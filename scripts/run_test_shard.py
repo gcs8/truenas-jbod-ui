@@ -131,6 +131,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_segmented_history",
         "test_segmented_history_reader",
         "test_segmented_restore_recovery",
+        "test_ses_unknown_occupancy_consumers",
         "test_ses_unknown_presence",
         "test_ses_zero_address_identity",
         "test_unittest_shards",

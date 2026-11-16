@@ -276,6 +276,12 @@ class SlotView(BaseModel):
     enclosure_label: str | None = None
     enclosure_name: str | None = None
     present: bool = False
+    # False when no evidence decided this bay's occupancy (#1218). `present`
+    # is then False too, but means "not known to hold a disk", not "empty":
+    # consumers must not draw, count, store or alert on the bay as either.
+    # Known is the default, so it is serialized only when False and saved
+    # snapshots without it read as before.
+    presence_known: bool = Field(default=True, exclude_if=lambda value: value is True)
     state: SlotState = SlotState.unknown
     # Live producers record the same state predicate before the locate mask.
     # Older saved snapshots omit it; never treat identify itself as a base state.
@@ -969,6 +975,10 @@ class StorageViewRuntimeSlot(BaseModel):
     target_system_id: str | None = None
     target_system_label: str | None = None
     occupied: bool = False
+    # False when the backing enclosure bay's occupancy was not read (#1218):
+    # `occupied` is then False without meaning empty. Serialized only when
+    # False, like SlotView.presence_known.
+    presence_known: bool = Field(default=True, exclude_if=lambda value: value is True)
     state: str = "empty"
     source: Literal["snapshot_slot", "inventory_candidate", "manual_mapping", "placeholder"] = "placeholder"
     # The view draws a layout whose bay order is unvalidated (#1068): this bay

@@ -4091,6 +4091,7 @@ class InventoryService:
                     slot_index=slot_value,
                     slot_label=label,
                     occupied=bool(slot and slot.present),
+                    presence_known=slot is None or slot.presence_known,
                     state=(slot.state.value if slot and isinstance(slot.state, SlotState) else str(slot.state) if slot else "empty"),
                     source="snapshot_slot",
                     match_reasons=["selected enclosure snapshot"],
@@ -16176,14 +16177,22 @@ class InventoryService:
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
         # its state was already empty.
-        status_says_populated = self._haystack_contains(
-            status_haystack, "ok", "installed", "ready", "present"
-        ) and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        # A status keyword is no occupancy evidence where SES reached the bay
+        # and its parser left occupancy undecided: `sesutil show` prints `OK`
+        # for a row with no device name.
+        status_says_populated = (
+            not ses_presence_unknown_without_disk
+            and self._haystack_contains(status_haystack, "ok", "installed", "ready", "present")
+            and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        )
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
             or (not ses_says_empty_without_disk and status_says_populated)
         )
+        # Occupancy is known when evidence said occupied or said empty. A
+        # False `present` without empty evidence only means nothing was read.
+        presence_known = present or empty
 
         if faulty and not ses_says_empty_without_disk and not ses_presence_unknown_without_disk:
             non_identify_state = SlotState.fault
@@ -16422,6 +16431,7 @@ class InventoryService:
             enclosure_label=enclosure_meta.get("label") or normalize_text(raw_slot_status.get("enclosure_label")),
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
+            presence_known=presence_known,
             state=state,
             non_identify_state=non_identify_state.value,
             identify_active=identify_active,

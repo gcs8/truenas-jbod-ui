@@ -906,12 +906,16 @@
 
   function storageViewRuntimeShortLabel(slot) {
     if (!slot || !slot.occupied) {
-      return "Empty";
+      // An unread bay is not an empty one (#1218).
+      return slot?.presence_known === false ? "Unknown" : "Empty";
     }
     return slot.serial || slot.device_name || slot.pool_name || "Matched disk";
   }
 
   function storageViewRuntimeSecondaryLabel(slot) {
+    if (slot?.presence_known === false && !slot.occupied) {
+      return "Whether this slot holds a disk is not known.";
+    }
     if (!slot || !slot.occupied) {
       return "No live disk is currently landing in this storage-view slot.";
     }
@@ -2243,7 +2247,7 @@
       return "";
     }
     if (!slot.device_name && !slot.occupied) {
-      return "This slot is empty.";
+      return slot.presence_known === false ? "Whether this slot holds a disk is not known." : "This slot is empty.";
     }
     const name = slot.device_name || `Slot ${slot.slot_label ?? state.selectedSlot}`;
     // Runtime slots carry bus, not the inventory record's raw.transport.
@@ -5772,7 +5776,8 @@
     const slot = entry?.slot || {};
     const storageViewSlot = entry?.storageViewSlot || null;
     const slotState = String(slot.state || storageViewSlot?.state || "").toLowerCase();
-    if (slotState === "empty") {
+    // An unread bay holds no known disk, whatever its saved assignment says.
+    if (slotState === "empty" || slot.presence_known === false) {
       return false;
     }
     if (slot.device_name || slot.serial || slot.pool_name || ["healthy", "identify", "fault", "unmapped"].includes(slotState)) {
@@ -10454,6 +10459,7 @@
       const slots = (Array.isArray(selectedView.slots) ? selectedView.slots : []).map((slot) => ({
         slot: slot.slot_index,
         state: slot.state || (slot.occupied ? "matched" : "empty"),
+        present: slot.occupied === true,
         mapping_source: slot.source || "unknown",
       }));
       const layoutCount = (Array.isArray(selectedView.slot_layout) ? selectedView.slot_layout : [])
@@ -10475,20 +10481,26 @@
   }
 
   function summarizeMappingHealth(slots, layoutSlotCount) {
-    const counts = { matched: 0, empty: 0, unmatched: 0, unknown: 0 };
+    const counts = { matched: 0, empty: 0, unmatched: 0, unverified: 0, unknown: 0 };
     (Array.isArray(slots) ? slots : []).forEach((slot) => {
       const slotState = String(slot?.state || "unknown").toLowerCase();
       if (slotState === "empty") {
         counts.empty += 1;
       } else if (slotState === "unmapped") {
-        counts.unmatched += 1;
+        // A saved assignment whose disk was not found is a disk only when the
+        // bay was read as occupied; otherwise nothing was observed (#1218).
+        if (slot?.present === false || slot?.presence_known === false) {
+          counts.unverified += 1;
+        } else {
+          counts.unmatched += 1;
+        }
       } else if (slotState === "unknown") {
         counts.unknown += 1;
       } else {
         counts.matched += 1;
       }
     });
-    const counted = counts.matched + counts.empty + counts.unmatched + counts.unknown;
+    const counted = counts.matched + counts.empty + counts.unmatched + counts.unverified + counts.unknown;
     const total = Math.max(Number(layoutSlotCount) || 0, counted);
     counts.unknown += Math.max(0, total - counted);
     const populated = counts.matched + counts.unmatched;
@@ -10497,6 +10509,10 @@
       headline = counts.unmatched === 1
         ? "1 disk is not matched to a bay. Click it to assign one."
         : `${counts.unmatched} disks are not matched to a bay. Click them to assign one.`;
+    } else if (counts.unverified > 0) {
+      headline = counts.unverified === 1
+        ? "1 saved bay assignment cannot be verified right now."
+        : `${counts.unverified} saved bay assignments cannot be verified right now.`;
     } else if (counts.unknown > 0) {
       headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} an unknown state.`;
     } else if (populated > 0) {
@@ -10504,7 +10520,8 @@
     } else {
       headline = "No disks are reported in this view.";
     }
-    return { ...counts, populated, total, headline };
+    const tone = counts.unmatched > 0 ? "warning" : counts.unverified + counts.unknown > 0 ? "unknown" : "ok";
+    return { ...counts, populated, total, headline, tone };
   }
 
   // Bay source codes off TrueNAS: Linux numbers come from the UniFi storage
@@ -10676,7 +10693,7 @@
     const health = summarizeMappingHealth(healthScope.slots, healthScope.layoutSlotCount);
     if (mappingHealthSummary) {
       setTextIfChanged(mappingHealthSummary, `${healthScope.label}: ${health.headline}`);
-      mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
+      mappingHealthSummary.dataset.tone = health.tone;
     }
     if (mappingHealthEvidence) {
       setTextIfChanged(mappingHealthEvidence, mappingHealthSourceNote(healthScope.slots, currentPlatform()));

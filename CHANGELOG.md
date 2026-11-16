@@ -49,9 +49,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   merge unrelated shelves seen from different hosts or give a bay another
   host's identify target; a bay whose SES occupancy is unknown, including a
   CORE `sesutil show` row without a device name, keeps its mapped disk and
-  shows as unknown instead of empty on every platform; and Quantastor no longer
-  hides a known disk behind a zero SAS address when stronger evidence says the
-  bay is occupied (#1262).
+  shows as unknown instead of empty on every platform. Such a bay is no longer
+  turned occupied by an `OK` status; history keeps its last recorded disk and
+  records no removal for it; a recorded SMART failure or temperature stays in
+  the alert metrics until the disk is read again; mapping health reports a
+  saved bay assignment that cannot be verified instead of a disk that is not
+  matched; and storage-view tiles show `Unknown` instead of `Empty`. Quantastor
+  no longer hides a known disk behind a zero SAS address when stronger
+  evidence says the bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

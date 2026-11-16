@@ -576,6 +576,11 @@ class HistoryCollector:
             if not collect_fast and not collect_slow:
                 continue
 
+            # A disk recorded in a bay whose occupancy this pass did not read
+            # was not read either: the pass is not complete evidence about it,
+            # so its earlier SMART evidence stands until a real read (#1218).
+            for recorded in self._unread_bay_recorded_disks(slot_records):
+                smart_evidence_expected.add(self._smart_evidence_disk_key(recorded))
             present_slots = [record.slot for record in slot_records if record.present]
             if not present_slots:
                 continue
@@ -1803,6 +1808,14 @@ class HistoryCollector:
 
         updates: list[SlotStateUpdate] = []
         for previous, record in zip(previous_records, slot_records, strict=True):
+            if not record.presence_known:
+                # Nothing was read about this bay's occupancy (#1218). Keep the
+                # recorded occupancy and disk and take only the new state, so an
+                # unread bay is never written as a removal or an insertion. A
+                # bay with no recorded row stays unrecorded until a real read.
+                if previous is None:
+                    continue
+                record = replace(previous, state=record.state, identify_active=record.identify_active)
             if self._should_backfill_extended_state(previous, record):
                 updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
@@ -2105,6 +2118,22 @@ class HistoryCollector:
             "reason": reason,
             "detail": SCOPE_SKIP_REASONS[reason],
         }
+
+    def _unread_bay_recorded_disks(self, slot_records: list[SlotStateRecord]) -> list[SlotStateRecord]:
+        """Recorded occupied rows for the bays whose occupancy was not read."""
+
+        recorded_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
+        disks: list[SlotStateRecord] = []
+        for record in slot_records:
+            if record.presence_known:
+                continue
+            scope_key = (record.system_id, record.enclosure_key)
+            if scope_key not in recorded_by_scope:
+                recorded_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
+            recorded = recorded_by_scope[scope_key].get(record.slot)
+            if recorded is not None and recorded.present:
+                disks.append(recorded)
+        return disks
 
     @staticmethod
     def _smart_evidence_disk_key(record: SlotStateRecord) -> str:
