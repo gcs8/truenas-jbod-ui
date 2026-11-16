@@ -964,5 +964,245 @@ class VerifyCleanupFailureTests(backup_fixtures.SchedulerTestBase):
         self.assertEqual(list(scheduler.paths.state_dir.glob("backup-fetch-*")), [])
 
 
+class RejectedCopyStaysRejectedTests(backup_fixtures.SchedulerTestBase):
+    """A size or content check that rejected the copy stays the result, whatever fails afterwards.
+
+    The copy is read through the shipping SFTP and S3 transport contexts (only
+    the network clients are fakes) or through the shipping download
+    destination, and is longer than catalogued, so the shipping size guard rejects
+    it. A later step then fails: closing the SFTP session, closing the SSH
+    client, closing the S3 client, or removing the partial download. No file
+    permissions are involved, so these tests also run as root.
+    """
+
+    SIZE_REJECTED = "Archive download is larger than expected; stopped before the catalogue check."
+    SITES = ("sftp_session_close", "ssh_client_close", "s3_client_close", "download_unlink")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.site: str | None = None
+        self.failure: BaseException | None = None
+        self.stored = b""
+        self.read_error: BaseException | None = None
+
+    _verify = VerifyOutcomeTests._verify
+    _detail = VerifyOutcomeTests._detail
+
+    def _fail(self, *args, **kwargs):
+        raise self.failure
+
+    def open_target(self, settings):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from history_service.backup_archive import transport
+
+        if self.site is None:
+            return super().open_target(settings)
+        stack = contextlib.ExitStack()
+        if self.site in {"sftp_session_close", "ssh_client_close"}:
+            ssh = archive_transport_fixtures.FakeSSHClient()
+            ssh.connect = lambda **kwargs: None
+            ssh.sftp.dirs.add("/backups")
+            for name in self.names:
+                ssh.sftp.files["/backups/" + name] = self.stored
+            if self.read_error is not None:
+                def open_fails(*args):
+                    raise self.read_error
+
+                ssh.sftp.open = open_fails
+            if self.site == "sftp_session_close":
+                ssh.sftp.close = self._fail
+            else:
+                ssh.close = self._fail
+            stack.enter_context(mock.patch.object(transport.paramiko, "SSHClient", return_value=ssh))
+            stack.enter_context(mock.patch.object(transport, "_sftp_host_key_policy", return_value=None))
+            stack.enter_context(mock.patch.object(transport, "_open_sftp_session", return_value=ssh.sftp))
+            sftp = SimpleNamespace(
+                password_file=None, private_key_file=None, hostname="sftp.example.test", effective_port=22,
+                username="backup", timeout_seconds=1, root="/backups",
+            )
+            opened = transport._open_sftp(sftp)
+        elif self.site == "s3_client_close":
+            client = archive_transport_fixtures.FakeS3Client()
+            for name in self.names:
+                client.objects["backups/" + name] = {"data": self.stored}
+            client.close = self._fail
+            boto3 = SimpleNamespace(client=lambda *args, **kwargs: client)
+            stack.enter_context(mock.patch.object(
+                transport, "_import_boto3",
+                return_value=(boto3, archive_transport_fixtures._TransferConfig, lambda **kwargs: None, ()),
+            ))
+            stack.enter_context(mock.patch.object(transport, "read_secret_file", return_value="synthetic"))
+            s3 = SimpleNamespace(
+                access_key_id_file="id", secret_access_key_file="key", timeout_seconds=1, endpoint_url="",
+                region="", bucket="backups", root="backups",
+            )
+            opened = transport._open_s3(s3)
+        else:
+            test = self
+
+            class Remote:
+                def get(self, name, local_path, *, limit=None):
+                    real_unlink = os.unlink
+                    calls = []
+
+                    def unlink(path, *args, **kwargs):
+                        calls.append(path)
+                        if len(calls) == 1:  # the download destination's own removal
+                            raise test.failure
+                        return real_unlink(path, *args, **kwargs)
+
+                    import io
+
+                    with mock.patch.object(transport.os, "unlink", side_effect=unlink):
+                        with transport._download_destination(local_path) as target:
+                            return transport._copy_stream(io.BytesIO(test.stored), target.write, limit)
+
+            opened = contextlib.nullcontext(Remote())
+
+        @contextlib.contextmanager
+        def with_fakes():
+            with stack, opened as remote:
+                yield remote
+
+        return with_fakes()
+
+    def _scheduler(self):
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        scheduler.run_now("full")
+        remote = scheduler.catalog.list(location="nas")[0]
+        self.names = [remote.name]
+        stored = (self.remote_root / "nas" / remote.name).read_bytes()
+        self.assertTrue(scheduler.get(remote.artifact_id).verified)
+        return scheduler, remote, stored
+
+    def _download(self, scheduler, artifact_id):
+        from history_service.backup_scheduler.api import build_app
+
+        status, body = backup_fixtures.asgi_call(build_app(scheduler), "GET", f"/internal/backups/{artifact_id}/download")
+        return status, json.loads(body) if status != 200 else None
+
+    def test_a_size_rejection_stays_a_mismatch_when_a_later_step_fails(self) -> None:
+        import errno
+
+        for site in self.SITES:
+            for failure in (OSError(errno.EIO, "Input/output error"), PermissionError(errno.EACCES, "Permission denied"), RuntimeError("closed")):
+                with self.subTest(site=site, failure=type(failure).__name__):
+                    scheduler, remote, stored = self._scheduler()
+                    self.stored = stored + b"OVERSIZED"
+                    self.site, self.failure = site, failure
+                    result = self._verify(scheduler, remote.artifact_id)
+                    self.assertEqual((result["ok"], result["outcome"]), (False, "mismatch"))
+                    self.assertEqual(result["detail"], self.SIZE_REJECTED)
+                    self.assertIs(result["artifact"]["verified"], False)
+                    self.assertIs(result["artifact"]["restorable"], False)
+                    self.assertFalse(scheduler.get(remote.artifact_id).verified)
+                    last = self._detail(scheduler, remote.artifact_id)["last_verify"]
+                    self.assertEqual((last["ok"], last["outcome"], last["detail"]), (False, "mismatch", self.SIZE_REJECTED))
+                    # A download of the same copy is refused as a mismatch too.
+                    status, body = self._download(scheduler, remote.artifact_id)
+                    self.assertEqual(status, 409, body)
+                    self.assertEqual(body["detail"], f"{self.SIZE_REJECTED} Verify it, or use another copy.")
+                    self.site = None
+                    self.doCleanups()
+                    self.setUp()
+
+    def test_a_non_os_error_from_workspace_removal_after_a_mismatch_is_a_mismatch(self) -> None:
+        from pathlib import Path
+        from unittest import mock
+
+        scheduler, remote, stored = self._scheduler()
+        (self.remote_root / "nas" / remote.name).write_bytes(b"X" * len(stored))
+        with mock.patch.object(Path, "rmdir", side_effect=RuntimeError("removal failed")):
+            result = self._verify(scheduler, remote.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "mismatch"))
+        self.assertEqual(result["detail"], "Readback does not match the catalogued size and SHA-256.")
+        self.assertFalse(scheduler.get(remote.artifact_id).verified)
+
+    def test_a_later_failure_without_a_rejection_is_still_unread(self) -> None:
+        import errno
+
+        for site in self.SITES[:3]:
+            with self.subTest(site=site):
+                scheduler, remote, stored = self._scheduler()
+                # The copy is intact; only closing fails, so the comparison never ran.
+                self.stored, self.site, self.failure = stored, site, OSError(errno.EIO, "Input/output error")
+                result = self._verify(scheduler, remote.artifact_id)
+                self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+                self.assertEqual(result["detail"], "OSError: Input/output error")
+                self.assertTrue(scheduler.get(remote.artifact_id).verified)
+                status, _body = self._download(scheduler, remote.artifact_id)
+                self.assertEqual(status, 502)
+                self.site = None
+                self.doCleanups()
+                self.setUp()
+
+    def test_a_read_failure_before_any_check_then_a_close_failure_is_unread(self) -> None:
+        import errno
+
+        scheduler, remote, stored = self._scheduler()
+        self.stored, self.site = stored + b"OVERSIZED", "sftp_session_close"
+        self.read_error = ConnectionResetError(errno.ECONNRESET, "Connection reset")
+        self.failure = OSError(errno.EIO, "Input/output error")
+        result = self._verify(scheduler, remote.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertTrue(scheduler.get(remote.artifact_id).verified)
+
+    def test_a_match_then_a_workspace_removal_os_error_is_still_a_match(self) -> None:
+        from pathlib import Path
+        from unittest import mock
+
+        scheduler, remote, _stored = self._scheduler()
+        with mock.patch.object(Path, "rmdir", side_effect=OSError(16, "Device or resource busy")):
+            result = self._verify(scheduler, remote.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (True, "matched"))
+        self.assertTrue(scheduler.get(remote.artifact_id).verified)
+
+    def test_interruption_and_cancellation_from_clean_up_propagate(self) -> None:
+        import asyncio
+
+        for failure in (KeyboardInterrupt(), asyncio.CancelledError()):
+            for site in ("sftp_session_close", "download_unlink"):
+                with self.subTest(site=site, failure=type(failure).__name__):
+                    scheduler, remote, stored = self._scheduler()
+                    self.stored, self.site, self.failure = stored + b"OVERSIZED", site, failure
+                    with self.assertRaises(type(failure)):
+                        scheduler.verify(remote.artifact_id)
+                    self.site = None
+                    self.doCleanups()
+                    self.setUp()
+
+    def test_the_chain_walk_is_bounded_and_survives_a_cycle(self) -> None:
+        from history_service.backup_archive.transport import ArchiveDownloadTooLargeError
+        from history_service.backup_scheduler import service
+        from history_service.backup_scheduler.service import ArchiveIntegrityError
+
+        rejected_copy_error = getattr(service, "rejected_copy_error", None)
+        self.assertIsNotNone(rejected_copy_error, "verify has no exception-chain walk")
+
+        def chain(length, last):
+            head = current = OSError("cleanup")
+            for _ in range(length):
+                current.__context__ = OSError("cleanup")
+                current = current.__context__
+            current.__context__ = last
+            return head
+
+        size = ArchiveDownloadTooLargeError(self.SIZE_REJECTED)
+        content = ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+        self.assertIs(rejected_copy_error(chain(2, size)), size)
+        cause = RuntimeError("wrapped")
+        cause.__cause__ = content
+        self.assertIs(rejected_copy_error(cause), content)
+        # Beyond the bound the walk stops and finds nothing.
+        self.assertIsNone(rejected_copy_error(chain(10_000, size)))
+        first, second = OSError("a"), OSError("b")
+        first.__context__, second.__context__ = second, first
+        second.__cause__ = first
+        self.assertIsNone(rejected_copy_error(first))
+        self.assertIsNone(rejected_copy_error(OSError("alone")))
+
+
 if __name__ == "__main__":
     unittest.main()

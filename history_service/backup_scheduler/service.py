@@ -1548,6 +1548,10 @@ class BackupScheduler:
             detail = str(exc)
         except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
+            rejection = rejected_copy_error(exc)
+            if rejection is not None:  # a later failure (e.g. clean-up) must not hide the rejection
+                self.catalog.mark_unverified(artifact_id)
+                outcome, detail = "mismatch", str(rejection)
         with self._state_lock:
             meta = self._meta.setdefault(artifact_id, {})
             # The result names the copy it read, so it never counts for another (#1202).
@@ -1660,6 +1664,20 @@ def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, 
 def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:
     if size != record.size or digest != record.sha256:
         raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+
+
+def rejected_copy_error(exc: BaseException) -> BaseException | None:
+    """The size or content check's rejection behind ``exc``, by type, or None (#1202)."""
+
+    pending, seen = [exc], set()
+    while pending and len(seen) < 32:  # bounded; ``seen`` also stops a cycle
+        current = pending.pop()
+        if isinstance(current, (ArchiveIntegrityError, ArchiveDownloadTooLargeError)):
+            return current
+        if id(current) not in seen:
+            seen.add(id(current))
+            pending += [link for link in (current.__cause__, current.__context__) if link is not None]
+    return None
 
 
 def _hash_file(path: Path) -> tuple[int, str]:
