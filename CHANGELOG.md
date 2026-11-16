@@ -51,14 +51,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- Changing where a system's reads go while keeping its system ID (its
-  appliance endpoint, platform, TLS server name, SSH hosts, their order or
-  port, the QuantaStor HA mode or controller hosts, or an enabled BMC) no
+- Changing where a system's reads are configured to go while keeping its
+  system ID (its appliance address including any path prefix, the API
+  dialect or version where it is part of that address, the platform, the TLS
+  server name the connection presents, SSH hosts, their order or port, the
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address) no
   longer serves the previous destination's saved SMART values or bay details:
-  each saved row records which destinations its reads used, and only rows
-  for the current destinations are read. An edit that moves no read, such as
-  a rename, a new key, or an extra SSH host on a platform that reads only the
-  primary host, keeps the saved values. The first SMART read served from saved values
+  each saved row records the configured destinations it was read under, and
+  only rows for the current configuration are read. This follows configured
+  routing only; it does not record which node of a system answered. An edit
+  that moves no read, such as a rename, a new key, or an extra SSH host on a
+  platform that reads only the primary host, keeps the saved values. The first SMART read served from saved values
   after a restart now refreshes from the disk in the background on its own,
   instead of waiting for a second request (#1261).
 - A failed history collection pass now logs which stage failed, the source

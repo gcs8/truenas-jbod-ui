@@ -10,15 +10,18 @@ appliance client is a mock that always fails, no network is touched.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import http.client
 import logging
+import os
+import ssl
 import tempfile
 import types
 import typing
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ValidationError
 
@@ -27,15 +30,138 @@ from app.config import BMCConfig, PathConfig, Settings, SSHConfig, SystemConfig,
 from app.models.domain import SlotView, SmartBatchRequest, SmartSummaryView
 from app.route_support import ensure_read_slot_bounds
 from app.services import inventory as inventory_module
+from app.services import truenas_ws as truenas_ws_module
 from app.services.inventory import slot_detail_collection_binding
 from app.services.inventory_registry import InventoryRegistry
-from app.services.quantastor_api import QuantastorRESTClient, build_quantastor_api_base
+from app.services.quantastor_api import QuantastorRESTClient
 from app.services.slot_detail_store import SlotDetailCacheEntry
-from app.services.tls_context import resolve_tls_server_name
-from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
+from app.services.supermicro_bmc import SupermicroBMCService
+from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
 SYSTEM_ID = "synthetic-system"
 SHELF = "synthetic-shelf"
+
+
+# ---------------------------------------------------------------------------
+# What the transports really send. The real clients run through urllib,
+# http.client and the WebSocket library up to the point where bytes would
+# leave: TCP is never opened, the TLS handshake is replaced by a recorder.
+# These observations do not use the destination plan, so a test comparing
+# them with the binding checks the plan against the wire, not against itself.
+
+class _Captured(Exception):
+    """Raised where the transport would first touch the network."""
+
+
+_PROXY_VARIABLES = ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "ws_proxy", "wss_proxy", "socks_proxy")
+
+
+@contextlib.contextmanager
+def _no_ambient_proxy():
+    # Proxy variables are deployment configuration, not part of a system's
+    # destination; keep them out of these observations.
+    with patch.dict(os.environ):
+        for name in list(os.environ):
+            if name.lower() in _PROXY_VARIABLES:
+                del os.environ[name]
+        yield
+
+
+@contextlib.contextmanager
+def _http_wire():
+    seen: dict = {}
+    original_putrequest = http.client.HTTPConnection.putrequest
+
+    def putrequest(conn, method, url, *args, **kwargs):
+        tls = isinstance(conn, http.client.HTTPSConnection)
+        seen["request"] = ("https" if tls else "http", conn.host.lower(), conn.port, url.split("?", 1)[0])
+        return original_putrequest(conn, method, url, *args, **kwargs)
+
+    def connect(conn):
+        seen["connect"] = (conn.host.lower(), conn.port)
+        if isinstance(conn, http.client.HTTPSConnection):
+            conn.sock = Mock()  # never written to: the TLS wrap below stops first
+            return
+        raise _Captured()
+
+    def wrap_socket(context, sock, *args, server_hostname=None, **kwargs):
+        seen["server_name"] = server_hostname.lower() if server_hostname else server_hostname
+        seen["checks_hostname"] = context.check_hostname
+        raise _Captured()
+
+    with _no_ambient_proxy(), \
+            patch.object(http.client.HTTPConnection, "putrequest", putrequest), \
+            patch.object(http.client.HTTPConnection, "connect", connect), \
+            patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+        yield seen
+
+
+def _quantastor_wire(config: TrueNASConfig) -> dict:
+    client = QuantastorRESTClient(config.model_copy(update={"api_user": "synthetic", "api_password": "synthetic"}))
+    with _http_wire() as seen:
+        try:
+            client._request_json("physicalDiskEnum")
+        except _Captured:
+            pass
+        except (TrueNASAPIError, ValueError) as exc:
+            return {"refused": (type(exc).__name__, config.host)}
+    return {key: seen.get(key) for key in ("request", "server_name")}
+
+
+def _bmc_wire(service: SupermicroBMCService) -> dict:
+    with _http_wire() as seen:
+        try:
+            service._redfish_get_json("/redfish/v1/Systems")
+        except _Captured:
+            pass
+        except (TrueNASAPIError, ValueError, http.client.HTTPException) as exc:
+            # A base URL no connection can be made to (for example a
+            # non-numeric port) is still a distinct destination.
+            return {"refused": (type(exc).__name__, service.base_url)}
+    return {key: seen.get(key) for key in ("request", "server_name")}
+
+
+def _truenas_wire(config: TrueNASConfig) -> dict:
+    """The URI and TLS server name the WebSocket session hands to the socket layer."""
+    client = TrueNASWebsocketClient(config.model_copy(update={"api_key": "synthetic"}))
+    seen: dict = {}
+    real_connect = truenas_ws_module.connect
+
+    def spy_connect(uri, **kwargs):
+        seen["uri"] = uri
+        return real_connect(uri, **kwargs)
+
+    async def create_connection(loop, factory, host=None, port=None, **kwargs):
+        seen["socket"] = (host.lower() if host else host, port)
+        server_name = kwargs.get("server_hostname")
+        if kwargs.get("ssl") is not None and server_name is None:
+            server_name = host  # asyncio presents the connect host by default
+        seen["server_name"] = server_name.lower() if server_name else None
+        raise _Captured()
+
+    async def open_session():
+        async with client._session():
+            pass
+
+    with _no_ambient_proxy(), patch.object(truenas_ws_module, "connect", spy_connect), \
+            patch.object(asyncio.BaseEventLoop, "create_connection", create_connection):
+        try:
+            asyncio.run(open_session())
+        except _Captured:
+            pass
+        except (TrueNASAPIError, ValueError) as exc:
+            return {"refused": (type(exc).__name__, config.host)}
+    uri = seen.get("uri") or ""
+    scheme, _, rest = uri.partition("://")
+    path = "/" + rest.split("/", 1)[1] if "/" in rest else ""
+    return {"request": (scheme, seen.get("socket"), path), "server_name": seen.get("server_name")}
+
+
+def _api_wire(service) -> dict:
+    client = service.truenas_client
+    if isinstance(client, QuantastorRESTClient):
+        return _quantastor_wire(client.config)
+    return _truenas_wire(client.config)
 
 
 def _system(
@@ -506,12 +632,8 @@ def _route_endpoint(router, path: str, method: str):
     )
 
 
-class QuantastorHaModeTests(unittest.TestCase):
-    """The QuantaStor HA mode decides which SSH hosts a SMART read uses.
-
-    With no HA node configured, turning HA mode on drops the API host from
-    the SSH hosts, so the same host list reaches another machine first.
-    """
+class _SmartRouteCase(unittest.TestCase):
+    """A saved row, a registry reload and both registered physical SMART routes."""
 
     API = "https://api.example.test"
 
@@ -522,11 +644,6 @@ class QuantastorHaModeTests(unittest.TestCase):
         self.router = app_routes.build_router()
         self.single = _route_endpoint(self.router, "/api/slots/{slot}/smart", "GET")
         self.batch = _route_endpoint(self.router, "/api/slots/smart-batch", "POST")
-
-    def _system(self, *, ha_enabled: bool, ha_nodes: list[dict] | None = None, label: str | None = None):
-        return _system(self.API, platform="quantastor", label=label, ssh=_ssh(
-            "api.example.test", "source-b.example.test", ha_enabled=ha_enabled, ha_nodes=ha_nodes or [],
-        ))
 
     def _start(self, system: SystemConfig) -> None:
         self.original = InventoryRegistry(_settings(self.root, system))
@@ -561,6 +678,19 @@ class QuantastorHaModeTests(unittest.TestCase):
             self.assertFalse(answer.available, "the other destination's saved SMART was served")
             self.assertIsNone(answer.power_on_hours)
             self.assertEqual(answer.message, CACHED_UNAVAILABLE)
+
+
+class QuantastorHaModeTests(_SmartRouteCase):
+    """The QuantaStor HA mode decides which SSH hosts a SMART read uses.
+
+    With no HA node configured, turning HA mode on drops the API host from
+    the SSH hosts, so the same host list reaches another machine first.
+    """
+
+    def _system(self, *, ha_enabled: bool, ha_nodes: list[dict] | None = None, label: str | None = None):
+        return _system(self.API, platform="quantastor", label=label, ssh=_ssh(
+            "api.example.test", "source-b.example.test", ha_enabled=ha_enabled, ha_nodes=ha_nodes or [],
+        ))
 
     def test_ha_mode_toggle_moves_the_read_and_the_binding(self) -> None:
         for before, after in ((False, True), (True, False)):
@@ -611,15 +741,226 @@ class QuantastorHaModeTests(unittest.TestCase):
             self.assertEqual(answer.power_on_hours, 17)
 
 
+class TransportDestinationTests(_SmartRouteCase):
+    """The binding follows what the API and BMC transports really send.
+
+    That is the whole request base (scheme, host, port and the path prefix,
+    with its case kept, and the JSON-RPC version where it is in the URL) and
+    the TLS server name the transport presents for the current settings. A
+    trust setting moves the binding only where it changes that name.
+    """
+
+    def _api(self, api_url: str, *, platform: str, label: str | None = None, **truenas) -> SystemConfig:
+        return _system(api_url, platform=platform, label=label, **truenas)
+
+    def _reload(self, system: SystemConfig) -> InventoryRegistry:
+        successor = super()._reload(system)
+        bmc = successor.get_service(SYSTEM_ID).bmc_service
+        if bmc is not None:
+            bmc.fetch_inventory = Mock(side_effect=TrueNASAPIError("Synthetic source unavailable"))
+        return successor
+
+    def _fresh_root(self) -> None:
+        self._tmp.cleanup()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def _assert_moved_through_both_routes(self, before: SystemConfig, after: SystemConfig) -> None:
+        self._fresh_root()
+        self._start(before)
+        successor = self._reload(after)
+        self._assert_routes_refuse(successor)
+        self.assertNotEqual(slot_detail_collection_binding(after), slot_detail_collection_binding(before))
+        # A SMART read the predecessor started before the reload lands now.
+        successor.slot_detail_store.save_entries([self.predecessor._build_slot_detail_entry(
+            _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=23),
+        )])
+        self._assert_routes_refuse(successor)
+
+    def _assert_kept_through_both_routes(self, before: SystemConfig, after: SystemConfig) -> None:
+        self._fresh_root()
+        self._start(before)
+        successor = self._reload(after)
+        self.assertEqual(slot_detail_collection_binding(after), slot_detail_collection_binding(before))
+        for answer in self._routes(successor):
+            self.assertTrue(answer.available, "an unchanged destination lost its own row")
+            self.assertEqual(answer.power_on_hours, 17)
+
+    def test_api_path_prefix_change_moves_the_request_and_the_binding(self) -> None:
+        # A path-routing proxy in front of several appliances picks the
+        # machine by this prefix; both API clients send it.
+        for platform in ("core", "quantastor"):
+            with self.subTest(platform=platform):
+                before = self._api("https://api.example.test/appliance-a", platform=platform)
+                after = self._api("https://api.example.test/appliance-b", platform=platform)
+                old_wire, new_wire = (
+                    _api_wire(InventoryRegistry(_settings(self.root, system)).get_service(SYSTEM_ID))
+                    for system in (before, after)
+                )
+                self.assertIn("/appliance-a/", old_wire["request"][-1])
+                self.assertIn("/appliance-b/", new_wire["request"][-1])
+                self._assert_moved_through_both_routes(before, after)
+
+    def test_api_path_prefix_case_is_kept(self) -> None:
+        for platform in ("core", "quantastor"):
+            with self.subTest(platform=platform):
+                lower = self._api("https://api.example.test/appliance-a", platform=platform)
+                upper = self._api("https://api.example.test/Appliance-A", platform=platform)
+                self.assertNotEqual(_api_wire(self._service(lower)), _api_wire(self._service(upper)))
+                self.assertNotEqual(slot_detail_collection_binding(lower), slot_detail_collection_binding(upper))
+
+    def test_unchanged_api_request_keeps_rows_through_both_routes(self) -> None:
+        # Control: a trailing slash is dropped by the URL builders, so the
+        # same request goes out and the saved data stays.
+        for platform in ("core", "quantastor"):
+            with self.subTest(platform=platform):
+                before = self._api("https://api.example.test/appliance-a", platform=platform)
+                after = self._api("https://api.example.test/appliance-a/", platform=platform, label="Renamed")
+                self.assertEqual(_api_wire(self._service(before)), _api_wire(self._service(after)))
+                self._assert_kept_through_both_routes(before, after)
+
+    def test_quantastor_verify_ssl_moves_the_server_name_with_an_override(self) -> None:
+        # The QuantaStor HTTP transport presents a differing server-name
+        # override only while it checks the certificate's host name.
+        def system(verify: bool) -> SystemConfig:
+            return self._api(
+                self.API, platform="quantastor", tls_server_name="source-b.example.test", verify_ssl=verify,
+            )
+
+        names = {verify: _api_wire(self._service(system(verify)))["server_name"] for verify in (False, True)}
+        self.assertEqual(names, {False: "api.example.test", True: "source-b.example.test"})
+        for before, after in ((False, True), (True, False)):
+            with self.subTest(verify_ssl_before=before):
+                self._assert_moved_through_both_routes(system(before), system(after))
+
+    def test_verify_ssl_that_moves_no_server_name_keeps_rows(self) -> None:
+        cases = {
+            # No override: the URL host is presented either way.
+            "quantastor without an override": lambda verify: self._api(
+                self.API, platform="quantastor", verify_ssl=verify,
+            ),
+            # The WebSocket session presents the override whatever the trust setting.
+            "core with an override": lambda verify: self._api(
+                self.API, platform="core", tls_server_name="source-b.example.test", verify_ssl=verify,
+            ),
+        }
+        for name, system in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(_api_wire(self._service(system(False))), _api_wire(self._service(system(True))))
+                self._assert_kept_through_both_routes(system(False), system(True))
+
+    def test_plain_http_sends_no_server_name(self) -> None:
+        plain = "http://api.example.test"
+        for platform in ("core", "quantastor"):
+            with self.subTest(platform=platform):
+                variants = [
+                    self._api(plain, platform=platform, tls_server_name=name, verify_ssl=verify)
+                    for name in (None, "source-a.example.test", "source-b.example.test")
+                    for verify in (False, True)
+                ]
+                wires = [_api_wire(self._service(system)) for system in variants]
+                self.assertTrue(all(wire["server_name"] is None for wire in wires), wires)
+                self.assertEqual(len({slot_detail_collection_binding(system) for system in variants}), 1)
+
+    def test_bmc_base_path_moves_the_binding(self) -> None:
+        def bmc(host: str, label: str | None = None) -> SystemConfig:
+            return self._api(self.API, platform="core", label=label).model_copy(
+                update={"bmc": BMCConfig(enabled=True, host=host, username="synthetic")},
+            )
+
+        before, after = bmc("bmc.example.test/bmc-a"), bmc("bmc.example.test/bmc-b")
+        old_wire, new_wire = (_bmc_wire(self._service(system).bmc_service) for system in (before, after))
+        self.assertEqual(old_wire["request"][-1], "/bmc-a/redfish/v1/Systems")
+        self.assertEqual(new_wire["request"][-1], "/bmc-b/redfish/v1/Systems")
+        self._assert_moved_through_both_routes(before, after)
+        # Control: the BMC service drops a trailing slash, so nothing moves.
+        same = bmc("https://bmc.example.test/bmc-a/", label="Renamed")
+        self.assertEqual(_bmc_wire(self._service(same).bmc_service), old_wire)
+        self._assert_kept_through_both_routes(before, same)
+
+    def test_jsonrpc_version_moves_the_binding_only_where_it_is_in_the_url(self) -> None:
+        def scale(dialect: str, version: str) -> SystemConfig:
+            return self._api(self.API, platform="scale", api_dialect=dialect, api_version=version)
+
+        cases = {
+            "jsonrpc version": (scale("jsonrpc", "current"), scale("jsonrpc", "v25.10.0"), True),
+            "ddp version": (scale("ddp", "current"), scale("ddp", "v25.10.0"), False),
+            "dialect": (scale("ddp", "current"), scale("jsonrpc", "current"), True),
+        }
+        for name, (before, after, moves) in cases.items():
+            with self.subTest(case=name):
+                wire_moved = _api_wire(self._service(before)) != _api_wire(self._service(after))
+                self.assertEqual(wire_moved, moves)
+                self.assertEqual(
+                    slot_detail_collection_binding(before) != slot_detail_collection_binding(after), moves,
+                )
+
+    def _service(self, system: SystemConfig):
+        return InventoryRegistry(_settings(self.root, system)).get_service(SYSTEM_ID)
+
+
+class RuntimeRoutingTests(unittest.TestCase):
+    """Which node of one configured system answers a read is not a destination change.
+
+    The binding protects against configuration pointing a system at another
+    machine. The nodes of one QuantaStor HA pair read the same shelves, and a
+    row with a live slot view is also checked against the disk's identity, so
+    a learned move of the reader from one node to the other keeps the saved
+    row of a strongly identified disk.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        system = _system("https://api.example.test", platform="quantastor", ssh=_ssh(
+            "api.example.test", ha_enabled=True, ha_nodes=[
+                {"system_id": "node-1", "host": "source-a.example.test"},
+                {"system_id": "node-2", "host": "source-b.example.test"},
+            ],
+        ))
+        self.registry = InventoryRegistry(_settings(Path(self._tmp.name), system))
+        self.service = self.registry.get_service(SYSTEM_ID)
+
+    @staticmethod
+    def _owned_by(node: str, serial: str = "SANITIZED-DISK-A") -> SlotView:
+        return _slot(serial).model_copy(update={"raw_status": {"quantastor_pool_owner_system_id": node}})
+
+    def test_learned_move_between_ha_nodes_keeps_the_saved_row(self) -> None:
+        binding = slot_detail_collection_binding(self.service.system)
+        on_a = self._owned_by("node-1")
+        self.assertEqual(self.service._build_quantastor_preferred_hosts(on_a)[0], "source-a.example.test")
+        self.registry.slot_detail_store.save_entries([self.service._build_slot_detail_entry(
+            on_a, smart_summary=SmartSummaryView(available=True, power_on_hours=17),
+        )])
+
+        # The pool fails over: the same disk is now read through node B, and
+        # the remembered good host follows it.
+        on_b = self._owned_by("node-2")
+        self.service._quantastor_preferred_ses_host = "source-b.example.test"
+        self.assertEqual(self.service._build_quantastor_preferred_hosts(on_b)[0], "source-b.example.test")
+        self.assertEqual(slot_detail_collection_binding(self.service.system), binding)
+
+        persisted = self.service._build_persisted_smart_summary(on_b)
+        self.assertIsNotNone(persisted, "a failover inside one system withheld the saved SMART")
+        self.assertEqual(persisted.power_on_hours, 17)
+        cached = self.service.get_cached_slot_smart_summary_without_layout(0, SHELF)
+        self.assertIsNotNone(cached)
+        assert cached is not None
+        self.assertEqual(cached.power_on_hours, 17)
+
+        # Control: the disk-identity check still applies to the live slot view.
+        self.assertIsNone(self.service._build_persisted_smart_summary(self._owned_by("node-2", "SANITIZED-DISK-B")))
+
+
 # ---------------------------------------------------------------------------
 # Every field of the system configuration model, one at a time.
 #
 # The cases are generated from ``SystemConfig`` itself, so a field added later
 # is swept without editing this test. For each baseline configuration, each
 # field is changed alone; the test then compares what the registry-built
-# readers would contact (API endpoint and TLS server name, SSH hosts in try
-# order with their port and controller association, BMC endpoint) with the
-# destination plan and the binding.
+# readers would contact (the API and BMC requests and TLS server names as
+# their transports send them, SSH hosts in try order with their port and
+# controller association) with the destination plan and the binding.
 
 # Learned hosts sit between the configured ones; reading with them shows
 # where each configured host is tried relative to them.
@@ -663,16 +1004,26 @@ def _baselines() -> dict[str, SystemConfig]:
            "extra_hosts": ["source-b.example.test", "source-e.example.test"], "user": "synthetic", "ha_nodes": nodes}
     return {
         "core": make("core", ssh=ssh, tls_server_name="sni.example.test"),
+        # A path prefix (behind a path-routing proxy) is part of every request.
+        "core-path-prefix": make("core", host="https://api.example.test/appliance-a", ssh={**ssh, "enabled": False}),
         "core-plain-http": make("core", host="http://api.example.test", ssh=ssh),
         "core-ssh-off": make("core", ssh={**ssh, "enabled": False}),
         "scale": make("scale", ssh=ssh, api_dialect="jsonrpc"),
         "linux": make("linux", ssh=ssh),
-        "esxi-bmc": make("esxi", ssh=ssh, bmc={"enabled": True, "host": "bmc.example.test", "username": "synthetic"}),
+        "esxi-bmc": make(
+            "esxi", ssh=ssh, bmc={"enabled": True, "host": "bmc.example.test/bmc-a", "username": "synthetic"},
+        ),
         "ipmi-bmc": make("ipmi", bmc={"enabled": True, "host": "https://bmc.example.test:8443"}),
         "quantastor-standalone": make(
             "quantastor", ssh={**ssh, "host": "api.example.test", "ha_nodes": [], "ha_enabled": False},
         ),
         "quantastor-ha": make("quantastor", ssh={**ssh, "ha_enabled": True}),
+        # A server-name override the HTTP transport presents only while it
+        # checks host names, and a path prefix.
+        "quantastor-sni-path": make(
+            "quantastor", host="https://api.example.test/appliance-a", tls_server_name="sni.example.test",
+            ssh={"enabled": False},
+        ),
     }
 
 
@@ -798,27 +1149,19 @@ def _mutations(base: SystemConfig):
         yield dotted, operation, accepted
 
 
-def _endpoint(url: str | None) -> tuple[str, str] | None:
-    if not url:
-        return None
-    parts = urlsplit(url)
-    return parts.scheme, parts.netloc.lower()
-
-
 def _observed_destinations(service, system_ids: set[str]) -> dict:
-    """What the registry-built readers of ``service`` would contact."""
+    """What the registry-built readers of ``service`` would contact.
+
+    The API and BMC entries are what their transports really send (see
+    `_api_wire`), not anything derived from the destination plan.
+    """
     system = service.system
-    client = service.truenas_client
-    url = (
-        build_quantastor_api_base(client.config.host) if isinstance(client, QuantastorRESTClient)
-        else client._endpoint_url()
-    )
-    server_name = resolve_tls_server_name(client.config)
+    bmc = service.bmc_service
     observed: dict = {
         # The platform picks which readers run at all.
         "platform": system.truenas.platform,
-        "api": (_endpoint(url), server_name.lower() if server_name else None),
-        "bmc": _endpoint(service.bmc_service.base_url) if service.bmc_service is not None else None,
+        "api": _api_wire(service),
+        "bmc": _bmc_wire(bmc) if bmc is not None and bmc.config.enabled and bmc.base_url else None,
     }
     if system.ssh.enabled:
         probe = service.ssh_probe
@@ -840,7 +1183,11 @@ def _observed_destinations(service, system_ids: set[str]) -> dict:
 
 
 class DestinationPlanFieldSweepTests(unittest.TestCase):
-    """Closes the class: no single configuration edit moves a read without the binding."""
+    """No single configuration edit moves a read without moving the binding, or the reverse.
+
+    This covers configured routing. Which node of one system answers at
+    runtime is not a configuration edit; see `RuntimeRoutingTests`.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:

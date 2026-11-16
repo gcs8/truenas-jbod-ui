@@ -136,7 +136,7 @@ from app.services.core_expander_counters import (
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
-from app.services.quantastor_api import QuantastorRESTClient, build_quantastor_api_base
+from app.services.quantastor_api import QuantastorRESTClient, quantastor_request_destination
 from app.services.parsers import (
     CORE_ZPOOL_STATUS_BY_DEVICE_OPTIONAL_COMMAND,
     fixed_device_sg_ses_note,
@@ -189,14 +189,14 @@ from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.supermicro_bmc import _normalize_bmc_host as normalize_bmc_host
-from app.services.tls_context import certificate_verification_failure_reason, resolve_tls_server_name
+from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
     TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
-    build_websocket_url,
     normalize_disk_inventory_rows,
+    truenas_session_destination,
 )
 from websockets.exceptions import ConnectionClosed
 
@@ -1603,18 +1603,30 @@ class CollectionDestinationPlan:
     """Where the reads of one system go, worked out from its configuration (#1207).
 
     The SMART and inventory readers take their configured destinations from
-    here, and the persisted-detail binding is a digest of it, so the binding
-    changes exactly when a read would go somewhere else. Credentials,
-    timeouts, trust settings and display fields are not destinations and are
-    not here. Runtime choices (a host that answered before, hosts learned
-    from the appliance) start from these configured ones.
+    here, and the API and BMC entries come from the clients' own request
+    builders, so the persisted-detail binding (a digest of this plan) changes
+    when the configuration sends a read somewhere else. Credentials,
+    timeouts and display fields are not destinations and are not here; a
+    trust setting is, only where it changes the TLS server name a transport
+    sends (QuantaStor presents a server-name override only while it verifies
+    host names). Ambient proxy variables are deployment configuration and
+    are not here either.
+
+    The plan describes configured routing; it does not record which node
+    answered. Runtime choices among the approved hosts of one system (a host
+    that answered before, cluster peers and per-controller hosts learned from
+    the appliance, a slot's owner or SES target) start from these configured
+    ones and are not part of it: they are the nodes of one system reading the
+    same shelves, and a row read with a live slot view is also checked
+    against the disk's identity.
     """
 
     platform: str
-    # (scheme, host and port) the API client connects to, and the TLS server
-    # name it presents there (an SNI-routed endpoint picks the appliance by
-    # it). Host names here are compared without case, as DNS does.
-    api_endpoint: tuple[str, str]
+    # The request base the API client sends to (scheme, host and port, and
+    # the path with its case kept, including the dialect's resource), and the
+    # TLS server name it presents there (an SNI-routed endpoint picks the
+    # appliance by it). Host names are compared without case, as DNS does.
+    api_resource: tuple[str, ...]
     api_tls_server_name: str | None
     # SSH, only while SSH reads are on. Hosts are compared as the readers
     # compare them: exact text after trimming.
@@ -1627,8 +1639,8 @@ class CollectionDestinationPlan:
     quantastor_standalone_hosts: QuantastorHostOrder | None = None
     quantastor_clustered_hosts: QuantastorHostOrder | None = None
     quantastor_node_hosts: tuple[tuple[str, str], ...] = ()
-    # The BMC's (scheme, host and port), only while the BMC is read.
-    bmc_endpoint: tuple[str, str] | None = None
+    # The BMC's base URL as its service sends it, only while the BMC is read.
+    bmc_resource: tuple[str, ...] | None = None
 
     def quantastor_hosts(self, *, clustered: bool) -> QuantastorHostOrder | None:
         return self.quantastor_clustered_hosts if clustered else self.quantastor_standalone_hosts
@@ -1637,13 +1649,18 @@ class CollectionDestinationPlan:
         return dict(self.quantastor_node_hosts).get(normalize_text(system_id) or "")
 
 
-def _url_endpoint(build: Callable[[str], str], host: str) -> tuple[str, str]:
+def _request_resource(url: str) -> tuple[str, ...]:
+    """(scheme, host and port, path) of a request base a client built.
+
+    Credentials in the URL are left out; the path keeps its case, because a
+    path-routing proxy can tell `/A` from `/a`.
+    """
     try:
-        parts = urlsplit(build(host))
+        parts = urlsplit(url)
     except ValueError:
         # Not a URL any client can connect to; still a distinct destination.
-        return "unparsed", host.strip().lower()
-    return parts.scheme, parts.netloc.lower()
+        return "unparsed", url.strip()
+    return parts.scheme, parts.netloc.rpartition("@")[2].lower(), parts.path
 
 
 def _quantastor_host_order(system: SystemConfig, *, skip_api_host: bool) -> QuantastorHostOrder:
@@ -1675,18 +1692,23 @@ def _quantastor_host_order(system: SystemConfig, *, skip_api_host: bool) -> Quan
 def collection_destination_plan(system: SystemConfig) -> CollectionDestinationPlan:
     """The one place that works out where ``system``'s reads go; see `CollectionDestinationPlan`."""
     platform = system.truenas.platform
-    # The same URL builders the API client and the BMC service connect with.
-    api_url_builder = build_quantastor_api_base if platform == "quantastor" else build_websocket_url
+    # The request bases and TLS server names come from the functions the API
+    # client and the BMC service build their own requests with.
+    request_destination = (
+        quantastor_request_destination if platform == "quantastor" else truenas_session_destination
+    )
     try:
-        server_name = resolve_tls_server_name(system.truenas)
-    except ValueError:
-        server_name = None
-    bmc_read = system.bmc.enabled and bool(normalize_bmc_host(system.bmc.host))
+        api_url, server_name = request_destination(system.truenas)
+        api_resource = _request_resource(api_url)
+    except (TrueNASAPIError, ValueError):
+        # The client refuses to connect at all; still a distinct destination.
+        api_resource, server_name = ("unusable", system.truenas.host.strip()), None
+    bmc_url = normalize_bmc_host(system.bmc.host)
     plan = CollectionDestinationPlan(
         platform=platform,
-        api_endpoint=_url_endpoint(api_url_builder, system.truenas.host),
+        api_resource=api_resource,
         api_tls_server_name=server_name.lower() if server_name else None,
-        bmc_endpoint=_url_endpoint(normalize_bmc_host, system.bmc.host) if bmc_read else None,
+        bmc_resource=_request_resource(bmc_url) if system.bmc.enabled and bmc_url else None,
     )
     ssh = system.ssh
     if not ssh.enabled:
@@ -1724,10 +1746,11 @@ def slot_detail_collection_binding(system: SystemConfig) -> str:
     """Digest of the destination plan that persisted slot details belong to (#1207).
 
     It is derived from `collection_destination_plan` only, so it changes
-    exactly when a read would go somewhere else, and an edit that moves no
-    read (a rename, a key rotation, an extra host a platform never reads)
-    keeps the persisted rows. Only the digest is stored, so the cache file
-    names no endpoint.
+    when the configuration sends a read somewhere else, and an edit that
+    moves no read (a rename, a key rotation, an extra host a platform never
+    reads) keeps the persisted rows. Like the plan, it describes configured
+    routing, not which node of the system answered. Only the digest is
+    stored, so the cache file names no endpoint.
     """
     identity = asdict(collection_destination_plan(system))
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
