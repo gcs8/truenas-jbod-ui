@@ -42,6 +42,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
   world-readable when the host refuses the mode change (#1180).
+- Certificate imports now keep asynchronous file reads and responses bound to
+  the editor and TLS target that started them, so later editor state cannot
+  receive an earlier import's trust result (#1252).
 
 ### Fixed
 
@@ -49,6 +52,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   platform to VMware ESXi or a BMC-only system while a permission preview is
   still loading now keeps the guidance for the form as it is; the older
   preview's result or error no longer replaces it (#1236).
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
+- Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
+  When days are not reported it shows the reported hours, and leaves the
+  value out when neither is known; a reported zero still shows (#1234).
+- Restore now refuses a history database whose schema version is outside the
+  range this release supports, in both backup formats and before anything is
+  activated, instead of replacing live history with a database the service
+  then refuses to start on. The message names the found and supported
+  versions, and live history is left unchanged (#1193).
+- Re-saving a system in System Setup no longer resets settings the form does
+  not show, such as the middleware call limit `max_concurrent_calls`, to their
+  defaults; the save now changes only the fields the form owns (#1194).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
@@ -80,6 +100,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- With zero-based API slot numbering, a disk whose nested enclosure slot is
+  the integer 0 now stays bound to bay 0 instead of losing its bay, matching
+  the string "0"; a boolean slot value is no longer read as a bay (#1235).
+- On ESXi hosts where two RAID controllers report the same local slot (such
+  as `13:0`), a placed disk no longer takes the other controller's pool,
+  topology and fault state; a slot key shared by several disks is no longer
+  used for topology lookup (#1237, refs #1213).
 
 ### Performance
 
