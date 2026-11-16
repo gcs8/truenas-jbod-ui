@@ -44,6 +44,7 @@ from history_service.segmented_restore import (
     tree_matches,
     write_restore_journal,
 )
+from history_service.segmented_restore import _require_recorded_history
 from history_service.segmented_restore import record_file as record_restore_file
 from history_service.segmented_restore import record_tree as record_restore_tree
 from history_service.store import SCHEMA, HistoryStore
@@ -1148,6 +1149,135 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                 finally:
                     record.write_bytes(original)
 
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
+    def _recover_at(
+        self,
+        target: _Deployment,
+        hot: Path,
+        segments: Path,
+        *,
+        apply: bool,
+    ) -> dict[str, Any]:
+        """Recover with the history paths spelled as the caller gives them."""
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": self._config_path(target)}):
+            return recover_pending_rotation(
+                source=hot,
+                segments_directory=segments,
+                apply=apply,
+            )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_accepts_history_reached_through_a_link_above_its_folder(self) -> None:
+        # The first folder's record holds the history paths as the restore
+        # spelled them. The same folder reached through a symbolic link higher
+        # up is the same history, so recovery must still complete.
+        cases = [
+            (crash, side, parts)
+            for crash, side in (("commit", "prior"), ("_finalize_commit", "candidate"))
+            for parts in (("hot",), ("segments",), ("hot", "segments"))
+        ]
+        for number, (crash, side, parts) in enumerate(cases):
+            with self.subTest(crash=crash, aliased=parts):
+                target = self._target(f"target-{number}")
+                exit_code = self._import_in_child(
+                    target,
+                    lambda crash=crash: [
+                        patch.object(_ImportActivationTransaction, crash, self._hard_exit)
+                    ],
+                )
+                self.assertEqual(exit_code, CRASH_EXIT)
+                alias = Path(self._directory.name) / f"alias-{number}"
+                alias.symlink_to(target.root, target_is_directory=True)
+                folder = alias / target.hot.parent.name
+                hot = folder / target.hot.name if "hot" in parts else target.hot
+                segments = (
+                    folder / target.segments.name if "segments" in parts else target.segments
+                )
+                self.assertNotEqual((hot, segments), (target.hot, target.segments))
+
+                self._recover_at(target, hot, segments, apply=False)
+                self.assertTrue(activation_pending_path(target.hot).exists())
+                result = self._recover_at(target, hot, segments, apply=True)
+
+                self.assertEqual(
+                    self._assert_one_generation(target, result, label=f"{crash} {parts}"),
+                    side,
+                )
+
+    def test_history_recorded_through_a_link_is_accepted_under_the_same_spelling(self) -> None:
+        # Whatever spelling the record holds is accepted when recovery is
+        # given that same spelling, link or no link, as before.
+        base = Path(self._directory.name)
+        (base / "real" / "history").mkdir(parents=True)
+        (base / "link").symlink_to(base / "real", target_is_directory=True)
+        hot = base / "link" / "history" / "history.db"
+        segments = base / "link" / "history" / "segments"
+        journal = {
+            "hot": {"prior": {"kind": "file"}, "candidate": {"kind": "file"}},
+            "segments": {"prior": {"kind": "directory"}, "candidate": {"kind": "directory"}},
+        }
+        anchor = {
+            "history": [
+                {"path": str(path), "kind": kind, **journal[name]}
+                for name, kind, path in (
+                    ("hot", "file", hot),
+                    ("segments", "directory", segments),
+                )
+            ]
+        }
+
+        _require_recorded_history(anchor, journal, hot, segments)
+
+        real = base / "real" / "history"
+        at_real_place = [
+            dict(item, path=str(real / Path(item["path"]).name)) for item in anchor["history"]
+        ]
+        _require_recorded_history({"history": at_real_place}, journal, hot, segments)
+        elsewhere = base / "real" / "other"
+        with self.assertRaises(ValueError) as refused:
+            _require_recorded_history(
+                anchor, journal, elsewhere / "history.db", elsewhere / "segments"
+            )
+        self.assertEqual(getattr(refused.exception, "reason", None), "history-target-unrecorded")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_history_under_another_name_for_its_folder(self) -> None:
+        # Only links above the history folder are followed. The folder's own
+        # name and the names in it must be the recorded ones.
+        target = self._target()
+        exit_code = self._import_in_child(
+            target,
+            lambda: [patch.object(_ImportActivationTransaction, "commit", self._hard_exit)],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        folder = target.hot.parent
+        renamed = folder.with_name("history-by-another-name")
+        renamed.symlink_to(folder.name, target_is_directory=True)
+        linked_hot = folder / "linked.db"
+        linked_hot.symlink_to(target.hot.name)
+        before = _tree_snapshot(target.root)
+        unrecorded = "history-target-unrecorded"
+        for label, hot, segments, reason in (
+            ("folder link", renamed / target.hot.name, renamed / target.segments.name, unrecorded),
+            ("folder link, hot only", renamed / target.hot.name, target.segments, unrecorded),
+            ("folder link, segments only", target.hot, renamed / target.segments.name, unrecorded),
+            # A linked database name is refused before any record is read.
+            ("file link", linked_hot, target.segments, None),
+        ):
+            for apply in (False, True):
+                with self.subTest(spelling=label, apply=apply):
+                    with self.assertRaises(ValueError) as refused:
+                        self._recover_at(target, hot, segments, apply=apply)
+                    self.assertEqual(getattr(refused.exception, "reason", None), reason)
+                    self.assertEqual(_tree_snapshot(target.root), before)
+
+        renamed.unlink()
+        linked_hot.unlink()
         result = self._recover(target)
         self.assertEqual(
             self._assert_one_generation(target, result, label="control"),

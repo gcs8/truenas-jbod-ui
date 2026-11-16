@@ -818,9 +818,11 @@ not the one the restore used (`configuration-target-unavailable`), a folder
 record is missing, malformed or does not belong to the first folder's record
 (`configuration-target-unsealed`), the journal names a target that its folder's
 record does not list exactly (`configuration-target-unrecorded`), the
-journal's history records or the history paths recovery was given are not
-exactly the ones the first folder's record holds, or that record holds none
-(`history-target-unrecorded`), a recorded
+journal's history records are not exactly the ones the first folder's record
+holds, the history paths recovery was given are not the recorded ones (a
+symbolic link above the history folder is followed before the comparison; the
+folder's own name and the names inside it must be the recorded ones), or that
+record holds none (`history-target-unrecorded`), a recorded
 file changed (`configuration-target-divergent`), the prior copy is gone
 (`prior-generation-unavailable`), or a committed import no longer holds the
 candidate (`committed-generation-incomplete`). Builds that only know version 1

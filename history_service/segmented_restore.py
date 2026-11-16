@@ -1069,6 +1069,23 @@ def _configuration_targets(
     return targets, anchor["decision"], ordered
 
 
+def _history_location(path: str | Path) -> str:
+    """Spell a history path with every link above its folder followed.
+
+    The folder's own name and the name inside it stay as given: recovery
+    never follows a link there. Links higher up only say where the folder is
+    mounted, so the same folder reached through one is the same history.
+    This reads link targets and writes nothing.
+    """
+    folder, name = os.path.split(os.path.abspath(path))
+    above, folder_name = os.path.split(folder)
+    try:
+        above = os.path.realpath(above)
+    except (OSError, ValueError):
+        pass
+    return os.path.join(above, folder_name, name)
+
+
 def _require_recorded_history(
     anchor: dict[str, Any],
     journal: dict[str, Any],
@@ -1079,21 +1096,28 @@ def _require_recorded_history(
 
     The journal's history records are only an index too: they must be the ones
     the first configuration folder's record holds, or a writer of the history
-    folder could choose which history recovery keeps (#1196).
+    folder could choose which history recovery keeps (#1196). The prior and
+    candidate records must be exactly the recorded ones. The paths must be the
+    recorded ones as given, or once the links above the history folder are
+    followed: a restore refuses to run through such a link, so its record
+    holds the folder's real place.
     """
-    expected = [
-        {
-            "path": os.path.abspath(path),
-            "kind": kind,
-            "prior": journal[name]["prior"],
-            "candidate": journal[name]["candidate"],
-        }
-        for name, kind, path in (
-            ("hot", "file", source),
-            ("segments", "directory", segments_directory),
-        )
+    accepted = [
+        [
+            {
+                "path": spell(path),
+                "kind": kind,
+                "prior": journal[name]["prior"],
+                "candidate": journal[name]["candidate"],
+            }
+            for name, kind, path in (
+                ("hot", "file", source),
+                ("segments", "directory", segments_directory),
+            )
+        ]
+        for spell in (os.path.abspath, _history_location)
     ]
-    if anchor["history"] != expected:
+    if anchor["history"] not in accepted:
         raise SegmentedRestoreRecoveryRefused(
             "history-target-unrecorded",
             "The restore journal's history records do not match the restore's own "
