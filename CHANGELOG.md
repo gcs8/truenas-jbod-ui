@@ -73,7 +73,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - History retention no longer deletes a migrated or imported row stored with
   a non-UTC offset while it is still newer than the retention cutoff, and
-  rollups keep the truly latest counter value across offsets (#1247).
+  rollups keep the latest counter value across offsets: exactly for
+  timestamps with an offset, and to SQLite's millisecond for other time text
+  it reads (#1247).
 - Changing where a system's reads are configured to go while keeping its
   system ID (its appliance address including any path prefix, the API
   dialect or version where it is part of that address, the platform, the TLS

@@ -4,7 +4,6 @@ import ctypes
 import errno
 import logging
 import os
-import re
 import secrets
 import shlex
 import shutil
@@ -643,64 +642,6 @@ def _history_utc_instant(value: object) -> str | None:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return None
         return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="microseconds")
-    except (ValueError, OverflowError):
-        return None
-
-
-# SQLite's own ISO date and time grammar, after the end spaces it skips are
-# removed: date, any run of spaces and "T", then an optional time with an
-# optional fraction and an optional "Z" or "+HH:MM" zone. Each repeat is
-# followed by text it cannot itself match, so a match takes time proportional
-# to the text.
-_SQLITE_SPACE = " \t\n\v\f\r"
-_SQLITE_ISO_TIME = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[ \t\n\v\f\rT]*"
-    r"(?:(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:[ \t\n\v\f\r]*(?:([+-])(\d{2}):(\d{2})|[Zz]))?)?",
-    re.ASCII,
-)
-
-
-def _sqlite_iso_utc_instant(value: object) -> str | None:
-    """UTC instant, to the microsecond, of ISO text as SQLite reads it, or None.
-
-    Only for ordering a counter's last value, never for expiry. SQLite reads
-    text the exact reading rejects: spaces at the end or before the zone, no
-    zone (taken as UTC), text after a NUL, a day past the end of its month or
-    hour 24 (both carried forward). SQLite rounds what it reads to the
-    millisecond; this keeps the digits, in the form _history_utc_instant
-    returns, so such a sample keeps its place among samples less than a
-    millisecond away. It reads nothing SQLite does not, apart from the last
-    half millisecond of year 9999, which SQLite builds differ on. Text SQLite
-    reads in another way (a year before 0001, a Julian day number, a time
-    without a date) has no instant here.
-    """
-
-    if not isinstance(value, str):
-        return None
-    matched = _SQLITE_ISO_TIME.fullmatch(value.split("\x00", 1)[0].rstrip(_SQLITE_SPACE))
-    if matched is None:
-        return None
-    year, month, day, hour, minute, second, fraction, sign, zone_hours, zone_minutes = matched.groups()
-    hours, minutes, seconds = int(hour or 0), int(minute or 0), int(second or 0)
-    offset = int(zone_hours or 0) * 60 + int(zone_minutes or 0)
-    if (
-        not 1 <= int(day) <= 31
-        or hours > 24
-        or minutes > 59
-        or seconds > 59
-        or int(zone_hours or 0) > 14
-        or int(zone_minutes or 0) > 59
-    ):
-        return None
-    try:
-        instant = datetime(int(year), int(month), 1) + timedelta(
-            days=int(day) - 1,
-            hours=hours,
-            minutes=minutes - (-offset if sign == "-" else offset),
-            seconds=seconds,
-            microseconds=int((fraction or "")[:6].ljust(6, "0")),
-        )
-        return instant.isoformat(timespec="microseconds")
     except (ValueError, OverflowError):
         return None
 
@@ -3525,32 +3466,29 @@ class HistoryStore:
                 return None
             return _history_utc_instant(text)
 
-        def order_instant(value: object) -> str | None:
-            try:
-                text = value.decode(encoding) if isinstance(value, bytes) else value
-            except UnicodeDecodeError:
-                return None
-            exact = _history_utc_instant(text)
-            return exact if exact is not None else _sqlite_iso_utc_instant(text)
-
         connection.create_function("_history_utc_instant", 1, utc_instant, deterministic=True)
-        connection.create_function("_history_order_instant", 1, order_instant, deterministic=True)
 
     @staticmethod
-    def _sample_order_instant(column: str) -> str:
-        """SQL for the instant a raw sample's last value is ordered by.
+    def _newer_last_sample(new: str, old: str) -> str:
+        """SQL: whether the sample at time text `new` gives a bucket's last value over `old`.
 
-        The exact instant where the text has one. A restored database can hold
-        text only SQLite reads (padded with spaces, or without an offset, which
-        SQLite takes as UTC); its ISO forms are read to the microsecond too.
-        What is left is ordered by the instant SQLite reads, to its
-        millisecond: SQLite names the sample's bucket from the same reading,
-        so every sample that has a bucket has a place in the order.
+        Three keys, strongest first, as the raw-sample rank in
+        _roll_up_metric_rows uses them. SQLite's own reading, which names the
+        bucket: it rounds to about a millisecond, which can tie two samples
+        but never puts an earlier one after a later one. Then, when both have
+        one, the exact instant. Then the stored text, as before #1204; a
+        later arrival wins a full tie. So text with no exact instant is in
+        time order to SQLite's millisecond, and closer than that only as its
+        text sorts; a NULL reading falls through to the next key.
         """
 
+        day_new, day_old = f"julianday({new})", f"julianday({old})"
+        exact_new = f"_history_utc_instant(CAST({new} AS BLOB))"
+        exact_old = f"_history_utc_instant(CAST({old} AS BLOB))"
         return (
-            f"COALESCE(_history_order_instant(CAST({column} AS BLOB)), "
-            f"strftime('%Y-%m-%dT%H:%M:%f', {column}) || '000')"
+            f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 "
+            f"WHEN {exact_new} IS NOT NULL AND {exact_old} IS NOT NULL THEN {exact_new} >= {exact_old} "
+            f"ELSE {new} >= {old} END"
         )
 
     @staticmethod
@@ -3699,6 +3637,13 @@ class HistoryStore:
         else:
             raise ValueError("Unsupported history rollup interval.")
         expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
+        # The last value's order (see _newer_last_sample): SQLite's reading;
+        # the exact instant, inside a tie whose samples all have one; the text.
+        partition = (
+            f"{bucket_expression}, system_id, enclosure_key, slot, "
+            "metric_name, COALESCE(disk_identity_key, '')"
+        )
+        newer = cls._newer_last_sample("excluded.last_observed_at", "metric_rollups.last_observed_at")
         written = connection.execute(
             f"""
             INSERT INTO metric_rollups (
@@ -3726,15 +3671,27 @@ class HistoryStore:
                 COALESCE(disk_identity_key, ''), MAX(logical_unit_id), MAX(sas_address)
             FROM (
                 SELECT
-                    metric_samples.*,
+                    keyed_samples.*,
                     ROW_NUMBER() OVER (
-                        PARTITION BY
-                            {bucket_expression}, system_id, enclosure_key, slot,
-                            metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY {cls._sample_order_instant("observed_at")} DESC, id DESC
+                        PARTITION BY {partition}
+                        ORDER BY order_day DESC, CASE WHEN order_all_exact THEN order_exact END DESC,
+                            observed_at DESC, id DESC
                     ) AS rollup_rank
-                FROM metric_samples
-                WHERE id IN ({expired_rows})
+                FROM (
+                    SELECT
+                        day_samples.*,
+                        MIN(order_exact IS NOT NULL) OVER (
+                            PARTITION BY {partition}, order_day
+                        ) AS order_all_exact
+                    FROM (
+                        SELECT
+                            metric_samples.*,
+                            julianday(observed_at) AS order_day,
+                            _history_utc_instant(CAST(observed_at AS BLOB)) AS order_exact
+                        FROM metric_samples
+                        WHERE id IN ({expired_rows})
+                    ) day_samples
+                ) keyed_samples
             ) selected_samples
             WHERE 1 = 1
               AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
@@ -3753,18 +3710,10 @@ class HistoryStore:
                 value_sum = metric_rollups.value_sum + excluded.value_sum,
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
-                last_value = CASE
-                    WHEN {cls._sample_order_instant("excluded.last_observed_at")}
-                        >= {cls._sample_order_instant("metric_rollups.last_observed_at")}
-                    THEN excluded.last_value
-                    ELSE metric_rollups.last_value
-                END,
-                last_observed_at = CASE
-                    WHEN {cls._sample_order_instant("excluded.last_observed_at")}
-                        >= {cls._sample_order_instant("metric_rollups.last_observed_at")}
-                    THEN excluded.last_observed_at
-                    ELSE metric_rollups.last_observed_at
-                END,
+                last_value = CASE WHEN {newer}
+                    THEN excluded.last_value ELSE metric_rollups.last_value END,
+                last_observed_at = CASE WHEN {newer}
+                    THEN excluded.last_observed_at ELSE metric_rollups.last_observed_at END,
                 device_name = COALESCE(excluded.device_name, metric_rollups.device_name),
                 serial = COALESCE(excluded.serial, metric_rollups.serial),
                 model = COALESCE(excluded.model, metric_rollups.model),
