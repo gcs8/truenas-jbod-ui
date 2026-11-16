@@ -443,7 +443,7 @@ journal. Restart the scheduler to apply a save:
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. With `trust_on_first_use`, a new host key is saved in the scheduler's own state folder and `known_hosts_path` is only read. Use SFTP for "SCP" |
 | `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted. Uploads check the remote size only; the target test and the backup's details say so until **Verify** downloads it and matches size and SHA-256 |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
-| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
+| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url`. When the store's checksum (ETag) matches the bytes sent, nothing is read back and the backup's details say "Checked by the provider's checksum at upload"; otherwise the upload is read back and hashed. Earlier versions recorded both cases the same way, so an S3 copy recorded as read back says "by the provider's checksum or by read-back". Each says so until **Verify** downloads it and matches size and SHA-256 |
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
 
@@ -474,7 +474,8 @@ Some copies are never deleted:
   Preserve one before an upgrade or migration and give a reason.
 - The newest copy of each class at each location that passed its last
   completed check is always kept. For an FTP copy that check can be the
-  upload's size check; its Verified column says so until **Verify** re-reads it.
+  upload's size check, and for an S3 copy the store's checksum; its Verified
+  column says so until **Verify** re-reads it.
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
 

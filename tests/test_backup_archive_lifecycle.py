@@ -489,7 +489,7 @@ class LifecycleApplyTests(CatalogCase):
         self.assertEqual([i.record.artifact_id for i in plan.items], [record.artifact_id])
         self.catalog.record_deletion("config-solo-0001", reason="manual", actor="op")
         result = manager.apply(plan, lambda _location: FakeTarget({record.name: record.size}))
-        self.assertIn("newest verified", str(result.error))
+        self.assertIn("newest copy of its class at this location that passed its last completed check", str(result.error))
         self.assertIsNotNone(self.catalog.get(record.artifact_id))
 
     def test_pin_during_delete_is_refused_and_object_state_stays_consistent(self) -> None:
@@ -541,7 +541,7 @@ class LifecycleApplyTests(CatalogCase):
 
     def test_claim_refuses_preserved_and_newest_verified(self) -> None:
         newest = self.local_records[0]
-        with self.assertRaisesRegex(CatalogError, "newest verified"):
+        with self.assertRaisesRegex(CatalogError, r"^Artifact is the newest copy of its class at this location that passed its last completed check \(the upload check or a later Verify\), so it is kept\.$"):
             self.catalog.claim_deletion(newest, actor="op")
         pinned = self.catalog.set_preserve(self.local_records[7].artifact_id, reason="hold", actor="admin")
         with self.assertRaisesRegex(CatalogError, "preserved"):

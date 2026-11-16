@@ -117,10 +117,11 @@ class StoredObject:
     sha256: str
     verified: bool
     # How ``verified`` was established at upload (#722): "readback" means the
-    # stored content was read back and hashed (or the provider confirmed the
-    # SHA-256); "size" means only the remote size was compared, and ``sha256``
-    # is the hash of the bytes sent. An explicit verify always downloads and
-    # checks size and SHA-256.
+    # stored content was read back and hashed; "provider_checksum" means the
+    # provider's own checksum (an S3 ETag) matched the bytes sent and nothing
+    # was read back (#1202); "size" means only the remote size was compared.
+    # In the last two ``sha256`` is the hash of the bytes sent. An explicit
+    # verify always downloads and checks size and SHA-256.
     upload_check: str = "readback"
 
 
@@ -349,6 +350,8 @@ class _TargetBase:
                     "; the remote size matched and SHA-256 was computed on the bytes sent"
                     " (the content was not read back)."
                 )
+            elif upload_check == "provider_checksum":
+                detail += "; the provider's checksum matched the bytes sent (the content was not read back)."
             else:
                 detail += " and readback matched."
             ok = True
@@ -1330,15 +1333,17 @@ class S3Target(_TargetBase):
                 Config=self._transfer_config,
             )
         try:
-            verified = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest(), multipart=multipart))
+            upload_check = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest(), multipart=multipart))
         except Exception:
             # Any readback failure (mismatch, timeout, reset) leaves an
             # uncatalogued object that grooming never sees, so remove it.
             self._delete_quietly(key)
             raise
-        return StoredObject(name=name, size=size, sha256=sha_hex, verified=verified)
+        return StoredObject(name=name, size=size, sha256=sha_hex, verified=True, upload_check=upload_check)
 
-    def _verify(self, key: str, size: int, sha_hex: str, expected_etag: str) -> bool:
+    def _verify(self, key: str, size: int, sha_hex: str, expected_etag: str) -> str:
+        """Check the stored object; return how: "provider_checksum" or "readback"."""
+
         head = self._client.head_object(Bucket=self._bucket, Key=key)
         remote_size = int(head.get("ContentLength", -1))
         _check_readback("S3", size, sha_hex, remote_size, None)
@@ -1347,7 +1352,8 @@ class S3Target(_TargetBase):
             raise ArchiveVerificationError("S3 archive stored SHA-256 metadata does not match the bytes sent.")
         etag = str(head.get("ETag") or "").strip('"')
         if etag and etag == expected_etag:
-            return True
+            # The provider's checksum matched; nothing was read back (#1202).
+            return "provider_checksum"
         # ETag is not the MD5 we computed (for example SSE-KMS): stream the
         # object back and hash it; this never buffers the whole object.
         body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
@@ -1358,7 +1364,7 @@ class S3Target(_TargetBase):
             if callable(close):
                 close()
         _check_readback("S3", size, sha_hex, back_size, back_sha)
-        return True
+        return "readback"
 
     def _delete_quietly(self, key: str) -> None:
         try:

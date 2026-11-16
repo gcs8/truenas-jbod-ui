@@ -283,6 +283,13 @@
     if (item.upload_check === "size") {
       return "Size only at upload; Verify re-reads and hashes it";
     }
+    // A checksum the storage provider reported is not a read-back by this app.
+    if (item.upload_check === "provider_checksum") {
+      return "Checked by the provider's checksum at upload; Verify re-reads and hashes it";
+    }
+    if (item.upload_check === "provider_checksum_or_readback") {
+      return "Checked at upload by the provider's checksum or by read-back; Verify re-reads and hashes it";
+    }
     if (item.location !== "local" && item.upload_check !== "readback") {
       return "Upload check not recorded; Verify re-reads and hashes it";
     }
@@ -1062,6 +1069,8 @@
             headers: { "Content-Type": "application/json" },
             body: "{}",
             timeoutMs: LONG_TIMEOUT_MS,
+            // A Verify that ran answers HTTP 200 with ok:false; show that result here.
+            acceptPartialResult: (result) => Boolean(result?.artifact && typeof result.artifact === "object"),
           });
           // The operation's own result: a copy the catalogue still counts as
           // verified was not read back when the Verify could not reach it.
@@ -1163,7 +1172,9 @@
           });
           const ms = Number(result.duration_ms);
           // #722: FTP compares only the remote size at upload; say so.
-          const sizeOnly = result.upload_check === "size" ? " Size checked only; Verify re-reads a backup." : "";
+          const sizeOnly = result.upload_check === "size"
+            ? " Size checked only; Verify re-reads a backup."
+            : result.upload_check === "provider_checksum" ? " Provider checksum checked only; Verify re-reads a backup." : "";
           state.targetResults.set(id, result.ok === false
             ? { ok: false, text: `Failed: ${scrubText(result.detail || "no detail")}` }
             : { ok: true, text: `Works${Number.isFinite(ms) ? ` (${ms} ms)` : ""}.${sizeOnly}` });
@@ -1350,6 +1361,8 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ plan_token: plan.token }),
             timeoutMs: LONG_TIMEOUT_MS,
+            // A clean-up that stopped answers HTTP 200 with ok:false and its result.
+            acceptPartialResult: (result) => Array.isArray(result?.deleted),
           });
           state.cleanupPlan = null;
           const count = (value) => (Array.isArray(value) ? value.length : 0);

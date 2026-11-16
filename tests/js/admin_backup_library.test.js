@@ -873,6 +873,111 @@ test("rows without upload-check provenance say so, the same way in both views (#
   assert.deepEqual(await listAndDetails({ verified: false, upload_check: "size", last_verify: null }), { column: "Not yet", fact: "Not yet" });
 });
 
+// A checksum the storage provider reports at upload is not this application
+// reading the copy back (#1202).
+const PROVIDER_CHECKSUM_TEXT = "Checked by the provider's checksum at upload; Verify re-reads and hashes it";
+const EITHER_TEXT = "Checked at upload by the provider's checksum or by read-back; Verify re-reads and hashes it";
+
+test("a provider-checksum copy says so in both views until its own Verify passes (#1202)", async () => {
+  const own = { at: "2026-09-21T10:05:00Z", ok: true };
+  for (const [uploadCheck, text] of [["provider_checksum", PROVIDER_CHECKSUM_TEXT], ["provider_checksum_or_readback", EITHER_TEXT]]) {
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: null }), { column: text, fact: text }, uploadCheck);
+    // A failed, unreachable or malformed Verify does not upgrade it.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: false } }), { column: text, fact: text }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: "true" } }), { column: text, fact: text }, uploadCheck);
+    // Its own passed Verify read it back.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: own }), { column: "Yes", fact: "Yes" }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, verified: false }), { column: "Not yet", fact: "Not yet" }, uploadCheck);
+  }
+  // Control: a copy this application read back at upload.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+});
+
+test("a provider-checksum target test does not read as a readback (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "s3 archive destination is writable; the provider's checksum matched the bytes sent (the content was not read back).", duration_ms: 42, provider: "s3", transport_encrypted: true, upload_check: "provider_checksum" }),
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.testTarget("legacy-ftp");
+  const row = elements.targets.querySelector('tr[data-target-id="legacy-ftp"]').textContent;
+  assert.match(row, /Works \(42 ms\)\. Provider checksum checked only; Verify re-reads a backup\./);
+});
+
+// The page's real shared transport over a synthetic fetch, so a body with
+// ok:false reaches the library exactly as the browser delivers it.
+function realTransportApi(replies) {
+  const base = fakeApi();
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    fetch: async (url, options = {}) => {
+      const key = `${String(options.method || "GET").toUpperCase()} ${url.split("?")[0]}`;
+      if (replies[key]) return jsonResponse(...replies[key](base.data));
+      return jsonResponse(200, await base.fetchJson(url, options));
+    },
+  });
+  return { ...base, fetchJson: transport.fetchJson };
+}
+
+test("a failed Verify shows its own result through the page's real transport (#1202)", async () => {
+  // Exactly what the scheduler and the admin route return (HTTP 200).
+  const artifact = (data, verified) => ({ ...data.artifacts[4], verified, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } });
+  const cases = [
+    ["unreachable", (data) => [200, { ok: false, artifact: artifact(data, true), detail: "ConnectionRefusedError" }],
+      ["Backup did not verify: ConnectionRefusedError", "error"], SIZE_ONLY_TEXT],
+    ["mismatch", (data) => [200, { ok: false, artifact: artifact(data, false), detail: "Readback does not match the catalogued size and SHA-256." }],
+      ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet"],
+  ];
+  for (const [name, reply, banner, column] of cases) {
+    const api = realTransportApi({
+      "POST /api/admin/backups/full-odd/verify": (data) => {
+        const [status, body] = reply(data);
+        Object.assign(data.artifacts[4], body.artifact);
+        return [status, body];
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, name);
+    assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+  }
+  // Controls: a passed Verify, and a refusal status, through the same transport.
+  const passed = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: true, artifact: data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." }],
+  });
+  let mounted = mount({ api: passed });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.deepEqual(mounted.banners.at(-1), ["Backup verified.", "success"]);
+  const missing = realTransportApi({ "POST /api/admin/backups/full-odd/verify": () => [404, { detail: "Artifact not found." }] });
+  mounted = mount({ api: missing });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.equal(mounted.banners.at(-1)[1], "error");
+  assert.match(mounted.banners.at(-1)[0], /^Verify failed: Artifact not found\./);
+});
+
+test("a clean-up refused by its guard shows the refusal through the page's real transport (#1202)", async () => {
+  const refusal = "CatalogError: Artifact is the newest copy of its class at this location that passed its last completed check (the upload check or a later Verify), so it is kept.";
+  const api = realTransportApi({
+    "POST /api/admin/backups/lifecycle/apply": () => [200, { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: refusal }, not_attempted: [] }],
+  });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), [`Clean up stopped after 0 of 1: ${refusal}`, "error"]);
+  assert.match(elements.dialog.textContent, /Clean up stopped after 0 of 1: CatalogError: Artifact is the newest copy/);
+  assert.doesNotMatch(banners.at(-1)[0], /verified copy|Request failed|may already be gone/);
+});
+
+test("a long unbroken value wraps inside the details dialog (#1202)", () => {
+  const rule = STYLES.match(/\.backup-policy-list dd \{[^}]*\}/)?.[0] || "";
+  assert.match(rule, /overflow-wrap:\s*anywhere/);
+});
+
 test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
   const { elements, library, api, banners, refreshes } = mount();
   await library.load();

@@ -1338,9 +1338,25 @@ class BackupScheduler:
             "app_version": meta.get("app_version"),
             # #1202: the list says what the details say. None for local copies
             # and copies catalogued before #722.
-            "upload_check": _upload_check(meta),
+            "upload_check": self._presented_upload_check(record, meta),
             "last_verify": _list_last_verify(record, meta),
         }
+
+    def _presented_upload_check(self, record: ArtifactRecord, meta: Mapping[str, Any]) -> str | None:
+        """How this copy was checked at upload, claiming no more than the record shows.
+
+        Earlier releases stored "readback" for an S3 upload whose ETag matched,
+        which read nothing back, and the stored record cannot tell that apart
+        from a real readback (#1202). Such a record, and one whose target is no
+        longer configured, is presented as either until its own Verify passes.
+        """
+
+        value = _upload_check(meta)
+        if value == "readback" and record.location != LOCAL_LOCATION:
+            target = self.policy.target(record.location)
+            if target is None or target.settings.provider == "s3":
+                return "provider_checksum_or_readback"
+        return value
 
     def detail(self, artifact_id: str) -> dict[str, Any]:
         record = self.get(artifact_id)
@@ -1560,7 +1576,7 @@ def _target_run(value: Any) -> dict[str, Any] | None:
 def _upload_check(meta: Mapping[str, Any]) -> str | None:
     value = meta.get("upload_check")
     # A malformed stored value is unknown for that copy; it must not break the list.
-    return value if isinstance(value, str) and value in {"readback", "size"} else None
+    return value if isinstance(value, str) and value in {"readback", "provider_checksum", "size"} else None
 
 
 def _own_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> Mapping[str, Any] | None:

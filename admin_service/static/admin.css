@@ -1900,6 +1900,7 @@ h3 {
 
 .backup-policy-list dd {
   margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .backup-table {

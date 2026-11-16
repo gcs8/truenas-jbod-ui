@@ -373,5 +373,297 @@ class VerifyResultIsBoundToItsCopyTests(backup_fixtures.SchedulerTestBase):
                 )
 
 
+S3_TARGET = {**backup_fixtures.TARGET, "target_id": "cloud", "label": "Cloud bucket", "provider": "s3",
+             "root": "archive", "bucket": "synthetic"}
+EITHER = "provider_checksum_or_readback"
+
+
+class ProviderChecksumIsNotAReadbackTests(backup_fixtures.SchedulerTestBase):
+    """A checksum the storage provider reports is not this application reading the copy back.
+
+    The real S3 target over the maintained in-memory client: a matching ETag
+    is checked without a download, an opaque one is downloaded and hashed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = archive_transport_fixtures.FakeS3Client()
+
+    def open_target(self, settings):
+        from types import SimpleNamespace
+
+        from history_service.backup_archive import transport
+
+        @contextlib.contextmanager
+        def opened():
+            if settings.provider != "s3":
+                yield LocalDirectoryTarget(self.remote_root / settings.target_id)
+                return
+            yield transport.S3Target(
+                self.client, "synthetic", "archive",
+                transfer_config=SimpleNamespace(
+                    multipart_threshold=transport.S3_MULTIPART_THRESHOLD,
+                    multipart_chunksize=transport.S3_MULTIPART_CHUNKSIZE,
+                ),
+                encrypted=True, connection_errors=(),
+            )
+
+        return opened()
+
+    def _config(self, *, with_s3: bool = True):
+        access, secret = self.root / "synthetic-access", self.root / "synthetic-secret"
+        for path in (access, secret):
+            path.write_text("synthetic-only")
+            path.chmod(0o600)
+        target = {**S3_TARGET, "access_key_id_file": str(access), "secret_access_key_file": str(secret)}
+        targets = [target, backup_fixtures.TARGET] if with_s3 else [backup_fixtures.TARGET]
+        return {"full": {"enabled": True}, "targets": targets}
+
+    def _views(self, scheduler, artifact_id):
+        """The copy as the scheduler, its HTTP list and its HTTP details present it."""
+
+        from history_service.backup_scheduler.api import build_app
+
+        app = build_app(scheduler)
+        status, body = backup_fixtures.asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        listed = next(item for item in json.loads(body)["artifacts"] if item["id"] == artifact_id)
+        status, body = backup_fixtures.asgi_call(app, "GET", f"/internal/backups/{artifact_id}")
+        self.assertEqual(status, 200)
+        library = next(item for item in scheduler.library()["artifacts"] if item["id"] == artifact_id)
+        return library, listed, json.loads(body)
+
+    def _assert_presented(self, scheduler, artifact_id, upload_check, *, passed):
+        for view in self._views(scheduler, artifact_id):
+            self.assertEqual(view["upload_check"], upload_check)
+            self.assertIs(view["verified"], True)  # the catalogue flag keeps its restore and retention meaning
+            if passed:
+                self.assertIs(view["last_verify"]["ok"], True)
+            else:
+                self.assertIsNone(view["last_verify"])
+
+    def _copies(self, scheduler):
+        return {r.location: r for r in scheduler.catalog.list()}
+
+    def test_a_matching_etag_is_recorded_as_a_provider_checksum_with_no_download(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        cloud = self._copies(scheduler)["cloud"]
+        self.assertEqual(self.client.get_calls, 0)  # nobody read this copy back
+        self.assertTrue(cloud.verified)
+        self.assertEqual(scheduler._metadata_snapshot(cloud.artifact_id)["upload_check"], "provider_checksum")
+        self._assert_presented(scheduler, cloud.artifact_id, "provider_checksum", passed=False)
+        # Its own Verify downloads and hashes it; only then does it count as read back.
+        self.assertTrue(scheduler.verify(cloud.artifact_id)["ok"])
+        self.assertEqual(self.client.get_calls, 1)
+        self._assert_presented(scheduler, cloud.artifact_id, "provider_checksum", passed=True)
+        # Control: the filesystem copy of the same run was read back at upload.
+        self._assert_presented(scheduler, self._copies(scheduler)["nas"].artifact_id, "readback", passed=False)
+
+    def test_an_opaque_etag_is_read_back_once_and_described_without_overclaiming(self) -> None:
+        self.client.etag_override = "kms-opaque"
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        cloud = self._copies(scheduler)["cloud"]
+        self.assertEqual(self.client.get_calls, 1)
+        self.assertEqual(scheduler._metadata_snapshot(cloud.artifact_id)["upload_check"], "readback")
+        # A stored S3 "readback" cannot be told apart from one an earlier
+        # release wrote for a matching ETag, so it is presented as either.
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+
+    def test_an_earlier_release_s3_readback_record_is_presented_as_either_until_verified(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        cloud = self._copies(scheduler)["cloud"]
+        with scheduler._state_lock:
+            # What earlier releases stored for a matching ETag.
+            scheduler._meta[cloud.artifact_id]["upload_check"] = "readback"
+            scheduler._save_meta()
+        scheduler.close()
+        state = (self._paths.state_dir / "artifact-meta.json", self._paths.state_dir / "catalog.sqlite3")
+        before = [path.read_bytes() for path in state]
+
+        scheduler = self.make(self._config())  # restart on the new code
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+        self.assertEqual(self.client.get_calls, 0)  # listing reads nothing back
+        self.assertEqual([path.read_bytes() for path in state], before)  # and rewrites nothing
+        # Control: a filesystem copy read back at upload keeps its readback.
+        self._assert_presented(scheduler, self._copies(scheduler)["nas"].artifact_id, "readback", passed=False)
+        self.assertTrue(scheduler.verify(cloud.artifact_id)["ok"])
+        self.assertEqual(self.client.get_calls, 1)
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=True)
+        scheduler.close()
+
+        # A copy whose target is no longer configured cannot be placed either.
+        scheduler = self.make(self._config(with_s3=False))
+        with scheduler._state_lock:
+            scheduler._meta[cloud.artifact_id].pop("last_verify")
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+
+    def test_the_target_test_does_not_call_a_provider_checksum_a_readback(self) -> None:
+        with self.open_target(SimpleSettings("s3")) as target:
+            result = target.test()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["upload_check"], "provider_checksum")
+        self.assertNotIn("readback matched", result["detail"])
+        self.assertIn("not read back", result["detail"])
+        self.assertEqual(self.client.get_calls, 0)
+        # Control: an opaque ETag is downloaded and hashed, a real readback.
+        self.client.etag_override = "kms-opaque"
+        with self.open_target(SimpleSettings("s3")) as target:
+            result = target.test()
+        self.assertEqual(result["upload_check"], "readback")
+        self.assertIn("readback matched", result["detail"])
+        self.assertEqual(self.client.get_calls, 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class SimpleSettings:
+    provider: str
+    target_id: str = "cloud"
+
+
+class CleanupRefusalWordingTests(backup_fixtures.SchedulerTestBase):
+    """The clean-up refusal says what its guard checks, not that a copy was read back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ftp = GatedFTP()
+        self.ftp.release.set()
+
+    def open_target(self, settings):
+        @contextlib.contextmanager
+        def opened():
+            yield FtpTarget(self.ftp, "/backups", encrypted=False)
+
+        return opened()
+
+    def test_a_size_only_copy_refused_in_a_race_is_not_called_verified(self) -> None:
+        from datetime import timedelta
+
+        from history_service.backup_scheduler.api import build_app
+
+        config = {"full": {"enabled": True, "remote_keep": 2}, "targets": [backup_fixtures.TARGET]}
+        scheduler = self.make(config)
+        scheduler.run_now("full")
+        self.now += timedelta(days=1)
+        scheduler.run_now("full")
+        older, newer = scheduler.catalog.list(location="nas")
+        scheduler.close()
+        scheduler = self.make({**config, "full": {"enabled": True, "remote_keep": 1}})
+        app = build_app(scheduler)
+
+        def call(method, path, body=None):
+            status, payload = backup_fixtures.asgi_call(app, method, path, body)
+            self.assertEqual(status, 200, payload)
+            return json.loads(payload)
+
+        plan = call("GET", "/internal/backups/lifecycle/plan")
+        self.assertEqual([item["id"] for item in plan["items"]], [older.artifact_id])
+        # The newer copy is damaged; its own Verify finds it and clears its flag,
+        # so the older size-only copy becomes the newest one the guard protects.
+        key = "/backups/" + newer.name
+        self.ftp.files[key] = b"X" * len(self.ftp.files[key])
+        self.assertIs(call("POST", f"/internal/backups/{newer.artifact_id}/verify", {})["ok"], False)
+        reads, files = self.ftp.retr_calls, dict(self.ftp.files)
+        # Through the admin route, which hands the page the scheduler's answer.
+        status, result = _admin_call(app, "/api/admin/backups/lifecycle/apply", None, {"plan_token": plan["plan_token"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(set(result), {"ok", "deleted", "already_missing", "failed", "not_attempted"})
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(result["failed"]["id"], older.artifact_id)
+        self.assertEqual(result["failed"]["error"], f"CatalogError: {GUARD_REFUSAL}")
+        self.assertNotIn("verified", result["failed"]["error"])
+        self.assertEqual((self.ftp.files, self.ftp.retr_calls), (files, reads))  # nothing deleted, nothing read
+        row = scheduler.serialize(scheduler.get(older.artifact_id))
+        self.assertEqual((row["upload_check"], row["last_verify"], row["verified"]), ("size", None, True))
+
+
+GUARD_REFUSAL = (
+    "Artifact is the newest copy of its class at this location that passed its last completed check "
+    "(the upload check or a later Verify), so it is kept."
+)
+
+
+def _admin_call(scheduler_app, route_path, artifact_id, body=None):
+    """Call the admin route with its scheduler client bridged to the real scheduler app."""
+
+    import asyncio
+    from unittest.mock import patch
+
+    from fastapi import HTTPException
+
+    import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
+    from admin_service.main import app as admin_app
+    from admin_service.services.backup_scheduler_client import SchedulerResponse
+
+    class Bridge:
+        def request(self, method, path, *, body=None, actor=None, **_options):
+            status, content = backup_fixtures.asgi_call(scheduler_app, method, path, body)
+            return SchedulerResponse(status, json.loads(content))
+
+    endpoint = next(route.endpoint for route in admin_app.routes if getattr(route, "path", "") == route_path)
+    args = (artifact_id,) if artifact_id is not None else (body,)
+    with patch("admin_service.routes.get_backup_scheduler_client", return_value=Bridge()):
+        try:
+            response = asyncio.run(endpoint(*args))
+        except HTTPException as exc:
+            return exc.status_code, {"detail": exc.detail}
+    return response.status_code, json.loads(response.body)
+
+
+class VerifyFailureResponseShapeTests(backup_fixtures.SchedulerTestBase):
+    """What a failed Verify really returns: the page is tested against exactly this."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ftp = GatedFTP()
+        self.ftp.release.set()
+
+    def open_target(self, settings):
+        @contextlib.contextmanager
+        def opened():
+            if settings.target_id in self.broken_targets:
+                raise ConnectionRefusedError("connection refused by nas.example.test")
+            yield FtpTarget(self.ftp, "/backups", encrypted=False)
+
+        return opened()
+
+    def test_unreachable_and_mismatch_are_http_200_with_the_operation_result(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        scheduler.run_now("full")
+        remote = scheduler.catalog.list(location="nas")[0]
+        app = build_app(scheduler)
+        path = f"/internal/backups/{remote.artifact_id}/verify"
+        cases = (
+            ("unreachable", "ConnectionRefusedError", True),
+            ("mismatch", "Readback does not match the catalogued size and SHA-256.", False),
+        )
+        for case, detail, flag in cases:
+            with self.subTest(case=case):
+                if case == "unreachable":
+                    self.broken_targets = {"nas"}
+                else:
+                    self.broken_targets = set()
+                    key = "/backups/" + remote.name
+                    self.ftp.files[key] = b"X" * len(self.ftp.files[key])
+                status, body = backup_fixtures.asgi_call(app, "POST", path, {})
+                payload = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(set(payload), {"ok", "artifact", "detail"})
+                self.assertIs(payload["ok"], False)
+                self.assertEqual(payload["detail"], detail)
+                self.assertIs(payload["artifact"]["verified"], flag)
+                self.assertNotIn("nas.example.test", body.decode())
+                admin_status, admin_payload = _admin_call(app, "/api/admin/backups/{artifact_id}/verify", remote.artifact_id)
+                self.assertEqual(admin_status, 200)
+                self.assertEqual(set(admin_payload), {"ok", "artifact", "detail"})
+                self.assertIs(admin_payload["ok"], False)
+                self.assertEqual(admin_payload["detail"], detail)
+
+
 if __name__ == "__main__":
     unittest.main()
