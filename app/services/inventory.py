@@ -509,10 +509,13 @@ STABLE_SMART_DETAIL_FIELDS = (
 # smartctl exit metadata describes the read, not a SMART measurement, so it
 # must not make a summary count as available (#1171).
 SMART_SUMMARY_READ_METADATA_FIELDS = frozenset({"smartctl_exit_status", "smartctl_status_flags"})
+# Names of fields a source reported but could not read: evidence about the
+# read, never a reading, so it neither makes a summary available nor persists.
+SMART_SUMMARY_UNREAD_FIELD = "unread_fields"
 SMART_SUMMARY_VALUE_FIELDS = tuple(
     field_name
     for field_name in SmartSummaryView.model_fields
-    if field_name not in {"available", "message", *SMART_SUMMARY_READ_METADATA_FIELDS}
+    if field_name not in {"available", "message", SMART_SUMMARY_UNREAD_FIELD, *SMART_SUMMARY_READ_METADATA_FIELDS}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
@@ -17808,7 +17811,15 @@ class InventoryService:
         summary.available = summary.available or any(
             getattr(summary, field_name) is not None for field_name in SMART_SUMMARY_VALUE_FIELDS
         )
+        InventoryService._prune_unread_smart_fields(summary)
         return summary
+
+    @staticmethod
+    def _prune_unread_smart_fields(summary: SmartSummaryView) -> None:
+        """Keep only "not read" names whose field still has no reading."""
+        summary.unread_fields = sorted(
+            {name for name in summary.unread_fields if getattr(summary, name, None) is None}
+        )
 
     @staticmethod
     def _normalize_smart_transport_value(value: str | None) -> str | None:
@@ -17972,6 +17983,10 @@ class InventoryService:
         for field_name in (*SMART_SUMMARY_VALUE_FIELDS, *SMART_SUMMARY_READ_METADATA_FIELDS):
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
+        # A field either source could not read stays "not read" until one of
+        # them supplies a reading for it.
+        primary.unread_fields = [*primary.unread_fields, *supplement.unread_fields]
+        InventoryService._prune_unread_smart_fields(primary)
 
         primary.available = primary.available or supplement.available
         if not primary.message and supplement.message:

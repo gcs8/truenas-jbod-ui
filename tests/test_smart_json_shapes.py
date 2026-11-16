@@ -10,7 +10,7 @@ import json
 import unittest
 from decimal import Decimal
 
-from app.models.domain import SlotView
+from app.models.domain import SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
 from app.services.parsers import (
     parse_nvme_id_ctrl_summary,
@@ -426,6 +426,398 @@ class NvmeReaderShapeTests(unittest.TestCase):
                     self.assertEqual(summary.firmware_version, "FW01")
                 else:
                     self.assertFalse(summary.available)
+
+
+ATA_STATISTIC_FIELDS = {
+    "Lifetime Power-On Resets": "power_on_resets",
+    "Number of Read Commands": "read_commands",
+    "Number of Write Commands": "write_commands",
+    "Number of Hardware Resets": "hardware_resets",
+    "Number of Interface CRC Errors": "interface_crc_errors",
+    "Percentage Used Endurance Indicator": "endurance_used_percent",
+    "Logical Sectors Read": "bytes_read",
+    "Logical Sectors Written": "bytes_written",
+}
+ATA_ATTRIBUTE_FIELDS = {
+    12: "power_cycle_count",
+    199: "interface_crc_errors",
+    232: "available_spare_percent",
+    169: "available_spare_percent",
+    241: "bytes_written",
+    242: "bytes_read",
+}
+# A sector-valued attribute or statistic becomes bytes with the 512-byte default.
+SECTOR_FIELDS = {"bytes_read", "bytes_written"}
+
+
+def _statistic(name: str, value: object) -> dict:
+    return {"ata_device_statistics": {"pages": [{"table": [{"name": name, "value": value}]}]}}
+
+
+def _attribute(attribute_id: int, raw: object, **row: object) -> dict:
+    return {"ata_smart_attributes": {"table": [{"id": attribute_id, "raw": raw, **row}]}}
+
+
+class AtaNumericAdmissionTests(unittest.TestCase):
+    """ATA statistic and attribute values are read only in their documented form."""
+
+    def _read(self, extra: dict):
+        return _summary({"temperature": {"current": 30}, **extra})
+
+    def test_statistic_value_needs_an_exact_count(self) -> None:
+        for name, field in ATA_STATISTIC_FIELDS.items():
+            for bad in ("bad0", "bad42", "42", 2.0, -1, True, [], {}, None):
+                with self.subTest(statistic=name, value=bad):
+                    summary = self._read(_statistic(name, bad))
+                    self.assertEqual(summary.temperature_c, 30)
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_statistic_value_controls(self) -> None:
+        for name, field in ATA_STATISTIC_FIELDS.items():
+            scale = 512 if field in SECTOR_FIELDS else 1
+            for good in (0, 42):
+                with self.subTest(statistic=name, value=good):
+                    summary = self._read(_statistic(name, good))
+                    self.assertEqual(getattr(summary, field), good * scale)
+                    self.assertEqual(summary.unread_fields, [])
+            with self.subTest(statistic=name, value="not valid"):
+                # smartctl leaves out the value of a statistic the drive marks invalid.
+                summary = self._read({"ata_device_statistics": {"pages": [{"table": [{"name": name}]}]}})
+                self.assertIsNone(getattr(summary, field))
+                self.assertEqual(summary.unread_fields, [])
+
+    def test_attribute_raw_value_needs_its_documented_form(self) -> None:
+        bad_raws = (
+            {"value": "bad42"}, {"value": "bad0"}, {"value": "42"}, {"value": 2.0}, {"value": -1},
+            {"value": True}, {"value": None}, {"value": [42]}, {"value": "bad", "string": "42"},
+            {"string": "bad42"}, {"string": "4 2"}, {"string": "-4"}, {"string": "²"}, {"string": "9" * 5000},
+            {}, "bad42", "-4", 2.0, True, [], None,
+        )
+        for attribute_id, field in ATA_ATTRIBUTE_FIELDS.items():
+            for raw in bad_raws:
+                with self.subTest(attribute=attribute_id, raw=str(raw)[:30]):
+                    summary = self._read(_attribute(attribute_id, raw))
+                    self.assertEqual(summary.temperature_c, 30)
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+            with self.subTest(attribute=attribute_id, raw="missing"):
+                summary = self._read({"ata_smart_attributes": {"table": [{"id": attribute_id}]}})
+                self.assertIsNone(getattr(summary, field))
+                self.assertIn(field, summary.unread_fields)
+
+    def test_attribute_raw_value_controls(self) -> None:
+        good_raws = (
+            ({"value": 0}, 0), ({"value": 42}, 42), ({"value": 42, "string": "42"}, 42),
+            ({"string": "42"}, 42), ({"string": "42 (Min/Max 20/45)"}, 42), (42, 42), ("42", 42),
+        )
+        for attribute_id, field in ATA_ATTRIBUTE_FIELDS.items():
+            scale = 512 if field in SECTOR_FIELDS else 1
+            for raw, expected in good_raws:
+                with self.subTest(attribute=attribute_id, raw=raw):
+                    summary = self._read(_attribute(attribute_id, raw))
+                    self.assertEqual(getattr(summary, field), expected * scale)
+                    self.assertEqual(summary.unread_fields, [])
+
+    def test_malformed_attribute_row_leaves_attribute_fields_unread(self) -> None:
+        # An attribute row whose id cannot be read may be any attribute, so
+        # an attribute this payload does not otherwise report is not read,
+        # while a valid sibling attribute is still published.
+        summary = self._read({"ata_smart_attributes": {"table": [
+            {"id": [], "raw": {"value": 2}},
+            {"id": 12, "raw": {"value": 3}},
+        ]}})
+        self.assertEqual(summary.power_cycle_count, 3)
+        self.assertIsNone(summary.interface_crc_errors)
+        self.assertIn("interface_crc_errors", summary.unread_fields)
+        self.assertNotIn("power_cycle_count", summary.unread_fields)
+
+
+class SmartNumericTokenTests(unittest.TestCase):
+    """Numbers inside names and keys are bounded and checked before conversion."""
+
+    def test_oversized_unit_multiplier_in_attribute_name_is_unread(self) -> None:
+        for attribute_id, field in ((241, "bytes_written"), (242, "bytes_read")):
+            for name in ("Host_Writes_" + "9" * 5000 + "MiB", "Host_Writes_" + "9" * 7 + "MiB",
+                         "Host_Writes_²MiB", "Host_Writes_٣٢MiB", "Host_Writes_0MiB", "Host_Writes_032MiB"):
+                with self.subTest(attribute=attribute_id, name=name[:24]):
+                    summary = _summary({"temperature": {"current": 30}, **_attribute(attribute_id, {"value": 2}, name=name)})
+                    self.assertEqual(summary.temperature_c, 30)
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_malformed_self_test_key_makes_the_latest_test_unread(self) -> None:
+        valid = {"code": {"string": "Background short"}, "result": {"string": "Completed"}, "power_on_time": {"hours": 4}}
+        for key in ("scsi_self_test_" + "9" * 5000, "scsi_self_test_²", "scsi_self_test_٣",
+                    "scsi_self_test_-1", "scsi_self_test_01", "scsi_self_test_", "scsi_self_test_1x"):
+            with self.subTest(key=key[:24]):
+                summary = _summary({"temperature": {"current": 30}, "scsi_self_test_0": valid, key: valid})
+                self.assertEqual(summary.temperature_c, 30)
+                # The malformed entry cannot be ordered, so no entry is the latest.
+                for field in ("last_test_type", "last_test_status", "last_test_lifetime_hours"):
+                    self.assertIsNone(getattr(summary, field), field)
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_self_test_order_control(self) -> None:
+        older = {"code": {"string": "Background long"}, "result": {"string": "Completed"}, "power_on_time": {"hours": 2}}
+        newer = {"code": {"string": "Background short"}, "result": {"string": "Completed"}, "power_on_time": {"hours": 4}}
+        summary = _summary({"power_on_time": {"hours": 10}, "scsi_self_test_1": older, "scsi_self_test_0": newer})
+        self.assertEqual((summary.last_test_type, summary.last_test_lifetime_hours, summary.last_test_age_hours),
+                         ("Background short", 4, 6))
+        self.assertEqual(summary.unread_fields, [])
+
+
+class AttributeUnitNameTests(unittest.TestCase):
+    """A reported attribute name that cannot be read gives no byte total."""
+
+    def _read(self, attribute_id: int, **row: object):
+        return _summary({"temperature": {"current": 30}, **_attribute(attribute_id, {"value": 2}, **row)})
+
+    def test_malformed_name_is_not_read_as_sectors(self) -> None:
+        for attribute_id, field in ((241, "bytes_written"), (242, "bytes_read")):
+            for name in (True, False, [], {}, None, 5, "", "  ", "Host_Writes_32MB", "Host_Writes_32mib"):
+                with self.subTest(attribute=attribute_id, name=name):
+                    summary = self._read(attribute_id, name=name)
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_name_controls(self) -> None:
+        for attribute_id, field in ((241, "bytes_written"), (242, "bytes_read")):
+            for row, expected in (
+                ({}, 1024),  # no name reported: the long-standing sector reading
+                ({"name": "Total_LBAs_Written"}, 1024),
+                ({"name": "Host_Writes_32MiB"}, 2 * 32 * 1024**2),
+                ({"name": "Lifetime_Writes_GiB"}, 2 * 1024**3),
+                ({"name": "Host_Writes_1KiB"}, 2 * 1024),
+            ):
+                with self.subTest(attribute=attribute_id, row=row):
+                    summary = self._read(attribute_id, **row)
+                    self.assertEqual(getattr(summary, field), expected)
+                    self.assertEqual(summary.unread_fields, [])
+
+
+class ByteCounterCapTests(unittest.TestCase):
+    """The 2**64-byte cap is exclusive for every byte-total producer, not only SCSI."""
+
+    def test_exact_cap_is_not_read_and_one_unit_below_is(self) -> None:
+        cases = (
+            ("sector statistic", lambda count: _statistic("Logical Sectors Written", count), 512, 2**55),
+            ("sector attribute", lambda count: _attribute(241, {"value": count}), 512, 2**55),
+            ("unit attribute", lambda count: _attribute(241, {"value": count}, name="Host_Writes_32MiB"),
+             32 * 1024**2, 2**39),
+            ("4096-byte sectors", lambda count: {"logical_block_size": 4096,
+                                                 **_statistic("Logical Sectors Written", count)}, 4096, 2**52),
+        )
+        for label, build, unit, count_at_cap in cases:
+            self.assertEqual(count_at_cap * unit, 2**64)
+            with self.subTest(source=label, at="cap"):
+                summary = _summary({"temperature": {"current": 30}, **build(count_at_cap)})
+                self.assertIsNone(summary.bytes_written)
+                self.assertIn("bytes_written", summary.unread_fields)
+            with self.subTest(source=label, at="below"):
+                summary = _summary({"temperature": {"current": 30}, **build(count_at_cap - 1)})
+                self.assertEqual(summary.bytes_written, (count_at_cap - 1) * unit)
+                self.assertEqual(summary.unread_fields, [])
+
+
+class NvmeRotationTests(unittest.TestCase):
+    def test_rejected_rotation_rate_is_not_inferred_for_nvme(self) -> None:
+        for bad in (True, False, None, "0", [], {}, 1.5, -1):
+            with self.subTest(value=bad):
+                summary = _summary({"device": {"protocol": "NVMe"}, "temperature": {"current": 30}, "rotation_rate": bad})
+                self.assertIsNone(summary.rotation_rate_rpm)
+                self.assertIn("rotation_rate_rpm", summary.unread_fields)
+
+    def test_rotation_controls(self) -> None:
+        for payload, expected in (
+            ({"device": {"protocol": "NVMe"}}, 0),  # absent: the NVMe inference stays
+            ({"device": {"protocol": "NVMe"}, "rotation_rate": 0}, 0),
+            ({"device": {"protocol": "SCSI"}, "rotation_rate": 7200}, 7200),
+            ({"device": {"protocol": "SCSI"}}, None),
+        ):
+            with self.subTest(payload=payload):
+                summary = _summary(payload)
+                self.assertEqual(summary.rotation_rate_rpm, expected)
+                self.assertEqual(summary.unread_fields, [])
+
+
+# One malformed source per field parse_smartctl_summary publishes. Each payload
+# also carries a valid sibling reading so the summary stays available.
+_SELF_TEST = {"code": {"string": "Background short"}, "result": {"string": "Completed"}}
+SMARTCTL_UNREAD_CASES = {
+    "temperature_c": (
+        {"temperature": {"current": "30"}}, {"temperature": 30},
+        {"scsi_environmental_reports": {"temperature_1": {"current": "30"}}},
+        # A rejected primary reading is not replaced by the environmental one.
+        {"temperature": {"current": True}, "scsi_environmental_reports": {"temperature_1": {"current": 30}}},
+    ),
+    "warning_temperature_c": (
+        {"nvme_composite_temperature_threshold": {"warning": "70"}},
+        {"nvme_composite_temperature_threshold": {"warning": True}, "temperature": {"op_limit_max": 70}},
+        {"temperature": {"op_limit_max": 70.5}},
+    ),
+    "critical_temperature_c": (
+        {"nvme_composite_temperature_threshold": {"critical": "80"}},
+        {"temperature": {"drive_trip": "x"}}, {"nvme_composite_temperature_threshold": 80},
+    ),
+    "smart_health_status": ({"smart_status": {"passed": "yes"}}, {"smart_status": True}),
+    "power_cycle_count": (_attribute(12, {"value": "x"}),),
+    "power_on_resets": (_statistic("Lifetime Power-On Resets", "x"),),
+    "power_on_hours": ({"power_on_time": {"hours": True}}, {"power_on_time": 5}),
+    "power_on_days": ({"power_on_time": {"hours": "48"}},),
+    "last_test_type": ({"scsi_self_test_0": {**_SELF_TEST, "code": {"string": 5}}},
+                       {"ata_smart_self_test_log": {"standard": {"table": [{"type": 5, "status": "Completed"}]}}},
+                       {"ata_smart_self_test_log": {"standard": {"table": "x"}}}),
+    "last_test_status": ({"scsi_self_test_0": {**_SELF_TEST, "result": []}},),
+    "last_test_lifetime_hours": ({"scsi_self_test_0": {**_SELF_TEST, "power_on_time": {"hours": "4"}}},
+                                 {"ata_smart_self_test_log": {"standard": {"table": [{"lifetime_hours": -4}]}}}),
+    "last_test_age_hours": ({"power_on_time": {"hours": "x"},
+                             "scsi_self_test_0": {**_SELF_TEST, "power_on_time": {"hours": 4}}},),
+    "logical_block_size": ({"logical_block_size": "4096"},),
+    "physical_block_size": ({"physical_block_size": 0}, {"physical_block_size": -512}),
+    "available_spare_percent": ({"nvme_smart_health_information_log": {"available_spare": "x"}},
+                                _attribute(232, {"value": "x"})),
+    "available_spare_threshold_percent": ({"nvme_smart_health_information_log": {"available_spare_threshold": -1}},),
+    "endurance_used_percent": ({"nvme_smart_health_information_log": {"percentage_used": "3"}},),
+    "endurance_remaining_percent": ({"nvme_smart_health_information_log": {"percentage_used": "3"}},),
+    "bytes_read": ({"nvme_smart_health_information_log": {"data_units_read": "x"}},
+                   {"scsi_error_counter_log": {"read": {"gigabytes_processed": "x"}}},
+                   {"scsi_error_counter_log": {"read": 5}}, {"scsi_error_counter_log": 5},
+                   {"logical_block_size": True, **_statistic("Logical Sectors Read", 2)}),
+    "bytes_written": ({"nvme_smart_health_information_log": {"data_units_written": 1.5}},
+                      # A rejected first source stops the chain: no lower source stands in.
+                      {"nvme_smart_health_information_log": {"data_units_written": "x"},
+                       **_statistic("Logical Sectors Written", 2)}),
+    "annualized_bytes_read": ({"power_on_time": {"hours": 1000},
+                               "nvme_smart_health_information_log": {"data_units_read": "x"}},),
+    "annualized_bytes_written": ({"power_on_time": {"hours": "x"},
+                                  "nvme_smart_health_information_log": {"data_units_written": 5}},),
+    "estimated_lifetime_bytes_written": ({"nvme_smart_health_information_log": {
+        "data_units_written": 5, "percentage_used": "x"}},),
+    "estimated_remaining_bytes_written": ({"nvme_smart_health_information_log": {
+        "data_units_written": "x", "percentage_used": 3}},),
+    "read_commands": (_statistic("Number of Read Commands", "x"),),
+    "write_commands": (_statistic("Number of Write Commands", "x"),),
+    "hardware_resets": (_statistic("Number of Hardware Resets", "x"),),
+    "interface_crc_errors": (_statistic("Number of Interface CRC Errors", "x"), _attribute(199, {"value": "x"}),
+                             {"ata_device_statistics": {"pages": "x"}}, {"ata_smart_attributes": {"table": {}}},
+                             # A statistic row whose name cannot be read may be this statistic.
+                             {"ata_device_statistics": {"pages": [{"table": [{"name": 5, "value": 1}]}]}},
+                             {"ata_device_statistics": {"pages": [{"table": "x"}]}}),
+    "media_errors": ({"nvme_smart_health_information_log": {"media_errors": "x"}},),
+    "unsafe_shutdowns": ({"nvme_smart_health_information_log": {"unsafe_shutdowns": "x"}},),
+    "rotation_rate_rpm": ({"rotation_rate": "7200"},),
+    "form_factor": ({"form_factor": {"name": 5}}, {"form_factor": "2.5 inches"}),
+    "firmware_version": ({"firmware_version": 5},),
+    "protocol_version": ({"nvme_version": {"string": 5}}, {"nvme_version": 5, "sata_version": {"string": "SATA 3.3"}}),
+    "namespace_eui64": ({"nvme_namespaces": [{"eui64": {"oui": "x", "ext_id": 1}}]},
+                        {"nvme_namespaces": [{"eui64": {"oui": 2**24, "ext_id": 1}}]},
+                        {"nvme_namespaces": [{"eui64": {"oui": 1, "ext_id": 2**40}}]},
+                        {"nvme_namespaces": [5]}, {"nvme_namespaces": {}}),
+    "read_cache_enabled": ({"read_lookahead": {"enabled": "yes"}}, {"read_lookahead": True}),
+    "writeback_cache_enabled": ({"write_cache": {"enabled": 1}},),
+    "transport_protocol": ({"device": {"protocol": 5}}, {"scsi_transport_protocol": {"name": 5}}),
+    "logical_unit_id": ({"logical_unit_id": 5}, {"logical_unit_id": "not hex"}),
+    "sas_address": ({"scsi_sas_port_0": {"phy_0": {"sas_address": 5}}},),
+    "attached_sas_address": ({"scsi_sas_port_0": {"phy_0": {"sas_address": "0x5000c500aa", "attached_sas_address": 5}}},),
+    "negotiated_link_rate": ({"interface_speed": {"current": {"string": 5}}},
+                             {"scsi_sas_port_0": {"phy_0": {"negotiated_logical_link_rate": []}}}),
+}
+# Published by parse_smartctl_summary but not a scalar reading from one key.
+SMARTCTL_FIELDS_WITHOUT_UNREAD_CASE = {
+    "available", "message", "unread_fields",
+    "namespace_nguid",  # always None in smartctl JSON; id-ns reads it
+    "sas_ports", "sata_phy_events",  # collections with their own per-row admission
+}
+
+
+class UnreadFieldTests(unittest.TestCase):
+    """A rejected SMART field is "not read": neither absent nor zero."""
+
+    def test_every_published_field_has_an_unread_case(self) -> None:
+        published = set(parse_smartctl_summary(json.dumps({"temperature": {"current": 30}})))
+        self.assertEqual(published - SMARTCTL_FIELDS_WITHOUT_UNREAD_CASE, set(SMARTCTL_UNREAD_CASES))
+
+    def test_rejected_source_is_listed_as_unread(self) -> None:
+        for field, payloads in SMARTCTL_UNREAD_CASES.items():
+            for extra in payloads:
+                with self.subTest(field=field, payload=json.dumps(extra)[:60]):
+                    sibling = {"firmware_version": "FW01"} if field != "firmware_version" else {"rotation_rate": 0}
+                    summary = _summary({**sibling, **extra})
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+                    self.assertEqual(summary.unread_fields, sorted(set(summary.unread_fields)))
+
+    def test_absent_and_valid_sources_are_not_unread(self) -> None:
+        for payload in ({}, {"temperature": {"current": 30}}, {"temperature": {}, "power_on_time": {}},
+                        {"power_on_time": {"hours": 0}, "temperature": {"current": 0}}):
+            with self.subTest(payload=payload):
+                self.assertEqual(_summary(payload).unread_fields, [])
+
+    def test_unread_only_payload_is_not_reported_as_no_fields(self) -> None:
+        empty = _summary({})
+        unread = _summary({"power_on_time": {"hours": True}})
+        self.assertFalse(unread.available)
+        self.assertEqual(unread.unread_fields, ["power_on_days", "power_on_hours"])
+        self.assertEqual(empty.unread_fields, [])
+        self.assertEqual(empty.message, "No SMART summary fields were returned for this disk.")
+        self.assertEqual(unread.message, "SMART summary fields were returned for this disk but could not be read.")
+
+    def test_nvme_readers_list_unread_fields(self) -> None:
+        cases = (
+            (parse_nvme_smart_log_summary, {"temperature": "303"}, ("temperature_c",)),
+            (parse_nvme_smart_log_summary, {"power_on_hours": True}, ("power_on_days", "power_on_hours")),
+            (parse_nvme_smart_log_summary, {"avail_spare": "x"}, ("available_spare_percent",)),
+            (parse_nvme_smart_log_summary, {"spare_thresh": "x"}, ("available_spare_threshold_percent",)),
+            (parse_nvme_smart_log_summary, {"percent_used": "x"},
+             ("endurance_remaining_percent", "endurance_used_percent")),
+            (parse_nvme_smart_log_summary, {"data_units_read": "x", "power_on_hours": 1000},
+             ("annualized_bytes_read", "bytes_read")),
+            (parse_nvme_smart_log_summary, {"media_errors": "x"}, ("media_errors",)),
+            (parse_nvme_smart_log_summary, {"unsafe_shutdowns": "x"}, ("unsafe_shutdowns",)),
+            (parse_nvme_id_ctrl_summary, {"fr": 5}, ("firmware_version",)),
+            (parse_nvme_id_ctrl_summary, {"ver": "1.3"}, ("protocol_version",)),
+            (parse_nvme_id_ctrl_summary, {"wctemp": 70000}, ("warning_temperature_c",)),
+            (parse_nvme_id_ctrl_summary, {"cctemp": True}, ("critical_temperature_c",)),
+            (parse_nvme_id_ns_summary, {"eui64": []}, ("namespace_eui64",)),
+            (parse_nvme_id_ns_summary, {"nguid": {}}, ("namespace_nguid",)),
+        )
+        for reader, payload, fields in cases:
+            with self.subTest(reader=reader.__name__, payload=payload):
+                result = reader(json.dumps(payload))
+                self.assertEqual(result["unread_fields"], sorted(fields))
+        for reader in (parse_nvme_smart_log_summary, parse_nvme_id_ctrl_summary, parse_nvme_id_ns_summary):
+            with self.subTest(reader=reader.__name__, payload="absent"):
+                self.assertEqual(reader("{}")["unread_fields"], [])
+        # 0 K is the documented "no threshold reported" value, not a rejected one.
+        self.assertEqual(parse_nvme_id_ctrl_summary('{"wctemp": 0}')["unread_fields"], [])
+
+    def test_merges_keep_unread_until_another_source_reads_the_field(self) -> None:
+        unread = _summary({"temperature": {"current": True}, "power_on_time": {"hours": True}, "firmware_version": "FW01"})
+        self.assertEqual(unread.unread_fields, ["power_on_days", "power_on_hours", "temperature_c"])
+        supplement = _summary({"power_on_time": {"hours": 48}})
+        merged = InventoryService._merge_missing_smart_fields(unread.model_copy(deep=True), supplement)
+        self.assertEqual((merged.power_on_hours, merged.power_on_days), (48, 2))
+        self.assertEqual(merged.unread_fields, ["temperature_c"])
+        # Unread evidence from a supplement survives a primary that did not read the field.
+        merged = InventoryService._merge_missing_smart_fields(_summary({"firmware_version": "FW01"}), unread)
+        self.assertEqual(merged.unread_fields, ["power_on_days", "power_on_hours", "temperature_c"])
+        # The inventory's own temperature fills the field, so it is no longer unread.
+        slot = _slot()
+        slot.temperature_c = 31
+        merged = InventoryService._merge_smart_summary(slot, unread.model_copy(deep=True))
+        self.assertEqual(merged.temperature_c, 31)
+        self.assertEqual(merged.unread_fields, ["power_on_days", "power_on_hours"])
+
+    def test_unread_list_is_not_a_reading_and_is_not_persisted(self) -> None:
+        from app.services import inventory as inventory_module
+
+        self.assertNotIn("unread_fields", inventory_module.SMART_SUMMARY_VALUE_FIELDS)
+        self.assertNotIn("unread_fields", inventory_module.STABLE_SMART_DETAIL_FIELDS)
+        merged = InventoryService._merge_smart_summary(_slot(), _summary({"power_on_time": {"hours": True}}))
+        self.assertFalse(merged.available)
+        self.assertEqual(merged.unread_fields, ["power_on_days", "power_on_hours"])
+        self.assertEqual(SmartSummaryView().unread_fields, [])
 
 
 if __name__ == "__main__":
