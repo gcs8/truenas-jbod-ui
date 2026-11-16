@@ -1698,6 +1698,13 @@ MPRUTIL_UNIT_COMMAND_PATTERN = re.compile(
     r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$"
 )
 
+# The unnumbered form reads the one controller of a host that has no unit
+# numbers. Its failure record names that controller by its fixed name, "mpr",
+# so the fabric view still counts the controller as attempted and unread.
+MPRUTIL_UNNUMBERED_READ_PATTERN = re.compile(
+    r"mprutil show (?:adapter|all|devices|enclosures|expanders|iocfacts)"
+)
+
 MPRUTIL_SUBCOMMAND_LABELS: dict[str, str] = {
     "adapter": "controller adapter detail",
     "devices": "MPR device rows",
@@ -5438,6 +5445,8 @@ class InventoryService:
 
         for prefix, context in SSH_FAILURE_CONTEXTS_BY_PREFIX:
             if canonical_command.startswith(prefix):
+                if MPRUTIL_UNNUMBERED_READ_PATTERN.fullmatch(canonical_command):
+                    return {**context, "controller": "mpr"}
                 return dict(context)
 
         return dict(DEFAULT_SSH_FAILURE_CONTEXT)

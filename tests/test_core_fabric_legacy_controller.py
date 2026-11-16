@@ -13,6 +13,7 @@ from pathlib import Path
 
 from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, MultipathMember, MultipathView, SlotState, SlotView
+from app.services.inventory import InventoryService
 from app.services.sas_fabric import build_sas_fabric_snapshot
 from app.services.sas_fabric_parsers import (
     build_core_mprutil_unit_commands,
@@ -20,6 +21,7 @@ from app.services.sas_fabric_parsers import (
     parse_mpr_enclosures,
     parse_mpr_expanders,
 )
+from app.services.ssh_probe import SSHCommandResult
 
 NO_CORE_DATA_WARNING = "No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions."
 UNREADABLE_MPRUTIL_WARNING = (
@@ -73,6 +75,14 @@ def _inventory_slot() -> SlotView:
         vdev_name="mirror-0",
         raw_status={"device_names": ["da0"]},
     )
+
+
+def _failure_records(*commands: str) -> list[dict]:
+    """The records the inventory hands the builder for failed commands (it names no command)."""
+    results = [SSHCommandResult(command=command, ok=False, exit_code=1) for command in commands]
+    records = InventoryService._ssh_failure_details(results)
+    assert not any("command" in key for record in records for key in record), records
+    return records
 
 
 def _core_fabric(
@@ -365,11 +375,11 @@ class CoreFabricLegacyControllerTests(unittest.TestCase):
                 self.assertEqual(fabric.warnings, [NO_CORE_DATA_WARNING])
 
     def test_readable_and_unreadable_units_make_the_view_partial(self) -> None:
-        failure = {"command": "sudo -n /usr/sbin/mprutil -u 1 show adapter", "canonical_command": "mprutil -u 1 show adapter"}
+        failures = _failure_records("sudo -n /usr/sbin/mprutil -u 1 show adapter")
         cases = {
             "unreadable text": ({"mprutil -u 1 show adapter": "unrecognized synthetic text\n"}, None, "unreadable"),
             "no output": ({"mprutil -u 1 show adapter": ""}, None, "no_output"),
-            "command failed": ({}, [failure], "command_failed"),
+            "command failed": ({}, failures, "command_failed"),
         }
         for name, (extra, failures, result) in cases.items():
             with self.subTest(name):
@@ -636,11 +646,11 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
                 self.assertEqual(enclosure.metrics.get("not_read", []), ["device_count"] if expected is None else [])
 
     def test_show_all_unit_commands_count_as_attempted(self) -> None:
-        failure = {"command": "sudo -n /usr/sbin/mprutil -u 1 show all", "canonical_command": "mprutil -u 1 show all"}
+        failures = _failure_records("sudo -n /usr/sbin/mprutil -u 1 show all")
         cases = {
             "answered": ({"mprutil -u 1 show all": "unrecognized synthetic text\n"}, None, "unreadable"),
             "empty": ({"mprutil -u 1 show all": ""}, None, "no_output"),
-            "failed": ({}, [failure], "command_failed"),
+            "failed": ({}, failures, "command_failed"),
         }
         for name, (extra, failures, result) in cases.items():
             with self.subTest(name):
@@ -654,6 +664,72 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
                 self.assertEqual([node.id for node in fabric.nodes if node.kind == "controller"], ["controller:mpr0"])
                 self.assertEqual(fabric.warnings, [UNREADABLE_UNIT_WARNING])
                 self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "partial")
+
+    def test_every_failed_unit_read_is_counted_from_the_record_the_inventory_builds(self) -> None:
+        # One failed read per unit subcommand: each leaves its controller attempted and unread.
+        for subcommand in ("adapter", "all", "devices", "enclosures", "expanders", "iocfacts"):
+            with self.subTest(subcommand):
+                failures = _failure_records(f"sudo -n /usr/sbin/mprutil -u 1 show {subcommand}")
+                fabric = _core_fabric(NUMBERED_UNIT_OUTPUTS, slots=[_inventory_slot()], command_failures=failures)
+
+                self.assertEqual(
+                    fabric.raw["controller_read"]["units"],
+                    [{"controller": "mpr0", "result": "read"}, {"controller": "mpr1", "result": "command_failed"}],
+                )
+                self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "partial")
+                self.assertEqual(fabric.warnings, [UNREADABLE_UNIT_WARNING])
+
+    def test_failed_unnumbered_read_counts_only_when_no_numbered_unit_was_read(self) -> None:
+        failures = _failure_records("sudo -n /usr/sbin/mprutil show adapter")
+        fabric = _core_fabric({}, slots=[_inventory_slot()], command_failures=failures)
+        self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr", "result": "command_failed"}])
+        self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "not_read")
+
+        fabric = _core_fabric(NUMBERED_UNIT_OUTPUTS, slots=[_inventory_slot()], command_failures=failures)
+        self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr0", "result": "read"}])
+        self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "complete")
+
+        # Control: the unnumbered context names only the unnumbered controller.
+        other = [{"context": "sas_fabric_mprutil", "controller": "mpr1"}, {"context": "sas_fabric_mprutil"}]
+        fabric = _core_fabric({}, slots=[_inventory_slot()], command_failures=other)
+        self.assertEqual(fabric.raw["controller_read"]["units"], [])
+
+    def test_failed_read_of_a_unit_number_that_is_not_admitted_is_counted_as_rejected(self) -> None:
+        failures = _failure_records("sudo -n /usr/sbin/mprutil -u 12345 show adapter")
+        fabric = _core_fabric(NUMBERED_UNIT_OUTPUTS, slots=[_inventory_slot()], command_failures=failures)
+
+        self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr0", "result": "read"}])
+        self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 1)
+        self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "partial")
+
+    def test_other_failed_commands_do_not_name_a_controller(self) -> None:
+        # Control: a failure that is not a unit read leaves a whole read complete.
+        failures = _failure_records(
+            "sudo -n /usr/sbin/mprutil show adapters",
+            "sudo -n /usr/sbin/mprutil show anything-else",
+            "sudo -n /usr/sbin/mprutil -u 1 show anything",
+            "sudo -n /sbin/camcontrol devlist -v",
+        )
+        fabric = _core_fabric(NUMBERED_UNIT_OUTPUTS, slots=[_inventory_slot()], command_failures=failures)
+
+        self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr0", "result": "read"}])
+        self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 0)
+        self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "complete")
+
+        # A record must carry both the unit-read context and its controller to name one.
+        for record in (
+            {"context": "sas_fabric_mprutil_adapter"},
+            {"controller": "mpr1"},
+            {"context": "sas_fabric_expander_phy_error_counters", "controller": "mpr1"},
+            {"context": "sas_fabric_mprutil", "controller": "mpr1"},
+            {"context": "sas_fabric_mprutil_adapter", "controller": "mpr"},
+            {"context": "sas_fabric_mprutil_adapter", "controller": "mpr1\n"},
+            {"context": None, "controller": None},
+        ):
+            with self.subTest(record=record):
+                fabric = _core_fabric(NUMBERED_UNIT_OUTPUTS, slots=[_inventory_slot()], command_failures=[record])
+                self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr0", "result": "read"}])
+                self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 0)
 
     def test_unit_numbers_must_be_one_to_four_ascii_digits(self) -> None:
         board = " SAS3008 Synthetic HBA 1.2.3\n"
