@@ -206,6 +206,8 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_metrics",
             "tests.test_perf",
             "tests.test_perf_budgets",
+            "tests.test_persisted_smart_binding",
+            "tests.test_persisted_smart_refresh",
             "tests.test_platform_parity_fixtures",
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",

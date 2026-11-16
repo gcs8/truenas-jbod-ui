@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- Last-good SMART values saved by earlier versions are not shown after the
+  upgrade, because they do not record which appliance they came from. Each
+  bay shows SMART again after its next successful SMART read (#1261).
+
 ### Changed
 
 - The image now installs every Python package, direct and transitive, from
@@ -48,6 +54,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Changing where a system's reads are configured to go while keeping its
+  system ID (its appliance address including any path prefix, the API
+  dialect or version where it is part of that address, the platform, the TLS
+  server name the connection presents, SSH hosts, their order or port, the
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address,
+  query included) no
+  longer serves the previous destination's saved SMART values or bay details:
+  each saved row records the configured destinations it was read under, and
+  only rows for the current configuration are read. This follows configured
+  routing only; it does not record which node of a system answered. An edit
+  that moves no read, such as a rename, a new key, or an extra SSH host on a
+  platform that reads only the primary host, keeps the saved values. The first SMART read served from saved values
+  after a restart now refreshes from the disk in the background on its own,
+  instead of waiting for a second request (#1261).
 - A history pass where every SMART metric read failed no longer counts as a
   success: it fails, keeps both metric cadences, and the next pass reads the
   metrics again. When only some scopes fail, the healthy ones keep their
