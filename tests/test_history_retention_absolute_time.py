@@ -398,6 +398,32 @@ def _batch_work(path: Path, cutoffs: dict[str, str | None]) -> tuple[int, dict]:
     return steps[0], result
 
 
+class HotRetentionAbsoluteTimeUtf16Tests(HotRetentionAbsoluteTimeTests):
+    """The same rules in a database whose text encoding is UTF-16.
+
+    Retention hands stored text to the exact-time test as raw bytes, which
+    are in the database's own encoding, not always UTF-8.
+    """
+
+    ENCODING = "UTF-16le"
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-utf16-")
+        self.addCleanup(self._temporary.cleanup)
+        self.path = Path(self._temporary.name) / "history.db"
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(f"PRAGMA encoding = '{self.ENCODING}'")
+            connection.execute("CREATE TABLE encoding_marker (value)")
+            connection.commit()
+        self.store = HistoryStore(str(self.path))
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA encoding").fetchone()[0], self.ENCODING)
+
+
+class HotRetentionAbsoluteTimeUtf16BigEndianTests(HotRetentionAbsoluteTimeUtf16Tests):
+    ENCODING = "UTF-16be"
+
+
 class RetentionPrecisionTests(unittest.TestCase):
     """Two samples in the same SQLite millisecond stay in their true order."""
 
@@ -1167,6 +1193,189 @@ class RetentionPassWrittenRollupTests(unittest.TestCase):
                 self.assertLessEqual(parsed[0], 2 * count, parses)
         self.assertLessEqual(parses[800] / parses[200], 1.5 * 800 / 200, parses)
         self.assertLessEqual(steps[800] / steps[200], 1.5 * 800 / 200, steps)
+
+
+UNDECODABLE_OLD = b"2026-11-01T00:00:00+00:0\xff"  # sorts more than a day before the cutoff
+UNDECODABLE_WINDOW = b"2026-11-14T00:00:00+00:0\xff"  # sorts in the day before the cutoff
+UNREADABLE_WINDOW = "2026-11-14T00:00:00+25:00"  # decodable, but not a time
+
+
+class RetentionUndecodableTimestampTests(unittest.TestCase):
+    """A timestamp stored as TEXT that is not UTF-8 never stops retention.
+
+    SQLite accepts such a value and so do the integrity and schema checks.
+    It is treated like any other text that is not a time: expired once its
+    text sorts more than a day before the cutoff, kept in the day before it.
+    Every other expired row in every table is still removed in the same pass.
+    """
+
+    POPULATIONS = ("events", "valueless_samples", "3600", "86400")
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-undecodable-")
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+
+    @staticmethod
+    def _insert(path: Path, population: str, observed_at: object, slot: int) -> None:
+        # bytes are written as a BLOB cast to TEXT: TEXT storage, raw bytes.
+        value = "CAST(? AS TEXT)" if isinstance(observed_at, bytes) else "?"
+        with closing(sqlite3.connect(path)) as connection:
+            if population == "events":
+                connection.execute(
+                    "INSERT INTO slot_events (observed_at, system_id, enclosure_key, slot, "
+                    "slot_label, event_type, details_json) "
+                    f"VALUES ({value}, 'synthetic-system', '', ?, '0', 'slot_state_changed', '{{}}')",
+                    (observed_at, slot),
+                )
+            elif population in ("samples", "valueless_samples"):
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, slot, "
+                    f"slot_label, metric_name, value_integer) VALUES ({value}, 'synthetic-system', "
+                    "'', ?, '0', 'bytes_read', ?)",
+                    (observed_at, slot, None if population == "valueless_samples" else 1),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO metric_rollups (bucket_start, bucket_seconds, system_id, "
+                    "enclosure_key, slot, slot_label, metric_name, sample_count, value_sum, "
+                    "value_min, value_max, last_value, last_observed_at) "
+                    f"VALUES ({value}, ?, 'synthetic-system', '', ?, '0', 'bytes_read', "
+                    "1, 1, 1, 1, 1, '2026-01-01T00:00:00+00:00')",
+                    (observed_at, int(population), slot),
+                )
+            connection.commit()
+
+    @staticmethod
+    def _left(path: Path) -> dict[str, list[bytes]]:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.text_factory = bytes
+            return {
+                "events": [row[0] for row in connection.execute(
+                    "SELECT observed_at FROM slot_events ORDER BY id")],
+                "samples": [row[0] for row in connection.execute(
+                    "SELECT observed_at FROM metric_samples ORDER BY id")],
+                "3600": [row[0] for row in connection.execute(
+                    "SELECT bucket_start FROM metric_rollups WHERE bucket_seconds = 3600 ORDER BY rowid")],
+                "86400": [row[0] for row in connection.execute(
+                    "SELECT bucket_start FROM metric_rollups WHERE bucket_seconds = 86400 ORDER BY rowid")],
+            }
+
+    def _case(self, name: str, population: str, undecodable: object, *, first: bool) -> tuple[Path, HistoryStore]:
+        # One readable expired row in every population, and the odd row in one.
+        # When first is false a readable row sorts before it, so a batch of
+        # one reaches the odd row with the scan floor already set.
+        path = self.root / f"{name}.db"
+        store = HistoryStore(str(path))
+        readable = "2026-11-12T00:00:00+00:00" if first else "2026-10-01T00:00:00+00:00"
+        for other in ("events", "samples", "3600", "86400"):
+            self._insert(path, other, readable, 1)
+        self._insert(path, population, undecodable, 2)
+        return path, store
+
+    def _retain_without_error(self, store: HistoryStore, **days_and_batches: int) -> dict:
+        try:
+            return _retain(store, **days_and_batches)
+        except sqlite3.Error as exc:
+            self.fail(f"retention raised and rolled back: {exc!r}")
+
+    def _retain_all(self, store: HistoryStore, batch_size: int) -> dict:
+        return self._retain_without_error(
+            store,
+            raw_metric_retention_days=1,
+            event_retention_days=1,
+            hourly_rollup_retention_days=1,
+            daily_rollup_retention_days=1,
+            batch_size=batch_size,
+            max_batches=50,
+        )
+
+    def _expected_left(self, population: str, kept: object) -> dict[str, list]:
+        left: dict[str, list] = {"events": [], "samples": [], "3600": [], "86400": []}
+        if kept is not None:
+            left["samples" if population.endswith("samples") else population].append(kept)
+        return left
+
+    def _matrix(self, undecodable: bytes, kept: bytes | None) -> None:
+        for population in self.POPULATIONS:
+            for first, batch_size in ((True, 100), (True, 1), (False, 1)):
+                name = f"{undecodable.hex()}-{population}-{first}-{batch_size}"
+                with self.subTest(population=population, odd_row_first=first, batch_size=batch_size):
+                    path, store = self._case(name, population, undecodable, first=first)
+                    result = self._retain_all(store, batch_size)
+                    self.assertEqual(self._left(path), self._expected_left(population, kept))
+                    self.assertFalse(result["has_more"])
+
+    def test_an_undecodable_timestamp_long_before_the_cutoff_is_deleted_like_any_old_text(self) -> None:
+        self._matrix(UNDECODABLE_OLD, kept=None)
+
+    def test_an_undecodable_timestamp_in_the_day_before_the_cutoff_is_kept_like_unreadable_text(self) -> None:
+        # Same rule as the decodable row whose time cannot be read.
+        self._matrix(UNREADABLE_WINDOW.encode(), kept=UNREADABLE_WINDOW.encode())
+        self._matrix(UNDECODABLE_WINDOW, kept=UNDECODABLE_WINDOW)
+
+    def test_the_pass_continues_after_an_undecodable_row_becomes_the_scan_floor(self) -> None:
+        path = self.root / "floor.db"
+        store = HistoryStore(str(path))
+        self._insert(path, "events", UNDECODABLE_OLD, 1)
+        for second in range(3):
+            self._insert(path, "events", f"2026-11-02T00:00:0{second}+00:00", 2)
+
+        result = self._retain_without_error(store, event_retention_days=1, batch_size=1, max_batches=10)
+
+        self.assertEqual(self._left(path)["events"], [])
+        self.assertEqual(result["events_removed"], 4)
+        self.assertFalse(result["has_more"])
+
+    def test_a_rollup_merge_treats_an_undecodable_last_time_like_unreadable_text(self) -> None:
+        # The bucket is kept (rollup retention off); a newer raw sample merges
+        # into it. An existing last time that is not a time keeps its value,
+        # exactly as for the decodable unreadable time.
+        outcomes = []
+        for name, last_observed_at in (("unreadable", UNREADABLE_WINDOW), ("undecodable", UNDECODABLE_WINDOW)):
+            with self.subTest(last_observed_at=name):
+                path = self.root / f"merge-{name}.db"
+                store = HistoryStore(str(path))
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        "INSERT INTO metric_rollups (bucket_start, bucket_seconds, system_id, "
+                        "enclosure_key, slot, slot_label, metric_name, sample_count, value_sum, "
+                        "value_min, value_max, last_value, last_observed_at, disk_identity_key) "
+                        "VALUES ('2026-11-03T00:00:00+00:00', 3600, ?, 'enc-a', 5, '05', "
+                        "'temperature_c', 1, 7, 7, 7, 7, CAST(? AS TEXT), '')",
+                        (SYSTEM_ID, last_observed_at.encode() if isinstance(last_observed_at, str) else last_observed_at),
+                    )
+                    connection.commit()
+                store.insert_metric_samples([_sample("2026-11-03T00:10:00+00:00", 40)])
+
+                result = self._retain_without_error(store, raw_metric_retention_days=1)
+
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.text_factory = bytes
+                    rows = connection.execute(
+                        "SELECT bucket_seconds, sample_count, last_value, last_observed_at "
+                        "FROM metric_rollups ORDER BY bucket_seconds"
+                    ).fetchall()
+                    samples = connection.execute("SELECT count(*) FROM metric_samples").fetchone()[0]
+                self.assertEqual(samples, 0)
+                self.assertEqual(result["metric_samples_removed"], 1)
+                self.assertFalse(result["has_more"])
+                self.assertEqual(rows[0][:3], (3600, 2, 7.0))
+                self.assertEqual(rows[1][:3], (86400, 1, 40.0))
+                outcomes.append(rows[0][3])
+        self.assertEqual(outcomes, [UNREADABLE_WINDOW.encode(), UNDECODABLE_WINDOW])
+
+    def test_an_undecodable_raw_sample_with_a_value_still_fails_its_rollup_as_before(self) -> None:
+        # No hourly bucket can be named for it, so its rollup insert fails and
+        # the batch rolls back, as it did before #1204 (unchanged here).
+        path = self.root / "valued.db"
+        store = HistoryStore(str(path))
+        self._insert(path, "samples", UNDECODABLE_OLD, 1)
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "NOT NULL constraint failed: metric_rollups.bucket_start"):
+            _retain(store, raw_metric_retention_days=1)
+
+        self.assertEqual(self._left(path)["samples"], [UNDECODABLE_OLD])
 
 
 class RetentionQueryPlanTests(unittest.TestCase):

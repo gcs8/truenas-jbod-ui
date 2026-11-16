@@ -3229,7 +3229,7 @@ class HistoryStore:
         }
 
         # In-memory scan state for this pass only (see _maintain_retention_batch).
-        scan_floors: dict[str, tuple[str, int]] = {}
+        scan_floors: dict[str, tuple[bytes, int]] = {}
         finished_tables: set[str] = set()
         for _ in range(max_batches):
             if should_continue is not None and not should_continue():
@@ -3323,7 +3323,7 @@ class HistoryStore:
         *,
         cutoffs: dict[str, str | None],
         batch_size: int,
-        scan_floors: dict[str, tuple[str, int]] | None = None,
+        scan_floors: dict[str, tuple[bytes, int]] | None = None,
         finished_tables: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         # The same ordered, bounded subquery selects the batch for both rollups and
@@ -3447,12 +3447,19 @@ class HistoryStore:
 
     @staticmethod
     def _register_retention_functions(connection: sqlite3.Connection) -> None:
-        connection.create_function(
-            "_history_utc_instant",
-            1,
-            _history_utc_instant,
-            deterministic=True,
-        )
+        # Retention passes stored text as a BLOB in the database's encoding,
+        # so text that does not decode reaches here instead of failing the
+        # statement; like any other text that is not a time, it has none.
+        encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+
+        def utc_instant(value: object) -> str | None:
+            try:
+                text = value.decode(encoding) if isinstance(value, bytes) else value
+            except UnicodeDecodeError:
+                return None
+            return _history_utc_instant(text)
+
+        connection.create_function("_history_utc_instant", 1, utc_instant, deterministic=True)
 
     @staticmethod
     def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
@@ -3490,17 +3497,17 @@ class HistoryStore:
         # equal and so be skipped.
         predicate = (
             f"{timestamp_column} < ? AND ({timestamp_column} < ? "
-            f"OR _history_utc_instant({timestamp_column}) < ?)"
+            f"OR _history_utc_instant(CAST({timestamp_column} AS BLOB)) < ?)"
         )
         if floored:
-            predicate += f" AND ({timestamp_column}, {key_column}) > (?, ?)"
+            predicate += f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)"
         return predicate
 
     @classmethod
     def _retention_parameters(
         cls,
         cutoff: str,
-        floor: tuple[str, int] | None,
+        floor: tuple[bytes, int] | None,
     ) -> tuple[Any, ...]:
         return (*cls._retention_bounds(cutoff), *(floor or ()))
 
@@ -3515,14 +3522,14 @@ class HistoryStore:
 
     @staticmethod
     def _advance_scan_floor(
-        floors: dict[str, tuple[str, int]],
+        floors: dict[str, tuple[bytes, int]],
         name: str,
         deleted: list[Any],
     ) -> int:
         # Every row before the last deleted one (by text, then key) was read by
         # this batch: deleted, or rejected by the exact-time test.
         if deleted:
-            floors[name] = max((str(row[0]), int(row[1])) for row in deleted)
+            floors[name] = max((bytes(row[0]), int(row[1])) for row in deleted)
         return len(deleted)
 
     @classmethod
@@ -3534,14 +3541,15 @@ class HistoryStore:
         timestamp_column: str,
         cutoff: str | None,
         batch_size: int,
-        floors: dict[str, tuple[str, int]],
+        floors: dict[str, tuple[bytes, int]],
     ) -> int:
         if cutoff is None:
             return 0
         floor = floors.get(table_name)
         subquery = cls._expired_rows_subquery(table_name, timestamp_column, floored=floor is not None)
         deleted = connection.execute(
-            f"DELETE FROM {table_name} WHERE id IN ({subquery}) RETURNING {timestamp_column}, id",
+            f"DELETE FROM {table_name} WHERE id IN ({subquery}) "
+            f"RETURNING CAST({timestamp_column} AS BLOB), id",
             (*cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()
         return cls._advance_scan_floor(floors, table_name, deleted)
@@ -3554,7 +3562,7 @@ class HistoryStore:
         cutoff: str,
         batch_size: int,
         bucket_seconds: int,
-        floor: tuple[str, int] | None,
+        floor: tuple[bytes, int] | None,
         rollup_cutoff: str | None = None,
     ) -> list[int]:
         """Roll the selected raw rows up; return the written rollups already expired.
@@ -3610,7 +3618,7 @@ class HistoryStore:
                         PARTITION BY
                             {bucket_expression}, system_id, enclosure_key, slot,
                             metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY _history_utc_instant(observed_at) DESC, id DESC
+                        ORDER BY _history_utc_instant(CAST(observed_at AS BLOB)) DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
                 WHERE id IN ({expired_rows})
@@ -3633,14 +3641,14 @@ class HistoryStore:
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
                 last_value = CASE
-                    WHEN _history_utc_instant(excluded.last_observed_at)
-                        >= _history_utc_instant(metric_rollups.last_observed_at)
+                    WHEN _history_utc_instant(CAST(excluded.last_observed_at AS BLOB))
+                        >= _history_utc_instant(CAST(metric_rollups.last_observed_at AS BLOB))
                     THEN excluded.last_value
                     ELSE metric_rollups.last_value
                 END,
                 last_observed_at = CASE
-                    WHEN _history_utc_instant(excluded.last_observed_at)
-                        >= _history_utc_instant(metric_rollups.last_observed_at)
+                    WHEN _history_utc_instant(CAST(excluded.last_observed_at AS BLOB))
+                        >= _history_utc_instant(CAST(metric_rollups.last_observed_at AS BLOB))
                     THEN excluded.last_observed_at
                     ELSE metric_rollups.last_observed_at
                 END,
@@ -3674,7 +3682,7 @@ class HistoryStore:
         bucket_seconds: int,
         cutoff: str | None,
         batch_size: int,
-        floors: dict[str, tuple[str, int]],
+        floors: dict[str, tuple[bytes, int]],
     ) -> int:
         if cutoff is None:
             return 0
@@ -3691,7 +3699,7 @@ class HistoryStore:
                 ORDER BY bucket_start, rowid
                 LIMIT ?
             )
-            RETURNING bucket_start, rowid
+            RETURNING CAST(bucket_start AS BLOB), rowid
             """,
             (bucket_seconds, *cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()
@@ -3705,7 +3713,7 @@ class HistoryStore:
         timestamp_column: str,
         cutoff: str | None,
         *,
-        floor: tuple[str, int] | None = None,
+        floor: tuple[bytes, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False
@@ -3723,7 +3731,7 @@ class HistoryStore:
         bucket_seconds: int,
         cutoff: str | None,
         *,
-        floor: tuple[str, int] | None = None,
+        floor: tuple[bytes, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False
