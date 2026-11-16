@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from app.models.domain import slot_occupancy
+
 
 FIELD_LABELS = {
     "present": "Present",
@@ -290,8 +292,8 @@ class SlotStateRecord:
             enclosure_label=enclosure_label,
             slot=slot_number,
             slot_label=normalize_text(slot_payload.get("slot_label")) or f"{slot_number:02d}",
-            present=as_bool(slot_payload.get("present")),
-            presence_known=slot_payload.get("presence_known") is not False,
+            present=slot_occupancy(slot_payload) == "present",
+            presence_known=slot_occupancy(slot_payload) != "unknown",
             state=normalize_text(slot_payload.get("state")),
             identify_active=as_bool(slot_payload.get("identify_active")),
             device_name=normalize_text(slot_payload.get("device_name")),

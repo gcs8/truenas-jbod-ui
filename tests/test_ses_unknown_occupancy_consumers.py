@@ -11,14 +11,20 @@ read that fact instead of treating the legacy False as an empty bay:
   while the disk last recorded there was not read; earlier alert evidence is
   kept until a real read replaces it.
 
+Every consumer asks one reader, ``slot_occupancy`` (``slotOccupancy`` on the
+page), which answers present, empty or unknown. A maintained scan keeps direct
+reads of the occupancy fields to a short allowlist with a reason each.
+
 Real parsers, resolvers, slot-view builders, the history collector and a
 disposable SQLite history store; synthetic inputs only.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -27,7 +33,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import StorageViewConfig
-from app.models.domain import InventorySnapshot, ManualMapping, SlotView
+from app.models import domain as domain_models
+from app.models.domain import InventorySnapshot, ManualMapping, SlotView, StorageViewRuntimeSlot
+from app.services import inventory as inventory_module
+from app.services.inventory_accounting import build_disk_retention_accounting
+from app.services.sas_fabric import build_sas_fabric_snapshot
 from history_service.collector import HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
 from history_service.domain import SlotStateRecord
@@ -245,6 +255,322 @@ class UnreadBayHistoryTests(unittest.TestCase):
         empty, _calls = self.run_pass(collector, KNOWN_EMPTY(), {}, start + timedelta(minutes=5))
         self.assertEqual(empty["last_smart_failure_evidence_disks"], 0)
         self.assertEqual(self.presence_changes(store), [(True, False)])
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OCCUPANCY_FIELDS = {"present", "occupied", "presence_known"}
+PRODUCTION_DIRS = ("app", "admin_service", "history_service")
+# Whole files where these field names never mean a bay's occupancy.
+OCCUPANCY_READ_EXEMPT_FILES = {
+    "app/services/parsers.py": "SES parser records carry tri-state presence evidence before any slot view exists",
+    "app/services/public_demo_fixture.py": "builds the synthetic public demo; no bay was read",
+    "history_service/system_backup.py": "`present` is backup group membership, not a bay",
+    "history_service/segment_catalog.py": "`present` is backup segment membership, not a bay",
+    "admin_service/static/admin_backups.js": "`present` is a secret file on disk, not a bay",
+}
+# (file, function) -> (direct reads, reason). Nothing here states emptiness,
+# counts a disk or words a message about the current occupant.
+OCCUPANCY_READ_ALLOWLIST = {
+    ("app/models/domain.py", "slot_occupancy"): (6, "the reader itself"),
+    ("app/static/app.js", "slotOccupancy"): (4, "the page's reader itself"),
+    ("app/services/inventory.py", "InventoryService._build_slot_view"): (2, "producer: decides occupancy from raw evidence and sets presence_known"),
+    ("app/services/inventory.py", "InventoryService._correlate_quantastor"): (1, "producer: raw SES candidate before the slot view"),
+    ("app/services/inventory.py", "InventoryService._merge_quantastor_ses_candidate"): (2, "producer: copies the SES candidate decision as one"),
+    ("app/services/inventory.py", "InventoryService._slot_has_live_empty_evidence"): (2, "producer: raw hint dict feeding the empty gate"),
+    ("app/services/inventory.py", "InventoryService._slot_identity_state"): (1, "identity key; unread groups with no-disk-known"),
+    ("app/services/inventory.py", "InventoryService._slot_detail_entry_matches"): (1, "cache admission; an unread bay admits no cached disk"),
+    ("app/services/inventory.py", "InventoryService._slot_disk_binding"): (1, "revision digest of the bay's disk identity"),
+    ("app/services/inventory.py", "InventoryService._smart_disk_identity"): (1, "SMART cache key; an unread bay has no disk identity"),
+    ("app/static/app.js", "candidateSlotsForSmartPrefetch"): (1, "SMART prefetch admission"),
+    ("app/static/app.js", "ensureHeatmapData"): (1, "SMART prefetch admission for storage-view tiles"),
+    ("app/static/app.js", "heatmapEntryOccupied"): (1, "heatmap scoring admission; declines an unread bay, draws no label"),
+    ("app/static/app.js", "sendLedAction"): (1, "repairs an old saved state from raw evidence; raw unknown stays unknown"),
+    ("app/static/app.js", "smartDiskIdentity"): (2, "SMART cache identity"),
+    ("app/static/sas_fabric_view.js", "diskTraceHasDisk"): (1, "disk trace admission; an unread bay traces no disk"),
+    ("app/static/sas_fabric_view.js", "smartCacheKey"): (1, "SMART cache key"),
+    ("history_service/collector.py", "HistoryCollector._has_stable_disk_identity"): (2, "compares two rows after unread bays took their recorded row"),
+    ("history_service/collector.py", "HistoryCollector._scope_history_skip_reason"): (4, "degraded-scan guard: an unread new row skips the scope, keeping history"),
+    ("history_service/domain.py", "build_slot_events"): (2, "compares two rows after unread bays took their recorded row"),
+    ("history_service/domain.py", "summarize_record"): (1, "labels a stored row; unread bays write no row"),
+}
+_JS_READ = re.compile(r"(?:\?\.|\.)(present|occupied|presence_known)\b|\[\s*[\"'](present|occupied|presence_known)[\"']\s*\]")
+_JS_FUNCTION = re.compile(r"^\s*(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(")
+
+
+def _python_occupancy_reads(path: Path) -> list[str]:
+    reads: list[str] = []
+
+    def visit(node: ast.AST, scope: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit(child, [*scope, child.name])
+                continue
+            field = None
+            if isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load):
+                field = child.attr
+            elif isinstance(child, ast.Subscript) and isinstance(child.ctx, ast.Load) and isinstance(child.slice, ast.Constant):
+                field = child.slice.value
+            elif isinstance(child, ast.Call) and child.args:
+                if isinstance(child.func, ast.Attribute) and child.func.attr == "get":
+                    argument = child.args[0]
+                elif isinstance(child.func, ast.Name) and child.func.id == "getattr" and len(child.args) > 1:
+                    argument = child.args[1]
+                else:
+                    argument = None
+                field = argument.value if isinstance(argument, ast.Constant) else None
+            if field in OCCUPANCY_FIELDS:
+                reads.append(".".join(scope) or "<module>")
+            visit(child, scope)
+
+    visit(ast.parse(path.read_text(encoding="utf-8")), [])
+    return reads
+
+
+def _javascript_occupancy_reads(path: Path) -> list[str]:
+    reads: list[str] = []
+    function = "<top>"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if match := _JS_FUNCTION.match(line):
+            function = match.group(1)
+        if line.lstrip().startswith("//"):
+            continue
+        reads.extend(function for _match in _JS_READ.finditer(line))
+    return reads
+
+
+def production_occupancy_reads() -> dict[tuple[str, str], int]:
+    """Direct reads of the occupancy fields in production code, per function."""
+
+    counts: dict[tuple[str, str], int] = {}
+    for directory in PRODUCTION_DIRS:
+        for path in sorted((REPO_ROOT / directory).rglob("*")):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in OCCUPANCY_READ_EXEMPT_FILES or path.suffix not in {".py", ".js"}:
+                continue
+            reads = _python_occupancy_reads(path) if path.suffix == ".py" else _javascript_occupancy_reads(path)
+            for function in reads:
+                counts[(relative, function)] = counts.get((relative, function), 0) + 1
+    return counts
+
+
+class OccupancyReaderTests(unittest.TestCase):
+    def test_the_reader_says_present_empty_or_unknown(self) -> None:
+        read = domain_models.slot_occupancy
+        self.assertEqual(read(KNOWN_PRESENT()), "present")
+        self.assertEqual(read(KNOWN_EMPTY()), "empty")
+        for name, build in UNREAD.items():
+            with self.subTest(name):
+                view = build()
+                self.assertEqual(read(view), "unknown")
+                self.assertEqual(read(_payload(view)), "unknown")
+                self.assertEqual(read(SlotStateRecord.from_snapshot_slot({"selected_system_id": "s"}, _payload(view))), "unknown")
+        self.assertEqual(read(StorageViewRuntimeSlot(slot_index=0, slot_label="00", occupied=True)), "present")
+        self.assertEqual(read(StorageViewRuntimeSlot(slot_index=0, slot_label="00")), "empty")
+        self.assertEqual(read(StorageViewRuntimeSlot(slot_index=0, slot_label="00", presence_known=False)), "unknown")
+        self.assertEqual(read({"occupied": False}), "empty")
+        self.assertEqual(read({"present": True}), "present")
+        self.assertEqual(read({"state": "healthy"}), "unknown")
+        self.assertEqual(read(None), "unknown")
+
+    def test_direct_occupancy_reads_stay_on_the_allowlist(self) -> None:
+        found = production_occupancy_reads()
+        expected = {key: count for key, (count, _reason) in OCCUPANCY_READ_ALLOWLIST.items()}
+        self.assertEqual(
+            {key: count for key, count in found.items() if expected.get(key) != count},
+            {},
+            "a production read of present/occupied/presence_known outside the reader: "
+            "use slot_occupancy()/slotOccupancy(), or add it to the allowlist with a reason",
+        )
+        self.assertEqual({key for key in expected if key not in found}, set(), "stale allowlist entry")
+        for key, (_count, reason) in OCCUPANCY_READ_ALLOWLIST.items():
+            self.assertTrue(reason.strip(), key)
+        for relative in OCCUPANCY_READ_EXEMPT_FILES:
+            self.assertTrue((REPO_ROOT / relative).is_file(), relative)
+
+    def test_the_scan_sees_a_new_direct_read(self) -> None:
+        # Control for the scan itself: both parsers find the shapes they look for.
+        with tempfile.TemporaryDirectory() as directory:
+            python_file = Path(directory) / "probe.py"
+            python_file.write_text(
+                "def f(slot, payload):\n    return slot.present, payload.get('occupied'), payload['presence_known'], "
+                "getattr(slot, 'present')\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_python_occupancy_reads(python_file), ["f"] * 4)
+            script = Path(directory) / "probe.js"
+            script.write_text("  function g(slot) {\n    return slot?.occupied || slot.present;\n  }\n", encoding="utf-8")
+            self.assertEqual(_javascript_occupancy_reads(script), ["g", "g"])
+
+
+class FleetAlertEvidenceTests(unittest.TestCase):
+    """SMART alert evidence is kept per disk, never as one fleet-wide block."""
+
+    def run_passes(self, stages: list[dict[str, tuple[SlotView, dict]]]) -> list[dict[str, Any]]:
+        # The real scope enumerator over a synthetic inventory transport.
+        collector, _store = UnreadBayHistoryTests.collector(self)  # type: ignore[arg-type]
+        stage: list[dict[str, tuple[SlotView, dict]]] = [stages[0]]
+
+        async def fetch_inventory(system_id=None, enclosure_id=None, **_kwargs):
+            enclosures = stage[0]
+            selected = enclosure_id if enclosure_id in enclosures else next(iter(enclosures))
+            view, _summaries = enclosures[selected]
+            return {
+                "selected_system_id": "s", "selected_enclosure_id": selected, "selected_system_platform": "core",
+                "systems": [{"id": "s"}], "enclosures": [{"id": name} for name in enclosures],
+                "slots": [{**_payload(view), "enclosure_id": selected}],
+                "sources": {"api": {"enabled": True, "ok": True}},
+            }
+
+        async def smart(scope, _slots, **_kwargs):
+            return stage[0][scope.enclosure_id][1]
+
+        collector._fetch_inventory = fetch_inventory  # type: ignore[method-assign]
+        collector._fetch_storage_views = AsyncMock(return_value={"views": []})  # type: ignore[method-assign]
+        collector._fetch_smart_summaries = smart  # type: ignore[method-assign]
+        start = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        statuses = []
+        for index, enclosures in enumerate(stages):
+            stage[0] = enclosures
+            with patch("history_service.collector.utcnow", return_value=start + timedelta(minutes=5 * index)):
+                asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+            scopes = asyncio.run(collector._enumerate_scopes(force_inventory=True))
+            statuses.append({**collector.status(), "scopes": [scope.enclosure_id for scope in scopes]})
+        return statuses
+
+    @staticmethod
+    def disk_b() -> SlotView:
+        return KNOWN_PRESENT().model_copy(update={"serial": "SANITIZED-B", "gptid": "synthetic-id-b"})
+
+    def test_removed_enclosure_evidence_clears_beside_an_unread_sibling(self) -> None:
+        first = {"enc-a": (KNOWN_PRESENT(), FAILED_HOT), "enc-b": (self.disk_b(), PASSED_COOL)}
+        later = {"enc-b": (UNREAD["core-show-unknown"](), {})}
+        statuses = self.run_passes([first, later, later, later])
+        self.assertEqual(statuses[0]["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(statuses[0]["last_max_temperature_celsius"], 61)
+        for status in statuses[1:]:
+            self.assertEqual(status["scopes"], ["enc-b"])
+            # A is in no configured scope: its failure and its 61 C are gone.
+            self.assertEqual(status["last_smart_failure_evidence_disks"], 0)
+            # B was not read again: it keeps only its own last reading.
+            self.assertEqual(status["last_max_temperature_celsius"], 35)
+            self.assertEqual(status["last_smart_failure_evidence_at"], statuses[0]["last_smart_failure_evidence_at"])
+
+    def test_an_unread_bay_keeps_only_its_own_failure(self) -> None:
+        # B failed and is now unread; A is read healthy every pass.
+        first = {"enc-a": (KNOWN_PRESENT(), PASSED_COOL), "enc-b": (self.disk_b(), FAILED_HOT)}
+        later = {"enc-a": (KNOWN_PRESENT(), PASSED_COOL), "enc-b": (UNREAD["quantastor-unknown"](), {})}
+        recovered = {"enc-a": (KNOWN_PRESENT(), PASSED_COOL), "enc-b": (self.disk_b(), PASSED_COOL)}
+        statuses = self.run_passes([first, later, later, recovered])
+        for status in statuses[:3]:
+            self.assertEqual(status["last_smart_failure_evidence_disks"], 1)
+            self.assertEqual(status["last_max_temperature_celsius"], 61)
+        # The evidence time is the oldest reading behind the total.
+        self.assertEqual(statuses[2]["last_smart_failure_evidence_at"], statuses[0]["last_smart_failure_evidence_at"])
+        # A real read of B replaces its evidence.
+        self.assertEqual(statuses[3]["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(statuses[3]["last_max_temperature_celsius"], 35)
+        self.assertGreater(statuses[3]["last_smart_failure_evidence_at"], statuses[0]["last_smart_failure_evidence_at"])
+
+    def test_removed_enclosure_control_without_an_unread_bay(self) -> None:
+        first = {"enc-a": (KNOWN_PRESENT(), FAILED_HOT), "enc-b": (self.disk_b(), PASSED_COOL)}
+        later = {"enc-b": (self.disk_b(), PASSED_COOL)}
+        statuses = self.run_passes([first, later])
+        self.assertEqual(statuses[1]["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(statuses[1]["last_max_temperature_celsius"], 35)
+        self.assertGreater(statuses[1]["last_smart_failure_evidence_at"], statuses[0]["last_smart_failure_evidence_at"])
+
+
+def _snapshot(*slots: SlotView, rows: list[list[int | None]] | None = None) -> InventorySnapshot:
+    return InventorySnapshot(
+        slots=list(slots), layout_rows=rows or [[slot.slot for slot in slots]], layout_slot_count=len(slots),
+        layout_columns=len(slots), refresh_interval_seconds=60, selected_system_id="s",
+        selected_enclosure_id="enc-a", selected_system_platform="core",
+    )
+
+
+class UnreadBayConsumerTests(unittest.TestCase):
+    def service(self):
+        case = presence_cases.CoreSesutilShowPresenceTests()
+        self.addCleanup(case.doCleanups)
+        return case.service()
+
+    def test_a_locate_light_on_an_unread_bay_keeps_occupancy_unknown(self) -> None:
+        # The page's mapping-health test uses exactly this shape.
+        view = _core_view("Slot 00  -  -  -  Identify")
+        self.assertEqual((view.present, view.presence_known, view.state.value), (False, False, "identify"))
+        self.assertEqual(domain_models.slot_occupancy(view), "unknown")
+
+    def test_storage_fabric_says_unknown_for_an_unread_bay(self) -> None:
+        service = self.service()
+        for name, build, expected in [
+            ("unread", UNREAD["core-show-unknown"], "unknown"),
+            ("known-empty", KNOWN_EMPTY, False),
+            ("known-present", KNOWN_PRESENT, True),
+        ]:
+            with self.subTest(name):
+                fabric = build_sas_fabric_snapshot(system=service.system, snapshot=_snapshot(build()), ssh_outputs={})
+                bays = [node for node in fabric.nodes if node.kind == "bay"]
+                self.assertTrue(bays)
+                for bay in bays:
+                    self.assertEqual(bay.metrics["present"], expected)
+
+    def test_saved_layout_bays_with_no_backing_row_are_unknown(self) -> None:
+        service = self.service()
+        view = StorageViewConfig(id="front", label="Front", kind="ses_enclosure", template_id="ses-auto")
+        runtime = service._build_ses_storage_view_runtime(view, _snapshot(KNOWN_EMPTY()))
+        backed = [slot for slot in runtime.slots if slot.slot_index == 0]
+        missing = [slot for slot in runtime.slots if slot.slot_index != 0]
+        self.assertEqual(len(missing), 23)
+        # The real empty read stays empty.
+        self.assertEqual([(s.occupied, s.presence_known, s.state) for s in backed], [(False, True, "empty")])
+        for slot in missing:
+            self.assertEqual((slot.occupied, slot.presence_known, slot.state), (False, False, "unknown"))
+            self.assertEqual(domain_models.slot_occupancy(slot), "unknown")
+            synthetic = service._build_slot_view_from_storage_view_runtime_slot(runtime, slot)
+            self.assertEqual((synthetic.present, synthetic.presence_known, synthetic.state.value), (False, False, "unknown"))
+
+    def test_manual_only_layout_bays_without_a_live_disk_are_unknown(self) -> None:
+        live = KNOWN_PRESENT()
+        slots = inventory_module._ManualOnlyStorageViewSlots(
+            mappings={1: MAPPING.model_copy(update={"slot": 1, "serial": "SANITIZED-GONE"}), 2: MAPPING.model_copy(update={"slot": 2})},
+            live_slots_by_key={key: live for key in inventory_module.normalize_lookup_keys(live.serial)},
+        )
+        no_assignment = slots.runtime_slot(0, "00", None)
+        unresolved = slots.runtime_slot(1, "01", None)
+        resolved = slots.runtime_slot(2, "02", None)
+        self.assertEqual((no_assignment.state, domain_models.slot_occupancy(no_assignment)), ("unknown", "unknown"))
+        self.assertEqual((unresolved.state, domain_models.slot_occupancy(unresolved)), ("unmapped", "unknown"))
+        self.assertEqual((resolved.state, domain_models.slot_occupancy(resolved)), ("healthy", "present"))
+
+    def test_inventory_binding_placeholders_stay_known_empty(self) -> None:
+        # Control: an inventory-binding view lists every disk the platform
+        # reports, so a bay no disk lands in is a real empty bay.
+        service = self.service()
+        view = StorageViewConfig(id="nvme", label="NVMe", kind="nvme_carrier", template_id="nvme-carrier-4")
+        runtime = service._build_candidate_storage_view_runtime(view, _snapshot(KNOWN_EMPTY()), [], set())
+        self.assertTrue(runtime.slots)
+        for slot in runtime.slots:
+            self.assertEqual((domain_models.slot_occupancy(slot), slot.state), ("empty", "empty"))
+
+    def test_retention_accounting_does_not_count_an_unread_saved_assignment(self) -> None:
+        unread = UNREAD["quantastor-unresolved-mapping"]()
+        self.assertEqual(unread.serial, "SANITIZED-MAPPED")
+        retention = build_disk_retention_accounting(source_disks=[], slots=[unread])
+        self.assertEqual((retention.source_disk_count, retention.rendered_unique_disk_count), (0, 0))
+        # Control: a bay read as holding the disk is a rendered disk.
+        present = build_disk_retention_accounting(source_disks=[], slots=[KNOWN_PRESENT()])
+        self.assertEqual(present.rendered_unique_disk_count, 1)
+
+    def test_restore_preview_marks_an_unread_bay_as_not_checkable(self) -> None:
+        warn = inventory_module.InventoryService._mapping_import_disk_warning
+        backup = ManualMapping(slot=0, serial="SANITIZED-BACKUP")
+        unread = warn(("enc-a", 0), backup, UNREAD["quantastor-unresolved-mapping"]())
+        self.assertEqual((unread["current"], unread["occupancy"]), (None, "unknown"))
+        # Controls keep the shape they had: no occupancy key when it was read.
+        empty = warn(("enc-a", 0), backup, KNOWN_EMPTY())
+        self.assertEqual((empty["current"], "occupancy" in empty), (None, False))
+        present = warn(("enc-a", 0), backup, KNOWN_PRESENT())
+        self.assertEqual((present["current"], "occupancy" in present), ("SANITIZED-MAPPED", False))
 
 
 if __name__ == "__main__":

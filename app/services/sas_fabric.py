@@ -20,6 +20,7 @@ from app.models.domain import (
     SasFabricTrace,
     SourceStatus,
     SlotView,
+    slot_occupancy,
 )
 from app.services.core_expander_counters import (
     CAPABILITY_DENIED as SMP_CAPABILITY_DENIED,
@@ -608,7 +609,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 status=slot.state.value if hasattr(slot.state, "value") else str(slot.state),
                 related_slots=[slot.slot],
                 metrics={
-                    "present": slot.present,
+                    "present": _bay_present_metric(slot),
                     "pool_name": slot.pool_name,
                     "vdev_name": slot.vdev_name,
                     "device_name": slot.device_name,
@@ -1064,7 +1065,7 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
                 status=slot.state.value if hasattr(slot.state, "value") else str(slot.state),
                 related_slots=[slot.slot],
                 metrics={
-                    "present": slot.present,
+                    "present": _bay_present_metric(slot),
                     "pool_name": slot.pool_name,
                     "vdev_name": slot.vdev_name,
                     "device_name": slot.device_name,
@@ -1431,7 +1432,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
                 status=_slot_state_text(slot),
                 related_slots=slot_numbers,
                 metrics={
-                    "present": slot.present,
+                    "present": _bay_present_metric(slot),
                     "pool_name": slot.pool_name,
                     "vdev_name": slot.vdev_name,
                     "device_name": slot.device_name,
@@ -1840,8 +1841,14 @@ def _storage_fabric_scope_warning(platform_label: str, fabric_kind: str) -> str:
     )
 
 
+def _bay_present_metric(slot: SlotView) -> bool | str:
+    """The bay's `present` metric: yes, no, or "unknown" when it was not read (#1218)."""
+    occupancy = slot_occupancy(slot)
+    return "unknown" if occupancy == "unknown" else occupancy == "present"
+
+
 def _slot_has_storage_fabric_evidence(slot: SlotView) -> bool:
-    if _slot_has_disk(slot) or slot.present or slot.smart_device_names:
+    if _slot_has_disk(slot) or slot_occupancy(slot) == "present" or slot.smart_device_names:
         return True
     if isinstance(slot.operator_context, dict) and any(_truthy_storage_value(value) for value in slot.operator_context.values()):
         return True
@@ -2314,7 +2321,7 @@ def _bmc_storage_route(
         "controller_name": controller_name,
         "controller_label": "BMC / IPMI",
         "controller_device": raw_status.get("bmc_controller_id") or "ipmi",
-        "controller_status": "present" if slot.present else "mapped",
+        "controller_status": "present" if slot_occupancy(slot) == "present" else "mapped",
         "controller_evidence": list(_BMC_INVENTORY_EVIDENCE),
         "controller_raw": {
             "bmc_controller_id": raw_status.get("bmc_controller_id"),
@@ -2322,7 +2329,7 @@ def _bmc_storage_route(
         },
         "path_id": f"path:{controller_name}:{_object_id_token(path_label)}",
         "path_label": path_label,
-        "path_state": "present" if slot.present else "mapped",
+        "path_state": "present" if slot_occupancy(slot) == "present" else "mapped",
         "path_type": "bmc-slot",
         "path_evidence": list(_BMC_INVENTORY_EVIDENCE),
         "path_raw": {

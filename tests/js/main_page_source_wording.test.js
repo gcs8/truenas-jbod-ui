@@ -67,7 +67,7 @@ test("SSH bay sources are named in plain words, not raw codes", () => {
 });
 
 test("an empty NVMe carrier slot is labelled Empty, like every other empty slot", () => {
-  const { storageViewRuntimeTilePrimary } = loadFunctions(["storageViewRuntimeTilePrimary"]);
+  const { storageViewRuntimeTilePrimary } = loadFunctions(["slotOccupancy", "storageViewRuntimeTilePrimary"]);
   for (const kind of ["nvme_carrier", "boot_devices", "manual", "ses_enclosure"]) {
     assert.equal(storageViewRuntimeTilePrimary({ occupied: false }, { kind }), "Empty", kind);
   }

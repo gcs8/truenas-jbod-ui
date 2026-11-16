@@ -54,6 +54,7 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
     SystemLocatorStatusView,
+    slot_occupancy,
 )
 from app.metrics import (
     observe_inventory_background_snapshot_refresh,
@@ -1035,8 +1036,10 @@ class _ManualOnlyStorageViewSlots:
             "slot_size": slot_size,
         }
         if mapping is None:
+            # No saved assignment and no live bay behind it: nothing says
+            # whether this bay holds a disk (#1218).
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state="unknown", source="placeholder",
+                **common, occupied=False, presence_known=False, state="unknown", source="placeholder",
                 placement_key="assigned by hand only",
             )
         live = next(
@@ -1050,7 +1053,8 @@ class _ManualOnlyStorageViewSlots:
         )
         if live is None:
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state=SlotState.unmapped.value, source="manual_mapping",
+                **common, occupied=False, presence_known=False, state=SlotState.unmapped.value,
+                source="manual_mapping",
                 match_reasons=["saved bay assignment"], placement_key="saved bay assignment",
                 device_name=mapping.device_name, serial=mapping.serial, gptid=mapping.gptid,
                 description=mapping.notes,
@@ -3350,7 +3354,9 @@ class InventoryService:
                             known_snapshots[option.id] = snapshot
                         if not inputs_are_current():
                             return fallback_order("current correlation inputs are unavailable")
-                        enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+                        enclosure_counts.append(
+                            (option.id, sum(1 for slot in snapshot.slots if slot_occupancy(slot) == "present"))
+                        )
 
                     order = effective_main_view_order(
                         enclosure_counts=enclosure_counts,
@@ -3684,7 +3690,7 @@ class InventoryService:
             if not in_pair(view_node):
                 continue
             for runtime_slot in view.slots:
-                if runtime_slot.occupied:
+                if slot_occupancy(runtime_slot) == "present":
                     rendered.setdefault(
                         (f"storage-view:{view.id}", runtime_slot.slot_index), (runtime_slot, view_node),
                     )
@@ -3900,8 +3906,9 @@ class InventoryService:
     def _storage_view_runtime_slot_state(
         cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
     ) -> SlotState:
-        if not runtime_slot.occupied:
-            return SlotState.empty
+        occupancy = slot_occupancy(runtime_slot)
+        if occupancy != "present":
+            return SlotState.empty if occupancy == "empty" else SlotState.unknown
         if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
@@ -3937,7 +3944,8 @@ class InventoryService:
             enclosure_id=f"storage-view:{runtime_view.id}",
             enclosure_label=runtime_view.label,
             enclosure_name=runtime_view.label,
-            present=runtime_slot.occupied,
+            present=slot_occupancy(runtime_slot) == "present",
+            presence_known=slot_occupancy(runtime_slot) != "unknown",
             state=self._storage_view_runtime_slot_state(runtime_slot),
             non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
@@ -4005,7 +4013,7 @@ class InventoryService:
             )
             runtime_views.append(runtime_view)
             for slot in runtime_view.slots:
-                if not slot.occupied:
+                if slot_occupancy(slot) != "present":
                     continue
                 candidate_key = (
                     normalize_text(slot.serial)
@@ -4086,13 +4094,20 @@ class InventoryService:
                 if slot
                 else storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
             )
+            # A layout bay the backing snapshot has no row for was not read: the
+            # snapshot lists the live layout's bays, so this one is unknown, not
+            # empty (#1218).
+            occupancy = slot_occupancy(slot)
             runtime_slots.append(
                 StorageViewRuntimeSlot(
                     slot_index=slot_value,
                     slot_label=label,
-                    occupied=bool(slot and slot.present),
-                    presence_known=slot is None or slot.presence_known,
-                    state=(slot.state.value if slot and isinstance(slot.state, SlotState) else str(slot.state) if slot else "empty"),
+                    occupied=occupancy == "present",
+                    presence_known=occupancy != "unknown",
+                    state=(
+                        slot.state.value if slot and isinstance(slot.state, SlotState)
+                        else str(slot.state) if slot else SlotState.unknown.value
+                    ),
                     source="snapshot_slot",
                     match_reasons=["selected enclosure snapshot"],
                     placement_key="live enclosure slot",
@@ -4168,7 +4183,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=visible_slot_count,
             slots=runtime_slots,
         )
@@ -4242,7 +4257,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=len(visible_slots),
             slots=runtime_slots,
         )
@@ -8375,13 +8390,17 @@ class InventoryService:
             return None
         if slot_view is None:
             return None
-        if not slot_view.present or slot_view.state == SlotState.empty:
+        # An unread bay's current disk cannot be compared; say that, never
+        # that the bay is empty (#1218).
+        occupancy = slot_occupancy(slot_view)
+        if occupancy != "present" or slot_view.state == SlotState.empty:
             current = None
         else:
             current = normalize_text(getattr(slot_view, field_name))
             if not current or current.casefold() == backup.casefold():
                 return None
-        return {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        warning = {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        return {**warning, "occupancy": "unknown"} if occupancy == "unknown" else warning
 
     async def preview_mapping_bundle(
         self,

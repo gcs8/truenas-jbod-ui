@@ -701,9 +701,22 @@
     return `${storageViewKindLabel(view)} · ${view?.label || view?.id || "Storage View"}${suffixes.length ? ` (${suffixes.join(" / ")})` : ""}`;
   }
 
+  // The one reader of a bay's occupancy on the page (#1218): "present",
+  // "empty" or "unknown". Slot views say `present`, storage-view runtime slots
+  // say `occupied`, and `presence_known: false` means nobody read the bay.
+  // `slot_occupancy` in app/models/domain.py is the server's twin.
+  function slotOccupancy(slot) {
+    if (!slot || slot.presence_known === false) return "unknown";
+    const flag = typeof slot.present === "boolean" ? slot.present : slot.occupied;
+    if (typeof flag !== "boolean") return "unknown";
+    return flag ? "present" : "empty";
+  }
+
+
   function storageViewRuntimeTilePrimary(slot, selectedView) {
-    if (!slot?.occupied) {
-      return "Empty";
+    const occupancy = slotOccupancy(slot);
+    if (occupancy !== "present") {
+      return occupancy === "unknown" ? "Unknown" : "Empty";
     }
     if (selectedView?.kind === "nvme_carrier" || selectedView?.kind === "boot_devices") {
       return slot.device_name || slot.serial || slot.pool_name || "Matched disk";
@@ -712,7 +725,11 @@
   }
 
   function storageViewRuntimeTileSummary(slot, selectedView) {
-    if (!slot?.occupied) {
+    const occupancy = slotOccupancy(slot);
+    if (occupancy === "unknown") {
+      return "Whether this slot holds a disk is not known.";
+    }
+    if (occupancy === "empty") {
       return selectedView?.kind === "nvme_carrier"
         ? "No live disk matched yet."
         : "No live disk is currently landing in this storage-view slot.";
@@ -786,17 +803,20 @@
 
   function buildEmbeddedBootMediaRuntimeTileMarkup(slot) {
     const slotLabel = slot?.slot_label || `Slot ${Number(slot?.slot_index ?? 0) + 1}`;
-    const primary = slot?.occupied
+    const occupancy = slotOccupancy(slot);
+    const primary = occupancy === "present"
       ? (slot.device_name ? `/dev/${slot.device_name}` : slot.serial || "Embedded boot media")
       : "Embedded boot media";
-    const summary = slot?.occupied
+    const summary = occupancy === "present"
       ? [
           slot.model || null,
           slot.size_human || null,
           slot.smart_device_type ? `smartctl -d ${slot.smart_device_type}` : null,
         ].filter(Boolean).join(" • ") || "Matched from live inventory."
-      : "No live boot device is currently landing in this storage-view slot.";
-    const tertiary = slot?.occupied
+      : occupancy === "unknown"
+        ? "Whether this slot holds a disk is not known."
+        : "No live boot device is currently landing in this storage-view slot.";
+    const tertiary = occupancy === "present"
       ? [
           slot.serial || null,
           slot.bus || null,
@@ -905,18 +925,20 @@
   }
 
   function storageViewRuntimeShortLabel(slot) {
-    if (!slot || !slot.occupied) {
+    const occupancy = slotOccupancy(slot);
+    if (occupancy !== "present") {
       // An unread bay is not an empty one (#1218).
-      return slot?.presence_known === false ? "Unknown" : "Empty";
+      return occupancy === "unknown" ? "Unknown" : "Empty";
     }
     return slot.serial || slot.device_name || slot.pool_name || "Matched disk";
   }
 
   function storageViewRuntimeSecondaryLabel(slot) {
-    if (slot?.presence_known === false && !slot.occupied) {
+    const occupancy = slotOccupancy(slot);
+    if (occupancy === "unknown") {
       return "Whether this slot holds a disk is not known.";
     }
-    if (!slot || !slot.occupied) {
+    if (occupancy === "empty") {
       return "No live disk is currently landing in this storage-view slot.";
     }
     return [
@@ -927,7 +949,7 @@
   }
 
   function storageViewRuntimeTertiaryLabel(slot) {
-    if (!slot?.occupied) {
+    if (slotOccupancy(slot) !== "present") {
       return slot?.slot_size || "";
     }
     return [
@@ -989,7 +1011,8 @@
           slot_index: Number(slotValue),
           slot_label: `Slot ${Number(slotValue) + 1}`,
           occupied: false,
-          state: "empty",
+          presence_known: false,
+          state: "unknown",
           slot_size: null,
         };
         const visualState = slot.state === "matched" ? "healthy" : slot.state;
@@ -1046,7 +1069,8 @@
         slot_index: Number(slotValue),
         slot_label: `Slot ${Number(slotValue) + 1}`,
         occupied: false,
-        state: "empty",
+        presence_known: false,
+        state: "unknown",
         slot_size: null,
       };
       const visualState = slot.state === "matched" ? "healthy" : slot.state;
@@ -1140,7 +1164,8 @@
       const displaySlot = {
         slot_index: liveSlot.slot,
         slot_label: liveSlot.slot_label || formatSlotLabel(slotNumber),
-        occupied: Boolean(liveSlot.device_name || liveSlot.serial || liveSlot.pool_name),
+        occupied: slotOccupancy(liveSlot) === "present",
+        presence_known: slotOccupancy(liveSlot) !== "unknown",
         state: liveSlot.state || "unknown",
         slot_size: slotSize,
         device_name: liveSlot.device_name || null,
@@ -2246,8 +2271,8 @@
     if (!slot) {
       return "";
     }
-    if (!slot.device_name && !slot.occupied) {
-      return slot.presence_known === false ? "Whether this slot holds a disk is not known." : "This slot is empty.";
+    if (!slot.device_name && slotOccupancy(slot) !== "present") {
+      return slotOccupancy(slot) === "unknown" ? "Whether this slot holds a disk is not known." : "This slot is empty.";
     }
     const name = slot.device_name || `Slot ${slot.slot_label ?? state.selectedSlot}`;
     // Runtime slots carry bus, not the inventory record's raw.transport.
@@ -3900,7 +3925,7 @@
     if (slot.state === "unmapped") return "UNMAPPED";
     if (slot.state === "identify") return "LOCATE";
     if (slot.state === "fault") return "FAULT";
-    if (slot.present) return "PRESENT";
+    if (slotOccupancy(slot) === "present") return "PRESENT";
     return "UNKNOWN";
   }
 
@@ -6034,7 +6059,8 @@
       : {
           ...storageViewSlot,
           slot: storageViewSlot.slot_index,
-          present: Boolean(storageViewSlot.occupied),
+          present: slotOccupancy(storageViewSlot) === "present",
+          presence_known: slotOccupancy(storageViewSlot) !== "unknown",
         };
     return {
       key: String(storageViewSlot.slot_index),
@@ -6783,7 +6809,10 @@
     const persistentIdText = slot.gptid ? `${persistentIdLabel(slot)}: ${slot.gptid}` : `${persistentIdLabel(slot)}: n/a`;
     const lines = [
       `${selectedView?.label || "Storage View"} • ${slot.slot_label}`,
-      slot.occupied ? (slot.serial || slot.device_name || "Matched disk") : "No live disk matched",
+      {
+        present: slot.serial || slot.device_name || "Matched disk",
+        unknown: "Whether this slot holds a disk is not known.",
+      }[slotOccupancy(slot)] || "No live disk matched",
       slot.device_name ? `Device: ${slot.device_name}` : null,
       slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
       persistentIdText,
@@ -7167,7 +7196,8 @@
         slot_index: slotNumber,
         slot_label: `Slot ${slotNumber + 1}`,
         occupied: false,
-        state: "empty",
+        presence_known: false,
+        state: "unknown",
       };
       return { key: slotNumber, view, viewSlot, liveSlot: null };
     }
@@ -10456,12 +10486,16 @@
 
   function mappingHealthScope(snapshot, selectedView) {
     if (selectedView) {
-      const slots = (Array.isArray(selectedView.slots) ? selectedView.slots : []).map((slot) => ({
-        slot: slot.slot_index,
-        state: slot.state || (slot.occupied ? "matched" : "empty"),
-        present: slot.occupied === true,
-        mapping_source: slot.source || "unknown",
-      }));
+      const slots = (Array.isArray(selectedView.slots) ? selectedView.slots : []).map((slot) => {
+        const occupancy = slotOccupancy(slot);
+        return {
+          slot: slot.slot_index,
+          state: slot.state || ({ present: "matched", empty: "empty" }[occupancy] || "unknown"),
+          present: occupancy === "present",
+          presence_known: occupancy !== "unknown",
+          mapping_source: slot.source || "unknown",
+        };
+      });
       const layoutCount = (Array.isArray(selectedView.slot_layout) ? selectedView.slot_layout : [])
         .flat()
         .filter((slot) => Number.isInteger(slot)).length;
@@ -10484,18 +10518,21 @@
     const counts = { matched: 0, empty: 0, unmatched: 0, unverified: 0, unknown: 0 };
     (Array.isArray(slots) ? slots : []).forEach((slot) => {
       const slotState = String(slot?.state || "unknown").toLowerCase();
-      if (slotState === "empty") {
-        counts.empty += 1;
-      } else if (slotState === "unmapped") {
+      // Occupancy decides before the state does: a locate or fault light on a
+      // bay nobody read is not a disk, and a bay read as empty holds none (#1218).
+      const occupancy = slotOccupancy(slot);
+      if (slotState === "unmapped") {
         // A saved assignment whose disk was not found is a disk only when the
-        // bay was read as occupied; otherwise nothing was observed (#1218).
-        if (slot?.present === false || slot?.presence_known === false) {
-          counts.unverified += 1;
-        } else {
+        // bay was read as occupied; otherwise nothing was observed.
+        if (occupancy === "present") {
           counts.unmatched += 1;
+        } else {
+          counts.unverified += 1;
         }
-      } else if (slotState === "unknown") {
+      } else if (occupancy === "unknown" || slotState === "unknown") {
         counts.unknown += 1;
+      } else if (slotState === "empty" || occupancy === "empty") {
+        counts.empty += 1;
       } else {
         counts.matched += 1;
       }
@@ -12157,6 +12194,10 @@
     const unchanged = preview?.unchanged || [];
     // Bays whose disk is not the one the backup names (#1141).
     const diskWarnings = preview?.disk_warnings || [];
+    // A bay nobody read cannot be compared: its disk is listed apart and the
+    // message never calls it empty (#1218).
+    const changedDisks = diskWarnings.filter((entry) => entry.occupancy !== "unknown");
+    const uncheckedDisks = diskWarnings.filter((entry) => entry.occupancy === "unknown");
     const formatDiskWarning = (entry) => {
       const label = fieldLabel(entry.field);
       const now = entry.current === null || entry.current === undefined
@@ -12170,10 +12211,15 @@
       `Update (${updates.length}): ${formatEntries(updates, (entry) => formatChanges(entry.changes))}`,
       `Remove (${removals.length}): ${formatEntries(removals, (entry) => formatRecord(entry.current))}`,
       `Unchanged (${unchanged.length}): ${formatEntries(unchanged, () => "")}`,
-      ...(diskWarnings.length ? [
-        `This bay now holds a different disk (${diskWarnings.length}): ${formatEntries(diskWarnings, formatDiskWarning)}`,
-        "Confirming restores the backup's assignments to these bays anyway.",
+      ...(changedDisks.length ? [
+        `This bay now holds a different disk (${changedDisks.length}): ${formatEntries(changedDisks, formatDiskWarning)}`,
       ] : []),
+      ...(uncheckedDisks.length ? [
+        `The current disk cannot be checked (${uncheckedDisks.length}): ${formatEntries(
+          uncheckedDisks, (entry) => `backup ${fieldLabel(entry.field)} ${formatValue(entry.backup)}`,
+        )}`,
+      ] : []),
+      ...(diskWarnings.length ? ["Confirming restores the backup's assignments to these bays anyway."] : []),
       "If the inventory changes before you confirm, the restore is canceled.",
     ].join("\n");
   }

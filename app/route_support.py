@@ -41,6 +41,7 @@ from app.models.domain import (
     InventorySnapshot,
     SnapshotExportRequest,
     StorageViewRuntimePayload,
+    slot_occupancy,
 )
 from app.perf import add_perf_metadata, perf_stage
 from app.script_json import register_script_json_filters
@@ -479,7 +480,7 @@ async def _load_storage_view_export_source(
     for view in filtered_runtime.views:
         slot_cache: dict[str, dict[str, Any]] = {}
         for runtime_slot in view.slots:
-            if not runtime_slot.occupied:
+            if slot_occupancy(runtime_slot) != "present":
                 continue
             try:
                 summary = await service.get_storage_view_slot_smart_summary(

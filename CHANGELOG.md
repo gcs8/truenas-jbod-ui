@@ -51,10 +51,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   CORE `sesutil show` row without a device name, keeps its mapped disk and
   shows as unknown instead of empty on every platform. Such a bay is no longer
   turned occupied by an `OK` status; history keeps its last recorded disk and
-  records no removal for it; a recorded SMART failure or temperature stays in
-  the alert metrics until the disk is read again; mapping health reports a
-  saved bay assignment that cannot be verified instead of a disk that is not
-  matched; and storage-view tiles show `Unknown` instead of `Empty`. Quantastor
+  records no removal for it; a recorded SMART failure or temperature for that
+  disk stays in the alert metrics until it is read again, while evidence for a
+  disk no longer in any configured enclosure is dropped; mapping health counts
+  it, even with a locate or fault light on, as unknown rather than as a disk,
+  and reports a saved bay assignment there as one that cannot be verified;
+  storage-view tiles, saved-view bays the backing enclosure does not list and
+  manual-only layout bays show `Unknown` instead of `Empty`; Storage Fabric
+  shows its `present` value as `unknown`; disk retention accounting does not
+  count a saved assignment there as a rendered disk; and the bay-assignment
+  restore preview says its current disk cannot be checked instead of calling
+  the bay empty. Quantastor
   no longer hides a known disk behind a zero SAS address when stronger
   evidence says the bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does

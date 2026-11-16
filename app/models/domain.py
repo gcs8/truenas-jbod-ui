@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
@@ -11,6 +12,36 @@ from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+SlotOccupancy = Literal["present", "empty", "unknown"]
+
+
+def slot_occupancy(slot: Any) -> SlotOccupancy:
+    """The one reader of a bay's occupancy (#1218): present, empty or unknown.
+
+    Slot views and history rows say ``present``, storage-view runtime slots say
+    ``occupied``, and ``presence_known`` says whether occupancy was read at all.
+    The legacy boolean alone cannot tell an empty bay from an unread one, so
+    every place that states emptiness, counts a disk or words a message about
+    the current occupant asks this function. ``slotOccupancy`` in
+    ``app/static/app.js`` is the page's twin. A slot with no boolean occupancy
+    is unknown.
+    """
+
+    if slot is None:
+        return "unknown"
+    if isinstance(slot, Mapping):
+        known = slot.get("presence_known")
+        flag = slot.get("present") if "present" in slot else slot.get("occupied")
+    else:
+        known = getattr(slot, "presence_known", True)
+        flag = getattr(slot, "present", None)
+        if flag is None:
+            flag = getattr(slot, "occupied", None)
+    if known is False or not isinstance(flag, bool):
+        return "unknown"
+    return "present" if flag else "empty"
 
 
 def trim_optional_text(value: str | None, *, max_length: int) -> str | None:
