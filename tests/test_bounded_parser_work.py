@@ -12,29 +12,50 @@ A few whole-line patterns in the MPR event parser are linear by construction
 `.+$`, which cannot fail on a single line). The tests name those patterns
 explicitly and charge them by region instead of region squared. Any other
 pattern, including a new one, is still charged as quadratic.
+
+The later tests measure the real regex engine as a growth ratio between two
+input sizes, and sweep every pattern in the parser modules (see the section
+comments below).
 """
 
 from __future__ import annotations
 
+import ast
 import random
 import re
 import sys
+import time
 import types
 import unittest
+from dataclasses import dataclass
+from pathlib import Path
+from re import _constants as _sre  # the parsed-pattern opcodes, for the pattern sweep
+from re import _parser as _sre_parse
 from unittest import mock
 
 from app.services import parsers
 from app.services.parsers import (
+    normalize_text,
+    parse_camcontrol_devlist,
+    parse_glabel_status,
     parse_sesutil_map,
     parse_sesutil_show_enclosures,
     parse_sg_ses_aes,
     parse_sg_ses_enclosure_status,
     parse_sg_ses_join_filter,
+    parse_smartctl_text_enrichment,
+    parse_unifi_gpio_debug,
 )
 from app.services import sas_fabric_parsers
 from app.services.sas_diagnostics import scsi
 from app.services.sas_diagnostics.scsi import MAX_CDB_TEXT_CHARS, decode_scsi_cdb_message
-from app.services.sas_fabric_parsers import _parse_mpr_sense_message, parse_mpr_dmesg_events
+from app.services.sas_fabric_parsers import (
+    _parse_mpr_sense_message,
+    parse_mpr_dmesg_events,
+    parse_mpr_expanders,
+    parse_mpr_sysctl_locations,
+    parse_pciconf_sas_controllers,
+)
 
 SIZES = (2000, 4000, 8000)
 # Doubling the input of a linear pass doubles the count plus a constant.
@@ -620,6 +641,683 @@ class SesPreCountWorkTests(BoundedWorkAssertions):
         assert slot_bracket is not None and not_slot_bracket is not None
         self.assertEqual(slot_bracket.enclosure_name, "ACME JBOD-24 0001")
         self.assertEqual(not_slot_bracket.enclosure_name, "Slot01[x")
+
+
+# --- Linear work, measured ---------------------------------------------------
+#
+# The work meter above models regex cost; it cannot see inside the regex
+# engine. The tests below time the real engine instead, but only as a ratio:
+# the same call on an input four times longer may take at most
+# LINEAR_GROWTH_LIMIT times as long. Linear work grows about 4x, quadratic work
+# about 16x, so the margin absorbs a busy runner. Each sample repeats the call
+# for at least SAMPLE_SECONDS and keeps the fastest of three, and a ratio over
+# the limit is measured again before it fails.
+
+LINEAR_GROWTH_LIMIT = 8.0
+SAMPLE_SECONDS = 0.002
+
+
+def _seconds_per_call(call, text: str) -> float:  # noqa: ANN001
+    best = float("inf")
+    for _ in range(3):
+        calls = 0
+        start = time.perf_counter()
+        while True:
+            call(text)
+            calls += 1
+            elapsed = time.perf_counter() - start
+            if elapsed >= SAMPLE_SECONDS:
+                break
+        best = min(best, elapsed / calls)
+    return best
+
+
+def _growth_ratio(call, small: str, large: str) -> float:  # noqa: ANN001
+    return _seconds_per_call(call, large) / _seconds_per_call(call, small)
+
+
+def _superlinear_growth(call, build, size: int) -> str | None:  # noqa: ANN001
+    """None when the work grows linearly, else a description of the growth."""
+
+    small, large = build(size), build(4 * size)
+    ratios = []
+    for _ in range(3):
+        ratios.append(_growth_ratio(call, small, large))
+        if ratios[-1] <= LINEAR_GROWTH_LIMIT:
+            return None
+    return (
+        f"work grew {min(ratios):.1f}x when the input grew 4x "
+        f"({len(small)} -> {len(large)} characters); linear work grows about 4x"
+    )
+
+
+class LinearGrowthAssertions(unittest.TestCase):
+    def assert_linear_growth(self, call, build, size: int = 2000) -> None:  # noqa: ANN001
+        growth = _superlinear_growth(call, build, size)
+        if growth is not None:
+            self.fail(growth)
+
+
+# The patterns these parsers used before this change, kept as the reference
+# for the exactness tests below.
+_REFERENCE_EXPANDER_PHY_PATTERN = re.compile(
+    r"^\s*(\d+)\s+(?:(\d+)\s+([0-9a-fA-F]{4})\s+([\d.]+)|)\s*([\d.]+|\?\?\?)\s+([\d.]+|\?\?\?)\s+(.+?)\s*$"
+)
+_REFERENCE_PCICONF_ATTRIBUTE_PATTERN = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+_REFERENCE_SYSCTL_ATTRIBUTE_PATTERN = re.compile(r"([a-zA-Z_]+)=([^\s]+)")
+_REFERENCE_CAMCONTROL_PATTERN = re.compile(
+    r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)"
+)
+_REFERENCE_SATA_CURRENT_PATTERN = re.compile(r"\(current:\s*([^)]+)\)", re.IGNORECASE)
+_REFERENCE_GPIO_PATTERN = re.compile(
+    r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
+    re.IGNORECASE,
+)
+# Whitespace and digits beyond ASCII, which `\s`, `\d` and the string methods
+# agree on, and no character that `str.splitlines` breaks a line at.
+_EXACTNESS_SPACES = (" ", "  ", "   ", "\t", "\xa0", "\u2003", "\x1f")
+
+
+def _random_text(rng: random.Random, tokens: tuple[str, ...], spaces: tuple[str, ...], length: int) -> str:
+    pieces = []
+    for _ in range(rng.randrange(length)):
+        pieces.append(rng.choice(tokens))
+        if rng.random() < 0.7:
+            pieces.append(rng.choice(spaces))
+    return "".join(pieces)
+
+
+# A synthetic expander header; the address is built at run time.
+_EXPANDER_HEADER = f"  8   {0xABC:016x}   0009   0001   0002   1"
+
+
+def _expanders(*phy_lines: str):  # noqa: ANN202
+    return parse_mpr_expanders("\n".join((_EXPANDER_HEADER, *phy_lines)))
+
+
+class MprExpanderPhyLineWorkTests(LinearGrowthAssertions):
+    def test_phy_lines_with_long_runs_have_linear_work(self) -> None:
+        shapes = {
+            # A long whitespace run inside the device text.
+            "device tail": (
+                lambda size: "  1   2   0001   12.0   12.0   12.0   X" + " " * size + "Y",
+                lambda size: [("1", "2", "0001", "12.0", "12.0", "12.0", "X" + " " * size + "Y")],
+            ),
+            # The optional fields are absent and whitespace runs on.
+            "missing speed": (lambda size: "  1" + " " * size + "X", lambda size: []),
+            # A digit run where speed and min meet, with nothing after it.
+            "speed digits": (
+                lambda size: "  1   2   0001   " + "1" * size + "X",
+                lambda size: [("1", None, None, None, "2", "0001", "1" * size + "X")],
+            ),
+            "min and max gap": (
+                lambda size: "  1   12.0   12.0" + " " * size,
+                lambda size: [("1", None, None, None, "12.0", "12.0", "")],
+            ),
+        }
+        keys = ("phy", "remote_phy", "dev_handle", "speed", "min", "max", "device")
+        for name, (build, expected) in shapes.items():
+            with self.subTest(shape=name):
+                parsed = _expanders(build(50))
+                self.assertEqual([tuple(row[key] for key in keys) for row in parsed[0]["phys"]], expected(50))
+                self.assert_linear_growth(lambda text: _expanders(text), build)
+
+    def test_phy_lines_match_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = (
+            "0", "1", "12", "12.0", "3.0", "6.0", ".", "1.", "..", "٣", "?", "??", "???", "????", "0001", "abcd",
+            "ABCD", "000g", "00001", "x", "SAS", "Target", "Initiator", "No", "Device", "phy", "phy 3", "12.012.0",
+            "3.0???",
+        )
+        cases = [
+            "     0       0      000a       12     3.0    12     SAS Target",
+            "    10                                3.0    12     No Device",
+            "  1   2   0001   12.0   12.0   12.0  ",
+            "  1   2   0001   12.0   12.0   12.0 ",
+            "  1   2   0001   12.0   12.0   SAS Target",
+            "  1   2   0001   12.012.0   12.0   x",
+            "  1   2   0001   12.0???   12.0   x",
+            "  1   2   0001   1   12.0   x",
+            "  1   ???   ???   phy 4",
+            "  1   ???   ???  ",
+            "1 2",
+        ] + [_random_text(rng, tokens, _EXACTNESS_SPACES, 12) for _ in range(6000)]
+        for line in cases:
+            if not line or _expanders(line)[1:]:
+                continue  # empty, or another expander header
+            reference = _REFERENCE_EXPANDER_PHY_PATTERN.match(line)
+            expected = []
+            if reference is not None and not reference.group(7).strip().lower().startswith("phy "):
+                expected = [
+                    {
+                        "phy": reference.group(1),
+                        "remote_phy": reference.group(2),
+                        "dev_handle": reference.group(3),
+                        "speed": reference.group(4),
+                        "min": reference.group(5),
+                        "max": reference.group(6),
+                        "device": reference.group(7).strip(),
+                    }
+                ]
+            with self.subTest(line=line):
+                self.assertEqual(_expanders(line)[0]["phys"], expected)
+
+
+class SasMetadataAttributeWorkTests(LinearGrowthAssertions):
+    def test_attribute_runs_without_equals_have_linear_work(self) -> None:
+        def pciconf(text: str):  # noqa: ANN202
+            return parse_pciconf_sas_controllers(text)
+
+        def sysctl(text: str):  # noqa: ANN202
+            return parse_mpr_sysctl_locations(text)
+
+        shapes = {
+            "pciconf key run": (pciconf, lambda size: "mpr0@pci0:0:1:0: " + "A" * size, {}),
+            "pciconf after a valid attribute": (
+                pciconf,
+                lambda size: "mpr0@pci0:0:1:0: class=0x010700 " + "A" * size,
+                {"class_code": "0x010700"},
+            ),
+            "pciconf digit run": (pciconf, lambda size: "mpr0@pci0:0:1:0: " + "1" * size, {}),
+            "pciconf key runs and separators": (
+                pciconf,
+                lambda size: "mpr0@pci0:0:1:0: " + "Ab_1 " * (size // 5),
+                {},
+            ),
+            "sysctl key run": (sysctl, lambda size: "dev.mpr.0.%location: " + "A" * size, {}),
+            "sysctl after a valid attribute": (
+                sysctl,
+                lambda size: "dev.mpr.0.%location: slot=1 " + "a" * size,
+                {"pci_slot": "1"},
+            ),
+        }
+        for name, (parse, build, attributes) in shapes.items():
+            with self.subTest(shape=name):
+                parsed = parse(build(50))
+                row = parsed[0] if isinstance(parsed, list) else parsed["mpr0"]
+                for key, value in attributes.items():
+                    self.assertEqual(row[key], value)
+                self.assert_linear_growth(parse, build)
+
+    def test_attributes_match_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = ("a", "A", "z", "_", "0", "9", "=", "==", "x=", "=y", "class=0x01", "dbsf=pci0:0:1:0", ".", "-", "é")
+        cases = ["slot=1 function=0 dbsf=pci0:3:0:0 handle=\\_SB_.PCI0", "a=b=c d= =e f==g", "1a=2 _=_"] + [
+            _random_text(rng, tokens, (" ", "\t", "\xa0", ""), 10) for _ in range(6000)
+        ]
+        pairs = (
+            (sas_fabric_parsers._PCICONF_ATTRIBUTE_PATTERN, _REFERENCE_PCICONF_ATTRIBUTE_PATTERN),
+            (sas_fabric_parsers._SYSCTL_LOCATION_ATTRIBUTE_PATTERN, _REFERENCE_SYSCTL_ATTRIBUTE_PATTERN),
+        )
+        for text in cases:
+            for pattern, reference in pairs:
+                with self.subTest(text=text, pattern=pattern.pattern):
+                    self.assertEqual(pattern.findall(text), reference.findall(text))
+
+
+class ParserLineWorkTests(LinearGrowthAssertions):
+    def test_camcontrol_device_lines_have_linear_work(self) -> None:
+        tail = " at scbus0 target 0 lun 0 (pass0,da0)"
+        shapes = {
+            "models without a target": (lambda size: "<a>" * (size // 3), {}),
+            "unclosed model": (lambda size: "<" * size, {}),
+            "target fields without a device list": (
+                lambda size: "<a> " + "target 1 lun 2 (" * (size // 16),
+                {},
+            ),
+            "match after many models": (lambda size: "<a>" * (size // 3) + tail, {"da0": "a"}),
+            "open brackets then a match": (lambda size: "<>" * (size // 2) + "<disk>" + tail, {"da0": "disk"}),
+        }
+        for name, (build, models) in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(parse_camcontrol_devlist(build(60)).models, models)
+                self.assert_linear_growth(parse_camcontrol_devlist, build)
+
+    def test_camcontrol_device_lines_match_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = (
+            "<", ">", "<>", "<a>", "<disk 1>", "target", "lun", "0", "12", "(", ")", "()", "(da0)", "(pass0,da0)",
+            "at", "scbus0", "x", ">target",
+        )
+        cases = [
+            "<SEAGATE ST4000NM0023 0004>        at scbus0 target 0 lun 0 (pass0,da0)",
+            "<>  <a> target 1 lun 2 (da1)",
+            "<a> target 1 lun 2 () target 3 lun 4 (da3)",
+            "<a> target 1 lun 2 (da1) <b> target 3 lun 4 (da3)",
+            "<a target 1 lun 2 (da1)",
+            "<a> target 1 lun 2 (da1",
+        ] + [_random_text(rng, tokens, (" ", "  ", "\t", ""), 14) for _ in range(6000)]
+        for line in cases:
+            reference = _REFERENCE_CAMCONTROL_PATTERN.search(line)
+            match = parsers._match_camcontrol_device_line(line)
+            with self.subTest(line=line):
+                if reference is None:
+                    self.assertIsNone(match)
+                    continue
+                assert match is not None
+                self.assertEqual(match.span(), reference.span())
+                self.assertEqual(match.groupdict(), reference.groupdict())
+
+    def test_sata_current_link_rate_has_linear_work(self) -> None:
+        def parse(text: str):  # noqa: ANN202
+            return parse_smartctl_text_enrichment("SATA Version is: " + text)
+
+        shapes = {
+            "whitespace without a close": (lambda size: "SATA 3.3, 6.0 Gb/s (current:" + " " * size + "x", None),
+            "repeated opens": (lambda size: "SATA 3.3 " + "(current:x" * (size // 10), None),
+            "close at the end": (lambda size: "SATA 3.3 (current:" + " " * size + "x)", "x"),
+        }
+        for name, (build, rate) in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(parse(build(60)).get("negotiated_link_rate"), rate)
+                self.assert_linear_growth(parse, build)
+
+    def test_sata_current_link_rate_matches_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = ("(current:", "(CURRENT:", "(", ")", "6.0 Gb/s", "x", ",", "SATA 3.3", ")(current:")
+        cases = ["SATA 3.3, 6.0 Gb/s (current: 6.0 Gb/s)", "(current: )", "(current:)", "(current:  ) x"] + [
+            _random_text(rng, tokens, (" ", "  ", "\t", ""), 8) for _ in range(6000)
+        ]
+        for value in cases:
+            reference = _REFERENCE_SATA_CURRENT_PATTERN.search(value)
+            match = parsers._SATA_CURRENT_LINK_RATE_PATTERN.search(value, 0, value.rfind(")") + 1)
+            with self.subTest(value=value):
+                self.assertEqual(match and (match.span(), match.groups()), reference and (reference.span(), reference.groups()))
+                parsed = parse_smartctl_text_enrichment("SATA Version is: " + value)
+                self.assertEqual(
+                    parsed.get("negotiated_link_rate"),
+                    reference and normalize_text(reference.group(1)),
+                )
+
+    def test_unifi_gpio_lines_have_linear_work(self) -> None:
+        line = " gpio-500 (                    |hdd@3               ) out hi"
+        shapes = {
+            "opens without a bay": (lambda size: " gpio-1 (" * (size // 9), {}),
+            "match after many opens": (lambda size: " gpio-1 (" * (size // 9) + line, {3: True}),
+            "bays without a direction": (lambda size: " gpio-1 (" + "|hdd@1 )" * (size // 8), {}),
+        }
+        for name, (build, states) in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(parse_unifi_gpio_debug(build(90)), states)
+                self.assert_linear_growth(parse_unifi_gpio_debug, build)
+
+    def test_unifi_gpio_lines_match_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = ("gpio-1", "GPIO-500", "gpio-", "(", ")", "|hdd@", "|hdd@3", "3", "out", "in", "hi", "lo", "?", "|")
+        cases = [
+            " gpio-500 (                    |hdd@0               ) out hi",
+            " gpio-1 ( |hdd@1 ) out lo gpio-2 ( |hdd@2 ) in hi",
+            " gpio-1 ( |hdd@1 ) out x |hdd@2 ) in hi",
+        ] + [_random_text(rng, tokens, (" ", "  ", "\t", ""), 14) for _ in range(6000)]
+        for line in cases:
+            reference = _REFERENCE_GPIO_PATTERN.search(line)
+            with self.subTest(line=line):
+                expected = {}
+                if reference is not None and reference.group("direction").lower() == "out":
+                    state = reference.group("state").lower()
+                    if state in {"hi", "lo"}:
+                        expected = {int(reference.group("slot")): state == "hi"}
+                self.assertEqual(parse_unifi_gpio_debug(line), expected)
+
+
+class GlabelStatusWorkTests(LinearGrowthAssertions):
+    def test_many_labels_on_one_provider_have_linear_work(self) -> None:
+        def build(size: int) -> str:
+            return "\n".join(f"gptid/label-{index}  N/A  da0p{index % 4 + 1}" for index in range(size // 30))
+
+        info = parse_glabel_status(build(300) + "\ngptid/label-0  N/A  da0p1")
+        self.assertEqual(info.device_to_gptids["da0"], [f"gptid/label-{index}" for index in range(10)])
+        self.assert_linear_growth(parse_glabel_status, build, size=60000)
+
+
+class SgSesJoinFirstHeaderTests(unittest.TestCase):
+    def test_first_of_two_valid_headers_supplies_the_element(self) -> None:
+        line = "Slot01 [0,1] Element type: Device slot [0,2] Element type: Array device slot"
+
+        self.assertEqual(
+            parsers._match_sg_ses_join_element_header(line),
+            ("Slot01", "0", "1", "Device slot [0,2] Element type: Array device slot"),
+        )
+        # The first header's type is the rest of the line, which is not a
+        # device slot, so no slot comes from this line; the second header
+        # would have made element 2 a slot.
+        self.assertIsNone(
+            parse_sg_ses_join_filter(
+                line + "\n  Predicted failure=0, Disabled=0, Swap=0, status: OK",
+                "sg_ses join /dev/sg7",
+            )
+        )
+
+
+# --- Every pattern in the parser modules -------------------------------------
+#
+# The modules this suite covers are read from source: every `re` call and every
+# compiled pattern, with the method each one is used with. Every quantifier
+# that can repeat without bound is then "pumped": the shortest text that reaches
+# it, a long run of one character the quantifier accepts (or of the text that
+# reaches it, so that every start of a search is tried too), and an ending that
+# makes the rest of the pattern fail. Each pumped text is run at two lengths
+# through the pattern's own method, or through the function that bounds it
+# where a pattern is only linear at its call site. A pattern added later is
+# swept the same way without editing this test.
+
+SWEPT_MODULES = (parsers, sas_fabric_parsers, scsi)
+_RE_FUNCTIONS = frozenset({"compile", "match", "search", "fullmatch", "findall", "finditer", "sub", "subn", "split"})
+_PATTERN_METHODS = frozenset(_RE_FUNCTIONS - {"compile"})
+_FLAG_POSITIONS = {"compile": 1, "match": 2, "search": 2, "fullmatch": 2, "findall": 2, "finditer": 2, "sub": 4,
+                   "subn": 4, "split": 3}
+# Functions that compile a pattern their callers pass in: (argument position,
+# flags, method).
+_PATTERNS_FROM_CALLERS = {"_ses_input_exceeds_bounds": (1, re.IGNORECASE, "match")}
+# Patterns that do more than linear work under an unanchored search, so their
+# callers bound them. Each one is pumped through that caller instead of the
+# bare pattern, and each has its own named tests above.
+_CALL_SITE_BOUNDED = {
+    r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)": (
+        decode_scsi_cdb_message,
+        "matched only inside the windows found around CDB:",
+    ),
+    r"[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?\.\s+\Z": (
+        decode_scsi_cdb_message,
+        "searched only in the window before CDB:",
+    ),
+    r"CDB:\s+[0-9a-fA-F][0-9a-fA-F ]*": (decode_scsi_cdb_message, "matched only in the window after CDB:"),
+    r"SCSI sense:\s*(?P<sense>\S.*?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\(": (
+        _parse_mpr_sense_message,
+        "matched only in the window after SCSI sense:",
+    ),
+    r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)": (
+        parse_camcontrol_devlist,
+        "matched once at the first model, up to the last )",
+    ),
+    r"\(current:\s*([^)]+)\)": (
+        lambda text: parse_smartctl_text_enrichment("SATA Version is: " + text),
+        "searched only up to the last )",
+    ),
+    r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)": (
+        parse_unifi_gpio_debug,
+        "matched once at the first gpio-N (",
+    ),
+}
+_PUMP_CHARACTERS = tuple(" \t\xa0aA0f9_.,:=-/x()[]?<>;#%+*'\"zZ!@|\n\x00é٣")
+_PUMP_ENDINGS = ("", "\x00", "!", "\n!", "x\x00")
+_PUMP_SIZE = 1000
+# Screening uses one fastest-of-three call per length. Below this many seconds
+# at the longer length a ratio is timer noise: quadratic work at that length
+# takes far longer. Anything over the limit is measured again, in full.
+_SCREEN_FLOOR_SECONDS = 0.001
+
+
+@dataclass(frozen=True)
+class _RegexSite:
+    module: str
+    line: int
+    pattern: str
+    flags: int
+    methods: frozenset[str]
+
+
+def _flag_value(node: ast.expr) -> int:
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "re":
+        return int(getattr(re, node.attr))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _flag_value(node.left) | _flag_value(node.right)
+    raise AssertionError(f"unrecognized regex flags: {ast.dump(node)}")
+
+
+def _literal_pattern(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        # An escaped value interpolated into the pattern: a literal word.
+        return "".join(part.value if isinstance(part, ast.Constant) else "Field" for part in node.values)
+    return None
+
+
+def _re_call(node: ast.AST) -> str | None:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "re"
+        and node.func.attr in _RE_FUNCTIONS
+    ):
+        return node.func.attr
+    return None
+
+
+def _method_calls(scope: ast.AST, name: str) -> frozenset[str]:
+    return frozenset(
+        node.func.attr
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == name
+        and node.func.attr in _PATTERN_METHODS
+    )
+
+
+def _regex_sites(module: types.ModuleType) -> list[_RegexSite]:
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    name = module.__name__
+    # The innermost function around each node: ast.walk visits outer
+    # functions first, so inner ones overwrite them.
+    owners: dict[int, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for function in ast.walk(tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(function):
+                owners[id(child)] = function
+    assigned: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            assigned[id(node.value)] = node.targets[0].id
+
+    sites = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _PATTERNS_FROM_CALLERS:
+            position, flags, method = _PATTERNS_FROM_CALLERS[node.func.id]
+            pattern = _literal_pattern(node.args[position])
+            if pattern is not None:
+                sites.append(_RegexSite(name, node.lineno, pattern, flags, frozenset({method})))
+            continue
+        function = _re_call(node)
+        if function is None:
+            continue
+        pattern = _literal_pattern(node.args[0])
+        if pattern is None:
+            owner = owners.get(id(node))
+            if owner is not None and owner.name in _PATTERNS_FROM_CALLERS:
+                continue  # swept at each caller above
+            raise AssertionError(f"{name}:{node.lineno}: a pattern that is not a literal cannot be swept")
+        flags_node = next((keyword.value for keyword in node.keywords if keyword.arg == "flags"), None)
+        if flags_node is None and len(node.args) > _FLAG_POSITIONS[function]:
+            flags_node = node.args[_FLAG_POSITIONS[function]]
+        flags = _flag_value(flags_node) if flags_node is not None else 0
+        if function == "compile":
+            bound = assigned.get(id(node))
+            scope = owners.get(id(node), tree)
+            methods = _method_calls(scope, bound) if bound else frozenset()
+            if bound is None or not methods or (scope is tree and not bound.startswith("_")):
+                # Unknown or shared use: sweep it as an unanchored search too.
+                methods |= {"search"}
+        else:
+            methods = frozenset({function})
+        sites.append(_RegexSite(name, node.lineno, pattern, flags, methods))
+    return sites
+
+
+def _class_member(item: tuple, character: str, flags: int) -> bool:
+    op, value = item
+    if op is _sre.LITERAL:
+        return re.fullmatch(re.escape(chr(value)), character, flags) is not None
+    if op is _sre.NOT_LITERAL:
+        return re.fullmatch(re.escape(chr(value)), character, flags) is None
+    if op is _sre.ANY:
+        return character != "\n" or bool(flags & re.DOTALL)
+    if op is _sre.IN:
+        parts = []
+        for member_op, member in value:
+            if member_op is _sre.NEGATE:
+                parts.insert(0, "^")
+            elif member_op is _sre.LITERAL:
+                parts.append(re.escape(chr(member)))
+            elif member_op is _sre.RANGE:
+                parts.append(f"{re.escape(chr(member[0]))}-{re.escape(chr(member[1]))}")
+            elif member_op is _sre.CATEGORY:
+                parts.append(_CATEGORY_CLASSES[member])
+            else:
+                raise AssertionError(f"unsupported class member {member_op}")
+        return re.fullmatch("[" + "".join(parts) + "]", character, flags) is not None
+    return False
+
+
+_CATEGORY_CLASSES = {
+    _sre.CATEGORY_DIGIT: r"\d",
+    _sre.CATEGORY_NOT_DIGIT: r"\D",
+    _sre.CATEGORY_SPACE: r"\s",
+    _sre.CATEGORY_NOT_SPACE: r"\S",
+    _sre.CATEGORY_WORD: r"\w",
+    _sre.CATEGORY_NOT_WORD: r"\W",
+}
+_SINGLE_CHARACTER_OPS = (_sre.LITERAL, _sre.NOT_LITERAL, _sre.ANY, _sre.IN)
+_REPEAT_OPS = (_sre.MAX_REPEAT, _sre.MIN_REPEAT, _sre.POSSESSIVE_REPEAT)
+
+
+def _shortest_text(items, flags: int) -> str:  # noqa: ANN001
+    """A short text that the parsed items accept, ignoring anchors and lookarounds."""
+
+    text = []
+    for op, value in items:
+        if op in _SINGLE_CHARACTER_OPS:
+            candidates = _PUMP_CHARACTERS + tuple(chr(code) for code in range(32, 127))
+            text.append(next(character for character in candidates if _class_member((op, value), character, flags)))
+        elif op in _REPEAT_OPS:
+            text.append(_shortest_text(value[2], flags) * value[0])
+        elif op is _sre.SUBPATTERN:
+            text.append(_shortest_text(value[-1], flags))
+        elif op is _sre.ATOMIC_GROUP:
+            text.append(_shortest_text(value, flags))
+        elif op is _sre.BRANCH:
+            text.append(_shortest_text(value[1][0], flags))
+        elif op not in (_sre.AT, _sre.ASSERT, _sre.ASSERT_NOT):
+            raise AssertionError(f"unsupported regex construct {op}")
+    return "".join(text)
+
+
+def _pump_points(items, flags: int, before: str = "", after: str = ""):  # noqa: ANN001, ANN202
+    """(text before, repeated unit, text after) for every unbounded quantifier."""
+
+    items = list(items)
+    for index, (op, value) in enumerate(items):
+        prefix = before + _shortest_text(items[:index], flags)
+        suffix = _shortest_text(items[index + 1 :], flags) + after
+        if op in _REPEAT_OPS:
+            body = list(value[2])
+            if value[1] is _sre.MAXREPEAT or value[1] > 64:
+                if len(body) == 1 and body[0][0] in _SINGLE_CHARACTER_OPS:
+                    units = [character for character in _PUMP_CHARACTERS if _class_member(body[0], character, flags)]
+                else:
+                    units = [_shortest_text(body, flags) or "x"]
+                for unit in units:
+                    yield prefix, unit, suffix
+                    if prefix:
+                        yield "", prefix + unit, suffix
+            yield from _pump_points(body, flags, prefix, suffix)
+        elif op is _sre.SUBPATTERN:
+            yield from _pump_points(value[-1], flags, prefix, suffix)
+        elif op is _sre.ATOMIC_GROUP:
+            yield from _pump_points(value, flags, prefix, suffix)
+        elif op is _sre.BRANCH:
+            for alternative in value[1]:
+                yield from _pump_points(alternative, flags, prefix, suffix)
+        elif op in (_sre.ASSERT, _sre.ASSERT_NOT):
+            yield from _pump_points(value[1], flags, prefix, suffix)
+
+
+def _pumped_texts(pattern: str, flags: int):  # noqa: ANN202
+    """(builder of a text of about `size` characters, label) for every pump."""
+
+    seen = set()
+    for prefix, unit, suffix in _pump_points(_sre_parse.parse(pattern, flags).data, flags):
+        for ending in (*_PUMP_ENDINGS, suffix, suffix + "\x00"):
+            key = (prefix, unit, ending)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield (
+                lambda size, prefix=prefix, unit=unit, ending=ending: (
+                    prefix + unit * max(1, size // len(unit)) + ending
+                ),
+                f"{prefix[:30]!r} + {unit[:30]!r} * n + {ending[:30]!r}",
+            )
+
+
+def _pattern_call(pattern: re.Pattern[str], method: str):  # noqa: ANN202
+    if method in {"sub", "subn"}:
+        return lambda text: getattr(pattern, method)("", text)
+    return getattr(pattern, method)
+
+
+def _fastest_call(call, text: str) -> float:  # noqa: ANN001
+    best = float("inf")
+    for _ in range(3):
+        start = time.perf_counter()
+        call(text)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+class ParserPatternSweepTests(LinearGrowthAssertions):
+    maxDiff = None
+
+    def test_every_pattern_in_the_parser_modules_is_swept(self) -> None:
+        sites = [site for module in SWEPT_MODULES for site in _regex_sites(module)]
+        patterns = {site.pattern for site in sites}
+
+        # The sweep found the patterns this suite already knows about, so the
+        # source reading works; and every call-site exception still exists.
+        self.assertGreater(len(sites), 100)
+        for known in (r"[^a-z0-9]+", r"^\s*Element\s+\d+,\s+Type:", r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})"):
+            self.assertIn(known, patterns)
+        self.assertEqual(set(_CALL_SITE_BOUNDED) - patterns, set())
+        for site in sites:
+            with self.subTest(site=f"{site.module}:{site.line}"):
+                self.assertTrue(site.methods)
+                self.assertTrue(site.methods <= _PATTERN_METHODS, site.methods)
+                # Every pattern parses into constructs the pump understands.
+                list(_pumped_texts(site.pattern, site.flags))
+
+    def test_every_unbounded_quantifier_does_linear_work(self) -> None:
+        calls: dict[tuple, tuple] = {}
+        for module in SWEPT_MODULES:
+            for site in _regex_sites(module):
+                if site.pattern in _CALL_SITE_BOUNDED:
+                    call, _reason = _CALL_SITE_BOUNDED[site.pattern]
+                    calls.setdefault((site.pattern, "caller"), (call, site))
+                    continue
+                compiled = re.compile(site.pattern, site.flags)
+                for method in sorted(site.methods):
+                    calls.setdefault((site.pattern, site.flags, method), (_pattern_call(compiled, method), site))
+
+        pumps = 0
+        superlinear = []
+        for (pattern, *_), (call, site) in calls.items():
+            for build, label in _pumped_texts(pattern, site.flags):
+                pumps += 1
+                small, large = build(_PUMP_SIZE), build(4 * _PUMP_SIZE)
+                large_seconds = _fastest_call(call, large)
+                if large_seconds < _SCREEN_FLOOR_SECONDS:
+                    continue
+                if large_seconds <= LINEAR_GROWTH_LIMIT * _fastest_call(call, small):
+                    continue
+                growth = _superlinear_growth(call, build, _PUMP_SIZE)
+                if growth is not None:
+                    # One reproduction per pattern is enough.
+                    superlinear.append(f"{site.module}:{site.line} {pattern!r}: {label}: {growth}")
+                    break
+        self.assertGreater(pumps, 1000)
+        self.assertEqual(superlinear, [])
 
 
 if __name__ == "__main__":

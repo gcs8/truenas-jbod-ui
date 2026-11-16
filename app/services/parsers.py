@@ -585,15 +585,47 @@ def parse_glabel_status(output: str) -> GlabelInfo:
         partitions_by_label.setdefault(label.lower(), set()).add(component.lower())
 
     info = GlabelInfo()
+    # A set beside each list, so a provider with many labels is not rescanned
+    # for every row (#1216).
+    listed_labels: dict[str, set[str]] = {}
     for gptid, _component, device in rows:
         if len(partitions_by_label[gptid.lower()]) > 1:
             continue
         info.gptid_to_device[gptid.lower()] = device
         info.device_to_gptid[device.lower()] = gptid
         labels = info.device_to_gptids.setdefault(device.lower(), [])
-        if gptid not in labels:
+        listed = listed_labels.setdefault(device.lower(), set())
+        if gptid not in listed:
+            listed.add(gptid)
             labels.append(gptid)
     return info
+
+
+_CAMCONTROL_DEVICE_LINE_PATTERN = re.compile(
+    r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)"
+)
+
+
+def _match_camcontrol_device_line(line: str) -> re.Match[str] | None:
+    """`_CAMCONTROL_DEVICE_LINE_PATTERN.search(line)` with work linear in the line.
+
+    An unanchored search retried the lazy scan for "target" from every "<", and
+    the device list from every "(" with no ")" after it (#1216). Only the first
+    "<" that has a model before its ">" can start the leftmost match: a later
+    one closes at the same or a later ">", so its search sees a subset of the
+    same text. The match must also end at or before the last ")". So one match
+    at that "<", confined to that end, finds the same match.
+    """
+
+    start = line.find("<")
+    while start >= 0:
+        model_end = line.find(">", start + 1)
+        if model_end < 0:
+            return None
+        if model_end > start + 1:
+            return _CAMCONTROL_DEVICE_LINE_PATTERN.match(line, start, line.rfind(")") + 1)
+        start = line.find("<", model_end + 1)
+    return None
 
 
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
@@ -608,10 +640,7 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             current_controller = normalize_text(bus_match.group("controller"))
             continue
 
-        match = re.search(
-            r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)",
-            line,
-        )
+        match = _match_camcontrol_device_line(line)
         if not match:
             continue
 
@@ -4180,6 +4209,9 @@ def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
     )
 
 
+_SATA_CURRENT_LINK_RATE_PATTERN = re.compile(r"\(current:\s*([^)]+)\)", re.IGNORECASE)
+
+
 def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
@@ -4219,7 +4251,10 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         elif line.startswith("SATA Version is:"):
             value = normalize_text(line.split(":", 1)[1])
             if value:
-                current_match = re.search(r"\(current:\s*([^)]+)\)", value, re.IGNORECASE)
+                # The match ends at a ")", so the search stops at the last
+                # one: with no ")" after it, a whitespace run after "current:"
+                # was retried from every position (#1216).
+                current_match = _SATA_CURRENT_LINK_RATE_PATTERN.search(value, 0, value.rfind(")") + 1)
                 if current_match:
                     negotiated_link_rate = normalize_text(current_match.group(1))
                     value = normalize_text(value[: current_match.start()].rstrip(" ,")) or value
@@ -4693,14 +4728,22 @@ def parse_ubntstorage_json(output: str) -> list[dict[str, Any]]:
     return []
 
 
+_UNIFI_GPIO_LINE_HEAD_PATTERN = re.compile(r"gpio-\d+\s+\(", re.IGNORECASE)
+_UNIFI_GPIO_LINE_PATTERN = re.compile(
+    r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
+    re.IGNORECASE,
+)
+
+
 def parse_unifi_gpio_debug(output: str) -> dict[int, bool]:
     slot_states: dict[int, bool] = {}
-    line_pattern = re.compile(
-        r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
-        re.IGNORECASE,
-    )
     for raw_line in output.splitlines():
-        match = line_pattern.search(raw_line)
+        # Only the first `gpio-N (` can start the leftmost match: a later one
+        # opens after it, so its greedy scan for "|hdd@" sees a subset of the
+        # same text. One match there, instead of a search that rescanned the
+        # rest of the line from every `gpio-N (` (#1216).
+        head = _UNIFI_GPIO_LINE_HEAD_PATTERN.search(raw_line)
+        match = _UNIFI_GPIO_LINE_PATTERN.match(raw_line, head.start()) if head else None
         if not match:
             continue
         if match.group("direction").lower() != "out":
