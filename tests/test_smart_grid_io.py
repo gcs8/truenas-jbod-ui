@@ -898,10 +898,17 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(s.present for s in snapshot.slots))
         return snapshot
 
-    async def grid(self, service, slots, phase="grid", **kwargs):
+    async def grid(self, service, slots, phase="grid", *, settle_refreshes=False, **kwargs):
         trace = StoreTrace(service.slot_detail_store)
         with trace.capture():
             result = await service.get_slot_smart_summaries(slots, **kwargs)
+            if settle_refreshes:
+                # A refresh this request scheduled runs beside it and may be
+                # between its staged write and its replace when the request
+                # returns. Let it finish before the write/replace pairing below.
+                tasks = list(service._smart_refresh_tasks.values())
+                if tasks:
+                    await asyncio.wait_for(asyncio.gather(*tasks), 5)
         trace.report(phase, len(result))
         self.assertEqual(trace.operations["read"], trace.operations["json_load"])
         self.assertEqual(trace.operations["write"], trace.operations["json_dump"])
@@ -1088,16 +1095,16 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             self.seed_history(service, snapshot)
             # Keep actual scheduling intact. Completion of a scheduled task is not
             # proof it fetched fresh data, so check the live read and the cached
-            # value before any second request (#1209).
+            # value before any second request (#1209). The scheduled refresh
+            # runs beside the request, so nothing here may depend on how far it
+            # got when the request returned: the stale answer (17, where a live
+            # read gives 321) is the proof that the request did not wait for it.
             with patch.object(service, "_schedule_background_smart_refresh",
                               wraps=service._schedule_background_smart_refresh) as scheduled:
-                result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-stale", allow_stale_cache=True)
+                result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-stale",
+                                            settle_refreshes=True, allow_stale_cache=True)
                 self.assertEqual(result[0].summary.power_on_hours, 17)
-                self.assertEqual(api.calls, 0)
                 scheduled.assert_called_once()
-                tasks = list(service._smart_refresh_tasks.values())
-                if tasks:
-                    await asyncio.wait_for(asyncio.gather(*tasks), 5)
             self.assertGreater(api.calls, 0, "the scheduled refresh did not read the disk")
             refreshed = service._smart_cache[service._smart_cache_key(snapshot.slots[0])]
             self.assertEqual(refreshed.power_on_hours, 321)
