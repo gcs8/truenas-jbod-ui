@@ -83,8 +83,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Upgrade effect: saving bay mappings now needs a working lock file beside
   the mapping file, and there is no unguarded fallback. A save that cannot
   hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
-  four page messages: another save is in progress, the storage does not
-  support file locking, the lock file's name is taken by something that is
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file's name is taken by something that is
   not a regular file, or the lock file cannot be opened for writing. Each
   points to the new Troubleshooting section "Saving bay mappings", which has
   the recovery steps. The wait runs off the UI event loop. Reads take no lock and

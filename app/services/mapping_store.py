@@ -167,7 +167,8 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
     """A mapping change was refused because the writer lock could not be held.
 
     ``reason`` is ``busy`` (another owner held it past the bounded wait),
-    ``unsupported`` (the filesystem cannot lock files), ``not_regular`` (the
+    ``unsupported`` (the lock call failed: no file locks on that storage, or
+    the host is short of lock records), ``not_regular`` (the
     lock path is not a regular file) or ``unwritable`` (the existing lock file
     cannot be opened for writing). The mapping file is unchanged.
     """
@@ -177,7 +178,9 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
     # Fixed page text per reason: no path, no exception text (the log has those).
     PUBLIC_DETAILS = {
         "busy": "Could not save: another bay mapping save is in progress." + _SEE,
-        "unsupported": "Could not save: the storage holding the mapping file does not support file locking." + _SEE,
+        "unsupported": (
+            "Could not save: a file lock could not be taken on the storage holding the mapping file." + _SEE
+        ),
         "not_regular": (
             "Could not save: the mapping lock file's name is taken by something that is not a regular file." + _SEE
         ),
@@ -185,7 +188,10 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
     }
     _REASONS = {
         "busy": "another writer held it past the bounded wait",
-        "unsupported": "the filesystem does not support file locks, so concurrent writers cannot be kept apart",
+        "unsupported": (
+            "the lock call failed (the storage may not provide file locks, or the host may be short of "
+            "lock records), so concurrent writers cannot be kept apart"
+        ),
         "not_regular": "the lock path is not a regular file; with every writer stopped, move it aside",
         "unwritable": "this process cannot open it for writing; fix its owner or mode",
     }

@@ -253,9 +253,9 @@ There is no setting that saves without it. The app log line starting
 | The page says | What it means |
 | --- | --- |
 | `another bay mapping save is in progress` | Another save, clear or import of the same mapping file, from this or another app process, held the lock past the 2 s wait. Save again when it finishes. If it never clears, look for a stuck process using the same data folder. |
-| `the storage holding the mapping file does not support file locking` | The data folder is on storage where file locks fail, for example an NFS mount without a lock manager. Move the mapping directory (below). |
+| `a file lock could not be taken on the storage holding the mapping file` | The lock call failed. The storage may not provide file locks, or the host may be short of lock resources; the message cannot tell which. See [When a file lock could not be taken](#when-a-file-lock-could-not-be-taken) below. |
 | `the mapping lock file's name is taken by something that is not a regular file` | A directory, link, FIFO or other non-file sits at the lock file's name. Repair it (below). |
-| `the mapping lock file cannot be opened for writing` | The lock file exists, but the app's user cannot open it for writing: wrong owner or mode. Repair it (below). |
+| `the mapping lock file cannot be opened for writing` | Something existed at the lock file's name and opening it for writing was refused. This message alone does not show the lock file is at fault: the data folder's permissions, or something that is not a regular file at that name, give the same refusal. Check in the order below. |
 
 To repair the lock file's name or permissions:
 
@@ -264,13 +264,17 @@ To repair the lock file's name or permissions:
    stopped until step 4.
 2. Keep the mapping file. Copy `data/slot_mappings.json` somewhere safe first;
    do not delete or edit it.
-3. Fix what sits at `data/slot_mappings.json.lock`:
-   - not a regular file: move it out of the way, for example
-     `mv data/slot_mappings.json.lock data/slot_mappings.json.lock.obstruction`,
-     then inspect it at leisure;
-   - a regular file the app cannot open: give it the app's owner and mode
-     `0660`, as in
-     [A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+3. Check in this order, and fix the first thing that is wrong:
+   1. The app's user can enter and write the data folder (`data/`): its owner
+      and mode, as in
+      [A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+   2. `data/slot_mappings.json.lock` is a regular file (not a pipe, folder or
+      link): `ls -ld data/slot_mappings.json.lock` starts with `-`. If it is
+      not, move it out of the way, for example
+      `mv data/slot_mappings.json.lock data/slot_mappings.json.lock.obstruction`,
+      then inspect it at leisure.
+   3. Only then its owner and mode: give the regular lock file the app's owner
+      and mode `0660`, as in the same section.
 4. Start again with `docker compose up -d` and save the mapping again. A missing
    lock file is created by the next save.
 
@@ -278,8 +282,22 @@ Do not delete an ordinary lock file while the services run: a running writer
 may hold it, and a new file would not keep the next writer out. With every
 writer stopped it is safe to remove; the next save recreates it.
 
-For storage without working file locks, move the mapping directory to storage
-whose file locks work, such as a local disk on the Docker host:
+### When a file lock could not be taken
+
+The lock call can fail for two reasons, and the message is the same for both:
+
+- The host is short of lock resources (for example, the kernel ran out of
+  lock records). Saves work again once it recovers. Try the save again, and
+  look at the host (its log, memory, processes holding many locks) before
+  moving anything.
+- The storage does not provide file locks, for example an NFS mount without a
+  lock manager. Then every save is refused the same way, also after a restart
+  of the app.
+
+Do not move the data folder after one refusal. Only when saves keep failing
+this way, also after a restart, and the host is healthy, move the mapping
+directory to storage whose file locks work, such as a local disk on the Docker
+host:
 
 1. Stop every service that writes mappings (`docker compose down`).
 2. Copy the data folder, with `slot_mappings.json`, to the new location.

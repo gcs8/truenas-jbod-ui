@@ -1159,7 +1159,7 @@ SEE_TROUBLESHOOTING = "The mappings were not changed. See Troubleshooting: savin
 LOCK_REFUSAL_DETAILS = {
     "busy": "Could not save: another bay mapping save is in progress. " + SEE_TROUBLESHOOTING,
     "unsupported": (
-        "Could not save: the storage holding the mapping file does not support file locking. "
+        "Could not save: a file lock could not be taken on the storage holding the mapping file. "
         + SEE_TROUBLESHOOTING
     ),
     "not_regular": (
@@ -1318,6 +1318,9 @@ class SaveRefusedAtTheLockFileSaysWhyTests(unittest.TestCase):
                 self.assertNotIn("/", detail)
                 self.assertNotIn(".lock", detail)
                 self.assertNotIn(".json", detail)
+        # A failed lock call can also mean the host ran out of lock records,
+        # so no message claims the storage cannot lock files.
+        self.assertNotIn("does not support", details["unsupported"])
 
 
 class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
@@ -1336,7 +1339,7 @@ class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
         self.assertIn("slot_mappings.json.lock", section)
         for phrase in (
             "another bay mapping save is in progress",
-            "does not support file locking",
+            "a file lock could not be taken",
             "is not a regular file",
             "cannot be opened for writing",
         ):
@@ -1355,6 +1358,32 @@ class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
                 self.assertIn(step, section)
         # Services stop before anything at the lock file's name is touched.
         self.assertLess(section.index("docker compose down"), section.index("mv "))
+
+    def test_a_failed_lock_call_names_both_causes_before_any_move(self) -> None:
+        section = " ".join(self.section().split())
+        lowered = section.lower()
+        self.assertNotIn("does not support file locking", section)
+        for phrase in (
+            "does not provide file locks",
+            "also after a restart",
+            "short of lock resources",
+            "try the save again",
+            "do not move the data folder after one refusal",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, lowered)
+        # Retrying and looking at the host come before moving the data folder.
+        self.assertLess(lowered.index("try the save again"), lowered.index("move the mapping directory"))
+
+    def test_an_open_refusal_is_checked_folder_first_then_file_type_then_owner(self) -> None:
+        section = " ".join(self.section().split())
+        lowered = section.lower()
+        self.assertIn("this message alone does not show the lock file is at fault", lowered)
+        folder = lowered.index("can enter and write the data folder")
+        regular = lowered.index("is a regular file (not a pipe, folder or link)")
+        owner = lowered.index("only then its owner and mode")
+        self.assertLess(folder, regular)
+        self.assertLess(regular, owner)
 
     def test_it_never_offers_an_unguarded_save_or_deleting_a_live_lock_file(self) -> None:
         section = " ".join(self.section().split()).lower()
