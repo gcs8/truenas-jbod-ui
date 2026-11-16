@@ -603,9 +603,6 @@ class TrueNASRawData:
     cli_hw_disks: list[dict[str, Any]] = field(default_factory=list)
     cli_hw_enclosures: list[dict[str, Any]] = field(default_factory=list)
     cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
-    # Lookup structures derived from the lists above, built on first use and
-    # dropped with this object, so they never outlive the collected data.
-    derived: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 # #1072: a connection that closes while its login is still running leaves an

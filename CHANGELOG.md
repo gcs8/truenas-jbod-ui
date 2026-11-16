@@ -51,16 +51,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - QuantaStor: two overlapping storage views on one node no longer both show
   the same disk, and another node's pool-device row at the same local path
   (such as `/dev/sda`) no longer moves a disk to that node's bay or gives it
-  that node's pool. A pool-device row must match the disk by stable identity,
-  or by path on the disk's own node, and is chosen once over every identity
-  the disk row, its CLI row and every hardware row linked to either of them
-  report (from either hardware list, with or without a slot, directly or
-  through another linked row); a bay's pool topology comes from that same
-  row. If those identities disagree, if more hardware rows are linked than a
-  fixed cap (256), or if equally ranked rows disagree on bay, pool, vdev,
-  class or status, the disk's pool-device membership and member status are
-  withheld with a page warning, whatever the row order, while the pool and
-  health the disk reports for itself still show (#1264).
+  that node's pool. A pool-device row's path now matches only a disk on the
+  row's own node; stable identifiers still match across nodes. A row whose
+  serial, SCSI ID or same-node physical disk ID contradicts the disk's own
+  row is not used, and a value that several disks carry (a placeholder serial
+  such as `0`) neither links a disk to a row nor refuses one. A bay's pool
+  topology comes from that same row. When only such a shared value links a
+  disk to rows, or equally ranked rows disagree on bay, pool, vdev, class or
+  status, the disk's pool-device membership is withheld with a page warning,
+  whatever the row order (#1264).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
