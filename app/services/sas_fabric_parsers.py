@@ -40,9 +40,15 @@ def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
 def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
     malformed_phy_rows = 0
+    discovering_phys = 0
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
+            continue
+        if stripped == "Discovery still in progress":
+            # mprutil prints this in place of the row of a PHY still being
+            # discovered and goes on; it holds that PHY's place, adds no row.
+            discovering_phys += 1
             continue
         if stripped.endswith("Adapter:"):
             detail["name"] = stripped.removesuffix(" Adapter:")
@@ -87,9 +93,16 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     rows = detail["phy_rows"]
     # Counts come only from a PHY table that was read whole. No table, a
     # malformed row, a repeated PHY number or a gap in the PHY numbers
-    # (0 to n-1, as mprutil lists them) leaves both counts unknown.
+    # (0 to n-1, as mprutil lists them) leaves both counts unknown. A PHY
+    # still in discovery fills its gap; the printed rows are what is counted.
     phy_numbers = [int(row["phy"]) for row in rows]
-    if rows and not malformed_phy_rows and sorted(phy_numbers) == list(range(len(rows))):
+    table_size = len(rows) + discovering_phys
+    if (
+        table_size
+        and not malformed_phy_rows
+        and len(set(phy_numbers)) == len(phy_numbers)
+        and all(number < table_size for number in phy_numbers)
+    ):
         detail["phy_count"] = len(rows)
         detail["linked_phy_count"] = sum(
             1 for row in rows if row.get("device_handle") and row.get("device") and row.get("device") != "No Device"
@@ -143,22 +156,26 @@ def parse_mpr_devices(text: str) -> list[dict[str, str]]:
     return rows
 
 
-def parse_mpr_enclosures(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:
+    rows: list[dict[str, str | None]] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not re.match(r"^\d+\s+[0-9a-fA-F]{8,}", stripped):
             continue
         parts = stripped.split()
-        if len(parts) < 5:
+        # mprutil prints the SEP handle as blanks for an enclosure that is not
+        # an SES device, so such a row has one handle before its type.
+        sep_handle = parts[2] if len(parts) >= 5 and re.fullmatch(r"[0-9a-fA-F]{4}", parts[3]) else None
+        handles = 2 if sep_handle else 1
+        if len(parts) < 3 + handles or not re.fullmatch(r"[0-9a-fA-F]{4}", parts[1 + handles]):
             continue
         rows.append(
             {
                 "slots": parts[0],
                 "logical_id": parts[1],
-                "sep_handle": parts[2],
-                "enc_handle": parts[3],
-                "type": " ".join(parts[4:]),
+                "sep_handle": sep_handle,
+                "enc_handle": parts[1 + handles],
+                "type": " ".join(parts[2 + handles:]),
             }
         )
     return rows
@@ -167,21 +184,18 @@ def parse_mpr_enclosures(text: str) -> list[dict[str, str]]:
 def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     expanders: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
-    header_pattern = re.compile(
-        r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
-    )
     phy_pattern = re.compile(
         r"^\s*(\d+)\s+(?:(\d+)\s+([0-9a-fA-F]{4})\s+([\d.]+)|)\s*([\d.]+|\?\?\?)\s+([\d.]+|\?\?\?)\s+(.+?)\s*$"
     )
     for line in text.splitlines():
-        header = header_pattern.match(line)
+        header = _match_mpr_expander_header(line)
         if header:
             current = {
                 "num_phys": header.group(1),
                 "sas_address": header.group(2),
                 "dev_handle": header.group(3),
-                "parent": header.group(4),
-                "enc_handle": header.group(5),
+                "parent": header.group(4).strip() or None,
+                "enc_handle": header.group(5).strip() or None,
                 "sas_level": header.group(6),
                 "phys": [],
             }
@@ -206,7 +220,7 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
                 "device": device,
             }
         )
-    candidate_lines = _mpr_expander_phy_candidate_lines(text, header_pattern)
+    candidate_lines = _mpr_expander_phy_candidate_lines(text)
     for expander, candidates in zip(expanders, candidate_lines):
         # Counts come only from a PHY table read whole: one row per reported
         # PHY, each PHY number unique and in range, and no rejected rows.
@@ -221,11 +235,25 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     return expanders
 
 
-def _mpr_expander_phy_candidate_lines(text: str, header_pattern: re.Pattern[str]) -> list[int]:
+_MPR_EXPANDER_HEADER = re.compile(
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
+)
+# mprutil prints a zero parent or enclosure handle as four blanks in its fixed
+# columns ("%04x       %s     %s       %d"), so those headers are read by position.
+_MPR_EXPANDER_HEADER_BLANK_HANDLES = re.compile(
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4}) {7}([0-9a-fA-F]{4}| {4}) {5}([0-9a-fA-F]{4}| {4}) {7}(\d+)\s*$"
+)
+
+
+def _match_mpr_expander_header(line: str) -> re.Match[str] | None:
+    return _MPR_EXPANDER_HEADER.match(line) or _MPR_EXPANDER_HEADER_BLANK_HANDLES.match(line)
+
+
+def _mpr_expander_phy_candidate_lines(text: str) -> list[int]:
     """Per expander header, the non-blank lines under it other than the column heading."""
     counts: list[int] = []
     for line in text.splitlines():
-        if header_pattern.match(line):
+        if _match_mpr_expander_header(line):
             counts.append(0)
             continue
         stripped = line.strip()

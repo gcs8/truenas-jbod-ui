@@ -55,16 +55,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read" or "at least N" in the summary, host line, disk view and main-page
   topology summary instead of 0, and a lane whose expander or enclosure list
   was not read says "Not read" instead of "No objects reported". A list
-  printed with its column heading and no rows is still a measured zero.
-  Every supported `mprutil -u N` command, `show all` included, counts its
-  unit as attempted; a unit that could not be read is named in a warning and
-  keeps the view partial, and a unit number that is not 1 to 4 digits is
+  printed with its column heading and no rows is still a measured zero, and
+  rows `mprutil` prints with blank columns (an expander's zero parent or
+  enclosure handle, a non-SES enclosure's SEP handle) are read. Every
+  supported `mprutil -u N` command, `show all` included, counts its unit as
+  attempted, and a `show all` reply is read through its `Adapter:`,
+  `Devices:`, `Enclosures:` and `Expanders:` sections (a dedicated reply for
+  the same list wins); a unit that could not be read is named in a warning
+  and keeps the view partial, and a unit number that is not 1 to 4 digits is
   rejected and counted, never shown. An adapter or expander PHY table that
   was not read whole (missing, short, malformed or repeated rows) shows its
   PHY counts as "not read", is counted in a warning and keeps the view
   partial; a whole table keeps its counts, including rows for PHYs with
-  nothing attached and an expander that reports zero PHYs. An enclosure's
-  device count comes only from a device list that was read. On a partial
+  nothing attached and an expander that reports zero PHYs, and a
+  "Discovery still in progress" line in place of a PHY row adds no warning.
+  Of these reads, an unread or rejected controller unit, an unread expander
+  or enclosure list and a PHY table not read whole make the status partial.
+  An enclosure's device count comes only from a device list that was read;
+  an unread device list shows that count as "not read" and, as before,
+  leaves the status alone. On a partial
   read, inventory bays that no controller lane claims are drawn in their own
   group, and the no-controller lanes say "disks" for unmapped inventory. An
   empty numbered `mprutil -u N` result no longer hides the unnumbered

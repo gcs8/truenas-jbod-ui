@@ -14,7 +14,12 @@ from pathlib import Path
 from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, MultipathMember, MultipathView, SlotState, SlotView
 from app.services.sas_fabric import build_sas_fabric_snapshot
-from app.services.sas_fabric_parsers import build_core_mprutil_unit_commands, parse_mpr_adapter_detail, parse_mpr_expanders
+from app.services.sas_fabric_parsers import (
+    build_core_mprutil_unit_commands,
+    parse_mpr_adapter_detail,
+    parse_mpr_enclosures,
+    parse_mpr_expanders,
+)
 
 NO_CORE_DATA_WARNING = "No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions."
 UNREADABLE_MPRUTIL_WARNING = (
@@ -95,7 +100,16 @@ def _virtual_slot(slot: int = 0) -> SlotView:
     )
 
 
-def _render_case_inputs() -> dict[str, tuple[dict[str, str], list[SlotView]]]:
+def _multipath_slot() -> SlotView:
+    # The inventory saw this disk on mpr0, so the disk view's trace reaches that controller.
+    return _inventory_slot().model_copy(update={"multipath": MultipathView(
+        name="disk0",
+        device_name="multipath/disk0",
+        members=[MultipathMember(device_name="da0", state="ACTIVE", controller_label="mpr0")],
+    )})
+
+
+def _render_case_inputs() -> dict[str, tuple]:
     """Builder inputs for the payloads the Node page test draws with the real page code."""
     second_physical = _inventory_slot().model_copy(update={"slot": 1, "slot_label": "01", "column_index": 1})
     return {
@@ -116,11 +130,17 @@ def _render_case_inputs() -> dict[str, tuple[dict[str, str], list[SlotView]]]:
             {**NUMBERED_UNIT_OUTPUTS, "mprutil -u 0 show adapter": LEGACY_OUTPUTS["mprutil show adapter"] + "0 malformed\n"},
             [_inventory_slot()],
         ),
+        "phy_table_rejected_on_path": (
+            {**NUMBERED_UNIT_OUTPUTS, "mprutil -u 0 show adapter": LEGACY_OUTPUTS["mprutil show adapter"] + "0 malformed\n"},
+            [_multipath_slot()],
+        ),
+        **{name: (outputs, [_inventory_slot()], SELECTED_ENCLOSURE) for name, outputs in _healthy_reply_cases().items()},
+        **{name: (outputs, [_inventory_slot()], SELECTED_ENCLOSURE) for name, outputs in _unread_reply_cases().items()},
     }
 
 
-def _render_case_payload(outputs: dict[str, str], slots: list[SlotView]) -> dict:
-    fabric = _core_fabric(outputs, slots=slots).model_dump(mode="json")
+def _render_case_payload(outputs: dict[str, str], slots: list[SlotView], selected: str | None = None) -> dict:
+    fabric = _core_fabric(outputs, slots=slots, selected=selected).model_dump(mode="json")
     fabric.pop("generated_at")
     return {"fabric": fabric, "slots": [slot.model_dump(mode="json") for slot in slots]}
 
@@ -489,6 +509,80 @@ def _printed_device_row(enclosure_handle: str = "0010") -> str:
     return f"00   10    {DEVICE_ADDRESS} 000b    000a      SAS Target    12    {enclosure_handle} 00    1\n"
 
 
+BLANK_HANDLE = "    "
+
+
+def _printed_expanders_with_handles(parent: str, enclosure: str) -> str:
+    # mprutil: "  %02d    %08x%08x    %04x       %s     %s       %d"; a zero parent
+    # or enclosure handle is printed as four blanks.
+    return _printed_expanders().replace("000a       0001     0010       1", f"000a       {parent}     {enclosure}       1")
+
+
+def _printed_enclosure(sep_handle: str = "000b", kind: str = "External SES-2") -> str:
+    # mprutil: "  %.2d    %08x%08x    %s       %04x     %s"; the SEP handle is four
+    # blanks for an enclosure that is not an SES device.
+    return ENCLOSURES_HEADING + f"  01    {SELECTED_ENCLOSURE}    {sep_handle}       0010     {kind}\n\n"
+
+
+def _adapter_with_discovery(phys: int, discovering: set[int]) -> str:
+    # mprutil prints "Discovery still in progress" in place of a PHY's row and goes on.
+    rows = "".join(
+        "Discovery still in progress\n" if phy in discovering else _adapter_phy_row(phy, attached=True)
+        for phy in range(phys)
+    )
+    return _printed_adapter([]).replace("Device\n\n", f"Device\n{rows}\n")
+
+
+def _healthy_unit(unit: int = 0) -> dict[str, str]:
+    """Every supported list of one unit, as mprutil prints it on a healthy system."""
+    return {
+        f"mprutil -u {unit} show adapter": _printed_adapter([True, False]).replace("mpr0 Adapter:", f"mpr{unit} Adapter:"),
+        f"mprutil -u {unit} show devices": DEVICES_HEADING + _printed_device_row() + "\n",
+        f"mprutil -u {unit} show enclosures": _printed_enclosure(),
+        f"mprutil -u {unit} show expanders": _printed_expanders(),
+    }
+
+
+def _show_all(unit: int = 0) -> str:
+    # mprutil `show all` prints each list under its section label.
+    replies = _healthy_unit(unit)
+    return "".join(
+        f"{label}:\n{replies[f'mprutil -u {unit} show {subcommand}']}"
+        for label, subcommand in (("Adapter", "adapter"), ("Devices", "devices"), ("Enclosures", "enclosures"), ("Expanders", "expanders"))
+    )
+
+
+def _two_unit_summary() -> str:
+    return "Device Name\t      Chip Name        Board Name        Firmware\n" + "".join(
+        f"/dev/mpr{unit}\t{'SAS3008':>16} {'Synthetic HBA':>16}        10000c00\n" for unit in (0, 1)
+    )
+
+
+def _healthy_reply_cases() -> dict[str, dict[str, str]]:
+    """Complete, successful replies in shapes mprutil prints: each must read as OK."""
+    unit = _healthy_unit()
+    cases = {
+        "healthy_lists": dict(unit),
+        "blank_expander_parent": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles(BLANK_HANDLE, "0010")},
+        "blank_expander_enclosure": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles("0001", BLANK_HANDLE)},
+        "blank_expander_handles": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles(BLANK_HANDLE, BLANK_HANDLE)},
+        "blank_sep_unknown_enclosure": {**unit, "mprutil -u 0 show enclosures": _printed_enclosure(BLANK_HANDLE, "Unknown")},
+        "show_all_only": {"mprutil -u 0 show all": _show_all()},
+        "show_all_second_unit": {"mprutil show adapters": _two_unit_summary(), **unit, "mprutil -u 1 show all": _show_all(1)},
+    }
+    for position, discovering in {"first": {0}, "interior": {1}, "last": {2}, "every": {0, 1, 2}}.items():
+        cases[f"discovery_{position}"] = {**unit, "mprutil -u 0 show adapter": _adapter_with_discovery(3, discovering)}
+    return cases
+
+
+def _unread_reply_cases() -> dict[str, dict[str, str]]:
+    """Controls: a reply that parses to nothing, or no reply text, is still not read."""
+    return {
+        "show_all_unparseable": {"mprutil -u 0 show all": "unrecognized synthetic text\n"},
+        "show_all_empty": {"mprutil -u 0 show all": ""},
+    }
+
+
 class CoreFabricReplyReadStateTests(unittest.TestCase):
     """A count or list is a measurement only when the reply carrying it was read and understood."""
 
@@ -646,6 +740,124 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
         self.assertEqual(expander.metrics["linked_phys"], 1)
         self.assertNotIn("not_read", expander.metrics)
         self.assertEqual(fabric.warnings, [])
+
+
+class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
+    """A complete, successful reply in a shape mprutil prints adds no warning and lowers no status."""
+
+    def healthy(self, name: str):
+        fabric = _core_fabric(_healthy_reply_cases()[name], slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        read = fabric.raw["controller_read"]
+        self.assertEqual(fabric.warnings, [])
+        self.assertEqual(read["counts"], {count: "complete" for count in ALL_COUNTS})
+        self.assertTrue(all(item["result"] == "read" for item in read["units"]), read["units"])
+        self.assertEqual(read["unread_phy_tables"], 0)
+        return fabric
+
+    @staticmethod
+    def kind_metrics(fabric, kind: str) -> list[dict]:
+        return [node.metrics for node in fabric.nodes if node.kind == kind]
+
+    def test_blank_expander_handles_as_printed_are_read(self) -> None:
+        for name, (parent, enclosure) in {
+            "blank_expander_parent": (None, "0010"),
+            "blank_expander_enclosure": ("0001", None),
+            "blank_expander_handles": (None, None),
+        }.items():
+            with self.subTest(name):
+                fabric = self.healthy(name)
+                self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["expanders"], "read")
+                [parsed] = parse_mpr_expanders(_healthy_reply_cases()[name]["mprutil -u 0 show expanders"])
+                self.assertEqual((parsed["parent"], parsed["enc_handle"], parsed["linked_phys"]), (parent, enclosure, 1))
+
+    def test_blank_sep_handle_enclosure_as_printed_is_read(self) -> None:
+        fabric = self.healthy("blank_sep_unknown_enclosure")
+        self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["enclosures"], "read")
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+        [parsed] = parse_mpr_enclosures(_printed_enclosure(BLANK_HANDLE, "Unknown"))
+        self.assertEqual((parsed["sep_handle"], parsed["enc_handle"], parsed["type"]), (None, "0010", "Unknown"))
+        # Control: an SES enclosure keeps both handles.
+        [parsed] = parse_mpr_enclosures(_printed_enclosure())
+        self.assertEqual((parsed["sep_handle"], parsed["enc_handle"], parsed["type"]), ("000b", "0010", "External SES-2"))
+
+    def test_show_all_alone_reads_its_sections(self) -> None:
+        fabric = self.healthy("show_all_only")
+        self.assertEqual([controller["id"] for controller in fabric.controllers], ["controller:mpr0"])
+        self.assertEqual(fabric.controllers[0]["board"], "Synthetic HBA")
+        self.assertEqual(fabric.raw["controller_read"]["lists"], {"mpr0": {"expanders": "read", "enclosures": "read", "devices": "read"}})
+        self.assertEqual((len(fabric.expanders), len(fabric.enclosures)), (1, 1))
+        [controller] = self.kind_metrics(fabric, "controller")
+        self.assertEqual((controller["phy_count"], controller["linked_phy_count"]), (2, 1))
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+
+    def test_second_listed_controller_supplied_only_by_show_all(self) -> None:
+        fabric = self.healthy("show_all_second_unit")
+        self.assertEqual([controller["id"] for controller in fabric.controllers], ["controller:mpr0", "controller:mpr1"])
+        self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr1"], {"expanders": "read", "enclosures": "read", "devices": "read"})
+        self.assertEqual(
+            [(metrics["phy_count"], metrics["linked_phy_count"]) for metrics in self.kind_metrics(fabric, "controller")],
+            [(2, 1), (2, 1)],
+        )
+
+    def test_dedicated_reply_wins_over_the_show_all_section(self) -> None:
+        outputs = {"mprutil -u 0 show all": _show_all(), "mprutil -u 0 show expanders": EXPANDERS_HEADING + "\n"}
+        fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        self.assertEqual(fabric.raw["controller_read"]["lists"].get("mpr0", {}).get("expanders"), "empty")
+        self.assertEqual(fabric.expanders, [])
+        self.assertEqual(len(fabric.enclosures), 1)
+        self.assertEqual(fabric.warnings, [])
+
+    def test_show_all_reads_only_its_four_section_labels(self) -> None:
+        other_device = f"00   11    5{4:015x} 000c    000a      SAS Target    12    0010 01    1\n"
+        sections = _show_all().split("Enclosures:\n")
+        outputs = {
+            "mprutil -u 0 show all": (
+                sections[0] + "Other:\n" + DEVICES_HEADING + other_device + "\nEnclosures:\n" + sections[1]
+                + "Summary:\nunrecognized synthetic text\n"
+            ),
+        }
+        fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        # Text under another label is ignored: no second device, no unread expander table.
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+        [expander] = self.kind_metrics(fabric, "expander")
+        self.assertEqual(expander["linked_phys"], 1)
+        self.assertEqual(fabric.warnings, [])
+
+    def test_show_all_label_with_nothing_under_it_is_not_read(self) -> None:
+        # mprutil prints each list's column heading when the list was read, so
+        # a label with nothing under it is a list that was not read, not zero.
+        devices = DEVICES_HEADING + _printed_device_row() + "\n"
+        outputs = {"mprutil -u 0 show all": _show_all().replace("Devices:\n" + devices, "Devices:\n\n")}
+        fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        self.assertEqual(fabric.raw["controller_read"]["lists"].get("mpr0", {}).get("devices"), "not_read")
+        [enclosure] = self.kind_metrics(fabric, "mpr-enclosure")
+        self.assertEqual((enclosure["device_count"], enclosure["not_read"]), (None, ["device_count"]))
+
+    def test_discovery_line_in_place_of_a_phy_row_is_recognised(self) -> None:
+        # What main shows: the printed rows are counted, no PHY is invented for
+        # the missing row, and no warning or lower status is added.
+        for position, counts in {"first": (2, 2), "interior": (2, 2), "last": (2, 2), "every": (0, 0)}.items():
+            with self.subTest(position):
+                fabric = self.healthy(f"discovery_{position}")
+                [controller] = self.kind_metrics(fabric, "controller")
+                self.assertEqual((controller["phy_count"], controller["linked_phy_count"]), counts)
+                self.assertNotIn("not_read", controller)
+        # Control: a gap with no discovery line is still not read whole.
+        detail = parse_mpr_adapter_detail(_adapter_with_discovery(3, {1}).replace("Discovery still in progress\n", ""))
+        self.assertEqual((detail["phy_count"], detail["phy_table"]), (None, "rejected"))
+
+    def test_unparseable_or_empty_replies_are_still_not_read(self) -> None:
+        for name, (result, warning) in {
+            "show_all_unparseable": ("unreadable", UNREADABLE_MPRUTIL_WARNING),
+            "show_all_empty": ("no_output", NO_CORE_DATA_WARNING),
+        }.items():
+            with self.subTest(name):
+                fabric = _core_fabric(_unread_reply_cases()[name], slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+                read = fabric.raw["controller_read"]
+                self.assertEqual(fabric.controllers, [])
+                self.assertEqual(read["units"], [{"controller": "mpr0", "result": result}])
+                self.assertEqual(read["counts"], {count: "not_read" for count in ALL_COUNTS})
+                self.assertEqual(fabric.warnings, [warning])
 
 
 if __name__ == "__main__":

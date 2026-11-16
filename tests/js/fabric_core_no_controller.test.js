@@ -290,6 +290,89 @@ test("a rejected PHY table is not read, never absent or zero, and the view is pa
   assert.equal(quiet.chip, "STORAGE PARTIAL");
 });
 
+// Complete, successful replies in shapes mprutil prints: each shows at least
+// what main showed, with no warning and no lower status. An expander whose
+// enclosure handle is blank is read but not drawn in the selected enclosure's
+// scope, as on main.
+const HEALTHY_SUMMARIES = {
+  healthy_lists: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  blank_expander_parent: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  blank_expander_enclosure: { controllers: "1", paths: "0", expanders: "0", enclosures: "1" },
+  blank_expander_handles: { controllers: "1", paths: "0", expanders: "0", enclosures: "1" },
+  blank_sep_unknown_enclosure: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  show_all_only: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  show_all_second_unit: { controllers: "2", paths: "0", expanders: "2", enclosures: "2" },
+  discovery_first: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  discovery_interior: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  discovery_last: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+  discovery_every: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
+};
+
+test("complete replies as mprutil prints them stay OK with their counts", () => {
+  for (const [name, summary] of Object.entries(HEALTHY_SUMMARIES)) {
+    const page = loadCase(name);
+    assert.equal(page.chip, "STORAGE OK", name);
+    assert.equal(page.warnings, "", name);
+    assert.doesNotMatch(page.status, /partial evidence/, name);
+    assert.deepEqual(page.summary, summary, name);
+    assert.doesNotMatch(textOf(page.map), /Not read|not read/, name);
+  }
+});
+
+test("control: an unparseable or empty reply still says not read and is partial", () => {
+  for (const name of ["show_all_unparseable", "show_all_empty"]) {
+    const page = loadCase(name);
+    assert.equal(page.chip, "STORAGE PARTIAL", name);
+    assert.deepEqual(page.summary, { controllers: "not read", paths: "not read", expanders: "not read", enclosures: "not read" }, name);
+  }
+  const lists = loadCase("unparsed_lists");
+  assert.equal(lists.chip, "STORAGE PARTIAL");
+  assert.equal(lists.summary.expanders, "not read");
+});
+
+test("disk view PHY fact of a controller whose table was not read whole says not read", () => {
+  const disk = textOf(loadCase("phy_table_rejected_on_path", "disk").map);
+  assert.match(disk, /PHY not read/);
+  // Control: the same controller with a table read whole shows its counts.
+  const fabric = structuredClone(CASES.phy_table_rejected_on_path.fabric);
+  const controller = fabric.nodes.find((node) => node.id === "controller:mpr0");
+  delete controller.metrics.not_read;
+  Object.assign(controller.metrics, { phy_count: 2, linked_phy_count: 1 });
+  const whole = textOf(loadPage(fabric, "disk", CASES.phy_table_rejected_on_path.slots).map);
+  assert.match(whole, /PHY 1\/2/);
+  assert.doesNotMatch(whole, /PHY not read/);
+});
+
+test("main page controller lane draws its list state, not the old default", () => {
+  const sandbox = vm.createContext({
+    state: {},
+    escapeHtml: String,
+    isStorageFabricPayload: () => false,
+    sasFabricDisplayLabel: (item) => item?.label || null,
+    sasFabricSortedSlots: (slots) => [...(slots || [])].sort((left, right) => left - right),
+    sasFabricSelectionTouchesNode: () => false,
+    sasFabricSelectionTouchesSlots: () => false,
+    renderSasFabricNodeButton: (node) => `[${node.id}]`,
+    sasFabricNodeMeta: () => "",
+    renderSasFabricPathButton: () => "",
+    renderSasFabricBayChips: () => "",
+    sasFabricListExpanded: () => false,
+    renderSasFabricExpandToggle: () => "",
+    formatSasFabricKind: String,
+  });
+  const names = ["sasFabricList", "renderSasFabricCompactNodes", "sasFabricLaneListEmptyText", "renderSasFabricLane"];
+  vm.runInContext(`${names.map(appFunctionSource).join("\n")}\nthis.lane = renderSasFabricLane;`, sandbox);
+  const drawLane = (fabric) => {
+    const nodeMap = new Map(fabric.nodes.map((node) => [node.id, node]));
+    return textOf(sandbox.lane(fabric.controllers[0], fabric, nodeMap));
+  };
+  const unread = drawLane(CASES.unparsed_lists.fabric);
+  assert.equal((unread.match(/Not read/g) || []).length, 2, unread);
+  assert.doesNotMatch(unread, /No objects reported/);
+  const whole = drawLane(CASES.complete.fabric);
+  assert.equal((whole.match(/No objects reported/g) || []).length, 2, whole);
+});
+
 test("main page inspector and lanes follow the same not-read facts", () => {
   const sandbox = vm.createContext({ kvRow: (label, value) => `${label}: ${value};`, formatSasFabricValue: String });
   vm.runInContext(`${["sasFabricList", "sasFabricMetricRows"].map(appFunctionSource).join("\n")}\nthis.rows = sasFabricMetricRows;`, sandbox);

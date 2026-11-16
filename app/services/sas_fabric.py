@@ -1837,18 +1837,46 @@ def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
 
 
 def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, Any]:
+    # A dedicated reply wins; otherwise the same list's `show all` section.
+    sections = _split_mpr_show_all(outputs.get(f"{prefix} all", ""))
+    replies = {
+        subcommand: outputs[f"{prefix} {subcommand}"] if f"{prefix} {subcommand}" in outputs else sections.get(subcommand)
+        for subcommand in ("adapter", "devices", "enclosures", "expanders", "iocfacts")
+    }
     payload: dict[str, Any] = {
-        "adapter_detail": parse_mpr_adapter_detail(outputs.get(f"{prefix} adapter", "")),
-        "devices": parse_mpr_devices(outputs.get(f"{prefix} devices", "")),
-        "enclosures": parse_mpr_enclosures(outputs.get(f"{prefix} enclosures", "")),
-        "expanders": parse_mpr_expanders(outputs.get(f"{prefix} expanders", "")),
-        "iocfacts": parse_mpr_iocfacts(outputs.get(f"{prefix} iocfacts", "")),
+        "adapter_detail": parse_mpr_adapter_detail(replies["adapter"] or ""),
+        "devices": parse_mpr_devices(replies["devices"] or ""),
+        "enclosures": parse_mpr_enclosures(replies["enclosures"] or ""),
+        "expanders": parse_mpr_expanders(replies["expanders"] or ""),
+        "iocfacts": parse_mpr_iocfacts(replies["iocfacts"] or ""),
     }
     payload["lists"] = {
-        subcommand: _mpr_list_state(outputs.get(f"{prefix} {subcommand}"), subcommand, payload[subcommand])
+        subcommand: _mpr_list_state(replies[subcommand], subcommand, payload[subcommand])
         for subcommand in _MPR_LIST_HEADINGS
     }
     return payload
+
+
+# `mprutil show all` prints these labels, each alone on a line, before the
+# reply of the command it runs. Text under any other label is not read.
+_MPR_SHOW_ALL_SECTIONS = {"Adapter:": "adapter", "Devices:": "devices", "Enclosures:": "enclosures", "Expanders:": "expanders"}
+_MPR_SHOW_ALL_LABEL = re.compile(r"[A-Z][A-Za-z]*:")
+
+
+def _split_mpr_show_all(text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        # Labels start at column 0; indented `Key:` lines belong to a reply.
+        if _MPR_SHOW_ALL_LABEL.fullmatch(line.rstrip()):
+            current = _MPR_SHOW_ALL_SECTIONS.get(line.rstrip())
+            if current is not None:
+                sections.setdefault(current, [])
+            continue
+        if current is not None:
+            sections[current].append(line)
+    # A label with nothing under it is a command that printed nothing: not read.
+    return {name: "\n".join(lines) + "\n" for name, lines in sections.items() if any(line.strip() for line in lines)}
 
 
 # mprutil prints a column heading before each list, even an empty one.
