@@ -1796,8 +1796,11 @@ class MappingStore:
             os.close(descriptor)
 
     def _validate_published_bytes(self, expected: bytes) -> None:
-        actual = self.file_path.read_bytes()
-        if actual != expected:
+        # The checked, non-blocking reader: a path that is no longer the
+        # regular file just published raises at once instead of blocking or
+        # following a link while the writer lock is held.
+        actual = self._read_source_bytes()
+        if actual is None or actual != expected:
             raise OSError("Published mapping bytes differ from the replacement.")
         payload = json.loads(actual.decode("utf-8"))
         if not isinstance(payload, dict) or payload.get("version") != 2:

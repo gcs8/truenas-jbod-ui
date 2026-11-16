@@ -985,6 +985,99 @@ class MappingExportReadsOneVersionTests(unittest.TestCase):
             self.assertEqual(bundle.enclosure_id, "shelf")
 
 
+@unittest.skipIf(not hasattr(os, "mkfifo"), "swapping in a FIFO needs POSIX mkfifo")
+@unittest.skipIf(fcntl is None, "the cross-process writer lock needs POSIX flock")
+class WriterReadbackRefusesANonRegularFileTests(unittest.TestCase):
+    """The writer's readback after publishing uses the checked, non-blocking read."""
+
+    def test_a_non_regular_file_at_readback_is_refused_promptly_and_frees_the_lock(self) -> None:
+        durability_error = mapping_store_module.MappingDurabilityError
+        for kind in ("fifo", "directory", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                path, store = seeded_store(directory)
+                elsewhere = Path(directory) / "elsewhere.json"
+                original_fsync = store._fsync_parent_directory
+
+                def swap_after_publish() -> None:
+                    original_fsync()
+                    # The symlink target holds exactly the published bytes, so a
+                    # readback that follows links would accept it.
+                    elsewhere.write_bytes(path.read_bytes())
+                    path.unlink()
+                    if kind == "fifo":
+                        os.mkfifo(path)
+                    elif kind == "directory":
+                        path.mkdir()
+                    else:
+                        path.symlink_to(elsewhere)
+
+                outcome: dict[str, object] = {}
+
+                def run() -> None:
+                    try:
+                        outcome["returned"] = store.save_mapping(mapping("a", 1, "first"))
+                    except BaseException as exc:  # noqa: BLE001 - reported below
+                        outcome["raised"] = exc
+
+                with patch.object(store, "_fsync_parent_directory", swap_after_publish):
+                    thread = threading.Thread(target=run, daemon=True)
+                    thread.start()
+                    thread.join(timeout=2)
+                    blocked = thread.is_alive()
+                    if blocked:
+                        # Rescue the blocked readback so the run cannot hang.
+                        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+                        thread.join(timeout=5)
+                self.assertFalse(blocked, f"the writer's readback blocked on a {kind} at the mapping path")
+                self.assertIsInstance(
+                    outcome.get("raised"),
+                    durability_error,
+                    f"the readback accepted a {kind}: {outcome!r}",
+                )
+                # The lock is free: another owner takes it at once, in this
+                # process and across processes.
+                holder = os.open(path.with_name(path.name + ".lock"), os.O_RDWR)
+                try:
+                    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(holder, fcntl.LOCK_UN)
+                finally:
+                    os.close(holder)
+                if path.is_dir() and not path.is_symlink():
+                    path.rmdir()
+                else:
+                    path.unlink()
+                path.write_bytes(elsewhere.read_bytes())
+                other = MappingStore(path)
+                other.writer_lock_timeout_seconds = 0.2
+                other.save_mapping(mapping("b", 2, "second"))
+                self.assertEqual(system_ids(path), ["a", "b", "seed"])
+
+    def test_a_normal_save_is_unchanged_byte_for_byte_and_in_its_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            published: list[bytes] = []
+            original_replace = store._replace_temp_file
+
+            def capture_then_replace(temp_path: Path) -> None:
+                published.append(temp_path.read_bytes())
+                original_replace(temp_path)
+
+            row = mapping("a", 1, "kept")
+            with patch.object(store, "_replace_temp_file", capture_then_replace):
+                returned = store.save_mapping(row)
+            self.assertEqual(len(published), 1)
+            self.assertEqual(path.read_bytes(), published[0])
+            fresh = MappingStore(path)
+            self.assertEqual(
+                [saved.model_dump() for saved in fresh.list_mappings("a", "shelf")],
+                [returned.model_dump()],
+            )
+            self.assertEqual((returned.system_id, returned.slot, returned.notes), ("a", 1, "kept"))
+            self.assertEqual(store.save_revision("a", "shelf", 1), fresh.save_revision("a", "shelf", 1))
+            self.assertEqual(store.scope_revision("a", "shelf"), fresh.scope_revision("a", "shelf"))
+            self.assertEqual(system_ids(path), ["a", "seed"])
+
+
 class MappingReadRefusalRouteTests(unittest.TestCase):
     """A read that refuses reaches the browser as a named, retryable 503."""
 

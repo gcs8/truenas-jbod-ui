@@ -89,7 +89,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `Retry-After`) instead of waiting. A read that already opened the file
   returns that complete version. A mapping path that is not a regular file,
   including one swapped in during a read, is refused without blocking and is
-  never read as "no mappings". A mapping export takes its rows and its
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
   revision from the same read. A refused import now gets the named 503
   instead of a generic error (#1256).
 
