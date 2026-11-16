@@ -1914,9 +1914,11 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                         self.assertEqual(_rollups(path), [(3600, 2, 2.0, later), (86400, 2, 2.0, later)])
 
     # Two samples SQLite reads in the same millisecond, at least one of them
-    # without an exact instant. Each row: later text, earlier text.
+    # without an exact instant. Each row: later text, earlier text. No
+    # fraction is above .9994: SQLite builds differ on whether .9995 and
+    # above stays in the second's last millisecond or rounds into the next.
     SAME_MILLISECOND_PAIRS = {
-        "padded end of a second": ("2026-11-03T00:30:00.999999+00:00 ", "2026-11-03T00:30:00.999000+00:00"),
+        "padded end of a second": ("2026-11-03T00:30:00.999400+00:00 ", "2026-11-03T00:30:00.999000+00:00"),
         "ordinary after a padded half millisecond": (
             "2026-11-03T00:30:00.001000+00:00",
             "2026-11-03T00:30:00.000500+00:00 ",
