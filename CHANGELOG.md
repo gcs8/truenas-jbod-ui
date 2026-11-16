@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- Last-good SMART values saved by earlier versions are not shown after the
+  upgrade, because they do not record which appliance they came from. Each
+  bay shows SMART again after its next successful SMART read (#1261).
+
 ### Changed
 
 - The image now installs every Python package, direct and transitive, from
@@ -48,6 +54,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Changing where a system's reads are configured to go while keeping its
+  system ID (its appliance address including any path prefix, the API
+  dialect or version where it is part of that address, the platform, the TLS
+  server name the connection presents, SSH hosts, their order or port, the
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address,
+  query included) no
+  longer serves the previous destination's saved SMART values or bay details:
+  each saved row records the configured destinations it was read under, and
+  only rows for the current configuration are read. This follows configured
+  routing only; it does not record which node of a system answered. An edit
+  that moves no read, such as a rename, a new key, or an extra SSH host on a
+  platform that reads only the primary host, keeps the saved values. The first SMART read served from saved values
+  after a restart now refreshes from the disk in the background on its own,
+  instead of waiting for a second request (#1261).
 - A history pass where every SMART metric read failed no longer counts as a
   success: it fails, keeps both metric cadences, and the next pass reads the
   metrics again. When only some scopes fail, the healthy ones keep their
@@ -153,6 +173,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   as `13:0`), a placed disk no longer takes the other controller's pool,
   topology and fault state; a slot key shared by several disks is no longer
   used for topology lookup (#1237, refs #1213).
+- When a refresh returns incomplete topology and the last trusted inventory
+  view is kept, the answer now says so: it keeps the trusted bays and their
+  read time, but shows the latest refresh's source status and warnings under
+  a warning that the view is retained, and the snapshot export reports the
+  same warning instead of the earlier successful status (#1242).
 
 ### Performance
 
@@ -165,6 +190,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, a `--root` below a directory another user could rename
+  entries in, and missing fixtures before running any command. Every write,
+  move or removal inside the directory it created first checks, by device and
+  inode for the root and every parent, that it is still that directory, and a
+  recursive removal first checks every deployment directory it created inside
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
+  verified, also between the admin scenario's two phases, and keeps the root
+  and exits nonzero when cleanup fails or is unknown. Its header states what
+  this does not cover: a process running as the same user or as root that
+  swaps directories while it runs (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,
