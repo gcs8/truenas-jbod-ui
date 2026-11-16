@@ -138,6 +138,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_startup_config",
     "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
+    "tests.test_unittest_identities",
     "tests.test_unittest_shards",
     "tests.test_wiki_drift_verifier",
 )

@@ -257,7 +257,7 @@ jobs:
       - name: Compile Python source
         run: python -m compileall app admin_service history_service scripts tests
 
-      # Every shard runs tests.test_unittest_shards, and shard 2 runs
+      # Shard 2 runs tests.test_unittest_shards and shard 4 runs
       # tests.test_perf_budgets, including the checked-in baseline command
       # contract. `run` refuses a module that is missing from the shard table.
       # dev-check-source-gate: performance-baseline
@@ -296,6 +296,11 @@ jobs:
     if: "${{ !cancelled() && needs.route.outputs.run == 'true' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # Only the label read below uses the token; no step that imports test
+      # code sees it.
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -303,6 +308,24 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
+      - name: Read test-removal approval
+        id: removal-approval
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Read live so adding the label and rerunning this job takes effect.
+          # This is the first step: it runs before checkout, dependency
+          # installation or any test import, so no pull-request code has run on
+          # this runner while the token is in use. That keeps the token away
+          # from test code; it does not stop a pull request editing this step.
+          approved="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | index("tests-removed-ok") != null')"
+          test "$approved" = true || test "$approved" = false
+          echo "approved=${approved}" >> "$GITHUB_OUTPUT"
+
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -318,8 +341,12 @@ jobs:
             requirements.txt
             requirements-dev.txt
 
-      - name: Install validation dependencies
-        run: python -m pip install -r requirements-dev.txt
+      # Discovery imports every test module, so it needs the same runtime and
+      # development dependencies as the shards.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip check
 
       - name: Download shard results
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -330,8 +357,13 @@ jobs:
           # reruns. The verifier selects the latest numeric attempt per shard.
           merge-multiple: false
 
+      # The expected set comes from discovery of this exact checkout, not from
+      # the shard table and not from a committed file.
+      - name: Discover test identities
+        run: python scripts/run_test_shard.py discover --output "$RUNNER_TEMP/test-identities/candidate.json"
+
       - name: Require a green result from every shard
-        run: python scripts/run_test_shard.py verify --results-dir shard-results --python-version "${{ matrix.python-version }}"
+        run: python scripts/run_test_shard.py verify --results-dir shard-results --python-version "${{ matrix.python-version }}" --inventory "$RUNNER_TEMP/test-identities/candidate.json"
 
       # A rerun may fail before writing a receipt. An older passing receipt
       # must not hide a failed, skipped or otherwise incomplete shard job.
@@ -339,6 +371,55 @@ jobs:
         env:
           SHARD_JOB_RESULT: ${{ needs.python-unittest.result }}
         run: test "$SHARD_JOB_RESULT" = success
+
+      # A test deleted and another added keeps every candidate-only check
+      # green, so compare with the base. Pull requests fail on a removed or
+      # renamed test unless they carry `tests-removed-ok`; pushes to main only
+      # report. This is a guard against unnoticed removal, not a trust
+      # boundary: the job runs this file, scripts/run_test_shard.py and the
+      # test code as the pull request has them, so a pull request that edits
+      # them can switch it off. Review such an edit like a removal.
+      - name: Compare test identities with the base
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          REMOVALS_APPROVED: ${{ steps.removal-approval.outputs.approved == 'true' }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          base_dir="$RUNNER_TEMP/base-source"
+          git worktree add --detach "$base_dir" "$BASE_SHA"
+          base_python=python
+          # Reuse this job's environment only when the base installs the same
+          # requirement files; otherwise give the base its own environment.
+          if ! git diff --quiet "$BASE_SHA" HEAD -- requirements.txt requirements-dev.txt; then
+            python -m venv "$RUNNER_TEMP/base-venv"
+            base_python="$RUNNER_TEMP/base-venv/bin/python"
+            "$base_python" -m pip install -r "$base_dir/requirements.txt" -r "$base_dir/requirements-dev.txt"
+          fi
+          # -I plus --root keeps this checkout's app and scripts off the
+          # import path while the base's tests are imported.
+          (cd "$base_dir" && "$base_python" -I "$GITHUB_WORKSPACE/scripts/run_test_shard.py" discover \
+            --root "$base_dir" --output "$RUNNER_TEMP/test-identities/base.json")
+          approval=()
+          if [ "$REMOVALS_APPROVED" = true ]; then
+            approval=(--removals-approved)
+          fi
+          python scripts/run_test_shard.py compare \
+            --base "$RUNNER_TEMP/test-identities/base.json" \
+            --candidate "$RUNNER_TEMP/test-identities/candidate.json" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            "${approval[@]}"
+
+      - name: Upload test identities
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: python-test-identities-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-identities/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Combine report-only coverage
         if: matrix.python-version == '3.14'
