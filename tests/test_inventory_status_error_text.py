@@ -2,39 +2,68 @@
 
 from __future__ import annotations
 
+import asyncio
+import errno
+import inspect
 import io
 import json
+import logging
 import ssl
 import tempfile
 import unittest
 from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
+from websockets.datastructures import Headers
+from websockets.exceptions import InvalidStatus
+from websockets.http11 import Response
 
+from app import main as app_main
+from app import route_support
 from app import routes as app_routes
 from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, SlotView
+from app.models.domain import (
+    InventorySnapshot,
+    LedAction,
+    LedRequest,
+    MappingBundle,
+    SlotView,
+    SmartBatchRequest,
+    SnapshotExportRequest,
+    SourceStatus,
+    StorageViewRuntimePayload,
+    SystemLocatorRequest,
+)
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.slot_detail_store import SlotDetailStore
+from app.services.snapshot_export import SnapshotExportService
+from app.services.ssh_probe import SSHCommandResult
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
+from app.services.tls_context import TlsTrustConfigurationError
 from app.services.truenas_ws import (
     TrueNASAPIError,
     TrueNASRawData,
+    TrueNASWebsocketClient,
     build_ddp_error,
     build_jsonrpc_error,
+    classify_remote_failure,
+    normalize_disk_inventory_rows,
 )
+from tests.test_snapshot_export import FakeHistoryBackend, build_request
+from tests.test_storage_view_smart_batch import _runtime as storage_view_runtime
 
 
 PRIVATE_MARKER = "SYNTHETIC-REMOTE-DETAIL"
 
 
-class InventoryStatusErrorTextTests(unittest.IsolatedAsyncioTestCase):
+class _InventoryFixture(unittest.IsolatedAsyncioTestCase):
     def _service(
         self,
         *,
@@ -127,6 +156,8 @@ class InventoryStatusErrorTextTests(unittest.IsolatedAsyncioTestCase):
             if getattr(route, "path", None) == path and method in getattr(route, "methods", set())
         )
 
+
+class InventoryStatusErrorTextTests(_InventoryFixture):
     async def test_success_control_keeps_the_named_reachable_status(self) -> None:
         payload, serialized = await self._serialized_bundle()
 
@@ -169,7 +200,7 @@ class InventoryStatusErrorTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(PRIVATE_MARKER, serialized)
         self.assertNotIn(PRIVATE_MARKER, json.dumps(payload["warnings"]))
 
-    async def test_quantastor_payload_body_and_reason_are_not_published(self) -> None:
+    async def test_quantastor_failures_use_fixed_public_reasons(self) -> None:
         client = QuantastorRESTClient(
             TrueNASConfig(
                 host="http://source.example.test",
@@ -388,17 +419,17 @@ class InventoryStatusErrorTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(PRIVATE_MARKER, status.model_dump_json())
 
     async def test_sibling_source_failures_use_fixed_public_reasons(self) -> None:
-        payload, serialized = await self._serialized_bundle(ssh_error=RuntimeError(PRIVATE_MARKER))
+        payload, serialized = await self._serialized_bundle(ssh_error=ConnectionResetError(PRIVATE_MARKER))
         self.assertEqual(
             payload["sources"]["ssh"]["message"],
-            "SSH diagnostics collection failed.",
+            "SSH diagnostics could not be reached.",
         )
         self.assertNotIn(PRIVATE_MARKER, serialized)
 
-        payload, serialized = await self._serialized_bundle(bmc_error=RuntimeError(PRIVATE_MARKER))
+        payload, serialized = await self._serialized_bundle(bmc_error=TimeoutError(PRIVATE_MARKER))
         self.assertEqual(
             payload["sources"]["bmc"]["message"],
-            "BMC / IPMI diagnostics collection failed.",
+            "BMC / IPMI diagnostics collection timed out.",
         )
         self.assertNotIn(PRIVATE_MARKER, serialized)
 
@@ -465,6 +496,834 @@ class BMCWarningErrorTextTests(unittest.TestCase):
         self.assertIn("category=remote_error", rendered)
         self.assertNotIn(PRIVATE_MARKER, rendered)
         self.assertNotIn(PRIVATE_MARKER, json.dumps(inventory.source_details))
+
+
+class _RecordedLogs(logging.Handler):
+    """Every record any logger emits while active, at every level."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def __enter__(self) -> "_RecordedLogs":
+        root = logging.getLogger()
+        self._previous_level = root.level
+        root.addHandler(self)
+        root.setLevel(logging.DEBUG)
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        root = logging.getLogger()
+        root.removeHandler(self)
+        root.setLevel(self._previous_level)
+
+    def text(self) -> str:
+        return "\n".join(record.getMessage() for record in self.records)
+
+    def matching(self, fragment: str) -> list[logging.LogRecord]:
+        return [record for record in self.records if fragment in record.getMessage()]
+
+
+def _raised_by(call) -> BaseException:
+    try:
+        call()
+    except BaseException as caught:  # noqa: BLE001 - the test inspects what the producer raised.
+        return caught
+    raise AssertionError("the producer did not raise")
+
+
+async def _raised_by_async(awaitable) -> BaseException:
+    try:
+        await awaitable
+    except BaseException as caught:  # noqa: BLE001 - the test inspects what the producer raised.
+        return caught
+    raise AssertionError("the producer did not raise")
+
+
+def _jsonrpc_error_with_remote_reason(method: str = "pool.query") -> TrueNASAPIError:
+    return build_jsonrpc_error(
+        method,
+        {
+            "code": -32001,
+            "message": PRIVATE_MARKER,
+            "data": {"errname": "EINVAL", "reason": PRIVATE_MARKER, "trace": PRIVATE_MARKER},
+        },
+    )
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def read(self, *_args: object) -> bytes:
+        return self._body
+
+
+class _FakeOpener:
+    def __init__(self, *, error: BaseException | None = None, body: bytes = b"") -> None:
+        self.error = error
+        self.body = body
+
+    def open(self, *_args: object, **_kwargs: object) -> _FakeResponse:
+        if self.error is not None:
+            raise self.error
+        return _FakeResponse(self.body)
+
+
+class FailureOriginTests(_InventoryFixture):
+    """Origin decides the text: service sentences pass, remote text never does."""
+
+    async def _bundle_and_logs(self, **service_kwargs) -> tuple[dict, str, _RecordedLogs]:
+        service = self._service(**service_kwargs)
+        with _RecordedLogs() as logs:
+            bundle = await service._collect_inventory_source_bundle()
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            sources=bundle.sources,
+            warnings=bundle.warnings,
+        )
+        payload = snapshot.model_dump(mode="json")
+        return payload, json.dumps(payload, sort_keys=True), logs
+
+    def _smart_service(self, *, platform: str, ssh_enabled: bool) -> InventoryService:
+        service = self._service(platform=platform)
+        service.system = service.system.model_copy(
+            update={"ssh": SSHConfig(enabled=ssh_enabled, host="source.example.test", user="svcuser")}
+        )
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            enclosure_id="synthetic-enclosure",
+            present=True,
+            device_name="sda",
+            serial="SANITIZED-SMART",
+            transport_protocol="SAS",
+        )
+        service.get_snapshot = AsyncMock(
+            return_value=InventorySnapshot(
+                slots=[slot],
+                refresh_interval_seconds=30,
+                selected_enclosure_id=slot.enclosure_id,
+            )
+        )
+        return service
+
+    @staticmethod
+    def _ssh_smart_result(stderr: str, exit_code: int | None):
+        async def run(_planner, *, initial_commands, host=None):
+            return [
+                SSHCommandResult(
+                    command=initial_commands[0],
+                    ok=False,
+                    stdout="",
+                    stderr=stderr,
+                    exit_code=exit_code,
+                )
+            ]
+
+        return AsyncMock(side_effect=run)
+
+    async def test_unexpected_local_exception_is_its_own_category_with_frames(self) -> None:
+        cases = (
+            ("api", {"api_error": KeyError(PRIVATE_MARKER)}, "TrueNAS API", "KeyError"),
+            ("ssh", {"ssh_error": ValueError(PRIVATE_MARKER)}, "SSH diagnostics", "ValueError"),
+            ("bmc", {"bmc_error": AttributeError(PRIVATE_MARKER)}, "BMC / IPMI diagnostics", "AttributeError"),
+        )
+        for source, kwargs, label, type_name in cases:
+            with self.subTest(source=source):
+                payload, serialized, logs = await self._bundle_and_logs(**kwargs)
+                self.assertEqual(
+                    payload["sources"][source]["message"],
+                    f"{label} collection stopped on an internal error; see the service log.",
+                )
+                internal = logs.matching("category=internal_error")
+                self.assertEqual(len(internal), 1, logs.text())
+                record = internal[0]
+                self.assertEqual(record.levelno, logging.ERROR)
+                self.assertEqual(record.name, "app.services.inventory")
+                self.assertIn(f"exception={type_name}", record.getMessage())
+                # Stack frames, so the bug can be found; no exception message.
+                self.assertIn("inventory.py", record.getMessage())
+                self.assertIsNone(record.exc_info)
+                self.assertNotIn(PRIVATE_MARKER, logs.text())
+                self.assertNotIn(PRIVATE_MARKER, serialized)
+
+    async def test_collector_failures_stay_at_error(self) -> None:
+        cases = (
+            ("api", {"api_error": ConnectionResetError(PRIVATE_MARKER)}, "Platform API collection failed"),
+            ("ssh", {"ssh_error": ConnectionResetError(PRIVATE_MARKER)}, "SSH diagnostics collection failed"),
+            ("bmc", {"bmc_error": ConnectionResetError(PRIVATE_MARKER)}, "BMC diagnostics collection failed"),
+        )
+        for source, kwargs, operation in cases:
+            with self.subTest(source=source):
+                _payload, _serialized, logs = await self._bundle_and_logs(**kwargs)
+                records = logs.matching(operation)
+                self.assertEqual(len(records), 1, logs.text())
+                self.assertEqual(records[0].levelno, logging.ERROR)
+                self.assertEqual(
+                    records[0].getMessage(),
+                    f"{operation} (category=unreachable, exception=ConnectionResetError)",
+                )
+
+    def test_category_is_decided_by_type_and_errno_not_by_text(self) -> None:
+        wrapped = self._error_with_cause(KeyError(PRIVATE_MARKER))
+        cases = (
+            (KeyError(PRIVATE_MARKER), "internal_error"),
+            (TypeError(PRIVATE_MARKER), "internal_error"),
+            (PermissionError(errno.EACCES, PRIVATE_MARKER), "internal_error"),
+            (ConnectionRefusedError(errno.ECONNREFUSED, PRIVATE_MARKER), "unreachable"),
+            (OSError(errno.ECONNRESET, PRIVATE_MARKER), "unreachable"),
+            (json.JSONDecodeError(PRIVATE_MARKER, "{", 0), "response_invalid"),
+            (ssl.SSLError(1, PRIVATE_MARKER), "tls_failed"),
+            # An adapter wrapper stays a remote failure whatever it wraps.
+            (wrapped, "remote_error"),
+            # Words in a message never change the category.
+            (KeyError("connection refused timed out ENOMETHOD"), "internal_error"),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__, expected=expected):
+                self.assertEqual(classify_remote_failure(error)[0], expected)
+
+    async def test_service_sentences_reach_source_status_unchanged(self) -> None:
+        row_limit = _raised_by(lambda: normalize_disk_inventory_rows([{}] * 4097))
+        bundle_refusal = TlsTrustConfigurationError(
+            "config/ca-bundle.pem",
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+        )
+        for error in (row_limit, bundle_refusal):
+            with self.subTest(error=type(error).__name__):
+                payload, _serialized, logs = await self._bundle_and_logs(api_error=error)
+                self.assertEqual(payload["sources"]["api"]["message"], str(error))
+                self.assertTrue(logs.matching("category=local"), logs.text())
+
+    async def test_tls_and_websocket_status_failures_get_their_own_categories(self) -> None:
+        cases = (
+            (ssl.SSLError(1, PRIVATE_MARKER), "TrueNAS API TLS connection failed."),
+            (
+                InvalidStatus(Response(401, PRIVATE_MARKER, Headers(), PRIVATE_MARKER.encode())),
+                "TrueNAS API authentication failed.",
+            ),
+            (
+                InvalidStatus(Response(503, PRIVATE_MARKER, Headers(), PRIVATE_MARKER.encode())),
+                "TrueNAS API reported a collection error (code 503).",
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                payload, serialized, logs = await self._bundle_and_logs(api_error=error)
+                self.assertEqual(payload["sources"]["api"]["message"], expected)
+                self.assertNotIn(PRIVATE_MARKER, serialized)
+                self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_missing_intermediate_certificate_codes_are_labelled(self) -> None:
+        for verify_code, label in ((2, "issuer certificate not available"), (21, "certificate chain incomplete")):
+            with self.subTest(verify_code=verify_code):
+                error = ssl.SSLCertVerificationError(1, PRIVATE_MARKER)
+                error.verify_code = verify_code
+                error.verify_message = PRIVATE_MARKER
+                payload, serialized, _logs = await self._bundle_and_logs(api_error=error)
+                self.assertEqual(
+                    payload["sources"]["api"]["message"],
+                    f"TrueNAS API certificate verification failed ({label}).",
+                )
+                self.assertNotIn(PRIVATE_MARKER, serialized)
+
+    async def test_api_failure_log_names_the_method_and_error_name(self) -> None:
+        error = build_ddp_error(
+            "disk.query",
+            {"error": 13, "errname": "EACCES", "reason": PRIVATE_MARKER, "trace": {"frames": [PRIVATE_MARKER]}},
+        )
+        _payload, serialized, logs = await self._bundle_and_logs(api_error=error)
+
+        records = logs.matching("Platform API collection failed")
+        self.assertEqual(len(records), 1, logs.text())
+        self.assertEqual(records[0].levelno, logging.ERROR)
+        self.assertEqual(
+            records[0].getMessage(),
+            "Platform API collection failed (category=remote_error, code=13, method=disk.query, "
+            "errname=EACCES, exception=TrueNASAPIError)",
+        )
+        self.assertNotIn(PRIVATE_MARKER, logs.text())
+        self.assertNotIn(PRIVATE_MARKER, serialized)
+
+    def test_older_dialect_keeps_only_a_well_formed_error_name(self) -> None:
+        error = build_ddp_error(
+            "disk.query",
+            {"error": 13, "errname": "EACCES", "reason": PRIVATE_MARKER, "trace": PRIVATE_MARKER},
+        )
+        self.assertEqual(str(error), "disk.query failed (remote error, EACCES, code 13).")
+        self.assertEqual(getattr(error, "errname", None), "EACCES")
+        self.assertEqual(getattr(error, "method", None), "disk.query")
+        for errname in ("eacces", "E" * 33, f"EACCES {PRIVATE_MARKER}", "", None, 13):
+            with self.subTest(errname=errname):
+                error = build_ddp_error("disk.query", {"error": 13, "errname": errname, "reason": PRIVATE_MARKER})
+                self.assertIsNone(getattr(error, "errname", None))
+                self.assertEqual(str(error), "disk.query failed (remote error, code 13).")
+
+    def test_jsonrpc_reason_is_kept_apart_bounded_and_clean(self) -> None:
+        error = build_jsonrpc_error(
+            "enclosure.set_slot_status",
+            {
+                "code": -32001,
+                "message": "Method call error",
+                "data": {"errname": "EINVAL", "reason": "Slot 3\x1b[31m is\nnot populated" + "x" * 400},
+            },
+        )
+        self.assertEqual(str(error), "enclosure.set_slot_status failed (remote error, EINVAL, code -32001).")
+        reason = error.reason or ""
+        self.assertTrue(reason.startswith("Slot 3 [31m is not populated"))
+        self.assertLessEqual(len(reason), 300)
+        self.assertFalse(any(not character.isprintable() for character in reason))
+
+    async def test_ssh_smart_turned_off_shows_the_service_sentence(self) -> None:
+        service = self._smart_service(platform="scale", ssh_enabled=False)
+        with _RecordedLogs() as logs:
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="synthetic-enclosure")
+
+        self.assertEqual(summary.message, "SMART detail needs SSH on this system, and SSH is turned off.")
+        self.assertTrue(logs.matching("SMART SSH collection failed (kind=ssh_disabled, exit_status=none)"), logs.text())
+
+    async def test_ssh_smart_guidance_is_shown_and_remote_output_is_not(self) -> None:
+        guidance_suffix = "Re-run the SSH access setup in the admin console to fix the sudo permissions."
+        cases = (
+            (
+                f"Sorry, user svcuser is not allowed to execute '/usr/sbin/smartctl -x -j /dev/sda' "
+                f"as root on {PRIVATE_MARKER}.",
+                1,
+                f"/dev/sda: The SSH user svcuser is not allowed to run smartctl on /dev/sda. {guidance_suffix}",
+                "kind=sudo_denied, exit_status=1",
+            ),
+            (
+                f"sudo: a password is required {PRIVATE_MARKER}",
+                1,
+                f"/dev/sda: smartctl needs a sudo password on this host. {guidance_suffix}",
+                "kind=sudo_password, exit_status=1",
+            ),
+            (
+                PRIVATE_MARKER,
+                2,
+                "SMART data collection over SSH failed.",
+                "kind=command_failed, exit_status=2",
+            ),
+        )
+        for stderr, exit_code, expected, log_fields in cases:
+            with self.subTest(log_fields=log_fields):
+                service = self._smart_service(platform="scale", ssh_enabled=True)
+                service._run_ssh_planned_commands = self._ssh_smart_result(stderr, exit_code)
+                with _RecordedLogs() as logs:
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="synthetic-enclosure")
+                self.assertEqual(summary.message, expected)
+                self.assertTrue(logs.matching(f"SMART SSH collection failed ({log_fields})"), logs.text())
+                self.assertNotIn(PRIVATE_MARKER, summary.model_dump_json())
+                self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_core_ssh_fallback_after_an_api_failure_uses_a_fixed_reason(self) -> None:
+        service = self._smart_service(platform="core", ssh_enabled=True)
+        service._run_ssh_planned_commands = self._ssh_smart_result(PRIVATE_MARKER, 2)
+        api_error = build_ddp_error("disk.smartctl", {"error": 5, "reason": PRIVATE_MARKER})
+        with (
+            patch.object(
+                service.truenas_client,
+                "fetch_disk_smartctl",
+                new=AsyncMock(side_effect=api_error),
+                create=True,
+            ),
+            _RecordedLogs() as logs,
+        ):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="synthetic-enclosure")
+
+        self.assertEqual(summary.message, "SMART data collection over SSH failed.")
+        self.assertTrue(
+            logs.matching(
+                "SMART API collection failed (category=remote_error, code=5, method=disk.smartctl, "
+                "exception=TrueNASAPIError)"
+            ),
+            logs.text(),
+        )
+        self.assertTrue(logs.matching("SMART SSH collection failed (kind=command_failed, exit_status=2)"), logs.text())
+        self.assertNotIn(PRIVATE_MARKER, summary.model_dump_json())
+        self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_smart_timeout_keeps_the_service_sentence(self) -> None:
+        service = self._smart_service(platform="core", ssh_enabled=False)
+
+        async def never_answers(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        with (
+            patch.object(service, "_smart_call_timeout_seconds", return_value=0.01),
+            patch.object(
+                service.truenas_client,
+                "fetch_disk_smartctl",
+                new=AsyncMock(side_effect=never_answers),
+                create=True,
+            ),
+            _RecordedLogs(),
+        ):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="synthetic-enclosure")
+
+        self.assertEqual(summary.message, "SMART lookup for sda timed out after 0.01s; the disk did not answer.")
+
+    async def test_smart_batch_fallback_uses_origin(self) -> None:
+        service = self._smart_service(platform="core", ssh_enabled=False)
+        local_error = await _raised_by_async(service.get_slot_smart_summary(7))
+        remote_error = build_ddp_error("disk.smartctl", {"error": 5, "reason": PRIVATE_MARKER})
+        for error, expected in (
+            (remote_error, "SMART data collection failed."),
+            (local_error, "Slot 07 is not present in the current snapshot."),
+        ):
+            with self.subTest(expected=expected):
+                service._get_slot_smart_summary_for_slot_view = AsyncMock(side_effect=error)
+                with _RecordedLogs() as logs:
+                    items = await service.get_slot_smart_summaries([0])
+                self.assertEqual([item.summary.message for item in items], [expected])
+                self.assertNotIn(PRIVATE_MARKER, items[0].summary.model_dump_json())
+                self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_smart_routes_show_service_sentences_with_status_400(self) -> None:
+        service = self._smart_service(platform="core", ssh_enabled=False)
+        service.get_storage_view_runtime = AsyncMock(return_value=StorageViewRuntimePayload(views=[]))
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        cases = (
+            (
+                self._route("/api/slots/{slot}/smart", "GET"),
+                {"slot": 7, "system_id": None, "enclosure_id": None, "fresh": False},
+                "Slot 07 is not present in the current snapshot.",
+            ),
+            (
+                self._route("/api/storage-views/{view_id}/slots/{slot_index}/smart", "GET"),
+                {"view_id": "missing", "slot_index": 0, "system_id": None, "enclosure_id": None, "fresh": False},
+                'The saved view "missing" does not exist on this system.',
+            ),
+            (
+                self._route("/api/storage-views/{view_id}/slots/smart-batch", "POST"),
+                {
+                    "view_id": "missing",
+                    "payload": SmartBatchRequest(slots=[0]),
+                    "system_id": None,
+                    "enclosure_id": None,
+                    "fresh": False,
+                },
+                'The saved view "missing" does not exist on this system.',
+            ),
+        )
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_read_slot_bounds", new=AsyncMock(return_value="verified")),
+        ):
+            for route, kwargs, expected in cases:
+                with self.subTest(route=route.__name__):
+                    with _RecordedLogs() as logs, self.assertRaises(HTTPException) as raised:
+                        await route(**kwargs)
+                    self.assertEqual(raised.exception.status_code, 400)
+                    self.assertEqual(raised.exception.detail, expected)
+                    self.assertFalse(logs.matching("SMART request failed"), logs.text())
+
+    async def test_read_sinks_never_carry_the_remote_reason(self) -> None:
+        error = _jsonrpc_error_with_remote_reason()
+        self.assertEqual(error.reason, PRIVATE_MARKER)
+        payload, serialized, logs = await self._bundle_and_logs(api_error=error)
+        self.assertEqual(
+            payload["sources"]["api"]["message"],
+            "TrueNAS API reported a collection error (code -32001).",
+        )
+        self.assertNotIn(PRIVATE_MARKER, serialized)
+        self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+        service = MagicMock()
+        service.system = SystemConfig(id="synthetic-route", truenas=TrueNASConfig(platform="scale"))
+        service.get_slot_smart_summary = AsyncMock(side_effect=error)
+        service.get_storage_view_runtime = AsyncMock(side_effect=error)
+        service.preview_mapping_bundle = AsyncMock(side_effect=error)
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        cases = (
+            (
+                self._route("/api/slots/{slot}/smart", "GET"),
+                {"slot": 0, "system_id": None, "enclosure_id": None, "fresh": False},
+                "SMART data could not be loaded.",
+            ),
+            (
+                self._route("/api/storage-views/{view_id}/history", "GET"),
+                {
+                    "view_id": "synthetic-view",
+                    "system_id": None,
+                    "enclosure_id": None,
+                    "window_hours": 24,
+                    "metrics": None,
+                    "event_limit": 12,
+                    "metric_limit": 60,
+                },
+                "Storage view data could not be loaded.",
+            ),
+            (
+                self._route("/api/mappings/import/preview", "POST"),
+                {"payload": MappingBundle(mappings=[]), "system_id": None, "enclosure_id": None},
+                "The mapping import preview could not be prepared.",
+            ),
+        )
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_read_slot_bounds", new=AsyncMock(return_value="verified")),
+        ):
+            for route, kwargs, expected in cases:
+                with self.subTest(route=route.__name__):
+                    with _RecordedLogs() as logs, self.assertRaises(HTTPException) as raised:
+                        await route(**kwargs)
+                    self.assertEqual(raised.exception.status_code, 400)
+                    self.assertEqual(raised.exception.detail, expected)
+                    self.assertTrue(logs.matching("category=remote_error"), logs.text())
+                    self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+        export_service = MagicMock()
+        export_service.get_storage_view_runtime = AsyncMock(return_value=storage_view_runtime(2))
+        export_service.get_storage_view_slot_smart_summary = AsyncMock(side_effect=error)
+        with _RecordedLogs() as logs:
+            _runtime, cache = await route_support._load_storage_view_export_source(
+                service=export_service,
+                payload=SnapshotExportRequest(include_storage_views=True),
+                snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+                enclosure_id=None,
+            )
+        self.assertEqual(
+            {entry["message"] for view in cache.values() for entry in view.values()},
+            {"SMART data collection failed."},
+        )
+        self.assertNotIn(PRIVATE_MARKER, json.dumps(cache))
+        self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_export_storage_view_cache_keeps_service_sentences(self) -> None:
+        local_service = self._smart_service(platform="core", ssh_enabled=False)
+        local_service.get_storage_view_runtime = AsyncMock(return_value=StorageViewRuntimePayload(views=[]))
+        local_error = await _raised_by_async(local_service.get_storage_view_slot_smart_summary("missing", 0))
+        export_service = MagicMock()
+        export_service.get_storage_view_runtime = AsyncMock(return_value=storage_view_runtime(1))
+        export_service.get_storage_view_slot_smart_summary = AsyncMock(side_effect=local_error)
+
+        _runtime, cache = await route_support._load_storage_view_export_source(
+            service=export_service,
+            payload=SnapshotExportRequest(include_storage_views=True),
+            snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+            enclosure_id=None,
+        )
+
+        self.assertEqual(
+            [entry["message"] for view in cache.values() for entry in view.values()],
+            ['The saved view "missing" does not exist on this system.'],
+        )
+
+    async def test_mapping_preview_keeps_the_service_refusal(self) -> None:
+        service = self._service()
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        route = self._route("/api/mappings/import/preview", "POST")
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await route(
+                payload=MappingBundle(mappings=[]),
+                system_id=None,
+                enclosure_id="virtual-system:synthetic-status",
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "Bay mapping is not available because this system has no known enclosure.",
+        )
+
+    async def test_healthz_and_export_carry_fixed_status_only(self) -> None:
+        payload, _serialized, _logs = await self._bundle_and_logs(api_error=_jsonrpc_error_with_remote_reason())
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            sources={name: SourceStatus(**value) for name, value in payload["sources"].items()},
+            warnings=payload["warnings"],
+        )
+        service = MagicMock()
+        service.peek_cached_snapshot.return_value = snapshot
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        registry.settings.systems = []
+        healthz = next(route for route in app_main.app.routes if getattr(route, "path", None) == "/healthz")
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))
+        with patch("app.routes.get_inventory_registry", return_value=registry):
+            response = await healthz.endpoint(request)
+        body = json.loads(response.body)
+        self.assertIn("TrueNAS API reported a collection error (code -32001).", body["summary"])
+        self.assertNotIn(PRIVATE_MARKER, response.body.decode())
+
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), route_support.templates)
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache={},
+            selected_slot=None,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        self.assertIn("TrueNAS API reported a collection error (code -32001).", rendered.html)
+        self.assertNotIn(PRIVATE_MARKER, rendered.html)
+
+    async def test_locator_status_uses_origin(self) -> None:
+        service = self._service(bmc_error=TrueNASAPIError(PRIVATE_MARKER))
+        real_bmc = SupermicroBMCService(
+            BMCConfig(enabled=True, host="bmc.example.test", username="synthetic-user", password="synthetic-password")
+        )
+        with patch.object(real_bmc, "_build_https_opener", return_value=_FakeOpener(body=b"<html></html>")):
+            local_error = _raised_by(real_bmc.get_uid_status)
+        cases = (
+            (local_error, "Supermicro BMC web login did not establish a session cookie.", "category=authentication_failed"),
+            (
+                KeyError(PRIVATE_MARKER),
+                "BMC locator status read stopped on an internal error; see the service log.",
+                "category=internal_error",
+            ),
+        )
+        assert service.bmc_service is not None
+        for error, expected, log_fragment in cases:
+            with self.subTest(expected=expected):
+                with (
+                    patch.object(service.bmc_service, "get_uid_status", side_effect=error),
+                    _RecordedLogs() as logs,
+                ):
+                    status = await service.get_system_locator_status()
+                self.assertEqual(status.reason, expected)
+                self.assertTrue(logs.matching(log_fragment), logs.text())
+                self.assertNotIn(PRIVATE_MARKER, logs.text())
+
+    async def test_authorized_actions_add_the_remote_reason(self) -> None:
+        led_error = build_jsonrpc_error(
+            "enclosure.set_slot_status",
+            {
+                "code": -32001,
+                "message": "Method call error",
+                "data": {"errname": "EINVAL", "reason": "Slot 3 is\nnot populated", "trace": PRIVATE_MARKER},
+            },
+        )
+        service = MagicMock()
+        service.system = SystemConfig(id="synthetic-route", truenas=TrueNASConfig(platform="scale"))
+        service.set_slot_led = AsyncMock(side_effect=led_error)
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        led_route = self._route("/api/slots/{slot}/led", "POST")
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
+            _RecordedLogs() as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await led_route(
+                slot=3,
+                payload=LedRequest(action=LedAction.identify),
+                system_id=None,
+                enclosure_id=None,
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "enclosure.set_slot_status failed (remote error, EINVAL, code -32001): Slot 3 is not populated",
+        )
+        # The route's own log line keeps the value-safe message only.
+        self.assertTrue(logs.matching("Locate light refusal"), logs.text())
+        self.assertNotIn("not populated", logs.text())
+        self.assertNotIn(PRIVATE_MARKER, logs.text() + raised.exception.detail)
+
+        bmc = SupermicroBMCService(
+            BMCConfig(enabled=True, host="bmc.example.test", username="synthetic-user", password="synthetic-password")
+        )
+        refusal = HTTPError(
+            f"https://bmc.example.test/cgi/op.cgi?{PRIVATE_MARKER}",
+            500,
+            "synthetic BMC refusal",
+            Message(),
+            io.BytesIO(PRIVATE_MARKER.encode()),
+        )
+        bmc_error = _raised_by(
+            lambda: bmc._post_web_text(
+                _FakeOpener(error=refusal),
+                "/cgi/op.cgi",
+                {"op": "misc_uid"},
+                csrf="synthetic",
+                referer="https://bmc.example.test/",
+            )
+        )
+        locator_service = self._service(bmc_error=TrueNASAPIError(PRIVATE_MARKER))
+        assert locator_service.bmc_service is not None
+        locator_service.bmc_service.set_uid_active.side_effect = bmc_error
+        registry.get_service.return_value = locator_service
+        locator_route = self._route("/api/system-locator", "POST")
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await locator_route(payload=SystemLocatorRequest(active=True), system_id=None)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "Supermicro BMC request failed: HTTP Error 500: synthetic BMC refusal",
+        )
+        self.assertNotIn(PRIVATE_MARKER, raised.exception.detail)
+
+    def test_only_authorized_routes_read_the_remote_reason(self) -> None:
+        authorization = app_routes.require_read_ui_mutation_authorization
+        readers: set[tuple[str, str]] = set()
+        for route in app_routes.build_router().routes:
+            source = inspect.getsource(route.endpoint)
+            if "_authorized_action_failure_detail(" not in source:
+                continue
+            for method in route.methods:
+                readers.add((method, route.path))
+            dependencies = [dependency.dependency for dependency in route.dependencies]
+            self.assertIn(authorization, dependencies, route.path)
+        self.assertEqual(
+            readers,
+            {("POST", "/api/slots/{slot}/led"), ("POST", "/api/system-locator")},
+        )
+        # Nothing outside the routes module reads the helper.
+        app_root = Path(app_routes.__file__).resolve().parent
+        users = sorted(
+            str(path.relative_to(app_root))
+            for path in app_root.rglob("*.py")
+            if "_authorized_action_failure_detail(" in path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(users, ["routes.py"])
+
+
+class AdapterMessageTests(unittest.IsolatedAsyncioTestCase):
+    """Each adapter writes its own message; remote text stays off it."""
+
+    def _bmc(self) -> SupermicroBMCService:
+        return SupermicroBMCService(
+            BMCConfig(enabled=True, host="bmc.example.test", username="synthetic-user", password="synthetic-password")
+        )
+
+    def test_redfish_errors_keep_remote_text_off_the_message(self) -> None:
+        service = self._bmc()
+        body = json.dumps({"error": {"message": "synthetic redfish refusal"}}).encode()
+        http_error = HTTPError(
+            f"https://bmc.example.test/redfish/v1/Systems/1?{PRIVATE_MARKER}",
+            500,
+            PRIVATE_MARKER,
+            Message(),
+            io.BytesIO(body),
+        )
+        with patch.object(service, "_build_https_opener", return_value=_FakeOpener(error=http_error)):
+            error = _raised_by(lambda: service._redfish_get_json("/redfish/v1/Systems/1"))
+        self.assertEqual(str(error), "Redfish request failed with HTTP 500.")
+        self.assertEqual(getattr(error, "reason", None), "synthetic redfish refusal")
+        self.assertEqual(getattr(error, "method", None), "/redfish/v1/Systems/1")
+        self.assertEqual(classify_remote_failure(error), ("remote_error", 500))
+
+        with patch.object(service, "_build_https_opener", return_value=_FakeOpener(error=URLError(PRIVATE_MARKER))):
+            error = _raised_by(lambda: service._redfish_get_json("/redfish/v1/Systems/1"))
+        self.assertEqual(str(error), "Redfish request failed.")
+        self.assertEqual(classify_remote_failure(error)[0], "unreachable")
+
+    def test_bmc_web_errors_keep_remote_text_off_the_message(self) -> None:
+        service = self._bmc()
+        error = _raised_by(
+            lambda: service._fetch_web_text(
+                _FakeOpener(error=URLError(PRIVATE_MARKER)),
+                "https://bmc.example.test/cgi/url_redirect.cgi?url_name=sys_storage",
+            )
+        )
+        self.assertEqual(str(error), "Supermicro BMC request failed.")
+        self.assertEqual(getattr(error, "method", None), "/cgi/url_redirect.cgi")
+        self.assertEqual(classify_remote_failure(error)[0], "unreachable")
+
+    def test_bmc_service_sentences_reach_warnings_with_their_category(self) -> None:
+        service = self._bmc()
+        with (
+            patch.object(service, "_populate_redfish_inventory"),
+            patch.object(service, "_populate_redfish_simple_storage_fallback"),
+            patch.object(service, "_build_https_opener", return_value=_FakeOpener(body=b"<html></html>")),
+            _RecordedLogs() as logs,
+        ):
+            inventory = service.fetch_inventory()
+        self.assertEqual(inventory.warnings, ["Supermicro BMC web login did not establish a session cookie."])
+        self.assertTrue(
+            logs.matching("BMC web inventory failed (category=authentication_failed, method=/cgi/login.cgi"),
+            logs.text(),
+        )
+
+    def test_quantastor_errors_name_the_endpoint(self) -> None:
+        client = QuantastorRESTClient(
+            TrueNASConfig(
+                host="http://source.example.test",
+                platform="quantastor",
+                api_user="synthetic-user",
+                api_password="synthetic-password",
+            )
+        )
+        with patch("app.services.quantastor_api.urlopen_with_tls_config", side_effect=URLError(PRIVATE_MARKER)):
+            error = _raised_by(lambda: client._request_json("storageSystemEnum"))
+        self.assertEqual(getattr(error, "method", None), "storageSystemEnum")
+        self.assertNotIn(PRIVATE_MARKER, str(error))
+
+    async def test_websocket_adapter_messages_are_fixed(self) -> None:
+        class ScriptedSocket:
+            def __init__(self, reply: dict) -> None:
+                self.reply = reply
+                self.send = AsyncMock()
+
+            async def recv(self) -> str:
+                return json.dumps(self.reply)
+
+        client = TrueNASWebsocketClient(TrueNASConfig(platform="core", api_key="synthetic-key"))
+        error = await _raised_by_async(
+            client._await_ddp_reply(
+                ScriptedSocket({"msg": "nosub", "id": "request-1", "detail": PRIVATE_MARKER}),
+                "disk.query",
+                "request-1",
+            )
+        )
+        self.assertEqual(str(error), "Unexpected response for disk.query.")
+        self.assertEqual(classify_remote_failure(error)[0], "response_invalid")
+
+        error = await _raised_by_async(
+            client._perform_handshake(ScriptedSocket({"msg": "failed", "version": PRIVATE_MARKER}), None)
+        )
+        self.assertEqual(str(error), "Unexpected websocket handshake response.")
+        self.assertEqual(classify_remote_failure(error)[0], "response_invalid")
+
+    async def test_login_failure_and_bmc_refusal_are_authentication_failures(self) -> None:
+        client = TrueNASWebsocketClient(
+            TrueNASConfig(platform="scale", api_dialect="jsonrpc", api_key="synthetic-key")
+        )
+        with patch.object(client, "_login", new=AsyncMock(return_value=False)):
+            login_error = await _raised_by_async(client._perform_handshake(MagicMock(), None))
+        self.assertEqual(str(login_error), "TrueNAS API authentication failed.")
+        self.assertIsNone(login_error.__cause__)
+        self.assertEqual(classify_remote_failure(login_error)[0], "authentication_failed")
+
+        bmc = self._bmc()
+        with patch.object(
+            bmc,
+            "_build_https_opener",
+            return_value=_FakeOpener(body=b"Invalid Username or Password"),
+        ):
+            with patch(
+                "app.services.supermicro_bmc.http.cookiejar.CookieJar.__iter__",
+                side_effect=lambda *_args: iter([object()]),
+            ):
+                refusal = _raised_by(bmc._open_web_session)
+        self.assertEqual(str(refusal), "Supermicro BMC rejected the configured username or password.")
+        self.assertEqual(classify_remote_failure(refusal)[0], "authentication_failed")
 
 
 if __name__ == "__main__":

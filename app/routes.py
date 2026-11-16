@@ -114,7 +114,12 @@ from app.services.snapshot_export import (
 )
 from app.services.storage_writability import StorageDirectoryUnwritable
 from app.services.tls_context import TlsTrustConfigurationError
-from app.services.truenas_ws import TrueNASAPIError, classify_remote_failure
+from app.services.truenas_ws import (
+    TrueNASAPIError,
+    bounded_remote_reason,
+    is_local_failure_message,
+    log_failure,
+)
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HISTORY_READ_BUSY_DETAIL,
@@ -226,18 +231,45 @@ def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
 
 
 SMART_REMOTE_FAILURE_DETAIL = "SMART data could not be loaded."
+STORAGE_VIEW_HISTORY_FAILURE_DETAIL = "Storage view data could not be loaded."
+MAPPING_PREVIEW_FAILURE_DETAIL = "The mapping import preview could not be prepared."
+
+
+def _read_failure_http_exception(
+    exc: TrueNASAPIError,
+    *,
+    operation: str,
+    detail: str,
+) -> HTTPException:
+    """A read route's 400: this service's own sentence as it is, else fixed text."""
+
+    if is_local_failure_message(exc):
+        return HTTPException(status_code=400, detail=str(exc))
+    log_failure(_routes_logger, operation, exc)
+    return HTTPException(status_code=400, detail=detail)
 
 
 def _smart_remote_http_exception(exc: TrueNASAPIError) -> HTTPException:
-    category, code = classify_remote_failure(exc)
-    code_context = f", code={code}" if code is not None else ""
-    _routes_logger.warning(
-        "SMART request failed (category=%s%s, exception=%s)",
-        category,
-        code_context,
-        type(exc).__name__,
+    return _read_failure_http_exception(
+        exc,
+        operation="SMART request",
+        detail=SMART_REMOTE_FAILURE_DETAIL,
     )
-    return HTTPException(status_code=400, detail=SMART_REMOTE_FAILURE_DETAIL)
+
+
+def _authorized_action_failure_detail(exc: TrueNASAPIError) -> str:
+    """Failure text for a route behind ``require_read_ui_mutation_authorization``.
+
+    It adds the remote reason the error keeps apart from its message (bounded,
+    without control characters). Only those routes may call this; read routes,
+    exports, source status and log lines use the message or a fixed category.
+    """
+
+    message = str(exc)
+    reason = bounded_remote_reason(getattr(exc, "reason", None))
+    if not reason or is_local_failure_message(exc):
+        return message
+    return f"{message.rstrip('.')}: {reason}"
 
 
 # The other half of that split: a filesystem failure on the SMART path is the
@@ -673,7 +705,7 @@ def build_router() -> APIRouter:
                 payload.action.value,
                 exc,
             )
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_authorized_action_failure_detail(exc)) from exc
         service.schedule_led_snapshot_refresh(enclosure_id=enclosure_id)
         return JSONResponse(
             {
@@ -733,7 +765,7 @@ def build_router() -> APIRouter:
         try:
             return await service.set_system_locator(payload.active)
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_authorized_action_failure_detail(exc)) from exc
 
     @router.post(
         "/api/slots/{slot}/mapping",
@@ -887,7 +919,11 @@ def build_router() -> APIRouter:
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _read_failure_http_exception(
+                exc,
+                operation="Mapping import preview",
+                detail=MAPPING_PREVIEW_FAILURE_DETAIL,
+            ) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         return JSONResponse(preview)
@@ -1402,7 +1438,11 @@ def build_router() -> APIRouter:
                 selected_enclosure_id=enclosure_id,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _read_failure_http_exception(
+                exc,
+                operation="Storage view history request",
+                detail=STORAGE_VIEW_HISTORY_FAILURE_DETAIL,
+            ) from exc
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
             raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')

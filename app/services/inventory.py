@@ -191,11 +191,15 @@ from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
+    LocalServiceError,
     TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
     classify_remote_failure,
+    is_local_failure_message,
+    log_failure,
     normalize_disk_inventory_rows,
 )
 from websockets.exceptions import ConnectionClosed
@@ -1579,11 +1583,13 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
 }
 
 _CERTIFICATE_VERIFY_CODE_LABELS: dict[int, str] = {
+    2: "issuer certificate not available",
     9: "certificate not yet valid",
     10: "certificate expired",
     18: "self-signed certificate",
     19: "self-signed certificate chain",
     20: "certificate issuer not trusted",
+    21: "certificate chain incomplete",
     62: "certificate name mismatch",
 }
 
@@ -1607,14 +1613,22 @@ def _certificate_verify_code_label(exc: BaseException) -> str | None:
     return None
 
 
-def _public_api_failure_message(label: str, exc: BaseException) -> str:
+def _public_source_failure_message(label: str, exc: BaseException) -> str:
+    """Source status text: this service's own sentence, else a fixed category."""
+
+    if is_local_failure_message(exc):
+        return str(exc)
     category, code = classify_remote_failure(exc)
+    if category == INTERNAL_FAILURE_CATEGORY:
+        return f"{label} collection stopped on an internal error; see the service log."
     if category == "authentication_failed":
         return f"{label} authentication failed."
     if category == "timeout":
         return f"{label} collection timed out."
     if category == "unreachable":
         return f"{label} could not be reached."
+    if category == "tls_failed":
+        return f"{label} TLS connection failed."
     if category == "method_unavailable":
         return f"{label} does not support a required API method."
     if category == "response_invalid":
@@ -1625,53 +1639,80 @@ def _public_api_failure_message(label: str, exc: BaseException) -> str:
     return f"{label} collection failed."
 
 
-def _public_smart_failure_message(exc: BaseException) -> str:
+def public_smart_failure_message(exc: BaseException) -> str:
+    """SMART fallback text: this service's own sentence, else a fixed category."""
+
+    if is_local_failure_message(exc):
+        return str(exc)
     category, _code = classify_remote_failure(exc)
+    if category == "certificate_verification":
+        certificate_label = _certificate_verify_code_label(exc)
+        detail = f" ({certificate_label})" if certificate_label else ""
+        return f"SMART data certificate verification failed{detail}."
     return {
         "authentication_failed": "SMART data authentication failed.",
-        "certificate_verification": "SMART data certificate verification failed.",
+        "busy": "The SMART data source is busy; try again shortly.",
+        INTERNAL_FAILURE_CATEGORY: "SMART data collection stopped on an internal error; see the service log.",
         "method_unavailable": "SMART data is unavailable through this API.",
         "response_invalid": "The SMART data source returned an unusable response.",
         "timeout": "SMART data collection timed out.",
+        "tls_failed": "The SMART data source TLS connection failed.",
         "unreachable": "The SMART data source could not be reached.",
     }.get(category, "SMART data collection failed.")
 
 
-def _public_smart_ssh_failure_message(message: str, service_user: str) -> str:
-    permission_suffix = "Re-run the SSH access setup in the admin console to fix the sudo permissions."
-    permission_start = message.find("The SSH user ")
-    permission_message = message[permission_start:] if permission_start >= 0 else ""
-    permission_pattern = re.compile(
-        rf"^The SSH user {re.escape(service_user)} is not allowed to run smartctl on "
-        rf"/dev/[A-Za-z0-9._/-]{{1,256}}\. {re.escape(permission_suffix)}$"
-    )
-    if permission_pattern.fullmatch(permission_message):
-        return permission_message
-    password_message = (
-        "smartctl needs a sudo password on this host. "
-        + permission_suffix
-    )
-    password_start = message.find("smartctl needs a sudo password on this host.")
-    if password_start >= 0 and message[password_start:] == password_message:
-        return password_message
-    return "SMART data collection failed."
+# A device path shown in this service's own SMART sentences. Names come from
+# the platform inventory, so anything outside this shape is not repeated.
+_PUBLIC_DEVICE_PATH = re.compile(r"(?:/dev/)?[A-Za-z0-9._/-]{1,128}")
+SMART_SSH_REMOTE_FAILURE_MESSAGE = "SMART data collection over SSH failed."
 
 
-def _log_remote_failure(
-    operation: str,
-    exc: BaseException,
-    *,
-    level: int = logging.WARNING,
-) -> None:
-    category, code = classify_remote_failure(exc)
-    code_context = f", code={code}" if code is not None else ""
-    logger.log(
-        level,
-        "%s failed (category=%s%s, exception=%s)",
-        operation,
-        category,
-        code_context,
-        type(exc).__name__,
+def _public_device_path(device_path: str) -> str:
+    return device_path if _PUBLIC_DEVICE_PATH.fullmatch(device_path) else "this disk"
+
+
+class SmartSshFailure(str):
+    """A SMART-over-SSH failure, with its origin recorded where it is produced.
+
+    The string value is the full diagnostic and may hold remote command output;
+    it is never published or logged. ``public_message`` is set only when the
+    producer wrote the sentence itself (SSH turned off, sudo guidance, a parse
+    failure); otherwise read responses use a fixed category. ``kind`` and
+    ``exit_status`` are the value-safe facts for the service log.
+    """
+
+    kind: str
+    public_message: str | None
+    exit_status: int | None
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        kind: str,
+        public_message: str | None = None,
+        exit_status: int | None = None,
+    ) -> "SmartSshFailure":
+        failure = super().__new__(cls, text)
+        failure.kind = kind
+        failure.public_message = public_message
+        failure.exit_status = exit_status if isinstance(exit_status, int) and not isinstance(exit_status, bool) else None
+        return failure
+
+
+def _smart_ssh_failure_public_message(error: str) -> str:
+    if isinstance(error, SmartSshFailure) and error.public_message:
+        return error.public_message
+    return SMART_SSH_REMOTE_FAILURE_MESSAGE
+
+
+def _log_smart_ssh_failure(error: str) -> None:
+    kind = error.kind if isinstance(error, SmartSshFailure) else "unclassified"
+    exit_status = error.exit_status if isinstance(error, SmartSshFailure) else None
+    logger.warning(
+        "SMART SSH collection failed (kind=%s, exit_status=%s)",
+        kind,
+        "none" if exit_status is None else exit_status,
     )
 
 
@@ -3847,10 +3888,10 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
-            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+            raise LocalServiceError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
         smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
         if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, smart_enclosure_id}:
@@ -3895,7 +3936,7 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slots = {slot.slot_index: slot for slot in runtime_view.slots}
 
         ordered: list[int] = []
@@ -3952,10 +3993,10 @@ class InventoryService:
                             bypass_negative_cache=bypass_negative_cache,
                         )
                     except TrueNASAPIError as exc:
-                        _log_remote_failure("Storage-view SMART collection", exc)
+                        log_failure(logger, "Storage-view SMART collection", exc)
                         summary = self._fallback_smart_summary(
                             slot_view,
-                            _public_smart_failure_message(exc),
+                            public_smart_failure_message(exc),
                         )
                 return slot_index, summary
 
@@ -3981,10 +4022,10 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
-            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+            raise LocalServiceError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
         history_enclosure_id = (
             runtime_view.backing_enclosure_id
@@ -4871,7 +4912,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background inventory source refresh failed: %s", exc)
+                log_failure(logger, "Background inventory source refresh", exc)
 
         task.add_done_callback(_cleanup)
         return task
@@ -5844,7 +5885,7 @@ class InventoryService:
 
         async def load_bmc_inventory() -> BMCInventory:
             if self.bmc_service is None:
-                raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
+                raise LocalServiceError("BMC / IPMI access is not configured for this system.")
             with perf_stage("inventory.bmc.fetch"):
                 # Retain the executor Future: cancelling an asyncio wrapper
                 # cannot stop this synchronous collector.
@@ -5881,7 +5922,7 @@ class InventoryService:
             try:
                 api_result = await api_task
             except Exception as exc:
-                _log_remote_failure("Platform API collection", exc, level=logging.ERROR)
+                log_failure(logger, "Platform API collection", exc, level=logging.ERROR)
                 certificate_failure = certificate_verification_failure_reason(exc)
                 if certificate_failure is not None:
                     # #954: keep the failure actionable without publishing the
@@ -5908,10 +5949,9 @@ class InventoryService:
                         "Slot details may be partial until it answers."
                     )
                 else:
-                    # Adapter exceptions can contain response bodies, traces,
-                    # URLs, or remote reasons. The value-safe log above keeps
-                    # only operation, category, bounded code, and exception type.
-                    public_message = _public_api_failure_message(api_label, exc)
+                    # The status shows this service's own sentence or a fixed
+                    # category; the log line above carries the structured facts.
+                    public_message = _public_source_failure_message(api_label, exc)
                     sources["api"] = SourceStatus(
                         enabled=True,
                         ok=False,
@@ -5940,11 +5980,11 @@ class InventoryService:
             try:
                 ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
             except Exception as exc:
-                _log_remote_failure("SSH diagnostics collection", exc, level=logging.ERROR)
+                log_failure(logger, "SSH diagnostics collection", exc, level=logging.ERROR)
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=False,
-                    message="SSH diagnostics collection failed.",
+                    message=_public_source_failure_message("SSH diagnostics", exc),
                     required_ok=False,
                 )
                 warnings.append("SSH is turned on but no command output came back.")
@@ -5958,11 +5998,11 @@ class InventoryService:
             try:
                 bmc_inventory = await bmc_task
             except Exception as exc:
-                _log_remote_failure("BMC diagnostics collection", exc, level=logging.ERROR)
+                log_failure(logger, "BMC diagnostics collection", exc, level=logging.ERROR)
                 sources["bmc"] = SourceStatus(
                     enabled=True,
                     ok=False,
-                    message="BMC / IPMI diagnostics collection failed.",
+                    message=_public_source_failure_message("BMC / IPMI diagnostics", exc),
                 )
                 warnings.append("BMC/IPMI is turned on but the BMC could not be read.")
             else:
@@ -6103,7 +6143,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background snapshot refresh failed for %s: %s", key, exc)
+                log_failure(logger, f"Background snapshot refresh for {key}", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -6200,7 +6240,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background SMART refresh failed for %s: %s", key, exc)
+                log_failure(logger, f"Background SMART refresh for {key}", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -7024,12 +7064,18 @@ class InventoryService:
         try:
             active = await asyncio.to_thread(self.bmc_service.get_uid_status)
         except Exception as exc:  # noqa: BLE001 - normalize operational failure in-band.
-            _log_remote_failure("BMC locator status read", exc)
+            log_failure(logger, "BMC locator status read", exc)
+            if is_local_failure_message(exc):
+                reason = str(exc)
+            elif classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+                reason = "BMC locator status read stopped on an internal error; see the service log."
+            else:
+                reason = "BMC locator status unavailable."
             return SystemLocatorStatusView(
                 supported=True,
                 active=False,
                 backend="supermicro_bmc",
-                reason="BMC locator status unavailable.",
+                reason=reason,
             )
 
         return SystemLocatorStatusView(
@@ -7041,10 +7087,13 @@ class InventoryService:
 
     async def set_system_locator(self, active: bool) -> SystemLocatorStatusView:
         if not self.system.bmc.enabled or self.bmc_service is None:
-            raise TrueNASAPIError("System locator control requires configured BMC / IPMI access.")
+            raise LocalServiceError("System locator control requires configured BMC / IPMI access.")
 
         try:
             resolved_active = await asyncio.to_thread(self.bmc_service.set_uid_active, bool(active))
+        except TrueNASAPIError:
+            # Keep the BMC error's structured fields for the authorized route.
+            raise
         except Exception as exc:  # noqa: BLE001 - normalize backend failures.
             raise TrueNASAPIError(str(exc)) from exc
 
@@ -7351,7 +7400,7 @@ class InventoryService:
             )
             slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
             if not slot_view:
-                raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+                raise LocalServiceError(f"Slot {slot:02d} is not present in the current snapshot.")
             return await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
                 allow_stale_cache=allow_stale_cache,
@@ -7791,13 +7840,10 @@ class InventoryService:
                 return summary
 
             if error_message:
-                logger.warning("SMART SSH collection failed (category=remote_error)")
+                _log_smart_ssh_failure(error_message)
             fallback = self._fallback_smart_summary(
                 slot_view,
-                _public_smart_ssh_failure_message(
-                    error_message,
-                    normalize_text(self.system.ssh.user) or "the SSH service account",
-                )
+                _smart_ssh_failure_public_message(error_message)
                 if error_message
                 else (
                     "TrueNAS did not return SMART data; turn on SSH for full SMART details."
@@ -7820,8 +7866,8 @@ class InventoryService:
                     else:
                         payload = await self._fetch_disk_smartctl_bounded(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
-                _log_remote_failure("SMART API collection", exc)
-                last_error = _public_smart_failure_message(exc)
+                log_failure(logger, "SMART API collection", exc)
+                last_error = public_smart_failure_message(exc)
                 continue
 
             api_summary = self._merge_smart_summary(
@@ -7841,8 +7887,8 @@ class InventoryService:
                         else:
                             enrichment_payload = await self._fetch_disk_smartctl_bounded(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
-                    _log_remote_failure("SMART API enrichment", exc)
-                    last_error = _public_smart_failure_message(exc)
+                    # The JSON summary stands; only its enrichment is missing.
+                    log_failure(logger, "SMART API enrichment", exc)
                 else:
                     api_summary = self._merge_missing_smart_fields(
                         api_summary,
@@ -7892,11 +7938,8 @@ class InventoryService:
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
             if ssh_error:
-                logger.warning("SMART SSH collection failed (category=remote_error)")
-                last_error = _public_smart_ssh_failure_message(
-                    ssh_error,
-                    normalize_text(self.system.ssh.user) or "the SSH service account",
-                )
+                _log_smart_ssh_failure(ssh_error)
+                last_error = _smart_ssh_failure_public_message(ssh_error)
 
         fallback = self._fallback_smart_summary(
             slot_view,
@@ -7927,8 +7970,11 @@ class InventoryService:
             async with asyncio.timeout(timeout):
                 return await self.truenas_client.fetch_disk_smartctl(candidate, args)
         except TimeoutError as exc:
-            raise TrueNASAPIError(
-                f"SMART lookup for {candidate} timed out after {timeout:g}s; the disk did not answer."
+            raise LocalServiceError(
+                f"SMART lookup for {_public_device_path(candidate)} timed out after {timeout:g}s; "
+                "the disk did not answer.",
+                category="timeout",
+                method="disk.smartctl",
             ) from exc
 
     async def _prime_core_grid(
@@ -8072,10 +8118,10 @@ class InventoryService:
                                 "admitted": admissions[slot]} if core_cohort is not None else {}),
                         )
                     except TrueNASAPIError as exc:
-                        _log_remote_failure("SMART batch collection", exc)
+                        log_failure(logger, "SMART batch collection", exc)
                         summary = self._fallback_smart_summary(
                             slot_lookup.get(slot),
-                            _public_smart_failure_message(exc),
+                            public_smart_failure_message(exc),
                         )
                     return SmartBatchItem(slot=slot, summary=summary)
 
@@ -8121,7 +8167,8 @@ class InventoryService:
         slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
-            return None, "SMART detail needs SSH on this system, and SSH is turned off."
+            ssh_disabled = "SMART detail needs SSH on this system, and SSH is turned off."
+            return None, SmartSshFailure(ssh_disabled, kind="ssh_disabled", public_message=ssh_disabled)
 
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
@@ -8253,16 +8300,24 @@ class InventoryService:
                             None if result.exit_code is None else smartctl_exit_flags(result.exit_code)
                         )
                     if summary is None:
-                        detail = (
-                            result.stderr.strip()
-                            or result.stdout.strip()
-                            or "Unknown SSH smartctl error."
-                        )
+                        remote_detail = result.stderr.strip() or result.stdout.strip()
+                        detail = remote_detail or "Unknown SSH smartctl error."
                         detail = self._describe_smartctl_ssh_failure(detail, device_path)
-                        last_error = (
-                            f"{target_host}:{device_path}: {detail}"
-                            if target_host
-                            else f"{device_path}: {detail}"
+                        kind, guidance = self._smartctl_ssh_failure_guidance(
+                            remote_detail,
+                            _public_device_path(device_path),
+                        )
+                        last_error = SmartSshFailure(
+                            (
+                                f"{target_host}:{device_path}: {detail}"
+                                if target_host
+                                else f"{device_path}: {detail}"
+                            ),
+                            kind=kind,
+                            public_message=(
+                                f"{_public_device_path(device_path)}: {guidance}" if guidance else None
+                            ),
+                            exit_status=result.exit_code,
                         )
                         if "command not found" not in detail.lower():
                             skipped_candidate = candidate
@@ -8293,29 +8348,48 @@ class InventoryService:
                         if self.system.truenas.platform == "quantastor" and target_host:
                             self._quantastor_preferred_ses_host = target_host
                         return summary, None
-                    last_error = (
-                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                        if target_host
-                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                    last_error = SmartSshFailure(
+                        (
+                            f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                            if target_host
+                            else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        ),
+                        kind="parse_failed",
+                        # Reached only when the parser reported its own fixed
+                        # "SMART JSON parsing failed." sentence.
+                        public_message=f"{_public_device_path(device_path)}: SMART JSON parsing failed.",
+                        exit_status=result.exit_code,
                     )
                     skipped_candidate = candidate
 
         return None, last_error
 
     def _describe_smartctl_ssh_failure(self, detail: str, device_path: str) -> str:
+        _kind, guidance = self._smartctl_ssh_failure_guidance(detail, device_path)
+        return guidance or detail
+
+    def _smartctl_ssh_failure_guidance(self, detail: str, device_path: str) -> tuple[str, str | None]:
+        """The failure kind and, for the known sudo refusals, this service's guidance.
+
+        The guidance is written here; the remote output only selects which
+        fixed sentence applies and is never part of it.
+        """
+
         lowered = detail.lower()
         if "not allowed to execute" in lowered and "smartctl" in lowered:
             service_user = normalize_text(self.system.ssh.user) or "the SSH service account"
-            return (
+            return "sudo_denied", (
                 f"The SSH user {service_user} is not allowed to run smartctl on {device_path}. "
                 "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
         if "a password is required" in lowered or "password is required" in lowered:
-            return (
+            return "sudo_password", (
                 "smartctl needs a sudo password on this host. "
                 "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
-        return detail
+        if not detail:
+            return "no_output", "Unknown SSH smartctl error."
+        return "command_failed", None
 
     def _smartctl_binary_candidates(self) -> tuple[str, ...]:
         if self.system.truenas.platform == "core":
@@ -8447,7 +8521,7 @@ class InventoryService:
             (normalize_text(enclosure_id) or "").startswith("virtual-system:")
             for enclosure_id in enclosure_ids
         ):
-            raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
+            raise LocalServiceError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
 
     @staticmethod
     def _mapping_import_written_bays(preview: dict[str, Any]) -> list[tuple[str | None, int]]:

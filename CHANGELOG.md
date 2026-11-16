@@ -38,10 +38,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
-- Replaced provider and transport exception text in inventory source status,
-  SMART responses, BMC collection warnings and locator status with fixed failure
-  categories, while keeping value-safe operation and cause categories in logs
-  (#1263).
+- Inventory source status and `/healthz`, SMART responses, BMC warnings,
+  locator status, storage-view history and mapping-preview errors and snapshot
+  exports now show a fixed category for a failure the platform API, SSH, the
+  BMC or the network reports (authentication failed, timed out, could not be
+  reached, TLS connection failed, certificate verification failed with a named
+  certificate problem, a reported error with its code), keep this service's
+  own messages such as the SSH-off note, sudo guidance and missing slot or view
+  as before, and name an unexpected local error as one. Log lines carry the
+  operation, category, method or endpoint, error name, code, errno or exit
+  status instead of exception text; collector failures stay at ERROR, and an
+  unexpected local error logs its stack frames without its message.
+  Locate-light and system-locator action errors add the reason the appliance
+  or BMC reported after the fixed message, bounded and without control
+  characters (#1263).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
