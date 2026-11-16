@@ -149,6 +149,22 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   interrupted before the new file is published leaves the previous file intact
   and removes its own staging copy, best effort, and no other file. Saves
   still rewrite `config.yaml` without its comments (#1253).
+- Backup retention no longer deletes the last good copy on the strength of a
+  kept copy it has not checked. Before deleting, grooming reads back the
+  newest kept copy and compares size and SHA-256; a missing or corrupt one is
+  marked unverified, the plan is worked out again and the next copy is tried,
+  at most three reads per class and location. A copy that cannot be read, a
+  spent read budget or too little scratch space stops deletion at that
+  location with a named reason, and a clean-up that marked copies unverified
+  says so on the backup page. A manual clean-up gets up to 10 minutes in all
+  for those reads. If no usable answer comes back, the page says, in the
+  warning colour, that no answer came back and the clean-up may have run, may
+  still be running or may not have started, and asks for a reload in a few
+  minutes; nothing later changes that message. When the backup scheduler
+  cannot be reached, so the request was never sent, the page says the clean-up
+  did not start. Reload admin pages that were open before upgrading. History sidecar snapshots are replaced only by
+  FULLs that pass the same fresh check, at most 14 local FULL content checks per
+  backup run including the kept-copy check (#1195).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
