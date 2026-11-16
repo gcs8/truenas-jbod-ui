@@ -230,6 +230,36 @@ class CdbTrailerGrammarTests(unittest.TestCase):
         self.assertEqual(decoded["service_action"], "0x10")
         self.assertEqual(decoded["decode_confidence"], "standard-partial")
 
+    def test_valid_service_action_control_keeps_its_label(self) -> None:
+        row = _pipeline_row("SERVICE ACTION IN(16). CDB: 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00")
+
+        self.assertNotIn("cdb_malformed", row)
+        self.assertEqual(row["service_action"], "0x10")
+        self.assertEqual(row["service_action_label"], "READ CAPACITY(16)")
+        self.assertEqual(row["decode_confidence"], "standard")
+
+    def test_trailer_length_must_be_plain_ascii_digits(self) -> None:
+        for value in ("+16", "-16", "1_6", "0x10", "\u0661\u0666", "\uff11\uff16"):
+            raw = f"28 00 00 00 00 00 00 00 01 00 length {value} SMID 7"
+            with self.subTest(value=value):
+                self.assert_refused(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
+
+    def test_byte_tokens_must_be_two_ascii_hex_digits(self) -> None:
+        for token in ("+0", "-0", "0_", "\u0660\u0660", "\uff10\uff10"):
+            raw = f"28 {token} 00 00 00 00 00 00 01 00"
+            with self.subTest(token=token):
+                self.assert_refused(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
+
+    def test_nothing_after_the_cdb_label_decodes_nothing(self) -> None:
+        # No byte text at all: nothing is decoded, so nothing is invented.
+        for message in ("READ(10). CDB:", "READ(10). CDB: "):
+            with self.subTest(message=message):
+                self.assertEqual(decode_scsi_cdb_message(message), {})
+                row = _pipeline_row(message)
+                for field in NUMERIC_FIELDS + ("cdb_hex", "byte_count", "opcode", "cdb_malformed"):
+                    self.assertNotIn(field, row)
+                    self.assertNotIn(field, row["decoded"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -142,6 +142,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "sense_key",
         "sense_label",
         "asc_label",
+        "asc_malformed",
         "log_page_code",
         "log_page",
         "log_page_control",
@@ -373,7 +374,8 @@ def _decode_scsi_status_event(message: str) -> dict[str, Any]:
 
 
 def _decode_cam_error_event(message: str) -> dict[str, Any]:
-    match = re.search(r"Error\s+(?P<code>\d+)\s*,\s*(?P<state>.+)$", message, re.IGNORECASE)
+    # ASCII digits only: int() would also convert other scripts' digits.
+    match = re.search(r"Error\s+(?P<code>[0-9]+)\s*,\s*(?P<state>.+)$", message, re.IGNORECASE)
     if not match:
         return {
             "label": f"CAM error: {message.strip()}" if message.strip() else "CAM error",

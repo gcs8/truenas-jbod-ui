@@ -464,12 +464,26 @@ SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0004", "name": "PHY reset problem count"},
 ]
 
-CDB_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{2}")
+# One byte printed as hexadecimal text: ASCII hex digits only, one or two of
+# them (the kernel prints CDB bytes as "%02x" and ASC/ASCQ as "%x"). A sign,
+# an underscore, a prefix, spaces, non-ASCII digits or a wider token (even
+# one with leading zeros) is not a byte and is never converted.
+HEX_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{1,2}")
 CDB_DECIMAL_TOKEN = re.compile(r"[0-9]+")
 # The only text the kernel prints after the CDB bytes is its transfer-length
 # trailer, "length <decimal>" (followed by "SMID <n>" and free text).
 CDB_TRAILER_WORD = "length"
 MAX_CDB_RAW_EVIDENCE_LENGTH = 128
+MAX_MALFORMED_ASC_EVIDENCE_LENGTH = 32
+
+
+def read_hex_byte_token(token: str, *, two_digits: bool = False) -> int | None:
+    """Return the byte a whole hex token names, or None when it is not one."""
+    if not isinstance(token, str) or not HEX_BYTE_TOKEN.fullmatch(token):
+        return None
+    if two_digits and len(token) != 2:
+        return None
+    return int(token, 16)
 
 
 def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
@@ -486,8 +500,9 @@ def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
     tokens = text.split()
     cdb_bytes: list[int] = []
     for index, token in enumerate(tokens):
-        if CDB_BYTE_TOKEN.fullmatch(token):
-            cdb_bytes.append(int(token, 16))
+        value = read_hex_byte_token(token, two_digits=True)
+        if value is not None:
+            cdb_bytes.append(value)
             continue
         trailer_value = tokens[index + 1] if index + 1 < len(tokens) else ""
         if cdb_bytes and token == CDB_TRAILER_WORD and CDB_DECIMAL_TOKEN.fullmatch(trailer_value):
@@ -579,6 +594,8 @@ def decode_scsi_sense_event(event: dict[str, Any]) -> dict[str, Any]:
     sense_key = str(event.get("sense_key") or event.get("sense") or "").upper()
     asc = str(event.get("asc") or "").lower()
     asc_tuple = parse_asc_ascq(asc)
+    if asc and asc_tuple is None:
+        return _malformed_asc_sense_event(asc, sense_key)
     asc_label = SCSI_ASC_ASCQ_LABELS.get(asc_tuple) if asc_tuple else None
     family = _sense_fault_family(reason, sense_key, asc_tuple)
     sense_label = SCSI_SENSE_KEY_LABELS.get(sense_key)
@@ -607,14 +624,39 @@ def decode_scsi_sense_event(event: dict[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+def _malformed_asc_sense_event(asc: str, sense_key: str) -> dict[str, Any]:
+    # A rejected ASC/ASCQ is not a code: no T10 label, fault family or layer is
+    # derived from it, and the event keeps the kernel's own reason as its title.
+    if len(asc) > MAX_MALFORMED_ASC_EVIDENCE_LENGTH:
+        asc = f"{asc[: MAX_MALFORMED_ASC_EVIDENCE_LENGTH - 3]}..."
+    return {
+        "sense_key": sense_key,
+        "sense_label": SCSI_SENSE_KEY_LABELS.get(sense_key),
+        "asc": asc,
+        "asc_malformed": True,
+        "description": "The target returned SCSI sense data, but its ASC/ASCQ value could not be decoded.",
+        "decode_confidence": "unconfirmed",
+        "decode_source": "kernel_message",
+        "source_attribution": dict(KERNEL_MESSAGE_SOURCE),
+        "decoder_note": (
+            "ASC/ASCQ value is malformed (each part must be one or two hex digits); it was not "
+            "decoded against the T10 table and the raw text is kept as evidence."
+        ),
+    }
+
+
 def parse_asc_ascq(value: str) -> tuple[int, int] | None:
-    parts = [part.strip() for part in str(value or "").split(",", 1)]
+    """Return ASC and ASCQ as the kernel prints them (``%x,%x``), or None.
+
+    Each part must be a whole byte token; the text is not trimmed or repaired.
+    """
+    parts = str(value or "").split(",")
     if len(parts) != 2:
         return None
-    try:
-        return int(parts[0], 16), int(parts[1], 16)
-    except ValueError:
+    asc, ascq = (read_hex_byte_token(part) for part in parts)
+    if asc is None or ascq is None:
         return None
+    return asc, ascq
 
 
 def decode_scsi_status_value(value: str) -> dict[str, Any]:
