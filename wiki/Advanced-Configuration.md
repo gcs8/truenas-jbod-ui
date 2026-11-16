@@ -193,11 +193,15 @@ turned on, Admin refuses to add a system or a demo, under any id, until
 
 **In Admin.** Open `default` in **System Setup** and save it. The save keeps
 the settings the form does not show (API dialect, call limit, timeouts, extra
-SSH hosts, the known-hosts file and the command list). A key or password that
-comes from `.env` has to be typed in: Admin does not copy it into
-`config.yaml` on its own.
+SSH hosts, the known-hosts file and the command list) and writes user names
+exactly as they are in effect, spaces included. For each key or password the
+form keeps, the save copies the value in effect into `config.yaml`, including
+one that comes from a `TRUENAS_*` or `SSH_*` variable or the file a `_FILE`
+variable names. It does not ask first. Admin never shows the value, and the
+same rules as for a hand edit below decide which value that is.
 
-**By hand.** In `config/config.yaml`:
+**By hand.** Take a backup of `config/config.yaml`, then make the whole change
+in one edit:
 
 1. Add `systems:` with one entry, `id: default`, and put the top-level
    `truenas` and `ssh` sections under it.
@@ -205,21 +209,38 @@ comes from `.env` has to be typed in: Admin does not copy it into
    effect into the matching field of that entry (`TRUENAS_API_KEY` is
    `truenas.api_key`, `SSH_KEY_PATH` is `ssh.key_path`; `SSH_COMMANDS_JSON`
    and `SSH_EXTRA_HOSTS_JSON` hold JSON lists):
-   - A variable set to a blank value is ignored, so the value from
+   - A direct variable set to a blank value is ignored, so the value from
      `config.yaml` stays in effect; do not copy the blank.
    - A `_FILE` variable (for example `TRUENAS_API_KEY_FILE`) names a file,
-     and that file's content, without its final line break, is the value. It
+     and that file's content, without one final line break, is the value. It
      wins over the same variable without `_FILE`. The entry has no `_FILE`
      field, so write the content itself.
-   - Copy a user name, key or password exactly, spaces included.
+   - An empty or blank file is not ignored: its content (nothing, or only
+     spaces) is the value in effect, and the key in `config.yaml` is not
+     used. Copy it exactly.
+   - A `_FILE` variable set to a blank path is not ignored either: it names
+     no readable file, so the configuration does not load until it is fixed
+     or removed.
+   - Copy a user name, key or password exactly, spaces included, and quote
+     it as a YAML string if it could read as something else (`'true'`,
+     `'null'`, `'007'`, or a value with leading or trailing spaces).
 3. Restart or wait for the reload, check that `default` still connects, then
    add the new system.
 
-Either way, the API key and passwords of `default` are then
-stored in `config.yaml` in plain text, and changing them in `.env` no longer
-has any effect. Keep the file readable by its owner only (Admin creates it with mode
-`0600` and keeps the mode of an existing file). A save from Admin rewrites
-`config.yaml` without its comments.
+Either way, the API key and passwords of `default` are then stored in
+`config.yaml` in plain text and the saved entry wins: on every later load a
+new value of a `TRUENAS_*` or `SSH_*` variable, or new content in its file, no
+longer changes that entry. Remove those variables from `.env` once the move is
+done. Until you do, the configuration still reads them on every load, so a
+`_FILE` variable must still name a readable file until you remove it, or the
+configuration does not load.
+
+Keep `config.yaml` readable only by its owner and the app's own services.
+Admin creates a new file with mode `0600` and keeps the mode of an existing
+file (the rewritten file belongs to the account and group Admin runs as); when
+a save copies a key or password from the environment into a file that group or
+other accounts can read, it logs a warning and says so in the save result. A
+save from Admin rewrites `config.yaml` without its comments.
 
 ## Opening view order
 

@@ -53,10 +53,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   a `systems` entry in `config.yaml`, and that its API key and passwords are
   then stored in `config.yaml`; the Advanced Configuration wiki page has the
   steps. Saving `default` from System Setup now keeps the settings the form
-  does not show, and a key or password that comes from `.env` is stored only
-  when it is typed in. Demo creation applies the same check. A config save
-  that fails or is interrupted before the new file is published leaves the
-  previous file intact and no longer leaves a `config.tmp` copy behind. Saves
+  does not show and the exact user names in effect, and copies each key or
+  password it keeps into `config.yaml` with the value in effect, including one
+  from a `TRUENAS_*` or `SSH_*` variable or its `_FILE` file, without showing
+  it; when group or other accounts can read `config.yaml`, that save logs a
+  warning and the result says so. Demo creation applies the same check. Each
+  config save stages under its own private name; one that fails or is
+  interrupted before the new file is published leaves the previous file intact
+  and removes its own staging copy, best effort, and no other file. Saves
   still rewrite `config.yaml` without its comments (#1253).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their

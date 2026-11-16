@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +27,7 @@ from app.config import (
     known_hosts_placeholder_paths,
     normalize_text,
 )
-from app.models.domain import SystemSetupRequest
+from app.models.domain import SystemSetupRequest, trim_optional_text
 from app.secret_files import write_text_atomically
 from app.services.config_change_journal import record_config_change
 from app.services.credential_authority import (
@@ -43,6 +45,8 @@ from app.services.sas_fabric import (
     CORE_PCICONF_LV_COMMAND,
 )
 
+
+logger = logging.getLogger(__name__)
 
 _CONFIG_WRITE_LOCK = threading.RLock()
 PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
@@ -80,9 +84,17 @@ LEGACY_DEMO_MIGRATION_DETAIL = (
     _LEGACY_SYSTEM_PREFIX + "a demo now would replace it. "
     + LEGACY_SYSTEM_MIGRATION_STEP + " Then add the demo."
 )
-LEGACY_SECRET_FROM_ENV_DETAIL = (
-    "The API key or a password of the 'default' system comes from .env, and saving it "
-    "here stores it in config.yaml. Type it in to save it there."
+# Saving `default` copies a kept key or password whose value comes from the
+# environment into config.yaml. When other accounts can read that file, the
+# save says so once in the log (base name only, never the value) and on the page.
+SECRET_FILE_READABLE_LOG = (
+    "Saved a key or password from the environment into %s, which group or other "
+    "accounts can read."
+)
+SECRET_FILE_READABLE_NOTE = (
+    "config.yaml now holds a key or password that came from the environment, and "
+    "accounts other than the file's owner can read it. Keep the file readable only "
+    "by its owner and the app's own services."
 )
 LEGACY_SECTIONS_INVALID_DETAIL = (
     "The top-level truenas or ssh settings in config.yaml are not valid, so the "
@@ -277,11 +289,17 @@ def _preserved_known_hosts_path(config_path: str | Path, raw_system: Any) -> str
     return str(configured)
 
 
-def _legacy_sections(config: dict[str, Any], *, with_environment: bool) -> dict[str, dict[str, Any]] | None:
+def _legacy_sections(
+    config: dict[str, Any],
+    *,
+    with_environment: bool,
+    applied: set[tuple[str, ...]] | None = None,
+) -> dict[str, dict[str, Any]] | None:
     """Copies of the top-level `truenas` and `ssh` sections, or None if not mappings.
 
     With ``with_environment`` the .env overrides are applied by the loader's
-    own rules (a blank override is unset; a `_FILE` variable's content wins).
+    own rules (a blank override is unset; a `_FILE` variable's content wins),
+    and ``applied`` receives the paths they set.
     """
     sections: dict[str, dict[str, Any]] = {}
     for section in _LEGACY_SYSTEM_SECTIONS:
@@ -292,7 +310,7 @@ def _legacy_sections(config: dict[str, Any], *, with_environment: bool) -> dict[
             return None
         sections[section] = copy.deepcopy(raw)
     if with_environment:
-        apply_env_overrides(sections, sections=_LEGACY_SYSTEM_SECTIONS)
+        apply_env_overrides(sections, sections=_LEGACY_SYSTEM_SECTIONS, applied=applied)
     return sections
 
 
@@ -353,25 +371,19 @@ class _LegacySystem:
     system: SystemConfig
     # The effective raw `ssh` mapping, for the operator's trust-file choice.
     raw_system: dict[str, Any]
-    # Secret fields whose value in effect comes from the environment.
+    # Secret fields whose value in effect an environment override set.
     environment_secrets: frozenset[tuple[str, str]]
 
 
 def _effective_legacy_system(config: dict[str, Any]) -> _LegacySystem:
-    effective = _legacy_sections(config, with_environment=True)
+    applied: set[tuple[str, ...]] = set()
+    effective = _legacy_sections(config, with_environment=True, applied=applied)
     validated = _validated_legacy_sections(effective)
     if effective is None or validated is None:
         # Never echo a validation error: it can quote a secret value.
         raise ValueError(LEGACY_SECTIONS_INVALID_DETAIL)
     truenas, ssh = validated
-    in_file = _validated_legacy_sections(_legacy_sections(config, with_environment=False))
-    environment_secrets = frozenset(
-        (section, field)
-        for section, field in _LEGACY_SECRET_FIELDS
-        if in_file is None
-        or getattr(in_file[0 if section == "truenas" else 1], field)
-        != getattr(truenas if section == "truenas" else ssh, field)
-    )
+    environment_secrets = frozenset(field for field in _LEGACY_SECRET_FIELDS if field in applied)
     return _LegacySystem(
         system=SystemConfig(id=LEGACY_SYSTEM_ID, label="Primary", truenas=truenas, ssh=ssh),
         raw_system={"ssh": effective["ssh"]},
@@ -380,6 +392,19 @@ def _effective_legacy_system(config: dict[str, Any]) -> _LegacySystem:
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _kept_loaded_text(requested: str | None, saved: str | None) -> str | None:
+    """``saved`` when ``requested`` is that value as the request trims it.
+
+    The form and the request trim text inputs; the loader keeps strings
+    exactly (a user name with spaces is sent as it is). A loaded value saved
+    unchanged keeps its exact form; any other value is saved as sent.
+    """
+
+    if saved is not None and trim_optional_text(saved, max_length=1024) == requested:
+        return saved
+    return requested
 
 
 def _apply_form_fields(model: _ModelT, updates: dict[str, Any]) -> _ModelT:
@@ -400,6 +425,8 @@ class SystemSetupService:
     def __init__(self, config_path: str) -> None:
         self.config_path = Path(config_path)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        # A page note from the last save_system call, or None.
+        self.last_save_note: str | None = None
 
     def create_system(self, payload: SystemSetupRequest) -> SystemConfig:
         system, _ = self.save_system(payload)
@@ -507,6 +534,7 @@ class SystemSetupService:
         return candidates[0][1]
 
     def save_system(self, payload: SystemSetupRequest) -> tuple[SystemConfig, bool]:
+        self.last_save_note = None
         with _CONFIG_WRITE_LOCK:
             config = self._load_config()
             raw_systems = list(config.get("systems") or [])
@@ -537,23 +565,41 @@ class SystemSetupService:
                 raise ValueError(f"System id '{system_id}' already exists in the current config.")
 
             existing_system = None
+            copies_environment_secret = False
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
             elif legacy is not None:
                 existing_system = legacy.system
-                # Keeping a secret whose value comes from .env would copy it
-                # into config.yaml; that needs the operator to type it in.
+                # A kept secret takes the value in effect, so one that an
+                # environment override set is copied into config.yaml.
                 kept = {
                     ("truenas", "api_key"): payload.api_key,
                     ("truenas", "api_password"): payload.api_password,
                     ("ssh", "password"): payload.ssh_password,
                     ("ssh", "sudo_password"): payload.ssh_sudo_password,
                 }
-                if any(
+                copies_environment_secret = any(
                     kept[field] == PRESERVE_SECRET_SENTINEL
                     for field in legacy.environment_secrets
-                ):
-                    raise ValueError(LEGACY_SECRET_FROM_ENV_DETAIL)
+                )
+
+            # Text the form loaded and sends back unchanged keeps its exact
+            # form; the loader does not trim it, so neither does a save.
+            def kept_text(requested: str | None, saved: str | None) -> str | None:
+                return _kept_loaded_text(requested, saved) if existing_system is not None else requested
+
+            truenas_host = kept_text(
+                payload.truenas_host,
+                existing_system.truenas.host if existing_system is not None else None,
+            )
+            api_user = kept_text(
+                payload.api_user,
+                existing_system.truenas.api_user if existing_system is not None else None,
+            )
+            ssh_user = kept_text(
+                payload.ssh_user,
+                existing_system.ssh.user if existing_system is not None else None,
+            )
 
             # The setup form still has no dialect control, so a clone (a saved
             # system re-saved under a new id) has no `existing_system` to read.
@@ -572,17 +618,22 @@ class SystemSetupService:
                     source_system_id=normalize_text(payload.clone_source_system_id),
                 )
 
+            saved_tls_ca_bundle_path = existing_system.truenas.tls_ca_bundle_path if existing_system is not None else None
             tls_ca_bundle_path = (
-                payload.tls_ca_bundle_path
+                kept_text(payload.tls_ca_bundle_path, saved_tls_ca_bundle_path)
                 if payload.tls_ca_bundle_path is not None
-                else (existing_system.truenas.tls_ca_bundle_path if existing_system is not None else None)
+                else saved_tls_ca_bundle_path
             )
+            saved_tls_server_name = existing_system.truenas.tls_server_name if existing_system is not None else None
             tls_server_name = (
-                payload.tls_server_name
+                kept_text(payload.tls_server_name, saved_tls_server_name)
                 if payload.tls_server_name is not None
-                else (existing_system.truenas.tls_server_name if existing_system is not None else None)
+                else saved_tls_server_name
             )
-            ssh_host = payload.ssh_host or payload.truenas_host
+            ssh_host = kept_text(
+                payload.ssh_host or payload.truenas_host,
+                existing_system.ssh.host if existing_system is not None else None,
+            )
             ssh_extra_hosts = (
                 list(existing_system.ssh.extra_hosts)
                 if existing_system is not None
@@ -609,8 +660,8 @@ class SystemSetupService:
                 )
                 requested_authority = api_credential_authority(
                     platform=payload.platform,
-                    host=payload.truenas_host,
-                    username=payload.api_user,
+                    host=truenas_host,
+                    username=api_user,
                     verify_tls=payload.verify_ssl,
                     tls_ca_bundle_path=tls_ca_bundle_path,
                     tls_server_name=tls_server_name,
@@ -642,7 +693,7 @@ class SystemSetupService:
                     platform=payload.platform,
                     hosts=[ssh_host, *ssh_extra_hosts, *ssh_ha_hosts],
                     port=payload.ssh_port,
-                    username=payload.ssh_user,
+                    username=ssh_user,
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                 )
                 if not same_credential_authorities(requested_authorities, saved_authorities):
@@ -747,12 +798,12 @@ class SystemSetupService:
             # default. A new system starts from the model defaults.
             base = existing_system if existing_system is not None else SystemConfig()
             truenas_updates: dict[str, Any] = {
-                "host": payload.truenas_host,
+                "host": truenas_host,
                 "api_key": resolve_secret(
                     payload.api_key,
                     existing_system.truenas.api_key if existing_system is not None else None,
                 ),
-                "api_user": payload.api_user or "",
+                "api_user": api_user or "",
                 "api_password": resolve_secret(
                     payload.api_password,
                     existing_system.truenas.api_password if existing_system is not None else None,
@@ -761,7 +812,10 @@ class SystemSetupService:
                 "verify_ssl": payload.verify_ssl,
                 "tls_ca_bundle_path": tls_ca_bundle_path,
                 "tls_server_name": tls_server_name,
-                "enclosure_filter": payload.enclosure_filter,
+                "enclosure_filter": kept_text(
+                    payload.enclosure_filter,
+                    existing_system.truenas.enclosure_filter if existing_system is not None else None,
+                ),
             }
             ssh_updates: dict[str, Any] = {
                 "enabled": ssh_enabled,
@@ -776,8 +830,11 @@ class SystemSetupService:
                     for node in payload.ha_nodes
                 ],
                 "port": payload.ssh_port,
-                "user": payload.ssh_user or "",
-                "key_path": payload.ssh_key_path or "",
+                "user": ssh_user or "",
+                "key_path": kept_text(
+                    payload.ssh_key_path,
+                    existing_system.ssh.key_path if existing_system is not None else None,
+                ) or "",
                 "password": resolve_secret(
                     payload.ssh_password,
                     existing_system.ssh.password if existing_system is not None else None,
@@ -846,7 +903,12 @@ class SystemSetupService:
             if payload.make_default or not normalize_text(str(config.get("default_system_id") or "")):
                 config["default_system_id"] = system_id
 
-            self._write_config(config)
+            published_mode = self._write_config(config)
+            if copies_environment_secret and os.name == "posix" and published_mode & 0o044:
+                # The copy neither refuses nor changes the mode: other services
+                # may read this file under another account. It says so instead.
+                logger.warning(SECRET_FILE_READABLE_LOG, self.config_path.name)
+                self.last_save_note = SECRET_FILE_READABLE_NOTE
             record_config_change("system.save", system_id)
             return system, existing_system is not None
 
@@ -860,8 +922,8 @@ class SystemSetupService:
             raise ValueError(f"Config file {self.config_path} must contain a YAML mapping.")
         return loaded
 
-    def _write_config(self, payload: dict[str, Any]) -> None:
-        write_text_atomically(
+    def _write_config(self, payload: dict[str, Any]) -> int:
+        return write_text_atomically(
             self.config_path,
             yaml.safe_dump(
                 payload,

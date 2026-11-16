@@ -1684,11 +1684,17 @@ def replace_settings(settings: Settings) -> None:
 get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 
 
-def apply_env_overrides(merged: dict[str, Any], *, sections: frozenset[str] | None = None) -> None:
+def apply_env_overrides(
+    merged: dict[str, Any],
+    *,
+    sections: frozenset[str] | None = None,
+    applied: set[tuple[str, ...]] | None = None,
+) -> None:
     """Apply the .env overrides to ``merged`` in place, as ``load_settings`` does.
 
     ``sections`` limits the overrides to those whose target starts with one of
     these top-level keys; the parsing and blank rules are the same either way.
+    ``applied`` receives the target path of every override that set a value.
     """
     for env_name, target_path in ENV_OVERRIDES.items():
         if sections is not None and target_path[0] not in sections:
@@ -1713,6 +1719,8 @@ def apply_env_overrides(merged: dict[str, Any], *, sections: frozenset[str] | No
         else:
             parsed_value = _parse_scalar(raw_value)
         _set_path_value(merged, target_path, parsed_value)
+        if applied is not None:
+            applied.add(target_path)
 
 
 def load_settings(
