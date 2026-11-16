@@ -114,6 +114,11 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
                 else None
             ),
             "not_attempted": [item.record.artifact_id for item in result.not_attempted],
+            # #1188: kept copies that failed their size and SHA-256 check, and
+            # planned deletions left in place because of it. A run can be
+            # complete (ok) and still have found damaged copies.
+            "downgraded": [record.artifact_id for record in getattr(result, "downgraded", ())],
+            "kept_after_replan": [item.record.artifact_id for item in getattr(result, "kept_after_replan", ())],
         }
 
     @app.post("/internal/backups/targets/{target_id}/test")

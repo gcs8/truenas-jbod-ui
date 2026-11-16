@@ -47,6 +47,29 @@
     missing: "Missing",
   };
   const LONG_TIMEOUT_MS = 15 * 60 * 1000;
+  // #1188: the one thing the page says when no usable answer to a clean-up
+  // came back (the words match the admin route's detail). Nothing later
+  // replaces it: no read can tell what this request did.
+  const CLEANUP_NO_ANSWER = "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+    + "started. Reload this page in a few minutes and check Last clean-up before starting another.";
+  // Another run held the scheduler. Its refusal does not say whether that run
+  // is a backup or a clean-up, so promise nothing about where its result shows.
+  const CLEANUP_BUSY = "A backup or clean-up is already running on the backup service, so this clean-up did not start "
+    + "and deleted nothing. Open Clean up again after it finishes.";
+  // The admin service never reached the scheduler, so nothing was sent.
+  const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
+  // A whole result, by the lists and failed entry the admin apply route checks
+  // before forwarding one: five lists of ids, and failed absent, null, or naming
+  // an id and an error. Two differences from the route: an answer naming a state
+  // is never a result here (the route does not look at state), and ok is not
+  // checked here (the transport has already settled it as false).
+  const CLEANUP_RESULT_LISTS = ["deleted", "already_missing", "not_attempted", "downgraded", "kept_after_replan"];
+  function isCleanupResult(value) {
+    const failed = value?.failed;
+    return typeof value?.state !== "string"
+      && CLEANUP_RESULT_LISTS.every((key) => Array.isArray(value?.[key]) && value[key].every((item) => typeof item === "string"))
+      && (failed === null || failed === undefined || (typeof failed?.id === "string" && typeof failed?.error === "string"));
+  }
   const SENSITIVE_KEY = /path|file|dir|root|password|passphrase|secret|token|credential|key_id|access_key|private|username|user$|host|endpoint|url|share|bucket|export|mount/i;
 
   // ---------------------------------------------------------------- model --
@@ -299,7 +322,10 @@
     if (!grooming || typeof grooming !== "object") return null;
     const when = grooming.at ? formatTime(grooming.at) : "";
     if (grooming.ok) {
-      return { tone: "is-ok", text: `Last clean-up: ${when || "-"}, ${Number(grooming.deleted) || 0} removed.` };
+      const text = `Last clean-up: ${when || "-"}, ${Number(grooming.deleted) || 0} removed.`;
+      // A finished clean-up can still have found damaged kept copies (#1188).
+      if (grooming.detail) return { tone: "is-bad", text: `${text} ${scrubText(grooming.detail)}` };
+      return { tone: "is-ok", text };
     }
     const failed = grooming.failed_locations && typeof grooming.failed_locations === "object" ? grooming.failed_locations : {};
     const places = Object.keys(failed).map((location) => `${locationLabel(location, targets)}: ${scrubText(failed[location] || "no detail")}`);
@@ -478,11 +504,26 @@
 
     // ------------------------------------------------------------- load --
 
-    function load({ quiet = false } = {}) {
-      if (state.loadPromise) return state.loadPromise;
+    // One list read at a time: plain callers share the read in flight. A caller
+    // that just changed something (fresh) queues one follow-up read instead, so
+    // it never settles on a reply that started before its write (#1200).
+    function load({ quiet = false, fresh = false } = {}) {
+      if (state.loadQueued) return state.loadQueued;
+      if (state.loadPromise) {
+        if (!fresh) return state.loadPromise;
+        state.loadQueued = state.loadPromise
+          .catch(() => {})
+          .then(() => startLoad({ quiet }));
+        return state.loadQueued;
+      }
+      return startLoad({ quiet });
+    }
+
+    function startLoad({ quiet }) {
+      state.loadQueued = null;
       state.loading = true;
       if (!quiet) setStatus("Loading backups...");
-      state.loadPromise = (async () => {
+      const run = (async () => {
         try {
           const payload = await deps.fetchJson(API_ROOT);
           state.data = {
@@ -493,6 +534,8 @@
             available: payload.available !== false,
             detail: typeof payload.detail === "string" ? payload.detail : "",
             running: payload.running && CLASSES.includes(payload.running.backup_class) ? payload.running : null,
+            // A manual clean-up runs as "lifecycle" (#1188).
+            cleanupRunning: payload.running?.backup_class === "lifecycle",
           };
           state.loadError = "";
           const count = state.data.artifacts.length;
@@ -505,6 +548,7 @@
           if (state.data.running) {
             parts.push(`A ${CLASS_SHORT[state.data.running.backup_class].toLowerCase()} backup is running.`);
           }
+          if (state.data.cleanupRunning) parts.push("A clean-up is running.");
           setStatus(parts.join(" "));
           const cleanup = state.data.available ? cleanupSummary(payload.grooming, state.data.targets, fmtTime) : null;
           if (cleanup && els.status) els.status.append(" ", el("span", { className: `backup-run-status ${cleanup.tone}`, text: cleanup.text }));
@@ -518,18 +562,21 @@
           scheduleRunningPoll();
         } finally {
           state.loading = false;
-          state.loadPromise = null;
           render();
         }
-      })();
-      return state.loadPromise;
+      })().finally(() => {
+        if (state.loadPromise === run) state.loadPromise = null;
+      });
+      state.loadPromise = run;
+      return run;
     }
 
-    // While a backup runs, re-read the list now and then so the result shows
-    // without a manual reload. Stops once nothing is running.
+    // While a backup or clean-up runs, re-read the list now and then so the
+    // result shows without a manual reload. Stops once nothing is running.
     const POLL_MS = deps.pollMs || 5000;
     function scheduleRunningPoll() {
-      if (state.pollTimer || !state.data?.running || isStopped() || !deps.setTimeout) return;
+      const waiting = state.data?.running || state.data?.cleanupRunning;
+      if (state.pollTimer || !waiting || isStopped() || !deps.setTimeout) return;
       state.pollTimer = deps.setTimeout(() => {
         state.pollTimer = null;
         // A hidden tab skips the request but keeps polling, so returning to it shows the result.
@@ -718,9 +765,13 @@
       return dialog;
     }
 
-    function dialogResult(text) {
+    function dialogResult(text, tone = "") {
       const node = els.dialog?.querySelector(".backup-dialog-result");
-      if (node) node.textContent = text;
+      if (node) {
+        node.textContent = text;
+        // A problem result carries the same tone as its banner (#1188).
+        node.className = `subtle action-note backup-dialog-result${tone ? ` ${tone}` : ""}`;
+      }
       return node;
     }
 
@@ -736,8 +787,9 @@
       const generation = state.dialogGeneration || 0;
       const live = () => generation === (state.dialogGeneration || 0) && Boolean(els.dialog?.open);
       return {
+        generation,
         live,
-        result: (text) => (live() ? dialogResult(text) : null),
+        result: (text, tone) => (live() ? dialogResult(text, tone) : null),
         actions: (...nodes) => {
           if (live()) setDialogActions(...nodes);
         },
@@ -925,9 +977,7 @@
       openDialog("Backup settings", [el("p", { className: "subtle", text: "Loading..." })], [cancelButton("Close")], trigger);
       const scope = dialogScope();
       try {
-        const view = await deps.fetchJson(POLICY_URL);
-        state.policyView = view;
-        showPolicyView(scope, view);
+        adoptPolicyView(scope, await deps.fetchJson(POLICY_URL));
       } catch (error) {
         scope.result(`Couldn't load the backup settings: ${errorText(error)}`);
       }
@@ -940,18 +990,43 @@
       scope.actions(cancelButton(), primary("Save", "policy-save"));
     }
 
-    function editorWithTargets(mutate) {
+    // The editor's model belongs to the dialog generation that loaded it, the
+    // same as its controls (#1199). A reply for a closed or replaced dialog
+    // cannot become the model that the open dialog saves.
+    function adoptPolicyView(scope, view) {
+      if (!scope.live()) return false;
+      state.policyView = view;
+      state.policyViewGeneration = scope.generation;
+      showPolicyView(scope, view);
+      return true;
+    }
+
+    function ownedPolicyView() {
+      const scope = dialogScope();
       const view = state.policyView;
-      if (!view) return;
-      // Keep what was typed: fold the current form back into the view first.
+      if (!view || !scope.live() || state.policyViewGeneration !== scope.generation) return null;
+      return { scope, view };
+    }
+
+    function editorWithTargets(mutate) {
+      const owned = ownedPolicyView();
+      if (!owned) return;
+      const { scope, view } = owned;
+      // Keep what was typed: fold the current form back into the view first,
+      // class settings as well as targets (#1198). Locked inputs are never
+      // read, so environment values stay as the server sent them.
       const edits = readEdits(view);
+      const classes = {};
+      Object.keys(view.classes || {}).forEach((backupClass) => {
+        const entry = view.classes[backupClass] || {};
+        classes[backupClass] = { ...entry, values: { ...entry.values, ...edits.classes[backupClass] } };
+      });
       const targets = view.targets.map((target, index) => ({
         ...target,
         values: { ...edits.targets[index].values },
         pendingSecrets: { ...edits.targets[index].secretChanges },
       }));
-      state.policyView = { ...view, targets: mutate(targets) };
-      showPolicyView(dialogScope(), state.policyView);
+      adoptPolicyView(scope, { ...view, classes, targets: mutate(targets) });
     }
 
     function addPolicyTarget() {
@@ -963,9 +1038,9 @@
     }
 
     function savePolicy() {
-      const view = state.policyView;
-      if (!view) return Promise.resolve();
-      const scope = dialogScope();
+      const owned = ownedPolicyView();
+      if (!owned) return Promise.resolve();
+      const { scope, view } = owned;
       const payload = buildPolicyPayload(view, readEdits(view));
       return once("policy-save", async () => {
         scope.result("Saving...");
@@ -975,8 +1050,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
           });
-          state.policyView = saved;
-          showPolicyView(scope, saved);
+          adoptPolicyView(scope, saved);
           scope.result(`Saved. Restart the backup scheduler to use the new settings: ${saved.restart_command || "restart enclosure-backup-scheduler"}`);
           setBanner("Backup settings saved. Restart the backup scheduler to apply them.", "success");
         } catch (error) {
@@ -1060,7 +1134,7 @@
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1095,7 +1169,7 @@
           });
           if (scope.live()) closeDialog();
           setBanner("Backup kept.", "success");
-          await load({ quiet: true });
+          await load({ quiet: true, fresh: true });
         } catch (error) {
           scope.result(`Couldn't keep it: ${errorText(error)}`);
         }
@@ -1115,7 +1189,7 @@
         } catch (error) {
           setBanner(`Couldn't change it: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1139,7 +1213,7 @@
             setBanner(`Backup failed: ${errorText(error)}`, "error");
           }
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1268,7 +1342,7 @@
               canPublish: scope.live,
               failureMessage: "Backup restored, but the page could not refresh. Refresh to check the current settings and service status.",
             });
-            await load({ quiet: true });
+            await load({ quiet: true, fresh: true });
           } catch (_) {
             if (scope.live()) {
               setBanner("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.", "error");
@@ -1309,7 +1383,7 @@
             throw new Error("The plan came back without a token, so it can't be applied safely.");
           }
           body?.replaceChildren(
-            el("p", { text: `These ${plan.items.length} ${plan.items.length === 1 ? "copy" : "copies"} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
+            el("p", { className: "backup-cleanup-intro", text: `${plan.items.length === 1 ? "This copy" : `These ${plan.items.length} copies`} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
             el("ul", { className: "backup-change-list backup-cleanup-list" }, plan.items.map((item) => {
               const artifact = findArtifact(item.id);
               const what = artifact
@@ -1331,6 +1405,27 @@
       const plan = state.cleanupPlan;
       const scope = dialogScope();
       if (!plan || !plan.token) return Promise.resolve();
+      // Once an outcome is shown, the plan's introduction must not still promise deletions.
+      const planned = plan.items.length;
+      const RESULT_TONES = { error: "is-bad", warning: "is-warning" };
+      const showResult = (text, bannerTone) => {
+        const intro = scope.body()?.querySelector(".backup-cleanup-intro");
+        if (intro) {
+          intro.textContent = planned === 1
+            ? "This copy was in the clean-up plan."
+            : `These ${planned} copies were in the clean-up plan.`;
+        }
+        scope.result(text, RESULT_TONES[bannerTone] || "");
+        setBanner(text, bannerTone);
+      };
+      // The outcome goes directly under the introduction, above the long list.
+      const body = scope.body();
+      const intro = body?.querySelector(".backup-cleanup-intro");
+      const resultLine = els.dialog?.querySelector(".backup-dialog-result");
+      if (body && intro && resultLine) {
+        const rest = Array.from(body.children).filter((node) => node !== intro && node !== resultLine);
+        body.replaceChildren(intro, resultLine, ...rest);
+      }
       return once("cleanup", async () => {
         scope.result("Deleting...");
         scope.actions(cancelButton("Close"));
@@ -1340,26 +1435,69 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ plan_token: plan.token }),
             timeoutMs: LONG_TIMEOUT_MS,
+            // A run that stopped, or that a keeper check refused, answers 200
+            // with ok: false and its result; that is a result to show, not a
+            // failed request. Anything short of the whole result stays a failure.
+            acceptPartialResult: isCleanupResult,
           });
           state.cleanupPlan = null;
+          // A result comes only from the scheduler's own answer. Anything else
+          // (a named state, or an answer without a result) is no answer.
+          if (typeof payload?.state === "string" || !Array.isArray(payload?.deleted)) {
+            showResult(CLEANUP_NO_ANSWER, "warning");
+            return;
+          }
           const count = (value) => (Array.isArray(value) ? value.length : 0);
           const deleted = count(payload.deleted) + count(payload.already_missing);
-          const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false;
+          // ok: false is the scheduler saying the run did not complete, whatever the lists hold.
+          const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false || payload.ok === false;
           const failedDetail = payload.failed?.error || payload.error;
-          const text = stopped
+          const summary = stopped
             ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
             : `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.`;
-          scope.result(text);
-          setBanner(text, stopped ? "error" : "success");
+          // #1188: kept copies that failed their check, and deletions not carried out because of it.
+          const downgraded = count(payload.downgraded);
+          const skipped = count(payload.kept_after_replan);
+          const one = downgraded === 1;
+          const notes = [];
+          if (downgraded) {
+            // "N of the copies it kept", so the count cannot read as a tally of kept copies.
+            notes.push(`${downgraded} of the copies it kept failed the size and SHA-256 check and ${one ? "was" : "were"} marked unverified.`);
+          }
+          if (skipped) {
+            notes.push(`${skipped} planned ${skipped === 1 ? "deletion was" : "deletions were"} not carried out, because the copies that would have stayed could not be confirmed good.`);
+          }
+          if (downgraded) {
+            // Verify re-reads a copy and marks it verified again when it matches;
+            // a new backup adds a good copy, after which older ones fall due again.
+            notes.push(skipped
+              ? `Run Verify on the ${one ? "copy" : "copies"} marked unverified: if ${one ? "it passes" : "they pass"}, clean up again; if not, back up again to replace ${one ? "it" : "them"}.`
+              : `Run Verify on the ${one ? "copy" : "copies"} marked unverified, or back up again to replace ${one ? "it" : "them"}.`);
+          }
+          const text = [summary, ...notes].join(" ");
+          showResult(text, stopped || notes.length ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
-          const text = error?.status === 409
-            ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
-            : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
-          scope.result(text);
-          setBanner(text, "error");
+          if (error?.status === 503 && error?.cleanupState === "cleanup_not_sent") {
+            showResult(CLEANUP_NOT_STARTED, "info");
+            return;
+          }
+          // The page's own timer ran out, or the request went out and the
+          // transport could not tell what happened (no answer, a broken
+          // connection, a 5xx or 408): no answer, never "failed".
+          if (error?.timedOut || error?.adminOutcome === "unknown") {
+            showResult(CLEANUP_NO_ANSWER, "warning");
+            return;
+          }
+          const busy = error?.status === 409 && /already in progress/i.test(String(error?.message || ""));
+          const text = busy
+            ? CLEANUP_BUSY
+            : error?.status === 409
+              ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
+              : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
+          showResult(text, busy ? "info" : "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 

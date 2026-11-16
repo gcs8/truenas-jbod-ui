@@ -978,6 +978,9 @@ def build_router() -> APIRouter:
                     "current_import_digest": exc.current_import_digest,
                 },
             )
+        except StorageDirectoryUnwritable as exc:
+            # The same named refusal as a single save, not a generic 500 (#1228).
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:

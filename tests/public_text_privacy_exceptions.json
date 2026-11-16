@@ -714,5 +714,21 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/fixtures/sas_fabric/core_no_controller_fabric.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:5f0cae8e4211a85f261675a956d3b42650d8e87540f37bfb27f79556aec60944": 255
+      }
+    },
+    "reason": "Synthetic builder output from the CORE Storage Fabric test inputs; exact detector counts are pinned."
+  },
+  "tests/test_core_fabric_legacy_controller.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:b0241848d0a8d04d11e7317ca6c440a80d07421b89cda6b027e9ce22fc02885c": 2
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   }
 }

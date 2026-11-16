@@ -83,7 +83,7 @@ from app.services.sas_fabric import (
     parse_mpr_sysctl_locations,
     parse_pciconf_sas_controllers,
 )
-from app.services.ssh_probe import SSHCommandResult
+from app.services.ssh_probe import SSHCommandResult, SSHLocalFailure
 from app.services.truenas_ws import TrueNASRawData
 from tests.test_inventory import build_inventory_service
 
@@ -570,7 +570,10 @@ process.stdout.write(ui.renderTraceMode(data.fabric));
                             f"36 {1:016x} 0001 ffff 0000 1", f"36 {2:016x} 0002 0001 0000 2",
                             f"36 {3:016x} 0003 0002 0000 3"])},
                     )
-                self.assertEqual(bool(fabric.warnings), limited)
+                self.assertEqual(
+                    "MPR expander ancestry resource limit exceeded; upstream connectivity is unknown." in fabric.warnings,
+                    limited,
+                )
                 self.assertEqual(sum(node.kind == "expander" for node in fabric.nodes), 1 if limited else 3)
                 self.assertEqual(any(link.kind == "expander-expander" for link in fabric.links), not limited)
 
@@ -1120,8 +1123,11 @@ Adapter     Chip           Board Name        Firmware
 
         self.assertEqual([row["unit"] for row in adapters], ["0", "1"])
         self.assertEqual(expanders[0]["sas_address"], "50030480090c4f7f")
-        self.assertEqual(expanders[0]["linked_phys"], 1)
-        self.assertEqual(expanders[0]["device_counts"]["End Device"], 1)
+        # The header reports 36 PHYs and only two rows follow: the table was
+        # not read whole, so its linked count and device tally are unknown.
+        self.assertEqual(len(expanders[0]["phys"]), 2)
+        self.assertIsNone(expanders[0]["linked_phys"])
+        self.assertIsNone(expanders[0]["device_counts"])
 
     def test_parse_pciconf_and_dmidecode_join_keys_for_supermicro_slots(self) -> None:
         controllers = parse_pciconf_sas_controllers(PCICONF_MPR_OUTPUT)
@@ -3199,10 +3205,10 @@ class SasFabricSnapshotTests(unittest.TestCase):
             "core": {
                 "platform": "core",
                 "with_ses": False,
+                # No mprutil output was observed, so no controller is invented (#1219).
                 "node_ids": [
                     "backplane:0",
                     "bay:0",
-                    "controller:mpr-1",
                     "host",
                     "pool:Tank%20Main",
                     "vdev:Tank%20Main/Data%2FMirror",
@@ -3210,7 +3216,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "host_metrics": {"slot_count": 1},
                 "host_evidence": [],
                 "bay_evidence": ["inventory snapshot"],
-                "warnings": [],
+                "warnings": ["No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions."],
                 "raw": {
                     "commands": [],
                     "path_counts": {},
@@ -3223,6 +3229,19 @@ class SasFabricSnapshotTests(unittest.TestCase):
                     "mpr_sysctl_locations": {},
                     "mpr_kernel_events": {"event_count": 0, "controllers": [], "devices": []},
                     "command_failures": [],
+                    # Nothing was read, so no controller-side count is a measurement (#1219).
+                    "controller_read": {
+                        "units": [],
+                        "counts": {
+                            "controllers": "not_read",
+                            "paths": "not_read",
+                            "expanders": "not_read",
+                            "enclosures": "not_read",
+                        },
+                        "lists": {},
+                        "rejected_units": 0,
+                        "unread_phy_tables": 0,
+                    },
                 },
             },
             "linux_ses": {
@@ -6005,7 +6024,13 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
                 phys = self.phys_in(command)
                 if slow_phy in phys:
                     # What SSHProbe returns when the command deadline expires.
-                    results.append(SSHCommandResult(command=command, ok=False, stderr="Command timed out"))
+                    results.append(SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="SSH command timed out.",
+                        exit_code=255,
+                        local_failure=SSHLocalFailure("timeout", "TimeoutError"),
+                    ))
                     continue
                 unit, address, device, _span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
                 per_phy = {phy: _smp_frame(phy, (offset + phy + 1, 0, 0, 0)) for phy in phys}
@@ -6388,7 +6413,13 @@ class CoreExpanderCounterHungTests(unittest.TestCase):
             unit, address, device, phys = _chunk_identity(command)
             if hang_phy in phys and ssh_timeout:
                 spent.append(float(SSHConfig().timeout_seconds))
-                return SSHCommandResult(command=command, ok=False, stderr="SSH command timed out.")
+                return SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stderr="SSH command timed out.",
+                    exit_code=255,
+                    local_failure=SSHLocalFailure("timeout", "TimeoutError"),
+                )
             per_phy: dict[int, object] = {}
             seconds = 0.0
             for phy in phys:

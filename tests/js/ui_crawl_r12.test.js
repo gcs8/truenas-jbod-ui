@@ -48,6 +48,8 @@ function inventoryStates() {
 function fakePage({ selector, visible = true, enabled = true }) {
   const page = {
     gotos: 0,
+    // A fresh page: there is no previous document to retire (#1232).
+    url: () => "about:blank",
     locator(css) {
       const hit = css === selector && visible;
       const first = () => ({ isEnabled: async () => enabled, isVisible: async () => hit });

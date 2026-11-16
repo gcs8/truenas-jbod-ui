@@ -383,8 +383,16 @@ backups:
 | `BACKUP_ARCHIVE_PASSPHRASE_FILE` | passphrase file (falls back to `SCHEDULED_BACKUP_PASSPHRASE_FILE`) |
 
 A scheduled FULL includes the history database and keeps `14` local copies by
-default (one daily copy for two weeks). Catalog-verified local FULLs gradually
-replace the standalone daily, weekly and monthly history-sidecar snapshots. The
+default (one daily copy for two weeks). Local FULLs that still match their
+catalogued size and SHA-256 when the scheduler re-reads them gradually replace
+the standalone daily, weekly and monthly history-sidecar snapshots. In one
+backup run the scheduler content-checks at most 14 local FULLs, newest first,
+counting the ones grooming's kept-copy check (below) already read in that run;
+those are reused, not read again. Every check counts toward that limit whether or not it
+matches, so damaged copies lower the credit instead of causing more reads. A FULL that is missing or has
+the wrong size earns no credit; one whose SHA-256 no longer matches also earns
+none and is marked unverified, and the status file stops naming it as the
+verified FULL. The
 scheduler retains enough older sidecars that the two sets still provide at least
 14 copies during cutover; after 14 usable local FULLs exist, no sidecar copy is
 needed for that floor. A lower customized FULL retention therefore leaves the
@@ -475,6 +483,89 @@ Some copies are never deleted:
 - The newest verified copy of each class at each location is always kept.
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
+
+Before grooming deletes a copy of a class at a location, it makes sure at
+least one copy it is keeping is still good. It reads back the newest verified
+copy that stays and checks its size and SHA-256 against the catalog. If that
+copy matches, the check ends and the deletions go ahead. If it is missing or no
+longer matches, it is marked unverified, the plan is worked out again (which
+can only remove deletions, never add one), and the next newest verified copy is
+read. The check stops as soon as nothing is left to delete. The clean-up result
+and the backup page's "Last clean-up" status line both say how many copies were
+marked unverified, even when the clean-up otherwise finished, in the same words
+("3 of the copies it kept failed the size and SHA-256 check and were marked
+unverified."). The clean-up result also says how many planned deletions were
+not carried out because the copies that would have stayed could not be
+confirmed good, and what to do next: run Verify on the copies marked
+unverified, then clean up again if they pass, or back up again to replace them
+if they do not. In the clean-up dialog that result is shown in the problem
+colour, directly under the plan's introduction, which changes to say the
+copies were in the plan rather than that they will be deleted.
+
+Because a clean-up reads kept copies back first, a manual clean-up can take
+minutes. The admin service waits up to 10 minutes in all for its answer, so it
+replies well before the page's own 15-minute limit.
+
+- If the backup service's result arrives, the dialog shows it.
+- If the backup scheduler cannot be reached (no socket, the connection is
+  refused or times out, or the wait ran out before the request was made),
+  nothing was sent. The API answers 503 with the fixed state
+  `cleanup_not_sent`, and the page says "Clean up did not start: The backup
+  scheduler service is not available." A 503 without that state, such as one
+  from a proxy in front of the admin service, gets the message below.
+- In every other case (the wait ran out, the connection broke while sending or
+  receiving, or the answer was not a clean-up result or a refusal), and when
+  the page itself stops waiting or gets an error that does not decide the
+  outcome, the dialog and banner say, in the warning colour: "No answer came
+  back for this clean-up. It may have run, may still be running, or may not
+  have started. Reload this page in a few minutes and check Last clean-up
+  before starting another." The page asks nothing more for that clean-up, and
+  no later list refresh changes this message; it stays until you close the
+  dialog or start something else. The "Last clean-up" line shows the most
+  recent clean-up the backup service recorded, which is not necessarily this
+  one.
+- While a clean-up runs, the status line says "A clean-up is running."
+
+A clean-up started while a backup or another clean-up is running does not
+start and deletes nothing; the dialog says so and asks you to open Clean up
+again after it finishes.
+
+Grooming refuses to delete anything more at that location for that run, and
+the status names the reason, when:
+
+- a kept copy cannot be read at all (`keeper-unreadable`,
+  `keeper-unverifiable` or `keeper-readback-failed`);
+- three kept copies of the same class and location in a row were missing or
+  did not match (`keeper-check-budget-exhausted`). Running out of reads never
+  allows a deletion;
+- there is not enough free space to stage a remote readback
+  (`keeper-scratch-capacity`, see below).
+
+Local copies are hashed in place. A remote kept copy is read back with the same
+streaming download an explicit verify uses, capped at the recorded size;
+grooming does not list the remote folder. A copy the target reports as not
+found is marked unverified, and any other download failure stops deletion at
+that location with `keeper-readback-failed`. A filesystem or NFS copy that is
+not a regular file (for example a FIFO) is refused without waiting on it.
+
+So on one grooming run, each class at a remote location with something to
+delete downloads one archive when its newest kept copy is good and at most
+three when it is not. Nothing is remembered between runs: every grooming run
+that deletes something reads its keeper again, and grooming also runs after
+configuration backups, so a large FULL keeper can be downloaded many times a
+day.
+
+The download is staged in one private `keeper-check-*` directory under the
+scheduler state directory and deleted as soon as it is hashed, so the extra
+disk space at any moment is one archive. The transports have no way to hash a
+download without storing it. Before each remote readback grooming removes any
+`keeper-check-*` directory a killed run left behind, and refuses with
+`keeper-scratch-capacity` unless the state directory's filesystem has room for
+the archive plus 64 MiB. In the published Compose layout the state directory
+shares a filesystem with the local archives.
+
+A preview reads only the catalog, so applying it can delete fewer copies than
+it listed.
 
 ### Deploy
 

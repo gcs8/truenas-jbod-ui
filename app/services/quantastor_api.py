@@ -13,7 +13,9 @@ from urllib.request import Request
 from app.config import TrueNASConfig
 from app.services.tls_context import (
     build_tls_client_context,
+    presented_tls_server_name,
     resolve_tls_server_name,
+    tls_checks_hostname,
     urlopen_with_tls_config,
 )
 from app.services.truenas_ws import (
@@ -42,6 +44,21 @@ def build_quantastor_api_base(host: str) -> str:
     if not path.endswith("/qstorapi"):
         path = f"{path}/qstorapi" if path else "/qstorapi"
     return urlunsplit((parsed.scheme or "https", parsed.netloc, path, "", ""))
+
+
+def quantastor_request_destination(config: TrueNASConfig) -> tuple[str, str | None]:
+    """The request base `QuantastorRESTClient` sends to and the TLS server name it presents.
+
+    The client builds its requests from this, and so does anything that has
+    to know where they go (the persisted-detail binding). The server name is
+    `None` for plain HTTP.
+    """
+    base_url = build_quantastor_api_base(config.host).rstrip("/")
+    if not base_url.startswith("https://"):
+        return base_url, None
+    return base_url, presented_tls_server_name(
+        base_url, resolve_tls_server_name(config), check_hostname=tls_checks_hostname(config),
+    )
 
 
 class QuantastorRESTClient:
@@ -153,7 +170,7 @@ class QuantastorRESTClient:
                 "Quantastor API access requires TRUENAS_API_USER and TRUENAS_API_PASSWORD."
             )
 
-        base_url = build_quantastor_api_base(self.config.host).rstrip("/")
+        base_url, server_name = quantastor_request_destination(self.config)
         query = urlencode({key: value for key, value in (params or {}).items() if value is not None})
         target = f"{base_url}/{endpoint}"
         if query:
@@ -177,7 +194,7 @@ class QuantastorRESTClient:
                 request,
                 timeout=self.config.timeout_seconds,
                 context=ssl_context,
-                server_hostname=resolve_tls_server_name(self.config),
+                server_hostname=server_name,
             ) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 body = response.read()

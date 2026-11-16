@@ -1003,6 +1003,21 @@ def build_jsonrpc_url(host: str, api_version: str = "current") -> str:
     return urlunsplit((scheme, parsed.netloc, f"{path}/api/{api_version}", "", ""))
 
 
+def truenas_session_destination(config: TrueNASConfig) -> tuple[str, str | None]:
+    """The WebSocket URL a `TrueNASWebsocketClient` session opens and the TLS server name it presents.
+
+    The session is opened from this, and so is anything that has to know
+    where it goes (the persisted-detail binding). The URL depends on the
+    dialect (and, for JSON-RPC, the version); the server name is `None`
+    without TLS.
+    """
+    if config.api_dialect == "jsonrpc":
+        url = build_jsonrpc_url(config.host, config.api_version)
+    else:
+        url = build_websocket_url(config.host)
+    return url, resolve_tls_server_name(config) if url.startswith("wss://") else None
+
+
 @dataclass(slots=True)
 class TrueNASRawData:
     enclosures: list[dict[str, Any]]
@@ -1085,9 +1100,7 @@ class TrueNASWebsocketClient:
         return self.config.api_dialect == "jsonrpc"
 
     def _endpoint_url(self) -> str:
-        if self._uses_jsonrpc:
-            return build_jsonrpc_url(self.config.host, self.config.api_version)
-        return build_websocket_url(self.config.host)
+        return truenas_session_destination(self.config)[0]
 
     def _make_dispatcher(self, ws: ClientConnection) -> _MiddlewareCallDispatcher:
         if self._uses_jsonrpc:
@@ -1626,7 +1639,7 @@ class TrueNASWebsocketClient:
 
     @asynccontextmanager
     async def _session(self):
-        websocket_url = self._endpoint_url()
+        websocket_url, server_name = truenas_session_destination(self.config)
         ssl_context = self._ssl_context()
 
         if not self.config.api_key:
@@ -1637,7 +1650,7 @@ class TrueNASWebsocketClient:
         connection = connect(
             websocket_url,
             ssl=ssl_context,
-            server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
+            server_hostname=server_name if ssl_context else None,
             open_timeout=self.config.timeout_seconds,
             close_timeout=self.config.timeout_seconds,
             ping_interval=20,

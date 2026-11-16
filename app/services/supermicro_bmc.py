@@ -103,6 +103,16 @@ def _normalize_bmc_host(host: str) -> str:
     return f"https://{trimmed.rstrip('/')}"
 
 
+def bmc_request_url(base_url: str, path: str) -> str:
+    """The URL a BMC request goes to: the request path appended to the base URL as text.
+
+    Everything the base URL carries is kept, a query included (a gateway in
+    front of several BMCs can route by it). The persisted-detail binding
+    reads where requests go from this function too.
+    """
+    return base_url + path
+
+
 def _int_from_hex(value: Any) -> int | None:
     text = normalize_value_text(value)
     if not text or text == "0":
@@ -423,7 +433,7 @@ class SupermicroBMCService:
         if not self.base_url:
             raise LocalServiceError("BMC host is not configured.")
         request = Request(
-            self.base_url + path,
+            bmc_request_url(self.base_url, path),
             headers={
                 "Accept": "application/json",
                 **self._basic_auth_header,
@@ -481,7 +491,7 @@ class SupermicroBMCService:
         opener = self._build_https_opener(cookie_jar)
         login_body = urlencode({"name": self.config.username, "pwd": self.config.password}).encode("utf-8")
         request = Request(
-            self.base_url + SUPER_MICRO_LOGIN_PATH,
+            bmc_request_url(self.base_url, SUPER_MICRO_LOGIN_PATH),
             data=login_body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
@@ -509,7 +519,7 @@ class SupermicroBMCService:
                 category="authentication_failed",
                 method=SUPER_MICRO_LOGIN_PATH,
             )
-        page = self._fetch_web_text(opener, self.base_url + SUPER_MICRO_STORAGE_PAGE)
+        page = self._fetch_web_text(opener, bmc_request_url(self.base_url, SUPER_MICRO_STORAGE_PAGE))
         csrf_match = re.search(r'SmcCsrfInsert\s*\(\s*"CSRF-TOKEN"\s*,\s*"([^"]+)"', page)
         if not csrf_match:
             raise LocalServiceError("Supermicro BMC storage page did not expose a CSRF token.", category="response_invalid")
@@ -536,7 +546,7 @@ class SupermicroBMCService:
         referer: str,
     ) -> str:
         request = Request(
-            self.base_url + path,
+            bmc_request_url(self.base_url, path),
             data=urlencode(params).encode("utf-8"),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",

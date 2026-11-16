@@ -1949,10 +1949,16 @@ h3 {
 
 .backup-run-status.is-bad,
 .backup-test-result.is-bad,
+.backup-dialog-result.is-bad,
 .backup-state.is-incomplete,
 .backup-state.is-unsupported,
 .backup-state.is-missing {
   color: var(--danger);
+}
+
+/* A clean-up whose state is not known (#1188), as the banner's warning tone. */
+.backup-dialog-result.is-warning {
+  color: var(--warning);
 }
 
 .backup-change-list {
@@ -1972,6 +1978,30 @@ h3 {
   background: var(--panel-strong);
   color: var(--text);
   box-shadow: var(--shadow);
+}
+
+/* #1188: a long clean-up plan scrolls inside its list, so the introduction,
+   the result and the buttons stay in view. Without :has() the whole dialog
+   scrolls, as before. */
+.backup-dialog[open]:has(.backup-cleanup-list) {
+  display: flex;
+  flex-direction: column;
+}
+
+.backup-dialog-body:has(> .backup-cleanup-list) {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.backup-dialog-body:has(> .backup-cleanup-list) > * {
+  margin-block: 0;
+}
+
+.backup-cleanup-list {
+  min-height: 3em;
+  overflow-y: auto;
 }
 
 .backup-dialog::backdrop {

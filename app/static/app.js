@@ -2303,6 +2303,45 @@
       .replace("Ses", "SES");
   }
 
+  // A count is a measurement only when its read was whole; the CORE payload
+  // says which controller-side counts were not read (`raw.controller_read`).
+  // Same rule as fabricCountPhrase on the Storage Fabric page.
+  function sasFabricCountPhrase(fabric, domain, count, noun) {
+    const counts = fabric?.raw?.controller_read?.counts;
+    const value = counts && typeof counts === "object" ? counts[domain] : "complete";
+    const readState = value === "complete" || value === "partial" ? value : "not_read";
+    const plural = `${noun}s`;
+    if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
+  }
+
+  // Unread controller data is not a report of no controllers.
+  function sasFabricNoControllerText(fabric, storagePayload) {
+    if (storagePayload) {
+      return { meta: "No storage sources reported", message: "No storage source rows are available yet." };
+    }
+    if (sasFabricCountPhrase(fabric, "controllers", 0, "controller") !== "0 controllers") {
+      return {
+        meta: "HBA controllers not read",
+        message: "Controller data could not be read. Check the SSH setup for this system in the admin console.",
+      };
+    }
+    return {
+      meta: "No HBA controllers reported",
+      message: "No controllers were reported. Check the SSH setup for this system in the admin console.",
+    };
+  }
+
+  function sasFabricCountSummary(fabric) {
+    return [
+      sasFabricCountPhrase(fabric, "controllers", sasFabricList(fabric.controllers).length, "source"),
+      sasFabricCountPhrase(fabric, "paths", sasFabricList(fabric.paths).length, "path"),
+      sasFabricCountPhrase(fabric, "expanders", sasFabricList(fabric.expanders).length, "expander"),
+      sasFabricCountPhrase(fabric, "enclosures", sasFabricList(fabric.enclosures).length, "enclosure"),
+      `${sasFabricList(fabric.traces).length} traces`,
+    ].join(" / ");
+  }
+
   function isStorageFabricPayload(fabric = state.sasFabric.data) {
     const kind = String(fabric?.raw?.fabric_kind || "");
     return fabric?.raw?.fabric_domain === "storage_fabric"
@@ -2375,11 +2414,13 @@
     return String(value);
   }
 
+  // A metric the producer lists in `not_read` was not read: say so, never omit it or show 0.
   function sasFabricMetricRows(metrics, labels = {}) {
+    const notRead = new Set(sasFabricList(metrics?.not_read));
     return Object.entries(metrics || {})
-      .filter(([, value]) => value !== null && value !== undefined && value !== "" && !Array.isArray(value))
+      .filter(([key, value]) => notRead.has(key) || (value !== null && value !== undefined && value !== "" && !Array.isArray(value)))
       .slice(0, 8)
-      .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), formatSasFabricValue(value)))
+      .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), notRead.has(key) ? "not read" : formatSasFabricValue(value)))
       .join("");
   }
 
@@ -2502,16 +2543,24 @@
     `;
   }
 
-  function renderSasFabricCompactNodes(nodes, limit = 8, expandKey = null) {
+  function renderSasFabricCompactNodes(nodes, limit = 8, expandKey = null, emptyText = "No objects reported") {
     const all = sasFabricList(nodes);
     if (!all.length) {
-      return '<span class="sas-fabric-empty-note">No objects reported</span>';
+      return `<span class="sas-fabric-empty-note">${escapeHtml(emptyText)}</span>`;
     }
     // Without a key there is no toggle to reach the rest, so show every node.
     const capped = Boolean(expandKey) && all.length > limit;
     const visible = capped && !sasFabricListExpanded(expandKey) ? all.slice(0, limit) : all;
     const buttons = visible.map((node) => renderSasFabricNodeButton(node, { meta: sasFabricNodeMeta(node) || node.raw_id || formatSasFabricKind(node.kind), extra: "sas-fabric-compact-node" })).join("");
     return `${buttons}${capped ? renderSasFabricExpandToggle(expandKey, all.length - limit) : ""}`;
+  }
+
+  // An empty lane list is "No objects reported" only when that list was read.
+  function sasFabricLaneListEmptyText(fabric, controllerName, listName) {
+    const read = fabric?.raw?.controller_read;
+    if (!read) return "No objects reported";
+    const state = read.lists?.[controllerName]?.[listName];
+    return state === "read" || state === "empty" ? "No objects reported" : "Not read";
   }
 
   function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
@@ -2562,11 +2611,11 @@
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Transport Detail" : "Expanders"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6, `expanders:${controllerId}`)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6, `expanders:${controllerId}`, sasFabricLaneListEmptyText(fabric, controllerName, "expanders"))}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Enclosures / Views" : "SES / MPR Enclosures"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6, `enclosures:${controllerId}`)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6, `enclosures:${controllerId}`, sasFabricLaneListEmptyText(fabric, controllerName, "enclosures"))}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Mapped Bays" : "Impacted Bays"}</div>
@@ -2595,16 +2644,17 @@
         related_slots: node.related_slots,
       }));
     if (!controllerRecords.length) {
+      const { meta, message } = sasFabricNoControllerText(fabric, storagePayload);
       return `
-        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: storagePayload ? "No storage sources reported" : "No HBA controllers reported" })}</div>
-        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controllers were reported. Check the SSH setup for this system in the admin console."}</div>
+        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta })}</div>
+        <div class="warning-item muted compact">${message}</div>
       `;
     }
     return `
       <div class="sas-fabric-host-row">
         ${renderSasFabricNodeButton(hostNode, {
           label: sasFabricDisplayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${storagePayload ? "source" : "controller"}${controllerRecords.length === 1 ? "" : "s"} / ${sasFabricList(fabric.nodes).length} nodes`,
+          meta: `${sasFabricCountPhrase(fabric, "controllers", controllerRecords.length, storagePayload ? "source" : "controller")} / ${sasFabricList(fabric.nodes).length} nodes`,
           extra: "sas-fabric-host-card",
         })}
       </div>
@@ -2735,13 +2785,7 @@
     }
     if (sasFabricSummary) {
       if (fabric) {
-        sasFabricSummary.textContent = [
-          `${sasFabricList(fabric.controllers).length} sources`,
-          `${sasFabricList(fabric.paths).length} paths`,
-          `${sasFabricList(fabric.expanders).length} expanders`,
-          `${sasFabricList(fabric.enclosures).length} enclosures`,
-          `${sasFabricList(fabric.traces).length} traces`,
-        ].join(" / ");
+        sasFabricSummary.textContent = sasFabricCountSummary(fabric);
       } else {
         sasFabricSummary.textContent = state.sasFabric.loading
           ? "Loading..."
@@ -4659,10 +4703,29 @@
     }, SMART_PREFETCH_DELAY_MS);
   }
 
+  // A SMART field listed in the summary's unread_fields was reported in a form
+  // that could not be read: it is "not read", neither absent ("n/a") nor zero.
+  // The summary API already takes an inventory reading of the same field when
+  // it has one, so the page does not fill a listed field from the slot.
+  function smartFieldNotRead(smartEntry, ...fields) {
+    const unread = smartEntry?.data?.unread_fields;
+    return Array.isArray(unread) && fields.some((field) => unread.includes(field));
+  }
+
+  // `formatted` unless it is a no-value text and one of `fields` was not read.
+  function smartNotReadOr(smartEntry, fields, formatted) {
+    const noValue = ["n/a", "Unavailable", "Loading..."].includes(formatted);
+    return noValue && smartFieldNotRead(smartEntry, ...fields) ? "not read" : formatted;
+  }
+
   function formatTemperatureValue(slot, smartEntry) {
-    const temperature = smartEntry?.data?.temperature_c ?? slot.temperature_c;
+    const notRead = smartFieldNotRead(smartEntry, "temperature_c");
+    const temperature = smartEntry?.data?.temperature_c ?? (notRead ? null : slot.temperature_c);
     if (Number.isInteger(temperature)) {
       return `${temperature} C`;
+    }
+    if (notRead) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4672,10 +4735,14 @@
 
   function formatLastSmartTestValue(slot, smartEntry) {
     const data = smartEntry?.data;
+    if (smartFieldNotRead(smartEntry, "last_test_type", "last_test_status")) {
+      return "not read";
+    }
     const testType = data?.last_test_type || slot.last_smart_test_type;
     const testStatus = data?.last_test_status || slot.last_smart_test_status;
     const ageHours = data?.last_test_age_hours;
-    const lifetimeHours = data?.last_test_lifetime_hours ?? slot.last_smart_test_lifetime_hours;
+    const lifetimeNotRead = smartFieldNotRead(smartEntry, "last_test_lifetime_hours", "last_test_age_hours");
+    const lifetimeHours = data?.last_test_lifetime_hours ?? (lifetimeNotRead ? null : slot.last_smart_test_lifetime_hours);
 
     if (testType && testStatus) {
       let suffix = "";
@@ -4683,6 +4750,8 @@
         suffix = ` (${ageHours}h ago)`;
       } else if (Number.isInteger(lifetimeHours)) {
         suffix = ` (@ ${lifetimeHours}h)`;
+      } else if (lifetimeNotRead) {
+        suffix = " (time not read)";
       }
       return `${testType}: ${testStatus}${suffix}`;
     }
@@ -4700,6 +4769,11 @@
     if (Number.isInteger(hours)) {
       return Number.isInteger(days) ? `${hours} hr (${days} d)` : `${hours} hr`;
     }
+    // Reported in a form that could not be read: neither absent nor zero.
+    const unread = smartEntry?.data?.unread_fields;
+    if (Array.isArray(unread) && (unread.includes("power_on_hours") || unread.includes("power_on_days"))) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -4707,18 +4781,24 @@
   }
 
   function formatPowerCycleValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.power_cycle_count, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.power_cycle_count, smartEntry, "power_cycle_count");
   }
 
   function formatPowerOnResetsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.power_on_resets, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.power_on_resets, smartEntry, "power_on_resets");
   }
 
   function formatSectorSizeValue(slot, smartEntry) {
-    const logical = smartEntry?.data?.logical_block_size ?? slot?.logical_block_size;
-    const physical = smartEntry?.data?.physical_block_size ?? slot?.physical_block_size;
-    if (Number.isInteger(logical) && Number.isInteger(physical)) {
-      return `Logical ${logical} B / Physical ${physical} B`;
+    const sizes = [["Logical", "logical_block_size"], ["Physical", "physical_block_size"]].map(([label, field]) => {
+      const notRead = smartFieldNotRead(smartEntry, field);
+      return { label, notRead, value: smartEntry?.data?.[field] ?? (notRead ? null : slot?.[field]) };
+    });
+    if (sizes.every(({ value }) => Number.isInteger(value))) {
+      return sizes.map(({ label, value }) => `${label} ${value} B`).join(" / ");
+    }
+    if (sizes.some(({ notRead }) => notRead)) {
+      return sizes.map(({ label, value, notRead }) => (Number.isInteger(value) ? `${label} ${value} B` : notRead ? `${label} not read` : null))
+        .filter(Boolean).join(" / ");
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4734,6 +4814,9 @@
     if (Number.isInteger(rpm)) {
       return `${rpm} rpm`;
     }
+    if (smartFieldNotRead(smartEntry, "rotation_rate_rpm")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -4744,6 +4827,9 @@
     const formFactor = smartEntry?.data?.form_factor;
     if (formFactor) {
       return formFactor;
+    }
+    if (smartFieldNotRead(smartEntry, "form_factor")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4769,11 +4855,13 @@
   }
 
   function formatReadCacheValue(smartEntry) {
-    return formatCacheFlagValue(smartEntry?.data?.read_cache_enabled, smartEntry);
+    return smartNotReadOr(smartEntry, ["read_cache_enabled"],
+      formatCacheFlagValue(smartEntry?.data?.read_cache_enabled, smartEntry));
   }
 
   function formatWritebackCacheValue(smartEntry) {
-    return formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry);
+    return smartNotReadOr(smartEntry, ["writeback_cache_enabled"],
+      formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry));
   }
 
   function formatTrimSupportedValue(smartEntry) {
@@ -4802,6 +4890,9 @@
     if (transport) {
       return transport;
     }
+    if (smartFieldNotRead(smartEntry, "transport_protocol")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -4809,6 +4900,9 @@
   }
 
   function formatLogicalUnitIdValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "logical_unit_id")) {
+      return "not read";
+    }
     const logicalUnitId = smartEntry?.data?.logical_unit_id || slot?.logical_unit_id || slot?.multipath?.lunid;
     const formatted = formatHexIdentifier(logicalUnitId);
     if (formatted) {
@@ -4821,6 +4915,9 @@
   }
 
   function formatSasAddressValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "sas_address")) {
+      return "not read";
+    }
     const sasAddress = smartEntry?.data?.sas_address || slot?.sas_address;
     const formatted = formatHexIdentifier(sasAddress);
     if (formatted) {
@@ -4840,6 +4937,9 @@
   }
 
   function formatAttachedSasAddressValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "attached_sas_address")) {
+      return "not read";
+    }
     const formatted = formatHexIdentifier(
       smartEntry?.data?.attached_sas_address || slot?.raw_status?.attached_sas_address
     );
@@ -4856,6 +4956,9 @@
     const linkRate = smartEntry?.data?.negotiated_link_rate;
     if (linkRate) {
       return linkRate;
+    }
+    if (smartFieldNotRead(smartEntry, "negotiated_link_rate")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5026,7 +5129,8 @@
   }
 
   function formatNamespaceNguidValue(smartEntry) {
-    return formatNamespaceIdentifierValue(smartEntry?.data?.namespace_nguid, smartEntry);
+    return smartNotReadOr(smartEntry, ["namespace_nguid"],
+      formatNamespaceIdentifierValue(smartEntry?.data?.namespace_nguid, smartEntry));
   }
 
   function formatNamespaceEui64Value(slot, smartEntry) {
@@ -5037,6 +5141,9 @@
       (!persistentId || namespaceEui64.toLowerCase() !== String(persistentId).toLowerCase())
     ) {
       return namespaceEui64;
+    }
+    if (smartFieldNotRead(smartEntry, "namespace_eui64")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5049,6 +5156,9 @@
     if (firmwareVersion) {
       return firmwareVersion;
     }
+    if (smartFieldNotRead(smartEntry, "firmware_version")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5059,6 +5169,9 @@
     const protocolVersion = smartEntry?.data?.protocol_version;
     if (protocolVersion) {
       return protocolVersion;
+    }
+    if (smartFieldNotRead(smartEntry, "protocol_version")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5077,11 +5190,13 @@
   }
 
   function formatWarningTemperatureValue(smartEntry) {
-    return formatThresholdTemperatureValue(smartEntry?.data?.warning_temperature_c, smartEntry);
+    return smartNotReadOr(smartEntry, ["warning_temperature_c"],
+      formatThresholdTemperatureValue(smartEntry?.data?.warning_temperature_c, smartEntry));
   }
 
   function formatCriticalTemperatureValue(smartEntry) {
-    return formatThresholdTemperatureValue(smartEntry?.data?.critical_temperature_c, smartEntry);
+    return smartNotReadOr(smartEntry, ["critical_temperature_c"],
+      formatThresholdTemperatureValue(smartEntry?.data?.critical_temperature_c, smartEntry));
   }
 
   function formatMetricBytes(value) {
@@ -5099,9 +5214,12 @@
     return `${size.toFixed(fractionDigits)} ${suffixes[suffixIndex]}`;
   }
 
-  function formatOptionalCount(value, smartEntry) {
+  function formatOptionalCount(value, smartEntry, field = null) {
     if (Number.isInteger(value)) {
       return value.toLocaleString();
+    }
+    if (field && smartFieldNotRead(smartEntry, field)) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5121,6 +5239,9 @@
     if (Number.isInteger(used)) {
       return `${used}% used`;
     }
+    if (smartFieldNotRead(smartEntry, "endurance_used_percent", "endurance_remaining_percent")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5134,7 +5255,10 @@
       return `${spare}% (threshold ${threshold}%)`;
     }
     if (Number.isInteger(spare)) {
-      return `${spare}%`;
+      return smartFieldNotRead(smartEntry, "available_spare_threshold_percent") ? `${spare}% (threshold not read)` : `${spare}%`;
+    }
+    if (smartFieldNotRead(smartEntry, "available_spare_percent", "available_spare_threshold_percent")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5154,11 +5278,11 @@
   }
 
   function formatBytesWrittenValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.bytes_written, smartEntry);
+    return smartNotReadOr(smartEntry, ["bytes_written"], formatBytesValue(smartEntry?.data?.bytes_written, smartEntry));
   }
 
   function formatBytesReadValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.bytes_read, smartEntry);
+    return smartNotReadOr(smartEntry, ["bytes_read"], formatBytesValue(smartEntry?.data?.bytes_read, smartEntry));
   }
 
   function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
@@ -5180,6 +5304,9 @@
     if (formatted) {
       return `${formatted}/yr`;
     }
+    if (smartFieldNotRead(smartEntry, "annualized_bytes_read")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5191,6 +5318,9 @@
     if (formatted) {
       return `${formatted}/yr`;
     }
+    if (smartFieldNotRead(smartEntry, "annualized_bytes_written")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5198,15 +5328,16 @@
   }
 
   function formatEstimatedRemainingWriteValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.estimated_remaining_bytes_written, smartEntry);
+    return smartNotReadOr(smartEntry, ["estimated_remaining_bytes_written"],
+      formatBytesValue(smartEntry?.data?.estimated_remaining_bytes_written, smartEntry));
   }
 
   function formatReadCommandsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.read_commands, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.read_commands, smartEntry, "read_commands");
   }
 
   function formatWriteCommandsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry, "write_commands");
   }
 
   function formatReadErrorCountValue(smartEntry) {
@@ -5232,7 +5363,7 @@
   }
 
   function formatMediaErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry, "media_errors");
   }
 
   function formatPredictiveErrorsValue(smartEntry) {
@@ -5244,21 +5375,24 @@
   }
 
   function formatUnsafeShutdownsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry, "unsafe_shutdowns");
   }
 
   function formatHardwareResetsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.hardware_resets, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.hardware_resets, smartEntry, "hardware_resets");
   }
 
   function formatInterfaceCrcErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.interface_crc_errors, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.interface_crc_errors, smartEntry, "interface_crc_errors");
   }
 
   function formatSmartHealthStatusValue(smartEntry) {
     const status = smartEntry?.data?.smart_health_status;
     if (status) {
       return status;
+    }
+    if (smartFieldNotRead(smartEntry, "smart_health_status")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5508,7 +5642,8 @@
   }
 
   function heatmapSmartNumber(entry, fieldName, fallback = null) {
-    if (!entry || !heatmapEntryOccupied(entry)) {
+    // An unread SMART field has no value, and no inventory value stands in.
+    if (!entry || !heatmapEntryOccupied(entry) || smartFieldNotRead(entry.smartEntry, fieldName)) {
       return null;
     }
     return nullableMetricNumber(entry.smartEntry?.data?.[fieldName]) ?? nullableMetricNumber(fallback);
@@ -5863,6 +5998,24 @@
     return Math.min(highCap, numeric >= highStep ? highCap : lowStep);
   }
 
+  // The SMART fields the Attention Score weighs. When one of them was not
+  // read, a low score is not evidence of low risk. The two temperature
+  // thresholds are weighed too, but are not risk readings on their own.
+  function attentionScoreInputState(data) {
+    const inputs = [
+      "smart_health_status", "temperature_c", "endurance_used_percent", "endurance_remaining_percent",
+      "media_errors", "predictive_errors", "non_medium_errors", "read_error_count", "uncorrected_read_errors",
+      "write_error_count", "uncorrected_write_errors", "interface_crc_errors", "unsafe_shutdowns",
+      "annualized_bytes_written",
+    ];
+    const thresholds = ["warning_temperature_c", "critical_temperature_c"];
+    const unread = Array.isArray(data?.unread_fields) ? data.unread_fields : [];
+    return {
+      notRead: [...inputs, ...thresholds].some((field) => unread.includes(field)),
+      anyRead: inputs.some((field) => ![null, undefined, ""].includes(data?.[field])),
+    };
+  }
+
   function computeAttentionScore(entry, entries, evaluation = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return { value: null, reasons: [] };
@@ -5886,8 +6039,10 @@
       reasons.push("identify active");
     }
 
+    let unavailableScore = 0;
     if (entry.smartEntry?.data?.available === false || (entry.smartEntry && !entry.smartEntry.loading && data.message && !data.available)) {
-      score += 10;
+      unavailableScore = 10;
+      score += unavailableScore;
       reasons.push("SMART unavailable");
     }
 
@@ -5996,10 +6151,30 @@
       }
     }
 
-    return {
-      value: Math.max(0, Math.min(100, Math.round(score))),
-      reasons: reasons.slice(0, 4),
-    };
+    const value = Math.max(0, Math.min(100, Math.round(score)));
+    const inputs = attentionScoreInputState(data);
+    if (!inputs.notRead) {
+      return { value, reasons: reasons.slice(0, 4) };
+    }
+    // Read fault evidence keeps its score; with no risk input read and no
+    // such evidence there is nothing to score, and 0 would read as low risk.
+    if (!inputs.anyRead && !Number.isFinite(temperature) && score - unavailableScore <= 0) {
+      return { value: null, reasons: [], missingText: "not scored: SMART inputs not read" };
+    }
+    return { value, reasons: [...reasons.slice(0, 3), "SMART inputs not read"] };
+  }
+
+  // Why a bay has no heat-map value, when that is known: the metric says so,
+  // or the SMART field it shows was reported but could not be read.
+  function heatmapMissingText(metric, entry, rawResult, evaluation) {
+    if (rawResult && typeof rawResult === "object" && rawResult.missingText) {
+      return rawResult.missingText;
+    }
+    if (evaluation?.timelineActive || metric?.requiresHistory) {
+      return null;
+    }
+    const fields = Array.isArray(metric?.historyMetrics) && metric.historyMetrics.length ? metric.historyMetrics : [metric?.id];
+    return smartFieldNotRead(entry?.smartEntry, ...fields) ? "not read" : null;
   }
 
   function heatmapLiveEntry(slot) {
@@ -6088,6 +6263,7 @@
         entry,
         value: hasDiskIdentity && Number.isFinite(numericValue) ? numericValue : null,
         reasons,
+        missingText: isEmptySlot ? null : heatmapMissingText(metric, entry, rawResult, evaluation),
       };
       if (temperatureBands && Number.isFinite(record.value)) {
         record.thresholds = resolveHeatmapTemperatureThresholds(entry?.smartEntry?.data, entry?.slot);
@@ -6297,7 +6473,7 @@
       tile.classList.add("heatmap-missing");
       badge.textContent = "--";
       badge.dataset.placeholder = "";
-      badge.title = `${metric.label}: unknown`;
+      badge.title = `${metric.label}: ${record?.missingText || "unknown"}`;
       host.appendChild(badge);
       return;
     }
@@ -6359,7 +6535,7 @@
     const record = heatmapContext.records.get(String(entryKey));
     const metric = heatmapContext.metric;
     if (!record || !Number.isFinite(record.value)) {
-      return [`Heat Map: ${metric.label} unknown`];
+      return [`Heat Map: ${metric.label} ${record?.missingText || "unknown"}`];
     }
     const lines = [`Heat Map: ${metric.label} ${metric.format(record.value)}`];
     if (record.band && record.thresholds) {
@@ -7702,11 +7878,14 @@
     const safeValue = escapeHtml(hasValue ? String(value) : "n/a");
     const encodedValue = hasValue ? encodeURIComponent(String(value)) : "";
     const titleAttribute = title ? ` title="${escapeHtml(title)}"` : "";
+    // Text standing in for a value (an identifier that was not read, or one
+    // still loading) is shown, but there is nothing to copy.
+    const hasCopyValue = hasValue && value !== "not read" && value !== "Loading...";
     return `
       <div class="kv-row">
         <div class="kv-label">${escapeHtml(label)}</div>
         <div class="kv-value"${titleAttribute}>${safeValue}</div>
-        <div>${copyable && hasValue ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
+        <div>${copyable && hasCopyValue ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
       </div>
     `;
   }

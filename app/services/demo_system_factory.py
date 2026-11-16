@@ -5,9 +5,15 @@ import re
 
 from app.config import Settings, _normalize_system_id
 from app.models.domain import DemoSystemRequest, EnclosureProfileRequest, SystemSetupRequest
+from app.secret_files import ReplacedDurabilityUncertainError
 from app.services.atomic_write import write_atomically
 from app.services.profile_builder import ProfileBuilderService, _PROFILE_WRITE_LOCK
-from app.services.system_setup import SystemSetupService, _CONFIG_WRITE_LOCK
+from app.services.system_setup import (
+    LEGACY_DEMO_MIGRATION_DETAIL,
+    SystemSetupService,
+    _CONFIG_WRITE_LOCK,
+    legacy_system_configured,
+)
 
 
 DEFAULT_DEMO_SYSTEM_ID = "demo-builder-lab"
@@ -34,8 +40,8 @@ class DemoSystemFactory:
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", system_id) or len(system_id) > 248:
                 raise ValueError("Demo system id must be at most 248 lowercase letters, digits, hyphens or underscores.")
             config = self.system_service._load_config()
-            if not config.get("systems") and (config.get("truenas") or {}).get("host"):
-                raise ValueError("Save the legacy system in System Setup before adding a demo, so its configuration is preserved.")
+            if legacy_system_configured(config):
+                raise ValueError(LEGACY_DEMO_MIGRATION_DETAIL)
             if any(
                 _normalize_system_id(item.get("id"), index + 1) == system_id
                 for index, item in enumerate(config.get("systems") or [])
@@ -49,8 +55,14 @@ class DemoSystemFactory:
             previous = profile_path.read_bytes() if profile_path.exists() else None
             try:
                 return self._create_new_demo_system(payload, settings)
+            except ReplacedDurabilityUncertainError:
+                # The new config is already visible and references the demo
+                # profile. Removing the profile now would leave that reference
+                # dangling, so keep it and report the uncertain save.
+                raise
             except Exception:
-                # A rejected/failed config save must not leave a new demo profile.
+                # A config save that failed before publication must not leave
+                # a new demo profile behind.
                 if previous is None:
                     profile_path.unlink(missing_ok=True)
                 else:
