@@ -742,12 +742,15 @@ def parse_chunk_output(output_key: str | None, stdout: object) -> PhyErrorLogRes
     return parsed
 
 
-def chunk_stop(output_key: str | None, ok: bool, stdout: object, stderr: object = "") -> tuple[str, int] | None:
+def chunk_stop(
+    output_key: str | None, ok: bool, stdout: object, *, timed_out: bool = False
+) -> tuple[str, int] | None:
     """Why an expander's read must stop after this chunk, and at which PHY.
 
-    A chunk past the SSH command deadline or with a call that gave no answer
-    is ``no_response`` (the expander is hung); a refused output is
-    ``rejected_output``; any other failed command is ``command_failed``; a
+    A chunk past the SSH command deadline (``timed_out``, set by the caller
+    from the local failure, never from command output) or with a call that
+    gave no answer is ``no_response`` (the expander is hung); a refused output
+    is ``rejected_output``; any other failed command is ``command_failed``; a
     chunk whose every call sudo refused is ``permission_denied``. None means
     the next chunk may run.
     """
@@ -756,7 +759,6 @@ def chunk_stop(output_key: str | None, ok: bool, stdout: object, stderr: object 
         return None
     first = span[1][0]
     if not ok:
-        timed_out = "timed out" in str(stderr or "").lower()
         return ("no_response" if timed_out else "command_failed", first)
     parsed = parse_chunk_output(output_key, stdout)
     if parsed is None or parsed.rejected:

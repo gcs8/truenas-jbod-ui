@@ -83,7 +83,7 @@ from app.services.sas_fabric import (
     parse_mpr_sysctl_locations,
     parse_pciconf_sas_controllers,
 )
-from app.services.ssh_probe import SSHCommandResult
+from app.services.ssh_probe import SSHCommandResult, SSHLocalFailure
 from app.services.truenas_ws import TrueNASRawData
 from tests.test_inventory import build_inventory_service
 
@@ -6005,7 +6005,13 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
                 phys = self.phys_in(command)
                 if slow_phy in phys:
                     # What SSHProbe returns when the command deadline expires.
-                    results.append(SSHCommandResult(command=command, ok=False, stderr="Command timed out"))
+                    results.append(SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="SSH command timed out.",
+                        exit_code=255,
+                        local_failure=SSHLocalFailure("timeout", "TimeoutError"),
+                    ))
                     continue
                 unit, address, device, _span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
                 per_phy = {phy: _smp_frame(phy, (offset + phy + 1, 0, 0, 0)) for phy in phys}
@@ -6388,7 +6394,13 @@ class CoreExpanderCounterHungTests(unittest.TestCase):
             unit, address, device, phys = _chunk_identity(command)
             if hang_phy in phys and ssh_timeout:
                 spent.append(float(SSHConfig().timeout_seconds))
-                return SSHCommandResult(command=command, ok=False, stderr="SSH command timed out.")
+                return SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stderr="SSH command timed out.",
+                    exit_code=255,
+                    local_failure=SSHLocalFailure("timeout", "TimeoutError"),
+                )
             per_phy: dict[int, object] = {}
             seconds = 0.0
             for phy in phys:

@@ -96,7 +96,7 @@ from app.services.profile_registry import (
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
-from app.services.ssh_probe import SSHCommandResult, SSHProbe
+from app.services.ssh_probe import SSHCommandResult, SSHLocalFailure, SSHProbe
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.storage_views import resolve_system_storage_views
 from app.services.storage_view_templates import get_storage_view_template, list_storage_view_templates
@@ -2474,10 +2474,10 @@ class InventoryHelpersTests(unittest.TestCase):
 
     def test_quantastor_backoff_warnings_are_collapsed_across_cli_and_ses(self) -> None:
         warnings = [
-            "Quantastor SSH CLI enrichment failed on 10.13.37.31: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:44.593780+00:00. REST data is still being used.",
-            "Quantastor SSH CLI enrichment failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00. REST data is still being used.",
-            "Quantastor SSH SES discovery failed on 10.13.37.31: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:44.593780+00:00.",
-            "Quantastor SSH SES discovery failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00.",
+            "Quantastor SSH CLI enrichment failed on 10.13.37.31 (retry_backoff; exit 255; retry after 2026-06-12T15:07:44.593780+00:00). REST data is still being used.",
+            "Quantastor SSH CLI enrichment failed on 10.13.37.30 (retry_backoff; exit 255; retry after 2026-06-12T15:07:41.513217+00:00). REST data is still being used.",
+            "Quantastor SSH SES discovery failed on 10.13.37.31 (retry_backoff; exit 255; retry after 2026-06-12T15:07:44.593780+00:00).",
+            "Quantastor SSH SES discovery failed on 10.13.37.30 (retry_backoff; exit 255; retry after 2026-06-12T15:07:41.513217+00:00).",
             "IO fencing is off on this QuantaStor cluster.",
         ]
 
@@ -2723,9 +2723,18 @@ class InventoryHelpersTests(unittest.TestCase):
 
     def test_summarize_ssh_failures_collapses_transport_level_batch_failure(self) -> None:
         command_results = [
-            SSHCommandResult(command="esxcli storage core adapter list", ok=False, stderr="Authentication failed.", exit_code=255),
-            SSHCommandResult(command="esxcli storage core device list", ok=False, stderr="Authentication failed.", exit_code=255),
-            SSHCommandResult(command="/opt/lsi/storcli64/storcli64 /c0 show all J", ok=False, stderr="Authentication failed.", exit_code=255),
+            SSHCommandResult(
+                command=command,
+                ok=False,
+                stderr="Authentication failed.",
+                exit_code=255,
+                local_failure=SSHLocalFailure("auth_failed", "AuthenticationException"),
+            )
+            for command in (
+                "esxcli storage core adapter list",
+                "esxcli storage core device list",
+                "/opt/lsi/storcli64/storcli64 /c0 show all J",
+            )
         ]
 
         warnings, status_message = InventoryService._summarize_ssh_failures(command_results, {})
@@ -11161,10 +11170,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(observed_transport_hosts, [])
         self.assertTrue(failures)
-        self.assertTrue(all("ssh_transport_failed; exit 255" in failure for failure in failures))
-        self.assertTrue(
-            all("not an operator-approved destination" not in failure for failure in failures)
-        )
+        self.assertTrue(all("destination_not_approved; exit 255" in failure for failure in failures))
 
     async def test_ssh_batches_for_different_hosts_are_not_globally_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11534,6 +11540,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                         ok=False,
                         stderr="Error reading SSH protocol banner",
                         exit_code=255,
+                        local_failure=SSHLocalFailure("protocol_error", "SSHException"),
                     )
                     for command in commands
                 ]
@@ -13168,6 +13175,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                         ok=False,
                         stderr="Error reading SSH protocol banner",
                         exit_code=255,
+                        local_failure=SSHLocalFailure("protocol_error", "SSHException"),
                     )
                     for command in command_list
                 ]
@@ -13193,7 +13201,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(overlay.values()))
             self.assertEqual(len(failures), 1)
             self.assertIn("Quantastor SSH CLI enrichment failed on 10.0.0.10", failures[0])
-            self.assertIn("ssh_transport_failed; exit 255", failures[0])
+            self.assertIn("protocol_error; exit 255", failures[0])
             self.assertNotIn("Error reading SSH protocol banner", failures[0])
             self.assertNotIn("disk inventory", failures[0])
 
@@ -14043,6 +14051,7 @@ Enclosure Status diagnostic page:
                         ok=False,
                         stderr="Error reading SSH protocol banner",
                         exit_code=255,
+                        local_failure=SSHLocalFailure("protocol_error", "SSHException"),
                     )
                     for command in commands
                 ]

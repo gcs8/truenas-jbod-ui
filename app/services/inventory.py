@@ -178,12 +178,15 @@ from app.services.parsers import (
     parse_unifi_gpio_debug,
     shift_hex_identifier,
 )
+from app.services import ssh_probe as ssh_probe_module
 from app.services.ssh_probe import (
     MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+    SSH_INTERNAL_ERROR_REASON,
     SSHCommandResult,
+    SSHLocalFailure,
     SSHProbe,
     SSHSession,
-    classify_ssh_failure,
+    ssh_failure_reason,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
@@ -296,15 +299,34 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^ ]+) "
     r"\(retry_backoff; exit 255; retry after (?P<retry_at>[^)]+)\)\."
 )
-LEGACY_QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
-    r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^:]+): "
-    r"Skipping optional SSH command batch after a recent connection startup failure; "
-    r"retry after (?P<retry_at>\S+)"
+# Local failure categories that mean no SSH session reached the host.
+SSH_LOGIN_FAILURE_REASONS = frozenset(
+    {
+        "auth_failed",
+        "connection_refused",
+        "destination_not_approved",
+        "dns_failed",
+        "host_key_rejected",
+        "host_unreachable",
+        "key_file_invalid",
+        "key_file_missing",
+        "key_file_unreadable",
+        "protocol_error",
+        "retry_backoff",
+        "ssh_disabled",
+        "ssh_transport_failed",
+        "timeout",
+    }
 )
-OPTIONAL_SSH_BACKOFF_DETAIL_REGEX = re.compile(
-    r"^Skipping optional SSH command batch after a recent connection startup failure; "
-    r"retry after (?P<retry_at>\S+?)(?:\.)?$"
+# Local connection failures that pause optional SSH batches for a while.
+SSH_CONNECTION_STARTUP_FAILURE_REASONS = frozenset(
+    {"connection_refused", "host_unreachable", "protocol_error", "ssh_transport_failed", "timeout"}
 )
+_PLAIN_DNS_NAME_RE = re.compile(
+    r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?"
+)
+UNPARSED_HOST_LOG_PLACEHOLDER = "<unparsed-host>"
 # Raw slot status keys that carry a state word; every other key is free text
 # or an identifier and must not drive presence, fault, or identify detection.
 SLOT_STATUS_TEXT_KEYS = ("status", "value", "value_raw", "state", "sas_device_type")
@@ -563,19 +585,25 @@ ESXI_FALLBACK_LAYOUT = (2, 1)
 # Scope for a SMART cache key or SSH host key when there is no enclosure id or
 # host to name. It never names a snapshot cache entry.
 UNSCOPED_KEY = "__default__"
-SSH_CONNECTION_FAILURE_MARKERS = (
-    "error reading ssh protocol banner",
-    "no existing session",
-    "timed out",
-    "unable to connect",
-    "connection refused",
-    "connection reset",
-    "maxstartups",
-)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log_safe_host(value: str | None) -> str:
+    """A host for a log line: an IP address or a plain DNS name, else a placeholder."""
+
+    text = value if isinstance(value, str) else ""
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        address = None
+    if address is not None and getattr(address, "scope_id", None) is None:
+        return str(address)
+    if _PLAIN_DNS_NAME_RE.fullmatch(text):
+        return text
+    return UNPARSED_HOST_LOG_PLACEHOLDER
 
 
 def _is_authentic_core_ses_target(target: Any) -> bool:
@@ -4894,29 +4922,37 @@ class InventoryService:
         # When the SSH session fails before any command can start, Paramiko
         # produces the same synthetic startup failure for every configured
         # command. Collapse that fan-out into one user-facing warning.
-        failure_reasons = {
-            classify_ssh_failure(
-                exit_code=failure.exit_code,
-                stdout=failure.stdout,
-                stderr=failure.stderr,
-            )
-            for failure in failures
+        # Only a failure this process recorded itself can collapse; a remote
+        # command's exit status, whatever it printed, stays per command.
+        local_failures = [getattr(failure, "local_failure", None) for failure in failures]
+        local_reasons = {
+            local_failure.reason if isinstance(local_failure, SSHLocalFailure) else None
+            for local_failure in local_failures
         }
         unique_exit_codes = {failure.exit_code for failure in failures}
         transport_level_failure = (
             not outputs
             and len(failures) == len(command_results)
-            and unique_exit_codes == {255}
-            and len(failure_reasons) == 1
+            and len(local_reasons) == 1
+            and None not in local_reasons
         )
         if transport_level_failure:
-            reason = next(iter(failure_reasons))
-            return (
-                [
-                    f"Could not log in over SSH ({reason}). Bay details from SSH are missing for this refresh."
-                ],
-                f"SSH login failed ({reason}).",
-            )
+            reason = next(iter(local_reasons))
+            if reason == SSH_INTERNAL_ERROR_REASON:
+                return (
+                    [
+                        f"SSH collection stopped on an internal error ({reason}). "
+                        "Bay details from SSH are missing for this refresh."
+                    ],
+                    f"SSH collection error ({reason}).",
+                )
+            if reason in SSH_LOGIN_FAILURE_REASONS:
+                return (
+                    [
+                        f"Could not log in over SSH ({reason}). Bay details from SSH are missing for this refresh."
+                    ],
+                    f"SSH login failed ({reason}).",
+                )
 
         normalized_outputs = {
             canonicalize_ssh_command(command): output
@@ -5017,11 +5053,7 @@ class InventoryService:
                 }
             details.append(
                 {
-                    "reason": classify_ssh_failure(
-                        exit_code=result.exit_code,
-                        stdout=result.stdout,
-                        stderr=result.stderr,
-                    ),
+                    "reason": ssh_failure_reason(result),
                     "exit_code": result.exit_code,
                     **context,
                 }
@@ -5401,7 +5433,7 @@ class InventoryService:
                 if item is None:
                     continue
                 if stop is None:
-                    stop = chunk_stop(key, item.ok, item.stdout, item.stderr)
+                    stop = chunk_stop(key, item.ok, item.stdout, timed_out=ssh_failure_reason(item) == "timeout")
                 if not item.ok:
                     continue
                 parsed = parse_chunk_output(key, item.stdout)
@@ -5547,7 +5579,9 @@ class InventoryService:
             item = by_key.get(last_sent.get(expander, ""))
             if item is None:
                 continue
-            stop = chunk_stop(last_sent[expander], item.ok, item.stdout, item.stderr)
+            stop = chunk_stop(
+                last_sent[expander], item.ok, item.stdout, timed_out=ssh_failure_reason(item) == "timeout"
+            )
             if stop is not None:
                 self._smp_counter_stopped[expander] = stop
                 queue.clear()
@@ -12660,11 +12694,7 @@ class InventoryService:
 
     @staticmethod
     def _ssh_failure_public_summary(result: SSHCommandResult) -> str:
-        reason = classify_ssh_failure(
-            exit_code=result.exit_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
+        reason = ssh_failure_reason(result)
         exit_status = result.exit_code if result.exit_code is not None else "unknown"
         return f"{reason}; exit {exit_status}"
 
@@ -12878,6 +12908,7 @@ class InventoryService:
                 ok=False,
                 stderr="SSH command result missing.",
                 exit_code=255,
+                local_failure=SSHLocalFailure("result_missing"),
             ),
         )
         if not discovery_result.ok:
@@ -12951,7 +12982,13 @@ class InventoryService:
         for device, (aes_command, ec_command, join_command) in device_commands.items():
             aes_result = results_by_command.get(
                 aes_command,
-                SSHCommandResult(command=aes_command, ok=False, stderr="SSH command result missing.", exit_code=255),
+                SSHCommandResult(
+                    command=aes_command,
+                    ok=False,
+                    stderr="SSH command result missing.",
+                    exit_code=255,
+                    local_failure=SSHLocalFailure("result_missing"),
+                ),
             )
             if not aes_result.ok:
                 failure_summary = self._ssh_failure_public_summary(aes_result)
@@ -16916,7 +16953,7 @@ class InventoryService:
         locate actions use it to check the shelf before switching a light.
         """
         if not self._ssh_destination_authority_approved(target_host):
-            failures = [(result, 0.0) for result in self._ssh_authority_failure_results(commands)]
+            failures = [(result, 0.0) for result in self._ssh_destination_refusal_results(commands, target_host)]
             if then is not None:
                 then([result for result, _duration in failures])
             return failures
@@ -17075,7 +17112,7 @@ class InventoryService:
         self, command: str, host: str | None = None, *, timeout_seconds: float | None = None
     ) -> Any:
         if not self._ssh_destination_authority_approved(host):
-            return self._ssh_authority_failure_results([command])[0]
+            return self._ssh_destination_refusal_results([command], host)[0]
         ssh_probe: Any = self.ssh_probe
         session = _ssh_command_session.get()
         if session is not None and (not normalize_text(host) or normalize_text(host) == normalize_text(self.system.ssh.host)):
@@ -17130,14 +17167,29 @@ class InventoryService:
         )
         return credential_authorities_are_approved(candidate, approved)
 
-    @staticmethod
-    def _ssh_authority_failure_results(commands: Iterable[str]) -> list[SSHCommandResult]:
+    def _ssh_destination_refusal_results(self, commands: Iterable[str], host: str | None) -> list[SSHCommandResult]:
+        """Refuse to send credentials to a host the operator did not configure."""
+
+        target_host = normalize_text(host) or ""
+        summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
+            (self.system.id, "destination_not_approved", target_host),
+            "destination_not_approved",
+        )
+        if summary is not None:
+            logger.warning(
+                "SSH destination refused for system=%s host=%s: not an approved destination for these "
+                "credentials (reason=destination_not_approved)%s",
+                self.system.id,
+                _log_safe_host(target_host),
+                summary.suffix(),
+            )
         return [
             SSHCommandResult(
                 command=command,
                 ok=False,
                 stderr="SSH target is not an operator-approved destination for this credential authority.",
                 exit_code=255,
+                local_failure=SSHLocalFailure("destination_not_approved"),
             )
             for command in commands
         ]
@@ -17178,8 +17230,9 @@ class InventoryService:
             "Skipping optional SSH command batch after a recent connection startup failure; "
             f"retry after {backoff_until.isoformat()}."
         )
+        failure = SSHLocalFailure("retry_backoff", retry_after=backoff_until)
         return [
-            SSHCommandResult(command=command, ok=False, stderr=message, exit_code=255)
+            SSHCommandResult(command=command, ok=False, stderr=message, exit_code=255, local_failure=failure)
             for command in commands
         ]
 
@@ -17203,8 +17256,6 @@ class InventoryService:
         insertion_index: int | None = None
         for warning in warnings:
             match = QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX.match(warning)
-            if match is None:
-                match = LEGACY_QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX.match(warning)
             if match:
                 if insertion_index is None:
                     insertion_index = len(collapsed)
@@ -17231,46 +17282,45 @@ class InventoryService:
     def _optional_ssh_transport_failure(
         results: Iterable[SSHCommandResult],
     ) -> tuple[str, int | None, str | None] | None:
+        """One local failure shared by every result, or None.
+
+        The category, and the retry time of a paused host, come from the
+        failure this process recorded, never from the result's text.
+        """
         result_list = list(results)
         if not result_list:
             return None
-        if not all((not result.ok and result.exit_code == 255) for result in result_list):
-            return None
-
-        retry_values: set[str] = set()
-        for result in result_list:
-            detail = normalize_text(result.stderr) or normalize_text(result.stdout) or ""
-            match = OPTIONAL_SSH_BACKOFF_DETAIL_REGEX.match(detail)
-            if match is None:
-                retry_values.clear()
-                break
-            retry_values.add(match.group("retry_at"))
-        if len(retry_values) == 1:
-            return "retry_backoff", 255, next(iter(retry_values))
-
-        reasons = {
-            classify_ssh_failure(
-                exit_code=result.exit_code,
-                stdout=result.stdout,
-                stderr=result.stderr,
-            )
+        failures = [
+            local_failure
             for result in result_list
-        }
+            if not result.ok and isinstance(local_failure := getattr(result, "local_failure", None), SSHLocalFailure)
+        ]
+        if len(failures) != len(result_list):
+            return None
+        reasons = {failure.reason for failure in failures}
         if len(reasons) != 1:
             return None
-        return next(iter(reasons)), 255, None
+        reason = next(iter(reasons))
+        exit_codes = {result.exit_code for result in result_list}
+        exit_code = next(iter(exit_codes)) if len(exit_codes) == 1 else None
+        retry_at: str | None = None
+        if reason == "retry_backoff":
+            retry_times = {failure.retry_after for failure in failures}
+            retry_after = next(iter(retry_times)) if len(retry_times) == 1 else None
+            if isinstance(retry_after, datetime):
+                retry_at = retry_after.isoformat()
+        return reason, exit_code, retry_at
 
     @staticmethod
     def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:
         if not results:
             return False
-        if not all((not result.ok and result.exit_code == 255) for result in results):
-            return False
-        details = " ".join(
-            f"{normalize_text(result.stderr)} {normalize_text(result.stdout)}".lower()
+        return all(
+            not result.ok
+            and isinstance(local_failure := getattr(result, "local_failure", None), SSHLocalFailure)
+            and local_failure.reason in SSH_CONNECTION_STARTUP_FAILURE_REASONS
             for result in results
         )
-        return any(marker in details for marker in SSH_CONNECTION_FAILURE_MARKERS)
 
     async def _run_ssh_planned_commands(
         self,
@@ -17283,7 +17333,7 @@ class InventoryService:
         if not initial_list:
             return []
         if not self._ssh_destination_authority_approved(host):
-            return self._ssh_authority_failure_results(initial_list)
+            return self._ssh_destination_refusal_results(initial_list, host)
 
         backoff_results = self._optional_ssh_backoff_failure_results(initial_list, host)
         if backoff_results is not None:
@@ -17409,7 +17459,7 @@ class InventoryService:
         if not command_list:
             return []
         if not self._ssh_destination_authority_approved(host):
-            return self._ssh_authority_failure_results(command_list)
+            return self._ssh_destination_refusal_results(command_list, host)
 
         backoff_results = self._optional_ssh_backoff_failure_results(command_list, host)
         if backoff_results is not None:
@@ -17440,6 +17490,7 @@ class InventoryService:
                     ok=False,
                     stderr="SSH command input transport is unavailable.",
                     exit_code=255,
+                    local_failure=SSHLocalFailure("input_not_supported"),
                 )
                 for command in command_list
             ]
