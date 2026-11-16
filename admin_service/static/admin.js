@@ -4690,6 +4690,9 @@
     if (state.sudoersPreviewTimerId) {
       window.clearTimeout(state.sudoersPreviewTimerId);
     }
+    // The form changed: retire any preview still in flight now, so its answer
+    // cannot render for the edited form before the debounced refresh runs.
+    state.sudoersPreviewRequestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
     state.sudoersPreviewTimerId = window.setTimeout(() => {
       state.sudoersPreviewTimerId = null;
       void refreshSudoersPreview();
@@ -4700,6 +4703,11 @@
     if (!elements.setupBootstrapSudoersPreview) {
       return;
     }
+    // Take ownership before any early return: the local guidance below (ESXi,
+    // BMC-only, bootstrap disabled) must retire every earlier request so its
+    // late success or error cannot replace that guidance.
+    const requestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
+    state.sudoersPreviewRequestSeq = requestSeq;
     const payload = collectSudoersPreviewPayload();
     const bmcOnly = setupPlatformUsesBmcOnlyHost(payload.platform);
     if (elements.setupBootstrapSudoersPanel) {
@@ -4737,8 +4745,6 @@
       });
       return;
     }
-    const requestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
-    state.sudoersPreviewRequestSeq = requestSeq;
     try {
       const result = await fetchJson("/api/admin/system-setup/sudoers-preview", {
         method: "POST",
@@ -5880,14 +5886,16 @@
       builderRevision: state.profileBuilderRevision,
       builderDraft: builder ? builderDraft() : null });
     let submitted = snapshot();
+    const sameEditor = () => state.setupEditorGeneration === submitted.generation;
+    const sameTarget = () => sameEditor() && target() === submitted.target;
     const owns = () => state.adminEditorOperationSeq[name] === sequence
-      && state.setupEditorGeneration === submitted.generation
-      && state.setupDraftRevision === submitted.revision && target() === submitted.target
+      && sameTarget()
+      && state.setupDraftRevision === submitted.revision
       && (!builder || (state.profileBuilderGeneration === submitted.builderGeneration
         && state.profileBuilderRevision === submitted.builderRevision
         && builderDraft() === submitted.builderDraft));
     // Only call after an admitted, synchronous change made by this operation.
-    return { owns, advance: () => { submitted = snapshot(); } };
+    return { owns, sameEditor, sameTarget, advance: () => { submitted = snapshot(); } };
   }
 
   function retireAdminEditorControls({ builderOnly = false } = {}) {
@@ -5902,7 +5910,11 @@
       if (elements.setupBootstrapButton) {
         elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
       }
-      for (const control of [elements.setupInspectTlsButton, elements.setupTrustRemoteTlsButton]) {
+      for (const control of [
+        elements.setupInspectTlsButton,
+        elements.setupTrustRemoteTlsButton,
+        elements.setupTlsImportCaButton,
+      ]) {
         if (control) control.disabled = Boolean(state.sessionStopped);
       }
       const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
@@ -6805,14 +6817,22 @@
     const operation = captureAdminEditorOperation(name);
     const sequence = state.adminEditorOperationSeq[name];
     const serverName = collectTlsServerName();
-    const owns = () => operation.owns() && collectTlsTargetHost() === host
+    const sameTarget = () => operation.sameTarget() && collectTlsTargetHost() === host
       && collectTlsServerName() === serverName;
+    const owns = () => operation.owns() && sameTarget();
     // This request's button is released by whichever request of this kind is
     // newest. Not every draft change (storage-view delete, duplicate or order
     // reset) releases editor controls, so a retired request still releases its
     // button unless a newer request of the same kind now holds it.
     const latest = () => state.adminEditorOperationSeq[name] === sequence;
-    return { owns, latest, serverName, advance: operation.advance };
+    return {
+      owns,
+      sameEditor: operation.sameEditor,
+      sameTarget,
+      latest,
+      serverName,
+      advance: operation.advance,
+    };
   }
 
   async function inspectTlsCertificate() {
@@ -6949,25 +6969,68 @@
       setBanner("Choose a PEM bundle before importing it into the local trust store.", "error");
       return;
     }
+    const requestTarget = {
+      host: collectTlsTargetHost() || null,
+      system_id: elements.setupSystemId?.value?.trim() || null,
+      bundle_name: suggestedTlsBundleName(),
+      tls_server_name: collectTlsServerName() || null,
+    };
+    const owner = captureTlsEditorOperation("tls-import", requestTarget.host || "");
+    const fileName = file.name || "the selected file";
+    const importFor = requestTarget.system_id
+      || elements.setupSystemLabel?.value?.trim()
+      || "the previous system";
+    const reportRetiredImport = (outcome) => {
+      if (!owner.latest()) return;
+      const sameEditor = owner.sameEditor();
+      const messages = {
+        "not-sent": {
+          same: "A certificate import stopped after this form changed, so no request was sent. Import the file again to use it.",
+          changed: `Certificate import for ${importFor} stopped before it was sent because the editor changed. Open ${importFor} and import the file again to use it.`,
+        },
+        finished: {
+          same: "A certificate import finished after this form changed, so its result was not applied. Import the file again to use it.",
+          changed: `Certificate import for ${importFor} finished after the editor changed, so its result was not applied. Open ${importFor} and import the file again to use it.`,
+        },
+        unknown: {
+          same: "A certificate import returned an error after this form changed, so the result is unknown for this form. Import the file again to be sure.",
+          changed: `Certificate import for ${importFor} returned an error after the editor changed, so the result is unknown. Open ${importFor} and import the file again to be sure.`,
+        },
+      };
+      const message = sameEditor ? messages[outcome].same : messages[outcome].changed;
+      if (sameEditor && elements.setupTlsImportResult) {
+        elements.setupTlsImportResult.textContent = message;
+      }
+      setBanner(message, "info");
+    };
+    let requestSent = false;
     if (elements.setupTlsImportCaButton) {
       elements.setupTlsImportCaButton.disabled = true;
     }
     if (elements.setupTlsImportResult) {
-      elements.setupTlsImportResult.textContent = `Importing ${file.name} into the local TLS trust store...`;
+      elements.setupTlsImportResult.textContent = `Importing ${fileName} into the local TLS trust store...`;
     }
     try {
       const pemText = await readTextFile(file);
+      // The file read is asynchronous too. Retire it before dispatch so an old
+      // editor cannot retarget the request to fields that are open now.
+      if (!owner.owns()) {
+        reportRetiredImport("not-sent");
+        return;
+      }
+      requestSent = true;
       const payload = await fetchJson("/api/admin/tls/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pem_text: pemText,
-          host: collectTlsTargetHost() || null,
-          system_id: elements.setupSystemId?.value?.trim() || null,
-          bundle_name: suggestedTlsBundleName(),
-          tls_server_name: collectTlsServerName() || null,
+          ...requestTarget,
         }),
       });
+      if (!owner.owns()) {
+        reportRetiredImport("finished");
+        return;
+      }
       const draftBefore = setupDraftSnapshot();
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
@@ -6979,28 +7042,33 @@
       }
       const leftOff = !validated && !elements.setupVerifySsl?.checked;
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       syncVerifySslHelp();
       syncApiSecretReentry();
       const trusted = syncTlsTrustStatus(payload.validation || null);
       const validationDetail = buildTlsValidationSuggestion(payload.validation);
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = trusted
-          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || collectTlsTargetHost() || "this host"}.`
+          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || requestTarget.host || "this host"}.`
           : `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path}. ${validationDetail || defaultTlsTrustDetail({ bundlePath: payload.bundle_path })}${leftOff ? " Certificate checks were left off." : " Certificate checks are still on, so refreshes will fail until this passes."}`.trim();
       }
       setBanner(
         trusted
-          ? `Imported and verified PEM trust bundle from ${file.name}.`
-          : `Imported PEM trust bundle from ${file.name}.`
+          ? `Imported and verified PEM trust bundle from ${fileName}.`
+          : `Imported PEM trust bundle from ${fileName}.`
       , trusted ? "success" : "info");
     } catch (error) {
+      if (!owner.owns()) {
+        reportRetiredImport(requestSent ? "unknown" : "not-sent");
+        return;
+      }
       syncTlsTrustStatus();
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = `TLS bundle import failed: ${error.message || error}`;
       }
       setBanner(`TLS bundle import failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupTlsImportCaButton) {
+      if (owner.latest() && elements.setupTlsImportCaButton) {
         elements.setupTlsImportCaButton.disabled = Boolean(state.sessionStopped);
       }
     }

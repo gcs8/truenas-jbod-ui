@@ -32,6 +32,7 @@ from app.models.domain import (
     SystemOption,
 )
 from app.services.storage_writability import probe_writable_directories
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 
 REVISION = "a" * 64
 CHOWN_SENTENCE = (
@@ -981,6 +982,14 @@ class AdminProbeHotPathTests(unittest.TestCase):
         for entry in app_route_support.ADMIN_PROBE_CACHE.values():
             entry.expires_at_monotonic = 0.0
 
+    def _wait_for_background_refresh(self) -> None:
+        # The refresh runs on its own thread; wait for it, failing only on a hang.
+        deadline = time.monotonic() + HANG_TIMEOUT_SECONDS
+        while self.URL in app_route_support._ADMIN_PROBE_REFRESHING:
+            if time.monotonic() > deadline:
+                self.fail("the background admin probe refresh did not finish")
+            time.sleep(0.005)
+
     def test_expired_answer_is_served_at_once_and_refreshed_in_the_background(self) -> None:
         release = threading.Event()
         started = threading.Event()
@@ -1004,10 +1013,7 @@ class AdminProbeHotPathTests(unittest.TestCase):
             # A second expired lookup while that probe runs starts no other probe.
             self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
             release.set()
-            for _ in range(200):
-                if self.URL not in app_route_support._ADMIN_PROBE_REFRESHING:
-                    break
-                time.sleep(0.01)
+            self._wait_for_background_refresh()
             self.assertEqual(mocked.call_count, 2)
         self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
 
@@ -1083,10 +1089,7 @@ class AdminProbeHotPathTests(unittest.TestCase):
                 for thread in threads:
                     thread.join(5)
                 gate.reset()
-                for _ in range(200):
-                    if self.URL not in app_route_support._ADMIN_PROBE_REFRESHING:
-                        break
-                    time.sleep(0.005)
+                self._wait_for_background_refresh()
                 # Every round after the first sees a fresh answer: no more probes.
                 self.assertEqual(probe.call_count, 1)
         self.assertEqual(len(results), 16 * 20)
