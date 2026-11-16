@@ -181,6 +181,7 @@ from app.services.parsers import (
 from app.services import ssh_probe as ssh_probe_module
 from app.services.ssh_probe import (
     MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+    SSH_DISABLED_MESSAGE,
     SSH_INTERNAL_ERROR_REASON,
     SSHCommandResult,
     SSHLocalFailure,
@@ -293,7 +294,7 @@ _CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS = frozenset(
 _ENCLOSURE_SLOT_NUMBER_KEYS = frozenset({"slot", "slot_number", "slotNumber", "index", "number"})
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
     r"^SSH command failed \((?:SG SES additional element status|SG SES enclosure status); "
-    r"[a-z_]+; exit \d+\)\.$"
+    r"[a-z_]+; exit \d+\)\.(?: .+)?$"
 )
 QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^ ]+) "
@@ -327,6 +328,26 @@ _PLAIN_DNS_NAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?"
 )
 UNPARSED_HOST_LOG_PLACEHOLDER = "<unparsed-host>"
+# A device read from discovery output is admitted only in the kernel's own
+# form, and only this many per host.
+SG_SES_DEVICE_RE = re.compile(r"/dev/sg(?:0|[1-9][0-9]{0,4})")
+SG_SES_MAX_DISCOVERED_DEVICES = 64
+# Host values a QuantaStor system row may contribute as SSH destinations.
+QUANTASTOR_MAX_REPORTED_HOSTS = 8
+SSH_DESTINATION_REFUSAL_MESSAGE = "SSH target is not an operator-approved destination for this credential authority."
+SSH_RESULT_MISSING_MESSAGE = "SSH command result missing."
+SSH_INTERNAL_ERROR_SENTENCE = "The read stopped on an internal error in this service; the service log has the details."
+# This service's own sentence for a local failure category. It is chosen by
+# the category alone; result text never selects or supplies it.
+SSH_LOCAL_FAILURE_SENTENCES: dict[str, str] = {
+    "destination_not_approved": SSH_DESTINATION_REFUSAL_MESSAGE,
+    "result_missing": SSH_RESULT_MISSING_MESSAGE,
+    "ssh_disabled": SSH_DISABLED_MESSAGE,
+    SSH_INTERNAL_ERROR_REASON: SSH_INTERNAL_ERROR_SENTENCE,
+}
+SSH_PARTIAL_INTERNAL_ERROR_STATUS = (
+    f"SSH collection error ({SSH_INTERNAL_ERROR_REASON}). Some SSH reads are missing for this refresh."
+)
 # Raw slot status keys that carry a state word; every other key is free text
 # or an identifier and must not drive presence, fault, or identify detection.
 SLOT_STATUS_TEXT_KEYS = ("status", "value", "value_raw", "state", "sas_device_type")
@@ -4949,7 +4970,8 @@ class InventoryService:
             if reason in SSH_LOGIN_FAILURE_REASONS:
                 return (
                     [
-                        f"Could not log in over SSH ({reason}). Bay details from SSH are missing for this refresh."
+                        f"Could not log in over SSH ({reason}).{cls._local_failure_sentence(reason)} "
+                        "Bay details from SSH are missing for this refresh."
                     ],
                     f"SSH login failed ({reason}).",
                 )
@@ -5007,15 +5029,43 @@ class InventoryService:
             if detail.get("criticality") == "enrichment"
         ]
         if outputs and enrichment_failures and len(enrichment_failures) == len(failures):
-            affected_contexts = sorted(
-                {
-                    str(detail.get("context_label") or "Storage Fabric enrichment")
-                    for detail in enrichment_failures
-                }
-            )
-            context_text = ", ".join(affected_contexts[:3])
-            if len(affected_contexts) > 3:
-                context_text = f"{context_text}, +{len(affected_contexts) - 3} more"
+
+            def contexts_text(details: list[dict[str, Any]]) -> str:
+                affected_contexts = sorted(
+                    {str(detail.get("context_label") or "Storage Fabric enrichment") for detail in details}
+                )
+                text = ", ".join(affected_contexts[:3])
+                if len(affected_contexts) > 3:
+                    text = f"{text}, +{len(affected_contexts) - 3} more"
+                return text
+
+            internal_details = [
+                detail for detail in enrichment_failures if detail.get("reason") == SSH_INTERNAL_ERROR_REASON
+            ]
+            other_details = [
+                detail for detail in enrichment_failures if detail.get("reason") != SSH_INTERNAL_ERROR_REASON
+            ]
+            if internal_details:
+                internal_text = contexts_text(internal_details)
+                optional_warnings = (
+                    [
+                        f"Some SSH commands failed ({contexts_text(other_details)}). The bay map still works; "
+                        "see Debug for failure context."
+                    ]
+                    if other_details
+                    else []
+                )
+                optional_warnings.append(
+                    "SSH collection stopped on an internal error in optional reads "
+                    f"({internal_text}; {SSH_INTERNAL_ERROR_REASON}). The bay map still works; "
+                    "the service log has the details."
+                )
+                return (
+                    optional_warnings,
+                    f"SSH collection error in optional reads ({internal_text}; {SSH_INTERNAL_ERROR_REASON}). "
+                    "The bay map is complete.",
+                )
+            context_text = contexts_text(enrichment_failures)
             return (
                 [
                     f"Some SSH commands failed ({context_text}). The bay map still works; "
@@ -5026,16 +5076,24 @@ class InventoryService:
             )
 
         warnings: list[str] = []
+        internal_error_seen = False
         for detail in failure_details:
             context_label = detail.get("context_label", "SSH command")
             exit_status = detail.get("exit_code")
             if exit_status is None:
                 exit_status = "unknown"
             reason = detail.get("reason", SSH_COMMAND_FAILURE_REASON)
+            if reason == SSH_INTERNAL_ERROR_REASON:
+                internal_error_seen = True
+                warnings.append(
+                    f"SSH collection stopped on an internal error ({context_label}; {reason}). "
+                    "Bay details from that read are missing for this refresh."
+                )
+                continue
             warnings.append(
-                f"SSH command failed ({context_label}; {reason}; exit {exit_status})."
+                f"SSH command failed ({context_label}; {reason}; exit {exit_status}).{cls._local_failure_sentence(reason)}"
             )
-        return (warnings, "Some SSH commands failed.")
+        return (warnings, SSH_PARTIAL_INTERNAL_ERROR_STATUS if internal_error_seen else "Some SSH commands failed.")
 
     @classmethod
     def _ssh_failure_details(cls, command_results: list[SSHCommandResult]) -> list[dict[str, Any]]:
@@ -12693,6 +12751,13 @@ class InventoryService:
         ]
 
     @staticmethod
+    def _local_failure_sentence(reason: str) -> str:
+        """This service's own sentence for a local category, with a leading space, or ''."""
+
+        sentence = SSH_LOCAL_FAILURE_SENTENCES.get(reason)
+        return f" {sentence}" if sentence else ""
+
+    @staticmethod
     def _ssh_failure_public_summary(result: SSHCommandResult) -> str:
         reason = ssh_failure_reason(result)
         exit_status = result.exit_code if result.exit_code is not None else "unknown"
@@ -12758,8 +12823,8 @@ class InventoryService:
             if transport_failure is not None:
                 failure_summary = self._format_optional_ssh_transport_failure(transport_failure)
                 failures.append(
-                    f"Quantastor SSH CLI enrichment failed on {host} ({failure_summary}). "
-                    "REST data is still being used."
+                    f"Quantastor SSH CLI enrichment failed on {host} ({failure_summary})."
+                    f"{self._local_failure_sentence(transport_failure[0])} REST data is still being used."
                 )
                 continue
 
@@ -12768,6 +12833,7 @@ class InventoryService:
                     failure_summary = self._ssh_failure_public_summary(result)
                     host_failures.append(
                         f"Quantastor SSH CLI {label} failed on {host} ({failure_summary})."
+                        f"{self._local_failure_sentence(ssh_failure_reason(result))}"
                     )
                     continue
                 payload = self._parse_quantastor_cli_json(result.stdout)
@@ -12845,11 +12911,7 @@ class InventoryService:
         if ttl_seconds <= 0:
             self._sg_ses_device_cache.pop(normalized_host, None)
             return
-        unique_devices: list[str] = []
-        for device in devices:
-            normalized_device = normalize_text(device)
-            if normalized_device and normalized_device not in unique_devices:
-                unique_devices.append(normalized_device)
+        unique_devices = self._admit_sg_ses_devices(devices)[0]
         if not unique_devices:
             return
         self._sg_ses_device_cache[normalized_host] = (
@@ -12858,13 +12920,51 @@ class InventoryService:
         )
 
     @staticmethod
-    def _parse_sg_ses_discovery_devices(stdout: str) -> list[str]:
+    def _admit_sg_ses_devices(values: Iterable[object]) -> tuple[list[str], int, int]:
+        """SG device paths in the kernel's form, deduplicated, at most the limit.
+
+        Returns the admitted devices, the number of values that are not an SG
+        device path, and the number of devices beyond the limit. A value that
+        is not admitted is counted, never kept or shown.
+        """
+
         devices: list[str] = []
-        for line in stdout.splitlines():
-            device = normalize_text(line)
-            if device and device.startswith("/dev/sg") and device not in devices:
-                devices.append(device)
-        return devices
+        rejected = 0
+        beyond_limit = 0
+        for value in values:
+            device = normalize_text(value) if isinstance(value, str) else None
+            if not device:
+                continue
+            if SG_SES_DEVICE_RE.fullmatch(device) is None:
+                rejected += 1
+                continue
+            if device in devices:
+                continue
+            if len(devices) >= SG_SES_MAX_DISCOVERED_DEVICES:
+                beyond_limit += 1
+                continue
+            devices.append(device)
+        return devices, rejected, beyond_limit
+
+    @classmethod
+    def _parse_sg_ses_discovery_devices(cls, stdout: str) -> list[str]:
+        return cls._admit_sg_ses_devices((stdout or "").splitlines())[0]
+
+    def _log_sg_ses_discovery_admission(self, host: str, rejected: int, beyond_limit: int) -> None:
+        summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
+            (self.system.id, "sg_ses_discovery_admission", normalize_text(host) or ""),
+            (rejected, beyond_limit),
+        )
+        if summary is not None:
+            logger.warning(
+                "SG SES discovery on %s ignored %d lines that are not an SG device path and %d devices "
+                "beyond the limit of %d (operation=sg_ses_discovery)%s",
+                _log_safe_host(host),
+                rejected,
+                beyond_limit,
+                SG_SES_MAX_DISCOVERED_DEVICES,
+                summary.suffix(),
+            )
 
     @staticmethod
     def _score_sg_ses_overlay(overlay: ParsedSSHData) -> int:
@@ -12906,7 +13006,7 @@ class InventoryService:
             SSHCommandResult(
                 command=discovery_command,
                 ok=False,
-                stderr="SSH command result missing.",
+                stderr=SSH_RESULT_MISSING_MESSAGE,
                 exit_code=255,
                 local_failure=SSHLocalFailure("result_missing"),
             ),
@@ -12918,13 +13018,18 @@ class InventoryService:
                 if transport_failure is not None
                 else self._ssh_failure_public_summary(discovery_result)
             )
+            sentence = self._local_failure_sentence(ssh_failure_reason(discovery_result))
             return (
                 [],
                 ParsedSSHData(),
-                [f"{failure_prefix} discovery failed on {host} ({failure_summary})."],
+                [f"{failure_prefix} discovery failed on {host} ({failure_summary}).{sentence}"],
             )
 
-        devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
+        devices, rejected_lines, beyond_limit = self._admit_sg_ses_devices(
+            (discovery_result.stdout or "").splitlines()
+        )
+        if rejected_lines or beyond_limit:
+            self._log_sg_ses_discovery_admission(host, rejected_lines, beyond_limit)
         if not devices:
             if not report_empty_discovery:
                 # Discovery ran and found no SES device. On a host with a
@@ -12976,8 +13081,9 @@ class InventoryService:
         transport_failure = self._optional_ssh_transport_failure(results_by_command.values())
         if transport_failure is not None:
             failure_summary = self._format_optional_ssh_transport_failure(transport_failure)
+            sentence = self._local_failure_sentence(transport_failure[0])
             return host_overlay, [
-                f"{failure_prefix} page probes failed on {host} ({failure_summary})."
+                f"{failure_prefix} page probes failed on {host} ({failure_summary}).{sentence}"
             ]
         for device, (aes_command, ec_command, join_command) in device_commands.items():
             aes_result = results_by_command.get(
@@ -12985,15 +13091,16 @@ class InventoryService:
                 SSHCommandResult(
                     command=aes_command,
                     ok=False,
-                    stderr="SSH command result missing.",
+                    stderr=SSH_RESULT_MISSING_MESSAGE,
                     exit_code=255,
                     local_failure=SSHLocalFailure("result_missing"),
                 ),
             )
             if not aes_result.ok:
                 failure_summary = self._ssh_failure_public_summary(aes_result)
+                sentence = self._local_failure_sentence(ssh_failure_reason(aes_result))
                 host_failures.append(
-                    f"{failure_prefix} AES page probe failed on {host} {device} ({failure_summary})."
+                    f"{failure_prefix} AES page probe failed on {host} {device} ({failure_summary}).{sentence}"
                 )
                 continue
 
@@ -13255,6 +13362,7 @@ class InventoryService:
         if raw_data is None:
             return {}
         result: dict[str, list[str]] = {}
+        beyond_limit = 0
         cluster_node_ids = {
             normalize_value_text(row.get("id"))
             for row in cls._quantastor_cluster_node_rows_from_raw(raw_data)
@@ -13284,8 +13392,14 @@ class InventoryService:
             if not host:
                 continue
             result.setdefault(system_id, [])
-            if host not in result[system_id]:
-                result[system_id].append(host)
+            if host in result[system_id]:
+                continue
+            if len(result[system_id]) >= QUANTASTOR_MAX_REPORTED_HOSTS:
+                beyond_limit += 1
+                continue
+            result[system_id].append(host)
+        if beyond_limit:
+            cls._log_reported_host_admission(0, beyond_limit)
         return result
 
     @classmethod
@@ -13356,6 +13470,8 @@ class InventoryService:
                 ipaddress.ip_address(host)
             except ValueError:
                 continue
+            if _log_safe_host(host) == UNPARSED_HOST_LOG_PLACEHOLDER:
+                continue
             return host
         return None
 
@@ -13423,8 +13539,11 @@ class InventoryService:
             "addresses",
         )
         hosts: list[str] = []
+        rejected = 0
+        beyond_limit = 0
 
         def add_host(value: Any) -> None:
+            nonlocal rejected, beyond_limit
             if value is None:
                 return
             if isinstance(value, dict):
@@ -13442,14 +13561,39 @@ class InventoryService:
             normalized = cls._normalize_host_identity(text)
             if not normalized or cls._quantastor_unusable_auto_host(normalized):
                 return
-            if normalized not in hosts:
-                hosts.append(normalized)
+            if _log_safe_host(normalized) == UNPARSED_HOST_LOG_PLACEHOLDER:
+                # Only an IP address or a plain DNS name becomes a destination.
+                rejected += 1
+                return
+            if normalized in hosts:
+                return
+            if len(hosts) >= QUANTASTOR_MAX_REPORTED_HOSTS:
+                beyond_limit += 1
+                return
+            hosts.append(normalized)
 
         for key in host_keys:
             add_host(system_row.get(key))
         for key in nested_keys:
             add_host(system_row.get(key))
+        if rejected or beyond_limit:
+            cls._log_reported_host_admission(rejected, beyond_limit)
         return hosts
+
+    @staticmethod
+    def _log_reported_host_admission(rejected: int, beyond_limit: int) -> None:
+        summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
+            ("quantastor_node_hosts", "admission"), (rejected, beyond_limit)
+        )
+        if summary is not None:
+            logger.warning(
+                "QuantaStor node host discovery ignored %d values that are not an IP address or DNS name "
+                "and %d beyond the limit of %d per system (operation=quantastor_node_hosts)%s",
+                rejected,
+                beyond_limit,
+                QUANTASTOR_MAX_REPORTED_HOSTS,
+                summary.suffix(),
+            )
 
     @staticmethod
     def _quantastor_unusable_auto_host(host: str | None) -> bool:
@@ -17187,7 +17331,7 @@ class InventoryService:
             SSHCommandResult(
                 command=command,
                 ok=False,
-                stderr="SSH target is not an operator-approved destination for this credential authority.",
+                stderr=SSH_DESTINATION_REFUSAL_MESSAGE,
                 exit_code=255,
                 local_failure=SSHLocalFailure("destination_not_approved"),
             )

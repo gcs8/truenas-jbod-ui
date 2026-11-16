@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from types import TracebackType
 
 import paramiko
 
@@ -232,6 +233,9 @@ _KEY_FILE_LOAD_FRAMES = frozenset(
 )
 _UNKNOWN_HOST_KEY_FRAMES = frozenset({("paramiko.client", "missing_host_key")})
 _FAILURE_LOG_FRAME_LIMIT = 20
+_FRAME_FILE_NAME_RE = re.compile(r"[A-Za-z0-9_.<>-]{1,80}")
+_FRAME_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_.<>]{1,80}")
+SSH_DISABLED_MESSAGE = "SSH fallback is disabled."
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,17 +329,40 @@ def ssh_failure_reason(result: SSHCommandResult) -> str:
     return classify_ssh_command_failure(exit_code=result.exit_code, stderr=result.stderr)
 
 
+def _frame_fact(value: object, pattern: re.Pattern[str], placeholder: str) -> str:
+    text = value if isinstance(value, str) else ""
+    return text if pattern.fullmatch(text) else placeholder
+
+
+def format_value_safe_frames(tb: TracebackType | None) -> str:
+    """The innermost frames as ``base name:line in function``, one per line.
+
+    At most ``_FAILURE_LOG_FRAME_LIMIT`` frames; no directory, no source text,
+    no locals. A name outside the short allowed form becomes a placeholder.
+    """
+
+    frames = list(traceback.walk_tb(tb))[-_FAILURE_LOG_FRAME_LIMIT:]
+    lines: list[str] = []
+    for frame, line_number in frames:
+        code = frame.f_code
+        file_name = _frame_fact(
+            code.co_filename.replace("\\", "/").rsplit("/", 1)[-1], _FRAME_FILE_NAME_RE, "<file>"
+        )
+        function_name = _frame_fact(code.co_name, _FRAME_FUNCTION_NAME_RE, "<function>")
+        lines.append(f"  {file_name}:{int(line_number or 0)} in {function_name}")
+    return "\n".join(lines)
+
+
 def _log_local_failure(template: str, args: tuple[object, ...], failure: SSHLocalFailure, exc: BaseException) -> None:
     """Log a local SSH failure with value-safe facts, never the exception message."""
 
     if failure.reason == SSH_INTERNAL_ERROR_REASON:
-        frames = traceback.format_list(traceback.extract_tb(exc.__traceback__, limit=-_FAILURE_LOG_FRAME_LIMIT))
         logger.error(
             template.replace("{detail}", "reason=%s type=%s") + "\nStack (exception message omitted):\n%s",
             *args,
             failure.reason,
             failure.exception_type,
-            "".join(frames).rstrip(),
+            format_value_safe_frames(exc.__traceback__),
         )
         return
     logger.warning(
@@ -691,7 +718,7 @@ class SSHProbe:
             if commands is None:
                 return []
             return [
-                self._failure_result(command, "SSH fallback is disabled.", SSHLocalFailure("ssh_disabled"))
+                self._failure_result(command, SSH_DISABLED_MESSAGE, SSHLocalFailure("ssh_disabled"))
                 for command in commands
             ]
         command_list = self._command_list(commands)
@@ -788,7 +815,7 @@ class SSHProbe:
             return SSHCommandResult(
                 command=command,
                 ok=False,
-                stderr="SSH fallback is disabled.",
+                stderr=SSH_DISABLED_MESSAGE,
                 exit_code=1,
                 local_failure=SSHLocalFailure("ssh_disabled"),
             )
@@ -809,7 +836,7 @@ class SSHProbe:
             return SSHCommandResult(
                 command=command,
                 ok=False,
-                stderr="SSH fallback is disabled.",
+                stderr=SSH_DISABLED_MESSAGE,
                 exit_code=1,
                 local_failure=SSHLocalFailure("ssh_disabled"),
             )

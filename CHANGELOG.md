@@ -43,8 +43,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   command text and remote output stay private, while logs keep value-safe cause
   and redacted command context. Connection, host-key, key-file,
   authentication, refused-destination and internal failures are categorised
-  from the local error itself, and the service log records its type and errno
-  (#1259).
+  from the local error itself, and the service log records its type and errno;
+  the service's own refusal sentence stays in the warning, an internal error is
+  reported as one even beside successful reads, and its log record lists frames
+  by file name, function and line only. SES device paths and node addresses
+  reported by a system are used only in their expected form and in bounded
+  number (#1259).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay

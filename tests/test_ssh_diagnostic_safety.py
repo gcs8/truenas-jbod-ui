@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
+import re
 import shlex
 import socket
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import paramiko
@@ -29,7 +32,7 @@ from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.parsers import ParsedSSHData
 from app.services.profile_registry import ProfileRegistry
-from app.services.ssh_probe import SSHCommandResult, SSHProbe, redact_ssh_command
+from app.services.ssh_probe import SSHCommandResult, SSHLocalFailure, SSHProbe, redact_ssh_command
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASRawData
 
@@ -701,8 +704,9 @@ class SSHFailureOriginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.levelname, "ERROR")
         line = record.getMessage()
         self.assertIn("reason=internal_error type=RuntimeError", line)
-        self.assertIn("in connect", line)
-        self.assertIn("raise exc", line)
+        self.assertIn("test_ssh_diagnostic_safety.py:", line)
+        self.assertIn(" in connect", line)
+        self.assertNotIn("raise exc", line)
         self.assertNotIn(ORIGIN_MARKER, line)
         self.assertIsNone(record.exc_info)
 
@@ -859,7 +863,7 @@ class SSHFailureOriginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(service._optional_ssh_transport_failure([results[0], remote[0]]))
         self.assertEqual(service._ssh_failure_public_summary(remote[0]), "ssh_command_failed; exit 255")
 
-    async def test_remote_exit_text_does_not_start_a_local_backoff(self) -> None:
+    async def test_optional_backoff_requires_local_failure_provenance(self) -> None:
         service = self._service()
         remote = [
             SSHCommandResult(command="synthetic", ok=False, stderr="Connection refused", exit_code=255),
@@ -945,6 +949,511 @@ class SSHFailureOriginTests(unittest.IsolatedAsyncioTestCase):
                 "Unrelated warning.",
             ],
         )
+
+
+VALUE_MARKER = "SYNTHETIC-REMOTE-VALUE"
+REFUSAL_SENTENCE = "SSH target is not an operator-approved destination for this credential authority."
+INTERNAL_SENTENCE = "The read stopped on an internal error in this service; the service log has the details."
+FRAME_LINE_RE = re.compile(r"  [A-Za-z0-9_.<>-]{1,80}:[0-9]+ in [A-Za-z0-9_.<>]{1,80}")
+
+
+def _sg_service(directory: str, platform: Literal["scale", "quantastor"] = "scale") -> InventoryService:
+    settings = Settings()
+    system = SystemConfig(
+        id=f"synthetic-{platform}",
+        truenas=TrueNASConfig(platform=platform),
+        ssh=SSHConfig(enabled=True, host="node.example.test", user="synthetic-operator", commands=[]),
+    )
+    api = AsyncMock()
+    api.fetch_all.return_value = TrueNASRawData(
+        enclosures=[],
+        disks=[{"name": "sda", "serial": "SANITIZED-DISK"}],
+        pools=[],
+        disk_temperatures={},
+        smart_test_results=[],
+    )
+    ssh = AsyncMock()
+    ssh.run_planned_commands.return_value = [
+        SSHCommandResult(command="synthetic-base", ok=True, stdout="base-output", exit_code=0)
+    ]
+    return InventoryService(
+        settings,
+        system,
+        api,
+        ssh,
+        None,
+        MappingStore(str(Path(directory) / "slot_mappings.json")),
+        ProfileRegistry(settings),
+        SlotDetailStore(str(Path(directory) / "slot_detail_cache.json")),
+    )
+
+
+class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """A value read from remote output is used or shown only after its grammar admits it."""
+
+    def setUp(self) -> None:
+        for limiter in ssh_probe_module.SSH_LOG_LIMITERS:
+            limiter.reset()
+        self.addCleanup(lambda: [limiter.reset() for limiter in ssh_probe_module.SSH_LOG_LIMITERS])
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+
+    def _planned_through_real_probe(self, service: InventoryService, discovery_stdout: str, planned: list[str]):
+        """Run the planner on a discovery answer; each planned page read fails on the real probe."""
+
+        probe = SSHProbe(SSHConfig(enabled=True, host="node.example.test"))
+
+        async def run_planned(planner, *, initial_commands, host):
+            del host
+            discovery = SSHCommandResult(
+                command=initial_commands[0], ok=True, stdout=discovery_stdout, exit_code=0
+            )
+            commands = planner([discovery])
+            planned.extend(commands)
+            results = [discovery]
+            for command in commands:
+                wire = MemorySSHWire(
+                    lambda channel, _command: MemorySSHWire.feed(
+                        channel, error=b"permission denied", eof=True, status=1
+                    )
+                )
+                try:
+                    results.append(probe._run_single_command(wire.client, command))
+                finally:
+                    wire.close()
+            return results
+
+        service._run_ssh_planned_commands = run_planned
+
+    async def test_discovered_sg_devices_are_admitted_only_in_the_device_form(self) -> None:
+        service = _sg_service(self.directory)
+        rejected_lines = [
+            f"/dev/sg0-{VALUE_MARKER}",
+            f"/dev/sg1 {VALUE_MARKER}",
+            f"/dev/sg{VALUE_MARKER}",
+            "/dev/sg01",
+            "/dev/sg123456",
+            f"{VALUE_MARKER} /dev/sg2",
+            "/dev/sg\u0663",
+        ]
+        stdout = "\n".join([*rejected_lines, "/dev/sg3", "", "/dev/sg3"]) + "\n"
+        planned: list[str] = []
+        self._planned_through_real_probe(service, stdout, planned)
+        limiter = RepeatedLogLimiter(repeat_interval_seconds=None)
+
+        with (
+            patch.object(ssh_probe_module, "SSH_COMMAND_FAILURE_LOG", limiter),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+        encoded = json.dumps(snapshot.model_dump(mode="json"), sort_keys=True)
+
+        self.assertNotIn(VALUE_MARKER, encoded)
+        self.assertIn(
+            "TrueNAS SCALE SSH SES AES page probe failed on node.example.test /dev/sg3 "
+            "(permission_denied; exit 1).",
+            snapshot.warnings,
+        )
+        self.assertEqual(
+            {shlex.split(command)[-1] for command in planned if "sg_ses" in command},
+            {"/dev/sg3"},
+        )
+        rendered = [logging.Formatter("%(levelname)s:%(name)s:%(message)s").format(r) for r in logs.records]
+        self.assertFalse([line for line in rendered if VALUE_MARKER in line], rendered)
+        self.assertFalse([line for line in rendered if "/dev/sg0" in line or "/dev/sg01" in line], rendered)
+        counted = [line for line in rendered if "operation=sg_ses_discovery" in line]
+        self.assertEqual(len(counted), 1, rendered)
+        self.assertTrue(counted[0].startswith("WARNING:app.services.inventory:"), counted[0])
+        self.assertIn("ignored 7 lines", counted[0])
+        self.assertIn("0 devices beyond the limit of 64", counted[0])
+        self.assertTrue(
+            any(
+                line.startswith("WARNING:app.services.ssh_probe:SSH command failed: ")
+                and "/dev/sg3" in line
+                for line in rendered
+            ),
+            rendered,
+        )
+
+    async def test_discovered_sg_device_count_is_bounded(self) -> None:
+        service = _sg_service(self.directory)
+        stdout = "".join(f"/dev/sg{index}\n" for index in range(70))
+        planned: list[str] = []
+        self._planned_through_real_probe(service, stdout, planned)
+        with self.assertLogs("app.services", level="WARNING") as logs:
+            devices, _overlay, _failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                "node.example.test", failure_prefix="TrueNAS SCALE SSH SES"
+            )
+        self.assertEqual(devices, [f"/dev/sg{index}" for index in range(64)])
+        planned_devices = {shlex.split(command)[-1] for command in planned if "sg_ses" in command}
+        self.assertEqual(len(planned_devices), 64)
+        counted = [line for line in logs.output if "operation=sg_ses_discovery" in line]
+        self.assertEqual(len(counted), 1, logs.output)
+        self.assertIn("ignored 0 lines", counted[0])
+        self.assertIn("6 devices beyond the limit of 64", counted[0])
+
+        with self.subTest(control="within_bound"):
+            service = _sg_service(self.directory)
+            self._planned_through_real_probe(service, "/dev/sg4\n/dev/sg5\n", [])
+            with self.assertNoLogs("app.services.inventory", level="WARNING"):
+                devices, _overlay, _failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                    "node.example.test", failure_prefix="TrueNAS SCALE SSH SES"
+                )
+            self.assertEqual(devices, ["/dev/sg4", "/dev/sg5"])
+
+    def test_sg_device_cache_keeps_only_admitted_devices(self) -> None:
+        service = _sg_service(self.directory)
+        service._remember_sg_ses_devices(
+            "node.example.test",
+            [f"/dev/sg0-{VALUE_MARKER}", "/dev/sg4", *(f"/dev/sg{index}" for index in range(10, 80))],
+        )
+        cached = service._get_cached_sg_ses_devices("node.example.test")
+        self.assertEqual(cached[0], "/dev/sg4")
+        self.assertEqual(len(cached), 64)
+        self.assertNotIn(VALUE_MARKER, json.dumps(cached))
+
+    def test_appliance_reported_ssh_hosts_pass_the_host_grammar(self) -> None:
+        row = {
+            "sshHost": f"{VALUE_MARKER}.example.test;exit",
+            "managementIpAddress": "node-b.example.test",
+            "ipAddress": "192.0.2.41",
+            "hostname": f"bad host {VALUE_MARKER}",
+            "ipAddresses": [f"198.51.100.{index}" for index in range(1, 40)],
+        }
+        with self.assertLogs("app.services.inventory", level="WARNING") as logs:
+            hosts = InventoryService._extract_quantastor_system_hosts(row)
+        self.assertEqual(hosts[:2], ["node-b.example.test", "192.0.2.41"])
+        self.assertEqual(len(hosts), 8)
+        self.assertNotIn(VALUE_MARKER.lower(), json.dumps(hosts).lower())
+        counted = [line for line in logs.output if "operation=quantastor_node_hosts" in line]
+        self.assertEqual(len(counted), 1, logs.output)
+        self.assertIn("ignored 2 values", counted[0])
+        self.assertIn("33 beyond the limit of 8", counted[0])
+        self.assertNotIn(VALUE_MARKER.lower(), counted[0].lower())
+
+        control = {"ipAddress": "192.0.2.42", "hostname": "node-c.example.test"}
+        with self.assertNoLogs("app.services.inventory", level="WARNING"):
+            self.assertEqual(
+                InventoryService._extract_quantastor_system_hosts(control),
+                ["192.0.2.42", "node-c.example.test"],
+            )
+
+        gateway = InventoryService._extract_quantastor_gateway_port_host
+        self.assertIsNone(gateway({"ipAddress": "[fe80::1%eth0]", "gateway": "192.0.2.1"}))
+        self.assertEqual(gateway({"ipAddress": "192.0.2.60", "gateway": "192.0.2.1"}), "192.0.2.60")
+        ports = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+            cli_network_ports=[
+                {"storageSystemId": "node-a", "ipAddress": f"192.0.2.{index}", "gateway": "192.0.2.1"}
+                for index in range(100, 120)
+            ],
+        )
+        with self.assertLogs("app.services.inventory", level="WARNING") as logs:
+            by_system = InventoryService._quantastor_gateway_hosts_by_system(ports)
+        self.assertEqual(by_system["node-a"], [f"192.0.2.{index}" for index in range(100, 108)])
+        self.assertTrue(any("12 beyond the limit of 8" in line for line in logs.output), logs.output)
+
+    async def test_appliance_reported_hosts_never_reach_fabric_warnings_unadmitted(self) -> None:
+        service = _sg_service(self.directory, "quantastor")
+        raw = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+            systems=[
+                {"id": "node-a", "storageSystemClusterId": "cluster-1", "hostname": f"bad host {VALUE_MARKER}"},
+                {"id": "node-b", "storageSystemClusterId": "cluster-1", "ipAddress": "192.0.2.51"},
+            ],
+        )
+        contacted: list[str] = []
+
+        async def refused(commands, host, *, stdin_data=None):
+            del stdin_data
+            contacted.append(host)
+            return _refused_probe_results(commands)
+
+        service._run_ssh_commands = AsyncMock(side_effect=refused)
+        _overlay, failures = await service._fetch_quantastor_cli_overlay(raw)
+        self.assertIn("192.0.2.51", contacted)
+        self.assertNotIn(VALUE_MARKER.lower(), json.dumps([contacted, failures]).lower())
+        self.assertIn(
+            "Quantastor SSH CLI enrichment failed on 192.0.2.51 (connection_refused; exit 255). "
+            "REST data is still being used.",
+            failures,
+        )
+
+
+class LocalFailureWordingTests(unittest.IsolatedAsyncioTestCase):
+    """Local failures keep this service's own fixed wording wherever they are rendered."""
+
+    def setUp(self) -> None:
+        for limiter in ssh_probe_module.SSH_LOG_LIMITERS:
+            limiter.reset()
+        self.addCleanup(lambda: [limiter.reset() for limiter in ssh_probe_module.SSH_LOG_LIMITERS])
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+
+    def _service(self) -> InventoryService:
+        settings = Settings()
+        system = SystemConfig(
+            id="synthetic-quantastor",
+            truenas=TrueNASConfig(platform="quantastor", api_user="synthetic", api_password="synthetic"),
+            ssh=SSHConfig(enabled=True, host="node.example.test", user="synthetic-operator", commands=[]),
+        )
+        return InventoryService(
+            settings,
+            system,
+            AsyncMock(),
+            SSHProbe(system.ssh),
+            None,
+            MappingStore(str(Path(self.directory) / "slot_mappings.json")),
+            ProfileRegistry(settings),
+            SlotDetailStore(str(Path(self.directory) / "slot_detail_cache.json")),
+        )
+
+    async def test_destination_refusal_keeps_its_fixed_sentence_in_rendered_warnings(self) -> None:
+        service = self._service()
+        service._build_configured_quantastor_hosts = MagicMock(return_value=["unapproved.example.test"])
+        with (
+            patch.object(SSHProbe, "run_commands", new=AsyncMock(side_effect=AssertionError("no transport"))),
+            patch.object(SSHProbe, "run_planned_commands", new=AsyncMock(side_effect=AssertionError("no transport"))),
+            self.assertLogs("app.services.inventory", level="WARNING"),
+        ):
+            _overlay, cli_failures = await service._fetch_quantastor_cli_overlay()
+            _devices, _ses, ses_failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                "unapproved.example.test", failure_prefix="Quantastor SSH SES"
+            )
+        self.assertEqual(
+            cli_failures,
+            [
+                "Quantastor SSH CLI enrichment failed on unapproved.example.test "
+                f"(destination_not_approved; exit 255). {REFUSAL_SENTENCE} REST data is still being used."
+            ],
+        )
+        self.assertEqual(
+            ses_failures,
+            [
+                "Quantastor SSH SES discovery failed on unapproved.example.test "
+                f"(destination_not_approved; exit 255). {REFUSAL_SENTENCE}"
+            ],
+        )
+
+        refusals = service._ssh_destination_refusal_results(["first", "second"], "unapproved.example.test")
+        for result in refusals:
+            # The sentence comes from the local reason, never from result text.
+            result.stderr = f"{VALUE_MARKER} rewritten"
+        warnings, status = InventoryService._summarize_ssh_failures(refusals, {})
+        self.assertEqual(
+            warnings,
+            [
+                f"Could not log in over SSH (destination_not_approved). {REFUSAL_SENTENCE} "
+                "Bay details from SSH are missing for this refresh."
+            ],
+        )
+        self.assertEqual(status, "SSH login failed (destination_not_approved).")
+        self.assertNotIn(VALUE_MARKER, json.dumps([warnings, status]))
+
+        with self.subTest(control="remote_text_is_not_a_local_sentence"):
+            remote = [
+                SSHCommandResult(command="first", ok=False, stderr=REFUSAL_SENTENCE, exit_code=255),
+                SSHCommandResult(command="second", ok=False, stderr=REFUSAL_SENTENCE, exit_code=255),
+            ]
+            warnings, _status = InventoryService._summarize_ssh_failures(remote, {})
+            self.assertNotIn(REFUSAL_SENTENCE, json.dumps(warnings))
+            self.assertEqual(
+                service._ssh_failure_public_summary(remote[0]), "ssh_command_failed; exit 255"
+            )
+
+    def test_internal_error_keeps_local_wording_in_partial_batches(self) -> None:
+        def internal(command: str) -> SSHCommandResult:
+            return SSHCommandResult(
+                command=command,
+                ok=False,
+                stderr=VALUE_MARKER,
+                exit_code=255,
+                local_failure=SSHLocalFailure("internal_error", "RuntimeError"),
+            )
+
+        cases = {
+            "one_success_one_internal": (
+                [SSHCommandResult(command="synthetic-ok", ok=True, stdout="ok", exit_code=0), internal("synthetic-bug")],
+                {"synthetic-ok": "ok"},
+                [
+                    "SSH collection stopped on an internal error (SSH command 2; internal_error). "
+                    "Bay details from that read are missing for this refresh."
+                ],
+                "SSH collection error (internal_error). Some SSH reads are missing for this refresh.",
+            ),
+            "remote_failure_and_internal": (
+                [
+                    SSHCommandResult(command="synthetic-ok", ok=True, stdout="ok", exit_code=0),
+                    SSHCommandResult(command="synthetic-remote", ok=False, stderr="failure", exit_code=3),
+                    internal("synthetic-bug"),
+                ],
+                {"synthetic-ok": "ok"},
+                [
+                    "SSH command failed (SSH command 2; ssh_command_failed; exit 3).",
+                    "SSH collection stopped on an internal error (SSH command 3; internal_error). "
+                    "Bay details from that read are missing for this refresh.",
+                ],
+                "SSH collection error (internal_error). Some SSH reads are missing for this refresh.",
+            ),
+            "optional_read_internal": (
+                [
+                    SSHCommandResult(command="synthetic-ok", ok=True, stdout="ok", exit_code=0),
+                    internal("sudo -n nvme list-subsys -o json"),
+                ],
+                {"synthetic-ok": "ok"},
+                [
+                    "SSH collection stopped on an internal error in optional reads "
+                    "(Linux NVMe subsystem detail; internal_error). The bay map still works; "
+                    "the service log has the details."
+                ],
+                "SSH collection error in optional reads (Linux NVMe subsystem detail; internal_error). "
+                "The bay map is complete.",
+            ),
+        }
+        for name, (results, outputs, expected_warnings, expected_status) in cases.items():
+            with self.subTest(case=name):
+                warnings, status = InventoryService._summarize_ssh_failures(results, outputs)
+                self.assertEqual(warnings, expected_warnings)
+                self.assertEqual(status, expected_status)
+                text = json.dumps([warnings, status])
+                self.assertNotIn(VALUE_MARKER, text)
+                self.assertNotIn("appliance", text.lower())
+
+        with self.subTest(control="remote_only_partial_batch"):
+            warnings, status = InventoryService._summarize_ssh_failures(
+                [
+                    SSHCommandResult(command="synthetic-ok", ok=True, stdout="ok", exit_code=0),
+                    SSHCommandResult(command="synthetic-remote", ok=False, stderr="failure", exit_code=3),
+                ],
+                {"synthetic-ok": "ok"},
+            )
+            self.assertEqual(warnings, ["SSH command failed (SSH command 2; ssh_command_failed; exit 3)."])
+            self.assertEqual(status, "Some SSH commands failed.")
+
+    async def test_internal_error_in_an_overlay_read_uses_the_local_sentence(self) -> None:
+        service = self._service()
+        service._build_configured_quantastor_hosts = MagicMock(return_value=["node.example.test"])
+
+        async def results(commands, _host, *, stdin_data=None):
+            del stdin_data
+            return [
+                SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stderr=VALUE_MARKER,
+                    exit_code=255,
+                    local_failure=SSHLocalFailure("internal_error", "RuntimeError"),
+                )
+                if index == 0
+                else SSHCommandResult(command=command, ok=True, stdout="[]", exit_code=0)
+                for index, command in enumerate(commands)
+            ]
+
+        service._run_ssh_commands = AsyncMock(side_effect=results)
+        _overlay, failures = await service._fetch_quantastor_cli_overlay()
+        self.assertIn(
+            f"Quantastor SSH CLI disk inventory failed on node.example.test (internal_error; exit 255). "
+            f"{INTERNAL_SENTENCE}",
+            failures,
+        )
+        self.assertNotIn(VALUE_MARKER, json.dumps(failures))
+
+
+class InternalErrorFrameRecordTests(unittest.TestCase):
+    """The internal-error record carries frame facts only: base name, line, function."""
+
+    def test_internal_error_record_has_no_paths_source_or_message(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        hidden_directory = "SYNTHETIC-DIRECTORY-MARKER"
+        injected_path = str(Path(directory.name) / hidden_directory / "injected_module.py")
+        namespace: dict[str, Any] = {}
+        source = (
+            "def descend(depth, exc):\n"
+            "    if depth <= 0:\n"
+            "        raise exc  # SYNTHETIC-SOURCE-TEXT\n"
+            "    descend(depth - 1, exc)\n"
+        )
+        exec(compile(source, injected_path, "exec"), namespace)  # noqa: S102 - local synthetic frames
+        descend = namespace["descend"]
+
+        def connect(self, **_kwargs):
+            descend(40, RuntimeError(VALUE_MARKER))
+
+        probe = SSHProbe(
+            SSHConfig(enabled=True, host="node.example.test", user="synthetic-operator", key_path="", known_hosts_path="")
+        )
+        with (
+            patch.object(paramiko.SSHClient, "connect", connect),
+            self.assertLogs("app.services.ssh_probe", level="ERROR") as logs,
+        ):
+            probe._run_commands_sync(["synthetic"])
+
+        self.assertEqual(len(logs.records), 1, logs.output)
+        record = logs.records[0]
+        self.assertIsNone(record.exc_info)
+        self.assertIsNone(record.stack_info)
+        rendered = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(pathname)s %(message)s"
+        ).format(record)
+        message = record.getMessage()
+        header, _separator, stack = message.partition("\nStack (exception message omitted):\n")
+        self.assertIn("reason=internal_error type=RuntimeError", header)
+        frame_lines = stack.splitlines()
+        self.assertTrue(frame_lines)
+        self.assertLessEqual(len(frame_lines), 20)
+        for line in frame_lines:
+            self.assertRegex(line, FRAME_LINE_RE)
+        self.assertEqual(frame_lines[-1], "  injected_module.py:3 in descend")
+        roots = {
+            str(Path(__file__).resolve().parents[1]),
+            sys.prefix,
+            sys.base_prefix,
+            str(Path.home()),
+            tempfile.gettempdir(),
+            directory.name,
+        }
+        for forbidden in (VALUE_MARKER, hidden_directory, "SYNTHETIC-SOURCE-TEXT", "raise exc", *roots):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, message)
+        # The logging module's own pathname field names the logging call site,
+        # which is this service's module, not a frame of the failure.
+        self.assertNotIn(hidden_directory, rendered)
+        self.assertNotIn(VALUE_MARKER, rendered)
+
+    def test_frame_formatter_bounds_names_and_count(self) -> None:
+        def raise_from(code_name: str, filename: str):
+            namespace: dict[str, Any] = {}
+            exec(compile("def f():\n    raise ValueError('x')\n", filename, "exec"), namespace)  # noqa: S102
+            function = namespace["f"]
+            function.__code__ = function.__code__.replace(co_name=code_name)
+            try:
+                function()
+            except ValueError as exc:
+                return exc
+            raise AssertionError("no exception")
+
+        exc = raise_from("bad name\nwith newline", "/synthetic root/" + "n" * 200 + ".py")
+        formatter = getattr(ssh_probe_module, "format_value_safe_frames", None)
+        self.assertIsNotNone(formatter, "the probe module has no value-safe frame formatter")
+        text = formatter(exc.__traceback__)
+        lines = text.splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, FRAME_LINE_RE)
+        self.assertNotIn("synthetic root", text)
+        self.assertNotIn("\nwith newline", text)
+        self.assertEqual(lines[-1], "  <file>:2 in <function>")
 
 
 if __name__ == "__main__":

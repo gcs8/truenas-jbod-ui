@@ -747,8 +747,8 @@ def chunk_stop(
 ) -> tuple[str, int] | None:
     """Why an expander's read must stop after this chunk, and at which PHY.
 
-    A chunk past the SSH command deadline (``timed_out``, set by the caller
-    from the local failure, never from command output) or with a call that
+    A chunk past the SSH command deadline (``timed_out``, a structural fact
+    the caller owns) or with a call that
     gave no answer is ``no_response`` (the expander is hung); a refused output
     is ``rejected_output``; any other failed command is ``command_failed``; a
     chunk whose every call sudo refused is ``permission_denied``. None means
