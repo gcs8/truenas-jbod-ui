@@ -21,6 +21,10 @@ from app.services.parsers import (
 from app.services.ssh_probe import SSHCommandResult
 
 SMART_PARSE_FAILED = "SMART JSON parsing failed."
+# Synthetic namespace identifiers in their documented widths (16 and 32 hex
+# digits), built from parts so no literal identifier-shaped token is tracked.
+EUI64_TEXT = "".join(("00a07510", "2b91c7cf"))
+NGUID_TEXT = "".join(("00000000", "00000010", "00a07501", "2b91c7cf"))
 
 # Valid JSON that is not an object, plus JSON that the decoder itself refuses
 # with something other than JSONDecodeError (an over-long integer literal is a
@@ -394,7 +398,7 @@ class NvmeReaderShapeTests(unittest.TestCase):
     def test_each_reader_object_control_parses(self) -> None:
         self.assertEqual(parse_nvme_smart_log_summary('{"temperature": 303}')["temperature_c"], 30)
         self.assertEqual(parse_nvme_id_ctrl_summary('{"fr": "FW01", "ver": 66304}')["protocol_version"], "1.3")
-        self.assertEqual(parse_nvme_id_ns_summary('{"eui64": "00000100000002"}')["namespace_eui64"], "eui.00000100000002")
+        self.assertEqual(parse_nvme_id_ns_summary(json.dumps({"eui64": EUI64_TEXT}))["namespace_eui64"], f"eui.{EUI64_TEXT}")
 
     def test_booleans_never_become_nvme_readings(self) -> None:
         for flag in (True, False):
@@ -818,6 +822,216 @@ class UnreadFieldTests(unittest.TestCase):
         self.assertFalse(merged.available)
         self.assertEqual(merged.unread_fields, ["power_on_days", "power_on_hours"])
         self.assertEqual(SmartSummaryView().unread_fields, [])
+
+
+class CelsiusRangeTests(unittest.TestCase):
+    """A Celsius reading is an integer from -100 to 1000; anything else is not read."""
+
+    def test_celsius_outside_the_supported_range_is_unread(self) -> None:
+        for value in (10**400, 2**63, 1001, -101):
+            for payload in ({"temperature": {"current": value}},
+                            {"scsi_environmental_reports": {"temperature_1": {"current": value}}}):
+                with self.subTest(value=str(value)[:12], source=next(iter(payload))):
+                    summary = _summary({"smart_status": {"passed": True}, **payload})
+                    self.assertEqual(summary.smart_health_status, "PASSED")
+                    self.assertIsNone(summary.temperature_c)
+                    self.assertIn("temperature_c", summary.unread_fields)
+        # NVMe Kelvin words convert to Celsius outside the range: 1 K and 65535 K.
+        for kelvin in (1, 65535):
+            with self.subTest(kelvin=kelvin):
+                self.assertEqual(parse_nvme_smart_log_summary(json.dumps({"temperature": kelvin}))["unread_fields"],
+                                 ["temperature_c"])
+                id_ctrl = parse_nvme_id_ctrl_summary(json.dumps({"wctemp": kelvin, "cctemp": kelvin}))
+                self.assertEqual(id_ctrl["unread_fields"], ["critical_temperature_c", "warning_temperature_c"])
+
+    def test_celsius_range_controls(self) -> None:
+        for value in (-100, -1, 0, 30, 1000):
+            with self.subTest(value=value):
+                summary = _summary({"temperature": {"current": value}})
+                self.assertEqual(summary.temperature_c, value)
+                self.assertEqual(summary.unread_fields, [])
+        for kelvin, celsius in ((173, -100), (303, 30), (348, 75)):
+            with self.subTest(kelvin=kelvin):
+                result = parse_nvme_smart_log_summary(json.dumps({"temperature": kelvin}))
+                self.assertEqual((result["temperature_c"], result["unread_fields"]), (celsius, []))
+
+
+class DocumentedFormTests(unittest.TestCase):
+    """Raw strings, namespace identifiers and the version word keep their documented form."""
+
+    def test_raw_string_member_must_be_text(self) -> None:
+        for attribute_id, field in ATA_ATTRIBUTE_FIELDS.items():
+            for raw in ({"string": 42}, {"string": 0}, {"string": True}, {"string": [42]}, {"string": None}):
+                with self.subTest(attribute=attribute_id, raw=raw):
+                    summary = _summary({"temperature": {"current": 30}, **_attribute(attribute_id, raw)})
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_raw_compatibility_forms_still_read(self) -> None:
+        # The bare integer and bare string forms are the older compatibility shape.
+        for raw in ({"string": "42"}, {"value": 42, "string": "42"}, 42, "42"):
+            with self.subTest(raw=raw):
+                summary = _summary(_attribute(199, raw))
+                self.assertEqual((summary.interface_crc_errors, summary.unread_fields), (42, []))
+
+    def test_namespace_identifiers_need_their_hex_form_and_width(self) -> None:
+        for field, key, bad_values in (
+            ("namespace_eui64", "eui64", (-1, 1, 10**30, "zz-not-hex-00000", EUI64_TEXT + "aa",
+                                          EUI64_TEXT[:14], "0x" + EUI64_TEXT, "0011 2233 4455 66")),
+            ("namespace_nguid", "nguid", (-1, 10**40, "hello", "0" * 31, "0" * 33, "g" * 32)),
+        ):
+            for bad in bad_values:
+                with self.subTest(field=field, value=str(bad)[:20]):
+                    result = parse_nvme_id_ns_summary(json.dumps({key: bad}))
+                    self.assertIsNone(result[field])
+                    self.assertEqual(result["unread_fields"], [field])
+
+    def test_namespace_identifier_controls(self) -> None:
+        for payload, eui64, nguid in (
+            ({"eui64": EUI64_TEXT}, f"eui.{EUI64_TEXT}", None),
+            ({"eui64": EUI64_TEXT.upper()}, f"eui.{EUI64_TEXT}", None),
+            ({"eui64": f"eui.{EUI64_TEXT}"}, f"eui.{EUI64_TEXT}", None),
+            ({"nguid": NGUID_TEXT.upper()}, None, NGUID_TEXT),
+        ):
+            with self.subTest(payload=payload):
+                result = parse_nvme_id_ns_summary(json.dumps(payload))
+                self.assertEqual((result["namespace_eui64"], result["namespace_nguid"], result["unread_fields"]),
+                                 (eui64, nguid, []))
+
+    def test_version_word_must_fit_its_32_bits(self) -> None:
+        for bad in (2**32, 2**40, 10**400):
+            with self.subTest(value=str(bad)[:12]):
+                result = parse_nvme_id_ctrl_summary(json.dumps({"ver": bad}))
+                self.assertEqual((result["protocol_version"], result["unread_fields"]), (None, ["protocol_version"]))
+        for good, expected in ((66304, "1.3"), (0x00020001, "2.0.1"), (2**32 - 1, "65535.255.255")):
+            with self.subTest(value=good):
+                result = parse_nvme_id_ctrl_summary(json.dumps({"ver": good}))
+                self.assertEqual((result["protocol_version"], result["unread_fields"]), (expected, []))
+
+
+class RefusedEvidenceTests(unittest.TestCase):
+    """Refused evidence is listed as unread, never dropped and never replaced by a fallback."""
+
+    def _read(self, extra: dict):
+        return _summary({"firmware_version": "FW01", **extra})
+
+    def test_rejected_temperature_limit_is_unread(self) -> None:
+        for bad in (10**400, 1000, 151, 19, 10, -1):
+            for key, field in (("op_limit_max", "warning_temperature_c"), ("limit_max", "critical_temperature_c"),
+                               ("critical_limit_max", "critical_temperature_c"), ("drive_trip", "critical_temperature_c")):
+                with self.subTest(key=key, value=str(bad)[:12]):
+                    summary = self._read({"temperature": {"current": 30, key: bad}})
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+                    self.assertEqual(summary.temperature_c, 30)
+
+    def test_refused_nvme_threshold_is_not_replaced_by_the_fallback(self) -> None:
+        for bad in (-1, 10**400, 1000):
+            with self.subTest(value=str(bad)[:12]):
+                summary = self._read({"nvme_composite_temperature_threshold": {"warning": bad, "critical": bad},
+                                      "temperature": {"current": 30, "op_limit_max": 70, "limit_max": 80}})
+                self.assertEqual((summary.warning_temperature_c, summary.critical_temperature_c), (None, None))
+                self.assertIn("warning_temperature_c", summary.unread_fields)
+                self.assertIn("critical_temperature_c", summary.unread_fields)
+
+    def test_temperature_limit_controls(self) -> None:
+        # Documented "not available" values stay absent, and the next source is still read.
+        for sentinel in (0, 255, -128):
+            with self.subTest(sentinel=sentinel):
+                summary = self._read({"nvme_composite_temperature_threshold": {"warning": sentinel},
+                                      "temperature": {"op_limit_max": 70, "drive_trip": sentinel}})
+                self.assertEqual((summary.warning_temperature_c, summary.critical_temperature_c), (70, None))
+                self.assertEqual(summary.unread_fields, [])
+        for value in (20, 70, 150):
+            with self.subTest(value=value):
+                summary = self._read({"temperature": {"op_limit_max": value, "limit_max": value}})
+                self.assertEqual((summary.warning_temperature_c, summary.critical_temperature_c), (value, value))
+                self.assertEqual(summary.unread_fields, [])
+
+    def test_invalid_attribute_id_leaves_attribute_fields_unread(self) -> None:
+        for bad_id in (-1, 0, 256, 10**400):
+            with self.subTest(attribute_id=str(bad_id)[:12]):
+                summary = self._read({"ata_smart_attributes": {"table": [{"id": bad_id, "raw": {"value": 3}}]}})
+                for field in ATA_ATTRIBUTE_FIELDS.values():
+                    self.assertIsNone(getattr(summary, field), field)
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_blank_statistic_name_leaves_statistic_fields_unread(self) -> None:
+        for name in (" ", "", "\t"):
+            with self.subTest(name=repr(name)):
+                summary = self._read({"ata_device_statistics": {"pages": [{"table": [{"name": name, "value": 42}]}]}})
+                for field in ATA_STATISTIC_FIELDS.values():
+                    self.assertIsNone(getattr(summary, field), field)
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_valid_uninteresting_rows_stay_absent(self) -> None:
+        summary = self._read({
+            "ata_smart_attributes": {"table": [{"id": 1, "raw": {"value": 0}}, {"id": 255, "raw": {"value": 0}}]},
+            "ata_device_statistics": {"pages": [{"table": [{"name": "Some Other Statistic", "value": 1}]}]},
+        })
+        self.assertEqual(summary.unread_fields, [])
+
+    def test_malformed_sas_port_or_phy_leaves_the_sas_projection_unread(self) -> None:
+        valid_phy = {"sas_address": "0x5000c500aa", "attached_sas_address": "0x5000c500bb",
+                     "negotiated_logical_link_rate": "phy enabled; 12 Gbps"}
+        for label, ports in (
+            ("phy not an object", {"scsi_sas_port_0": {"phy_0": True}}),
+            ("port not an object", {"scsi_sas_port_0": [1]}),
+            ("port scalar", {"scsi_sas_port_0": True}),
+            ("malformed sibling port", {"scsi_sas_port_0": {"phy_0": valid_phy}, "scsi_sas_port_1": "x"}),
+            ("malformed sibling phy", {"scsi_sas_port_0": {"phy_0": valid_phy, "phy_1": []}}),
+        ):
+            with self.subTest(case=label):
+                # The interface speed is not a stand-in for a SAS link rate that was refused.
+                summary = self._read({"interface_speed": {"current": {"string": "6.0 Gb/s"}}, **ports})
+                for field in ("sas_address", "attached_sas_address", "negotiated_link_rate"):
+                    self.assertIsNone(getattr(summary, field), field)
+                    self.assertIn(field, summary.unread_fields)
+
+    def test_sas_projection_controls(self) -> None:
+        summary = self._read({"scsi_sas_port_0": {"num_phys": 1, "phy_0": {
+            "sas_address": "0x5000c500aa", "attached_sas_address": "0x5000c500bb",
+            "negotiated_logical_link_rate": "phy enabled; 12 Gbps"}}})
+        self.assertEqual((summary.sas_address, summary.attached_sas_address, summary.negotiated_link_rate),
+                         ("0x5000c500aa", "0x5000c500bb", "phy enabled; 12 Gbps"))
+        self.assertEqual(summary.unread_fields, [])
+        summary = self._read({"interface_speed": {"current": {"string": "6.0 Gb/s"}}})
+        self.assertEqual((summary.negotiated_link_rate, summary.unread_fields), ("6.0 Gb/s", []))
+
+    def test_self_test_object_without_its_value_is_unread(self) -> None:
+        valid = {"type": {"string": "Short offline"}, "status": {"string": "Completed without error"}, "lifetime_hours": 10}
+        for key, field in (("type", "last_test_type"), ("status", "last_test_status"),
+                           ("lifetime_hours", "last_test_lifetime_hours")):
+            for bad in ({"wrong": [42]}, {}):
+                with self.subTest(key=key, value=bad):
+                    row = {**valid, key: bad}
+                    summary = self._read({"ata_smart_self_test_log": {"standard": {"table": [row]}}})
+                    self.assertIsNone(getattr(summary, field))
+                    self.assertIn(field, summary.unread_fields)
+        for key, field in (("code", "last_test_type"), ("result", "last_test_status")):
+            with self.subTest(key=key, log="scsi"):
+                summary = self._read({"scsi_self_test_0": {**_SELF_TEST, key: {}}})
+                self.assertIsNone(getattr(summary, field))
+                self.assertIn(field, summary.unread_fields)
+
+    def test_self_test_shape_controls(self) -> None:
+        for row in (
+            {"type": {"string": "Short offline"}, "status": {"string": "Completed without error"}, "lifetime_hours": 10},
+            {"type": {"name": "Short offline"}, "status": {"name": "Completed without error"}, "lifetime_hours": {"hours": 10}},
+            {"type": "Short offline", "status": "Completed without error", "lifetime_hours": 10},
+        ):
+            with self.subTest(row=row):
+                summary = self._read({"ata_smart_self_test_log": {"standard": {"table": [row]}}})
+                self.assertEqual((summary.last_test_type, summary.last_test_status, summary.last_test_lifetime_hours),
+                                 ("Short offline", "Completed without error", 10))
+                self.assertEqual(summary.unread_fields, [])
+
+    def test_refused_transport_name_is_not_replaced_by_the_device_protocol(self) -> None:
+        summary = self._read({"scsi_transport_protocol": {"name": 5}, "device": {"protocol": "SCSI"}})
+        self.assertIsNone(summary.transport_protocol)
+        self.assertIn("transport_protocol", summary.unread_fields)
+        summary = self._read({"device": {"protocol": "NVMe"}})
+        self.assertEqual((summary.transport_protocol, summary.unread_fields), ("NVMe", []))
 
 
 if __name__ == "__main__":

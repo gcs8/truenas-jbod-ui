@@ -356,11 +356,6 @@ def _coerce_non_negative_int(value: Any) -> int | None:
     return None
 
 
-def _json_int(value: Any) -> int | None:
-    """An exact JSON integer, or None; booleans and floats are not readings."""
-    return value if type(value) is int else None
-
-
 def _json_text(value: Any) -> str | None:
     """Reported JSON text, or None when the field is not a string."""
     return normalize_text(value) if isinstance(value, str) else None
@@ -495,12 +490,21 @@ def _annualize_bytes(
 _NVME_KELVIN_LIMIT = 0xFFFF
 
 
+# A drive temperature reading in Celsius is an integer in this range; any other
+# value is not read. The bound also keeps every consumer's float conversion safe.
+_CELSIUS_MIN, _CELSIUS_MAX = -100, 1000
+
+
+def _json_celsius(value: Any) -> int | None:
+    return value if type(value) is int and _CELSIUS_MIN <= value <= _CELSIUS_MAX else None
+
+
 def _kelvin_to_celsius(value: Any) -> int | None:
     kelvin = _coerce_non_negative_int(value)
     # Bounded before float arithmetic: an oversized integer cannot become a float.
     if kelvin is None or kelvin == 0 or kelvin > _NVME_KELVIN_LIMIT:
         return None
-    return int(round(kelvin - 273.15))
+    return _json_celsius(int(round(kelvin - 273.15)))
 
 
 def _reported_kelvin(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
@@ -511,7 +515,8 @@ def _reported_kelvin(container: dict[str, Any], key: str, unread: set[str], fiel
 
 
 def _format_nvme_version(value: Any) -> str | None:
-    if type(value) is not int or value < 0:
+    # The version word is 32 bits wide; a wider value is not a version.
+    if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
         return None
     major = (value >> 16) & 0xFFFF
     minor = (value >> 8) & 0xFF
@@ -521,21 +526,20 @@ def _format_nvme_version(value: Any) -> str | None:
     return f"{major}.{minor}"
 
 
+# nvme-cli reports a namespace EUI-64 as 16 hex digits and an NGUID as 32; the
+# optional "eui." prefix is the form this formatter publishes.
+_NVME_EUI64_REGEX = re.compile(r"(?:[eE][uU][iI]\.)?([0-9a-fA-F]{16})")
+_NVME_NGUID_REGEX = re.compile(r"[0-9a-fA-F]{32}")
+
+
 def _format_nvme_eui64(value: Any) -> str | None:
-    if type(value) not in (str, int):
-        return None
-    text = normalize_value_text(value)
-    if not text:
-        return None
-    lowered = text.lower()
-    return lowered if lowered.startswith("eui.") else f"eui.{lowered}"
+    match = _NVME_EUI64_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return f"eui.{match.group(1).lower()}" if match else None
 
 
 def _format_nvme_nguid(value: Any) -> str | None:
-    if type(value) not in (str, int):
-        return None
-    text = normalize_value_text(value)
-    return text.lower() if text else None
+    match = _NVME_NGUID_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return match.group(0).lower() if match else None
 
 
 def _ata_attributes_unreadable(payload: dict[str, Any]) -> bool:
@@ -554,7 +558,11 @@ def _ata_attributes_unreadable(payload: dict[str, Any]) -> bool:
     table = block["table"]
     if not isinstance(table, list):
         return True
-    return any(not isinstance(entry, dict) or type(entry.get("id")) is not int for entry in table)
+    # ATA attribute numbers are 1 to 255; any other id is not an identity.
+    return any(
+        not isinstance(entry, dict) or type(entry.get("id")) is not int or not 1 <= entry["id"] <= 255
+        for entry in table
+    )
 
 
 # smartctl's raw string for these attributes is the decimal count, optionally
@@ -573,7 +581,9 @@ def _ata_raw_count(raw: Any) -> int | None:
     if isinstance(raw, dict):
         if "value" in raw:
             return _coerce_non_negative_int(raw["value"])
-        raw = raw.get("string")
+        # ``string`` is text; the bare-integer compatibility form is not a member.
+        string = raw.get("string")
+        raw = string if isinstance(string, str) else None
     if type(raw) is int:
         return raw if raw >= 0 else None
     if isinstance(raw, str):
@@ -701,8 +711,9 @@ def _ata_device_stats_unreadable(payload: dict[str, Any]) -> bool:
         if "table" not in page:
             continue
         table = page["table"]
+        # A row without a non-blank name may be any statistic.
         if not isinstance(table, list) or any(
-            not isinstance(entry, dict) or not isinstance(entry.get("name"), str) for entry in table
+            not isinstance(entry, dict) or _json_text(entry.get("name")) is None for entry in table
         ):
             return True
     return False
@@ -3714,6 +3725,9 @@ def _reported_test_text(
         text = _reported_text(value, "string", unread, field)
         if text is None and field not in unread:
             text = _reported_text(value, "name", unread, field)
+        if text is None:
+            # An object without its text is a reported value that was not read.
+            unread.add(field)
         return text
     if allow_text:
         return _reported_text(container, key, unread, field)
@@ -3760,9 +3774,11 @@ def _extract_smartctl_latest_test(
             latest_test_type = _reported_test_text(latest_test, "type", unread, "last_test_type", allow_text=True)
             latest_test_status = _reported_test_text(latest_test, "status", unread, "last_test_status", allow_text=True)
             if isinstance(latest_test.get("lifetime_hours"), dict):
+                # The object form carries its value in ``hours``; without it the
+                # reported lifetime was not read.
+                lifetime = {"hours": None, **latest_test["lifetime_hours"]}
                 latest_test_lifetime_hours = _reported(
-                    latest_test["lifetime_hours"], "hours", _coerce_non_negative_int,
-                    unread, "last_test_lifetime_hours",
+                    lifetime, "hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
                 )
             else:
                 latest_test_lifetime_hours = _reported(
@@ -3780,13 +3796,18 @@ def _extract_smartctl_sas_phy(
     payload: dict[str, Any],
     unread: set[str] | None = None,
 ) -> tuple[str | None, str | None, str | None] | None:
+    unread = unread if unread is not None else set()
     sas_port_phys: list[dict[str, Any]] = []
     for key, value in payload.items():
-        if not (key.startswith("scsi_sas_port_") and isinstance(value, dict)):
+        if not key.startswith("scsi_sas_port_"):
             continue
-        for subkey, phy in value.items():
-            if subkey.startswith("phy_") and isinstance(phy, dict):
-                sas_port_phys.append(phy)
+        phys = [phy for subkey, phy in value.items() if subkey.startswith("phy_")] if isinstance(value, dict) else None
+        if phys is None or not all(isinstance(phy, dict) for phy in phys):
+            # A port or PHY that cannot be read may be the attached one, so no
+            # PHY is reported as the disk's, and no other source stands in.
+            unread.update(("sas_address", "attached_sas_address", "negotiated_link_rate"))
+            return None, None, None
+        sas_port_phys.extend(phys)
 
     selected_phy = next(
         (
@@ -3799,7 +3820,6 @@ def _extract_smartctl_sas_phy(
     )
     if not selected_phy:
         return None
-    unread = unread if unread is not None else set()
     return (
         _reported_sas_address(selected_phy, "sas_address", unread, "sas_address"),
         _reported_sas_address(selected_phy, "attached_sas_address", unread, "attached_sas_address"),
@@ -4072,15 +4092,22 @@ def _smartctl_threshold_celsius(value: Any) -> int | None:
     return value if 20 <= value <= 150 else None
 
 
+# The documented "not available" limit values (see _smartctl_threshold_celsius).
+_SMARTCTL_THRESHOLD_NOT_AVAILABLE = frozenset({0, 255, -128})
+
+
 def _reported_threshold(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
-    """A reported limit; a documented "not available" value is absent, a
-    non-integer is not read."""
+    """A reported limit; a documented "not available" value is absent, and any
+    other value that is not a plausible rating is not read."""
     if key not in container:
         return None
-    if type(container[key]) is not int:
-        unread.add(field)
+    value = container[key]
+    if type(value) is int and value in _SMARTCTL_THRESHOLD_NOT_AVAILABLE:
         return None
-    return _smartctl_threshold_celsius(container[key])
+    rating = _smartctl_threshold_celsius(value)
+    if rating is None:
+        unread.add(field)
+    return rating
 
 
 def _extract_smartctl_temperature_thresholds(
@@ -4145,11 +4172,11 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
 
     unread: set[str] = set()
     temperature = _reported_object(payload, "temperature", unread, *_SMARTCTL_TEMPERATURE_FIELDS)
-    current_temperature = _reported(temperature, "current", _json_int, unread, "temperature_c")
+    current_temperature = _reported(temperature, "current", _json_celsius, unread, "temperature_c")
     if current_temperature is None and "temperature_c" not in unread:
         environmental_reports = _reported_object(payload, "scsi_environmental_reports", unread, "temperature_c")
         environmental_temperature = _reported_object(environmental_reports, "temperature_1", unread, "temperature_c")
-        current_temperature = _reported(environmental_temperature, "current", _json_int, unread, "temperature_c")
+        current_temperature = _reported(environmental_temperature, "current", _json_celsius, unread, "temperature_c")
     power_on_time = _reported_object(payload, "power_on_time", unread, "power_on_hours")
     firmware_version = _reported_text(payload, "firmware_version", unread, "firmware_version")
     nvme_version = _reported_object(payload, "nvme_version", unread, "protocol_version")

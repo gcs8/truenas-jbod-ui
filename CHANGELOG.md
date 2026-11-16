@@ -77,19 +77,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 - SMART and NVMe JSON with an unexpected shape no longer breaks the SMART
-  summary or shows invented readings. A non-object payload reports SMART as
-  unavailable. A field reported in a shape that cannot be read (a boolean, a
-  float, text such as `bad0` in a number, an out-of-range or oversized value,
-  a malformed attribute name or self-test entry) is "not read": it is not
-  turned into a number, not replaced by a default or by a lower-priority
-  source, and the SMART summary API lists it in a new `unread_fields` list.
-  A reported but invalid logical block size no longer falls back to 512 bytes,
-  and an invalid NVMe rotation rate is no longer shown as SSD. Disk details,
-  the SMART tooltip, Storage Fabric and the saved HTML copy show an unread
-  power-on time as `not read` instead of hiding it or showing `0 d`; an
-  absent one is still omitted or `n/a`, and a summary whose every field was
-  unreadable says "SMART summary fields were returned for this disk but could
-  not be read." (#1249).
+  summary. A non-object payload reports SMART as unavailable. Each scalar
+  field the summary readers publish is checked against its documented JSON
+  form (an integer, text, a boolean, a hex identifier of the documented
+  width) and, where one is set, a range: Celsius readings -100 to 1000,
+  temperature limits 20 to 150 C, byte totals below 2^64, a 32-bit NVMe
+  version word, ATA attribute ids 1 to 255. A field reported in any other form
+  is "not read": its value is null, no default or lower-priority source in the
+  same output stands in for it, and the SMART summary API lists it in a new
+  `unread_fields` list. Documented "not available" limits stay absent, and
+  large integers in fields with no set range (hours, counters, sizes) are
+  still published as reported. A reported but invalid logical block size no
+  longer falls back to 512 bytes, and an invalid NVMe rotation rate is no
+  longer shown as SSD. Disk and storage-view details and the SMART tooltip
+  (live and in the saved HTML copy), the live heat map tooltip and Storage
+  Fabric show `not read` for such a field
+  instead of hiding it, showing `n/a` or `0 d`, or filling it from the slot;
+  an absent field keeps its existing text, and a summary whose every field
+  was unreadable says "SMART summary fields were returned for this disk but
+  could not be read." The Attention Score adds the reason "SMART inputs not
+  read" when an input it weighs was not read, and shows "not scored: SMART
+  inputs not read" instead of 0 when none was read and nothing else scored.
+  The history collector treats a temperature it cannot convert, or a value
+  its database cannot store, as no sample instead of failing the pass. Stored
+  history, the saved slot-detail cache, the heat-map timeline and the per-row
+  SAS port and SATA PHY counters do not yet keep "not read" apart from absent
+  (#1249).
 
 ### Performance
 
