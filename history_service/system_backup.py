@@ -81,7 +81,12 @@ from history_service.segmented_restore import (
     tree_matches as restore_tree_matches,
     write_restore_journal,
 )
-from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
+from history_service.startup import HistorySchemaVersionError
+from history_service.store import (
+    SQLITE_CONNECT_TIMEOUT_SECONDS,
+    HistoryStore,
+    require_restorable_schema_version,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -3692,10 +3697,13 @@ class SystemBackupService:
             member_key = entry.get("member_key")
             if not isinstance(member_key, str) or member_key not in extracted:
                 raise ValueError("Segmented history archive is missing a required segment.")
-            self._validate_history_member(
-                extracted[member_key],
-                integrity_checked=history_integrity_checked,
-            )
+            try:
+                self._validate_history_member(
+                    extracted[member_key],
+                    integrity_checked=history_integrity_checked,
+                )
+            except HistorySchemaVersionError as exc:
+                raise ValueError(exc.reason) from exc
             segment_id = entry.get("segment_id")
             local_segments.append(
                 {
@@ -4020,6 +4028,8 @@ class SystemBackupService:
                     ):
                         raise ValueError("Structured YAML member exceeds its size limit.")
                     validator(self._extracted_member_bytes(content))
+            except HistorySchemaVersionError as exc:
+                raise ValueError(exc.reason) from exc
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
@@ -4418,6 +4428,13 @@ class SystemBackupService:
                 candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
             with closing(sqlite3.connect(database_uri, uri=True)) as connection:
+                # The database's own compatibility marker, checked against the
+                # range startup admits before anything is activated (#1189).
+                # Raises HistorySchemaVersionError; callers turn it into the
+                # operator-facing ValueError so the reason is not wrapped away.
+                require_restorable_schema_version(
+                    int(connection.execute("PRAGMA user_version").fetchone()[0])
+                )
                 rows = (
                     [("ok",)]
                     if integrity_checked

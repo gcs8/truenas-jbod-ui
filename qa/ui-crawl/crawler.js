@@ -235,6 +235,7 @@ class Crawler {
     const index = (state.steps || []).findIndex((step) => step.forEachOption);
     if (index < 0) return [state];
     const step = state.steps[index];
+    await this.retireDocument();
     this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     await this.load(target);
     const driver = this.newDriver(target);
@@ -350,6 +351,22 @@ class Crawler {
     if (admitted.length) (this.loadAdmitted = this.loadAdmitted || []).push(...admitted.map((entry) => ({ target: this.loadTarget, state: this.guard.state, ...entry })));
   }
 
+  // #1232: before the next state's policy is armed, the outgoing document is
+  // replaced with about:blank (no request, nothing to guard). Until that
+  // navigation commits the outgoing page is still alive and its queued
+  // requests (the history dashboard's health poll) are judged by its own
+  // state's read list, which the guard keeps after endState(); once it is
+  // gone nothing it queued can reach the next state's list. The finished
+  // state's load and follow-up windows close here, at the start of this
+  // navigation, as they did at the start of the next page load: retiring a
+  // page never extends them.
+  async retireDocument() {
+    this.endLoadWindow();
+    this.endFollowUp();
+    if (!this.page || this.page.url() === "about:blank") return;
+    await this.page.goto("about:blank", { waitUntil: "load", timeout: 60_000 });
+  }
+
   async load(target) {
     // Serialize and space page loads on a live stack (Archive load rules).
     const wait = this.lastLoad + this.paceMs - Date.now();
@@ -412,8 +429,12 @@ class Crawler {
     this.bucket = record.findings;
     this.log(`${target.label} ${state.id}: start`);
     let driver = null;
-    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
+    // #1232: a page that could not be retired fails this state before it
+    // loads, and this state's policy is never armed while that page lives.
+    const retired = await this.retireDocument().then(() => null, (error) => error);
+    if (!retired) this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     try {
+      if (retired) throw new Error(`could not retire the previous page: ${String(retired.message || retired).split("\n")[0]}`);
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
       record.readyMs = readyMs;

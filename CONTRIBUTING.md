@@ -245,8 +245,9 @@ Raw command reference (the wrapper remains authoritative):
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
 COVERAGE_CORE=sysmon coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
-python scripts/run_test_shard.py check-counts  # compare discovery with the reviewed per-module baseline
-python scripts/run_test_shard.py update-counts # after intentional test additions/removals; review the JSON diff
+python scripts/run_test_shard.py discover --output head-ids.json  # every test identity; refuses to overwrite
+python scripts/run_test_shard.py discover --root ../base-worktree --output base-ids.json  # a `git worktree` of the base
+python scripts/run_test_shard.py compare --base base-ids.json --candidate head-ids.json  # removed or added tests
 python scripts/run_test_shard.py run --shard 1 # one CI shard; `list` prints the table
 python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
@@ -365,18 +366,30 @@ npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
 ```
 
-CI runs the fixture-only browser specs on every pull request, in the
-`Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
-`qa/chassis-row-overflow.spec.js`, `qa/connections-clear-selection.spec.js`,
-`qa/connections-overflow.spec.js`, `qa/header-and-disk-path-layout.spec.js`,
-`qa/heatmap-temperature-bands.spec.js`, `qa/offline-snapshot.spec.js`,
-`qa/saved-view-selection.spec.js`, `qa/ui-a11y-narrow-layout.spec.js`, `qa/ui-coverage.spec.js`,
+CI runs the fixture-only browser specs on every pull request:
+`qa/admin-draft-target-ownership.spec.js`, `qa/chassis-row-overflow.spec.js`,
+`qa/connections-clear-selection.spec.js`, `qa/connections-overflow.spec.js`,
+`qa/header-and-disk-path-layout.spec.js`, `qa/heatmap-temperature-bands.spec.js`,
+`qa/offline-snapshot.spec.js`, `qa/release-contract.spec.js`,
+`qa/saved-view-selection.spec.js`, `qa/ui-a11y-narrow-layout.spec.js`,
+`qa/ui-coverage.spec.js`, `qa/ui-coverage-primary-crawl.spec.js`,
 `qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
 own synthetic fixtures and need no running stack:
 
 ```bash
-npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-coverage.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
+npx playwright test qa/admin-draft-target-ownership.spec.js qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/release-contract.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-coverage.spec.js qa/ui-coverage-primary-crawl.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
+
+In CI they run as four parallel `Fixture browser specs (leg N)` jobs. Each leg
+runs the explicit spec list in its matrix entry in `.github/workflows/ci.yml`,
+in the `Run fixture-only browser specs` step, with one Playwright worker; leg 1
+also runs the public demo checks and the current-source demo smoke once. The
+required `Checked-in public demo artifact` check waits for all four legs and
+fails unless every one succeeded. A new fixture spec must be added to exactly
+one leg (pick the one with the least measured time); a spec that should not run
+there goes in `NOT_ON_A_FIXTURE_LEG` in `tests/test_ci_browser_legs.py` with
+the place it runs instead. That test fails on a spec that is on no leg or on
+two.
 
 `qa/header-and-disk-path-layout.spec.js` also registers the Storage Fabric
 stale-refresh suite from `qa/fixture-suites/`. Its standalone entry point is
@@ -434,7 +447,8 @@ tooling exists to catch those automatically.
   in a state's `covers` or in `ignored_controls` with a reason. A hook with a
   literal value is keyed by that value (`[data-admin-view-button=backups]`), so
   a new tab or mode that reuses a hook still needs its own entry; dynamic
-  values (bays) share one key. The spec also crawls the `ci: true` states on
+  values (bays) share one key. Its companion `qa/ui-coverage-primary-crawl.spec.js`
+  (a separate file so CI can run it on its own leg) crawls the `ci: true` states on
   synthetic fixtures (including fixture variants for configurations such as
   write sign-in) at the `ci` widths and fails on any unexplained layout,
   contrast, heat-map or console finding, on an accessibility checker that did
@@ -628,16 +642,31 @@ shards split the test modules by the `SHARDS` table in
 `scripts/run_test_shard.py`; the gate downloads every shard's result and fails
 unless each one ran and passed on that Python version, so a shard that failed,
 was skipped, or never uploaded a result turns the required check red. Each result
-also records discovery counts by module. The gate compares their union with the
-reviewed `tests/unittest_test_counts.json` baseline and names every module that
-gained or lost tests; method- and class-level skips remain counted because the
-contract concerns discovery, not platform-dependent outcomes. A module that raises
-`SkipTest` at import collapses to one test, so the gate reports it as lost tests
-and `update-counts` refuses to record it. Regenerate the baseline only after an intentional
-test change with `python scripts/run_test_shard.py update-counts`, then review the
-manifest diff. Every `tests/test_*.py` module must sit in exactly one shard; `run`
-refuses to start otherwise and `tests.test_unittest_shards` asserts the same
-partition. Report-only
+lists the identity (`module.Class.test_method`) of every test the shard collected,
+started and completed. The gate also runs `run_test_shard.py discover` on the same
+checkout, which finds the expected identities from the test files themselves, not
+from the shard table and not from any committed file, and refuses an import error,
+a module that raises `SkipTest` at import, a module with no tests and a duplicate
+identity. `verify` then requires every discovered test to have completed exactly
+once across the shards and names each test that no shard ran, that ran twice, or
+that ran without being discovered. Method- and class-level skips still count as
+completed; a `setUpClass` skip that stops tests from starting does not. Adding a
+test needs no count file and no regeneration step.
+
+On pull requests the gate also discovers the identities of the base commit (in a
+separate worktree, with this checkout kept off the import path) and runs
+`run_test_shard.py compare`. A test present at the base and gone from the pull
+request, including a rename or a deletion paired with an addition, fails the check
+and is listed in the job summary. If the removal is intended, a maintainer applies
+the `tests-removed-ok` label and reruns the `Python compile and unittest` jobs; the
+label is read live. Pushes to `main` run the same comparison but only report. The
+comparison is a guard against unnoticed removal, not a trust boundary: it runs in
+the pull request's own workflow with the pull request's `run_test_shard.py` and
+test code, so a pull request that edits `.github/workflows/ci.yml`,
+`scripts/run_test_shard.py` or the test code discovery imports can switch it off.
+Review such an edit with the same attention as a test removal. Every
+`tests/test_*.py` module must sit in exactly one shard; `run` refuses to start
+otherwise and `tests.test_unittest_shards` asserts the same partition. Report-only
 coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
 combined in the 3.14 gate. Coverage is report-only. CodeQL is report-only until
 repository branch protection explicitly makes it required. `Image-only upgrade smoke` (the previous public release upgraded by
@@ -747,8 +776,10 @@ that comment yet; the table below is the authoritative list either way.
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
 | `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
 | A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
-| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted), and `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts` | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard; the reviewed count baseline makes the intentional addition explicit |
-| An added, removed, or generated Python unittest | `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts`, with the resulting per-module count change reviewed | The required shard gate reports per-module count drift. It compares counts, not test IDs, so a rename, or a deletion paired with an addition in the same module, leaves the count unchanged and needs a reviewer's eye on the test diff |
+| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard |
+| An added or generated Python unittest | Nothing else. There is no count file to update | The required gate discovers every test identity on the checked-out commit and fails unless each one completed exactly once across the shards |
+| A removed or renamed Python unittest | The `tests-removed-ok` label on the pull request, applied by a maintainer after reading the removal list in the `Python compile and unittest` job summary | The gate compares the pull request's test identities with its base and fails on any that disappeared, including a deletion paired with an addition that keeps the count the same. The label acknowledges the listed removals; it does not waive the completeness check |
+| `.github/workflows/ci.yml` gate steps, `scripts/run_test_shard.py`, or how test modules load | The same reviewer attention as a test removal | The removal check runs from these files as the pull request has them, so an edit to them can switch it off; it guards against unnoticed removal, not against a change that disables it |
 | Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
 | A wiki page added or removed | The page count in `scripts/check_public_docs.py`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` (the inventory under `docs/archive/` is a historical baseline and is not updated) | `check_public_docs.py` and the docs contract test count and enumerate pages |
 | `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
