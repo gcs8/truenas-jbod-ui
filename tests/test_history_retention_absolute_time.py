@@ -1795,6 +1795,179 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
 
                 self.assertEqual(_rollups(path), [(3600, 2, 31.0, second), (86400, 2, 31.0, second)])
 
+    # Two samples less than a millisecond apart, the first in text only SQLite
+    # reads. SQLite's own reading rounds to the millisecond, which would tie
+    # them or turn them round. Each row: later text, earlier text.
+    SUBMILLISECOND_PAIRS = {
+        "padded end of a second": ("2026-11-03T00:30:00.999999+00:00 ", "2026-11-03T00:30:00.999000+00:00"),
+        "padded end of a second, next microsecond": (
+            "2026-11-03T00:30:00.999999+00:00 ",
+            "2026-11-03T00:30:00.999001+00:00",
+        ),
+        "ordinary after a padded half millisecond": (
+            "2026-11-03T00:30:00.001000+00:00",
+            "2026-11-03T00:30:00.000500+00:00 ",
+        ),
+        "no offset": ("2026-11-03T00:30:00.999999", "2026-11-03T00:30:00.999000+00:00"),
+        "space before the offset": ("2026-11-03T00:30:00.000900 +00:00", "2026-11-03T00:30:00.000500+00:00"),
+        "another offset": ("2026-11-02T19:30:00.999999-05:00 ", "2026-11-03T00:30:00.999000+00:00"),
+        "both padded": ("2026-11-03T00:30:00.000600Z ", "2026-11-03T00:30:00.000500Z  "),
+    }
+
+    def test_samples_less_than_a_millisecond_apart_keep_their_order_in_one_pass(self) -> None:
+        for index, (form, (later, earlier)) in enumerate(self.SUBMILLISECOND_PAIRS.items()):
+            for batch_size in (100, 2, 1):
+                for order in ("later first", "earlier first"):
+                    with self.subTest(form=form, batch_size=batch_size, order=order):
+                        path, store = self._store(f"sub-{index}-{batch_size}-{order[0]}")
+                        rows = [(later, 2), (earlier, 1)]
+                        self._insert(path, rows if order == "later first" else rows[::-1])
+
+                        result = self._retain_counters(store, batch_size)
+
+                        self.assertEqual(result["metric_samples_removed"], 2)
+                        self.assertEqual(_rollups(path), [(3600, 2, 2.0, later), (86400, 2, 2.0, later)])
+
+    def test_a_merge_keeps_the_order_of_samples_less_than_a_millisecond_apart(self) -> None:
+        for index, (form, (later, earlier)) in enumerate(self.SUBMILLISECOND_PAIRS.items()):
+            for batch_size in (100, 1):
+                for first, second in (((later, 2), (earlier, 1)), ((earlier, 1), (later, 2))):
+                    with self.subTest(form=form, batch_size=batch_size, first=first[1]):
+                        path, store = self._store(f"submerge-{index}-{batch_size}-{first[1]}")
+                        self._insert(path, [first])
+                        self._retain_counters(store, batch_size)
+                        self._insert(path, [second])
+
+                        self._retain_counters(store, batch_size)
+
+                        self.assertEqual(_rollups(path), [(3600, 2, 2.0, later), (86400, 2, 2.0, later)])
+
+
+class SqliteIsoInstantTests(unittest.TestCase):
+    """The ordering-only reading of ISO text that SQLite reads and the exact reading rejects."""
+
+    READ = {
+        "2026-11-03T00:30:00.999999+00:00 ": "2026-11-03T00:30:00.999999",
+        "2026-11-03T00:30:00.999999+00:00\t\n\v\f\r": "2026-11-03T00:30:00.999999",
+        "2026-11-03T00:30:00.000500Z  ": "2026-11-03T00:30:00.000500",
+        "2026-11-03T00:30:00.5z": "2026-11-03T00:30:00.500000",
+        "2026-11-03T00:30:00.999999": "2026-11-03T00:30:00.999999",
+        "2026-11-03 00:30:00.1234567": "2026-11-03T00:30:00.123456",
+        "2026-11-03T00:30": "2026-11-03T00:30:00.000000",
+        "2026-11-03 T 00:30:00 +01:30 ": "2026-11-02T23:00:00.000000",
+        "2026-11-02T19:30:00.999999-05:00 ": "2026-11-03T00:30:00.999999",
+        "2026-11-03T00:30:00.999999+00:00\x00tail": "2026-11-03T00:30:00.999999",
+        "2026-11-03": "2026-11-03T00:00:00.000000",
+        "2026-11-03T": "2026-11-03T00:00:00.000000",
+        "2026-11-03 ": "2026-11-03T00:00:00.000000",
+        # SQLite carries a day past the end of a month, and hour 24, forward.
+        "2026-02-31T00:30:00.000001": "2026-03-03T00:30:00.000001",
+        "2026-11-03T24:30:00.000001": "2026-11-04T00:30:00.000001",
+        "9999-12-30T23:59:59.999999+00:00 ": "9999-12-30T23:59:59.999999",
+    }
+    # Text SQLite reads that this reading leaves to SQLite's millisecond.
+    LEFT_TO_SQLITE = ["-2026-11-03T00:30:00", "0000-11-03T00:30:00", "2461348.5", "00:30:00", "0001-01-01T00:00:00+14:00 "]
+    # Text SQLite does not read.
+    NOT_A_TIME = [
+        "",
+        " 2026-11-03T00:30:00",
+        "2026-11-03T00:30:00.",
+        "2026-11-03T00:30:00. 5",
+        "2026-11-03T00:30:00+0000 ",
+        "2026-11-03T00:30:00 +00:00 x",
+        "2026-11-03T00:30:00+15:00 ",
+        "2026-11-03T00:30:00+00:60 ",
+        "2026-11-03T25:30:00",
+        "2026-11-03T00:60:00",
+        "2026-11-03T00:30:60",
+        "2026-11-03T00:30: ",
+        "2026-13-03T00:30:00",
+        "2026-11-32T00:30:00",
+        "2026-11-00T00:30:00",
+        "2026-11-03+00:00",
+        "2026-11-3T00:30:00",
+        "26-11-03T00:30:00",
+        "2026-11-03T0:30:00",
+        "2026-11-03T00:30:00\u00a0",
+        "\u0662\u0660\u0662\u0666-11-03T00:30:00",
+        "2026-11-03T00:30:00 Z Z",
+        "now ",
+        "x",
+    ]
+
+    def test_it_reads_the_instant_to_the_microsecond(self) -> None:
+        from history_service.store import _history_utc_instant, _sqlite_iso_utc_instant
+
+        for text, instant in self.READ.items():
+            with self.subTest(text=text):
+                self.assertIsNone(_history_utc_instant(text))
+                self.assertEqual(_sqlite_iso_utc_instant(text), instant)
+
+    def test_it_reads_nothing_sqlite_does_not_and_agrees_with_sqlite_to_the_millisecond(self) -> None:
+        from history_service.store import _sqlite_iso_utc_instant
+
+        def seconds(value: str) -> float:
+            return (datetime.fromisoformat(value) - datetime(2026, 1, 1)).total_seconds()
+
+        # Not the last day of year 9999: SQLite builds differ on whether its
+        # last half millisecond, which rounds up out of range, is a time.
+        dates = ["2026-11-03", "2026-02-29", "2026-04-31", "0001-01-01", "9999-12-30", "2026-1-03", "2026-11-03x"]
+        joins = ["T", " ", "", "  T\t", "t", "_"]
+        times = ["00:30", "00:30:00", "23:59:59", "24:00:00", "24:59:59", "00:30:00:", "0:30:00", "00:30:61"]
+        fractions = ["", ".5", ".000500", ".999999", ".9999999", ".9995", ".", ".x"]
+        zones = ["", "Z", "z", "+00:00", "-05:00", "+14:00", "-14:59", "+15:00", "+0000", "+00", "UTC"]
+        tails = ["", " ", "\t\n", " x", "\x00tail", "\u00a0"]
+        read = 0
+        with closing(sqlite3.connect(":memory:")) as connection:
+            for date in dates:
+                for join in joins:
+                    for time_text in times:
+                        for fraction in fractions:
+                            for gap in ("", " "):
+                                for zone in zones:
+                                    for tail in tails:
+                                        text = f"{date}{join}{time_text}{fraction}{gap}{zone}{tail}"
+                                        instant = _sqlite_iso_utc_instant(text)
+                                        if instant is None:
+                                            continue
+                                        read += 1
+                                        sqlite_seconds = connection.execute(
+                                            "SELECT (julianday(?) - julianday('2026-01-01')) * 86400.0", (text,)
+                                        ).fetchone()[0]
+                                        self.assertIsNotNone(sqlite_seconds, repr(text))
+                                        self.assertLess(abs(seconds(instant) - sqlite_seconds), 0.0011, repr(text))
+            for text in self.READ:
+                self.assertIsNotNone(connection.execute("SELECT julianday(?)", (text,)).fetchone()[0], repr(text))
+            for text in self.LEFT_TO_SQLITE:
+                with self.subTest(left=text):
+                    self.assertIsNotNone(connection.execute("SELECT julianday(?)", (text,)).fetchone()[0])
+                    self.assertIsNone(_sqlite_iso_utc_instant(text))
+            for text in self.NOT_A_TIME:
+                with self.subTest(rejected=text):
+                    self.assertIsNone(connection.execute("SELECT julianday(?)", (text,)).fetchone()[0])
+                    self.assertIsNone(_sqlite_iso_utc_instant(text))
+        self.assertGreater(read, 2000)  # the matrix did reach the reading
+
+    def test_long_text_is_read_in_time_proportional_to_its_length(self) -> None:
+        import time
+
+        from history_service.store import _sqlite_iso_utc_instant
+
+        def cost(text: str) -> float:
+            started = time.process_time()
+            self.assertIsNone(_sqlite_iso_utc_instant(text))
+            return time.process_time() - started
+
+        size = 200_000
+        for name, text in {
+            "spaces then text": "2026-11-03T00:30:00" + " " * size + "x",
+            "spaces round a zone": "2026-11-03T00:30:00" + " " * size + "+00:00" + " " * size + "x",
+            "separators": "2026-11-03" + " T" * size + "x",
+            "fraction digits": "2026-11-03T00:30:00." + "9" * size + "x",
+        }.items():
+            with self.subTest(text=name):
+                self.assertLess(cost(text), 2.0)
+
 
 class RetentionSqliteReadableTimeUtf16Tests(RetentionSqliteReadableTimeTests):
     ENCODING = "UTF-16le"

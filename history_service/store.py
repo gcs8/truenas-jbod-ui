@@ -4,6 +4,7 @@ import ctypes
 import errno
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -642,6 +643,64 @@ def _history_utc_instant(value: object) -> str | None:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return None
         return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="microseconds")
+    except (ValueError, OverflowError):
+        return None
+
+
+# SQLite's own ISO date and time grammar, after the end spaces it skips are
+# removed: date, any run of spaces and "T", then an optional time with an
+# optional fraction and an optional "Z" or "+HH:MM" zone. Each repeat is
+# followed by text it cannot itself match, so a match takes time proportional
+# to the text.
+_SQLITE_SPACE = " \t\n\v\f\r"
+_SQLITE_ISO_TIME = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[ \t\n\v\f\rT]*"
+    r"(?:(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:[ \t\n\v\f\r]*(?:([+-])(\d{2}):(\d{2})|[Zz]))?)?",
+    re.ASCII,
+)
+
+
+def _sqlite_iso_utc_instant(value: object) -> str | None:
+    """UTC instant, to the microsecond, of ISO text as SQLite reads it, or None.
+
+    Only for ordering a counter's last value, never for expiry. SQLite reads
+    text the exact reading rejects: spaces at the end or before the zone, no
+    zone (taken as UTC), text after a NUL, a day past the end of its month or
+    hour 24 (both carried forward). SQLite rounds what it reads to the
+    millisecond; this keeps the digits, in the form _history_utc_instant
+    returns, so such a sample keeps its place among samples less than a
+    millisecond away. It reads nothing SQLite does not, apart from the last
+    half millisecond of year 9999, which SQLite builds differ on. Text SQLite
+    reads in another way (a year before 0001, a Julian day number, a time
+    without a date) has no instant here.
+    """
+
+    if not isinstance(value, str):
+        return None
+    matched = _SQLITE_ISO_TIME.fullmatch(value.split("\x00", 1)[0].rstrip(_SQLITE_SPACE))
+    if matched is None:
+        return None
+    year, month, day, hour, minute, second, fraction, sign, zone_hours, zone_minutes = matched.groups()
+    hours, minutes, seconds = int(hour or 0), int(minute or 0), int(second or 0)
+    offset = int(zone_hours or 0) * 60 + int(zone_minutes or 0)
+    if (
+        not 1 <= int(day) <= 31
+        or hours > 24
+        or minutes > 59
+        or seconds > 59
+        or int(zone_hours or 0) > 14
+        or int(zone_minutes or 0) > 59
+    ):
+        return None
+    try:
+        instant = datetime(int(year), int(month), 1) + timedelta(
+            days=int(day) - 1,
+            hours=hours,
+            minutes=minutes - (-offset if sign == "-" else offset),
+            seconds=seconds,
+            microseconds=int((fraction or "")[:6].ljust(6, "0")),
+        )
+        return instant.isoformat(timespec="microseconds")
     except (ValueError, OverflowError):
         return None
 
@@ -3466,21 +3525,31 @@ class HistoryStore:
                 return None
             return _history_utc_instant(text)
 
+        def order_instant(value: object) -> str | None:
+            try:
+                text = value.decode(encoding) if isinstance(value, bytes) else value
+            except UnicodeDecodeError:
+                return None
+            exact = _history_utc_instant(text)
+            return exact if exact is not None else _sqlite_iso_utc_instant(text)
+
         connection.create_function("_history_utc_instant", 1, utc_instant, deterministic=True)
+        connection.create_function("_history_order_instant", 1, order_instant, deterministic=True)
 
     @staticmethod
     def _sample_order_instant(column: str) -> str:
         """SQL for the instant a raw sample's last value is ordered by.
 
-        The exact instant where the text has one. Otherwise the instant SQLite
-        reads, to its millisecond: SQLite names the sample's bucket from the
-        same reading, so every sample that has a bucket has a place in the
-        order. A restored database can hold text only SQLite reads (padded
-        with spaces, or without an offset, which SQLite takes as UTC).
+        The exact instant where the text has one. A restored database can hold
+        text only SQLite reads (padded with spaces, or without an offset, which
+        SQLite takes as UTC); its ISO forms are read to the microsecond too.
+        What is left is ordered by the instant SQLite reads, to its
+        millisecond: SQLite names the sample's bucket from the same reading,
+        so every sample that has a bucket has a place in the order.
         """
 
         return (
-            f"COALESCE(_history_utc_instant(CAST({column} AS BLOB)), "
+            f"COALESCE(_history_order_instant(CAST({column} AS BLOB)), "
             f"strftime('%Y-%m-%dT%H:%M:%f', {column}) || '000')"
         )
 
