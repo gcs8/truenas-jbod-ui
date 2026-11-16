@@ -323,17 +323,22 @@ SSH_LOGIN_FAILURE_REASONS = frozenset(
 SSH_CONNECTION_STARTUP_FAILURE_REASONS = frozenset(
     {"connection_refused", "host_unreachable", "protocol_error", "ssh_transport_failed", "timeout"}
 )
+# A host name: ASCII labels of letters, digits, hyphens and underscores (an
+# underscore is not valid DNS, but such names exist on real networks).
 _PLAIN_DNS_NAME_RE = re.compile(
-    r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?"
+    r"(?=.{1,253}\.?\Z)(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.)*"
+    r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.?"
 )
 UNPARSED_HOST_LOG_PLACEHOLDER = "<unparsed-host>"
 # A device read from discovery output is admitted only in the kernel's own
-# form, and only this many per host.
-SG_SES_DEVICE_RE = re.compile(r"/dev/sg(?:0|[1-9][0-9]{0,4})")
-SG_SES_MAX_DISCOVERED_DEVICES = 64
-# Host values a QuantaStor system row may contribute as SSH destinations.
-QUANTASTOR_MAX_REPORTED_HOSTS = 8
+# form. The count limit sits far above real hardware (one expander can carry
+# 1,024 disks and a host many dual-pathed shelves) and only stops runaway
+# output; reaching it is shown on the page with both counts.
+SG_SES_DEVICE_RE = re.compile(r"/dev/sg(0|[1-9][0-9]{0,4})")
+SG_SES_MAX_DISCOVERED_DEVICES = 16384
+# Addresses one QuantaStor node may contribute as SSH destinations, per system
+# row and per system's gateway ports. Reaching it is shown on the page.
+QUANTASTOR_MAX_REPORTED_HOSTS = 256
 SSH_DESTINATION_REFUSAL_MESSAGE = "SSH target is not an operator-approved destination for this credential authority."
 SSH_RESULT_MISSING_MESSAGE = "SSH command result missing."
 SSH_INTERNAL_ERROR_SENTENCE = "The read stopped on an internal error in this service; the service log has the details."
@@ -625,6 +630,31 @@ def _log_safe_host(value: str | None) -> str:
     if _PLAIN_DNS_NAME_RE.fullmatch(text):
         return text
     return UNPARSED_HOST_LOG_PLACEHOLDER
+
+
+def _parse_reported_host(value: str | None) -> str | None:
+    """A reported host as an IP address or a host name, lower-cased, else None.
+
+    Total: it never raises, never URL-parses and never turns the value into a
+    different host. IPv6 may be bracketed; an IPv6 zone index is refused.
+    """
+
+    text = normalize_text(value) if isinstance(value, str) else None
+    if not text or len(text) > 255 or not text.isascii() or not text.isprintable():
+        return None
+    bracketed = text.startswith("[") and text.endswith("]")
+    candidate = text[1:-1] if bracketed else text
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        address = None
+    if address is not None:
+        if getattr(address, "scope_id", None) is not None or (bracketed and address.version != 6):
+            return None
+        return candidate.lower()
+    if not bracketed and _PLAIN_DNS_NAME_RE.fullmatch(text):
+        return text.lower()
+    return None
 
 
 def _is_authentic_core_ses_target(target: Any) -> bool:
@@ -6026,6 +6056,8 @@ class InventoryService:
                 quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
             # A setup failure such as a missing node address reaches both overlays; say it once.
             warnings.extend(failure for failure in quantastor_ses_failures if failure not in quantastor_cli_failures)
+            # Reported node addresses that were not used are shown as counts, never echoed.
+            warnings.extend(self._quantastor_reported_host_warnings(raw_data))
 
             # Failed attempts matter even when they contributed no overlay rows.
             if quantastor_cli_failures or quantastor_ses_failures:
@@ -12921,30 +12953,28 @@ class InventoryService:
 
     @staticmethod
     def _admit_sg_ses_devices(values: Iterable[object]) -> tuple[list[str], int, int]:
-        """SG device paths in the kernel's form, deduplicated, at most the limit.
+        """SG device paths in the kernel's form, deduplicated, in numeric order.
 
-        Returns the admitted devices, the number of values that are not an SG
-        device path, and the number of devices beyond the limit. A value that
-        is not admitted is counted, never kept or shown.
+        Returns the admitted devices (the lowest indexes, at most the limit),
+        the number of values that are not an SG device path, and the number of
+        devices beyond the limit. A value that is not admitted is counted,
+        never kept or shown.
         """
 
-        devices: list[str] = []
+        indexes: set[int] = set()
         rejected = 0
-        beyond_limit = 0
         for value in values:
             device = normalize_text(value) if isinstance(value, str) else None
             if not device:
                 continue
-            if SG_SES_DEVICE_RE.fullmatch(device) is None:
+            match = SG_SES_DEVICE_RE.fullmatch(device)
+            if match is None:
                 rejected += 1
                 continue
-            if device in devices:
-                continue
-            if len(devices) >= SG_SES_MAX_DISCOVERED_DEVICES:
-                beyond_limit += 1
-                continue
-            devices.append(device)
-        return devices, rejected, beyond_limit
+            indexes.add(int(match.group(1)))
+        ordered = sorted(indexes)
+        limit = SG_SES_MAX_DISCOVERED_DEVICES
+        return [f"/dev/sg{index}" for index in ordered[:limit]], rejected, max(0, len(ordered) - limit)
 
     @classmethod
     def _parse_sg_ses_discovery_devices(cls, stdout: str) -> list[str]:
@@ -12953,7 +12983,7 @@ class InventoryService:
     def _log_sg_ses_discovery_admission(self, host: str, rejected: int, beyond_limit: int) -> None:
         summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
             (self.system.id, "sg_ses_discovery_admission", normalize_text(host) or ""),
-            (rejected, beyond_limit),
+            "admission",
         )
         if summary is not None:
             logger.warning(
@@ -12977,6 +13007,16 @@ class InventoryService:
         failure_prefix: str,
         report_empty_discovery: bool = True,
     ) -> tuple[list[str], ParsedSSHData, list[str]]:
+        devices, overlay, failures, _incomplete = await self._discover_sg_ses_host_read(
+            host, failure_prefix=failure_prefix, report_empty_discovery=report_empty_discovery
+        )
+        return devices, overlay, failures
+
+    async def _discover_sg_ses_host_read(
+        self, host: str, *, failure_prefix: str, report_empty_discovery: bool = True
+    ) -> tuple[list[str], ParsedSSHData, list[str], str | None]:
+        """Discover and read one host; the last item is the incomplete-read warning, if any."""
+
         discovery_command = self._build_sg_ses_discovery_command()
 
         def planner(results: list[SSHCommandResult]) -> list[str]:
@@ -13023,6 +13063,7 @@ class InventoryService:
                 [],
                 ParsedSSHData(),
                 [f"{failure_prefix} discovery failed on {host} ({failure_summary}).{sentence}"],
+                None,
             )
 
         devices, rejected_lines, beyond_limit = self._admit_sg_ses_devices(
@@ -13036,11 +13077,12 @@ class InventoryService:
                 # plain HBA that is the normal answer, not a failure; the
                 # caller decides whether enclosure evidence was expected.
                 logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
-                return [], ParsedSSHData(), []
+                return [], ParsedSSHData(), [], None
             return (
                 [],
                 ParsedSSHData(),
                 [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."],
+                None,
             )
         page_results = [result for result in results if result.command != discovery_command]
         overlay, failures = await self._fetch_sg_ses_host_overlay(
@@ -13049,7 +13091,15 @@ class InventoryService:
             failure_prefix=failure_prefix,
             command_results=page_results,
         )
-        return devices, overlay, failures
+        incomplete = None
+        if beyond_limit:
+            incomplete = (
+                f"{failure_prefix} read is incomplete on {host}: {len(devices)} SG devices read, "
+                f"{beyond_limit} left out at the limit of {SG_SES_MAX_DISCOVERED_DEVICES} per host. "
+                "Bays behind the devices left out are missing for this refresh."
+            )
+            failures = [*failures, incomplete]
+        return devices, overlay, failures, incomplete
 
     async def _fetch_sg_ses_host_overlay(
         self,
@@ -13135,6 +13185,7 @@ class InventoryService:
         best_host: str | None = None
         best_failures: list[str] = []
         failures: list[str] = []
+        incomplete_reads: list[str] = []
         successful_overlays: list[ParsedSSHData] = []
 
         for host in hosts:
@@ -13158,11 +13209,13 @@ class InventoryService:
                     continue
                 self._sg_ses_device_cache.pop(normalize_text(host), None)
 
-            devices, host_overlay, host_failures = await self._discover_and_fetch_sg_ses_host_overlay(
+            devices, host_overlay, host_failures, incomplete = await self._discover_sg_ses_host_read(
                 host,
                 failure_prefix=failure_prefix,
                 report_empty_discovery=report_empty_discovery,
             )
+            if incomplete is not None:
+                incomplete_reads.append(incomplete)
             if not devices:
                 failures.extend(host_failures)
                 if cached_failures:
@@ -13172,7 +13225,8 @@ class InventoryService:
             if host_failures:
                 failures.extend(host_failures)
             host_score = self._score_sg_ses_overlay(host_overlay)
-            if host_score > 0:
+            # A cut device list is not cached, so every refresh says it is incomplete.
+            if host_score > 0 and incomplete is None:
                 self._remember_sg_ses_devices(host, devices)
             if merge_hosts and host_score > 0:
                 successful_overlays.append(host_overlay)
@@ -13186,6 +13240,7 @@ class InventoryService:
             return ParsedSSHData(), failures, None
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
+        best_failures.extend(warning for warning in incomplete_reads if warning not in best_failures)
         return best_overlay, best_failures, best_host
 
     def _scale_expected_ses_missing_failure(self) -> str:
@@ -13359,10 +13414,23 @@ class InventoryService:
         cls,
         raw_data: TrueNASRawData | None = None,
     ) -> dict[str, list[str]]:
+        result, rejected, beyond_by_system = cls._admit_quantastor_gateway_hosts(raw_data)
+        if rejected or beyond_by_system:
+            cls._log_reported_host_admission(rejected, sum(beyond_by_system.values()))
+        return result
+
+    @classmethod
+    def _admit_quantastor_gateway_hosts(
+        cls,
+        raw_data: TrueNASRawData | None = None,
+    ) -> tuple[dict[str, list[str]], int, dict[str, int]]:
+        """Gateway-port hosts per system, the rejected count, and the count beyond the limit per system."""
+
         if raw_data is None:
-            return {}
+            return {}, 0, {}
         result: dict[str, list[str]] = {}
-        beyond_limit = 0
+        rejected = 0
+        beyond_by_system: dict[str, int] = {}
         cluster_node_ids = {
             normalize_value_text(row.get("id"))
             for row in cls._quantastor_cluster_node_rows_from_raw(raw_data)
@@ -13388,19 +13456,18 @@ class InventoryService:
             )
             if not system_id or (cluster_node_ids and system_id not in cluster_node_ids):
                 continue
-            host = cls._extract_quantastor_gateway_port_host(row)
+            host, row_rejected = cls._read_quantastor_gateway_port_host(row)
+            rejected += row_rejected
             if not host:
                 continue
             result.setdefault(system_id, [])
             if host in result[system_id]:
                 continue
             if len(result[system_id]) >= QUANTASTOR_MAX_REPORTED_HOSTS:
-                beyond_limit += 1
+                beyond_by_system[system_id] = beyond_by_system.get(system_id, 0) + 1
                 continue
             result[system_id].append(host)
-        if beyond_limit:
-            cls._log_reported_host_admission(0, beyond_limit)
-        return result
+        return result, rejected, beyond_by_system
 
     @classmethod
     def _quantastor_cluster_node_rows_from_raw(cls, raw_data: TrueNASRawData | None = None) -> list[dict[str, Any]]:
@@ -13456,24 +13523,35 @@ class InventoryService:
 
     @classmethod
     def _extract_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> str | None:
+        return cls._read_quantastor_gateway_port_host(row)[0]
+
+    @classmethod
+    def _read_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> tuple[str | None, int]:
+        """The port's IP address, and 1 when it has none but carried a value that is not a host."""
+
         # An alias interface (eno1:gm, an HA VIP) floats between nodes. isVirtualPort also marks
         # bonds and VLANs, which stay on their node and may carry its only default route.
         if row.get("isVirtualInterface") is True:
-            return None
+            return None, 0
         if not cls._quantastor_network_port_has_default_gateway(row):
-            return None
+            return None, 0
+        unusable = 0
         for key in ("ipAddress", "ipAddr", "ip", "address", "hostAddress"):
-            host = cls._normalize_host_identity(str(row.get(key)) if row.get(key) is not None else None)
-            if not host or cls._quantastor_unusable_auto_host(host):
+            text = normalize_value_text(row.get(key))
+            if not text:
+                continue
+            host = _parse_reported_host(text)
+            if host is None:
+                unusable = 1
+                continue
+            if cls._quantastor_unusable_auto_host(host):
                 continue
             try:
                 ipaddress.ip_address(host)
             except ValueError:
                 continue
-            if _log_safe_host(host) == UNPARSED_HOST_LOG_PLACEHOLDER:
-                continue
-            return host
-        return None
+            return host, 0
+        return None, unusable
 
     @staticmethod
     def _quantastor_network_port_has_default_gateway(row: dict[str, Any]) -> bool:
@@ -13502,6 +13580,15 @@ class InventoryService:
 
     @classmethod
     def _extract_quantastor_system_hosts(cls, system_row: dict[str, Any]) -> list[str]:
+        hosts, rejected, beyond_limit = cls._admit_quantastor_system_hosts(system_row)
+        if rejected or beyond_limit:
+            cls._log_reported_host_admission(rejected, beyond_limit)
+        return hosts
+
+    @classmethod
+    def _admit_quantastor_system_hosts(cls, system_row: dict[str, Any]) -> tuple[list[str], int, int]:
+        """A system row's hosts, the count that is not a host, and the count beyond the limit."""
+
         host_keys = (
             "sshHost",
             "sshHostname",
@@ -13558,12 +13645,12 @@ class InventoryService:
             text = normalize_text(str(value))
             if not text:
                 return
-            normalized = cls._normalize_host_identity(text)
-            if not normalized or cls._quantastor_unusable_auto_host(normalized):
-                return
-            if _log_safe_host(normalized) == UNPARSED_HOST_LOG_PLACEHOLDER:
-                # Only an IP address or a plain DNS name becomes a destination.
+            normalized = _parse_reported_host(text)
+            if normalized is None:
+                # Only an IP address or a host name becomes a destination.
                 rejected += 1
+                return
+            if cls._quantastor_unusable_auto_host(normalized):
                 return
             if normalized in hosts:
                 return
@@ -13576,14 +13663,46 @@ class InventoryService:
             add_host(system_row.get(key))
         for key in nested_keys:
             add_host(system_row.get(key))
-        if rejected or beyond_limit:
-            cls._log_reported_host_admission(rejected, beyond_limit)
-        return hosts
+        return hosts, rejected, beyond_limit
+
+    @classmethod
+    def _quantastor_reported_host_warnings(cls, raw_data: TrueNASRawData | None) -> list[str]:
+        """Page warnings for reported node addresses that were not used, with counts only."""
+
+        rejected = 0
+        used_at_limit = 0
+        left_out = 0
+        for row in cls._quantastor_cluster_node_rows_from_raw(raw_data):
+            hosts, row_rejected, row_beyond = cls._admit_quantastor_system_hosts(row)
+            rejected += row_rejected
+            if row_beyond:
+                used_at_limit += len(hosts)
+                left_out += row_beyond
+        by_system, port_rejected, beyond_by_system = cls._admit_quantastor_gateway_hosts(raw_data)
+        rejected += port_rejected
+        for system_id, beyond in beyond_by_system.items():
+            used_at_limit += len(by_system.get(system_id, []))
+            left_out += beyond
+        warnings: list[str] = []
+        if rejected:
+            warnings.append(
+                f"QuantaStor reported {rejected} node "
+                f"{'address that is' if rejected == 1 else 'addresses that are'} not an IP address or DNS "
+                f"name (reported address not usable). {'It was' if rejected == 1 else 'They were'} not "
+                "tried over SSH."
+            )
+        if left_out:
+            warnings.append(
+                f"QuantaStor node address read is incomplete: {used_at_limit} "
+                f"{'address' if used_at_limit == 1 else 'addresses'} used, {left_out} left out at the limit "
+                f"of {QUANTASTOR_MAX_REPORTED_HOSTS} per node. The addresses left out were not tried over SSH."
+            )
+        return warnings
 
     @staticmethod
     def _log_reported_host_admission(rejected: int, beyond_limit: int) -> None:
         summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
-            ("quantastor_node_hosts", "admission"), (rejected, beyond_limit)
+            ("quantastor_node_hosts", "admission"), "admission"
         )
         if summary is not None:
             logger.warning(
@@ -13617,9 +13736,17 @@ class InventoryService:
         host = normalize_text(value)
         if not host:
             return None
+        # A bare address or host name is read directly; only a configured
+        # URL-like value is URL-parsed, and an unparseable one has no identity.
+        reported = _parse_reported_host(host)
+        if reported is not None:
+            return reported
         target = host if "://" in host else f"//{host}"
-        parsed = urlsplit(target)
-        identity = parsed.hostname
+        try:
+            parsed = urlsplit(target)
+            identity = parsed.hostname
+        except ValueError:
+            return None
         if not identity and parsed.path and "/" not in parsed.path:
             identity = parsed.path
         return identity.lower() if identity else None

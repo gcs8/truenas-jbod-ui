@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -27,6 +28,7 @@ from tests.test_ssh_probe import MemorySSHWire
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.log_limiter import RepeatedLogLimiter
 from app.models.domain import SasFabricSnapshot
+from app.services import inventory as inventory_module
 from app.services import ssh_probe as ssh_probe_module
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
@@ -1066,7 +1068,7 @@ class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(counted), 1, rendered)
         self.assertTrue(counted[0].startswith("WARNING:app.services.inventory:"), counted[0])
         self.assertIn("ignored 7 lines", counted[0])
-        self.assertIn("0 devices beyond the limit of 64", counted[0])
+        self.assertIn("0 devices beyond the limit of 16384", counted[0])
         self.assertTrue(
             any(
                 line.startswith("WARNING:app.services.ssh_probe:SSH command failed: ")
@@ -1081,11 +1083,20 @@ class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
         stdout = "".join(f"/dev/sg{index}\n" for index in range(70))
         planned: list[str] = []
         self._planned_through_real_probe(service, stdout, planned)
-        with self.assertLogs("app.services", level="WARNING") as logs:
-            devices, _overlay, _failures = await service._discover_and_fetch_sg_ses_host_overlay(
+        with (
+            patch.object(inventory_module, "SG_SES_MAX_DISCOVERED_DEVICES", 64),
+            self.assertLogs("app.services", level="WARNING") as logs,
+        ):
+            devices, _overlay, failures = await service._discover_and_fetch_sg_ses_host_overlay(
                 "node.example.test", failure_prefix="TrueNAS SCALE SSH SES"
             )
         self.assertEqual(devices, [f"/dev/sg{index}" for index in range(64)])
+        self.assertIn(
+            "TrueNAS SCALE SSH SES read is incomplete on node.example.test: 64 SG devices read, "
+            "6 left out at the limit of 64 per host. Bays behind the devices left out are missing "
+            "for this refresh.",
+            failures,
+        )
         planned_devices = {shlex.split(command)[-1] for command in planned if "sg_ses" in command}
         self.assertEqual(len(planned_devices), 64)
         counted = [line for line in logs.output if "operation=sg_ses_discovery" in line]
@@ -1110,7 +1121,7 @@ class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
         )
         cached = service._get_cached_sg_ses_devices("node.example.test")
         self.assertEqual(cached[0], "/dev/sg4")
-        self.assertEqual(len(cached), 64)
+        self.assertEqual(len(cached), 71)
         self.assertNotIn(VALUE_MARKER, json.dumps(cached))
 
     def test_appliance_reported_ssh_hosts_pass_the_host_grammar(self) -> None:
@@ -1124,12 +1135,12 @@ class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("app.services.inventory", level="WARNING") as logs:
             hosts = InventoryService._extract_quantastor_system_hosts(row)
         self.assertEqual(hosts[:2], ["node-b.example.test", "192.0.2.41"])
-        self.assertEqual(len(hosts), 8)
+        self.assertEqual(len(hosts), 41)
         self.assertNotIn(VALUE_MARKER.lower(), json.dumps(hosts).lower())
         counted = [line for line in logs.output if "operation=quantastor_node_hosts" in line]
         self.assertEqual(len(counted), 1, logs.output)
         self.assertIn("ignored 2 values", counted[0])
-        self.assertIn("33 beyond the limit of 8", counted[0])
+        self.assertIn("0 beyond the limit of 256", counted[0])
         self.assertNotIn(VALUE_MARKER.lower(), counted[0].lower())
 
         control = {"ipAddress": "192.0.2.42", "hostname": "node-c.example.test"}
@@ -1153,10 +1164,9 @@ class RemoteValueAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 for index in range(100, 120)
             ],
         )
-        with self.assertLogs("app.services.inventory", level="WARNING") as logs:
+        with self.assertNoLogs("app.services.inventory", level="WARNING"):
             by_system = InventoryService._quantastor_gateway_hosts_by_system(ports)
-        self.assertEqual(by_system["node-a"], [f"192.0.2.{index}" for index in range(100, 108)])
-        self.assertTrue(any("12 beyond the limit of 8" in line for line in logs.output), logs.output)
+        self.assertEqual(by_system["node-a"], [f"192.0.2.{index}" for index in range(100, 120)])
 
     async def test_appliance_reported_hosts_never_reach_fabric_warnings_unadmitted(self) -> None:
         service = _sg_service(self.directory, "quantastor")
@@ -1454,6 +1464,328 @@ class InternalErrorFrameRecordTests(unittest.TestCase):
         self.assertNotIn("synthetic root", text)
         self.assertNotIn("\nwith newline", text)
         self.assertEqual(lines[-1], "  <file>:2 in <function>")
+
+
+def _sg_discovery_stdout(indexes: Iterable[int]) -> str:
+    # The shell glob lists device nodes in string order (sg1, sg10, sg100, sg2).
+    return "".join(f"{path}\n" for path in sorted(f"/dev/sg{index}" for index in indexes))
+
+
+def _quantastor_snapshot_service(directory: str, node_a_row: dict[str, Any]) -> tuple[InventoryService, list[str]]:
+    service = _sg_service(directory, "quantastor")
+    service.truenas_client.fetch_all.return_value = TrueNASRawData(
+        enclosures=[],
+        disks=[],
+        pools=[],
+        disk_temperatures={},
+        smart_test_results=[],
+        systems=[
+            {"id": "node-a", "storageSystemClusterId": "cluster-1", **node_a_row},
+            {"id": "node-b", "storageSystemClusterId": "cluster-1", "ipAddress": "192.0.2.51"},
+        ],
+    )
+    contacted: list[str] = []
+
+    async def refused(commands, host, *, stdin_data=None):
+        del stdin_data
+        contacted.append(host)
+        return _refused_probe_results(commands)
+
+    async def planned(planner, *, initial_commands, host):
+        del planner
+        contacted.append(host)
+        return _refused_probe_results(list(initial_commands))
+
+    service._run_ssh_commands = AsyncMock(side_effect=refused)
+    service._run_ssh_planned_commands = planned
+    return service, contacted
+
+
+def _documentation_addresses(count: int) -> list[str]:
+    pool = [f"198.51.100.{index}" for index in range(1, 201)] + [f"203.0.113.{index}" for index in range(1, 201)]
+    return pool[:count]
+
+
+REPORTED_ADDRESS_NOT_USABLE_ONE = (
+    "QuantaStor reported 1 node address that is not an IP address or DNS name "
+    "(reported address not usable). It was not tried over SSH."
+)
+
+
+class DiscoveryScaleAndReportedHostTests(unittest.IsolatedAsyncioTestCase):
+    """Real hardware counts are read in full; a reported host is read by a total parser."""
+
+    def setUp(self) -> None:
+        for limiter in ssh_probe_module.SSH_LOG_LIMITERS:
+            limiter.reset()
+        self.addCleanup(lambda: [limiter.reset() for limiter in ssh_probe_module.SSH_LOG_LIMITERS])
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+
+    @staticmethod
+    def _planned_with_quiet_pages(service: InventoryService, discovery_stdout: str, planned: list[str]) -> None:
+        async def run_planned(planner, *, initial_commands, host):
+            del host
+            discovery = SSHCommandResult(command=initial_commands[0], ok=True, stdout=discovery_stdout, exit_code=0)
+            commands = planner([discovery])
+            planned.extend(commands)
+            return [discovery, *(SSHCommandResult(command=command, ok=True, stdout="", exit_code=0) for command in commands)]
+
+        service._run_ssh_planned_commands = run_planned
+
+    async def test_sg_discovery_reads_large_real_shelf_counts_without_a_warning(self) -> None:
+        for count in (70, 1024, 5200):
+            with self.subTest(devices=count):
+                service = _sg_service(self.directory)
+                planned: list[str] = []
+                self._planned_with_quiet_pages(service, _sg_discovery_stdout(range(count)), planned)
+                with self.assertNoLogs("app.services.inventory", level="WARNING"):
+                    devices, _overlay, failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                        "node.example.test", failure_prefix="TrueNAS SCALE SSH SES"
+                    )
+                self.assertEqual(devices, [f"/dev/sg{index}" for index in range(count)])
+                self.assertEqual(failures, [])
+                self.assertEqual(
+                    len({shlex.split(command)[-1] for command in planned if "sg_ses" in command}), count
+                )
+
+    async def test_sg_discovery_limit_is_shown_on_the_page_with_both_counts(self) -> None:
+        service = _sg_service(self.directory)
+        planned: list[str] = []
+        self._planned_with_quiet_pages(service, _sg_discovery_stdout(range(16385)), planned)
+        with self.assertLogs("app.services.inventory", level="WARNING") as logs:
+            snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+        expected = (
+            "TrueNAS SCALE SSH SES read is incomplete on node.example.test: 16384 SG devices read, "
+            "1 left out at the limit of 16384 per host. Bays behind the devices left out are missing "
+            "for this refresh."
+        )
+        encoded = json.loads(json.dumps(snapshot.model_dump(mode="json")))
+        self.assertIn(expected, encoded["warnings"])
+        planned_devices = {shlex.split(command)[-1] for command in planned if "sg_ses" in command}
+        self.assertEqual(len(planned_devices), 16384)
+        self.assertIn("/dev/sg16383", planned_devices)
+        self.assertNotIn("/dev/sg16384", planned_devices)
+        counted = [line for line in logs.output if "operation=sg_ses_discovery" in line]
+        self.assertEqual(len(counted), 1, logs.output)
+        self.assertIn("1 devices beyond the limit of 16384", counted[0])
+
+    async def test_sg_devices_are_ordered_by_numeric_index_before_any_cut(self) -> None:
+        stdout = "/dev/sg100\n/dev/sg10\n/dev/sg1\n/dev/sg2\n"
+        devices, rejected, beyond = InventoryService._admit_sg_ses_devices(stdout.splitlines())
+        self.assertEqual((devices, rejected, beyond), (["/dev/sg1", "/dev/sg2", "/dev/sg10", "/dev/sg100"], 0, 0))
+
+        service = _sg_service(self.directory)
+        self._planned_with_quiet_pages(service, stdout, [])
+        with (
+            patch.object(inventory_module, "SG_SES_MAX_DISCOVERED_DEVICES", 2),
+            patch.object(InventoryService, "_score_sg_ses_overlay", return_value=1),
+        ):
+            self.assertEqual(
+                InventoryService._admit_sg_ses_devices(stdout.splitlines()), (["/dev/sg1", "/dev/sg2"], 0, 2)
+            )
+            for refresh in (1, 2):
+                with self.subTest(refresh=refresh):
+                    _overlay, failures, _best = await service._fetch_sg_ses_overlay(
+                        ["node.example.test"], failure_prefix="TrueNAS SCALE SSH SES"
+                    )
+                    self.assertIn(
+                        "TrueNAS SCALE SSH SES read is incomplete on node.example.test: 2 SG devices read, "
+                        "2 left out at the limit of 2 per host. Bays behind the devices left out are missing "
+                        "for this refresh.",
+                        failures,
+                    )
+                    # A cut device list is not cached, so the next refresh still says so.
+                    self.assertEqual(service._get_cached_sg_ses_devices("node.example.test"), [])
+
+        with self.subTest(control="within_limit_is_cached"):
+            service = _sg_service(self.directory)
+            self._planned_with_quiet_pages(service, stdout, [])
+            with patch.object(InventoryService, "_score_sg_ses_overlay", return_value=1):
+                _overlay, failures, _best = await service._fetch_sg_ses_overlay(
+                    ["node.example.test"], failure_prefix="TrueNAS SCALE SSH SES"
+                )
+            self.assertEqual(failures, [])
+            self.assertEqual(
+                service._get_cached_sg_ses_devices("node.example.test"),
+                ["/dev/sg1", "/dev/sg2", "/dev/sg10", "/dev/sg100"],
+            )
+
+    async def test_sg_incomplete_read_on_any_host_stays_on_the_page(self) -> None:
+        service = _sg_service(self.directory)
+        answers = {"node-a.example.test": "/dev/sg1\n/dev/sg2\n/dev/sg3\n", "node-b.example.test": "/dev/sg1\n"}
+
+        async def run_planned(planner, *, initial_commands, host):
+            discovery = SSHCommandResult(command=initial_commands[0], ok=True, stdout=answers[host], exit_code=0)
+            commands = planner([discovery])
+            return [discovery, *(SSHCommandResult(command=command, ok=True, stdout="", exit_code=0) for command in commands)]
+
+        service._run_ssh_planned_commands = run_planned
+        with (
+            patch.object(inventory_module, "SG_SES_MAX_DISCOVERED_DEVICES", 2),
+            # The cut host scores lower, so the other host's overlay is the one kept.
+            patch.object(InventoryService, "_score_sg_ses_overlay", side_effect=[1, 2]),
+        ):
+            _overlay, failures, best = await service._fetch_sg_ses_overlay(
+                list(answers), failure_prefix="TrueNAS SCALE SSH SES"
+            )
+        self.assertEqual(best, "node-b.example.test")
+        self.assertEqual(
+            failures,
+            [
+                "TrueNAS SCALE SSH SES read is incomplete on node-a.example.test: 2 SG devices read, "
+                "1 left out at the limit of 2 per host. Bays behind the devices left out are missing "
+                "for this refresh."
+            ],
+        )
+
+    def test_sg_device_digits_are_ascii_only_in_every_position(self) -> None:
+        values = ["/dev/sg1\u0663", "/dev/sg\u06631", "/dev/sg1\uff12", "/dev/sg7"]
+        self.assertEqual(InventoryService._admit_sg_ses_devices(values), (["/dev/sg7"], 3, 0))
+
+    async def test_reported_host_reader_is_total_and_never_rewrites_an_address(self) -> None:
+        label = "a" * 63
+        name_253 = ".".join([label, label, label, "b" * 61])
+        cases: dict[str, str | None] = {
+            "[::1": None,
+            "::1]": None,
+            "[bad]": None,
+            "\uff3b2001:db8::1\uff3d": None,
+            "node\uff1a22.example.test": None,
+            "node\uff0fx.example.test": None,
+            "fe80::1%eth0": None,
+            "[fe80::1%eth0]": None,
+            "bad host": None,
+            "node-e\n.example.test": None,
+            "node-f\t.example.test": None,
+            "operator@node.example.test": None,
+            "node.example.test:22": None,
+            "ssh://node.example.test": None,
+            "-oProxyCommand=x": None,
+            "b" * 64 + ".example.test": None,
+            name_253 + "c": None,
+            "2001:db8::1": "2001:db8::1",
+            "2001:DB8::A": "2001:db8::a",
+            "::ffff:192.0.2.70": "::ffff:192.0.2.70",
+            "[::ffff:192.0.2.71]": "::ffff:192.0.2.71",
+            "[2001:db8::2]": "2001:db8::2",
+            "node_b.example.test": "node_b.example.test",
+            "NODE-C.Example.TEST": "node-c.example.test",
+            "node-d.example.test.": "node-d.example.test.",
+            "nodee": "nodee",
+            "123": "123",
+            label + ".example.test": label + ".example.test",
+            name_253: name_253,
+            "192.0.2.61": "192.0.2.61",
+            "[192.0.2.62]": None,
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                service, contacted = _quantastor_snapshot_service(self.directory, {"hostname": value})
+                try:
+                    snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+                except Exception as exc:  # noqa: BLE001 - the reader must be total
+                    self.fail(f"the reported-host reader raised {type(exc).__name__}")
+                encoded = json.loads(json.dumps(snapshot.model_dump(mode="json")))
+                warnings = encoded["warnings"]
+                self.assertLessEqual(
+                    set(contacted), {expected, "192.0.2.51", "node.example.test"} - {None}, contacted
+                )
+                if expected is None:
+                    self.assertIn(REPORTED_ADDRESS_NOT_USABLE_ONE, warnings)
+                    self.assertNotIn(value.strip(), json.dumps(warnings))
+                else:
+                    self.assertIn(expected, contacted)
+                    self.assertNotIn(REPORTED_ADDRESS_NOT_USABLE_ONE, warnings)
+                    if expected != value:
+                        self.assertNotIn(value, contacted)
+
+    def test_host_identity_comparison_never_raises_and_keeps_ipv6_whole(self) -> None:
+        same = InventoryService._quantastor_hosts_match
+        self.assertFalse(same("2001:db8::1", "2001:db8::2"))
+        self.assertTrue(same("2001:db8::1", "https://[2001:db8::1]:8153"))
+        self.assertTrue(same("Node-A.Example.Test", "node-a.example.test"))
+        for value in ("[::1", "::1]", "[bad]", "\uff3b2001:db8::1\uff3d", "node\uff1a22.example.test"):
+            with self.subTest(value=value):
+                try:
+                    matched = same(value, "192.0.2.51")
+                except ValueError:
+                    self.fail("host identity comparison raised")
+                self.assertFalse(matched)
+
+    async def test_reported_host_limit_is_shown_on_the_page_with_both_counts(self) -> None:
+        service, contacted = _quantastor_snapshot_service(
+            self.directory, {"ipAddresses": _documentation_addresses(257)}
+        )
+        snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+        self.assertIn(
+            "QuantaStor node address read is incomplete: 256 addresses used, 1 left out at the limit of "
+            "256 per node. The addresses left out were not tried over SSH.",
+            snapshot.warnings,
+        )
+        self.assertIn("203.0.113.56", contacted)
+        self.assertNotIn("203.0.113.57", contacted)
+
+        for count in (8, 9, 256):
+            with self.subTest(control=count):
+                addresses = _documentation_addresses(count)
+                service, contacted = _quantastor_snapshot_service(self.directory, {"ipAddresses": addresses})
+                snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+                self.assertFalse([w for w in snapshot.warnings if "node address" in w], snapshot.warnings)
+                self.assertLessEqual(set(addresses), set(contacted))
+
+    def test_gateway_port_hosts_are_read_far_above_real_port_counts(self) -> None:
+        ports = [
+            {"storageSystemId": "node-a", "ipAddress": f"198.51.100.{index}", "gateway": "198.51.100.254"}
+            for index in range(1, 201)
+        ] + [
+            {"storageSystemId": "node-a", "ipAddress": f"2001:db8::{index:x}", "gateway": "2001:db8::fffe"}
+            for index in range(1, 58)
+        ] + [{"storageSystemId": "node-a", "ipAddress": "fe80::1%eth0", "gateway": "192.0.2.1"}]
+        raw = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[], cli_network_ports=ports
+        )
+        by_system = InventoryService._quantastor_gateway_hosts_by_system(raw)
+        self.assertEqual(len(by_system["node-a"]), 256)
+        self.assertEqual(by_system["node-a"][-1], "2001:db8::38")
+        self.assertEqual(
+            InventoryService._quantastor_reported_host_warnings(raw),
+            [
+                REPORTED_ADDRESS_NOT_USABLE_ONE,
+                "QuantaStor node address read is incomplete: 256 addresses used, 1 left out at the limit of "
+                "256 per node. The addresses left out were not tried over SSH.",
+            ],
+        )
+        healthy = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[], cli_network_ports=ports[:12]
+        )
+        self.assertEqual(len(InventoryService._quantastor_gateway_hosts_by_system(healthy)["node-a"]), 12)
+        self.assertEqual(InventoryService._quantastor_reported_host_warnings(healthy), [])
+
+    def test_admission_warnings_use_a_fixed_limiter_state(self) -> None:
+        now = [1000.0]
+        limiter = RepeatedLogLimiter(repeat_interval_seconds=60, clock=lambda: now[0])
+        service = _sg_service(self.directory)
+        with (
+            patch.object(ssh_probe_module, "SSH_COMMAND_FAILURE_LOG", limiter),
+            self.assertLogs("app.services.inventory", level="WARNING") as logs,
+        ):
+            for count in (1, 2, 1, 2):
+                service._log_sg_ses_discovery_admission("node.example.test", count, 0)
+                InventoryService._log_reported_host_admission(count, 0)
+            now[0] += 61
+            service._log_sg_ses_discovery_admission("node.example.test", 2, 3)
+            InventoryService._log_reported_host_admission(2, 3)
+        sg_lines = [line for line in logs.output if "operation=sg_ses_discovery" in line]
+        host_lines = [line for line in logs.output if "operation=quantastor_node_hosts" in line]
+        self.assertEqual(len(sg_lines), 2, logs.output)
+        self.assertEqual(len(host_lines), 2, logs.output)
+        self.assertIn("ignored 1 lines", sg_lines[0])
+        self.assertIn("ignored 1 values", host_lines[0])
+        self.assertIn("ignored 2 lines that are not an SG device path and 3 devices", sg_lines[1])
+        self.assertIn("ignored 2 values that are not an IP address or DNS name and 3 beyond", host_lines[1])
+        self.assertIn("3 identical messages suppressed", sg_lines[1])
 
 
 if __name__ == "__main__":

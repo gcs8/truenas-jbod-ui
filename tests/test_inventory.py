@@ -11498,11 +11498,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
             )
-            service._discover_and_fetch_sg_ses_host_overlay = AsyncMock(
+            service._discover_sg_ses_host_read = AsyncMock(
                 return_value=(
                     ["/dev/sg0"],
                     overlay,
                     ["TrueNAS SCALE SSH SES EC page probe failed."],
+                    None,
                 )
             )
 
