@@ -194,6 +194,25 @@ test("a healthy, fully read disk still scores 0 with no reason", () => {
   assert.deepEqual(plain([failed.value, failed.reasons]), [51, ["SMART FAILED", "100 CRC errors"]]);
 });
 
+// The score weighs both thresholds, so each one refused on its own makes a
+// healthy 0 incomplete; read fault evidence is not involved.
+for (const field of ["warning_temperature_c", "critical_temperature_c"]) {
+  test(`a refused ${field} qualifies a healthy zero score`, () => {
+    const refused = score({ smart_health_status: "PASSED", temperature_c: 30 }, [field]);
+    assert.deepEqual(plain([refused.value, refused.reasons]), [0, ["SMART inputs not read"]]);
+    assert.equal(refused.missingText, undefined);
+    const read = score({ smart_health_status: "PASSED", temperature_c: 30, warning_temperature_c: 60, critical_temperature_c: 70 });
+    assert.deepEqual(plain([read.value, read.reasons]), [0, []]);
+  });
+}
+
+test("Available Spare says not read when only its threshold was refused and no spare reading exists", () => {
+  assert.equal(app.formatAvailableSpareValue(entry({ firmware_version: "FW01" }, ["available_spare_threshold_percent"])), "not read");
+  // Absent spare with nothing refused keeps n/a.
+  assert.equal(app.formatAvailableSpareValue(entry({ firmware_version: "FW01" })), "n/a");
+  assert.equal(app.formatAvailableSpareValue(entry({ firmware_version: "FW01" }, ["media_errors"])), "n/a");
+});
+
 test("the heat map says why a bay has no value", () => {
   const temperature = { id: "temperature_c", label: "Temperature", historyMetrics: ["temperature_c"], format: String };
   const attention = { id: "attention_score", label: "Attention Score", format: String };

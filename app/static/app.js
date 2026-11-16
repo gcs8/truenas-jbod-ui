@@ -5213,7 +5213,7 @@
     if (Number.isInteger(spare)) {
       return smartFieldNotRead(smartEntry, "available_spare_threshold_percent") ? `${spare}% (threshold not read)` : `${spare}%`;
     }
-    if (smartFieldNotRead(smartEntry, "available_spare_percent")) {
+    if (smartFieldNotRead(smartEntry, "available_spare_percent", "available_spare_threshold_percent")) {
       return "not read";
     }
     if (smartEntry?.loading) {
@@ -5955,7 +5955,8 @@
   }
 
   // The SMART fields the Attention Score weighs. When one of them was not
-  // read, a low score is not evidence of low risk.
+  // read, a low score is not evidence of low risk. The two temperature
+  // thresholds are weighed too, but are not risk readings on their own.
   function attentionScoreInputState(data) {
     const inputs = [
       "smart_health_status", "temperature_c", "endurance_used_percent", "endurance_remaining_percent",
@@ -5963,9 +5964,10 @@
       "write_error_count", "uncorrected_write_errors", "interface_crc_errors", "unsafe_shutdowns",
       "annualized_bytes_written",
     ];
+    const thresholds = ["warning_temperature_c", "critical_temperature_c"];
     const unread = Array.isArray(data?.unread_fields) ? data.unread_fields : [];
     return {
-      notRead: inputs.some((field) => unread.includes(field)),
+      notRead: [...inputs, ...thresholds].some((field) => unread.includes(field)),
       anyRead: inputs.some((field) => ![null, undefined, ""].includes(data?.[field])),
     };
   }
