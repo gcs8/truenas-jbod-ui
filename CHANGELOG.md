@@ -48,6 +48,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A history pass where every SMART metric read failed no longer counts as a
+  success: it fails, keeps both metric cadences, and the next pass reads the
+  metrics again. When only some scopes fail, the healthy ones keep their
+  samples and the failed ones are retried on the next pass while the
+  collector reports partial collection (#1241).
 - In the admin setup form, turning off One-Time Bootstrap or switching the
   platform to VMware ESXi or a BMC-only system while a permission preview is
   still loading now keeps the guidance for the form as it is; the older

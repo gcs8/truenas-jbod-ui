@@ -107,6 +107,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_fresh_deadline",
         "test_history_health_states",
         "test_history_released_schema_upgrades",
+        "test_history_smart_metric_failure",
         "test_jbod_runner_trial",
         "test_mapping_store",
         "test_metrics",
