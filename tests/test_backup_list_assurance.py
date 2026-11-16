@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import threading
 import unittest
 
@@ -854,6 +855,113 @@ class VerifyOutcomeTests(backup_fixtures.SchedulerTestBase):
                 last_verify = self._detail(scheduler, nas.artifact_id)["last_verify"]
                 self.assertIn("outcome", last_verify, "the details carry no Verify outcome")
                 self.assertEqual(last_verify["outcome"], presented)
+
+
+@unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+class VerifyCleanupFailureTests(backup_fixtures.SchedulerTestBase):
+    """Removing the fetched copy can fail after the comparison; the comparison result stands.
+
+    The failure is real: right after the unchanged comparison, the task's own
+    fetch directory is made read-only, so removing the fetched file fails at
+    the operating system with ``PermissionError``.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = archive_transport_fixtures.FakeS3Client()
+        self.read_fails: set[str] = set()
+
+    _copies = VerifyOutcomeTests._copies
+    open_target = VerifyOutcomeTests.open_target
+    _config = VerifyOutcomeTests._config
+    _verify = VerifyOutcomeTests._verify
+    _detail = VerifyOutcomeTests._detail
+    _corrupt = VerifyOutcomeTests._corrupt
+
+    @contextlib.contextmanager
+    def _errors_logged(self):
+        import logging
+
+        records: list[str] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(f"{record.levelname}:{record.getMessage()}")
+
+        handler = Capture(logging.ERROR)
+        log = logging.getLogger("history_service.backup_scheduler.service")
+        log.addHandler(handler)
+        try:
+            yield records
+        finally:
+            log.removeHandler(handler)
+
+    def _lock_fetch_dir_after_comparison(self, scheduler):
+        from unittest import mock
+
+        from history_service.backup_scheduler import service
+
+        original = service._require_match
+        locked = []
+
+        def compare_then_lock(*args):
+            try:
+                original(*args)
+            finally:
+                for workspace in scheduler.paths.state_dir.glob("backup-fetch-*"):
+                    workspace.chmod(0o500)
+                    locked.append(workspace)
+
+        def unlock():
+            for workspace in locked:
+                workspace.chmod(0o700)
+
+        self.addCleanup(unlock)
+        return mock.patch.object(service, "_require_match", side_effect=compare_then_lock)
+
+    def test_a_mismatch_stays_a_mismatch_when_clean_up_fails(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        self._corrupt("nas", nas)
+        with self._lock_fetch_dir_after_comparison(scheduler), self._errors_logged() as logs:
+            result = self._verify(scheduler, nas.artifact_id)
+            status, body = backup_fixtures.asgi_call(
+                build_app(scheduler), "GET", f"/internal/backups/{nas.artifact_id}/download"
+            )
+        self.assertEqual((result["ok"], result["outcome"]), (False, "mismatch"))
+        self.assertEqual(result["detail"], "Readback does not match the catalogued size and SHA-256.")
+        self.assertIs(result["artifact"]["verified"], False)
+        self.assertIs(result["artifact"]["restorable"], False)
+        self.assertFalse(scheduler.get(nas.artifact_id).verified)
+        self.assertEqual(self._detail(scheduler, nas.artifact_id)["last_verify"]["outcome"], "mismatch")
+        # A download of the same bytes is refused as a mismatch, not as an unreadable copy.
+        self.assertEqual(status, 409, body)
+        self.assertTrue(logs and all(line.startswith("ERROR:") and "PermissionError" in line for line in logs), logs)
+
+    def test_a_match_stays_a_match_when_clean_up_fails(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        with self._lock_fetch_dir_after_comparison(scheduler), self._errors_logged() as logs:
+            result = self._verify(scheduler, nas.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (True, "matched"))
+        self.assertTrue(scheduler.get(nas.artifact_id).verified)
+        self.assertEqual(self._detail(scheduler, nas.artifact_id)["last_verify"]["outcome"], "matched")
+        self.assertTrue(logs and all(line.startswith("ERROR:") and "PermissionError" in line for line in logs), logs)
+        self.assertFalse(any(str(scheduler.paths.state_dir) in line for line in logs), logs)
+
+    def test_an_ordinary_mismatch_is_still_a_mismatch(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        self._corrupt("nas", nas)
+        result = self._verify(scheduler, nas.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "mismatch"))
+        self.assertFalse(scheduler.get(nas.artifact_id).verified)
+        self.assertEqual(list(scheduler.paths.state_dir.glob("backup-fetch-*")), [])
 
 
 if __name__ == "__main__":

@@ -75,7 +75,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   generic request failure. A Verify now reports whether the copy was read and
   matched, read and did not match, or could not be read; one that could not
   read the copy says nothing was checked and its earlier status is unchanged,
-  instead of reading as a failed check (#1255).
+  instead of reading as a failed check. If removing the fetched temporary copy
+  fails afterwards, the comparison's result stands (a copy that did not match
+  is still reported and marked as not matching, and a download of it is still
+  refused as a mismatch) and the clean-up failure is logged (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

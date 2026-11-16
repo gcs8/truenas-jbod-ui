@@ -1510,9 +1510,13 @@ class BackupScheduler:
             _require_match(record, size, digest)
             yield record, local
         finally:
-            for child in workspace.iterdir():
-                child.unlink(missing_ok=True)
-            workspace.rmdir()
+            try:
+                for child in workspace.iterdir():
+                    child.unlink(missing_ok=True)
+                workspace.rmdir()
+            except OSError as exc:
+                # Never let clean-up replace the result of the read and comparison (#1202).
+                logger.error("Backup fetch workspace could not be removed (%s).", type(exc).__name__)
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
