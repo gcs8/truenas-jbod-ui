@@ -344,7 +344,10 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
     controller_pattern = re.compile(
         r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
+        # The loginfo value is the whole rest of the line, whatever it holds:
+        # the decoder decides whether it is a number. A later tail is never
+        # read in place of the first one.
+        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo(?:\s+(?P<loginfo>.*))?)?$"
     )
     disk_pattern = re.compile(
         r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
@@ -393,7 +396,8 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
                     "controller": controller_match.group("controller"),
                     "target": target,
                     "smid": controller_match.group("smid"),
-                    "loginfo": controller_match.group("loginfo"),
+                    # An empty loginfo field is present but malformed, not absent.
+                    "loginfo": (controller_match.group("loginfo") or "") if target is not None else None,
                     "message": message,
                     "event_type": _mpr_dmesg_event_type(message),
                     "severity": "error",

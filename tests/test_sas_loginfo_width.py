@@ -112,6 +112,76 @@ class LoginfoSummaryBoundTests(unittest.TestCase):
         self.assertEqual(summary.get("loginfo_rejected_count"), 0)
 
 
+# A loginfo field whose value is not a hex number of at most 32 bits, or that
+# is followed by more text (including a second loginfo tail), is malformed.
+MALFORMED_LOGINFO = (
+    "3001zz00",
+    "+30010000",
+    "-1",
+    "3001_0000",
+    "\u06630010000",
+    "gg",
+    "30010000,1",
+    "30010000 extra",
+    "zz tgt 1 SMID 2 loginfo 30010000",
+    "",
+)
+
+
+class MalformedLoginfoTests(unittest.TestCase):
+    """The loginfo field's complete raw value is read; a rejected one stays visible."""
+
+    SCOPES = (("by_controller", "mpr0"), ("by_controller_target", "mpr0:1"))
+
+    @staticmethod
+    def _line(loginfo: str) -> str:
+        return f"mpr0: Controller reported scsi ioc terminated tgt 1 SMID 1 loginfo {loginfo}".rstrip()
+
+    def assert_valid_control(self) -> None:
+        events = parse_mpr_dmesg_events(self._line("30010000"))
+        row = events["by_controller"]["mpr0"]["event_table"]["rows"][0]
+        self.assertEqual(row["label"], KNOWN_LABEL)
+        self.assertEqual(row["decode_confidence"], "vendor-reference")
+        for scope, key in self.SCOPES:
+            self.assertEqual(events[scope][key]["loginfo_counts"], {"30010000": 1})
+            self.assertEqual(events[scope][key]["loginfo_rejected_count"], 0)
+
+    def test_malformed_values_are_rejected_not_absent(self) -> None:
+        for raw in MALFORMED_LOGINFO:
+            with self.subTest(loginfo=raw):
+                events = parse_mpr_dmesg_events(self._line(raw))
+                row = events["by_controller"]["mpr0"]["event_table"]["rows"][0]
+                for source in (row, row["decoded"]):
+                    self.assertNotEqual(source.get("label"), KNOWN_LABEL)
+                    self.assertEqual(source.get("family"), "controller_terminated_io")
+                    self.assertEqual(source.get("decode_confidence"), "unconfirmed")
+                    self.assertIn("not decoded", source.get("decoder_note", ""))
+                    self.assertNotIn("vendor", source)
+                    self.assertNotIn("lsi_loginfo", source)
+                self.assertEqual(row["decoded"]["loginfo"], raw.lower())
+                self.assertEqual(row["loginfo"], raw)
+                self.assertEqual(row["target"], "1")
+                self.assertEqual(row["smid"], "1")
+                for scope, key in self.SCOPES:
+                    summary = events[scope][key]
+                    self.assertEqual(summary["loginfo_counts"], {})
+                    self.assertEqual(summary["loginfo_rejected_count"], 1)
+                    metric = _diagnostic_metric_summary(summary)
+                    self.assertEqual(metric["loginfo_counts"], {})
+                    self.assertEqual(metric["loginfo_rejected_count"], 1)
+                self.assert_valid_control()
+
+    def test_rejected_raw_evidence_is_bounded(self) -> None:
+        raw = "z" * 200
+        events = parse_mpr_dmesg_events(self._line(raw))
+        row = events["by_controller"]["mpr0"]["event_table"]["rows"][0]
+
+        self.assertIsInstance(row["decoded"].get("loginfo"), str)
+        self.assertLessEqual(len(row["decoded"]["loginfo"]), 32)
+        self.assertTrue(row["decoded"]["loginfo"].endswith("..."))
+        self.assertLessEqual(len(row["loginfo"]), 384)
+
+
 class KernelTextSummaryKeyTests(unittest.TestCase):
     """Free kernel text is bounded like row text before it becomes a summary key."""
 

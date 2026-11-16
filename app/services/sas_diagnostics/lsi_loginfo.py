@@ -271,6 +271,21 @@ MAX_REJECTED_LOGINFO_LENGTH = 32
 def _over_width_loginfo(raw: str) -> dict[str, Any]:
     # A loginfo is a 32-bit value. Masking a wider token to its low 32 bits
     # would select a known fault from a suffix, so it stays raw evidence.
+    return _undecoded_loginfo(
+        raw, "Loginfo value is wider than 32 bits, so it was not decoded against the LSI reference table."
+    )
+
+
+def malformed_loginfo_result(raw: str) -> dict[str, Any]:
+    """Result for a loginfo field whose value is not a hexadecimal number."""
+    return _undecoded_loginfo(
+        raw,
+        "Loginfo value is malformed (it must be hexadecimal digits), so it was not decoded "
+        "against the LSI reference table.",
+    )
+
+
+def _undecoded_loginfo(raw: str, note: str) -> dict[str, Any]:
     bounded = raw
     if len(bounded) > MAX_REJECTED_LOGINFO_LENGTH:
         bounded = f"{bounded[: MAX_REJECTED_LOGINFO_LENGTH - 3]}..."
@@ -281,13 +296,14 @@ def _over_width_loginfo(raw: str) -> dict[str, Any]:
         "description": "The HBA reported an IO terminated before normal completion; its loginfo value was not decoded.",
         "loginfo": bounded,
         "decode_confidence": "unconfirmed",
-        "decoder_note": "Loginfo value is wider than 32 bits, so it was not decoded against the LSI reference table.",
+        "decoder_note": note,
     }
 
 
-def loginfo_is_over_width(loginfo: Any) -> bool:
-    """True when a hex loginfo token has more than 32 bits of digits."""
-    return len(str(loginfo or "").strip().lower().removeprefix("0x")) > MAX_LOGINFO_HEX_DIGITS
+def loginfo_is_rejected(loginfo: Any) -> bool:
+    """True unless the loginfo is a hex number of at most 32 bits."""
+    raw = str(loginfo or "").strip().lower().removeprefix("0x")
+    return not (raw and re.fullmatch(r"[0-9a-f]+", raw) and len(raw) <= MAX_LOGINFO_HEX_DIGITS)
 
 
 def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:

@@ -12,7 +12,7 @@ from app.services.sas_diagnostics.common import (
     fault_family_severity,
     severity_rank,
 )
-from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo, loginfo_is_over_width
+from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo, loginfo_is_rejected, malformed_loginfo_result
 from app.services.sas_diagnostics.scsi import (
     decode_scsi_cdb_message,
     decode_scsi_sense_event,
@@ -93,6 +93,9 @@ def decode_mpr_dmesg_event(event: dict[str, Any]) -> dict[str, Any]:
         decoded_loginfo = decode_lsi_loginfo(loginfo)
         if decoded_loginfo:
             return decoded_loginfo
+        if event.get("loginfo") is not None:
+            # The field was printed but is not a number: say so, never absent.
+            return malformed_loginfo_result(loginfo)
         return {
             "label": "Controller terminated SCSI IO",
             "family": "controller_terminated_io",
@@ -237,10 +240,10 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
         summary["devices"].add(event["device"])
     if event.get("target"):
         summary["targets"].add(event["target"])
-    if event.get("loginfo"):
-        # An over-width loginfo is never decoded, so it is counted as rejected
-        # instead of becoming an unbounded summary key.
-        if loginfo_is_over_width(event["loginfo"]):
+    if event.get("loginfo") is not None:
+        # A loginfo that is not a 32-bit hex number is never decoded, so it is
+        # counted as rejected instead of becoming a summary key.
+        if loginfo_is_rejected(event["loginfo"]):
             summary["loginfo_rejected_count"] += 1
         else:
             summary["loginfo_counts"][event["loginfo"]] += 1
