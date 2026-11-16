@@ -764,33 +764,47 @@ last.
 
 When the same import also restores configuration files or folders (config,
 runtime overrides, profiles, mappings, aliases, slot cache, SSH keys, TLS trust or
-known hosts), the marker becomes a whole-import journal (version 2). Before each
-of those targets changes, the journal durably records its absolute path, the
-identity of its parent folder, its fixed staging and prior names, and the exact
-prior and candidate records. The first time it touches a folder, the import also
-writes a private seal file, `.truenas-jbod-ui-import-seal-<transaction>`, there
-and records it. The journal itself lives in the history folder, which
-lower-trust services can write. Recovery acts on a configuration folder only
-when that folder holds the recorded seal, so a forged journal cannot point
-recovery at files its writer could not change itself. Parked prior and displaced
-configuration copies are retired by an authenticated rename before they are
-deleted, so a crash part-way through a delete never leaves a recorded path half
-removed. The import then records `commit` before commit
-cleanup, or `rollback` before an in-process rollback. Recovery converges every
-recorded target and the history generation to that decision. With no decision it
-finishes forward only when every target already holds the candidate, and
-otherwise returns every target to the prior generation. It reports
-`prior-generation-restored` or `candidate-finalized` only after configuration and
-history agree. Recovery refuses, changes nothing and keeps the journal with a
-named `reason` when the journal is malformed or overlaps history
-(`journal-invalid`), was written by another user (`journal-owner-mismatch`), a
-target's folder is missing or is not the one the restore used
-(`configuration-target-unavailable`), the folder lacks the recorded seal
-(`configuration-target-unsealed`), a recorded file changed
-(`configuration-target-divergent`), the prior copy is gone
+known hosts), the marker becomes a whole-import journal (version 2). Before
+anything is staged in a configuration folder, the import writes a private record
+there, `.truenas-jbod-ui-import-seal-<transaction>`. Before each target changes,
+the import rewrites its folder's record (write, fsync, rename, folder fsync) to
+add the target's absolute path, the identity of its folder, its fixed staging
+and prior names, and the exact prior and candidate records. The first folder's
+record also lists every folder before anything in that folder changes, and holds
+the decision: `pending`, then `commit` before commit cleanup or `rollback` before
+an in-process rollback. The journal lives in the history folder, which
+lower-trust services can write, so it is only an index: it names the transaction
+and the first folder, and repeats each target for a cross-check. Recovery acts
+only on targets the folder records list, converges every folder the first record
+lists, and takes the decision from that record, never from the journal: `commit`
+finishes forward, and `pending` or `rollback` returns every target and the
+history to the prior generation. Parked prior and displaced configuration copies
+are retired by an authenticated rename before they are deleted, so a crash
+part-way through a delete never leaves a recorded path half removed. Recovery
+reports `prior-generation-restored` or `candidate-finalized` only after
+configuration and history agree, then removes the journal and the folder
+records. It refuses, changes nothing and keeps the journal with a named `reason`
+when the journal is malformed or overlaps history (`journal-invalid`), was
+written by another user (`journal-owner-mismatch`), a folder is missing or is
+not the one the restore used (`configuration-target-unavailable`), a folder
+record is missing, malformed or does not belong to the first folder's record
+(`configuration-target-unsealed`), the journal names a target that its folder's
+record does not list exactly (`configuration-target-unrecorded`), a recorded
+file changed (`configuration-target-divergent`), the prior copy is gone
 (`prior-generation-unavailable`), or a committed import no longer holds the
 candidate (`committed-generation-incomplete`). Builds that only know version 1
 refuse a version 2 journal rather than recovering history alone (#1196).
+
+What this protects: recovery deletes, replaces or renames a configuration path
+only when the record in that path's own folder, written by the restore before
+the path changed, names it, and it moves the listed targets together to their
+recorded prior or candidate as the restore's recorded decision says. Editing
+the journal cannot change that. A writer of the history folder can still delete
+the journal or rewrite it as a history-only journal, so that recovery leaves
+configuration as the interrupted import left it, or make recovery refuse. Recovery
+judges history only from the history folder, so such a writer can always make
+history disagree with configuration. A writer of a configuration folder can
+change those files directly; recovery gives it no more than that.
 
 The history container does not mount the configuration volume, and in the base
 Compose file the admin service that ran the restore writes the journal as root.

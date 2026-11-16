@@ -25,6 +25,7 @@ from history_service import segment_migration
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
+from history_service.segmented_restore import import_seal_path
 from history_service.segmented_restore import record_file as record_restore_file
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
@@ -345,6 +346,50 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
     def _hard_exit(*_args: Any, **_kwargs: Any) -> None:
         os._exit(CRASH_EXIT)
 
+    def _crash_before_history(self, target: _Deployment) -> Path:
+        """Interrupt the import after configuration, before history; return the journal."""
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(
+                    _ImportActivationTransaction,
+                    "activate_segmented_history",
+                    self._hard_exit,
+                )
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        self.assertEqual(self._config_generation(target), "candidate")
+        marker = activation_pending_path(target.hot)
+        self.assertTrue(marker.exists())
+        return marker
+
+    def _assert_refused_and_unchanged(
+        self,
+        target: _Deployment,
+        reason: str,
+        *,
+        protected: Path | None = None,
+        protected_bytes: bytes | None = None,
+    ) -> None:
+        """Both dry run and apply refuse with ``reason`` and change nothing."""
+        marker = activation_pending_path(target.hot)
+        journal_before = marker.read_bytes()
+        hot_before = target.hot.read_bytes()
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                with self.assertRaises(ValueError) as refused:
+                    self._recover(target, apply=apply)
+                self.assertEqual(getattr(refused.exception, "reason", None), reason)
+                self.assertEqual(marker.read_bytes(), journal_before)
+                self.assertEqual(target.hot.read_bytes(), hot_before)
+                self.assertEqual(self._config_generation(target), "candidate")
+                if protected is not None:
+                    self.assertEqual(
+                        protected.read_bytes() if protected.exists() else None,
+                        protected_bytes,
+                    )
+
     # Crash matrix -----------------------------------------------------------
 
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
@@ -539,7 +584,15 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
 
         self.assertEqual(exit_code, CRASH_EXIT)
         journal = json.loads(activation_pending_path(target.hot).read_text(encoding="utf-8"))
-        self.assertEqual(journal.get("decision"), "commit")
+        # The decision lives in the first configuration folder's record, not
+        # in the journal a writer of the history folder could edit.
+        anchor = json.loads(
+            import_seal_path(target.runtime.parent, journal["transaction_id"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(anchor.get("decision"), "commit")
+        self.assertNotIn("decision", journal)
 
         result = self._recover(target)
 
@@ -703,12 +756,27 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         )
         original = marker.read_bytes()
         forged = json.loads(original)
-        forged["targets"][0]["path"] = str(target.hot)
+        transaction_id = forged["transaction_id"]
+        history_folder = target.hot.parent.stat()
+        # Every other field is consistent with the hot database, so only the
+        # overlap check can refuse this target.
+        forged["targets"][0].update(
+            {
+                "path": str(target.hot),
+                "parent": {
+                    "device": history_folder.st_dev,
+                    "inode": history_folder.st_ino,
+                },
+                "staged_name": f".{target.hot.name}.restore-{transaction_id}",
+                "previous_name": f".{target.hot.name}.previous-{transaction_id}",
+            }
+        )
         marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
 
         with self.assertRaises(ValueError) as refused:
             self._recover(target)
         self.assertEqual(getattr(refused.exception, "reason", None), "journal-invalid")
+        self.assertIn("overlaps history", str(refused.exception))
         self.assertTrue(marker.exists())
         self.assertEqual(target.runtime.read_bytes(), CANDIDATE_RUNTIME)
 
@@ -718,6 +786,218 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             self._assert_one_generation(target, result, label="control"),
             "prior",
         )
+
+    # Folder records (journal edited by a writer of the history folder) ------
+
+    def _runtime_entry(self, journal: dict[str, Any], target: _Deployment) -> dict[str, Any]:
+        return next(item for item in journal["targets"] if item["path"] == str(target.runtime))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_forged_target_in_a_folder_the_restore_changed(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        original = marker.read_bytes()
+        journal = json.loads(original)
+        transaction_id = journal["transaction_id"]
+        # An unselected sibling in the folder the restore really changed and
+        # sealed. The forged target claims it did not exist before, so a
+        # return to the prior generation would delete it.
+        victim = target.runtime.parent / "profiles.yaml"
+        victim_bytes = b"synthetic profiles kept by the operator\n"
+        victim.write_bytes(victim_bytes)
+        forged_target = dict(self._runtime_entry(journal, target))
+        forged_target.update(
+            {
+                "path": str(victim),
+                "staged_name": f".{victim.name}.restore-{transaction_id}",
+                "previous_name": f".{victim.name}.previous-{transaction_id}",
+                "prior": {"kind": "missing"},
+                "candidate": record_restore_file(victim),
+            }
+        )
+        forged = json.loads(original)
+        forged["targets"].append(forged_target)
+        marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+
+        self._assert_refused_and_unchanged(
+            target,
+            "configuration-target-unrecorded",
+            protected=victim,
+            protected_bytes=victim_bytes,
+        )
+
+        # Control: the journal the restore wrote recovers and keeps the file.
+        marker.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+        self.assertEqual(victim.read_bytes(), victim_bytes)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_listed_target_whose_records_were_altered(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        original = marker.read_bytes()
+        for field in ("prior", "candidate"):
+            with self.subTest(field=field):
+                forged = json.loads(original)
+                entry = self._runtime_entry(forged, target)
+                entry[field] = dict(entry[field], sha256="0" * 64)
+                marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+                self._assert_refused_and_unchanged(target, "configuration-target-unrecorded")
+
+        marker.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_truncated_or_replaced_folder_record(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        transaction_id = json.loads(marker.read_bytes())["transaction_id"]
+        record = import_seal_path(target.runtime.parent, transaction_id)
+        other_folder_record = import_seal_path(target.mapping.parent, transaction_id)
+        original = record.read_bytes()
+        for label, content in (
+            ("truncated", original[: len(original) // 2]),
+            ("replaced", other_folder_record.read_bytes()),
+        ):
+            with self.subTest(record=label):
+                record.write_bytes(content)
+                self._assert_refused_and_unchanged(target, "configuration-target-unsealed")
+
+        record.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_converges_a_restored_folder_the_journal_omits(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        forged = json.loads(marker.read_bytes())
+        # Dropping a whole folder from the index must not leave its restored
+        # files behind while every other target returns to the prior.
+        forged["targets"] = [
+            item
+            for item in forged["targets"]
+            if Path(item["path"]).parent != target.mapping.parent
+        ]
+        self.assertTrue(forged["targets"])
+        marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+
+        result = self._recover(target)
+
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="folder omitted"),
+            "prior",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_first_folder_record_planted_outside_configuration(self) -> None:
+        target = self._target()
+        # Every target, history included, holds the candidate and no decision
+        # was recorded, so the restore's own records return to the prior.
+        exit_code = self._import_in_child(
+            target,
+            lambda: [patch.object(_ImportActivationTransaction, "commit", self._hard_exit)],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        marker = activation_pending_path(target.hot)
+        original = marker.read_bytes()
+        journal = json.loads(original)
+        transaction_id = journal["transaction_id"]
+
+        def identity(folder: Path) -> dict[str, Any]:
+            metadata = folder.stat()
+            return {"path": str(folder), "device": metadata.st_dev, "inode": metadata.st_ino}
+
+        # A writer of the history folder plants a first-folder record there
+        # that claims the commit decision, listing the real configuration
+        # folders or leaving them out.
+        planted_folder = target.hot.parent
+        planted = import_seal_path(planted_folder, transaction_id)
+        hot_before = target.hot.read_bytes()
+        for label, folders in (
+            ("lists them", [planted_folder, target.runtime.parent, target.mapping.parent]),
+            ("leaves them out", [planted_folder]),
+        ):
+            with self.subTest(planted=label):
+                planted.unlink(missing_ok=True)
+                descriptor = os.open(planted, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(
+                        json.dumps(
+                            {
+                                "purpose": "restore-import-seal",
+                                "transaction_id": transaction_id,
+                                "folder": str(planted_folder),
+                                "anchor": str(planted_folder),
+                                "folders": [identity(folder) for folder in folders],
+                                "decision": "commit",
+                                "targets": [],
+                            }
+                        ).encode("utf-8")
+                    )
+                forged = json.loads(original)
+                forged["anchor"] = identity(planted_folder)
+                marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+                for apply in (False, True):
+                    with self.assertRaises(ValueError, msg=f"apply={apply}") as refused:
+                        self._recover(target, apply=apply)
+                    self.assertEqual(
+                        getattr(refused.exception, "reason", None),
+                        "configuration-target-unsealed",
+                    )
+                    self.assertTrue(marker.exists())
+                    self.assertEqual(target.hot.read_bytes(), hot_before)
+                    self.assertEqual(self._config_generation(target), "candidate")
+
+        planted.unlink()
+        marker.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_takes_the_decision_from_the_configuration_folder(self) -> None:
+        cases = (
+            # Crash after the commit decision; the journal now claims rollback.
+            ("committed", "_finalize_commit", "rollback", "candidate"),
+            # Crash after every target, history included, held the candidate
+            # and before any decision; the journal now claims commit.
+            ("undecided", "commit", "commit", "prior"),
+        )
+        for label, crash_at, forged_decision, expected in cases:
+            with self.subTest(case=label):
+                target = self._target(f"target-{label}")
+                exit_code = self._import_in_child(
+                    target,
+                    lambda name=crash_at: [
+                        patch.object(_ImportActivationTransaction, name, self._hard_exit)
+                    ],
+                )
+                self.assertEqual(exit_code, CRASH_EXIT)
+                marker = activation_pending_path(target.hot)
+                forged = json.loads(marker.read_bytes())
+                forged["decision"] = forged_decision
+                marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+
+                result = self._recover(target)
+
+                self.assertEqual(
+                    self._assert_one_generation(target, result, label=label),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

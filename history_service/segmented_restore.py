@@ -19,6 +19,7 @@ ACTIVATION_JOURNAL_VERSION = 1
 # instead of recovering history alone (#1196).
 WHOLE_IMPORT_JOURNAL_VERSION = 2
 WHOLE_IMPORT_DECISIONS = frozenset({"pending", "commit", "rollback"})
+IMPORT_SEAL_PURPOSE = "restore-import-seal"
 MAX_ACTIVATION_JOURNAL_BYTES = 1024 * 1024
 RESTORE_PHASES = frozenset(
     {
@@ -297,7 +298,8 @@ def tree_matches(path: Path, record: Any) -> bool:
         return False
 
 
-def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _read_private_json(path: Path, *, invalid: str, changed: str) -> tuple[Any, dict[str, Any]]:
+    """Read a bounded private single-link JSON file and its exact record."""
     descriptor = os.open(
         path,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -310,10 +312,10 @@ def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
             or stat.S_IMODE(before.st_mode) & 0o077
             or before.st_size > MAX_ACTIVATION_JOURNAL_BYTES
         ):
-            raise ValueError("History activation journal is invalid.")
+            raise ValueError(invalid)
         content = os.read(descriptor, MAX_ACTIVATION_JOURNAL_BYTES + 1)
         if len(content) > MAX_ACTIVATION_JOURNAL_BYTES or os.read(descriptor, 1):
-            raise ValueError("History activation journal is invalid.")
+            raise ValueError(invalid)
         after = os.fstat(descriptor)
         path_metadata = os.stat(path, follow_symlinks=False)
         if (
@@ -333,13 +335,31 @@ def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
             before.st_mtime_ns,
             before.st_ctime_ns,
         ) or (path_metadata.st_dev, path_metadata.st_ino) != (before.st_dev, before.st_ino):
-            raise ValueError("History activation journal changed while it was being read.")
+            raise ValueError(changed)
     finally:
         os.close(descriptor)
     try:
         payload = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("History activation journal is invalid.") from exc
+        raise ValueError(invalid) from exc
+    return payload, {
+        "kind": "file",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+    }
+
+
+def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload, record = _read_private_json(
+        path,
+        invalid="History activation journal is invalid.",
+        changed="History activation journal changed while it was being read.",
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("operation") not in {"rotate", "segmented-restore"}
@@ -352,16 +372,7 @@ def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
         )
     ):
         raise ValueError("History activation journal is invalid.")
-    return payload, {
-        "kind": "file",
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "size_bytes": len(content),
-        "device": before.st_dev,
-        "inode": before.st_ino,
-        "mode": stat.S_IMODE(before.st_mode),
-        "uid": before.st_uid,
-        "gid": before.st_gid,
-    }
+    return payload, record
 
 
 def write_restore_journal(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -409,10 +420,11 @@ def _journal_update_path(path: Path, transaction_id: str) -> Path:
 
 
 def import_seal_path(folder: Path, transaction_id: str) -> Path:
-    """Seal a restore writes into each configuration folder it journals.
+    """Record a restore keeps inside each configuration folder it changes.
 
     The journal lives in the history folder, which lower-trust services can
-    write. Requiring a recorded seal inside every target folder means only a
+    write. The restore rewrites this record durably before each target in the
+    folder changes, and recovery acts only on targets it lists, so only a
     writer of that folder can make recovery act on it (#1196).
     """
     return folder / f".truenas-jbod-ui-import-seal-{transaction_id}"
@@ -687,6 +699,192 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return common in {str(first), str(second)}
 
 
+def _valid_folder_identity(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("device")) is int
+        and value["device"] >= 0
+        and type(value.get("inode")) is int
+        and value["inode"] > 0
+    )
+
+
+def _normalized_absolute(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and os.path.isabs(value)
+        and os.path.normpath(value) == value
+        and Path(value).name not in {"", ".", ".."}
+    )
+
+
+def _parse_configuration_target(item: Any, *, transaction_id: str) -> dict[str, Any]:
+    """Validate one recorded configuration target; ``ValueError`` names the fault."""
+    if not isinstance(item, dict):
+        raise ValueError("a target entry is not an object.")
+    if not _normalized_absolute(item.get("path")):
+        raise ValueError("a target path is not a normalized absolute path.")
+    path = Path(item["path"])
+    kind = item.get("kind")
+    if kind not in {"file", "directory"}:
+        raise ValueError("a target kind is not recognised.")
+    validate = _valid_file_record if kind == "file" else _valid_tree_record
+    prior = item.get("prior")
+    candidate = item.get("candidate")
+    if not validate(candidate) or not isinstance(prior, dict):
+        raise ValueError("a target record is malformed.")
+    if prior.get("kind") != "missing" and not validate(prior):
+        raise ValueError("a prior target record is malformed.")
+    if not _valid_folder_identity(item.get("parent")):
+        raise ValueError("a target parent record is malformed.")
+    try:
+        _artifact_name(
+            item.get("staged_name"),
+            expected=f".{path.name}.restore-{transaction_id}",
+            label="staged configuration path",
+        )
+        _artifact_name(
+            item.get("previous_name"),
+            expected=f".{path.name}.previous-{transaction_id}",
+            label="prior configuration path",
+        )
+    except ValueError as exc:
+        raise ValueError("a target artifact name is unexpected.") from exc
+    return {
+        "entry": item,
+        "path": path,
+        "kind": kind,
+        "parent": item["parent"],
+        "staged": path.parent / item["staged_name"],
+        "previous": path.parent / item["previous_name"],
+        "prior": prior,
+        "candidate": candidate,
+        "matcher": file_matches if kind == "file" else tree_matches,
+    }
+
+
+def _require_disjoint(
+    targets: list[dict[str, Any]],
+    protected: list[Path],
+    transaction_id: str,
+) -> None:
+    claimed = list(protected)
+    for target in targets:
+        record_path = import_seal_path(target["path"].parent, transaction_id)
+        claimed.extend((record_path, _journal_update_path(record_path, transaction_id)))
+    for target in targets:
+        paths = (target["path"], target["staged"], target["previous"])
+        for path in paths:
+            if any(_paths_overlap(path, other) for other in claimed):
+                raise ValueError("a target overlaps history or another target.")
+        claimed.extend(paths)
+
+
+def read_import_seal(
+    path: Path,
+    *,
+    transaction_id: str,
+    folder: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one configuration folder's restore record and check its shape.
+
+    The record must be a private single-link file owned by this user, written
+    for ``transaction_id`` and naming ``folder`` as its own folder.
+    """
+    payload, record = _read_private_json(
+        path,
+        invalid="Restore folder record is invalid.",
+        changed="Restore folder record changed while it was being read.",
+    )
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or record["uid"] != geteuid():
+        raise ValueError("Restore folder record is invalid.")
+    anchor = payload.get("anchor") if isinstance(payload, dict) else None
+    expected_keys = {"purpose", "transaction_id", "folder", "anchor", "targets"}
+    if anchor == folder:
+        expected_keys |= {"folders", "decision"}
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload["purpose"] != IMPORT_SEAL_PURPOSE
+        or payload["transaction_id"] != transaction_id
+        or payload["folder"] != folder
+        or not _normalized_absolute(anchor)
+        or not isinstance(payload["targets"], list)
+    ):
+        raise ValueError("Restore folder record is invalid.")
+    if anchor == folder:
+        folders = payload["folders"]
+        if (
+            payload["decision"] not in WHOLE_IMPORT_DECISIONS
+            or not isinstance(folders, list)
+            or not folders
+            or not all(
+                isinstance(item, dict)
+                and set(item) == {"path", "device", "inode"}
+                and _normalized_absolute(item["path"])
+                and _valid_folder_identity(item)
+                for item in folders
+            )
+            or folders[0]["path"] != folder
+            or len({item["path"] for item in folders}) != len(folders)
+        ):
+            raise ValueError("Restore folder record is invalid.")
+    return payload, record
+
+
+def _unsealed() -> SegmentedRestoreRecoveryRefused:
+    return SegmentedRestoreRecoveryRefused(
+        "configuration-target-unsealed",
+        "The restore journal names a configuration file whose folder holds no "
+        "matching restore seal, so it was not written by the restore that "
+        "changed that folder. Recovery changed nothing.",
+    )
+
+
+def _load_folder_record(folder: Path, transaction_id: str) -> dict[str, Any]:
+    path = import_seal_path(folder, transaction_id)
+    try:
+        payload, record = read_import_seal(
+            path,
+            transaction_id=transaction_id,
+            folder=str(folder),
+        )
+    except (OSError, ValueError) as exc:
+        raise _unsealed() from exc
+    return {"folder": str(folder), "path": path, "payload": payload, "record": record}
+
+
+def _require_configuration_folder(folder: Path, identity: dict[str, Any] | None) -> None:
+    cursor = folder
+    try:
+        while True:
+            metadata = os.stat(cursor, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("not a directory")
+            if cursor == cursor.parent:
+                break
+            cursor = cursor.parent
+        folder_metadata = os.stat(folder, follow_symlinks=False)
+    except OSError as exc:
+        raise SegmentedRestoreRecoveryRefused(
+            "configuration-target-unavailable",
+            "This interrupted restore also changed configuration files that are "
+            "not reachable here. Run recovery where the configuration volume is "
+            "mounted (the admin service).",
+        ) from exc
+    if identity is not None and (folder_metadata.st_dev, folder_metadata.st_ino) != (
+        identity["device"],
+        identity["inode"],
+    ):
+        raise SegmentedRestoreRecoveryRefused(
+            "configuration-target-unavailable",
+            "This interrupted restore also changed configuration files, but their "
+            "folder here is not the one the restore used. Run recovery where the "
+            "same configuration volume is mounted (the admin service).",
+        )
+
+
 def _configuration_targets(
     *,
     journal: dict[str, Any],
@@ -694,13 +892,18 @@ def _configuration_targets(
     journal_path: Path,
     source: Path,
     segments_directory: Path,
-) -> tuple[list[dict[str, Any]], str | None]:
-    """Validate the non-history targets a whole-import journal recorded."""
+) -> tuple[list[dict[str, Any]], str | None, list[dict[str, Any]]]:
+    """Resolve the configuration targets, decision and folder records of a journal.
+
+    The journal lives in the history folder, which lower-trust services can
+    write, so it is only an index: it names the transaction and the first
+    configuration folder. Each configuration folder holds the restore's own
+    record of every target in it; the first folder's record also lists every
+    folder and holds the decision. Recovery acts only on targets those records
+    list, and refuses a journal target they do not list exactly (#1196).
+    """
     if journal.get("journal_version") != WHOLE_IMPORT_JOURNAL_VERSION:
-        return [], None
-    decision = journal.get("decision")
-    if decision not in WHOLE_IMPORT_DECISIONS:
-        raise _journal_invalid("the import decision is not recognised.")
+        return [], None, []
     recorded = journal.get("targets")
     if not isinstance(recorded, list):
         raise _journal_invalid("the target list is missing.")
@@ -718,78 +921,24 @@ def _configuration_targets(
         segments_directory.parent / f".{segments_directory.name}.restore-{transaction_id}",
         segments_directory.parent / f".{segments_directory.name}.previous-{transaction_id}",
     ]
-    targets: list[dict[str, Any]] = []
+    anchor_reference = journal.get("anchor")
+    if not (
+        isinstance(anchor_reference, dict)
+        and set(anchor_reference) == {"path", "device", "inode"}
+        and _normalized_absolute(anchor_reference["path"])
+        and _valid_folder_identity(anchor_reference)
+    ):
+        raise _journal_invalid("the first configuration folder is not recorded.")
+    indexed: list[dict[str, Any]] = []
     for item in recorded:
-        if not isinstance(item, dict):
-            raise _journal_invalid("a target entry is not an object.")
-        raw_path = item.get("path")
-        if (
-            not isinstance(raw_path, str)
-            or not os.path.isabs(raw_path)
-            or os.path.normpath(raw_path) != raw_path
-            or Path(raw_path).name in {"", ".", ".."}
-        ):
-            raise _journal_invalid("a target path is not a normalized absolute path.")
-        path = Path(raw_path)
-        kind = item.get("kind")
-        if kind not in {"file", "directory"}:
-            raise _journal_invalid("a target kind is not recognised.")
-        validate = _valid_file_record if kind == "file" else _valid_tree_record
-        prior = item.get("prior")
-        candidate = item.get("candidate")
-        if not validate(candidate) or not isinstance(prior, dict):
-            raise _journal_invalid("a target record is malformed.")
-        if prior.get("kind") != "missing" and not validate(prior):
-            raise _journal_invalid("a prior target record is malformed.")
-        parent = item.get("parent")
-        if not (
-            isinstance(parent, dict)
-            and type(parent.get("device")) is int
-            and parent["device"] >= 0
-            and type(parent.get("inode")) is int
-            and parent["inode"] > 0
-        ):
-            raise _journal_invalid("a target parent record is malformed.")
-        if not _valid_file_record(item.get("seal")):
-            raise _journal_invalid("a target seal record is malformed.")
         try:
-            _artifact_name(
-                item.get("staged_name"),
-                expected=f".{path.name}.restore-{transaction_id}",
-                label="staged configuration path",
-            )
-            _artifact_name(
-                item.get("previous_name"),
-                expected=f".{path.name}.previous-{transaction_id}",
-                label="prior configuration path",
-            )
+            indexed.append(_parse_configuration_target(item, transaction_id=transaction_id))
         except ValueError as exc:
-            raise _journal_invalid("a target artifact name is unexpected.") from exc
-        staged = path.parent / item["staged_name"]
-        previous = path.parent / item["previous_name"]
-        seal = import_seal_path(path.parent, transaction_id)
-        for claimed in (path, staged, previous):
-            if any(_paths_overlap(claimed, other) for other in protected) or _paths_overlap(
-                claimed, seal
-            ):
-                raise _journal_invalid("a target overlaps history or another target.")
-        protected.extend((path, staged, previous))
-        targets.append(
-            {
-                "path": path,
-                "kind": kind,
-                "parent": parent,
-                "staged": staged,
-                "previous": previous,
-                "seal_path": seal,
-                "seal": item["seal"],
-                "prior": prior,
-                "candidate": candidate,
-                "matcher": file_matches if kind == "file" else tree_matches,
-            }
-        )
-    if not targets:
-        return targets, decision
+            raise _journal_invalid(str(exc)) from exc
+    try:
+        _require_disjoint(indexed, protected, transaction_id)
+    except ValueError as exc:
+        raise _journal_invalid(str(exc)) from exc
     # Only the identity that wrote the journal may follow its configuration
     # paths; anyone else could otherwise point recovery at files it cannot
     # write itself.
@@ -802,45 +951,62 @@ def _configuration_targets(
             "that ran the restore (the admin service), with the configuration "
             "volume mounted.",
         )
+    anchor_folder = anchor_reference["path"]
+    _require_configuration_folder(Path(anchor_folder), anchor_reference)
+    records = {anchor_folder: _load_folder_record(Path(anchor_folder), transaction_id)}
+    anchor = records[anchor_folder]["payload"]
+    if anchor["anchor"] != anchor_folder:
+        raise _unsealed()
+    listed = [item["path"] for item in anchor["folders"]]
+    for target in indexed:
+        folder = target["path"].parent
+        _require_configuration_folder(folder, target["parent"])
+        if str(folder) not in records:
+            records[str(folder)] = _load_folder_record(folder, transaction_id)
+        if str(folder) not in listed:
+            raise _unsealed()
+        if target["entry"] not in records[str(folder)]["payload"]["targets"]:
+            raise SegmentedRestoreRecoveryRefused(
+                "configuration-target-unrecorded",
+                "The restore journal names a configuration file that the restore's "
+                "own record in that folder does not list, or lists differently. "
+                "Recovery changed nothing.",
+            )
+    # The first folder's list, not the journal, decides which folders recovery
+    # converges, so a journal that omits a folder cannot leave it behind.
+    targets: list[dict[str, Any]] = []
+    for identity in anchor["folders"]:
+        folder = Path(identity["path"])
+        _require_configuration_folder(folder, identity)
+        if identity["path"] not in records:
+            if not path_entry_exists(import_seal_path(folder, transaction_id)):
+                # The import lists a folder before writing that folder's
+                # record, and changes nothing in it until the record exists.
+                continue
+            records[identity["path"]] = _load_folder_record(folder, transaction_id)
+        # Every folder record must name this first folder; a record planted in
+        # a folder its writer controls cannot claim the others.
+        if records[identity["path"]]["payload"]["anchor"] != anchor_folder:
+            raise _unsealed()
+        for item in records[identity["path"]]["payload"]["targets"]:
+            try:
+                target = _parse_configuration_target(item, transaction_id=transaction_id)
+            except ValueError as exc:
+                raise _unsealed() from exc
+            if target["path"].parent != folder or (
+                target["parent"]["device"],
+                target["parent"]["inode"],
+            ) != (identity["device"], identity["inode"]):
+                raise _unsealed()
+            targets.append(target)
+    try:
+        _require_disjoint(targets, protected, transaction_id)
+    except ValueError as exc:
+        raise _unsealed() from exc
     for target in targets:
-        path = target["path"]
-        cursor = path.parent
-        try:
-            while True:
-                metadata = os.stat(cursor, follow_symlinks=False)
-                if not stat.S_ISDIR(metadata.st_mode):
-                    raise OSError("not a directory")
-                if cursor == cursor.parent:
-                    break
-                cursor = cursor.parent
-            parent_metadata = os.stat(path.parent, follow_symlinks=False)
-        except OSError as exc:
-            raise SegmentedRestoreRecoveryRefused(
-                "configuration-target-unavailable",
-                "This interrupted restore also changed configuration files that are "
-                "not reachable here. Run recovery where the configuration volume is "
-                "mounted (the admin service).",
-            ) from exc
-        if (parent_metadata.st_dev, parent_metadata.st_ino) != (
-            target["parent"]["device"],
-            target["parent"]["inode"],
-        ):
-            raise SegmentedRestoreRecoveryRefused(
-                "configuration-target-unavailable",
-                "This interrupted restore also changed configuration files, but their "
-                "folder here is not the one the restore used. Run recovery where the "
-                "same configuration volume is mounted (the admin service).",
-            )
-        if not file_matches(target["seal_path"], target["seal"]):
-            raise SegmentedRestoreRecoveryRefused(
-                "configuration-target-unsealed",
-                "The restore journal names a configuration file whose folder holds no "
-                "matching restore seal, so it was not written by the restore that "
-                "changed that folder. Recovery changed nothing.",
-            )
         matcher = target["matcher"]
         for location, allowed in (
-            (path, (target["prior"], target["candidate"])),
+            (target["path"], (target["prior"], target["candidate"])),
             (target["staged"], (target["candidate"],)),
             (target["previous"], (target["prior"],)),
         ):
@@ -852,7 +1018,8 @@ def _configuration_targets(
                     "A configuration file changed after the interrupted restore; "
                     "recovery kept every file for review.",
                 )
-    return targets, decision
+    ordered = [records[path] for path in listed if path in records]
+    return targets, anchor["decision"], ordered
 
 
 def _remove_journal_update(journal_path: Path, transaction_id: str) -> None:
@@ -868,13 +1035,27 @@ def _remove_journal_update(journal_path: Path, transaction_id: str) -> None:
         remove_recorded_file(update_path, record, label="activation journal update")
 
 
-def _remove_import_seals(configuration_targets: list[dict[str, Any]]) -> None:
-    removed: set[Path] = set()
-    for target in configuration_targets:
-        if target["seal_path"] in removed:
-            continue
-        removed.add(target["seal_path"])
-        remove_recorded_file(target["seal_path"], target["seal"], label="restore import seal")
+def _remove_import_seals(folder_records: list[dict[str, Any]], transaction_id: str) -> None:
+    # The first folder's record names the others, so it goes last.
+    for folder_record in reversed(folder_records):
+        update_path = _journal_update_path(folder_record["path"], transaction_id)
+        if path_entry_exists(update_path):
+            try:
+                _, update_record = read_import_seal(
+                    update_path,
+                    transaction_id=transaction_id,
+                    folder=folder_record["folder"],
+                )
+            except (OSError, ValueError):
+                # A torn update is not the restore's record; leave it for review.
+                update_record = None
+            if update_record is not None:
+                remove_recorded_file(update_path, update_record, label="restore import seal")
+        remove_recorded_file(
+            folder_record["path"],
+            folder_record["record"],
+            label="restore import seal",
+        )
 
 
 def recover_segmented_restore(
@@ -894,7 +1075,7 @@ def recover_segmented_restore(
         if path_entry_exists(Path(f"{source}{suffix}")):
             raise ValueError("Segmented restore recovery refuses SQLite sidecar artifacts.")
     paths = _restore_paths(source, segments_directory, journal)
-    configuration_targets, decision = _configuration_targets(
+    configuration_targets, decision, folder_records = _configuration_targets(
         journal=journal,
         journal_record=journal_record,
         journal_path=journal_path,
@@ -949,14 +1130,14 @@ def recover_segmented_restore(
         target["matcher"](target["path"], target["candidate"])
         for target in configuration_targets
     )
-    # A whole-import journal converges every target to its recorded decision.
-    # Without one, only a fully activated candidate is finished forward.
-    if decision == "commit":
-        finish_candidate = True
-    elif decision == "rollback":
-        finish_candidate = False
+    # A whole import converges every target to the decision recorded in its
+    # first configuration folder, never to anything the journal says; an
+    # undecided whole import returns to the prior generation. A history-only
+    # journal finishes forward only when the candidate is fully live.
+    if decision is None:
+        finish_candidate = candidate_live
     else:
-        finish_candidate = candidate_live and configuration_candidate_live
+        finish_candidate = decision == "commit"
     if finish_candidate and not (candidate_live and configuration_candidate_live):
         raise SegmentedRestoreRecoveryRefused(
             "committed-generation-incomplete",
@@ -1025,7 +1206,7 @@ def recover_segmented_restore(
             record=journal_record,
             label="activation journal",
         )
-        _remove_import_seals(configuration_targets)
+        _remove_import_seals(folder_records, journal["transaction_id"])
         return {
             "apply": True,
             "phase": journal["phase"],
@@ -1098,7 +1279,7 @@ def recover_segmented_restore(
         record=journal_record,
         label="activation journal",
     )
-    _remove_import_seals(configuration_targets)
+    _remove_import_seals(folder_records, journal["transaction_id"])
     return {
         "apply": True,
         "phase": journal["phase"],
