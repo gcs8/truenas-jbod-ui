@@ -175,6 +175,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file was replaced between its check and its open reads again, and
+  after three such rereads refuses with `mapping_read_busy` (503,
+  `Retry-After`) instead of waiting. A read that already opened the file
+  returns that complete version. A mapping path that is not a regular file,
+  including one swapped in during a read, is refused without blocking and is
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
+  revision from the same read. A refused import now gets the named 503
+  instead of a generic error (#1256).
 
 ### Performance
 
