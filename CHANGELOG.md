@@ -146,6 +146,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Storage Fabric event decoding no longer turns a CDB with a malformed byte
+  token into a different valid command with an invented address and length;
+  it is marked malformed and keeps its raw text. An ASC/ASCQ value that is not
+  two one- or two-digit hex bytes is no longer labelled as the sense code it
+  resembles; the first `asc:` field of a sense line is read whole, so such a
+  value is neither dropped nor replaced by a later `asc:` fragment, and it is
+  marked malformed with no fault family. A loginfo value that is wider than
+  32 bits or is not a hex number is no longer labelled as a known fault or
+  dropped; it stays unconfirmed, summaries count it as rejected instead of
+  listing the raw value, and long kernel text is shortened before it becomes
+  a summary key. Only the first `tgt`/`SMID`/`loginfo` tail of a controller
+  line is read: when its fields are not in the kernel's form it is marked
+  malformed and counted as rejected, and a later tail is never decoded in
+  its place (#1239).
 - Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
   stop other admin requests while slow storage writes or syncs the staged
   file, and a cancelled upload keeps its file until the write has finished.
@@ -178,6 +192,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file was replaced between its check and its open reads again, and
+  after three such rereads refuses with `mapping_read_busy` (503,
+  `Retry-After`) instead of waiting. A read that already opened the file
+  returns that complete version. A mapping path that is not a regular file,
+  including one swapped in during a read, is refused without blocking and is
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
+  revision from the same read. A refused import now gets the named 503
+  instead of a generic error (#1256).
 
 ### Performance
 
