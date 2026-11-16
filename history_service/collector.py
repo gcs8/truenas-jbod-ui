@@ -679,20 +679,23 @@ class HistoryCollector:
             and trusted_smart_scope_observed
             and not smart_scope_unavailable
         ):
-            evidence_at = {key: observed_at for key in smart_failure_health_observed | smart_temperature_observed}
+            # Failure and temperature are separate readings with their own
+            # times: a summary may carry one without the other.
+            failure_at = dict.fromkeys(smart_failure_health_observed, observed_at)
+            temperature_at = dict.fromkeys(smart_temperature_observed, observed_at)
             for key in smart_evidence_unread - smart_evidence_expected:
                 if (failure := self._smart_failure_by_disk.get(key)) is not None:
                     smart_failure_health_observed.add(key)
                     if failure[0]:
                         smart_failure_evidence.add(key)
-                    evidence_at[key] = failure[1]
+                    failure_at[key] = failure[1]
                 if (temperature := self._smart_temperature_by_disk.get(key)) is not None:
                     smart_temperature_observed.add(key)
                     smart_temperatures[key] = temperature[0]
-                    evidence_at[f"temperature:{key}"] = temperature[1]
+                    temperature_at[key] = temperature[1]
             if smart_evidence_expected.issubset(smart_failure_health_observed):
                 self._smart_failure_by_disk = {
-                    key: (key in smart_failure_evidence, evidence_at[key]) for key in smart_failure_health_observed
+                    key: (key in smart_failure_evidence, failure_at[key]) for key in smart_failure_health_observed
                 }
                 self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
                 self.last_smart_failure_evidence_at = min(
@@ -700,7 +703,7 @@ class HistoryCollector:
                 )
             if smart_evidence_expected.issubset(smart_temperature_observed):
                 self._smart_temperature_by_disk = {
-                    key: (value, evidence_at.get(f"temperature:{key}", evidence_at[key]))
+                    key: (value, temperature_at[key])
                     for key, value in smart_temperatures.items()
                 }
                 self.last_max_temperature_celsius = (

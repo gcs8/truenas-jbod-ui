@@ -119,6 +119,8 @@ class ParsedSSHData:
     esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
     esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
     esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
+    # Each answered `/eall/sall` listing: whether its reply was a whole drive census.
+    esxi_storcli_drive_lists: dict[str, bool] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -5061,6 +5063,35 @@ def parse_storcli_physical_drives(
     return drives
 
 
+def storcli_physical_drive_list_complete(output: str) -> bool:
+    """True when a `/eall/sall show all J` reply is a whole drive census (#1218).
+
+    Every controller block answered `Success` and every row of its drive list
+    names an enclosure and slot, so a slot it lists no drive in is empty. A
+    failed, unparsed or partial reply, or one with no drive list, proves no
+    absence.
+    """
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return False
+    controllers = payload.get("Controllers") if isinstance(payload, dict) else None
+    if not isinstance(controllers, list) or not controllers:
+        return False
+    for controller in controllers:
+        status = controller.get("Command Status") if isinstance(controller, dict) else None
+        response = controller.get("Response Data") if isinstance(controller, dict) else None
+        if not isinstance(status, dict) or str(status.get("Status") or "").strip().casefold() != "success":
+            return False
+        rows = (response.get("Drive Information") or response.get("PD LIST")) if isinstance(response, dict) else None
+        if not isinstance(rows, list) or not rows or not all(
+            isinstance(row, dict) and _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2]
+            for row in rows
+        ):
+            return False
+    return True
+
+
 def _collect_storcli_virtual_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     details: dict[str, dict[str, Any]] = {}
     for key, value in response_data.items():
@@ -5297,6 +5328,9 @@ def parse_ssh_outputs(
             )
         elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
             controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
+            parsed.esxi_storcli_drive_lists[command_key] = storcli_physical_drive_list_complete(
+                normalized_outputs[command_key]
+            )
             parsed.esxi_storcli_physical_drives.extend(
                 parse_storcli_physical_drives(
                     normalized_outputs[command_key],

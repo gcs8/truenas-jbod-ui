@@ -59,7 +59,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   storage-view tiles, saved-view bays the backing enclosure does not list and
   manual-only layout bays show `Unknown` instead of `Empty`; Storage Fabric
   shows its `present` value as `unknown`; disk retention accounting does not
-  count a saved assignment there as a rendered disk; and the bay-assignment
+  count a saved assignment there as a rendered disk; a manual-only saved view
+  does not show a saved serial in such a bay as a disk;
+  saving or clearing a bay assignment there is refused with a message that the
+  disk could not be checked, not that it changed; and the bay-assignment
   restore preview says its current disk cannot be checked instead of calling
   the bay empty. Quantastor
   no longer hides a known disk behind a zero SAS address when stronger

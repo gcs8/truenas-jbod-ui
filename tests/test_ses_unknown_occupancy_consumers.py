@@ -275,11 +275,11 @@ OCCUPANCY_READ_ALLOWLIST = {
     ("app/static/app.js", "slotOccupancy"): (4, "the page's reader itself"),
     ("app/services/inventory.py", "InventoryService._build_slot_view"): (2, "producer: decides occupancy from raw evidence and sets presence_known"),
     ("app/services/inventory.py", "InventoryService._correlate_quantastor"): (1, "producer: raw SES candidate before the slot view"),
+    ("app/services/inventory.py", "InventoryService._correlate_esxi_host"): (1, "producer: a whole StorCLI census decides raw empty evidence"),
     ("app/services/inventory.py", "InventoryService._merge_quantastor_ses_candidate"): (2, "producer: copies the SES candidate decision as one"),
     ("app/services/inventory.py", "InventoryService._slot_has_live_empty_evidence"): (2, "producer: raw hint dict feeding the empty gate"),
     ("app/services/inventory.py", "InventoryService._slot_identity_state"): (1, "identity key; unread groups with no-disk-known"),
     ("app/services/inventory.py", "InventoryService._slot_detail_entry_matches"): (1, "cache admission; an unread bay admits no cached disk"),
-    ("app/services/inventory.py", "InventoryService._slot_disk_binding"): (1, "revision digest of the bay's disk identity"),
     ("app/services/inventory.py", "InventoryService._smart_disk_identity"): (1, "SMART cache key; an unread bay has no disk identity"),
     ("app/static/app.js", "candidateSlotsForSmartPrefetch"): (1, "SMART prefetch admission"),
     ("app/static/app.js", "ensureHeatmapData"): (1, "SMART prefetch admission for storage-view tiles"),
@@ -571,6 +571,275 @@ class UnreadBayConsumerTests(unittest.TestCase):
         self.assertEqual((empty["current"], "occupancy" in empty), (None, False))
         present = warn(("enc-a", 0), backup, KNOWN_PRESENT())
         self.assertEqual((present["current"], "occupancy" in present), ("SANITIZED-MAPPED", False))
+
+
+
+TEMPERATURE_ONLY = {0: {"available": True, "temperature_c": 35}}
+HEALTH_ONLY = {0: {"available": True, "smart_health_status": "FAILED"}}
+PASSED_WARM = {0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 40}}
+
+
+class PartialSmartSummaryThenUnreadTests(unittest.TestCase):
+    """A SMART summary may lack optional fields; the next unread pass still completes."""
+
+    def run_passes(self, stages: list[tuple[SlotView, dict]]) -> list[dict[str, Any]]:
+        collector, store = UnreadBayHistoryTests.collector(self)  # type: ignore[arg-type]
+        retention = MagicMock(wraps=collector._run_retention_if_due)
+        collector._run_retention_if_due = retention  # type: ignore[method-assign]
+        start = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        statuses = []
+        for index, (view, summaries) in enumerate(stages):
+            at = start + timedelta(minutes=5 * index)
+            collector._enumerate_scopes = AsyncMock(return_value=[ScopeSnapshot(  # type: ignore[method-assign]
+                system_id="s", system_label="S", enclosure_id="enc-a", enclosure_label="Shelf",
+                snapshot={"selected_system_id": "s", "selected_enclosure_id": "enc-a", "slots": [_payload(view)]},
+            )])
+            collector._fetch_smart_summaries = AsyncMock(return_value=summaries)  # type: ignore[method-assign]
+            with patch("history_service.collector.utcnow", return_value=at):
+                try:
+                    asyncio.run(collector.run_once(force_fast=True, force_slow=True, include_due_intervals=False))
+                except Exception as exc:  # noqa: BLE001 - the assertion names the failure.
+                    self.fail(f"collection pass {index} raised {exc!r}")
+            status = collector.status()
+            # The pass ran to the end: backup, retention and the success time.
+            self.assertEqual(status["last_success_at"], at.isoformat(), index)
+            self.assertEqual(store.create_backup.call_count, index + 1, index)  # type: ignore[attr-defined]
+            self.assertEqual(retention.call_count, index + 1, index)
+            statuses.append(status)
+        return statuses
+
+    def test_temperature_only_then_unread_bays_complete_and_keep_the_temperature(self) -> None:
+        unread = UNREAD["core-show-unknown"]
+        statuses = self.run_passes([
+            (KNOWN_PRESENT(), TEMPERATURE_ONLY), (unread(), {}), (unread(), {}),
+            (KNOWN_PRESENT(), PASSED_WARM), (KNOWN_EMPTY(), {}),
+        ])
+        first, *unread_passes, healthy, empty = statuses
+        for status in unread_passes:
+            # The disk was not read again: its own temperature and its time stand.
+            self.assertEqual(status["last_max_temperature_celsius"], 35)
+            self.assertEqual(status["last_temperature_evidence_at"], first["last_temperature_evidence_at"])
+            self.assertEqual(status["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(healthy["last_max_temperature_celsius"], 40)
+        self.assertGreater(healthy["last_temperature_evidence_at"], first["last_temperature_evidence_at"])
+        self.assertEqual(healthy["last_smart_failure_evidence_disks"], 0)
+        self.assertIsNone(empty["last_max_temperature_celsius"])
+        self.assertEqual(empty["last_smart_failure_evidence_disks"], 0)
+
+    def test_health_only_then_unread_bays_keep_the_failure(self) -> None:
+        # Control: a summary with health and no temperature.
+        unread = UNREAD["quantastor-unknown"]
+        statuses = self.run_passes([
+            (KNOWN_PRESENT(), HEALTH_ONLY), (unread(), {}), (unread(), {}), (KNOWN_PRESENT(), PASSED_WARM),
+        ])
+        first, *unread_passes, healthy = statuses
+        self.assertEqual(first["last_smart_failure_evidence_disks"], 1)
+        for status in unread_passes:
+            self.assertEqual(status["last_smart_failure_evidence_disks"], 1)
+            self.assertEqual(status["last_smart_failure_evidence_at"], first["last_smart_failure_evidence_at"])
+        self.assertEqual(healthy["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(healthy["last_max_temperature_celsius"], 40)
+
+
+class ManualOnlyUnreadIdentityTests(unittest.TestCase):
+    """A manual-only view takes a saved serial as a live disk only from a bay read as holding it."""
+
+    def runtime_bay(self, live: SlotView) -> tuple[StorageViewRuntimeSlot, int]:
+        from app.services.profile_registry import UNIFI_LAYOUT_ONLY_PROFILE_IDS
+
+        case = presence_cases.CoreSesutilShowPresenceTests()
+        self.addCleanup(case.doCleanups)
+        service = case.service()
+        profile = service.profile_registry.get("supermicro-ssg-2028r-shared-front-24")
+        snapshot = InventorySnapshot(
+            slots=[live], selected_system_id=service.system.id, selected_enclosure_id="enc-a",
+            selected_profile=profile, refresh_interval_seconds=60,
+        )
+        service.mapping_store.save_mapping(ManualMapping(
+            system_id=service.system.id, enclosure_id="enc-a", slot=2, serial="SANITIZED-MAPPED",
+        ))
+        view = StorageViewConfig(
+            id="manual-pinned", label="Manual pinned", kind="ses_enclosure", template_id="ses-auto",
+            profile_id=sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0],
+        )
+        runtime = service._build_ses_storage_view_runtime(view, snapshot)
+        return next(slot for slot in runtime.slots if slot.slot_index == 2), runtime.matched_count
+
+    def test_an_unread_bay_with_the_saved_serial_is_not_a_live_disk(self) -> None:
+        unread = UNREAD["quantastor-unresolved-mapping"]()
+        self.assertEqual((unread.serial, domain_models.slot_occupancy(unread)), ("SANITIZED-MAPPED", "unknown"))
+        bay, matched = self.runtime_bay(unread)
+        self.assertEqual(
+            (bay.occupied, bay.presence_known, bay.state, domain_models.slot_occupancy(bay), matched),
+            (False, False, "unmapped", "unknown", 0),
+        )
+        # It stays a saved assignment that cannot be verified.
+        self.assertEqual(bay.serial, "SANITIZED-MAPPED")
+
+    def test_a_bay_read_as_holding_the_disk_still_resolves(self) -> None:
+        bay, matched = self.runtime_bay(KNOWN_PRESENT())
+        self.assertEqual(
+            (bay.occupied, bay.state, domain_models.slot_occupancy(bay), matched), (True, "healthy", "present", 1),
+        )
+
+    def test_a_confirmed_empty_bay_is_not_a_live_disk(self) -> None:
+        for name, live in {
+            "no identity": KNOWN_EMPTY(),
+            # An empty row that still names the saved serial is no live disk either.
+            "saved serial": KNOWN_EMPTY().model_copy(update={"serial": "SANITIZED-MAPPED"}),
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(domain_models.slot_occupancy(live), "empty")
+                bay, matched = self.runtime_bay(live)
+                self.assertEqual(
+                    (bay.occupied, bay.state, domain_models.slot_occupancy(bay), matched),
+                    (False, "unmapped", "unknown", 0),
+                )
+
+
+UNVERIFIABLE_SAVE = "The disk in this bay could not be checked right now. Nothing was saved. Reload and try again."
+UNVERIFIABLE_CLEAR = "The disk in this bay could not be checked right now. Nothing was cleared. Reload and try again."
+CHANGED_SAVE = "The disk in this bay changed. Reload to see it, then save again."
+CHANGED_CLEAR = "The disk in this bay changed. Reload to see it, then clear again."
+
+
+class MappingWriteAgainstAnUnreadBayTests(unittest.TestCase):
+    """A save or clear is refused when the pre-write read could not tell what is in the bay."""
+
+    def write(self, action: str, editor_saw: SlotView, now: SlotView) -> tuple[Any, Any]:
+        from app.services.mapping_store import bind_mapping_revision
+
+        case = presence_cases.CoreSesutilShowPresenceTests()
+        self.addCleanup(case.doCleanups)
+        service = case.service()
+        service._get_pre_write_snapshot = AsyncMock(  # type: ignore[method-assign]
+            return_value=InventorySnapshot(
+                slots=[now.model_copy(update={"enclosure_id": "enc-a"})], refresh_interval_seconds=60,
+            ),
+        )
+        store = service.mapping_store
+        system_id = service.system.id
+        if action == "clear":
+            store.save_mapping(ManualMapping(system_id=system_id, enclosure_id="enc-a", slot=0, serial="SANITIZED-MAPPED"))
+            revision = store.clear_revision(system_id, "enc-a", 0)
+        else:
+            revision = store.save_revision(system_id, "enc-a", 0)
+        # The revision the editor got, bound to the bay as it showed it.
+        expected = bind_mapping_revision(
+            revision, service._slot_disk_binding(editor_saw.model_copy(update={"enclosure_id": "enc-a"})),
+        )
+        try:
+            if action == "clear":
+                asyncio.run(service.clear_mapping(0, "enc-a", expected_revision=expected, invalidate_snapshot=False))
+            else:
+                asyncio.run(service.save_mapping(
+                    0, {"serial": "SANITIZED-NEW"}, "enc-a", expected_revision=expected, invalidate_snapshot=False,
+                ))
+            error = None
+        except Exception as exc:  # noqa: BLE001 - the assertions name the refusal.
+            error = exc
+        stored = store.get_mapping(system_id, "enc-a", 0)
+        return error, stored.serial if stored else None
+
+    def test_an_unread_pre_write_read_is_refused_as_not_checkable(self) -> None:
+        unread = UNREAD["core-show-unknown"]
+        for action, text, kept in (("save", UNVERIFIABLE_SAVE, None), ("clear", UNVERIFIABLE_CLEAR, "SANITIZED-MAPPED")):
+            # The editor showed a disk, an empty bay, or the same unread bay.
+            for name, editor_saw in {"disk": KNOWN_PRESENT, "empty": KNOWN_EMPTY, "unread": unread}.items():
+                with self.subTest(action=action, editor_saw=name):
+                    error, stored = self.write(action, editor_saw(), unread())
+                    self.assertIsNotNone(error, "an unread bay let the write through")
+                    self.assertEqual(
+                        (getattr(error, "error_code", None), getattr(error, "public_detail", None), str(error)),
+                        ("mapping_disk_unverifiable", text, text),
+                    )
+                    self.assertTrue(getattr(error, "current_revision", None))
+                    # Nothing was written.
+                    self.assertEqual(stored, kept)
+
+    def test_a_verified_change_keeps_the_disk_changed_refusal(self) -> None:
+        other_disk = lambda: KNOWN_PRESENT().model_copy(update={"serial": "SANITIZED-OTHER"})  # noqa: E731
+        for action, text in (("save", CHANGED_SAVE), ("clear", CHANGED_CLEAR)):
+            for name, now in {"other disk": other_disk, "empty bay": KNOWN_EMPTY}.items():
+                with self.subTest(action=action, now=name):
+                    error, _stored = self.write(action, KNOWN_PRESENT(), now())
+                    self.assertEqual((getattr(error, "error_code", None), str(error)), ("mapping_disk_changed", text))
+
+    def test_the_same_disk_still_saves_and_clears(self) -> None:
+        self.assertEqual(self.write("save", KNOWN_PRESENT(), KNOWN_PRESENT()), (None, "SANITIZED-NEW"))
+        self.assertEqual(self.write("clear", KNOWN_PRESENT(), KNOWN_PRESENT()), (None, None))
+
+
+STORCLI_LIST = "/opt/lsi/storcli64/storcli64 /c{controller}/eall/sall show all J"
+
+
+def _storcli_reply(status: str = "Success", slot_text: str = "13:0") -> str:
+    drive = {"Ctl": "c0", "EID:Slt": slot_text, "DID": 0, "State": "Onln", "DG": "0", "Size": "1 TB",
+             "Intf": "NVMe", "Med": "SSD", "SeSz": "512B", "Model": "Synthetic", "SN": "SANITIZED-M2"}
+    return json.dumps({"Controllers": [{
+        "Command Status": {"Controller": 0, "Status": status, "Description": "None"},
+        "Response Data": {"Drive Information": [drive]},
+    }]})
+
+
+class StorcliOnlyEnumerationTests(unittest.TestCase):
+    """A complete StorCLI drive list on the RAID-card layout leaves the bays it did not list empty."""
+
+    def correlate(self, outputs: dict[str, str], *, profile_id: str | None = None, controllers: tuple[int, ...] = (0,)):
+        from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
+        from app.services.mapping_store import MappingStore
+        from app.services.parsers import ParsedSSHData, parse_ssh_outputs
+        from app.services.profile_registry import ESXI_AOC_SLG4_2H8M2_PROFILE_ID, ProfileRegistry
+        from app.services.slot_detail_store import SlotDetailStore
+        from app.services.truenas_ws import TrueNASRawData
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = Settings()
+        system = SystemConfig(
+            id="synthetic-esxi", truenas=TrueNASConfig(platform="esxi"),
+            default_profile_id=profile_id or ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+            ssh=SSHConfig(enabled=False, commands=[STORCLI_LIST.format(controller=c) for c in controllers]),
+        )
+        service = inventory_module.InventoryService(
+            settings, system, AsyncMock(), AsyncMock(), None, MappingStore(str(Path(directory.name) / "m.json")),
+            ProfileRegistry(settings), SlotDetailStore(str(Path(directory.name) / "d.json")),
+        )
+        raw = TrueNASRawData(enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[])
+        slots, *_rest = service._correlate(
+            raw, parse_ssh_outputs(outputs, 2, None), [], quantastor_ses_data=ParsedSSHData(),
+        )
+        return service, slots
+
+    def test_a_complete_list_leaves_an_unlisted_bay_empty(self) -> None:
+        service, slots = self.correlate({STORCLI_LIST.format(controller=0): _storcli_reply()})
+        by_slot = {slot.slot: slot for slot in slots}
+        self.assertEqual(
+            (domain_models.slot_occupancy(by_slot[0]), by_slot[0].state.value, by_slot[0].serial),
+            ("present", "healthy", "SANITIZED-M2"),
+        )
+        self.assertEqual((domain_models.slot_occupancy(by_slot[1]), by_slot[1].state.value), ("empty", "empty"))
+        fabric = build_sas_fabric_snapshot(system=service.system, snapshot=_snapshot(*slots), ssh_outputs={})
+        presence = sorted(str(node.metrics["present"]) for node in fabric.nodes if node.kind == "bay")
+        self.assertEqual(presence, ["False", "True"])
+
+    def test_a_failed_partial_or_unsupported_list_leaves_the_bay_unknown(self) -> None:
+        listing = STORCLI_LIST.format(controller=0)
+        cases = {
+            "command failed": ({listing: _storcli_reply(status="Failure")}, {}),
+            "a row without a slot": ({listing: _storcli_reply(slot_text="13:x")}, {}),
+            "not json": ({listing: "Controller = 0\nStatus = Success"}, {}),
+            "a second listing did not answer": ({listing: _storcli_reply()}, {"controllers": (0, 1)}),
+            "no listing": ({}, {}),
+            "another layout": ({listing: _storcli_reply()}, {"profile_id": "supermicro-ssg-2028r-shared-front-24"}),
+        }
+        for name, (outputs, options) in cases.items():
+            with self.subTest(name):
+                _service, slots = self.correlate(outputs, **options)
+                unlisted = [slot for slot in slots if slot.serial != "SANITIZED-M2"]
+                self.assertTrue(unlisted)
+                for slot in unlisted:
+                    self.assertEqual(domain_models.slot_occupancy(slot), "unknown", slot.slot)
 
 
 if __name__ == "__main__":

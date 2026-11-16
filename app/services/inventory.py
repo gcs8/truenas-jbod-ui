@@ -83,6 +83,8 @@ from app.services.mapping_store import (
     MappingRevisionConflict,
     MappingSlotDiskChanged,
     MappingSlotDiskChangedBeforeClear,
+    MappingSlotDiskUnverifiable,
+    MappingSlotDiskUnverifiableBeforeClear,
     MappingStore,
     bind_mapping_revision,
     resolve_physical_mapping_scope,
@@ -4057,7 +4059,9 @@ class InventoryService:
                 mappings[slot_value] = mapping
         live_slots_by_key: dict[str, SlotView] = {}
         for live_slot in snapshot.slots:
-            if live_slot.identity_state == "unknown":
+            # Only a bay read as holding a disk can stand for a saved identity:
+            # an unread or empty row naming it is no live disk (#1218).
+            if live_slot.identity_state == "unknown" or slot_occupancy(live_slot) != "present":
                 continue
             for value in (live_slot.serial, live_slot.gptid, live_slot.device_name):
                 for key in normalize_lookup_keys(value):
@@ -6950,11 +6954,15 @@ class InventoryService:
         logical unit id, then persistent id), the same set that decides whether
         an occupied bay's disk is known. An empty or missing bay binds as empty;
         an occupied bay without a strong identifier binds as unknown, so a swap
-        between two such disks cannot be told apart. The reusable device name
-        and the bay's SAS address are not part of it.
+        between two such disks cannot be told apart. A bay whose occupancy was
+        not read binds as unread, never as empty (#1218). The reusable device
+        name and the bay's SAS address are not part of it.
         """
-        if slot_view is None or not slot_view.present or slot_view.state == SlotState.empty:
-            identity: list[str | None] = ["empty"]
+        occupancy = "empty" if slot_view is None else slot_occupancy(slot_view)
+        if occupancy == "unknown":
+            identity: list[str | None] = ["unread"]
+        elif occupancy == "empty" or slot_view.state == SlotState.empty:
+            identity = ["empty"]
         else:
             identity = ["occupied", None, None]
             for field_name in STRONG_SLOT_IDENTITY_FIELDS:
@@ -6988,6 +6996,19 @@ class InventoryService:
             and expected_revision[split:] != binding
         ):
             raise changed(conflict.current_revision) from conflict
+
+    @staticmethod
+    def _refuse_if_slot_unread(
+        slot_view: SlotView | None, revision: Callable[[], str], binding: str,
+        refusal: type[MappingSlotDiskUnverifiable],
+    ) -> None:
+        """Refuse any write to a bay whose occupancy the pre-write read did not read (#1218).
+
+        Nothing can be checked against such a bay, so no editor revision lets
+        the write through, and the refusal does not claim the disk changed.
+        """
+        if slot_view is not None and slot_occupancy(slot_view) == "unknown":
+            raise refusal(bind_mapping_revision(revision(), binding))
 
     async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
         """Read the current view a bay-assignment write is checked against.
@@ -7031,6 +7052,10 @@ class InventoryService:
         # as the pre-write read found it is bound here, so a write prepared
         # against another disk is refused before anything is stored (#1141).
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.save_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiable,
+        )
         try:
             saved = self.mapping_store.save_mapping(
                 mapping, expected_revision=expected_revision, revision_binding=binding,
@@ -7064,6 +7089,10 @@ class InventoryService:
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.clear_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiableBeforeClear,
+        )
         try:
             cleared = self.mapping_store.clear_mapping(
                 self.system.id,
@@ -9927,6 +9956,20 @@ class InventoryService:
         if len(disks_by_bmc_slot) < len({disk.slot for disk in disk_records if disk.slot is not None}):
             warnings.append("ESXi controller/enclosure coordinates overlap; ambiguous disks remain unplaced.")
 
+        # The RAID card's drive list is its whole census only when every
+        # listing configured and run answered in full; a card bay it lists no
+        # drive in is then empty, as before #1218. A failed, partial or
+        # unparsed listing, or another layout, proves no absence.
+        drive_lists = ssh_data.esxi_storcli_drive_lists
+        configured_lists = {
+            command for command in map(canonicalize_ssh_command, self.system.ssh.commands)
+            if re.fullmatch(r"storcli /(?:c\d+|call)/eall/sall show all J", command)
+        }
+        storcli_census_complete = (
+            selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+            and bool(drive_lists) and all(drive_lists.values()) and configured_lists <= drive_lists.keys()
+        )
+        listed_slots = {disk.slot for disk in disk_records if disk.slot is not None}
         esxi_topology_members = self._build_esxi_topology_members(disk_records)
         slot_hints = selected_profile.slot_hints or {}
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
@@ -10079,6 +10122,8 @@ class InventoryService:
                     }
             raw_slot_status["mapping_resolution_source"] = resolution.source
             raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
+            if storcli_census_complete and disk is None and slot not in listed_slots and raw_slot_status["present"] is None:
+                raw_slot_status["present"] = False
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
