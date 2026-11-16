@@ -441,10 +441,7 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
 
 
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
-    controller_pattern = re.compile(
-        r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
-    )
+    controller_pattern = re.compile(r"^(?P<controller>mpr\d+):\s+(?P<body>.+)$")
     disk_pattern = re.compile(
         r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
         r"(?P<target>\d+):(?P<lun>\d+)\):\s+(?P<message>.+)$"
@@ -485,19 +482,23 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         else:
             controller_match = controller_pattern.match(source_line)
             if controller_match:
-                message = controller_match.group("message").strip()
-                target = _bounded_numeric_token(controller_match.group("target"))
+                message, tail_match, rejected_tail = _split_mpr_controller_tail(controller_match.group("body"))
+                target = _bounded_numeric_token(tail_match.group("target")) if tail_match else None
                 event = {
                     "source": "controller",
                     "controller": controller_match.group("controller"),
                     "target": target,
-                    "smid": controller_match.group("smid"),
-                    "loginfo": controller_match.group("loginfo"),
+                    "smid": tail_match.group("smid") if tail_match else None,
+                    # An empty loginfo field is present but malformed, not absent.
+                    "loginfo": (tail_match.group("loginfo") or "") if tail_match else None,
                     "message": message,
                     "event_type": _mpr_dmesg_event_type(message),
                     "severity": "error",
                     "line": stripped,
                 }
+                if rejected_tail is not None:
+                    event["controller_tail_malformed"] = True
+                    event["controller_tail_raw"] = rejected_tail
                 if source_timestamp:
                     event["timestamp_raw"] = source_timestamp
         if not event:
@@ -531,6 +532,36 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             for key, summary in sorted(summaries["by_controller_target"].items())
         },
     }
+
+
+_CONTROLLER_TAIL_MARKERS = tuple(re.compile(marker, re.IGNORECASE) for marker in ("tgt", "SMID", "loginfo"))
+# The kernel prints "tgt %u SMID %u loginfo %x". The loginfo value is the whole
+# rest of the line, whatever it holds: the decoder decides whether it is a number.
+_CONTROLLER_TAIL = re.compile(r"tgt\s+(?P<target>[0-9]+)\s+SMID\s+(?P<smid>[0-9]+)\s+loginfo(?:\s+(?P<loginfo>.*))?")
+
+
+def _split_mpr_controller_tail(body: str) -> tuple[str, re.Match[str] | None, str | None]:
+    """Split a controller line into its message and its first tgt/SMID/loginfo tail.
+
+    The tail is found by its three markers, in order and in any case, before
+    any field is validated, so a later tail is never read in place of the
+    first. Returns the message, the tail match when every field is in the
+    kernel's form, and the raw tail text when it is present but rejected.
+    """
+    start = _CONTROLLER_TAIL_MARKERS[0].search(body)
+    if start is None:
+        return body.strip(), None, None
+    position = start.end()
+    for marker in _CONTROLLER_TAIL_MARKERS[1:]:
+        found = marker.search(body, position)
+        if found is None:
+            return body.strip(), None, None
+        position = found.end()
+    message, tail = body[: start.start()], body[start.start() :]
+    tail_match = _CONTROLLER_TAIL.fullmatch(tail) if message.strip() and message[-1].isspace() else None
+    if tail_match is None:
+        return message.strip() or body.strip(), None, tail
+    return message.strip(), tail_match, None
 
 
 def _bounded_numeric_token(value: str | None) -> str | None:
@@ -611,16 +642,44 @@ def _mpr_dmesg_severity(message: str) -> str:
     return "info"
 
 
+_SENSE_PREFIX = re.compile(r"SCSI sense:", re.IGNORECASE)
+_SENSE_ASC_MARKER = re.compile(r"asc:", re.IGNORECASE)
+_SENSE_REASON_OPENER = re.compile(r"\s\(")
+
+
 def _parse_mpr_sense_message(message: str) -> dict[str, str]:
-    match = re.search(r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)", message)
-    if not match:
+    """Split a sense line into sense key, ASC/ASCQ field and reason.
+
+    The kernel prints ``SCSI sense: <key> asc:%x,%x (<reason>)``. The first
+    ``asc:`` marker (any case) is the only ASC field read. Its complete raw
+    value, everything up to the reason, is kept whatever it contains, so the
+    strict reader decides whether it is a code. The sense key is the text
+    before that marker, so a malformed field is never absorbed into the key,
+    and a later ``asc:`` fragment is never read in its place. An empty field
+    is kept as ``""`` (present but malformed); no marker means no ASC field.
+    """
+    prefix = _SENSE_PREFIX.search(message)
+    if not prefix:
         return {}
-    return {
-        "sense": match.group("sense").strip(),
-        "sense_key": match.group("sense").strip().upper(),
-        "asc": match.group("asc").lower(),
-        "reason": match.group("reason").strip(),
-    }
+    body = message[prefix.end() :]
+    marker = _SENSE_ASC_MARKER.search(body)
+    if not marker:
+        return {}
+    sense = body[: marker.start()].strip()
+    rest = body[marker.end() :]
+    asc, reason = rest, None
+    opener = _SENSE_REASON_OPENER.search(rest)
+    close = rest.rfind(")")
+    if opener and close > opener.end():
+        end = opener.start()
+        while end and rest[end - 1].isspace():
+            end -= 1
+        asc = rest[:end]
+        reason = rest[opener.end() : close].strip()
+    parsed = {"sense": sense, "sense_key": sense.upper(), "asc": asc.lower()}
+    if reason is not None:
+        parsed["reason"] = reason
+    return parsed
 
 
 def admit_mpr_unit_number(token: str | None) -> int | None:

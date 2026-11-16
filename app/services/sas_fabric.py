@@ -3018,6 +3018,7 @@ def _diagnostic_metric_summary(summary: dict[str, Any] | None) -> dict[str, Any]
         "targets": summary.get("targets") or [],
         "sense_counts": summary.get("sense_counts") or {},
         "loginfo_counts": summary.get("loginfo_counts") or {},
+        "loginfo_rejected_count": summary.get("loginfo_rejected_count", 0),
         "fault_family_counts": summary.get("fault_family_counts") or {},
         "operation_counts": summary.get("operation_counts") or {},
         "top_findings": summary.get("top_findings") or [],
