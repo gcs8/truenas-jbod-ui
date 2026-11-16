@@ -95,6 +95,43 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   when the config file was already replaced and only the directory fsync
   failed; the profile is kept and the request reports an uncertain save
   (#1240).
+- The CORE Storage Fabric view no longer invents an `mpr-1` controller when
+  no `mprutil` output was returned; it says no controller or path data is
+  available and still draws the bays, pools and vdevs the inventory knows.
+  Output that cannot be read as controller data no longer creates a
+  controller. A count or list is shown as measured only when the reply that
+  carries it was read: a controller, path, expander or enclosure count whose
+  read did not happen, was incomplete or could not be parsed reads "not
+  read" or "at least N" in the summary, host line, disk view and main-page
+  topology summary instead of 0, and a lane whose expander or enclosure list
+  was not read says "Not read" instead of "No objects reported". A list
+  printed with its column heading and no rows is still a measured zero, and
+  rows `mprutil` prints with blank columns (an expander's zero parent or
+  enclosure handle, a non-SES enclosure's SEP handle) are read. Every
+  supported `mprutil -u N` command, `show all` included, counts its unit as
+  attempted, and a `show all` reply is read through its `Adapter:`,
+  `Devices:`, `Enclosures:` and `Expanders:` sections (a dedicated reply for
+  the same list wins, and a section in which `mprutil` printed an error is
+  not read); a unit that could not be read is named in a warning
+  and keeps the view partial, and a unit number that is not 1 to 4 digits is
+  rejected and counted, never shown. An adapter or expander PHY table that
+  was not read whole (missing, short, malformed or repeated rows) shows its
+  PHY counts as "not read", is counted in a warning and keeps the view
+  partial; a whole table keeps its counts, including rows for PHYs with
+  nothing attached and an expander that reports zero PHYs, and a
+  "Discovery still in progress" line in place of a PHY row adds no warning.
+  Of these reads, an unread or rejected controller unit, an unread expander
+  or enclosure list and a PHY table not read whole make the status partial.
+  An enclosure's device count comes only from a device list that was read;
+  an unread device list shows that count as "not read" and, as before,
+  leaves the status alone. On a partial
+  read, inventory bays that no controller lane claims are drawn in their own
+  group, and the no-controller lanes say "disks" for unmapped inventory. An
+  empty numbered `mprutil -u N` result no longer hides the unnumbered
+  adapter details. When only the unnumbered `mprutil show ...` commands
+  answer, their board and firmware stay on one controller, and every link
+  and controller reference names a node that is in the map (#1244, refs
+  #1219).
 - System Setup no longer replaces a system configured only in the top-level
   `truenas` and `ssh` settings (in `config.yaml` or `.env`, including one that
   sets only a credential and uses the default host) when a system is added,
@@ -137,6 +174,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
+- QuantaStor: two overlapping storage views on one node no longer both show
+  the same disk, and another node's pool-device row at the same local path
+  (such as `/dev/sda`) no longer moves a disk to that node's bay, gives it
+  that node's pool, or lists the disk as visible on that node. A pool-device
+  row's device path now matches only a disk on the row's own node, and a row
+  with no known node matches no disk by path when the grid has several nodes;
+  stable identifiers (physical disk ID, serial, SCSI ID) still match across
+  nodes, and single-node systems are unchanged (#1264).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

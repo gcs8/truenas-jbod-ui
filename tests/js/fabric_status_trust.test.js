@@ -77,6 +77,8 @@ function loadTrustStatus() {
     functionSource("fabricRefreshingWindowSeconds"),
     functionSource("fabricEvidenceAgeSeconds"),
     functionSource("formatEvidenceAge"),
+    functionSource("fabricCountState"),
+    functionSource("fabricCountsIncomplete"),
     functionSource("fabricTrustStatus"),
   ].join("\n");
   vm.runInContext(`${source}\nthis.__loaded = fabricTrustStatus;`, sandbox);
