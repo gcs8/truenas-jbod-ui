@@ -4700,6 +4700,11 @@
     if (Number.isInteger(hours)) {
       return Number.isInteger(days) ? `${hours} hr (${days} d)` : `${hours} hr`;
     }
+    // Reported in a form that could not be read: neither absent nor zero.
+    const unread = smartEntry?.data?.unread_fields;
+    if (Array.isArray(unread) && (unread.includes("power_on_hours") || unread.includes("power_on_days"))) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }

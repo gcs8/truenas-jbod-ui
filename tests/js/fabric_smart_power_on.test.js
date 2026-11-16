@@ -1,8 +1,9 @@
 "use strict";
 
-// Storage Fabric SMART power-on time: an unknown value is omitted, never shown
-// as a measured zero. The summaries below have the shape the SMART summary
-// API serialises: every field present, unknown fields null.
+// Storage Fabric SMART power-on time: an absent value is omitted, a value the
+// SMART JSON reported but could not be read says "not read", and neither is
+// shown as a measured zero. The summaries below have the shape the SMART
+// summary API serialises: every field present, unknown fields null.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -28,12 +29,14 @@ function functionSource(source, name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
-const { formatInteger, formatSmartPowerOn, smartSummaryLine } = new Function(
+const { formatInteger, formatSmartPowerOn, formatSmartPowerOnFact, smartSummaryLine } = new Function(
   [
     functionSource(FABRIC_SOURCE, "formatInteger"),
     functionSource(FABRIC_SOURCE, "formatSmartPowerOn"),
+    functionSource(FABRIC_SOURCE, "smartPowerOnNotRead"),
+    functionSource(FABRIC_SOURCE, "formatSmartPowerOnFact"),
     functionSource(FABRIC_SOURCE, "smartSummaryLine"),
-    "return { formatInteger, formatSmartPowerOn, smartSummaryLine };",
+    "return { formatInteger, formatSmartPowerOn, formatSmartPowerOnFact, smartSummaryLine };",
   ].join("\n"),
 )();
 
@@ -45,6 +48,7 @@ function summary(fields) {
     temperature_c: null,
     power_on_hours: null,
     power_on_days: null,
+    unread_fields: [],
     ...fields,
   };
 }
@@ -76,4 +80,31 @@ test("formatInteger does not turn null or booleans into 0", () => {
     assert.equal(formatInteger(value), "", `value ${String(value)}`);
   }
   assert.equal(formatInteger(0), "0");
+});
+
+test("a reported but unreadable power-on time says not read", () => {
+  const unread = summary({ smart_health_status: "PASSED", temperature_c: 30, unread_fields: ["power_on_days", "power_on_hours"] });
+  assert.equal(formatSmartPowerOn(unread), "");
+  assert.equal(formatSmartPowerOnFact(unread), "not read");
+  assert.equal(smartSummaryLine(unread), "PASSED / 30 C / power on not read");
+  // Absent stays omitted; zero and a reading stay readings.
+  assert.equal(formatSmartPowerOnFact(summary({ temperature_c: 30 })), "");
+  assert.equal(smartSummaryLine(summary({ temperature_c: 30 })), "30 C");
+  assert.equal(formatSmartPowerOnFact(summary({ power_on_hours: 0, power_on_days: 0 })), "0 d");
+  // A value another source filled wins over the unread marker.
+  assert.equal(formatSmartPowerOnFact(summary({ power_on_hours: 48, power_on_days: 2, unread_fields: ["power_on_hours"] })), "2 d");
+  // Other unread fields do not make power-on time unread.
+  assert.equal(formatSmartPowerOnFact(summary({ unread_fields: ["temperature_c"] })), "");
+  // A summary with nothing readable keeps its own message.
+  assert.equal(
+    smartSummaryLine({ available: false, message: "SMART summary fields were returned for this disk but could not be read.", unread_fields: ["power_on_hours"] }),
+    "SMART summary fields were returned for this disk but could not be read.",
+  );
+});
+
+test("the SMART card and the disk path facts use the power-on fact", () => {
+  const card = functionSource(FABRIC_SOURCE, "renderSmartSummaryCard");
+  assert.match(card, /formatSmartPowerOnFact\(summary\)/);
+  assert.doesNotMatch(card, /formatSmartPowerOn\(summary\)/);
+  assert.match(FABRIC_SOURCE, /\["Power on", formatSmartPowerOnFact\(smartSummary\)\]/);
 });

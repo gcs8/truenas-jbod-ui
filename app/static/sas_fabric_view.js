@@ -1539,7 +1539,8 @@
     if (!summary) {
       return "";
     }
-    // Unknown power-on time (null) is omitted like any other unknown SMART field.
+    // An absent power-on time (null) is omitted like any other absent SMART
+    // field; smartPowerOnNotRead says when it was reported but not read.
     const isCount = value => Number.isInteger(value) && value >= 0;
     if (isCount(summary.power_on_days)) {
       return `${formatInteger(summary.power_on_days)} d`;
@@ -1548,6 +1549,17 @@
       return `${formatInteger(summary.power_on_hours)} h`;
     }
     return "";
+  }
+
+  // The SMART JSON reported a power-on time but in a form that could not be
+  // read: say so instead of omitting it like an absent one.
+  function smartPowerOnNotRead(summary) {
+    const unread = Array.isArray(summary?.unread_fields) ? summary.unread_fields : [];
+    return !formatSmartPowerOn(summary) && (unread.includes("power_on_hours") || unread.includes("power_on_days"));
+  }
+
+  function formatSmartPowerOnFact(summary) {
+    return formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "not read" : "");
   }
 
   function smartSummaryLine(summary) {
@@ -1560,7 +1572,7 @@
     return [
       summary.smart_health_status,
       summary.temperature_c != null ? `${summary.temperature_c} C` : null,
-      formatSmartPowerOn(summary),
+      formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "power on not read" : null),
     ].filter(Boolean).join(" / ");
   }
 
@@ -1597,7 +1609,7 @@
         <div>
           ${summary.smart_health_status ? `<span><em>Health</em>${escapeHtml(summary.smart_health_status)}</span>` : ""}
           ${summary.temperature_c != null ? `<span><em>Temp</em>${escapeHtml(`${summary.temperature_c} C`)}</span>` : ""}
-          ${formatSmartPowerOn(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOn(summary))}</span>` : ""}
+          ${formatSmartPowerOnFact(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOnFact(summary))}</span>` : ""}
           ${lastTest ? `<span><em>Last test</em>${escapeHtml(lastTest)}</span>` : ""}
           ${ioTotals ? `<span><em>I/O totals</em>${escapeHtml(ioTotals)}</span>` : ""}
           ${errorCounts ? `<span><em>Errors</em>${escapeHtml(errorCounts)}</span>` : ""}
@@ -3176,7 +3188,7 @@
           ["GPTID", slot?.gptid],
           ["Multipath state", slot?.multipath?.state || slot?.multipath?.provider_state],
           ["SMART", smartSummaryLine(smartSummary)],
-          ["Power on", formatSmartPowerOn(smartSummary)],
+          ["Power on", formatSmartPowerOnFact(smartSummary)],
           ["Last SMART test", [slot?.last_smart_test_type, slot?.last_smart_test_status].filter(Boolean).join(" / ")],
           ["Transport", [slot?.transport_protocol, slot?.scsi_hctl, slot?.sg_device].filter(Boolean).join(" / ")],
           ["Attached SAS", slot?.attached_sas_address],
