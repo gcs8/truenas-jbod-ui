@@ -507,7 +507,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         prep = source.split("HARDENED_OWNERSHIP_PREP = (", 1)[1].split("\n)\n", 1)[0]
         # A diagnostic may reject chown without executing an ownership repair.
         self.assertEqual(source.count("sudo chown "), prep.count("sudo chown "))
-        self.assertIn("HARDENED_OWNERSHIP_PREP", inspect.getsource(smoke.prepare_root))
+        # prepare_root runs it through hardened_ownership_commands(), one checked command at a time.
+        self.assertIn("hardened_ownership_commands()", inspect.getsource(smoke.prepare_root))
         calls = []
         deployment = smoke.Deployment(Path("/nonexistent"))
         deployment.compose = lambda *args, **kwargs: calls.append(args) or ""
@@ -3118,7 +3119,7 @@ class UpgradeScenarioContractTests(unittest.TestCase):
                 def prepare(path, compose, config):
                     if path.name == "target":
                         self.assertNotEqual(config.read_bytes(), args.config_fixture.read_bytes())
-                    path.mkdir()
+                    path.mkdir(mode=0o700)  # private, as prepare_root creates it
                     smoke._record_created_root(path)  # as prepare_root records the directory it created
                     (path / "docker-compose.yml").write_text("synthetic transport only")
                     (path / "must-not-survive").write_text("source" if path.name == "source" else "target")
@@ -3214,7 +3215,7 @@ class CleanHostRestoreDriverTests(unittest.TestCase):
                 return self.run_python(service, script)
 
         def prepare(path, compose, config):
-            path.mkdir()
+            path.mkdir(mode=0o700)  # private, as prepare_root creates it
             smoke._record_created_root(path)  # as prepare_root records the directory it created
             (path / "docker-compose.yml").write_text("synthetic transport only")
 

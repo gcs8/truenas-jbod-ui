@@ -77,7 +77,12 @@ mistakes (a ``--root`` that already holds something, a directory replaced by a
 scenario step or by an operator while it runs) and against other unprivileged
 users on the host: the root and every directory above it must be owned by the
 invoking user or root and must not let another user rename entries in it
-(group- or other-writable without the sticky bit). Every write, move or
+(group- or other-writable without the sticky bit). The root itself is created
+mode 0700 and must stay private to the invoking user for the whole run, so no
+other user can reach anything inside it, including the directories the
+hardened scenario hands to the app and backup identities. Ownership changes
+never follow a symlink and change a directory only after every entry below it,
+each as its own checked command. Every write, move or
 removal inside a root, privileged or not, first passes one ownership check: the
 device and inode of the root and of every directory above it are still the
 ones recorded when this run created it. Nothing is removed recursively until
@@ -135,6 +140,9 @@ APP_UID = 10001
 # as wiki/Troubleshooting.md documents it ("A non-root container gets
 # permission denied"); a contract test keeps the two identical. It runs once,
 # before the hardened install first starts, never as part of an upgrade.
+# The documented operator step (wiki/Troubleshooting.md), kept verbatim as the
+# reference. The smoke runs it as hardened_ownership_commands(): the same
+# entries and owners, as separate checked commands that follow no link.
 HARDENED_OWNERSHIP_PREP = (
     'app_uid="${APP_UID:-10001}"',
     'app_gid="${APP_GID:-10001}"',
@@ -354,6 +362,13 @@ def _owned_root(root: Path) -> tuple[Path, _OwnedRoot]:
                          "leaving it untouched") from None
     expect(current == record.identity, f"deployment root {key} is no longer the directory this run created "
                                        "(it or a parent was replaced); leaving it untouched")
+    try:
+        mode = stat.S_IMODE(os.lstat(key).st_mode)
+    except OSError:
+        raise SmokeError(f"deployment root {key} cannot be read; leaving it untouched") from None
+    # Private for the whole run: another user must not reach a directory this run handed to it.
+    expect(not mode & 0o077, f"deployment root {key} is open to other users (mode {mode:04o}); it must stay "
+                             "private to this user while the run works in it; leaving it untouched")
     return key, record
 
 
@@ -421,11 +436,43 @@ def _create_owned_directory(root: Path, mode: int) -> None:
         raise SmokeError(f"deployment root {root} already exists; pass an absent path") from None
     try:
         info = os.lstat(root)
-        fresh = stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not os.listdir(root)
+        fresh = (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077
+                 and not os.listdir(root))
     except OSError:
         fresh = False
     expect(fresh, f"deployment root {root} is not the empty directory this run just created; leaving it untouched")
     _record_created_root(root)
+
+
+def _ownership_identity(name: str, default: str) -> str:
+    """The id the documented step's ``${NAME:-default}`` gives: the environment value unless unset or empty."""
+    value = os.environ.get(name) or default
+    expect(value.isascii() and value.isdigit() and len(value) <= 10,
+           f"{name} must be a numeric id for the hardened ownership step; refusing before creating the root")
+    return value
+
+
+def hardened_ownership_commands() -> list[list[str]]:
+    """The documented ownership step as separate privileged commands that follow no link.
+
+    Same entries and owners as HARDENED_OWNERSHIP_PREP: ./config except
+    config/backup-secrets, then ./data, ./logs and ./history recursively, then
+    ./backup-status for the backup identity. find lists ./config deepest
+    first and ``chown -h`` changes each entry itself, so no directory is handed
+    over while an entry below it still waits for its change; ``chown -R``
+    without -H or -L walks by descriptor and never follows a link. Each is its
+    own command with its own ownership check, run from the root.
+    """
+    app_uid = _ownership_identity("APP_UID", "10001")
+    app_gid = _ownership_identity("APP_GID", "10001")
+    backup_uid = _ownership_identity("BACKUP_UID", "1000")
+    app = f"{app_uid}:{app_gid}"
+    return [
+        ["sudo", "find", "-P", "./config", "-depth", "!", "-path", "./config/backup-secrets",
+         "!", "-path", "./config/backup-secrets/*", "-exec", "chown", "-h", app, "{}", "+"],
+        *(["sudo", "chown", "-h", "-R", "-P", app, "--", f"./{name}"] for name in ("data", "logs", "history")),
+        ["sudo", "install", "-d", "-o", backup_uid, "-g", app_gid, "-m", "2750", "./backup-status"],
+    ]
 
 
 def owns_root(root: Path) -> bool:
@@ -449,6 +496,7 @@ def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroo
     for label, fixture in (("compose", compose_fixture), ("config", config_fixture), ("nonroot", nonroot_fixture)):
         if fixture is not None:
             expect(fixture.is_file(), f"{label} fixture {fixture} is missing or not a regular file")
+    ownership = hardened_ownership_commands() if nonroot_fixture is not None else []
     admitted = admitted_root(root)
     expect(admitted == Path(os.path.abspath(root)),
            f"deployment root {root} is reached through a symlink; pass its real path {admitted}")
@@ -457,7 +505,8 @@ def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroo
     expect(not os.path.lexists(root),
            f"deployment root {root} already exists; pass an absent path, the smoke never replaces existing files")
     expect(bool(compose_project_name(root)), f"deployment root name {root.name!r} does not give a Compose project name")
-    _create_owned_directory(root, 0o755)
+    # 0700 for the whole run: no other user can reach what the run hands to it.
+    _create_owned_directory(root, 0o700)
     owned_write(root, root / "docker-compose.yml", compose_fixture.read_bytes(), 0o644)
     # Existing installs created these as root; the base Compose must accept
     # them without any ownership migration.
@@ -467,9 +516,11 @@ def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroo
                      str(root / "config" / "config.yaml")])
     if nonroot_fixture is not None:
         # Adopting the overlay is a separate, one-time change made before the
-        # hardened install first starts: the documented ownership step, verbatim.
+        # hardened install first starts: the documented ownership step, as
+        # hardened_ownership_commands() runs it, one checked command at a time.
         owned_write(root, root / "docker-compose.nonroot.yml", nonroot_fixture.read_bytes(), 0o644)
-        owned_run(root, ["bash", "-euo", "pipefail", "-c", "\n".join(HARDENED_OWNERSHIP_PREP)], cwd=root)
+        for command in ownership:
+            owned_run(root, command, cwd=root)
     return root
 
 

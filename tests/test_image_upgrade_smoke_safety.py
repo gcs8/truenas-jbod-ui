@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -27,7 +28,7 @@ _PREVIOUS_UMASK: list[int] = []
 def setUpModule() -> None:
     # The smoke refuses a root that another user could rename entries in,
     # group-writable included; build the synthetic trees with the usual umask
-    # whatever the runner's is (the script itself creates its roots 0755/0700).
+    # whatever the runner's is (the script itself creates its roots 0700).
     _PREVIOUS_UMASK.append(os.umask(0o022))
 
 
@@ -222,7 +223,8 @@ class RootAdmissionTests(unittest.TestCase):
 
 
 def claim(smoke, root: Path) -> None:
-    """Record the directory now at ``root`` as created by this run, exactly as prepare_root does."""
+    """Record the directory now at ``root`` as created by this run, exactly as prepare_root does (mode 0700)."""
+    os.chmod(root, 0o700)
     smoke._record_created_root(root)
 
 
@@ -986,7 +988,7 @@ class OwnershipCheckedWriteTests(RoundThreeCase):
             stage_backup_target(root, available=available)
 
         cases = {
-            "prepare_root": (None, 8, lambda root: smoke.prepare_root(
+            "prepare_root": (None, 12, lambda root: smoke.prepare_root(
                 root, COMPOSE_FIXTURE, CONFIG_FIXTURE, NONROOT_FIXTURE)),
             "install_backup_scheduler_with_target": (registered, 7, lambda root: (
                 smoke.install_backup_scheduler_with_target(smoke.Deployment(root)))),
@@ -1149,6 +1151,22 @@ class CreationAcquisitionTests(RoundThreeCase):
         self.assertFalse(self.smoke.owns_root(root))
 
 
+    def test_a_directory_open_to_other_users_found_at_creation_is_not_recorded(self):
+        # The root is recorded only while it is private, not first and refused later.
+        root, _ = self.case("acquire-open")
+        real_mkdir = os.mkdir
+
+        def mkdir_open(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, 0o755 if Path(path) == root else mode, *args, **kwargs)
+
+        host = TreeHost()
+        with mock.patch.object(self.smoke.os, "mkdir", side_effect=mkdir_open):
+            outcome, _ = self.attempt(lambda: self.smoke.prepare_root(root, COMPOSE_FIXTURE, CONFIG_FIXTURE), host)
+        self.assertRegex(outcome, "^refused: .*not the empty directory this run just created")
+        self.assertEqual(host.commands, [])
+        self.assertNotIn(root, self.smoke._OWNED_ROOTS)
+
+
 class NestedRootRemovalTests(RoundThreeCase):
     """Nothing is removed recursively until every root this run created beneath it passes its own check."""
 
@@ -1179,6 +1197,283 @@ class NestedRootRemovalTests(RoundThreeCase):
         self.assertFalse(outer.exists())
         self.assertNotIn(child, self.smoke._OWNED_ROOTS)
         self.assertNotIn(outer, self.smoke._OWNED_ROOTS)
+
+
+class HandoffHost(TreeHost):
+    """TreeHost that models the hardened ownership handoff, operand by operand, without changing any owner.
+
+    Each ``chown`` operand (direct, recursive or from ``find -exec``) is
+    resolved the way the kernel resolves it for chown: through every
+    intermediate component, and through a final symlink unless ``-h`` is given.
+    A directory handed to the app identity is then writable by that other user.
+    Before each later operand that user replaces the entry on that operand's
+    path inside a directory it was handed with a symlink to an outside file, if
+    it can reach that directory: every directory between the shared parent and
+    it is either its own or searchable by others. ``reach_always`` grants the
+    reach regardless, to test the ownership step on its own. A recursive
+    ``chown -R`` without ``-H``/``-L`` walks by descriptor and never follows a
+    link, so its descendants are taken as one step. The handoff is modelled:
+    no owner, mode or privilege changes.
+    """
+
+    def __init__(self, root: Path, shared: Path, outside: Path, *, reach_always: bool = False,
+                 attacks: bool = True, populate=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.root, self.shared, self.outside = root, shared, outside
+        self.reach_always = reach_always
+        self.attacks = attacks
+        self.populate = populate
+        self.handed: set[Path] = set()
+        self.targets: list[tuple[Path, str]] = []
+        self.installs: list[tuple[Path, str, str]] = []
+        self.swaps: list[Path] = []
+        self.root_modes: list[int] = []
+
+    def done(self, listed, kwargs):
+        self.commands.append(listed)
+        self.kwargs.append(kwargs)
+        return subprocess.CompletedProcess(listed, 0, "" if kwargs.get("text") else b"", "")
+
+    def __call__(self, command, **kwargs):
+        listed = list(command)
+        if os.path.isdir(self.root):
+            self.root_modes.append(os.lstat(self.root).st_mode)
+        cwd = Path(kwargs.get("cwd") or os.getcwd())
+        if listed[:1] == ["bash"]:
+            self.ownership_started()
+            for line in listed[-1].splitlines():
+                self.interpret_line(line, cwd)
+            return self.done(listed, kwargs)
+        if listed[:2] in (["sudo", "find"], ["sudo", "chown"]):
+            self.ownership_started()
+            self.privileged(listed, cwd)
+            return self.done(listed, kwargs)
+        if listed[:3] == ["sudo", "install", "-d"] and "-o" in listed and os.path.isdir(cwd / listed[-1]):
+            # An ownership change of an existing directory, as in the hardened step.
+            self.record_install(listed, cwd)
+            return self.done(listed, kwargs)
+        return super().__call__(command, **kwargs)
+
+    def ownership_started(self) -> None:
+        if self.populate is not None:
+            self.populate(self.root)
+            self.populate = None
+
+    def interpret_line(self, line: str, cwd: Path) -> None:
+        """One line of the documented shell step; ``name="${NAME:-default}"`` reads the environment like the shell."""
+        import re
+        import shlex
+        assignment = re.fullmatch(r'(\w+)="\$\{(\w+):-(\d+)\}"', line)
+        if assignment:
+            value = os.environ.get(assignment[2]) or assignment[3]
+            self.variables = {**getattr(self, "variables", {}), assignment[1]: value}
+            return
+        words = [re.sub(r"\$(\w+)", lambda match: self.variables[match[1]], word) for word in shlex.split(line)]
+        if words[:3] == ["sudo", "install", "-d"]:
+            self.record_install(words, cwd)
+        else:
+            self.privileged(words, cwd)
+
+    def record_install(self, words: list[str], cwd: Path) -> None:
+        self.attack(cwd / words[-1])
+        target = Path(os.path.realpath(cwd / words[-1]))
+        owner = f"{words[words.index('-o') + 1]}:{words[words.index('-g') + 1]}"
+        self.installs.append((target, owner, words[words.index("-m") + 1]))
+
+    def privileged(self, words: list[str], cwd: Path) -> None:
+        import fnmatch
+        if words[1] == "find":
+            rest = words[2:]
+            while rest[0] in ("-P", "-H", "-L"):
+                rest = rest[1:]
+            start, expression = rest[0], rest[1:]
+            exec_at = expression.index("-exec")
+            chown = expression[exec_at:expression.index("{}")][1:]
+            patterns = [expression[i + 1] for i, word in enumerate(expression) if word == "-path"]
+            depth, prune = "-depth" in expression, "-prune" in expression
+            operands = []
+
+            def visit(relative: str) -> None:
+                excluded = any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+                path = cwd / relative
+                descend = path.is_dir() and not path.is_symlink() and not (excluded and prune and not depth)
+                if not depth and not excluded:
+                    operands.append(relative)
+                if descend:
+                    for name in sorted(os.listdir(path)):
+                        visit(f"{relative}/{name}")
+                if depth and not excluded:
+                    operands.append(relative)
+
+            visit(start)
+            self.chown(chown, operands, cwd)
+        elif words[1] == "chown":
+            self.chown(words[1:], None, cwd)
+        else:
+            raise AssertionError(f"unexpected privileged command {words}")
+
+    def chown(self, words: list[str], operands: list[str] | None, cwd: Path) -> None:
+        flags = {word for word in words[1:] if word.startswith("-") and word != "--"}
+        positional = [word for word in words[1:] if not word.startswith("-")]
+        identity, named = positional[0], positional[1:]
+        recursive = "-R" in flags
+        follow_final = "-h" not in flags and not (recursive and not flags & {"-H", "-L"})
+        for relative in (named if operands is None else operands):
+            self.attack(cwd / relative)
+            path = Path(os.path.normpath(cwd / relative))
+            target = Path(os.path.realpath(path)) if follow_final else Path(os.path.realpath(path.parent)) / path.name
+            self.hand(target, identity)
+            if recursive and target.is_dir() and not target.is_symlink():
+                for directory, names, files in os.walk(target):
+                    for name in sorted(names + files):
+                        entry = Path(directory) / name
+                        # -H/-L make the walk follow a link below an operand too.
+                        self.hand(Path(os.path.realpath(entry)) if flags & {"-H", "-L"} else entry, identity)
+
+    def hand(self, target: Path, identity: str) -> None:
+        self.targets.append((target, identity))
+        if target.is_dir() and not target.is_symlink() and target.is_relative_to(self.root):
+            self.handed.add(target)
+
+    def reachable(self, directory: Path) -> bool:
+        if self.reach_always:
+            return True
+        for component in [directory, *directory.parents]:
+            if component == self.shared:
+                return True
+            if component != directory and component not in self.handed \
+                    and not os.lstat(component).st_mode & stat.S_IXOTH:
+                return False
+        return False
+
+    def attack(self, pending: Path) -> None:
+        if not self.attacks:
+            return
+        pending = Path(os.path.normpath(pending))
+        for directory in sorted(self.handed, key=lambda path: len(path.parts)):
+            if pending == directory or not pending.is_relative_to(directory) or not self.reachable(directory):
+                continue
+            entry = directory / pending.relative_to(directory).parts[0]
+            if entry.is_symlink() or not os.path.lexists(entry):
+                continue
+            entry.rename(entry.with_name(entry.name + ".before-swap"))
+            entry.symlink_to(self.outside if entry == pending else self.outside.parent)
+            self.swaps.append(entry)
+            return
+
+    def outside_targets(self) -> list[Path]:
+        return [target for target, _ in self.targets if not target.is_relative_to(self.root)]
+
+
+class DescendantHandoffTests(RoundThreeCase):
+    """A directory handed to another user never lets that user redirect a later privileged step."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("APP_UID", "APP_GID", "BACKUP_UID"):
+            os.environ.pop(name, None)
+        self.shared = self.parent / "shared"
+        self.shared.mkdir()
+        os.chmod(self.shared, 0o1777)  # sticky and shared, like /tmp: admitted
+        self.addCleanup(os.chmod, self.shared, 0o755)
+        (self.parent / "outside").mkdir()
+        self.outside = self.parent / "outside" / "operator-file"
+        self.outside.write_text("synthetic, never handed over\n", encoding="utf-8")
+
+    def hardened(self, root: Path, **kwargs) -> tuple[str, HandoffHost]:
+        host = HandoffHost(root, self.shared, self.outside, **kwargs)
+        outcome, _ = self.attempt(
+            lambda: self.smoke.prepare_root(root, COMPOSE_FIXTURE, CONFIG_FIXTURE, NONROOT_FIXTURE), host)
+        return outcome, host
+
+    def test_the_app_identity_cannot_reach_what_it_was_handed_while_ownership_changes(self):
+        outcome, host = self.hardened(self.shared / "smoke-root")
+        self.assertEqual(outcome, "completed")
+        self.assertTrue(host.targets, "the ownership step did not run")
+        self.assertEqual(host.swaps, [], "another user reached a directory it had been handed")
+        self.assertEqual(host.outside_targets(), [], "an ownership change resolved outside the root")
+        self.assertEqual(self.outside.read_text(encoding="utf-8"), "synthetic, never handed over\n")
+
+    def test_the_ownership_step_follows_no_link_even_where_that_user_could_reach(self):
+        # The step on its own, with the private root assumed away: a nested entry
+        # waits below a directory that could be handed over first, and a link
+        # already inside ./config must be changed itself, not its referent.
+        def populate(root: Path) -> None:
+            (root / "config" / "ssh" / "known_hosts").write_text("synthetic\n", encoding="utf-8")
+            (root / "config" / "planted-link").symlink_to(self.outside)
+            (root / "data" / "planted-link").symlink_to(self.outside)
+
+        outcome, host = self.hardened(self.shared / "smoke-root", reach_always=True, populate=populate)
+        self.assertEqual(outcome, "completed")
+        self.assertTrue(host.targets)
+        self.assertEqual(host.outside_targets(), [], f"swapped entries: {host.swaps}")
+        # Each ownership change is its own checked command, not one check around a shell.
+        self.assertEqual([command for command in host.commands if command[:1] in (["bash"], ["sh"])], [])
+
+    def test_the_root_stays_private_to_this_user_for_every_privileged_command(self):
+        root = self.shared / "smoke-root"
+        outcome, host = self.hardened(root)
+        self.assertEqual(outcome, "completed")
+        self.assertTrue(host.root_modes)
+        self.assertEqual({oct(stat.S_IMODE(mode) & 0o077) for mode in host.root_modes}, {"0o0"})
+        self.assertEqual(stat.S_IMODE(os.lstat(root).st_mode) & 0o077, 0)
+
+    def test_a_root_opened_to_other_users_stops_the_next_write_and_removal(self):
+        root = self.shared / "smoke-root"
+        self.prepare(root, TreeHost())
+        os.chmod(root, 0o755)
+        self.addCleanup(lambda: os.path.isdir(root) and os.chmod(root, 0o700))
+        for name, action in (("set_image", lambda: self.smoke.Deployment(root).set_image("synthetic")),
+                             ("cleanup", lambda: self.smoke.cleanup(root))):
+            with self.subTest(action=name):
+                host = TreeHost()
+                outcome, _ = self.attempt(action, host)
+                self.assertRegex(outcome, "^refused: .*open to other users")
+                self.assertEqual(host.commands, [])
+                self.assertFalse((root / ".env").exists())
+
+    def test_symlink_safe_step_changes_the_same_paths_to_the_same_owners_as_the_documented_one(self):
+        # Healthy control: on an ordinary tree the script's step and the
+        # documented shell step change exactly the same entries, and both
+        # leave config/backup-secrets to the backup identity.
+        def populate(root: Path) -> None:
+            for name in ("config/ssh", "config/backup-secrets", "data/sub"):
+                (root / name).mkdir(parents=True, exist_ok=True)
+            for name in ("config/ssh/known_hosts", "config/backup-secrets/backup-passphrase", "data/sub/file"):
+                (root / name).write_text("synthetic\n", encoding="utf-8")
+
+        root = self.shared / "smoke-root"
+        outcome, host = self.hardened(root, populate=populate, attacks=False)
+        self.assertEqual(outcome, "completed")
+        documented_root = self.shared / "documented-root"
+        self.prepare(documented_root, TreeHost())
+        populate(documented_root)
+        documented = HandoffHost(documented_root, self.shared, self.outside, attacks=False)
+        for line in self.smoke.HARDENED_OWNERSHIP_PREP:
+            documented.interpret_line(line, documented_root)
+
+        def relative(recorded, base):
+            return sorted((str(target.relative_to(base)), *rest) for target, *rest in recorded)
+
+        self.assertEqual(relative(host.targets, root), relative(documented.targets, documented_root))
+        self.assertEqual(relative(host.installs, root), relative(documented.installs, documented_root))
+        self.assertNotIn("config/backup-secrets", [path for path, _ in relative(host.targets, root)])
+        self.assertIn(("config/config.yaml", "10001:10001"), relative(host.targets, root))
+
+    def test_identities_follow_the_documented_defaults_and_are_refused_unless_numeric(self):
+        root = self.shared / "smoke-root"
+        os.environ.update(APP_UID="20001", APP_GID="", BACKUP_UID="1000")
+        outcome, host = self.hardened(root)
+        self.assertEqual(outcome, "completed")
+        self.assertEqual({identity for _, identity in host.targets}, {"20001:10001"})
+        os.environ["APP_UID"] = "app user"
+        outcome, host = self.hardened(self.shared / "named-root")
+        self.assertRegex(outcome, "^refused: APP_UID")
+        self.assertEqual(host.commands, [])
+        self.assertFalse(os.path.lexists(self.shared / "named-root"))
 
 
 class ThreatModelTests(unittest.TestCase):
@@ -1215,6 +1510,10 @@ class ThreatModelTests(unittest.TestCase):
                         and isinstance(node.args[0], ast.List) and node.args[0].elts:
                     words = [element.value for element in node.args[0].elts[:2] if isinstance(element, ast.Constant)]
                     privileged_write = words[:1] == ["sudo"] and words[1:2] and words[1] not in self.READ_VERBS
+                    # find is a read only without an action that changes what it finds.
+                    privileged_write = privileged_write or words[:2] == ["sudo", "find"] and any(
+                        isinstance(element, ast.Constant) and element.value in ("-exec", "-execdir", "-ok", "-delete")
+                        for element in node.args[0].elts)
                     if words[:1] == ["bash"] or privileged_write:
                         offenders.append(f"{function.name}: {' '.join(map(str, words))}")
                 elif isinstance(callee, ast.Attribute) and (

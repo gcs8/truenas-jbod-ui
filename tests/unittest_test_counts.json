@@ -56,7 +56,7 @@
     "test_history_schema_version_gate": 17,
     "test_history_service": 341,
     "test_image_upgrade_contract": 123,
-    "test_image_upgrade_smoke_safety": 51,
+    "test_image_upgrade_smoke_safety": 58,
     "test_immutable_deployment": 92,
     "test_inventory": 610,
     "test_inventory_registry_routes": 15,

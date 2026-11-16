@@ -94,8 +94,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   move or removal inside the directory it created first checks, by device and
   inode for the root and every parent, that it is still that directory, and a
   recursive removal first checks every deployment directory it created inside
-  it. It pins one Compose project for startup, teardown and the absence
-  readback, reports success only after teardown and resource absence are
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
   verified, also between the admin scenario's two phases, and keeps the root
   and exits nonzero when cleanup fails or is unknown. Its header states what
   this does not cover: a process running as the same user or as root that
