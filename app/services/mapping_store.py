@@ -193,7 +193,10 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
             "lock records), so concurrent writers cannot be kept apart"
         ),
         "not_regular": "the lock path is not a regular file; with every writer stopped, move it aside",
-        "unwritable": "this process cannot open it for writing; fix its owner or mode",
+        "unwritable": (
+            "this process cannot open it for writing; check the data folder's permissions, then that "
+            "the lock path is a regular file, then its owner and mode"
+        ),
     }
 
     def __init__(self, lock_path: Path, reason: str) -> None:

@@ -1321,6 +1321,12 @@ class SaveRefusedAtTheLockFileSaysWhyTests(unittest.TestCase):
         # A failed lock call can also mean the host ran out of lock records,
         # so no message claims the storage cannot lock files.
         self.assertNotIn("does not support", details["unsupported"])
+        # A lock file that cannot be opened does not show the lock file is at
+        # fault, so the logged reason names the checks in the wiki's order.
+        logged = refusal(Path("/app/data/slot_mappings.json.lock"), "unwritable").operator_message
+        self.assertNotIn("fix its owner or mode", logged)
+        self.assertLess(logged.index("data folder"), logged.index("regular file"))
+        self.assertLess(logged.index("regular file"), logged.index("owner and mode"))
 
 
 class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
