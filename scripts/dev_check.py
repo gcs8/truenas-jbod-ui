@@ -236,6 +236,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_smart_grid_io",
             "tests.test_smart_unread_consumers",
             "tests.test_snapshot_export",
+            "tests.test_ssh_diagnostic_safety",
             "tests.test_storage_view_smart_batch",
             "tests.test_system_backup",
             "tests.test_system_setup_field_ownership",
