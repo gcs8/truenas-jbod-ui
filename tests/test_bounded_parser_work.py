@@ -1212,7 +1212,10 @@ _PARITY_FIXTURES = Path(__file__).parent / "fixtures" / "platform_parity"
 def _overlay_stub(slot_count: int, *, merge: bool = True) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         settings=types.SimpleNamespace(layout=types.SimpleNamespace(slot_count=slot_count)),
-        _optional_ssh_transport_failure_detail=InventoryService._optional_ssh_transport_failure_detail,
+        _optional_ssh_transport_failure=InventoryService._optional_ssh_transport_failure,
+        _format_optional_ssh_transport_failure=InventoryService._format_optional_ssh_transport_failure,
+        _local_failure_sentence=InventoryService._local_failure_sentence,
+        _ssh_failure_public_summary=InventoryService._ssh_failure_public_summary,
         _tag_ses_overlay=InventoryService._tag_ses_overlay if merge else (lambda parsed, host: None),
         _merge_ses_overlay_data=InventoryService._merge_ses_overlay_data if merge else (lambda base, overlay: base),
     )
@@ -1641,7 +1644,10 @@ def _empty_bay_redundant_paths(*, later_shelf: bool, path_b_first: bool = False)
 def _two_host_service(host_pages: dict[str, list[dict[str, str]]]) -> types.SimpleNamespace:
     service = types.SimpleNamespace(
         settings=types.SimpleNamespace(layout=types.SimpleNamespace(slot_count=4)),
-        _optional_ssh_transport_failure_detail=InventoryService._optional_ssh_transport_failure_detail,
+        _optional_ssh_transport_failure=InventoryService._optional_ssh_transport_failure,
+        _format_optional_ssh_transport_failure=InventoryService._format_optional_ssh_transport_failure,
+        _local_failure_sentence=InventoryService._local_failure_sentence,
+        _ssh_failure_public_summary=InventoryService._ssh_failure_public_summary,
         _tag_ses_overlay=InventoryService._tag_ses_overlay,
         _merge_ses_overlay_data=InventoryService._merge_ses_overlay_data,
         _score_sg_ses_overlay=InventoryService._score_sg_ses_overlay,
@@ -1659,7 +1665,12 @@ def _two_host_service(host_pages: dict[str, list[dict[str, str]]]) -> types.Simp
         service.scores[host] = InventoryService._score_sg_ses_overlay(overlay)
         return devices, overlay, failures
 
+    async def discover_read(host, *, failure_prefix, report_empty_discovery=True):  # noqa: ANN001, ANN202
+        # The whole device list was read: no incomplete-read warning.
+        return (*await discover(host, failure_prefix=failure_prefix, report_empty_discovery=report_empty_discovery), None)
+
     service._discover_and_fetch_sg_ses_host_overlay = discover
+    service._discover_sg_ses_host_read = discover_read
     return service
 
 
