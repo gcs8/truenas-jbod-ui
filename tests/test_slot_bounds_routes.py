@@ -27,7 +27,7 @@ from app.models.domain import (
     SmartSummaryView,
     utcnow,
 )
-from app.services.inventory import InventoryService, UnknownEnclosureError
+from app.services.inventory import InventoryService, UnknownEnclosureError, slot_detail_collection_binding
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
@@ -629,6 +629,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
                         slot=5,
                         identifiers=["serial-a"],
                         smart_fields={"available": True, "temperature_c": 33},
+                        collection_binding=slot_detail_collection_binding(service.system),
                     )
                 ]
             )
@@ -882,6 +883,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
                         slot=slot,
                         identifiers=[f"serial-{slot}"],
                         smart_fields={"available": True, "temperature_c": temperature},
+                        collection_binding=slot_detail_collection_binding(service.system),
                     )
                     for slot, temperature in ((5, 33), (6, 34))
                 ]
