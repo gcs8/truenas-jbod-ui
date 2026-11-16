@@ -204,6 +204,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   StorCLI virtual drive without a decimal VD number is no longer given the
   physical drives of every VD; and a configured SSH command longer than 4096
   characters or 256 words is refused when the configuration loads (#1260).
+- SES evidence no longer misplaces or hides disks: zero SAS addresses no longer
+  merge unrelated shelves seen from different hosts or give a bay another
+  host's identify target; a bay whose SES occupancy is unknown, including a
+  CORE `sesutil show` row without a device name, keeps its mapped disk and
+  shows as unknown instead of empty on every platform. Such a bay is no longer
+  turned occupied by an `OK` status; history keeps its last recorded disk and
+  records no removal for it; a recorded SMART failure or temperature for that
+  disk stays in the alert metrics until it is read again, while evidence for a
+  disk no longer in any configured enclosure is dropped; mapping health counts
+  it, even with a locate or fault light on, as unknown rather than as a disk,
+  and reports a saved bay assignment there as one that cannot be verified;
+  storage-view tiles, saved-view bays the backing enclosure does not list and
+  manual-only layout bays show `Unknown` instead of `Empty`; Storage Fabric
+  shows its `present` value as `unknown`; disk retention accounting does not
+  count a saved assignment there as a rendered disk; a manual-only saved view
+  does not show a saved serial in such a bay as a disk;
+  saving or clearing a bay assignment there is refused with a message that the
+  disk could not be checked, not that it changed; and the bay-assignment
+  restore preview says its current disk cannot be checked instead of calling
+  the bay empty. Quantastor
+  no longer hides a known disk behind a zero SAS address when stronger
+  evidence says the bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

@@ -30,6 +30,7 @@ from history_service.diagnostics import (
     classify_collection_failure,
     classify_retention_failure,
 )
+from app.models.domain import slot_occupancy
 from app.request_context import request_id_headers
 from app.metrics import (
     observe_history_collection_run,
@@ -331,6 +332,12 @@ class HistoryCollector:
         self.last_smart_failure_evidence_at: str | None = None
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
+        # Per-disk evidence behind the two aggregates above, keyed like
+        # smart_evidence_expected: (failed or temperature, observed at). A disk
+        # in an unread bay keeps only its own entry; a disk in no current scope
+        # is dropped when the aggregate is next replaced (#1218).
+        self._smart_failure_by_disk: dict[str, tuple[bool, str]] = {}
+        self._smart_temperature_by_disk: dict[str, tuple[float, str]] = {}
         self._scope_enumeration_complete = True
         self._scope_collection_degraded_reason: str | None = None
         # Scopes whose SMART metric read failed, with the metric kinds ("fast",
@@ -487,6 +494,7 @@ class HistoryCollector:
         smart_temperature_observed: set[str] = set()
         smart_failure_evidence: set[str] = set()
         smart_temperatures: dict[str, float] = {}
+        smart_evidence_unread: set[str] = set()
         trusted_smart_scope_observed = False
         smart_scope_unavailable = False
         smart_scopes_succeeded = 0
@@ -593,11 +601,16 @@ class HistoryCollector:
             if not scope_collect_fast and not scope_collect_slow:
                 continue
 
-            present_slots = [record.slot for record in slot_records if record.present]
+            # A disk recorded in a bay whose occupancy this pass did not read
+            # was not read either: it keeps its own earlier SMART evidence
+            # until a real read, and nothing else's (#1218).
+            for recorded in self._unread_bay_recorded_disks(slot_records):
+                smart_evidence_unread.add(self._smart_evidence_disk_key(recorded))
+            present_slots = [record.slot for record in slot_records if slot_occupancy(record) == "present"]
             if not present_slots:
                 self._pending_smart_metric_scopes.pop(scope_key, None)
                 continue
-            records_by_slot = {record.slot: record for record in slot_records if record.present}
+            records_by_slot = {record.slot: record for record in slot_records if slot_occupancy(record) == "present"}
             for record in records_by_slot.values():
                 smart_evidence_expected.add(self._smart_evidence_disk_key(record))
             self._set_collection_activity(f"collecting SMART metrics for {scope_label} ({scope_index}/{len(scopes)})")
@@ -720,14 +733,39 @@ class HistoryCollector:
             and trusted_smart_scope_observed
             and not smart_scope_unavailable
         ):
+            # Failure and temperature are separate readings with their own
+            # times: a summary may carry one without the other.
+            failure_at = dict.fromkeys(smart_failure_health_observed, observed_at)
+            temperature_at = dict.fromkeys(smart_temperature_observed, observed_at)
+            for key in smart_evidence_unread - smart_evidence_expected:
+                if (failure := self._smart_failure_by_disk.get(key)) is not None:
+                    smart_failure_health_observed.add(key)
+                    if failure[0]:
+                        smart_failure_evidence.add(key)
+                    failure_at[key] = failure[1]
+                if (temperature := self._smart_temperature_by_disk.get(key)) is not None:
+                    smart_temperature_observed.add(key)
+                    smart_temperatures[key] = temperature[0]
+                    temperature_at[key] = temperature[1]
             if smart_evidence_expected.issubset(smart_failure_health_observed):
+                self._smart_failure_by_disk = {
+                    key: (key in smart_failure_evidence, failure_at[key]) for key in smart_failure_health_observed
+                }
                 self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
-                self.last_smart_failure_evidence_at = observed_at
+                self.last_smart_failure_evidence_at = min(
+                    [observed_at, *(at for _failed, at in self._smart_failure_by_disk.values())]
+                )
             if smart_evidence_expected.issubset(smart_temperature_observed):
+                self._smart_temperature_by_disk = {
+                    key: (value, temperature_at[key])
+                    for key, value in smart_temperatures.items()
+                }
                 self.last_max_temperature_celsius = (
                     max(smart_temperatures.values()) if smart_temperatures else None
                 )
-                self.last_temperature_evidence_at = observed_at
+                self.last_temperature_evidence_at = min(
+                    [observed_at, *(at for _value, at in self._smart_temperature_by_disk.values())]
+                )
             if self.last_smart_failure_evidence_at and self.last_temperature_evidence_at:
                 self.last_smart_evidence_at = min(
                     self.last_smart_failure_evidence_at,
@@ -1859,6 +1897,14 @@ class HistoryCollector:
 
         updates: list[SlotStateUpdate] = []
         for previous, record in zip(previous_records, slot_records, strict=True):
+            if slot_occupancy(record) == "unknown":
+                # Nothing was read about this bay's occupancy (#1218). Keep the
+                # recorded occupancy and disk and take only the new state, so an
+                # unread bay is never written as a removal or an insertion. A
+                # bay with no recorded row stays unrecorded until a real read.
+                if previous is None:
+                    continue
+                record = replace(previous, state=record.state, identify_active=record.identify_active)
             if self._should_backfill_extended_state(previous, record):
                 updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
@@ -2161,6 +2207,22 @@ class HistoryCollector:
             "reason": reason,
             "detail": SCOPE_SKIP_REASONS[reason],
         }
+
+    def _unread_bay_recorded_disks(self, slot_records: list[SlotStateRecord]) -> list[SlotStateRecord]:
+        """Recorded occupied rows for the bays whose occupancy was not read."""
+
+        recorded_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
+        disks: list[SlotStateRecord] = []
+        for record in slot_records:
+            if slot_occupancy(record) != "unknown":
+                continue
+            scope_key = (record.system_id, record.enclosure_key)
+            if scope_key not in recorded_by_scope:
+                recorded_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
+            recorded = recorded_by_scope[scope_key].get(record.slot)
+            if recorded is not None and slot_occupancy(recorded) == "present":
+                disks.append(recorded)
+        return disks
 
     @staticmethod
     def _smart_evidence_disk_key(record: SlotStateRecord) -> str:
@@ -2587,7 +2649,8 @@ class HistoryCollector:
                     slot_index = int(slot_payload.get("slot_index"))
                 except (TypeError, ValueError):
                     continue
-                occupied = bool(slot_payload.get("occupied"))
+                occupancy = slot_occupancy(slot_payload)
+                occupied = occupancy == "present"
                 slot_payloads.append(
                     {
                         "slot": slot_index,
@@ -2595,6 +2658,7 @@ class HistoryCollector:
                         "enclosure_id": f"{STORAGE_VIEW_SCOPE_PREFIX}{view_id}",
                         "enclosure_label": view_label,
                         "present": occupied,
+                        **({"presence_known": False} if occupancy == "unknown" else {}),
                         "state": normalize_text(slot_payload.get("state")) or ("matched" if occupied else "empty"),
                         "identify_active": False,
                         "device_name": normalize_text(slot_payload.get("device_name")),
