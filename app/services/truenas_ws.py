@@ -428,8 +428,10 @@ def log_failure(
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
 
-# Origin is decided by structure. Outside the two authorized action details
-# (the bounded ``.reason``), remote text is never shown or logged.
+# Origin is decided by structure. On the platform API and BMC read paths,
+# outside the two authorized action details (the bounded ``.reason``), remote
+# text is never shown or logged. SSH command failures are handled apart from
+# this, in the SSH probe and the inventory's failure records.
 # Sorting a remote failure into one of the fixed categories is different: the
 # older (DDP) dialect gives no structured field for these two conditions, so
 # each is recognised by a known marker in the appliance's own reply (``busy``:

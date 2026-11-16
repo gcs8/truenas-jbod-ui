@@ -1627,7 +1627,7 @@ class LogOriginTests(_InventoryFixture):
     def test_log_identifier_admits_only_bounded_plain_identifiers(self) -> None:
         log_identifier = getattr(truenas_ws_module, "log_identifier", None)
         self.assertIsNotNone(log_identifier, "the one strict identifier formatter")
-        for value in ("shelf-a", "__service_no_enclosure__", "5003048001c1043f", "/dev/ses0", "a" * 96):
+        for value in ("shelf-a", "__service_no_enclosure__", "abc123def456", "/dev/ses0", "a" * 96):
             with self.subTest(value=value[:12]):
                 self.assertEqual(log_identifier(value), value)
         for value in ("a" * 97, "", " shelf", "shelf a", "shelf\n", "shelf\x1b[31m", "sh\u00e9lf", "-shelf", None, 5):
