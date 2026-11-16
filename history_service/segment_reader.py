@@ -203,7 +203,9 @@ class SegmentedHistoryReader:
         try:
             # One bounded, non-blocking open, read through its descriptor: a
             # FIFO or other file swapped in after the check above is refused.
-            with open_regular_file(catalog_path, invalid=invalid) as (descriptor, opened):
+            with open_regular_file(
+                catalog_path, invalid=invalid, single_link=False
+            ) as (descriptor, opened):
                 content = read_descriptor(
                     descriptor,
                     opened,

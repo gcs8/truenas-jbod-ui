@@ -85,9 +85,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   not settle, it reports `configuration-recovery-incomplete`, changes nothing
   and exits with status 3; a folder it lists past its scan bound gives
   `recovery-scan-limit-reached` the same way. Run such a recovery through the
-  admin service, which mounts the configuration volume; a receipt printed by
-  the history container says the configuration folders were not checked there
-  (#1265).
+  admin service, which mounts the configuration volume; a receipt printed
+  without `APP_SERVICE_ROLE=admin` (the history container, or an older Compose
+  file with no roles) says the configuration folders were not checked there and
+  gives the admin command, which sets that role. The guide's check for records
+  left after the journal calls them stale only when configuration and history
+  both hold the generation the restore's recorded decision selects (#1265).
 
 ### Performance
 

@@ -837,7 +837,8 @@ class HistoryStore:
             " If the interrupted run was a backup restore that also restored "
             "configuration, run the same command through the admin service instead, "
             "which also checks the configuration folders: docker compose --profile admin "
-            f"run --rm --no-deps --entrypoint python enclosure-admin {arguments}."
+            "run --rm --no-deps -e APP_SERVICE_ROLE=admin --entrypoint python "
+            f"enclosure-admin {arguments}."
             if admin_for_restore
             else ""
         )

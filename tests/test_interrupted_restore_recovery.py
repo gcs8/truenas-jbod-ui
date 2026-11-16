@@ -40,6 +40,7 @@ from history_service.segmented_restore import (
     file_matches,
     import_seal_path,
     read_activation_journal,
+    read_import_seal,
     tree_matches,
     write_restore_journal,
 )
@@ -1092,6 +1093,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                                 "anchor": str(planted_folder),
                                 "folders": [identity(folder) for folder in folders],
                                 "decision": "commit",
+                                "history": [],
                                 "targets": [],
                             }
                         ).encode("utf-8")
@@ -1347,6 +1349,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                     "anchor": str(folder),
                     "folders": [identity],
                     "decision": decision,
+                    "history": [],
                     "targets": [],
                 },
             )
@@ -1509,17 +1512,152 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                 with self.assertRaises(HistoryStorageUnavailableError) as refused:
                     SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
             self.assertEqual(str(refused.exception), "Segmented history catalog is invalid.")
-        with self.subTest(bound="single link"):
-            alias = segments.parent / "catalog-alias.json"
-            os.link(catalog, alias)
-            try:
-                with self.assertRaises(HistoryStorageUnavailableError) as refused:
-                    SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
-                self.assertEqual(str(refused.exception), "Segmented history catalog is invalid.")
-            finally:
-                alias.unlink()
-        # Control again, after the alias is gone.
+        kept = segments.parent / "catalog-kept.json"
+        os.replace(catalog, kept)
+        try:
+            for kind in ("symlink", "named pipe"):
+                with self.subTest(kind=kind):
+                    if kind == "symlink":
+                        catalog.symlink_to(kept)
+                    elif hasattr(os, "mkfifo"):
+                        os.mkfifo(catalog, 0o600)
+                    else:
+                        continue
+                    try:
+                        with self.assertRaises(ValueError) as refused:
+                            SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+                        self.assertEqual(
+                            str(refused.exception),
+                            "Segmented history segment catalog must be a regular file.",
+                        )
+                    finally:
+                        catalog.unlink()
+        finally:
+            os.replace(kept, catalog)
+        # Control again, after the catalog is back.
         SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+
+    def test_running_store_reads_a_catalog_with_a_second_name(self) -> None:
+        # The catalog publisher links the new name before it removes the
+        # temporary one, so a real catalog can carry two names.
+        hot, segments = _create_history(Path(self._directory.name) / "history", "named")
+        catalog = segments / "catalog.json"
+
+        def counts() -> dict[str, int]:
+            # A fresh store for each read, so no cached reader hides the open.
+            store = HistoryStore(
+                str(hot),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog,
+            )
+            return store._segmented_reader().counts()
+
+        one_name = counts()
+        self.assertEqual(one_name["event_count"], 2)
+        os.link(catalog, segments / ".catalog-synthetic.json")
+        self.assertEqual(catalog.stat().st_nlink, 2)
+        self.assertEqual(counts(), one_name)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_migration_stopped_after_the_catalog_link_recovers_as_before(self) -> None:
+        root = Path(self._directory.name)
+        hot = root / "history.db"
+        segments = root / "segments"
+        with contextlib.closing(sqlite3.connect(hot)) as connection, connection:
+            connection.executescript(SCHEMA)
+            for event_type, observed_at in (
+                ("sealed", "2025-01-01T00:00:00+00:00"),
+                ("hot", "2025-01-03T00:00:00+00:00"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO slot_events (
+                        observed_at, system_id, enclosure_key, slot,
+                        slot_label, event_type, details_json
+                    ) VALUES (?, 'synthetic-system', 'synthetic-enclosure', 1, 'slot-1', ?, '{}')
+                    """,
+                    (observed_at, event_type),
+                )
+        real_link = os.link
+
+        def link_then_stop(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+            real_link(source, destination, *args, **kwargs)
+            if Path(destination).name == "catalog.json":
+                os._exit(CRASH_EXIT)
+
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - runs only in the child
+            try:
+                with patch.object(segment_migration.os, "link", link_then_stop):
+                    segment_migration.migrate_segmented_history(
+                        source=hot,
+                        segments_directory=segments,
+                        cutoff="2025-01-02T00:00:00+00:00",
+                        key_id="synthetic",
+                        apply=True,
+                    )
+            finally:
+                os._exit(FINISHED_EXIT)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), CRASH_EXIT)
+        catalog = segments / "catalog.json"
+        # The real catalog and the publisher's temporary name are one file.
+        self.assertEqual(catalog.stat().st_nlink, 2)
+        dry_run = segment_migration.recover_pending_migration(
+            source=hot, segments_directory=segments, apply=False
+        )
+        self.assertEqual(dry_run["recovery_state"], "published-catalog-ready-to-finalize")
+        applied = segment_migration.recover_pending_migration(
+            source=hot, segments_directory=segments, apply=True
+        )
+        self.assertEqual(applied["recovery_state"], "published-catalog-finalized")
+        store = HistoryStore(
+            str(hot),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog,
+        )
+        self.assertEqual(store._segmented_reader().counts()["event_count"], 2)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_private_recovery_records_with_a_second_name_are_still_refused(self) -> None:
+        target = self._target()
+        journal = self._crash_before_history(target)
+        payload, _ = read_activation_journal(journal)
+        transaction_id = payload["transaction_id"]
+        folder = target.runtime.parent
+        record = import_seal_path(folder, transaction_id)
+        compared = target.runtime
+        readers: dict[str, tuple[Path, Callable[[], Any], str]] = {
+            "journal": (
+                journal,
+                lambda: read_activation_journal(journal),
+                "History activation journal is invalid.",
+            ),
+            "folder record": (
+                record,
+                lambda: read_import_seal(
+                    record, transaction_id=transaction_id, folder=str(folder)
+                ),
+                "Restore folder record is invalid.",
+            ),
+            "compared file": (
+                compared,
+                lambda: record_restore_file(compared),
+                "Segmented restore artifact must be a single-link regular file.",
+            ),
+        }
+        for name, (path, read, refusal) in readers.items():
+            with self.subTest(file=name):
+                read()  # Control: one name reads.
+                alias = path.parent / f"{path.name}.second-name"
+                os.link(path, alias)
+                try:
+                    with self.assertRaises(ValueError) as refused:
+                        read()
+                    self.assertEqual(str(refused.exception), refusal)
+                finally:
+                    alias.unlink()
+                read()
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
     def test_rollback_swapped_for_a_fifo_after_its_check_does_not_block_rotation_recovery(
@@ -1717,19 +1855,31 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         image_config = target.root / "image" / "config"
         image_config.mkdir(parents=True)
         (target.root / "image" / "data").mkdir()
-        history_container = {
-            "APP_SERVICE_ROLE": "history",
-            "APP_CONFIG_PATH": str(image_config / "config.yaml"),
-        }
-        for apply in (False, True):
-            code, receipt, stderr = self._recover_with_command(
-                target, apply=apply, environment_overrides=history_container
-            )
-            self.assertEqual(code, 0, stderr[-400:])
-            self.assertIs(receipt["configuration_folders_checked"], False)
-            self.assertIn("not checked", receipt["message"])
-            self.assertIn("enclosure-admin", receipt["message"])
-            self.assertIn("--recover", receipt["message"])
+        # Only an explicit admin role reads as checked: an older Compose file
+        # sets no role at all, so unset, blank and any other role count as
+        # unchecked too. The dry runs leave the import as it was.
+        for role in ("history", None, "", " ", "ui", "worker"):
+            history_container = {"APP_CONFIG_PATH": str(image_config / "config.yaml")}
+            if role is not None:
+                history_container["APP_SERVICE_ROLE"] = role
+            with self.subTest(role=role):
+                code, receipt, stderr = self._recover_with_command(
+                    target, apply=False, environment_overrides=history_container
+                )
+                self.assertEqual(code, 0, stderr[-400:])
+                self.assertIs(receipt.get("configuration_folders_checked"), False)
+                self.assertIn("not checked", receipt["message"])
+                self.assertIn(
+                    "docker compose --profile admin run --rm --no-deps "
+                    "-e APP_SERVICE_ROLE=admin --entrypoint python enclosure-admin",
+                    receipt["message"],
+                )
+                self.assertIn("--recover", receipt["message"])
+        code, receipt, stderr = self._recover_with_command(
+            target, apply=True, environment_overrides=history_container
+        )
+        self.assertEqual(code, 0, stderr[-400:])
+        self.assertIs(receipt.get("configuration_folders_checked"), False)
         # Where the configuration volume is mounted, the records left by the
         # interrupted import are found and nothing changes.
         before = _tree_snapshot(target.root)
@@ -1763,7 +1913,9 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                 )
         message = str(refused.exception)
         self.assertIn("enclosure-history scripts/rotate_segmented_history.py", message)
-        self.assertIn("enclosure-admin", message)
+        self.assertIn(
+            "--no-deps -e APP_SERVICE_ROLE=admin --entrypoint python enclosure-admin", message
+        )
         self.assertIn("restore", message)
 
     def test_unreadable_folder_is_reported_as_unread_not_as_holding_records(self) -> None:
@@ -1837,7 +1989,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             raise AssertionError("the guide does not carry exactly one restore-record check")
         return blocks[0]
 
-    def _run_record_check(self, target: _Deployment) -> list[str]:
+    def _run_record_check(self, target: _Deployment, script: str | None = None) -> list[str]:
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -1850,7 +2002,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         )
         completed = subprocess.run(
             [sys.executable, "-"],
-            input=self._documented_record_check(),
+            input=self._documented_record_check() if script is None else script,
             cwd=REPOSITORY,
             env=environment,
             capture_output=True,
@@ -1863,34 +2015,127 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
     def test_documented_clean_up_settles_records_left_after_the_journal(self) -> None:
-        for case in ("stale", "changed since"):
+        restore_target = _ImportActivationTransaction._restore_target
+
+        def stop_before_history_rollback(transaction: Any, entry: Any) -> None:
+            if entry.target_path in {target.hot, target.segments}:
+                os._exit(CRASH_EXIT)
+            restore_target(transaction, entry)
+
+        failed_commit = patch.object(
+            _ImportActivationTransaction, "commit", side_effect=ValueError("synthetic failure")
+        )
+        cases: dict[str, tuple[Callable[[], list[Any]], str, str]] = {
+            # name: (fault, configuration side, history side)
+            "stale commit": (
+                lambda: [
+                    patch.object(_ImportActivationTransaction, "remove_import_seals", self._hard_exit)
+                ],
+                "candidate",
+                "candidate",
+            ),
+            "stale rollback": (
+                lambda: [
+                    failed_commit,
+                    patch.object(_ImportActivationTransaction, "remove_import_seals", self._hard_exit),
+                ],
+                "prior",
+                "prior",
+            ),
+            "changed since": (
+                lambda: [
+                    patch.object(_ImportActivationTransaction, "remove_import_seals", self._hard_exit)
+                ],
+                "candidate",
+                "candidate",
+            ),
+            "journal present": (
+                lambda: [
+                    patch.object(
+                        SystemBackupService, "_remove_segmented_activation_marker", self._hard_exit
+                    )
+                ],
+                "candidate",
+                "candidate",
+            ),
+            "history not named": (
+                lambda: [
+                    patch.object(_ImportActivationTransaction, "remove_import_seals", self._hard_exit)
+                ],
+                "candidate",
+                "candidate",
+            ),
+            # Configuration is back on the prior side, history still on the
+            # restored side, and the journal is gone from the history volume.
+            "history on the other side": (
+                lambda: [
+                    failed_commit,
+                    patch.object(
+                        _ImportActivationTransaction, "_restore_target", stop_before_history_rollback
+                    ),
+                ],
+                "prior",
+                "candidate",
+            ),
+        }
+        for case, (fault, config_side, history_side) in cases.items():
             with self.subTest(case=case):
                 target = self._target(f"target-{case.replace(' ', '-')}")
-                exit_code = self._import_in_child(
-                    target,
-                    lambda: [
-                        patch.object(
-                            _ImportActivationTransaction, "remove_import_seals", self._hard_exit
-                        )
-                    ],
-                )
-                self.assertEqual(exit_code, CRASH_EXIT)
-                self.assertFalse(activation_pending_path(target.hot).exists())
-                self.assertEqual(self._config_generation(target), "candidate")
-                self.assertEqual(self._history_generation(target), "candidate")
-                code, receipt, stderr = self._recover_with_command(target, apply=False)
-                self.assertEqual((code, receipt["recovery_state"]), (INCOMPLETE_EXIT, INCOMPLETE_STATE))
+                self.assertEqual(self._import_in_child(target, fault), CRASH_EXIT)
+                journal = activation_pending_path(target.hot)
+                if case == "history on the other side":
+                    journal.unlink()
+                self.assertEqual(journal.exists(), case == "journal present")
+                self.assertEqual(self._config_generation(target), config_side)
+                self.assertEqual(self._history_generation(target), history_side)
+                if case != "journal present":
+                    code, receipt, stderr = self._recover_with_command(target, apply=False)
+                    self.assertEqual(
+                        (code, receipt["recovery_state"]), (INCOMPLETE_EXIT, INCOMPLETE_STATE)
+                    )
                 if case == "changed since":
                     target.runtime.write_bytes(b"app: {edited: true}\n")
+                if case == "history not named":
+                    # A first-folder record that does not say which history
+                    # the restore selected cannot show that history agrees.
+                    (anchor,) = target.runtime.parent.glob(".truenas-jbod-ui-import-seal-*")
+                    payload = json.loads(anchor.read_bytes())
+                    self.assertEqual(len(payload.pop("history")), 2)
+                    anchor.write_bytes(json.dumps(payload).encode("utf-8"))
                 before = _tree_snapshot(target.root)
                 lines = self._run_record_check(target)
                 self.assertEqual(_tree_snapshot(target.root), before)
+                output = "\n".join(lines)
                 removals = [line.split(" ", 1)[1] for line in lines if line.startswith("remove ")]
-                if case == "changed since":
-                    self.assertIn("KEEP", "\n".join(lines))
+                if case in {
+                    "changed since",
+                    "journal present",
+                    "history not named",
+                    "history on the other side",
+                }:
+                    self.assertIn("KEEP", output)
+                    self.assertNotIn("STALE", output)
                     self.assertEqual(removals, [])
+                    if case == "history not named":
+                        self.assertIn("the first folder's record does not name the history", output)
+                    if case == "history on the other side":
+                        self.assertIn(f"history {target.hot} holds candidate", lines)
+                        self.assertIn(f"history {target.hot} does not hold the prior copy", output)
+                    if case == "journal present":
+                        # Without its journal check the same script would
+                        # call these records stale, so this case reaches it.
+                        check = self._documented_record_check()
+                        guard = (
+                            "    if journal.exists():\n"
+                            '        problems.append(f"the journal {journal} exists")\n'
+                        )
+                        self.assertIn(guard, check)
+                        unguarded = self._run_record_check(target, check.replace(guard, ""))
+                        self.assertIn("STALE", "\n".join(unguarded))
                     continue
-                self.assertIn("STALE", "\n".join(lines))
+                self.assertIn("STALE", output)
+                self.assertIn(f"history {target.hot} holds {history_side}", lines)
+                self.assertIn(f"history {target.segments} holds {history_side}", lines)
                 self.assertEqual(
                     sorted(str(Path(path).parent) for path in removals),
                     sorted(
@@ -1905,7 +2150,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                 code, receipt, stderr = self._recover_with_command(target, apply=False)
                 self.assertEqual((code, receipt), (1, None))
                 self.assertIn("Segment rotation recovery is not pending.", stderr)
-                self.assertEqual(self._config_generation(target), "candidate")
+                self.assertEqual(self._config_generation(target), config_side)
 
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
     def test_process_loss_after_every_fsync_converges_or_changes_nothing(self) -> None:

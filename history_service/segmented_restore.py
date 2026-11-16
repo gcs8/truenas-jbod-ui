@@ -846,7 +846,7 @@ def read_import_seal(
     anchor = payload.get("anchor") if isinstance(payload, dict) else None
     expected_keys = {"purpose", "transaction_id", "folder", "anchor", "targets"}
     if anchor == folder:
-        expected_keys |= {"folders", "decision"}
+        expected_keys |= {"folders", "decision", "history"}
     if (
         not isinstance(payload, dict)
         or set(payload) != expected_keys
@@ -861,6 +861,7 @@ def read_import_seal(
         folders = payload["folders"]
         if (
             payload["decision"] not in WHOLE_IMPORT_DECISIONS
+            or not isinstance(payload["history"], list)
             or not isinstance(folders, list)
             or not folders
             or not all(

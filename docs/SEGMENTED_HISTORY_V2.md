@@ -772,8 +772,11 @@ add the target's absolute path, the identity of its folder, its fixed staging
 and prior names, and the exact prior and candidate records. The first folder's
 record also lists every folder before anything in that folder changes, and holds
 the decision: `pending`, then `commit` before commit cleanup or `rollback` before
-an in-process rollback. The journal lives in the history folder, which
-lower-trust services can write, so it is only an index: it names the transaction
+an in-process rollback. It also keeps the journal's prior and candidate records
+of the history database and the segments folder, for the read-only clean-up
+check below; recovery reads history from the journal. The journal lives in the
+history folder, which lower-trust services can write, so it is only an index:
+it names the transaction
 and the first folder, and repeats each target for a cross-check. Recovery acts
 only on targets the folder records list, converges every folder the first record
 lists, and takes the decision from that record, never from the journal: `commit`
@@ -835,12 +838,14 @@ directly; recovery gives it no more than that.
 
 Limits: a configuration destination outside the folders the settings name is not
 checked, and a recovery run where the configuration folders are not mounted
-(the history container) cannot see their records. A receipt printed by the
-history container (`APP_SERVICE_ROLE=history`) therefore carries
+(the history container) cannot see their records. Only a recovery run with
+`APP_SERVICE_ROLE=admin` prints a receipt that reads as if the folders were
+checked. With the role `history`, unset (as in a Compose file from before the
+roles existed), blank or anything else, the receipt carries
 `configuration_folders_checked: false` and a message that says the folders were
 not checked there and gives the admin-service command that checks them; the
 history service's startup message for a pending activation names the same
-command. When an interrupted import may have restored configuration, run
+command. The role changes only this label, not what recovery reads or changes. When an interrupted import may have restored configuration, run
 recovery through the admin service as described below.
 
 The history container does not mount the configuration volume, and in the base
@@ -849,9 +854,11 @@ Recovery from the history container therefore refuses such a journal with
 `journal-owner-mismatch` or `configuration-target-unavailable`. Run the same
 `scripts/rotate_segmented_history.py --source ... --segments-dir ... --recover`
 arguments shown in the rotation section above through the admin service instead:
-`docker compose --profile admin run --rm --no-deps --entrypoint python
-enclosure-admin` with no `--user` override, since that service mounts
-configuration, data and history as the identity that ran the restore. Add
+`docker compose --profile admin run --rm --no-deps -e APP_SERVICE_ROLE=admin
+--entrypoint python enclosure-admin` with no `--user` override, since that
+service mounts configuration, data and history as the identity that ran the
+restore. The command sets the role itself, so it gives the checked receipt on
+an installation that kept an older Compose file with no role entries. Add
 `--apply` only after reviewing the reported state. A history-only restore keeps
 the version 1 journal and the history-container command unchanged; only a
 recovery run through the admin service also checks the configuration folders.
@@ -877,30 +884,41 @@ from ones an edited journal left behind. To settle that case by hand:
    `docker compose --profile admin run --rm --no-deps -T --entrypoint python
    enclosure-admin - < check-restore-records.py`. It reads only. For each restore
    transaction it prints the decision held by the first folder's record and,
-   for every file the records list, whether it holds the prior copy, the
-   restored copy (`candidate`) or neither.
-5. If it prints `STALE`, every listed file holds the generation that decision
-   selects (`commit`: the restored copy; `pending` or `rollback`: the prior
-   copy), so the restore or its recovery had finished. Remove exactly the files
-   it prints after `remove`, in that order; the first folder's record comes
-   last because it names the others. If it prints `KEEP`, remove nothing: a
-   listed file holds neither copy, a record cannot be read, the first folder's
-   record is missing or a journal exists. Compare the listed files by hand with
-   the `prior` and `candidate` records (size and sha256) in each record and put
-   back what is needed from a backup before you remove the records.
+   for the history database, the segments folder and every file the records
+   list, whether it holds the prior copy, the restored copy (`candidate`) or
+   neither.
+5. If it prints `STALE`, configuration and history both hold the generation
+   that decision selects (`commit`: the restored copies; `pending` or
+   `rollback`: the prior copies), so the restore or its recovery had finished.
+   Remove exactly the files it prints after `remove`, in that order; the first
+   folder's record comes last because it names the others. If it prints
+   `KEEP`, remove nothing yet: a listed file or the history holds the other
+   copy or neither, a record cannot be read, the first folder's record is
+   missing or does not name the history, or a journal exists.
 6. Run the dry run again. With no record left it ends with
    `Segment rotation recovery is not pending.` and status 1, the normal answer
    when nothing is pending. Then start the services; the history service no
    longer reports a pending activation.
 
-The check judges history only indirectly: the journal is removed only after
-history has reached the generation the decision selects, and the check never
-calls records stale while a journal exists. Lines starting `leftover` name a
-staging or prior copy beside a listed file (`.<name>.restore-<transaction>` or
-`.<name>.previous-<transaction>`); a crash just before a record listed such a
-copy can leave one, and a crash during a record update can leave an unreadable
-`<record>.next-<transaction>`. Neither is live configuration and recovery
-leaves both for review; remove them by hand after step 6.
+The check compares the history database and the segments folder with the prior
+and restored copies that the first folder's record names, so it does not call
+records stale while configuration and history hold different generations, and
+it never calls them stale while a journal exists. It compares the history
+database byte for byte: once the history service has written to it, the check
+cannot tell which generation it holds and prints `KEEP`, so run it before the
+services start again. If it prints `KEEP` and no journal exists, nothing on the
+two volumes says which generation is whole. The way out is to restore a known
+good backup that carries both history and configuration, then remove the old
+transaction's `.truenas-jbod-ui-import-seal-<transaction>` records from the
+folders the dry run lists, the first folder's record (the one with `decision`)
+last, and continue with step 6.
+
+Lines starting `leftover` name a staging or prior copy beside a listed file
+(`.<name>.restore-<transaction>` or `.<name>.previous-<transaction>`); a crash
+just before a record listed such a copy can leave one, and a crash during a
+record update can leave an unreadable `<record>.next-<transaction>`. Neither is
+live configuration and recovery leaves both for review; remove them by hand
+after step 6.
 
 ```python
 # check-restore-records: list the restore records left in the configuration
@@ -915,6 +933,20 @@ from history_service.system_backup import restore_configuration_folders
 
 PREFIX = ".truenas-jbod-ui-import-seal-"
 journal = activation_pending_path(os.environ.get("HISTORY_SQLITE_PATH", "/app/history/history.db"))
+
+
+def holds(entry):
+    """Whether a recorded path holds its prior copy, its candidate or neither."""
+    path = Path(entry["path"])
+    match = file_matches if entry["kind"] == "file" else tree_matches
+    prior = entry["prior"]
+    if match(path, entry["candidate"]):
+        return "candidate"
+    if match(path, prior) or (prior.get("kind") == "missing" and not os.path.lexists(path)):
+        return "prior"
+    return "neither"
+
+
 transactions = {}
 for folder in restore_configuration_folders():
     if folder.is_dir():
@@ -938,37 +970,35 @@ for transaction, paths in sorted(transactions.items()):
         except (OSError, ValueError):
             problems.append(f"record {path} cannot be read")
     anchors = [path for path, payload in records.items() if payload.get("anchor") == payload.get("folder")]
-    decision = records[anchors[0]].get("decision") if len(anchors) == 1 else None
+    anchor = records[anchors[0]] if len(anchors) == 1 else {}
+    decision = anchor.get("decision")
     print(f"transaction {transaction} decision {decision}")
     expected = "candidate" if decision == "commit" else "prior"
     if journal.exists():
         problems.append(f"the journal {journal} exists")
     if decision is None:
         problems.append("the first folder's record is missing or cannot be read")
-    for payload in records.values():
-        for target in payload["targets"]:
-            try:
-                path = Path(target["path"])
-                match = file_matches if target["kind"] == "file" else tree_matches
-                prior = target["prior"]
-                if match(path, target["candidate"]):
-                    state = "candidate"
-                elif match(path, prior) or (prior.get("kind") == "missing" and not os.path.lexists(path)):
-                    state = "prior"
-                else:
-                    state = "neither"
-                print(f"target {path} holds {state}")
-                if state != expected:
-                    problems.append(f"{path} does not hold the {expected} copy")
-                for name in (target["staged_name"], target["previous_name"]):
-                    if os.path.lexists(path.parent / name):
-                        print(f"leftover {path.parent / name}")
-            except (KeyError, TypeError, AttributeError):
-                problems.append("a record lists a file it does not describe")
+    history = anchor.get("history")
+    if not isinstance(history, list) or not history:
+        problems.append("the first folder's record does not name the history")
+        history = []
+    checked = [("history", entry) for entry in history]
+    checked += [("target", entry) for payload in records.values() for entry in payload["targets"]]
+    for label, entry in checked:
+        try:
+            state = holds(entry)
+            print(f"{label} {entry['path']} holds {state}")
+            if state != expected:
+                problems.append(f"{label} {entry['path']} does not hold the {expected} copy")
+            for name in (entry.get("staged_name"), entry.get("previous_name")):
+                if name and os.path.lexists(Path(entry["path"]).parent / name):
+                    print(f"leftover {Path(entry['path']).parent / name}")
+        except (KeyError, TypeError, AttributeError):
+            problems.append(f"a record lists a {label} it does not describe")
     if problems:
         print("KEEP: " + "; ".join(problems))
         continue
-    print("STALE: every listed file holds the generation the decision selects")
+    print("STALE: configuration and history hold the generation the decision selects")
     for path in [*updates, *[path for path in records if path not in anchors], *anchors]:
         print(f"remove {path}")
 ```

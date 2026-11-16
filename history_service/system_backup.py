@@ -1136,7 +1136,12 @@ class _ImportActivationTransaction:
             "targets": [],
         }
         if self._anchor_folder is None:
-            payload.update(anchor=folder, folders=[identity], decision="pending")
+            payload.update(
+                anchor=folder,
+                folders=[identity],
+                decision="pending",
+                history=self._recorded_history(),
+            )
         else:
             # The first folder's record lists a folder before anything in it
             # changes, so a journal that omits the folder cannot skip it.
@@ -1158,6 +1163,30 @@ class _ImportActivationTransaction:
                 anchor=identity,
                 targets=[],
             )
+
+    def _recorded_history(self) -> list[dict[str, Any]]:
+        """The history this restore replaces and installs, as the journal has it.
+
+        The first folder's record keeps it so that records left after the
+        journal is gone can be checked against history, not only against
+        configuration (#1196). Recovery itself reads history from the journal.
+        """
+        prepared = self._prepared_segmented_restore
+        journal = self._activation_journal_payload
+        if prepared is None or journal is None or prepared.store.segment_catalog_path is None:
+            return []
+        return [
+            {
+                "path": os.path.abspath(path),
+                "kind": kind,
+                "prior": journal[name]["prior"],
+                "candidate": journal[name]["candidate"],
+            }
+            for name, kind, path in (
+                ("hot", "file", prepared.store.file_path),
+                ("segments", "directory", prepared.store.segment_catalog_path.parent),
+            )
+        ]
 
     def _seal_target(self, entry: dict[str, Any]) -> None:
         """Add ``entry`` to its folder's record (write, fsync, rename, fsync)."""

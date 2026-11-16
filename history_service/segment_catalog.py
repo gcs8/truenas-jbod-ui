@@ -47,13 +47,17 @@ def open_regular_file(
     *,
     invalid: str,
     private: bool = False,
+    single_link: bool = True,
 ) -> Iterator[tuple[int, os.stat_result]]:
     """Open ``path`` once for reading: no link followed, never blocking.
 
     A FIFO, socket, device or folder is refused before it is opened. The
-    opened descriptor must be a single-link regular file (with ``private``,
-    one that only its owner can read); callers read through it and check it
-    with ``require_unchanged`` instead of opening the path again (#1196).
+    opened descriptor must be a regular file, with one link unless
+    ``single_link`` is false (with ``private``, one that only its owner can
+    read); callers read through it and check it with ``require_unchanged``
+    instead of opening the path again (#1196). The segment catalog passes
+    ``single_link=False``: its publisher links the new name before it removes
+    the temporary one, so a real catalog can carry two names.
     """
     entry = os.stat(path, follow_symlinks=False)
     if not stat.S_ISREG(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
@@ -70,7 +74,7 @@ def open_regular_file(
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
+            or (single_link and metadata.st_nlink != 1)
             or (private and stat.S_IMODE(metadata.st_mode) & 0o077)
         ):
             raise ValueError(invalid)

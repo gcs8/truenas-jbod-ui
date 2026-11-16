@@ -1232,12 +1232,13 @@ def recover_pending_rotation(
             }
     if receipt.get("recovery_state") == CONFIGURATION_RECOVERY_INCOMPLETE:
         return receipt
-    if os.environ.get("APP_SERVICE_ROLE", "").strip() == "history":
-        # The history container mounts no configuration volume, so a receipt
-        # printed there must not read as if configuration had been checked.
+    if os.environ.get("APP_SERVICE_ROLE", "").strip() != "admin":
+        # Only the admin service mounts the configuration volume, and an older
+        # Compose file sets no role, so any other role (or none) must not read
+        # as if configuration had been checked.
         command = (
-            "docker compose --profile admin run --rm --no-deps --entrypoint python "
-            "enclosure-admin scripts/rotate_segmented_history.py --source "
+            "docker compose --profile admin run --rm --no-deps -e APP_SERVICE_ROLE=admin "
+            "--entrypoint python enclosure-admin scripts/rotate_segmented_history.py --source "
             f"{shlex.quote(str(source))} --segments-dir "
             f"{shlex.quote(str(segments_directory))} --recover"
         )
