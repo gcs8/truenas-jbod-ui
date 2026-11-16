@@ -96,6 +96,15 @@ def load_secret_environment_value(env_name: str) -> str | None:
     return value
 
 
+class ReplacedDurabilityUncertainError(OSError):
+    """The replacement is already visible, but the directory fsync failed.
+
+    Raised only after ``os.replace`` has published the new file. A caller
+    must not treat it as proof that the old file survived, and must not undo
+    work that the visible file now depends on.
+    """
+
+
 def write_text_atomically(path: Path, text: str) -> None:
     """Replace ``path`` with ``text`` through a fsynced temporary file.
 
@@ -141,4 +150,6 @@ def write_text_atomically(path: Path, text: str) -> None:
         except OSError as exc:
             # Replacement has already happened. Do not claim either success
             # or that the old bytes survived a failed durability barrier.
-            raise OSError(exc.errno, "File replaced; directory durability is uncertain.") from exc
+            raise ReplacedDurabilityUncertainError(
+                exc.errno, "File replaced; directory durability is uncertain."
+            ) from exc
