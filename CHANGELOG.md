@@ -165,6 +165,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   did not start. Reload admin pages that were open before upgrading. History sidecar snapshots are replaced only by
   FULLs that pass the same fresh check, at most 14 local FULL content checks per
   backup run including the kept-copy check (#1195).
+- Malformed controller, enclosure (SES), expander, PCI, disk list or SMART
+  output no longer ties up the parser for seconds: a few kilobytes of long
+  letter, digit or whitespace runs made the CDB decoder, the SES element
+  count, the `mprutil show expanders` PHY rows, the `pciconf` and sysctl
+  location attributes, the `camcontrol devlist` and UniFi GPIO lines, the SATA
+  link-rate field, the `glabel status` label list and the `lsscsi -t`
+  transport field rescan the same text. A `camcontrol devlist` row with many
+  aliases, StorCLI output with many virtual drives, an SSH command with many
+  `sudo` options, the enclosure sysfs map read once for each SES device, and
+  the SES overlay that merged each SES device into everything merged before it
+  no longer cost the square of their size. The work of each parser named here
+  now grows linearly with its output, except the SES merge for one enclosure
+  reached over many paths, which costs what it did before and is tracked
+  separately. Well-formed output parses as before, including the SES shelves,
+  bays and locate targets shown and the host chosen when several hosts read
+  the same shelves. With redundant paths to a shelf,
+  an empty bay and different element numbering on the paths, a bay can still
+  be merged into its neighbour, as before; that is tracked separately. An
+  operation name or a run of CDB bytes too long to be real is not decoded; a
+  StorCLI virtual drive without a decimal VD number is no longer given the
+  physical drives of every VD; and a configured SSH command longer than 4096
+  characters or 256 words is refused when the configuration loads (#1260).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
