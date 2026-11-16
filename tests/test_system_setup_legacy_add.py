@@ -8,8 +8,8 @@ from empty silently stops monitoring it. System Setup and demo creation refuse
 every add while that system exists, whatever id the request carries,
 ``default`` included. A real edit of ``default`` (``replace_existing``) starts
 from the system in effect and keeps every field the form does not own; a key
-or password that comes from the environment is only stored in config.yaml
-when the operator types it in.
+or password the form keeps is saved with the value the configuration resolved,
+including one that comes from the environment.
 """
 
 from __future__ import annotations
@@ -17,7 +17,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import logging
 import os
+import re
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,9 +59,14 @@ LEGACY_DEMO_DETAIL = (
     _LEGACY_SYSTEM_PREFIX + "a demo now would replace it. "
     + LEGACY_SYSTEM_MIGRATION_STEP + " Then add the demo."
 )
-LEGACY_SECRET_FROM_ENV_DETAIL = (
-    "The API key or a password of the 'default' system comes from .env, and saving it "
-    "here stores it in config.yaml. Type it in to save it there."
+SECRET_FILE_READABLE_NOTE = (
+    "config.yaml now holds a key or password that came from the environment, and "
+    "accounts other than the file's owner can read it. Keep the file readable only "
+    "by its owner and the app's own services."
+)
+SECRET_FILE_READABLE_LOG = (
+    "Saved a key or password from the environment into config.yaml, which group or "
+    "other accounts can read."
 )
 LEGACY_SECTIONS_INVALID_DETAIL = (
     "The top-level truenas or ssh settings in config.yaml are not valid, so the "
@@ -111,14 +119,19 @@ RICH_LEGACY_CONFIG = {
 }
 
 
+def _form_text(value) -> str | None:
+    # admin.js sends `field.value.trim() || null` for its text inputs.
+    return (value or "").strip() or None
+
+
 def _loaded_form_payload(serialized: dict, **changes) -> dict:
     """The body the System Setup form posts for a loaded system saved as is.
 
     Field for field what ``collectSetupPayload`` in admin.js builds from the
-    serialized system: configured secrets as the keep-existing sentinel, the
-    redacted command list as ``preserve`` from the loaded id, generated
-    storage views left out, and ``replace_existing`` because the id is the
-    loaded one.
+    serialized system: text inputs trimmed, configured secrets as the
+    keep-existing sentinel, the redacted command list as ``preserve`` from the
+    loaded id, generated storage views left out, and ``replace_existing``
+    because the id is the loaded one.
     """
 
     def secret(name: str):
@@ -126,23 +139,23 @@ def _loaded_form_payload(serialized: dict, **changes) -> dict:
 
     payload = {
         "system_id": serialized["id"],
-        "label": serialized["label"],
+        "label": (serialized["label"] or "").strip(),
         "platform": serialized["platform"],
-        "truenas_host": serialized["truenas_host"],
+        "truenas_host": (serialized["truenas_host"] or "").strip(),
         "api_key": secret("api_key"),
-        "api_user": serialized["api_user"] or None,
+        "api_user": _form_text(serialized["api_user"]),
         "api_password": secret("api_password"),
         "verify_ssl": serialized["verify_ssl"],
-        "tls_ca_bundle_path": serialized["tls_ca_bundle_path"] or None,
-        "tls_server_name": serialized["tls_server_name"] or None,
-        "enclosure_filter": serialized["enclosure_filter"] or None,
+        "tls_ca_bundle_path": _form_text(serialized["tls_ca_bundle_path"]),
+        "tls_server_name": _form_text(serialized["tls_server_name"]),
+        "enclosure_filter": _form_text(serialized["enclosure_filter"]),
         "ssh_enabled": serialized["ssh_enabled"],
-        "ssh_host": serialized["ssh_host"] or None,
+        "ssh_host": _form_text(serialized["ssh_host"]),
         "ha_enabled": False,
         "ha_nodes": [],
         "ssh_port": serialized["ssh_port"],
-        "ssh_user": serialized["ssh_user"] or None,
-        "ssh_key_path": serialized["ssh_key_path"] or None,
+        "ssh_user": _form_text(serialized["ssh_user"]),
+        "ssh_key_path": _form_text(serialized["ssh_key_path"]),
         "ssh_password": secret("ssh_password"),
         "ssh_sudo_password": secret("ssh_sudo_password"),
         "ssh_strict_host_key_checking": serialized["ssh_strict_host_key_checking"],
@@ -157,8 +170,8 @@ def _loaded_form_payload(serialized: dict, **changes) -> dict:
             else {"ssh_commands": [], "ssh_commands_action": "replace"}
         ),
         "bmc_enabled": serialized["bmc_enabled"],
-        "bmc_host": serialized["bmc_host"] or None,
-        "bmc_username": serialized["bmc_username"] or None,
+        "bmc_host": _form_text(serialized["bmc_host"]),
+        "bmc_username": _form_text(serialized["bmc_username"]),
         "bmc_password": secret("bmc_password"),
         "bmc_verify_ssl": serialized["bmc_verify_ssl"],
         "bmc_timeout_seconds": serialized["bmc_timeout_seconds"] or 15,
@@ -240,6 +253,50 @@ class _LegacyConfigMixin:
     def _effective_system_hosts(self) -> dict[str, str]:
         settings = load_settings(create_directories=False)
         return {system.id: system.truenas.host for system in settings.systems}
+
+    def _raw_entry(self, system_id: str = "default") -> dict:
+        document = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        return next(entry for entry in document["systems"] if entry["id"] == system_id)
+
+    def _secret_file(self, name: str, content: bytes) -> Path:
+        path = self.root / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+        return path
+
+    def _set_env(self, environment: dict[str, str]) -> None:
+        for env_name, env_value in environment.items():
+            os.environ[env_name] = env_value
+            self.addCleanup(os.environ.pop, env_name, None)
+
+    def _capture_logs(self) -> list[logging.LogRecord]:
+        records: list[logging.LogRecord] = []
+
+        class _Collector(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collector(level=logging.DEBUG)
+        root = logging.getLogger()
+        previous = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+
+        def restore() -> None:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+
+        self.addCleanup(restore)
+        return records
+
+    @staticmethod
+    def _log_text(records: list[logging.LogRecord]) -> str:
+        parts = []
+        for record in records:
+            parts.append(record.getMessage())
+            if record.exc_info:
+                parts.append(logging.Formatter().formatException(record.exc_info))
+        return "\n".join(parts)
 
     @staticmethod
     def _request(system_id: str, host: str = "https://new.example.test") -> SystemSetupRequest:
@@ -466,6 +523,14 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(list(saved), ["default"])
         self.assertEqual(saved["default"].label, "Archive")
         self.assertEqual(self._effective_dumps(), before)
+        # The operator's trust file is written into the entry itself, so it
+        # stays when the obsolete top-level sections are removed.
+        self.assertEqual(self._raw_entry()["ssh"]["known_hosts_path"], "/srv/synthetic/known_hosts")
+        document = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        document.pop("truenas")
+        document.pop("ssh")
+        self._write(document)
+        self.assertEqual(self._effective_dumps(), before)
 
         status, response = self._post_setup(
             {"system_id": "new-host", "label": "New host", "truenas_host": "https://new.example.test"}
@@ -474,39 +539,185 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(list(self._effective_default()), ["default", "new-host"])
         self.assertEqual(self._effective_dumps(), before)
 
-    def test_loaded_form_does_not_store_a_secret_from_env_without_it_being_typed(self) -> None:
-        # A kept secret whose value comes from the environment would be
-        # copied into config.yaml; that needs the operator to type it.
-        secret_file = self.root / "synthetic-api-key"
-        secret_file.write_text("synthetic-file-env-key\n", encoding="utf-8")
-        secret_file.chmod(0o600)
+    def _save_loaded_form(self, document: dict, *, mode: int = 0o600, **changes) -> tuple[int, dict, list]:
+        self._write(document)
+        self.config_path.chmod(mode)
+        serialized = serialize_systems(load_settings(create_directories=False))[0]
+        records = self._capture_logs()
+        status, response = self._post_setup(_loaded_form_payload(serialized, **changes))
+        return status, response, records
+
+    def _assert_not_disclosed(self, value: str, response: dict, records: list) -> None:
+        if not value.strip():
+            return
+        self.assertNotIn(value, json.dumps(response))
+        self.assertNotIn(value, self._log_text(records))
+
+    def test_loaded_form_copies_a_kept_secret_from_the_environment_exactly(self) -> None:
+        # Saving the loaded form keeps every configured secret. One that the
+        # running configuration takes from the environment (a direct variable
+        # or a `_FILE` variable's content) is written into the entry exactly
+        # as resolved, and is never shown in the answer or the log.
+        lf_file = self._secret_file("api-key-lf", b"synthetic-file-env-key\n")
+        crlf_file = self._secret_file("api-key-crlf", b" synthetic crlf key \r\n")
+        spaces_file = self._secret_file("api-key-spaces", b" \t \n")
+        sudo_file = self._secret_file("sudo-password", b"synthetic sudo password")
         cases = (
-            ("TRUENAS_API_KEY", "synthetic-env-key", "api_key", ("truenas", "api_key")),
-            ("TRUENAS_API_KEY_FILE", str(secret_file), "api_key", ("truenas", "api_key")),
-            ("SSH_PASSWORD", "synthetic-env-password", "ssh_password", ("ssh", "password")),
+            ({"TRUENAS_API_KEY": "synthetic-env-key"}, ("truenas", "api_key"), "synthetic-env-key"),
+            ({"TRUENAS_API_KEY_FILE": str(lf_file)}, ("truenas", "api_key"), "synthetic-file-env-key"),
+            (
+                {"TRUENAS_API_KEY": "synthetic-stale-direct", "TRUENAS_API_KEY_FILE": str(crlf_file)},
+                ("truenas", "api_key"),
+                " synthetic crlf key ",
+            ),
+            ({"TRUENAS_API_KEY_FILE": str(spaces_file)}, ("truenas", "api_key"), " \t "),
+            ({"TRUENAS_API_PASSWORD": "  synthetic env password  "}, ("truenas", "api_password"), "  synthetic env password  "),
+            ({"SSH_PASSWORD": "synthetic-env-ssh-password"}, ("ssh", "password"), "synthetic-env-ssh-password"),
+            ({"SSH_SUDO_PASSWORD_FILE": str(sudo_file)}, ("ssh", "sudo_password"), "synthetic sudo password"),
         )
-        for env_name, env_value, field, (section, key) in cases:
-            with self.subTest(env=env_name):
-                os.environ[env_name] = env_value
-                self.addCleanup(os.environ.pop, env_name, None)
-                before_bytes = self._write(RICH_LEGACY_CONFIG)
+        for environment, (section, key), expected in cases:
+            with self.subTest(env=sorted(environment)):
+                self._set_env(environment)
+                self._write(RICH_LEGACY_CONFIG)
                 before = self._effective_dumps()
-                in_effect = before[0 if section == "truenas" else 1][key]
-                self.assertNotEqual(in_effect, RICH_LEGACY_CONFIG[section][key])
-                serialized = serialize_systems(load_settings(create_directories=False))[0]
+                self.assertEqual(before[0 if section == "truenas" else 1][key], expected)
 
-                status, response = self._post_setup(_loaded_form_payload(serialized))
+                status, response, records = self._save_loaded_form(RICH_LEGACY_CONFIG)
 
-                self.assertEqual(status, 400, response)
-                self.assertEqual(response.get("detail"), LEGACY_SECRET_FROM_ENV_DETAIL)
-                self.assertEqual(self.config_path.read_bytes(), before_bytes)
-
-                # Control: typed in, the same value is saved and still in effect.
-                status, response = self._post_setup(_loaded_form_payload(serialized, **{field: in_effect}))
                 self.assertEqual(status, 200, response)
+                self.assertTrue(response["updated_existing"])
+                self.assertEqual(self._raw_entry()[section][key], expected)
                 self.assertEqual(self._effective_dumps(), before)
-                os.environ.pop(env_name)
+                self._assert_not_disclosed(expected, response, records)
+                # The saved entry wins from now on: a rotated value in the
+                # environment, or none at all, changes nothing.
+                for env_name in environment:
+                    if env_name.endswith("_FILE"):
+                        Path(os.environ[env_name]).write_bytes(b"synthetic-rotated-value")
+                    else:
+                        os.environ[env_name] = "synthetic-rotated-value"
                 self.assertEqual(self._effective_dumps(), before)
+                for env_name in environment:
+                    os.environ.pop(env_name)
+                self.assertEqual(self._effective_dumps(), before)
+
+    def test_a_blank_direct_variable_never_overwrites_a_saved_key(self) -> None:
+        # Control: a blank direct variable is ignored by the loader, so the
+        # key and password in config.yaml stay in effect and are what is saved.
+        self._set_env({"TRUENAS_API_KEY": "", "SSH_PASSWORD": "   "})
+        status, response, _records = self._save_loaded_form(RICH_LEGACY_CONFIG)
+        self.assertEqual(status, 200, response)
+        entry = self._raw_entry()
+        self.assertEqual(entry["truenas"]["api_key"], RICH_LEGACY_CONFIG["truenas"]["api_key"])
+        self.assertEqual(entry["ssh"]["password"], RICH_LEGACY_CONFIG["ssh"]["password"])
+
+    def test_empty_file_content_is_saved_as_the_empty_value_in_effect(self) -> None:
+        # An empty file is not ignored: it is the key in effect (none), so the
+        # key in config.yaml was not in use and the entry gets no key either.
+        empty_file = self._secret_file("api-key-empty", b"")
+        self._set_env({"TRUENAS_API_KEY_FILE": str(empty_file)})
+        self._write(RICH_LEGACY_CONFIG)
+        before = self._effective_dumps()
+        self.assertEqual(before[0]["api_key"], "")
+
+        status, response, _records = self._save_loaded_form(RICH_LEGACY_CONFIG)
+
+        self.assertEqual(status, 200, response)
+        self.assertEqual(self._raw_entry()["truenas"].get("api_key", ""), "")
+        self.assertEqual(self._effective_dumps(), before)
+
+    def test_after_the_copy_a_file_variable_must_name_a_readable_file_until_removed(self) -> None:
+        secret_file = self._secret_file("api-key", b"synthetic-file-env-key\n")
+        self._set_env({"TRUENAS_API_KEY_FILE": str(secret_file)})
+        status, response, _records = self._save_loaded_form(RICH_LEGACY_CONFIG)
+        self.assertEqual(status, 200, response)
+
+        secret_file.unlink()
+        with self.assertRaisesRegex(Exception, "TRUENAS_API_KEY_FILE must reference a readable regular file"):
+            load_settings(create_directories=False)
+        os.environ.pop("TRUENAS_API_KEY_FILE")
+        self.assertEqual(self._effective_default()["default"].truenas.api_key, "synthetic-file-env-key")
+
+    def test_loaded_form_keeps_exact_user_names(self) -> None:
+        # The loader keeps user names exactly (QuantaStor sends the API user
+        # verbatim in Basic authentication); the form trims its inputs. A
+        # loaded user name saved unchanged keeps its exact form.
+        for user in ("  synthetic admin  ", "'quoted-user'", '"double-quoted"', "true", "null", "007"):
+            with self.subTest(user=user):
+                document = {
+                    "truenas": {
+                        "host": "https://qs.example.test",
+                        "platform": "quantastor",
+                        "api_user": user,
+                        "api_password": "synthetic-qs-password",
+                        "verify_ssl": False,
+                    },
+                    "ssh": {"enabled": True, "host": "qs.example.test", "user": user},
+                }
+                self._write(document)
+                before = self._effective_dumps()
+                self.assertEqual(before[0]["api_user"], user)
+
+                status, response, records = self._save_loaded_form(document)
+
+                self.assertEqual(status, 200, response)
+                entry = self._raw_entry()
+                self.assertEqual(entry["truenas"]["api_user"], user)
+                self.assertEqual(entry["ssh"]["user"], user)
+                self.assertEqual(entry["truenas"]["api_password"], "synthetic-qs-password")
+                self.assertEqual(self._effective_dumps(), before)
+                self._assert_not_disclosed("synthetic-qs-password", response, records)
+
+        # Control: a user name the operator changes is saved as sent.
+        self._write({**document, "truenas": {**document["truenas"], "api_user": "  synthetic admin  "}})
+        serialized = serialize_systems(load_settings(create_directories=False))[0]
+        status, response = self._post_setup(
+            _loaded_form_payload(serialized, api_user="synthetic-other", api_password="synthetic-typed")
+        )
+        self.assertEqual(status, 200, response)
+        self.assertEqual(self._raw_entry()["truenas"]["api_user"], "synthetic-other")
+
+    def _readable_warnings(self, records: list) -> list[str]:
+        return [
+            record.getMessage()
+            for record in records
+            if record.levelno == logging.WARNING and record.name == "app.services.system_setup"
+        ]
+
+    def test_copy_into_an_owner_only_config_keeps_its_mode_and_warns_nothing(self) -> None:
+        self._set_env({"TRUENAS_API_KEY": "synthetic-env-key"})
+        status, response, records = self._save_loaded_form(RICH_LEGACY_CONFIG, mode=0o600)
+        self.assertEqual(status, 200, response)
+        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o600)
+        self.assertEqual(self._readable_warnings(records), [])
+        self.assertNotIn(SECRET_FILE_READABLE_NOTE, response["detail"])
+
+    def test_copy_into_a_shared_config_warns_once_and_keeps_its_mode(self) -> None:
+        # The copy does not refuse, ask or change the file's mode (other
+        # services may read it under another account); it says so once in the
+        # log, without the value or a path, and on the page.
+        for mode in (0o644, 0o640):
+            with self.subTest(mode=oct(mode)):
+                self._set_env({"TRUENAS_API_KEY": "synthetic-env-key"})
+                status, response, records = self._save_loaded_form(RICH_LEGACY_CONFIG, mode=mode)
+                self.assertEqual(status, 200, response)
+                self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), mode)
+                self.assertEqual(self._raw_entry()["truenas"]["api_key"], "synthetic-env-key")
+                self.assertEqual(self._readable_warnings(records), [SECRET_FILE_READABLE_LOG])
+                self.assertTrue(response["detail"].endswith(" " + SECRET_FILE_READABLE_NOTE), response["detail"])
+                self._assert_not_disclosed("synthetic-env-key", response, records)
+                self.assertNotIn(str(self.root), self._log_text(records))
+                os.environ.pop("TRUENAS_API_KEY")
+
+    def test_no_copy_into_a_shared_config_adds_no_warning(self) -> None:
+        # Controls: a key already held in config.yaml, or a key typed in,
+        # is not a copy from the environment.
+        for changes in ({}, {"api_key": "synthetic-typed-key"}):
+            with self.subTest(typed=bool(changes)):
+                status, response, records = self._save_loaded_form(RICH_LEGACY_CONFIG, mode=0o644, **changes)
+                self.assertEqual(status, 200, response)
+                self.assertEqual(self._readable_warnings(records), [])
+                self.assertNotIn(SECRET_FILE_READABLE_NOTE, response["detail"])
 
     def test_documented_manual_move_uses_the_values_in_effect(self) -> None:
         # The wiki step, literally: one systems entry with id 'default'
@@ -517,10 +728,15 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         secret_file = self.root / "synthetic-api-key"
         secret_file.write_text("synthetic-key-from-file\n", encoding="utf-8")
         secret_file.chmod(0o600)
+        blank_file = self._secret_file("synthetic-blank-key", b"  \n")
         cases = {
             "blank direct value": (
                 {"TRUENAS_API_KEY": "", "SSH_PASSWORD": "   "},
                 {},
+            ),
+            "blank file content": (
+                {"TRUENAS_API_KEY_FILE": str(blank_file)},
+                {"truenas": {"api_key": "  "}},
             ),
             "direct and file value": (
                 {
@@ -566,13 +782,19 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         wiki = Path(__file__).resolve().parents[1] / "wiki" / "Advanced-Configuration.md"
         text = wiki.read_text(encoding="utf-8")
         self.assertTrue(WIKI_MIGRATION_HEADING + "\n" in text, f"missing {WIKI_MIGRATION_HEADING!r}")
-        section = text.split(WIKI_MIGRATION_HEADING, 1)[1].split("\n## ", 1)[0]
+        section = " ".join(text.split(WIKI_MIGRATION_HEADING, 1)[1].split("\n## ", 1)[0].split())
         for statement in (
-            "A variable set to a blank value is ignored",
-            "`_FILE`",
+            "A direct variable set to a blank value is ignored",
+            "An empty or blank file is not ignored",
+            "A `_FILE` variable set to a blank path is not ignored",
+            "the saved entry wins",
+            "must still name a readable file until you remove it",
+            "copies the value in effect into `config.yaml`",
             "stored in `config.yaml`",
         ):
             self.assertTrue(statement in section, f"section does not say {statement!r}")
+        for stale in ("has to be typed in", "no longer has any effect"):
+            self.assertFalse(stale in section, f"section still says {stale!r}")
 
 
 class LegacySystemAddServiceTests(_LegacyConfigMixin, unittest.TestCase):
@@ -685,6 +907,40 @@ class LegacySystemAddServiceTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(system.truenas.timeout_seconds, 91)
         self.assertEqual(system.ssh.timeout_seconds, 33)
 
+    def _edit_default(self, **fields) -> None:
+        SystemSetupService(str(self.config_path)).save_system(
+            SystemSetupRequest(
+                system_id="default",
+                label="Primary",
+                truenas_host="https://env.example.test",
+                replace_existing=True,
+                **fields,
+            )
+        )
+
+    def test_copy_into_a_new_config_file_is_owner_only(self) -> None:
+        # No config.yaml yet: the system comes from the environment alone.
+        # The copy creates the file with mode 0600 and logs no warning.
+        self._set_env({"TRUENAS_HOST": "https://env.example.test", "TRUENAS_API_KEY": "synthetic-env-key"})
+        records = self._capture_logs()
+        self._edit_default(api_key=PRESERVE)
+        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o600)
+        self.assertEqual(self._raw_entry()["truenas"]["api_key"], "synthetic-env-key")
+        self.assertFalse(
+            [record for record in records if record.levelno >= logging.WARNING],
+            self._log_text(records),
+        )
+
+    def test_a_blank_file_variable_refuses_the_save_without_writing(self) -> None:
+        # A `_FILE` variable set to a blank path is not ignored: it names no
+        # readable file, so the configuration cannot be resolved.
+        before = self._write(RICH_LEGACY_CONFIG)
+        self._set_env({"TRUENAS_API_KEY_FILE": ""})
+        with self.assertRaises(ValueError) as caught:
+            self._edit_default(api_key=PRESERVE)
+        self.assertEqual(str(caught.exception), "TRUENAS_API_KEY_FILE must reference a readable regular file.")
+        self.assertEqual(self.config_path.read_bytes(), before)
+
     def test_invalid_legacy_sections_refuse_the_edit_without_echoing_them(self) -> None:
         before = self._write({"truenas": {"api_key": "synthetic-test-key", "timeout_seconds": "not-a-number"}})
         with self.assertRaises(ValueError) as caught:
@@ -713,10 +969,14 @@ class ConfigStagingCleanupTests(_LegacyConfigMixin, unittest.TestCase):
         ]
     }
 
+    STAGING_NAME = re.compile(r"^\.config\.yaml\.[0-9a-f]{32}\.tmp$")
+
     def setUp(self) -> None:
         super().setUp()
-        self.staging = self.config_path.with_suffix(".tmp")
         self.service = SystemSetupService(str(self.config_path))
+
+    def _directory(self) -> dict[str, bytes]:
+        return {path.name: path.read_bytes() for path in self.config_path.parent.iterdir()}
 
     def _operations(self):
         return (
@@ -728,28 +988,113 @@ class ConfigStagingCleanupTests(_LegacyConfigMixin, unittest.TestCase):
         for name, operation in self._operations():
             for failure in (OSError(errno.EIO, "synthetic rename failure"), KeyboardInterrupt()):
                 with self.subTest(operation=name, failure=type(failure).__name__):
-                    before = self._write(self.POPULATED)
+                    self._write(self.POPULATED)
+                    before = self._directory()
                     with mock.patch.object(secret_files.os, "replace", side_effect=failure):
                         with self.assertRaises(type(failure)):
                             operation()
-                    self.assertEqual(self.config_path.read_bytes(), before)
-                    self.assertFalse(self.staging.exists())
+                    self.assertEqual(self._directory(), before)
 
-    def test_cleanup_removes_only_the_staging_file_this_write_created(self) -> None:
-        # Control: if the staging name no longer holds this write's file,
-        # the cleanup leaves whatever is there.
-        before = self._write(self.POPULATED)
+    def test_each_write_stages_under_its_own_exclusive_owner_only_name(self) -> None:
+        self._write(self.POPULATED)
+        real_open, real_replace = os.open, os.replace
+        created: list[tuple[str, int, int]] = []
+        published: list[str] = []
 
-        def swap_then_fail(source, target):
-            Path(source).unlink()
-            Path(source).write_text("not this write's file", encoding="utf-8")
-            raise OSError(errno.EIO, "synthetic rename failure")
+        def recording_open(path, flags, mode=0o777, *args, **kwargs):
+            if Path(path).parent == self.config_path.parent and flags & os.O_CREAT:
+                created.append((Path(path).name, flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
 
-        with mock.patch.object(secret_files.os, "replace", side_effect=swap_then_fail):
+        def recording_replace(source, target):
+            published.append(Path(source).name)
+            return real_replace(source, target)
+
+        with (
+            mock.patch.object(secret_files.os, "open", side_effect=recording_open),
+            mock.patch.object(secret_files.os, "replace", side_effect=recording_replace),
+        ):
+            self.service.save_system(self._request("new-host"))
+            self.service.save_system(self._request("other-host", "https://other.example.test"))
+
+        self.assertEqual(len(created), 2, created)
+        self.assertEqual([name for name, _flags, _mode in created], published)
+        self.assertNotEqual(published[0], published[1])
+        for name, flags, mode in created:
+            self.assertRegex(name, self.STAGING_NAME)
+            self.assertTrue(flags & os.O_EXCL)
+            self.assertEqual(mode, 0o600)
+        self.assertEqual(set(self._directory()), {"config.yaml"})
+
+    def test_another_writers_staging_file_is_never_removed(self) -> None:
+        # Another writer's staging file (or one left by an older version) is
+        # not this write's to remove, whether the write succeeds or fails.
+        self._write(self.POPULATED)
+        foreign = {
+            "config.tmp": b"older version staging",
+            ".config.yaml." + "0" * 32 + ".tmp": b"another writer's staging",
+        }
+        for name, content in foreign.items():
+            (self.config_path.parent / name).write_bytes(content)
+
+        self.service.save_system(self._request("new-host"))
+        with mock.patch.object(secret_files.os, "replace", side_effect=OSError(errno.EIO, "synthetic rename failure")):
             with self.assertRaises(OSError):
-                self.service.save_system(self._request("new-host"))
-        self.assertEqual(self.config_path.read_bytes(), before)
-        self.assertEqual(self.staging.read_text(encoding="utf-8"), "not this write's file")
+                self.service.save_system(self._request("other-host", "https://other.example.test"))
+
+        directory = self._directory()
+        for name, content in foreign.items():
+            self.assertEqual(directory.get(name), content)
+        self.assertEqual(set(directory), {"config.yaml", *foreign})
+
+    def test_overlapping_writers_each_remove_only_their_own_staging_file(self) -> None:
+        # Writer A fails after writer B ran to completion between A's staging
+        # and A's rename: B's published file stays, A removes only its own.
+        self._write(self.POPULATED)
+        real_replace = os.replace
+        calls: list[str] = []
+
+        def interleave(source, target):
+            calls.append(Path(source).name)
+            if len(calls) == 1:
+                secret_files.write_text_atomically(self.config_path, "written: by-b\n")
+                raise OSError(errno.EIO, "synthetic rename failure")
+            return real_replace(source, target)
+
+        with mock.patch.object(secret_files.os, "replace", side_effect=interleave):
+            with self.assertRaises(OSError):
+                secret_files.write_text_atomically(self.config_path, "written: by-a\n")
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0], calls[1])
+        self.assertEqual(self._directory(), {"config.yaml": b"written: by-b\n"})
+
+    def test_staging_is_owner_only_until_its_content_is_complete(self) -> None:
+        # The staging file is 0600 while it is written and takes the
+        # destination's mode (0600 for a new file) only once it is complete.
+        content = "written: complete\n"
+        for existing_mode in (0o644, 0o640, 0o600, None):
+            with self.subTest(existing=oct(existing_mode) if existing_mode else "new"):
+                if existing_mode is None:
+                    self.config_path.unlink(missing_ok=True)
+                    expected_final = 0o600
+                else:
+                    self._write(self.POPULATED)
+                    self.config_path.chmod(existing_mode)
+                    expected_final = existing_mode
+                real_fchmod = os.fchmod
+                observed: list[tuple[int, int]] = []
+
+                def recording_fchmod(descriptor, mode):
+                    observed.append((os.fstat(descriptor).st_size, mode))
+                    return real_fchmod(descriptor, mode)
+
+                with mock.patch.object(secret_files.os, "fchmod", side_effect=recording_fchmod):
+                    published_mode = secret_files.write_text_atomically(self.config_path, content)
+
+                self.assertEqual(observed, [(0, 0o600), (len(content), expected_final)])
+                self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), expected_final)
+                self.assertEqual(published_mode, expected_final)
 
     def test_an_interrupt_after_the_rename_keeps_the_published_file(self) -> None:
         # Control: once the rename happened the new file is the config; the
@@ -765,7 +1110,7 @@ class ConfigStagingCleanupTests(_LegacyConfigMixin, unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.service.save_system(self._request("new-host"))
         self.assertEqual(self._effective_system_hosts(), {"lab": "https://lab.example.test", "new-host": "https://new.example.test"})
-        self.assertFalse(self.staging.exists())
+        self.assertEqual(set(self._directory()), {"config.yaml"})
 
 
 if __name__ == "__main__":
