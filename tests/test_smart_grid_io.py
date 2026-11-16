@@ -1087,15 +1087,20 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await self.snapshot(service, 1)
             self.seed_history(service, snapshot)
             # Keep actual scheduling intact. Completion of a scheduled task is not
-            # proof it fetched fresh data (the inherited loader can coalesce it).
+            # proof it fetched fresh data, so check the live read and the cached
+            # value before any second request (#1209).
             with patch.object(service, "_schedule_background_smart_refresh",
                               wraps=service._schedule_background_smart_refresh) as scheduled:
                 result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-stale", allow_stale_cache=True)
                 self.assertEqual(result[0].summary.power_on_hours, 17)
+                self.assertEqual(api.calls, 0)
                 scheduled.assert_called_once()
                 tasks = list(service._smart_refresh_tasks.values())
                 if tasks:
                     await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            self.assertGreater(api.calls, 0, "the scheduled refresh did not read the disk")
+            refreshed = service._smart_cache[service._smart_cache_key(snapshot.slots[0])]
+            self.assertEqual(refreshed.power_on_hours, 321)
             result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-default-after-stale")
             self.assertEqual(result[0].summary.power_on_hours, 321)
             self.assertGreater(api.calls, 0)

@@ -65,7 +65,7 @@
     {"service":"admin","method":"GET","path":"/","class":"read","why":"Admin page document.","fingerprint":"aa84ba7e2af239f2e2b903b4"},
     {"service":"admin","method":"GET","path":"/api/admin/state","class":"read","why":"Admin bootstrap state.","fingerprint":"281462424b311a74133885e9"},
     {"service":"admin","method":"GET","path":"/api/admin/runtime","class":"read","why":"Container runtime status.","fingerprint":"7554954af6200f4b0befdf88"},
-    {"service":"admin","method":"POST","path":"/api/admin/runtime-behavior","class":"forbidden","why":"Saves runtime settings.","fingerprint":"65249fcb1805793e49e14ed2"},
+    {"service":"admin","method":"POST","path":"/api/admin/runtime-behavior","class":"forbidden","why":"Saves runtime settings.","fingerprint":"ebbc21fe7c40ff7023e5f5e6"},
     {"service":"admin","method":"POST","path":"/api/admin/runtime/containers/{container_key}/stop","class":"forbidden","why":"Stops a container.","fingerprint":"660d2c4a68d0e96ddff73113"},
     {"service":"admin","method":"POST","path":"/api/admin/runtime/containers/{container_key}/start","class":"forbidden","why":"Starts a container.","fingerprint":"8af01204856b9e0ba5deaa57"},
     {"service":"admin","method":"POST","path":"/api/admin/runtime/containers/{container_key}/restart","class":"forbidden","why":"Restarts a container.","fingerprint":"7a6b27444bb955b3bbf4991c"},
