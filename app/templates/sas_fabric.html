@@ -87,25 +87,35 @@
     aria-live="polite"
   ></p>
 
+  {#- A count whose read did not happen says "not read", never 0 (same rule as fabricCountText). -#}
+  {%- macro fabric_count(items, domain) -%}
+    {%- set fabric_read_counts = ((fabric.raw or {}).get("controller_read") or {}).get("counts") -%}
+    {%- set count = items | length -%}
+    {%- if fabric_read_counts is not mapping -%}{{ count }}
+    {%- elif fabric_read_counts.get(domain) == "complete" -%}{{ count }}
+    {%- elif fabric_read_counts.get(domain) == "partial" and count > 0 -%}at least {{ count }}
+    {%- else -%}not read
+    {%- endif -%}
+  {%- endmacro %}
   <section class="summary-strip fabric-summary-strip" id="fabric-summary-strip">
     <div class="summary-card">
       <span class="summary-label">HBAs</span>
-      <span class="summary-value" id="fabric-summary-controllers">{{ fabric.controllers | length }}</span>
+      <span class="summary-value" id="fabric-summary-controllers">{{ fabric_count(fabric.controllers, "controllers") }}</span>
       <span class="summary-note">reported by the host</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Paths</span>
-      <span class="summary-value" id="fabric-summary-paths">{{ fabric.paths | length }}</span>
+      <span class="summary-value" id="fabric-summary-paths">{{ fabric_count(fabric.paths, "paths") }}</span>
       <span class="summary-note">active + standby</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Expanders</span>
-      <span class="summary-value" id="fabric-summary-expanders">{{ fabric.expanders | length }}</span>
+      <span class="summary-value" id="fabric-summary-expanders">{{ fabric_count(fabric.expanders, "expanders") }}</span>
       <span class="summary-note">SAS expanders seen</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Enclosures</span>
-      <span class="summary-value" id="fabric-summary-enclosures">{{ fabric.enclosures | length }}</span>
+      <span class="summary-value" id="fabric-summary-enclosures">{{ fabric_count(fabric.enclosures, "enclosures") }}</span>
       <span class="summary-note">seen by the HBA or SES</span>
     </div>
     <div class="summary-card">
