@@ -5066,14 +5066,19 @@ def parse_storcli_physical_drives(
 
 
 def storcli_physical_drive_list_complete(output: str) -> bool:
-    """True when a `/eall/sall show all J` reply is a whole drive census (#1218).
+    """True when a `/eall/sall show all J` reply is taken as the drive census (#1218).
 
     Every controller block answered `Success`, the drive parser read at least
     one drive record (from the `Drive Information`/`PD LIST` table or from
     `Drive /cN/eM/sK` entries), every record names an enclosure and slot, and
     no `Drive /cN/eM/sK` entry names a drive the records do not; a slot it
-    lists no drive in is then empty. A failed, unparsed, partial or
-    self-contradicting reply, or one with no drive record, proves no absence.
+    lists no drive in is then taken as empty. A failed or unparsed reply, one
+    with no drive record, a record without its enclosure and slot, or a
+    `Drive /cN/eM/sK` entry for a drive the records do not list proves no
+    absence. The check runs one way only (the records may list drives no such
+    entry names), and nothing compares the records with the controller's own
+    drive count or enclosure list: a well-formed reply that leaves drives out
+    is taken as the census, as before #1218.
     """
     try:
         payload = json.loads(output)

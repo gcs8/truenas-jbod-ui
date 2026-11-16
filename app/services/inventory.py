@@ -9956,10 +9956,11 @@ class InventoryService:
         if len(disks_by_bmc_slot) < len({disk.slot for disk in disk_records if disk.slot is not None}):
             warnings.append("ESXi controller/enclosure coordinates overlap; ambiguous disks remain unplaced.")
 
-        # The RAID card's drive list is its whole census only when every
-        # listing configured and run answered in full; a card bay it lists no
-        # drive in is then empty, as before #1218. A failed, partial or
-        # unparsed listing, or another layout, proves no absence.
+        # The RAID card's drive list is taken as its census only when every
+        # listing configured and run passed the parser's census check; a card
+        # bay it lists no drive in is then empty, as before #1218. A listing
+        # that failed that check or did not answer, or another layout, proves
+        # no absence.
         drive_lists = ssh_data.esxi_storcli_drive_lists
         configured_lists = {
             command for command in map(canonicalize_ssh_command, self.system.ssh.commands)
