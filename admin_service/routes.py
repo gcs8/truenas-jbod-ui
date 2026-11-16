@@ -100,6 +100,7 @@ from app.models.domain import (
     TLSCertificateInspectRequest,
     TLSRemoteCertificateTrustRequest,
 )
+from app.secret_files import ReplacedDurabilityUncertainError
 from app.services.config_change_journal import record_config_change
 from app.services.credential_authority import (
     api_credential_authority,
@@ -306,17 +307,24 @@ def build_router(admin_settings: Any) -> APIRouter:
 
     @router.post("/api/admin/runtime-behavior")
     async def update_runtime_behavior(payload: dict[str, Any]) -> JSONResponse:
-        settings = reload_app_settings()
+        # Refuse a malformed body before loading settings or starting a save,
+        # and journal only the mapping that was validated (#1231).
         values = payload.get("values") if isinstance(payload, dict) else None
+        if not isinstance(values, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="values must be a mapping of timing setting names to values.",
+            )
+        settings = reload_app_settings()
         try:
             runtime_behavior = await asyncio.to_thread(
                 save_runtime_behavior_overrides,
                 settings,
-                values if isinstance(values, dict) else {},
+                values,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await asyncio.to_thread(record_config_change, "runtime_overrides.save", ",".join(sorted(values or {})))
+        await asyncio.to_thread(record_config_change, "runtime_overrides.save", ",".join(sorted(values)))
 
         return await config_mutation_response(
             {"ok": True, "runtime_behavior": runtime_behavior},
@@ -1012,6 +1020,14 @@ def build_router(admin_settings: Any) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ReplacedDurabilityUncertainError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The demo system was written to the config file, but the save could not be confirmed "
+                    "as durable. Its profile was kept. Reload System Setup to check the saved state."
+                ),
+            ) from exc
 
         refreshed_settings = reload_app_settings()
         saved_system = result["system"]

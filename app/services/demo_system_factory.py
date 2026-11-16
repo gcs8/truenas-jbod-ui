@@ -5,6 +5,7 @@ import re
 
 from app.config import Settings, _normalize_system_id
 from app.models.domain import DemoSystemRequest, EnclosureProfileRequest, SystemSetupRequest
+from app.secret_files import ReplacedDurabilityUncertainError
 from app.services.atomic_write import write_atomically
 from app.services.profile_builder import ProfileBuilderService, _PROFILE_WRITE_LOCK
 from app.services.system_setup import (
@@ -54,8 +55,14 @@ class DemoSystemFactory:
             previous = profile_path.read_bytes() if profile_path.exists() else None
             try:
                 return self._create_new_demo_system(payload, settings)
+            except ReplacedDurabilityUncertainError:
+                # The new config is already visible and references the demo
+                # profile. Removing the profile now would leave that reference
+                # dangling, so keep it and report the uncertain save.
+                raise
             except Exception:
-                # A rejected/failed config save must not leave a new demo profile.
+                # A config save that failed before publication must not leave
+                # a new demo profile behind.
                 if previous is None:
                     profile_path.unlink(missing_ok=True)
                 else:
