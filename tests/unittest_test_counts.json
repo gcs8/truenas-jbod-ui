@@ -94,7 +94,7 @@
     "test_sas_cdb_malformed_tokens": 21,
     "test_sas_decoder_byte_tokens": 15,
     "test_sas_fabric": 223,
-    "test_sas_loginfo_width": 11,
+    "test_sas_loginfo_width": 17,
     "test_scheduled_backup": 27,
     "test_script_json": 13,
     "test_script_platform_guards": 3,

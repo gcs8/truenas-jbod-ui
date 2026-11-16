@@ -86,7 +86,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   32 bits or is not a hex number is no longer labelled as a known fault or
   dropped; it stays unconfirmed, summaries count it as rejected instead of
   listing the raw value, and long kernel text is shortened before it becomes
-  a summary key (#1239).
+  a summary key. Only the first `tgt`/`SMID`/`loginfo` tail of a controller
+  line is read: when its fields are not in the kernel's form it is marked
+  malformed and counted as rejected, and a later tail is never decoded in
+  its place (#1239).
 
 ### Performance
 
