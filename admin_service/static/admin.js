@@ -4690,6 +4690,9 @@
     if (state.sudoersPreviewTimerId) {
       window.clearTimeout(state.sudoersPreviewTimerId);
     }
+    // The form changed: retire any preview still in flight now, so its answer
+    // cannot render for the edited form before the debounced refresh runs.
+    state.sudoersPreviewRequestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
     state.sudoersPreviewTimerId = window.setTimeout(() => {
       state.sudoersPreviewTimerId = null;
       void refreshSudoersPreview();
@@ -4700,6 +4703,11 @@
     if (!elements.setupBootstrapSudoersPreview) {
       return;
     }
+    // Take ownership before any early return: the local guidance below (ESXi,
+    // BMC-only, bootstrap disabled) must retire every earlier request so its
+    // late success or error cannot replace that guidance.
+    const requestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
+    state.sudoersPreviewRequestSeq = requestSeq;
     const payload = collectSudoersPreviewPayload();
     const bmcOnly = setupPlatformUsesBmcOnlyHost(payload.platform);
     if (elements.setupBootstrapSudoersPanel) {
@@ -4737,8 +4745,6 @@
       });
       return;
     }
-    const requestSeq = (state.sudoersPreviewRequestSeq || 0) + 1;
-    state.sudoersPreviewRequestSeq = requestSeq;
     try {
       const result = await fetchJson("/api/admin/system-setup/sudoers-preview", {
         method: "POST",

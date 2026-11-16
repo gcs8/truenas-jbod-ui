@@ -48,6 +48,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- In the admin setup form, turning off One-Time Bootstrap or switching the
+  platform to VMware ESXi or a BMC-only system while a permission preview is
+  still loading now keeps the guidance for the form as it is; the older
+  preview's result or error no longer replaces it (#1236).
 - When two BMC controllers or shelves report a drive at the same bay number,
   an IPMI host's bay now shows unknown with a warning, keeps both
   observations and offers no identify light, instead of showing whichever
