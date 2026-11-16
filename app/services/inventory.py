@@ -10402,16 +10402,20 @@ class InventoryService:
             selected_system_id,
             selected_hw_enclosure_id,
         )
-        # Conflicting pool-device rows leave a disk's membership unknown (#1211);
-        # say so once, so a withheld vdev or fault status is not read as healthy.
+        # Conflicting pool-device rows or disk identities leave a disk's
+        # pool-device membership unknown (#1211); say so once, so a withheld
+        # member status is not read as healthy. The pool and health the disk
+        # row reports for itself are independent evidence and still show.
         conflicted = sum(1 for disk in disk_records if disk.raw.get("quantastor_pool_device_conflict"))
         if conflicted:
             warnings.append(
-                f"QuantaStor reported conflicting pool memberships for {conflicted} disk; "
-                "its pool, vdev and member status are shown as unknown."
+                f"QuantaStor gave conflicting pool-device or identity data for {conflicted} disk, "
+                "so its pool-device membership and member status are withheld; any pool and health "
+                "reported for the disk itself are still shown."
                 if conflicted == 1 else
-                f"QuantaStor reported conflicting pool memberships for {conflicted} disks; "
-                "their pool, vdev and member status are shown as unknown."
+                f"QuantaStor gave conflicting pool-device or identity data for {conflicted} disks, "
+                "so their pool-device membership and member status are withheld; any pool and health "
+                "reported for each disk itself are still shown."
             )
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
@@ -10836,17 +10840,32 @@ class InventoryService:
             )
             if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
-            # A pool-device row is admitted by this disk's own identity first,
-            # then by the hardware row's identifiers. A node-local path admits
-            # only a row from the same node, and a row that contradicts any
-            # identity the record holds (disk row or matched hardware row)
-            # never does (#1211).
+            # Pool-device membership is decided once, after every key and every
+            # identity the service holds for this disk is gathered: the disk row,
+            # every hardware row its keys reach and the matched CLI row (identity
+            # only, never a lookup key). A node-local path admits only a row from
+            # the same node; a row that contradicts that identity never is; and
+            # identities that disagree among themselves leave it unknown (#1211).
             disk_scope = owner_id or selected_system_id or pool_device_index.sole_system_id
+            reached_hw_rows, hw_overloaded = self._quantastor_reached_hw_rows(lookup_keys, hw_slot_hints)
             disk_identity = self._quantastor_pool_device_disk_identity(
-                disk, hint.get("hw_raw") if hint else None, disk_scope,
+                disk, reached_hw_rows, disk_scope, cli_hint,
             )
-            pool_device, pool_device_conflict = self._admit_quantastor_pool_device(
-                pool_device_index, disk_identity, disk_scope, lookup_keys, selected_system_id,
+            admission_keys = set(lookup_keys)
+            for value in (
+                disk.get("serialNumber"),
+                disk.get("serial"),
+                *(
+                    row.get(name)
+                    for row in reached_hw_rows
+                    for name in ("physicalDiskId", "serialNum", "serialNumber", "scsiId", "sasAddress", "id")
+                ),
+            ):
+                admission_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+            # Like an overloaded key: the identity cannot be gathered within the
+            # bound, so the membership is unknown rather than decided on part of it.
+            pool_device, pool_device_conflict = (None, True) if hw_overloaded else self._admit_quantastor_pool_device(
+                pool_device_index, disk_identity, disk_scope, admission_keys, selected_system_id,
             )
             merged_raw = dict(disk)
             if hint and isinstance(hint.get("hw_raw"), dict):
@@ -10877,10 +10896,6 @@ class InventoryService:
                 cli_hint = ({key: cli_hint[key] for key in (
                     "devicePath", "altDevicePath", "deviceName", "device", "name"
                 ) if key in cli_hint} if same_owner else None)
-            if pool_device is None and not pool_device_conflict:
-                pool_device, pool_device_conflict = self._admit_quantastor_pool_device(
-                    pool_device_index, disk_identity, disk_scope, lookup_keys, selected_system_id,
-                )
             if pool_device is not None:
                 merged_raw["quantastor_pool_device"] = pool_device
             elif pool_device_conflict:
@@ -11127,6 +11142,8 @@ class InventoryService:
                     str(preferred_row.get("controllerId")) if preferred_row.get("controllerId") is not None else None
                 ),
                 "hw_raw": preferred_row,
+                # Every row of the group is an identity source for the disk (#1211).
+                "hw_rows": tuple(rows),
                 "source": row_source,
             }
             for row in rows:
@@ -11396,33 +11413,61 @@ class InventoryService:
         return index
 
     @staticmethod
+    def _quantastor_reached_hw_rows(
+        lookup_keys: set[str],
+        hw_slot_hints: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Every hardware row the disk's own keys reach, not only the one that places it.
+
+        Returns (rows, overloaded). A hardware group with more rows than
+        QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX is not read row by row, which keeps
+        the work per disk bounded; its identity is then unknown.
+        """
+        hints: dict[int, dict[str, Any]] = {}
+        for key in lookup_keys:
+            hint = hw_slot_hints.get(key)
+            if hint is not None:
+                hints[id(hint)] = hint
+        rows: dict[int, dict[str, Any]] = {}
+        for hint in hints.values():
+            group = hint.get("hw_rows") or (hint.get("hw_raw"),)
+            if len(group) > QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX:
+                return [], True
+            for row in group:
+                if isinstance(row, dict):
+                    rows[id(row)] = row
+        return list(rows.values()), False
+
+    @staticmethod
     def _quantastor_pool_device_disk_identity(
         disk: dict[str, Any],
-        hw_row: dict[str, Any] | None,
+        hw_rows: list[dict[str, Any]],
         disk_scope: str | None,
+        cli_row: dict[str, Any] | None = None,
     ) -> dict[str, set[str]]:
-        """Every serial, SCSI ID and same-node physical disk ID the record holds.
+        """Every serial, SCSI ID and same-node physical disk ID known for the disk.
 
-        The disk row and its matched hardware row are separate identity
-        sources; a pool-device row is checked against both (#1211). More than
-        one value of a kind means the record's own sources disagree, and then
-        no row naming that kind can be shown to be this disk.
+        Sources: every alias on the disk row, every hardware row its keys reach
+        and the CLI row matched to it (#1211). More than one value of a kind
+        means those sources disagree about which disk this is.
         """
-        hw = hw_row if isinstance(hw_row, dict) else {}
+        cli = cli_row if isinstance(cli_row, dict) else {}
 
         def texts(*values: Any) -> set[str]:
             return {text for value in values if (text := normalize_value_text(value))}
 
+        serial = texts(disk.get("serialNumber"), disk.get("serial"),
+                       cli.get("serialNumber"), cli.get("serial"), cli.get("serialNum"))
+        scsi = texts(disk.get("scsiId"), cli.get("scsiId"))
         physical = texts(disk.get("id"))
-        # A hardware row's physical disk ID is node-local: it names this disk
-        # only when the hardware row comes from the disk's own node.
-        if normalize_value_text(hw.get("storageSystemId")) == disk_scope:
-            physical |= texts(hw.get("physicalDiskId"))
-        return {
-            "serial": texts(disk.get("serialNumber") or disk.get("serial"), hw.get("serialNum"), hw.get("serialNumber")),
-            "scsi": texts(disk.get("scsiId"), hw.get("scsiId")),
-            "physical": physical,
-        }
+        for row in hw_rows:
+            serial |= texts(row.get("serialNum"), row.get("serialNumber"))
+            scsi |= texts(row.get("scsiId"))
+            # A hardware row's physical disk ID is node-local: it names this
+            # disk only when the hardware row comes from the disk's own node.
+            if normalize_value_text(row.get("storageSystemId")) == disk_scope:
+                physical |= texts(row.get("physicalDiskId"))
+        return {"serial": serial, "scsi": scsi, "physical": physical}
 
     @staticmethod
     def _quantastor_pool_device_contradicts(
@@ -11470,11 +11515,14 @@ class InventoryService:
         """The one pool-device row this disk's identity admits (#1211).
 
         Returns (row, conflict). Ranking (a row with a slot, then the selected
-        node, then a spare) only orders rows already admitted. Admitted rows
-        that tie at the top yet differ in bay, pool, vdev, class or status are
-        a conflict, and so is a key shared by more rows than
-        QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX: no row is returned, whatever the
-        input order, and the conflict flag is set.
+        node, then a spare) only orders rows already admitted. These are a
+        conflict: a candidate row for a disk whose own identities disagree
+        (`identity` holds two values of one kind), admitted rows that tie at
+        the top yet differ in bay, pool, vdev, class or status, and a key
+        shared by more rows than QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX. Then no
+        row is returned and the conflict flag is set. Tied rows that agree
+        give one row chosen by content, so the answer never depends on the
+        input order.
         """
         positions: set[int] = set()
         for key in lookup_keys:
@@ -11482,6 +11530,12 @@ class InventoryService:
                 return None, True
             positions.update(index.stable.get(key, ()))
             positions.update(index.paths.get((disk_scope, key), ()))
+        if not positions:
+            return None, False
+        if any(len(values) > 1 for values in identity.values()):
+            # Which disk this is is itself in dispute, so no row can be shown
+            # to be it, and admitting one that matches either side is a guess.
+            return None, True
         ranked: list[tuple[tuple[bool, int], int]] = []
         for position in positions:
             row = index.rows[position]
@@ -11501,7 +11555,16 @@ class InventoryService:
         memberships = {self._quantastor_pool_device_membership(index.rows[position]) for position in top}
         if len(memberships) > 1:
             return None, True
-        return index.rows[top[0]], False
+        # Agreeing rows can still differ in paths and IDs, which feed SMART
+        # and slot context: pick by content, never by input position.
+        return min((index.rows[position] for position in top), key=self._quantastor_row_order_key), False
+
+    @staticmethod
+    def _quantastor_row_order_key(row: dict[str, Any]) -> str:
+        try:
+            return json.dumps(row, sort_keys=True, default=repr)
+        except (TypeError, ValueError):
+            return repr(sorted(row.items(), key=lambda item: repr(item[0])))
 
     @staticmethod
     def _select_quantastor_canonical_slot(rows: list[dict[str, Any]]) -> int | None:

@@ -71,6 +71,18 @@ MEMBER_B = {
 }
 
 
+CONFLICT_WARNING_ONE = (
+    "QuantaStor gave conflicting pool-device or identity data for 1 disk, so its pool-device "
+    "membership and member status are withheld; any pool and health reported for the disk "
+    "itself are still shown."
+)
+CONFLICT_WARNING_MANY = (
+    "QuantaStor gave conflicting pool-device or identity data for {count} disks, so their "
+    "pool-device membership and member status are withheld; any pool and health reported for "
+    "each disk itself are still shown."
+)
+
+
 def _raw(*, disks, pools=(), pool_devices=(), systems=({"id": "node-a"}, {"id": "node-b"})) -> TrueNASRawData:
     return TrueNASRawData(
         enclosures=[], disks=list(disks), pools=list(pools), pool_devices=list(pool_devices),
@@ -232,10 +244,7 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
         service = _service()
         first = self.PEER_ROW
         second = {**first, "id": "member-other", "raidGroupId": "other-vdev", "status": "FAULTED"}
-        expected_warning = (
-            "QuantaStor reported conflicting pool memberships for 1 disk; "
-            "its pool, vdev and member status are shown as unknown."
-        )
+        expected_warning = CONFLICT_WARNING_ONE
         # Controls: each row alone is admitted and drawn.
         for rows, vdev, state in (([first], "shared-vdev", "healthy"), ([second], "other-vdev", "fault")):
             with self.subTest(single=rows[0]["id"]):
@@ -298,6 +307,41 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
         self.assertIs(service._build_quantastor_disk_records(raw, "node-a")[0].raw["quantastor_pool_device"],
                       self.PEER_ROW)
 
+    def test_a_hardware_group_shared_by_many_rows_is_not_read_row_by_row(self) -> None:
+        # Every hardware row a disk reaches is an identity source, but a group
+        # of hardware rows sharing one key must not be read in full for every
+        # disk: past the cap the identity is unknown, and so is the membership.
+        from unittest import mock
+
+        from app.services import inventory
+
+        service = _service()
+        disks = [{**DISK_A, "id": f"disk-{n}", "devicePath": f"/dev/synthetic-{n}"} for n in range(200)]
+        hw_rows = [{"id": f"hw-{n}", "serialNumber": "SANITIZED-QS-A", "storageSystemId": "node-a",
+                    "enclosureId": "shelf-a", "slot": 0} for n in range(200)]
+        reached = InventoryService._quantastor_reached_hw_rows
+        sizes: list[int] = []
+
+        def spy(lookup_keys, hints):
+            result = reached(lookup_keys, hints)
+            sizes.append(len(result[0]))
+            return result
+
+        raw = _raw(disks=disks, pools=[POOL_B], pool_devices=[self.PEER_ROW])
+        raw.hw_disks = hw_rows
+        with mock.patch.object(InventoryService, "_quantastor_reached_hw_rows", staticmethod(spy)):
+            records = service._build_quantastor_disk_records(raw, "node-a")
+        self.assertEqual(len(records), 200)
+        self.assertLessEqual(max(sizes), inventory.QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX)
+        self.assertEqual(sum("quantastor_pool_device" in record.raw for record in records), 0)
+        self.assertEqual(sum(bool(record.raw.get("quantastor_pool_device_conflict")) for record in records), 200)
+
+        # Control: a group at the cap is read row by row and the coherent row is admitted.
+        raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=[self.PEER_ROW])
+        raw.hw_disks = hw_rows[:inventory.QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX]
+        self.assertIs(service._build_quantastor_disk_records(raw, "node-a")[0].raw["quantastor_pool_device"],
+                      self.PEER_ROW)
+
     def test_a_peer_disk_at_the_same_local_path_does_not_make_this_disk_visible_there(self) -> None:
         service = _service()
         context = {"cluster_node_ids": ["node-a", "node-b"], "selected_view_label": "node-a"}
@@ -314,6 +358,229 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
                 service._annotate_quantastor_slot_context(slots, raw, "node-a", context)
                 self.assertEqual(slots[0].serial, "SANITIZED-QS-A")
                 self.assertEqual(slots[0].operator_context["visible_on_labels"], visible_on)
+
+
+# Generated admission cases. The expectations below are written from the rule,
+# not from the implementation: every identity the service holds for a disk is
+# gathered first (REST disk row, every hardware row its keys reach, the matched
+# CLI row), and the decision is made once over that whole set.
+HOME_POOL = {"id": "pool-a", "name": "HOME-POOL", "storageSystemId": "node-a"}
+OTHER_POOL = {"id": "pool-c", "name": "OTHER-POOL", "storageSystemId": "node-a"}
+# A row of another node at the same local path; it must never be admitted.
+DECOY_ROW = {**MEMBER_B, "physicalDiskSerialNumber": "SANITIZED-QS-Z"}
+# Identity kinds: (agreeing value, conflicting value, disk-side sources, row-side fields).
+# A source is (container, field); "hw1" is reached by the disk's hwDiskId, "hw2"
+# by the disk's own ID, "cli" is the CLI row the CLI resolver admits.
+IDENTITY_KINDS = {
+    "serial": ("SANITIZED-QS-A", "SANITIZED-QS-C",
+               (("rest", "serialNumber"), ("rest", "serial"), ("hw1", "serialNumber"), ("hw1", "serialNum"),
+                ("hw2", "serialNumber"), ("cli", "serialNumber")),
+               (("row", "physicalDiskSerialNumber"), ("nested", "serialNumber"))),
+    "scsi": ("scsi-synthetic-a", "scsi-synthetic-c",
+             (("rest", "scsiId"), ("hw1", "scsiId"), ("cli", "scsiId")),
+             (("row", "physicalDiskScsiId"), ("nested", "scsiId"))),
+    "physical": ("disk-a", "disk-c",
+                 (("rest", "id"), ("hw1", "physicalDiskId")),
+                 (("row", "physicalDiskId"), ("nested", "id"))),
+}
+
+
+# Outcome totals of the generated identity cases, counted from the rule above
+# (both orders): serial 3**6 x 6 row states, SCSI 3**3 x 6, physical 3**2 x 6 x
+# 2 hardware-row nodes, each in two orders.
+IDENTITY_CASE_COUNTS = {"cases": 9288, "admitted": 1284, "refused": 2364, "conflict": 5640}
+
+
+def _identity_fixture(kind, states, row_state, hw1_node="node-a"):
+    """Build one case. `states` maps each source to None, "agree" or "conflict"."""
+    agree, conflict, sources, _row_fields = IDENTITY_KINDS[kind]
+    value = {None: None, "agree": agree, "conflict": conflict}
+    disk = {"storageSystemId": "node-a", "enclosureId": "shelf-a", "devicePath": "/dev/sda", "slot": 0,
+            "healthStatus": "ONLINE", "hwDiskId": "hw-a"}
+    if kind != "physical":
+        disk["id"] = "disk-a"
+    hw1 = {"id": "hw-a", "storageSystemId": hw1_node, "enclosureId": "shelf-a", "slot": 0}
+    hw2 = {"id": "hw-b", "physicalDiskId": "disk-a", "storageSystemId": "node-a", "enclosureId": "shelf-a",
+           "slot": 0}
+    cli = {"physicalDiskId": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda"}
+    containers = {"rest": disk, "hw1": hw1, "hw2": hw2, "cli": cli}
+    for (container, field), state in zip(sources, states):
+        if state is not None:
+            containers[container][field] = value[state]
+    row = {"id": "member-a", "storageSystemId": "node-a", "storagePoolId": "pool-a", "devicePath": "/dev/sda",
+           "slot": 1, "raidGroupId": "vdev-a", "status": "ONLINE"}
+    if row_state is not None and row_state != "no-row":
+        (container, field), state = row_state
+        if container == "row":
+            row[field] = value[state]
+        else:
+            row["physicalDiskObj"] = {field: value[state]}
+    hw_rows = [hw1] if kind == "physical" else [hw1, hw2]
+    cli_rows = [] if kind == "physical" else [cli]
+    pool_rows = [] if row_state == "no-row" else [row]
+    return disk, hw_rows, cli_rows, pool_rows
+
+
+def _identity_expectation(kind, states, row_state, hw1_node="node-a"):
+    """What the rule says: (admitted, conflict, cli_matched)."""
+    agree, conflict, sources, _row_fields = IDENTITY_KINDS[kind]
+    value = {None: None, "agree": agree, "conflict": conflict}
+    by_source = {source: value[state] for source, state in zip(sources, states)}
+    rest = {v for (container, _f), v in by_source.items() if container == "rest" and v}
+    # The CLI row is matched only when it does not contradict the REST disk,
+    # and never when the REST disk's own serial aliases disagree.
+    cli_value = by_source.get(("cli", "serialNumber" if kind == "serial" else "scsiId"))
+    cli_matched = kind != "physical" and len(rest) <= 1 and not (cli_value and rest and cli_value not in rest)
+    known = set(rest)
+    for (container, _field), v in by_source.items():
+        if not v or container == "rest":
+            continue
+        if container == "cli" and not cli_matched:
+            continue
+        # A hardware row's physical disk ID names this disk only on its own node.
+        if kind == "physical" and container == "hw1" and hw1_node != "node-a":
+            continue
+        known.add(v)
+    if row_state == "no-row":
+        return False, False, cli_matched
+    if len(known) > 1:
+        return False, True, cli_matched
+    row_value = value[row_state[1]] if row_state is not None else None
+    if row_value and known and row_value not in known:
+        return False, False, cli_matched
+    return True, False, cli_matched
+
+
+class QuantastorPoolDeviceGeneratedAdmissionTests(unittest.TestCase):
+    def _report(self, mismatches: list, total: int) -> None:
+        # One summary, so a failure shows how many generated cases differ.
+        if mismatches:
+            shown = "\n".join(repr(item) for item in mismatches[:12])
+            self.fail(f"{len(mismatches)} of {total} generated cases differ from the rule; first ones:\n{shown}")
+
+    def test_every_identity_field_of_every_source_present_absent_or_conflicting(self) -> None:
+        import itertools
+
+        service = _service()
+        pools = [HOME_POOL, POOL_B]
+        counts = {"cases": 0, "admitted": 0, "refused": 0, "conflict": 0}
+        mismatches = []
+        for kind, (_agree, _conflict, sources, row_fields) in IDENTITY_KINDS.items():
+            row_states = ["no-row", None, *((field, state) for field in row_fields for state in ("agree", "conflict"))]
+            hw1_nodes = ("node-a", "node-b") if kind == "physical" else ("node-a",)
+            for states in itertools.product((None, "agree", "conflict"), repeat=len(sources)):
+                for row_state, hw1_node in itertools.product(row_states, hw1_nodes):
+                    admitted, conflict, cli_matched = _identity_expectation(kind, states, row_state, hw1_node)
+                    disk, hw_rows, cli_rows, rows = _identity_fixture(kind, states, row_state, hw1_node)
+                    expected = (cli_matched and bool(cli_rows), admitted, conflict, 1 if admitted else 0)
+                    for order in (1, -1):
+                        raw = _raw(disks=[disk, DISK_B][::order], pools=pools,
+                                   pool_devices=[*rows, DECOY_ROW][::order])
+                        raw.hw_disks = hw_rows[::order]
+                        raw.cli_disks = cli_rows
+                        record = service._build_quantastor_disk_records(raw, "node-a")[0]
+                        admitted_row = record.raw.get("quantastor_pool_device")
+                        # The first field is a self-check of the fixture: the CLI
+                        # row is matched exactly when the CLI resolver's rule says.
+                        got = ("quantastor_cli_disk" in record.raw,
+                               admitted_row is not None and admitted_row is rows[0],
+                               bool(record.raw.get("quantastor_pool_device_conflict")), record.slot)
+                        if got != expected:
+                            mismatches.append((kind, states, row_state, hw1_node, order, "got", got,
+                                               "expected", expected))
+                        counts["cases"] += 1
+                        counts["admitted" if admitted else "conflict" if conflict else "refused"] += 1
+        self._report(mismatches, counts["cases"])
+        # Every outcome is reached, so no branch of the rule is vacuous.
+        self.assertEqual(counts, IDENTITY_CASE_COUNTS)
+
+    # How a row can be found for a disk: the disk-side fields that make the key
+    # known, and the row fields that name it. Each row names only its own key.
+    CHANNELS = {
+        "own-node-path": ({}, {}, {"devicePath": "/dev/sda"}),
+        "rest-serialNumber": ({"serialNumber": "SANITIZED-QS-A"}, {}, {"physicalDiskSerialNumber": "SANITIZED-QS-A"}),
+        "rest-serial": ({"serial": "SANITIZED-QS-A"}, {}, {"physicalDiskSerialNumber": "SANITIZED-QS-A"}),
+        "hw-serialNumber": ({}, {"serialNumber": "SANITIZED-QS-A"}, {"physicalDiskSerialNumber": "SANITIZED-QS-A"}),
+        "hw-serialNum": ({}, {"serialNum": "SANITIZED-QS-A"}, {"physicalDiskObj": {"serialNumber": "SANITIZED-QS-A"}}),
+        "rest-scsiId": ({"scsiId": "scsi-synthetic-a"}, {}, {"physicalDiskScsiId": "scsi-synthetic-a"}),
+        "hw-scsiId": ({}, {"scsiId": "scsi-synthetic-a"}, {"physicalDiskScsiId": "scsi-synthetic-a"}),
+        "rest-id": ({"id": "disk-a"}, {}, {"physicalDiskId": "disk-a"}),
+        "hw-physicalDiskId": ({}, {"physicalDiskId": "disk-a"}, {"physicalDiskObj": {"id": "disk-a"}}),
+    }
+    # Each membership field separately, and a control where nothing differs.
+    MEMBERSHIP_CHANGES = {
+        "same": {}, "bay": {"slot": 0}, "pool": {"storagePoolId": "pool-c"},
+        "vdev": {"raidGroupId": "vdev-c"}, "class": {"class": "log"}, "status": {"status": "FAULTED"},
+    }
+
+    def test_equal_ranked_rows_found_through_any_two_identity_sources(self) -> None:
+        import itertools
+
+        service = _service()
+        counts = {"cases": 0, "conflict": 0, "one-answer": 0}
+        mismatches = []
+        channel_pairs = list(itertools.combinations_with_replacement(self.CHANNELS, 2))
+        for (first_channel, second_channel), (change, fields), disk_pool in itertools.product(
+            channel_pairs, self.MEMBERSHIP_CHANGES.items(), (None, "pool-a"),
+        ):
+            disk = {"storageSystemId": "node-a", "enclosureId": "shelf-a", "devicePath": "/dev/sda", "slot": 0,
+                    "healthStatus": "ONLINE", "hwDiskId": "hw-a"}
+            if disk_pool:
+                disk["storagePoolId"] = disk_pool
+            hw = {"id": "hw-a", "storageSystemId": "node-a", "enclosureId": "shelf-a", "slot": 0}
+            rows = []
+            for number, channel in enumerate((first_channel, second_channel), start=1):
+                disk_fields, hw_fields, row_fields = self.CHANNELS[channel]
+                disk.update(disk_fields)
+                hw.update(hw_fields)
+                rows.append({"id": f"member-{number}", "storageSystemId": "node-a", "storagePoolId": "pool-a",
+                             "slot": 1, "raidGroupId": "vdev-a", "status": "ONLINE", **row_fields})
+            rows[1].update(fields)
+            if change == "same":
+                # One answer: the same row in either order, drawn, no warning.
+                expected = (True, False, (1, "HOME-POOL", "vdev-a", "healthy"), 0)
+            else:
+                # Unknown membership with one warning; the pool the disk reports
+                # for itself is kept, the pool-device membership is not.
+                expected = (False, True, (0, "HOME-POOL" if disk_pool else None, None, "healthy"), 1)
+            chosen = set()
+            for order in (1, -1):
+                raw = _raw(disks=[disk], pools=[HOME_POOL, OTHER_POOL], pool_devices=rows[::order])
+                raw.hw_disks = [hw]
+                record = service._build_quantastor_disk_records(raw, "node-a")[0]
+                warnings: list[str] = []
+                slots, *_ = service._correlate(raw, ParsedSSHData(), warnings, selected_enclosure_id="node-a")
+                bay = next(slot for slot in slots if slot.present)
+                admitted_row = record.raw.get("quantastor_pool_device")
+                if admitted_row is not None:
+                    chosen.add(admitted_row.get("id"))
+                got = (admitted_row is not None and any(admitted_row is row for row in rows),
+                       record.raw.get("quantastor_pool_device_conflict") is True,
+                       (bay.slot, bay.pool_name, bay.vdev_name, bay.state.value),
+                       warnings.count(CONFLICT_WARNING_ONE))
+                if got != expected:
+                    mismatches.append((first_channel, second_channel, change, disk_pool, order, "got", got,
+                                       "expected", expected))
+                counts["cases"] += 1
+                counts["one-answer" if change == "same" else "conflict"] += 1
+            if change == "same" and len(chosen) != 1:
+                mismatches.append((first_channel, second_channel, change, disk_pool, "order-dependent", sorted(chosen)))
+        self._report(mismatches, counts["cases"])
+        self.assertEqual(counts, {"cases": 1080, "conflict": 900, "one-answer": 180})
+
+    def test_conflict_warning_counts_disks(self) -> None:
+        service = _service()
+        disks = [{**DISK_A, "id": f"disk-{n}", "devicePath": f"/dev/synthetic-{n}", "slot": n,
+                  "serialNumber": None} for n in range(2)]
+        rows = [{"id": f"member-{n}-{v}", "physicalDiskId": f"disk-{n}", "storageSystemId": "node-a",
+                 "storagePoolId": "pool-a", "slot": n, "raidGroupId": f"vdev-{v}", "status": "ONLINE"}
+                for n in range(2) for v in ("x", "y")]
+        warnings: list[str] = []
+        service._correlate(_raw(disks=disks, pools=[HOME_POOL], pool_devices=rows), ParsedSSHData(), warnings,
+                           selected_enclosure_id="node-a")
+        self.assertEqual([w for w in warnings if w.startswith("QuantaStor gave conflicting")],
+                         [CONFLICT_WARNING_MANY.format(count=2)])
+
 
 
 if __name__ == "__main__":
