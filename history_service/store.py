@@ -3486,24 +3486,25 @@ class HistoryStore:
     def _newer_last_sample(new: str, old: str) -> str:
         """SQL: whether the sample at time text `new` gives a bucket's last value over `old`.
 
-        Three keys, strongest first, as the raw-sample rank in
-        _roll_up_metric_rows uses them. SQLite's own reading, which names the
-        bucket: it rounds to about a millisecond, which can tie two samples
-        but never puts an earlier one after a later one. Then, when both have
-        one, the exact instant. Then the stored text, as before #1204; a
-        later arrival wins a full tie. So text with no exact instant is in
-        time order to SQLite's millisecond, and closer than that only as its
-        text sorts; a NULL reading falls through to the next key.
+        One total order, the same as the raw-sample rank in
+        _roll_up_metric_rows: SQLite's own reading, which also names the
+        bucket, then the stored text as before #1204; a later arrival wins
+        where both are equal, as the higher row id does in the rank. So the
+        last value does not depend on how the samples were batched.
+
+        SQLite's reading rounds to about a millisecond, which can tie two
+        samples but never puts an earlier one after a later one. Inside one
+        such millisecond the text decides, even between two times that each
+        name an exact instant, so a sample a fraction of a millisecond older
+        can give the last value when its text sorts last. The service writes
+        one timestamp format, whose text sorts in time order, and never
+        samples one counter twice in a millisecond: only restored or imported
+        text can meet this. A NULL reading on either side falls through to
+        the text.
         """
 
         day_new, day_old = f"julianday({new})", f"julianday({old})"
-        exact_new = f"_history_utc_instant(CAST({new} AS BLOB))"
-        exact_old = f"_history_utc_instant(CAST({old} AS BLOB))"
-        return (
-            f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 "
-            f"WHEN {exact_new} IS NOT NULL AND {exact_old} IS NOT NULL THEN {exact_new} >= {exact_old} "
-            f"ELSE {new} >= {old} END"
-        )
+        return f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 ELSE {new} >= {old} END"
 
     @staticmethod
     def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
@@ -3651,8 +3652,8 @@ class HistoryStore:
         else:
             raise ValueError("Unsupported history rollup interval.")
         expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
-        # The last value's order (see _newer_last_sample): SQLite's reading;
-        # the exact instant, inside a tie whose samples all have one; the text.
+        # The last value's order (see _newer_last_sample): SQLite's reading,
+        # the text, then the row id. Rows without a value are not ranked.
         partition = (
             f"{bucket_expression}, system_id, enclosure_key, slot, "
             "metric_name, COALESCE(disk_identity_key, '')"
@@ -3685,30 +3686,15 @@ class HistoryStore:
                 COALESCE(disk_identity_key, ''), MAX(logical_unit_id), MAX(sas_address)
             FROM (
                 SELECT
-                    keyed_samples.*,
+                    metric_samples.*,
                     ROW_NUMBER() OVER (
                         PARTITION BY {partition}
-                        ORDER BY order_day DESC, CASE WHEN order_all_exact THEN order_exact END DESC,
-                            observed_at DESC, id DESC
+                        ORDER BY julianday(observed_at) DESC, observed_at DESC, id DESC
                     ) AS rollup_rank
-                FROM (
-                    SELECT
-                        day_samples.*,
-                        MIN(order_exact IS NOT NULL) OVER (
-                            PARTITION BY {partition}, order_day
-                        ) AS order_all_exact
-                    FROM (
-                        SELECT
-                            metric_samples.*,
-                            julianday(observed_at) AS order_day,
-                            _history_utc_instant(CAST(observed_at AS BLOB)) AS order_exact
-                        FROM metric_samples
-                        WHERE id IN ({expired_rows})
-                    ) day_samples
-                ) keyed_samples
+                FROM metric_samples
+                WHERE id IN ({expired_rows})
+                  AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
             ) selected_samples
-            WHERE 1 = 1
-              AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
             GROUP BY
                 {bucket_expression}, system_id, enclosure_key, slot,
                 metric_name, COALESCE(disk_identity_key, '')

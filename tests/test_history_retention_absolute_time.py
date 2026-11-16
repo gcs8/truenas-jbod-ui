@@ -3,9 +3,10 @@
 Migration, imports and history reads accept ISO-8601 timestamps with any UTC
 offset. Retention must never expire a row whose absolute time is not older
 than the cutoff, whatever offset it was stored with, and must keep distinct
-microseconds apart. A counter's last value follows time order: exactly
-between timestamps with an offset, to SQLite's millisecond for other text
-SQLite reads, and inside one such millisecond by the stored text, as before.
+microseconds apart. A counter's last value follows time order to SQLite's
+millisecond for any text SQLite reads, and inside one such millisecond the
+order of the stored text, as before, in every batching. The service's own
+timestamps sort as text in time order.
 A row stored with a positive offset whose text still sorts after the cutoff
 is expired on a later pass, never early, so a batch never reads rows newer
 than the cutoff by text. One batch reads at most its size
@@ -15,6 +16,7 @@ synthetic and live in a temporary directory.
 
 from __future__ import annotations
 
+import itertools
 import random
 import sqlite3
 import tempfile
@@ -24,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from history_service.domain import MetricSample
+from history_service.domain import MetricSample, isoformat_utc
 from history_service.segment_migration import migrate_segmented_history
 from history_service.store import HistoryStore
 
@@ -75,7 +77,7 @@ def _event_labels(path: Path) -> list[str]:
         )
 
 
-def _sample(observed_at: str, value: int, *, metric_name: str = "temperature_c") -> MetricSample:
+def _sample(observed_at: str, value: int | None, *, metric_name: str = "temperature_c") -> MetricSample:
     return MetricSample(
         observed_at=observed_at,
         system_id=SYSTEM_ID,
@@ -558,7 +560,7 @@ class HotRetentionAbsoluteTimeUtf16BigEndianTests(HotRetentionAbsoluteTimeUtf16T
 
 
 class RetentionPrecisionTests(unittest.TestCase):
-    """Two samples in the same SQLite millisecond stay in their true order."""
+    """Two samples of the service's own format in one SQLite millisecond stay in their true order."""
 
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="retention-precision-")
@@ -1800,8 +1802,8 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                 self.assertEqual(_rollups(path), [(3600, 2, 31.0, second), (86400, 2, 31.0, second)])
 
     def test_a_late_sample_at_the_same_instant_follows_the_stored_text_when_one_time_is_not_exact(self) -> None:
-        # One SQLite millisecond, and only one of the two has an exact
-        # instant: the stored text decides, as it did before #1204.
+        # One SQLite millisecond: the stored text decides, as it did before
+        # #1204, here where only one of the two has an exact instant.
         ordinary = "2026-11-03T00:30:00+00:00"
         padded = SQLITE_ONLY_0030["trailing spaces"]
         for first, second in ((ordinary, padded), (padded, ordinary)):
@@ -1816,15 +1818,10 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                 last = (31.0, second) if second >= first else (30.0, first)
                 self.assertEqual(_rollups(path), [(3600, 2, *last), (86400, 2, *last)])
 
-    # Two samples less than a millisecond apart that keep their order: both
-    # have exact instants, or SQLite reads them in different milliseconds.
-    # Each row: later text, earlier text. All are 00:30 UTC on 2026-11-03.
+    # Two samples less than a millisecond apart that keep their order whatever
+    # their text: SQLite reads them in different milliseconds. Each row: later
+    # text, earlier text. All are 00:30 UTC on 2026-11-03.
     SUBMILLISECOND_PAIRS = {
-        "both exact, another offset, one SQLite millisecond": (
-            "2026-11-02T19:30:00.000600-05:00",
-            "2026-11-03T00:30:00.000500+00:00",
-        ),
-        "both exact, Z and an offset": ("2026-11-03T00:30:00.000900Z", "2026-11-03T05:30:00.000800+05:00"),
         "padded, another offset, either side of a SQLite millisecond": (
             "2026-11-02T19:30:00.001600-05:00 ",
             "2026-11-03T00:30:00.001400+00:00",
@@ -1928,19 +1925,38 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
     }
 
     def test_samples_in_one_sqlite_millisecond_without_exact_instants_follow_the_stored_text(self) -> None:
-        """Closer than SQLite's millisecond, text with no exact instant is ordered as before #1204.
+        """Closer than SQLite's millisecond, samples are ordered as before #1204.
 
         This is narrower than time order: the stored text, then the row key,
         decides, so a sample a fraction of a millisecond older can give the
         last value when its text sorts last. It is never worse than before.
         """
 
-        for index, (form, (later, earlier)) in enumerate(self.SAME_MILLISECOND_PAIRS.items()):
+        self._assert_the_stored_text_orders(self.SAME_MILLISECOND_PAIRS, "same")
+
+    # Two samples SQLite reads in the same millisecond, both with an exact
+    # instant. Each row: later text, earlier text. The exact instant does not
+    # order them: the stored text does, as for any other text in one SQLite
+    # millisecond. Both pairs give the earlier sample's value.
+    SAME_MILLISECOND_EXACT_PAIRS = {
+        "another offset": ("2026-11-02T19:30:00.000600-05:00", "2026-11-03T00:30:00.000500+00:00"),
+        "Z and an offset": ("2026-11-03T00:30:00.000900Z", "2026-11-03T05:30:00.000800+05:00"),
+    }
+
+    def test_samples_in_one_sqlite_millisecond_with_exact_instants_also_follow_the_stored_text(self) -> None:
+        self._assert_the_stored_text_orders(self.SAME_MILLISECOND_EXACT_PAIRS, "exact")
+
+    def _assert_the_stored_text_orders(self, pairs: dict[str, tuple[str, str]], prefix: str) -> None:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            for later, earlier in pairs.values():
+                days = connection.execute("SELECT julianday(?), julianday(?)", (later, earlier)).fetchone()
+                self.assertEqual(days[0], days[1], (later, earlier))
+        for index, (form, (later, earlier)) in enumerate(pairs.items()):
             last = (2.0, later) if later > earlier else (1.0, earlier)
             for batch_size in (100, 2, 1):
                 for order in ("later first", "earlier first"):
                     with self.subTest(form=form, batch_size=batch_size, order=order):
-                        path, store = self._store(f"same-{index}-{batch_size}-{order[0]}")
+                        path, store = self._store(f"{prefix}-{index}-{batch_size}-{order[0]}")
                         rows = [(later, 2), (earlier, 1)]
                         self._insert(path, rows if order == "later first" else rows[::-1])
 
@@ -1949,7 +1965,7 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                         self.assertEqual(_rollups(path), [(3600, 2, *last), (86400, 2, *last)])
                 for first, second in (((later, 2), (earlier, 1)), ((earlier, 1), (later, 2))):
                     with self.subTest(form=form, batch_size=batch_size, merged_first=first[1]):
-                        path, store = self._store(f"samemerge-{index}-{batch_size}-{first[1]}")
+                        path, store = self._store(f"{prefix}merge-{index}-{batch_size}-{first[1]}")
                         self._insert(path, [first])
                         self._retain_counters(store, batch_size)
                         self._insert(path, [second])
@@ -1999,6 +2015,159 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                                 retain(store, batch_size)
 
                         self.assertEqual(_rollups(path), [(3600, 2, 2.0, later), (86400, 2, 2.0, later)])
+
+    def _last_values_for_every_batching(self, name: str, rows: dict[str, tuple[str, int]]) -> dict[str, list]:
+        """Retain the rows in every batching; return each one's rollups.
+
+        Every ordered partition of the rows into batches that arrive one after
+        another (a later batch merges into the bucket an earlier one wrote),
+        and all rows at once in both insertion orders for batch sizes 1, 2
+        and 100.
+        """
+
+        keys = sorted(rows)
+        self.assertEqual(len(keys), 3)
+        partitions: set[tuple[tuple[str, ...], ...]] = {(tuple(keys),)}
+        for first, second, third in itertools.permutations(keys):
+            for cut in ([[first], [second], [third]], [[first, second], [third]], [[first], [second, third]]):
+                partitions.add(tuple(tuple(sorted(batch)) for batch in cut))
+        self.assertEqual(len(partitions), 13)
+        results = {}
+        for partition in sorted(partitions):
+            label = " then ".join("".join(batch) for batch in partition)
+            path, store = self._store(f"{name}-{label.replace(' ', '')}")
+            for batch in partition:
+                self._insert(path, [rows[key] for key in batch])
+                self._retain_counters(store, 100)
+            results[label] = _rollups(path)
+        for order in (keys, keys[::-1]):
+            for batch_size in (1, 2, 100):
+                label = f"{''.join(order)} together, batch size {batch_size}"
+                path, store = self._store(f"{name}-{''.join(order)}-{batch_size}")
+                self._insert(path, [rows[key] for key in order])
+                self._retain_counters(store, batch_size)
+                results[label] = _rollups(path)
+        return results
+
+    # Three samples in one SQLite millisecond; their text sorts A, B, C from
+    # last to first. Only some of them have an exact instant, and the truly
+    # latest one is not A. A gives the last value in every batching.
+    SAME_MILLISECOND_TRIPLES = {
+        "an exact pair and a time without an offset": {
+            "A": ("2026-11-03T01:30:00+01:00", 1),
+            "B": ("2026-11-03T00:30:00.000001+00:00", 2),
+            "C": ("2026-11-03 00:30:00", 3),
+        },
+        "an exact pair either side of padded text": {
+            "A": ("2026-11-03T01:30:00.000100+01:00", 1),
+            "C": ("2026-11-03T00:30:00.000200 ", 3),
+            "B": ("2026-11-02T19:30:00.000300-05:00", 2),
+        },
+    }
+
+    def test_samples_in_one_sqlite_millisecond_give_one_last_value_for_any_batching(self) -> None:
+        for index, (form, rows) in enumerate(self.SAME_MILLISECOND_TRIPLES.items()):
+            winner = rows["A"][0]
+            self.assertEqual(max(text for text, _ in rows.values()), winner)
+            results = self._last_values_for_every_batching(f"triple-{index}", rows)
+            self.assertEqual(len(results), 19)
+            for label, rollups in results.items():
+                with self.subTest(form=form, batches=label):
+                    self.assertEqual(rollups, [(3600, 3, 1.0, winner), (86400, 3, 1.0, winner)])
+
+    def test_one_instant_spelled_two_ways_gives_one_last_value_ranked_or_merged(self) -> None:
+        # The same instant with two offsets. The text that sorts last gives
+        # the last value, ranked in one batch or merged in either order.
+        later_text, earlier_text = "2026-11-03T01:30:00+01:00", "2026-11-03T00:30:00+00:00"
+        expected = [(3600, 2, 1.0, later_text), (86400, 2, 1.0, later_text)]
+        for mode in ("together", "later text first", "earlier text first"):
+            with self.subTest(mode=mode):
+                path, store = self._store(f"spelled-{mode.replace(' ', '')}")
+                rows = [(later_text, 1), (earlier_text, 2)]
+                if mode == "earlier text first":
+                    rows.reverse()
+                if mode == "together":
+                    self._insert(path, rows)
+                    self._retain_counters(store, 100)
+                else:
+                    for row in rows:
+                        self._insert(path, [row])
+                        self._retain_counters(store, 100)
+
+                self.assertEqual(_rollups(path), expected)
+
+    def test_the_later_row_gives_the_last_value_of_identical_text_in_one_batch(self) -> None:
+        text = "2026-11-03T00:30:00+00:00"
+        for batch_size in (100, 2):
+            with self.subTest(batch_size=batch_size):
+                path, store = self._store(f"identical-{batch_size}")
+                self._insert(path, [(text, 1), (text, 2)])
+
+                self._retain_counters(store, batch_size)
+
+                self.assertEqual(_rollups(path), [(3600, 2, 2.0, text), (86400, 2, 2.0, text)])
+
+    def test_the_services_own_timestamps_in_one_millisecond_follow_time_order(self) -> None:
+        # The collector stamps samples with isoformat_utc: UTC, +00:00, and
+        # six fraction digits, or none at a whole second. Inside one SQLite
+        # millisecond that text sorts in time order.
+        instants = {
+            "A": datetime(2026, 11, 3, 0, 30, tzinfo=timezone.utc),
+            "B": datetime(2026, 11, 3, 0, 30, 0, 300, tzinfo=timezone.utc),
+            "C": datetime(2026, 11, 3, 0, 30, 0, 400, tzinfo=timezone.utc),
+        }
+        rows = {key: (isoformat_utc(instant), value) for value, (key, instant) in enumerate(instants.items(), 1)}
+        latest = rows["C"][0]
+        self.assertEqual(rows["A"][0], "2026-11-03T00:30:00+00:00")
+        self.assertEqual(latest, "2026-11-03T00:30:00.000400+00:00")
+        with closing(sqlite3.connect(":memory:")) as connection:
+            days = {connection.execute("SELECT julianday(?)", (text,)).fetchone()[0] for text, _ in rows.values()}
+        self.assertEqual(len(days), 1)
+        self.assertEqual(sorted(rows, key=lambda key: rows[key][0]), sorted(instants, key=lambda key: instants[key]))
+
+        for label, rollups in self._last_values_for_every_batching("service", rows).items():
+            with self.subTest(batches=label):
+                self.assertEqual(rollups, [(3600, 3, 3.0, latest), (86400, 3, 3.0, latest)])
+
+    def test_a_sample_without_a_value_never_gives_the_last_value(self) -> None:
+        # The valued sample is 10 at 00:29 or 00:30 UTC; the one without a
+        # value is in the same hour, first by SQLite's reading and last by
+        # text, then the reverse. Another hour holds only samples without one.
+        valued_bucket = [
+            ("2026-11-03T00:00:00+00:00", 3600, 1, 10.0, 10.0, 10.0, 10.0),
+            ("2026-11-03T00:00:00+00:00", 86400, 1, 10.0, 10.0, 10.0, 10.0),
+        ]
+        cases = {
+            "the sample without a value is later": ("2026-11-03T00:30:00+00:00", "2026-11-03T01:29:00+01:00"),
+            "the sample without a value is earlier": ("2026-11-03T01:29:00+01:00", "2026-11-03T00:30:00+00:00"),
+        }
+        valueless_only = ["2026-11-05T03:00:00+00:00", "2026-11-05T02:10:00-01:00"]
+        for index, (case, (valueless, valued)) in enumerate(cases.items()):
+            for batch_size in (100, 2, 1):
+                with self.subTest(case=case, batch_size=batch_size):
+                    path, store = self._store(f"valueless-{index}-{batch_size}")
+                    store.insert_metric_samples(
+                        [
+                            _sample(valueless, None, metric_name="bytes_read"),
+                            _sample(valued, 10, metric_name="bytes_read"),
+                            *(_sample(text, None, metric_name="bytes_read") for text in valueless_only),
+                        ]
+                    )
+
+                    try:
+                        result = self._retain_counters(store, batch_size)
+                    except sqlite3.IntegrityError as error:
+                        self.fail(f"retention failed and kept every row: {error}")
+
+                    self.assertEqual(result["metric_samples_removed"], 4)
+                    self.assertFalse(result["has_more"])
+                    with closing(sqlite3.connect(path)) as connection:
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 0)
+                        rollups = connection.execute(
+                            "SELECT bucket_start, bucket_seconds, sample_count, value_sum, value_min, value_max, "
+                            "last_value, last_observed_at FROM metric_rollups ORDER BY bucket_start, bucket_seconds"
+                        ).fetchall()
+                    self.assertEqual(rollups, [(*row, valued) for row in valued_bucket])
 
 
 class SqliteMillisecondRoundingTests(unittest.TestCase):
