@@ -64,7 +64,7 @@
     "test_logging_config": 17,
     "test_mapping_routes": 21,
     "test_mapping_store": 116,
-    "test_mapping_store_writer_lock": 15,
+    "test_mapping_store_writer_lock": 23,
     "test_metrics": 26,
     "test_nonroot_cli": 4,
     "test_nonroot_migration": 55,

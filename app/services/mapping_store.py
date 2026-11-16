@@ -45,11 +45,10 @@ ScopeIdentity: TypeAlias = tuple[str | None, int]
 
 # Every MappingStore on one file shares one in-process writer lock, so two
 # owners in one process serialize exactly as one shared store does (#1228).
-# Readers never take it. A second, separate lock is held only for the instant
-# a writer swaps the file in and a reader opens it, so a reader never sees the
-# file change between its identity check and its open. Entries go away with
-# the last store that uses them.
-_PATH_LOCKS: weakref.WeakValueDictionary[tuple[str, str], Any] = weakref.WeakValueDictionary()
+# Readers take no lock: replacement is atomic, so a reader that finds the file
+# changed under it has met a newer version and reads again. Entries go away
+# with the last store that uses them.
+_PATH_LOCKS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _PATH_LOCKS_GUARD = threading.Lock()
 
 # The filesystem has no flock (for example NFS without a lock manager).
@@ -59,13 +58,20 @@ _UNSUPPORTED_LOCK_ERRNOS = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOS
 _NOT_REGULAR_LOCK_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
 
 
-def _shared_path_lock(file_path: Path, role: str = "writer") -> Any:
-    key = (
-        role,
-        os.path.join(
-            os.path.normcase(os.path.realpath(file_path.parent)),
-            os.path.normcase(file_path.name),
-        ),
+# A read that finds the file replaced between its checks reads again, at most
+# this many times, then refuses by name rather than wait for writers to stop.
+_SOURCE_REREADS = 3
+# Errors that mean the path or handle went stale under a reader: the file it
+# observed was replaced or removed, so a fresh read may succeed.
+_STALE_SOURCE_ERRNOS = frozenset(
+    code for code in (errno.ENOENT, errno.ELOOP, getattr(errno, "ESTALE", None)) if code is not None
+)
+
+
+def _shared_path_lock(file_path: Path) -> Any:
+    key = os.path.join(
+        os.path.normcase(os.path.realpath(file_path.parent)),
+        os.path.normcase(file_path.name),
     )
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.get(key)
@@ -185,6 +191,34 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
         RuntimeError.__init__(self, self.operator_message)
 
 
+class MappingReadBusy(RuntimeError):
+    """A read kept finding the mapping file replaced while it read it.
+
+    Readers take no lock. Each replacement is a complete newer version, so a
+    read that meets one reads again; after the bounded rereads it refuses
+    instead of waiting for writers to stop. Nothing was changed.
+    """
+
+    error_code = "mapping_read_busy"
+    reason = "busy"
+    public_detail = "The mappings were being changed while they were read. Try again."
+
+    def __init__(self, file_path: Path) -> None:
+        self.operator_message = (
+            f"Mapping read refused: {file_path} was replaced on each of "
+            f"{_SOURCE_REREADS + 1} reads in a row. Nothing was changed."
+        )
+        super().__init__(self.operator_message)
+
+
+class _SourceReplacedDuringRead(Exception):
+    """One read met a replaced, removed or stale source; ``original`` is its error."""
+
+    def __init__(self, original: OSError | None = None) -> None:
+        super().__init__("Configured mapping source identity changed during open.")
+        self.original = original
+
+
 class MappingDurabilityError(RuntimeError):
     """A complete replacement is visible but its durability is indeterminate."""
 
@@ -287,7 +321,8 @@ class MappingStore:
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _shared_path_lock(self.file_path)
-        self._publication_lock = _shared_path_lock(self.file_path, "publication")
+        # Set on the thread that holds this store's writer transaction.
+        self._writer_thread = threading.local()
 
     @property
     def writer_lock_path(self) -> Path:
@@ -310,7 +345,11 @@ class MappingStore:
         try:
             descriptor = self._acquire_writer_lock(deadline)
             try:
-                yield
+                self._writer_thread.active = True
+                try:
+                    yield
+                finally:
+                    self._writer_thread.active = False
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
@@ -549,19 +588,46 @@ class MappingStore:
         return version, entries
 
     def _read_source_bytes(self) -> bytes | None:
+        """Read one complete published version without waiting for a writer.
+
+        Writers publish by atomic rename, so a file that changes between this
+        read's checks was replaced by a newer complete version: read again, at
+        most ``_SOURCE_REREADS`` times, then refuse by name (#1228). Inside
+        this store's own writer transaction no writer that follows the
+        protocol can replace the file, so a change there fails closed at once.
+        """
+        rereads = 0 if getattr(self._writer_thread, "active", False) else _SOURCE_REREADS
+        for _attempt in range(rereads + 1):
+            try:
+                return self._read_source_bytes_once()
+            except _SourceReplacedDuringRead as replaced:
+                if rereads == 0:
+                    if replaced.original is not None:
+                        raise replaced.original from None
+                    raise OSError(str(replaced)) from None
+        raise MappingReadBusy(self.file_path)
+
+    def _read_source_bytes_once(self) -> bytes | None:
         flags = os.O_RDONLY
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        # Only this check-and-open excludes an in-process replacement, never a
-        # whole writer transaction, so a stalled writer cannot hold up a read.
-        with self._publication_lock:
-            try:
-                observed = os.lstat(self.file_path)
-            except FileNotFoundError:
-                return None
-            if not stat.S_ISREG(observed.st_mode):
-                raise OSError("Configured mapping source is not a regular file.")
+        try:
+            observed = os.lstat(self.file_path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno is not None and exc.errno == getattr(errno, "ESTALE", None):
+                raise _SourceReplacedDuringRead(exc) from exc
+            raise
+        if not stat.S_ISREG(observed.st_mode):
+            raise OSError("Configured mapping source is not a regular file.")
+        try:
             descriptor = os.open(self.file_path, flags)
+        except OSError as exc:
+            # Removed, or replaced by a link, after the check: met a change.
+            if exc.errno in _STALE_SOURCE_ERRNOS:
+                raise _SourceReplacedDuringRead(exc) from exc
+            raise
         try:
             opened = os.fstat(descriptor)
             if (
@@ -569,7 +635,7 @@ class MappingStore:
                 or opened.st_dev != observed.st_dev
                 or opened.st_ino != observed.st_ino
             ):
-                raise OSError("Configured mapping source identity changed during open.")
+                raise _SourceReplacedDuringRead()
             chunks: list[bytes] = []
             while True:
                 chunk = os.read(descriptor, 1024 * 1024)
@@ -577,6 +643,10 @@ class MappingStore:
                     break
                 chunks.append(chunk)
             return b"".join(chunks)
+        except OSError as exc:
+            if exc.errno is not None and exc.errno == getattr(errno, "ESTALE", None):
+                raise _SourceReplacedDuringRead(exc) from exc
+            raise
         finally:
             os.close(descriptor)
 
@@ -1696,8 +1766,7 @@ class MappingStore:
             self._fsync_temp_file(handle)
 
     def _replace_temp_file(self, temp_path: Path) -> None:
-        with self._publication_lock:
-            os.replace(temp_path, self.file_path)
+        os.replace(temp_path, self.file_path)
 
     def _fsync_parent_directory(self) -> None:
         descriptor = os.open(self.file_path.parent, os.O_RDONLY)

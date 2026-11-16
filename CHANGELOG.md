@@ -82,9 +82,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (`slot_mappings.json.lock` beside the file) from the read to the readback,
   and refuse with `mapping_writer_lock_unavailable` when another writer holds
   it too long, the filesystem cannot lock files, or the lock path is not a
-  regular file. The wait runs off the UI event loop, and reads do not wait
-  for a writer's transaction. A refused import now gets the named 503 instead
-  of a generic error (#1256).
+  regular file. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file replaced while reading it reads the newer version, and after
+  three such rereads refuses with `mapping_read_busy` (503, `Retry-After`)
+  instead of waiting. A refused import now gets the named 503 instead of a
+  generic error (#1256).
 
 ### Performance
 

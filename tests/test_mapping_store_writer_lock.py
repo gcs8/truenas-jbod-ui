@@ -563,6 +563,335 @@ class MappingWritesLeaveTheEventLoopFreeTests(unittest.TestCase):
             service.invalidate_physical_enclosure_snapshot_cache.assert_called_once()
 
 
+MAPPING_READ_BUSY = "mapping_read_busy"
+
+
+def read_busy_refusal_type(test: unittest.TestCase) -> type[Exception]:
+    refusal = getattr(mapping_store_module, "MappingReadBusy", None)
+    if refusal is None:
+        test.fail("the mapping store has no named refusal for a read that keeps meeting newer files")
+    return refusal
+
+
+def stalled_rename(path: Path):
+    """Hold a writer inside its os.replace onto `path` until released."""
+    entered, release = threading.Event(), threading.Event()
+    original_replace = os.replace
+
+    def replace(source, destination, *args, **kwargs):
+        if Path(destination) == path:
+            entered.set()
+            if not release.wait(timeout=30):
+                raise AssertionError("the test never released the stalled rename")
+        return original_replace(source, destination, *args, **kwargs)
+
+    return patch.object(mapping_store_module.os, "replace", replace), entered, release
+
+
+class ReadsNeverWaitForAPublishingWriterTests(unittest.TestCase):
+    """A reader never waits for a writer, not even one stalled inside its rename."""
+
+    def test_reads_return_the_last_published_content_while_a_rename_is_stalled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, _store = seeded_store(directory)
+            owner, reader = MappingStore(path), MappingStore(path)
+            published = path.read_bytes()
+            reads = {
+                "load_read_snapshot": lambda: len(reader.load_read_snapshot()),
+                "list_mappings": lambda: sorted(row.system_id for row in reader.list_mappings()),
+                "get_mapping": lambda: reader.get_mapping("a", "shelf", 1),
+                "load_all": lambda: len(reader.load_all()),
+                "load_lookup_snapshot": lambda: len(reader.load_lookup_snapshot()),
+                "save_revision": lambda: bool(reader.save_revision("b", "shelf", 2)),
+                "preview_replace_mappings": lambda: bool(
+                    reader.preview_replace_mappings("b", "shelf", [mapping("b", 3, "imported")])["revision"]
+                ),
+            }
+            stall, entered, release = stalled_rename(path)
+            with stall, ThreadPoolExecutor(max_workers=len(reads) + 1) as pool:
+                writer = pool.submit(owner.save_mapping, mapping("a", 1, "first"))
+                try:
+                    self.assertTrue(entered.wait(timeout=10), "the writer did not reach its rename")
+                    futures = {name: pool.submit(read) for name, read in reads.items()}
+                    wait(futures.values(), timeout=2)
+                    for name, future in futures.items():
+                        with self.subTest(read=name):
+                            self.assertTrue(future.done(), f"{name} waited for a writer stalled in its rename")
+                    self.assertEqual(path.read_bytes(), published)
+                finally:
+                    release.set()
+                writer.result(timeout=30)
+                for future in futures.values():
+                    self.assertIsNone(future.exception(timeout=30))
+            # Each read returned the last published content, not the stalled writer's.
+            self.assertEqual(futures["list_mappings"].result(), ["seed"])
+            self.assertIsNone(futures["get_mapping"].result())
+            self.assertEqual(futures["load_all"].result(), 1)
+            self.assertEqual(system_ids(path), ["a", "seed"])
+
+    def test_the_event_loop_keeps_running_while_a_rename_is_stalled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, _store = seeded_store(directory)
+            owner, reader = MappingStore(path), MappingStore(path)
+            service = bare_inventory_service(reader)
+            # An empty bundle writes no bays, so the preview reads no appliance.
+            bundle = MappingBundle(mappings=[])
+            reads = {
+                "preview": lambda: service.preview_mapping_bundle(bundle, selected_enclosure_id="shelf"),
+                "export": lambda: service.export_mapping_bundle(selected_enclosure_id="shelf"),
+            }
+
+            async def heartbeat_during(read):
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                ticks: list[float] = []
+                loop.call_later(0.02, lambda: ticks.append(loop.time() - started))
+                result = await read()
+                elapsed = loop.time() - started
+                await asyncio.sleep(0.03)
+                return ticks, elapsed, result
+
+            for name, read in reads.items():
+                with self.subTest(read=name):
+                    stall, entered, release = stalled_rename(path)
+                    # Only a thread outside the loop can rescue a blocked loop;
+                    # it fires long after a prompt read would have returned.
+                    rescue = threading.Timer(1.0, release.set)
+                    with stall, ThreadPoolExecutor(max_workers=1) as pool:
+                        writer = pool.submit(owner.save_mapping, mapping("a", 1, name))
+                        try:
+                            self.assertTrue(entered.wait(timeout=10), "the writer did not reach its rename")
+                            rescue.start()
+                            ticks, elapsed, result = asyncio.run(heartbeat_during(read))
+                        finally:
+                            release.set()
+                            rescue.cancel()
+                            rescue.join()
+                        writer.result(timeout=30)
+                    self.assertTrue(ticks, "a timer due during the read never ran")
+                    self.assertLess(ticks[0], 0.3, "the read blocked the event loop behind a stalled rename")
+                    self.assertLess(elapsed, 0.5, "the read waited for a writer stalled in its rename")
+                    if name == "export":
+                        # The last published content: the preview round's save,
+                        # not the export round's, which was still in its rename.
+                        self.assertEqual([row.notes for row in result.mappings], ["preview"])
+
+    def test_a_writer_does_not_wait_for_a_reader_paused_between_its_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, _store = seeded_store(directory)
+            owner, reader = MappingStore(path), MappingStore(path)
+            paused, writer_done = threading.Event(), threading.Event()
+            reader_observations: list[Path] = []
+            original_lstat = os.lstat
+
+            def lstat(name, *args, **kwargs):
+                result = original_lstat(name, *args, **kwargs)
+                if threading.current_thread().name == "paused-reader" and Path(name) == path:
+                    reader_observations.append(Path(name))
+                    if not paused.is_set():
+                        paused.set()
+                        writer_done.wait(timeout=5)
+                return result
+
+            outcome: dict[str, object] = {}
+
+            def read() -> None:
+                try:
+                    outcome["ids"] = sorted(row.system_id for row in reader.list_mappings())
+                except Exception as exc:  # noqa: BLE001 - reported by the assertions below
+                    outcome["error"] = exc
+
+            with patch.object(mapping_store_module.os, "lstat", lstat), ThreadPoolExecutor(max_workers=1) as pool:
+                reading = threading.Thread(target=read, name="paused-reader")
+                reading.start()
+                try:
+                    self.assertTrue(paused.wait(timeout=10), "the reader did not reach its first check")
+                    writer = pool.submit(owner.save_mapping, mapping("a", 1, "first"))
+                    wait([writer], timeout=2)
+                    self.assertTrue(writer.done(), "the writer waited for a reader paused between its checks")
+                    self.assertIsNone(writer.exception())
+                finally:
+                    writer_done.set()
+                    reading.join(timeout=30)
+            self.assertFalse(reading.is_alive())
+            self.assertNotIn("error", outcome)
+            # The reader met the newer file, reread it once and returned it whole.
+            self.assertEqual(outcome["ids"], ["a", "seed"])
+            self.assertEqual(len(reader_observations), 2)
+
+    def churn(self, path: Path, swaps: int | None):
+        """Replace the file with a fresh inode just before each source open."""
+        original_open, original_replace = os.open, os.replace
+        content = path.read_bytes()
+        opens: list[int] = []
+
+        def open_after_swap(name, flags, *args, **kwargs):
+            if Path(name) == path and not flags & os.O_CREAT:
+                opens.append(1)
+                if swaps is None or len(opens) <= swaps:
+                    fresh = path.with_name("churn.json")
+                    fresh.write_bytes(content)
+                    original_replace(fresh, path)
+            return original_open(name, flags, *args, **kwargs)
+
+        return patch.object(mapping_store_module.os, "open", open_after_swap), opens, content
+
+    def test_a_read_that_keeps_meeting_newer_files_refuses_by_name_after_three_rereads(self) -> None:
+        refusal_type = read_busy_refusal_type(self)
+        reads = {
+            "load_read_snapshot": lambda store: store.load_read_snapshot(),
+            "list_mappings": lambda store: store.list_mappings(),
+            # The tolerant display reads must not turn the refusal into "no mappings".
+            "get_mapping": lambda store: store.get_mapping("seed", "shelf", 0),
+            "load_all": lambda store: store.load_all(),
+            "load_lookup_snapshot": lambda store: store.load_lookup_snapshot(),
+            "save_revision": lambda store: store.save_revision("b", "shelf", 2),
+        }
+        for name, read in reads.items():
+            with self.subTest(read=name), tempfile.TemporaryDirectory() as directory:
+                path, _store = seeded_store(directory)
+                reader = MappingStore(path)
+                churn, opens, content = self.churn(path, swaps=None)
+                with churn, self.assertRaises(refusal_type) as raised:
+                    read(reader)
+                self.assertEqual(raised.exception.error_code, MAPPING_READ_BUSY)
+                self.assertEqual(raised.exception.reason, "busy")
+                self.assertEqual(len(opens), 4, "one read and three rereads, then the refusal")
+                self.assertEqual(path.read_bytes(), content)
+
+                # Control: three newer files in a row are still read through.
+                churn, opens, content = self.churn(path, swaps=3)
+                with churn:
+                    if name == "get_mapping":
+                        self.assertEqual(read(reader).notes, "seed")
+                    else:
+                        self.assertTrue(read(reader))
+                self.assertEqual(len(opens), 4)
+
+    def test_a_writer_still_refuses_a_file_replaced_during_its_own_read(self) -> None:
+        # Inside the writer transaction no writer that follows the protocol can
+        # replace the file, so a change there is refused at once, as before.
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            churn, opens, content = self.churn(path, swaps=None)
+            with churn, self.assertRaises(OSError):
+                store.save_mapping(mapping("a", 1, "first"))
+            self.assertEqual(len(opens), 1)
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_a_reread_still_refuses_a_file_replaced_by_a_link(self) -> None:
+        refusal_type = read_busy_refusal_type(self)
+        original_open = os.open
+        with tempfile.TemporaryDirectory() as directory:
+            path, _store = seeded_store(directory)
+            reader = MappingStore(path)
+            elsewhere = Path(directory) / "elsewhere.json"
+            elsewhere.write_bytes(path.read_bytes())
+            opens: list[int] = []
+
+            def link_then_open(name, flags, *args, **kwargs):
+                if Path(name) == path and not flags & os.O_CREAT:
+                    opens.append(1)
+                    if len(opens) == 1:
+                        path.unlink()
+                        path.symlink_to(elsewhere)
+                return original_open(name, flags, *args, **kwargs)
+
+            with patch.object(mapping_store_module.os, "open", link_then_open):
+                with self.assertRaises(OSError) as raised:
+                    reader.list_mappings()
+            # The first open met the link (O_NOFOLLOW) and read again; the
+            # reread's own check refused the link without opening it.
+            self.assertNotIsInstance(raised.exception, refusal_type)
+            self.assertIn("not a regular file", str(raised.exception))
+            self.assertEqual(len(opens), 1)
+
+    def test_a_vanished_or_stale_handle_is_reread(self) -> None:
+        original_open, original_fstat, original_read = os.open, os.fstat, os.read
+        original_lstat = os.lstat
+        stale = getattr(errno, "ESTALE", errno.EIO)
+        for case in ("vanished_open", "stale_lstat", "stale_open", "stale_fstat", "stale_read"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                path, _store = seeded_store(directory)
+                reader = MappingStore(path)
+                descriptors: list[int] = []
+                failed: list[str] = []
+
+                def source_open(name, flags, *args, **kwargs):
+                    if Path(name) == path and not flags & os.O_CREAT:
+                        if not failed and case == "vanished_open":
+                            failed.append(case)
+                            raise FileNotFoundError(errno.ENOENT, "synthetic vanished file")
+                        if not failed and case == "stale_open":
+                            failed.append(case)
+                            raise OSError(stale, "synthetic stale handle")
+                        descriptor = original_open(name, flags, *args, **kwargs)
+                        descriptors.append(descriptor)
+                        return descriptor
+                    return original_open(name, flags, *args, **kwargs)
+
+                def source_lstat(name, *args, **kwargs):
+                    if case == "stale_lstat" and not failed and Path(name) == path:
+                        failed.append(case)
+                        raise OSError(stale, "synthetic stale handle")
+                    return original_lstat(name, *args, **kwargs)
+
+                def source_fstat(descriptor, *args, **kwargs):
+                    if case == "stale_fstat" and not failed and descriptor in descriptors:
+                        failed.append(case)
+                        raise OSError(stale, "synthetic stale handle")
+                    return original_fstat(descriptor, *args, **kwargs)
+
+                def source_read(descriptor, size):
+                    if case == "stale_read" and not failed and descriptor in descriptors:
+                        failed.append(case)
+                        raise OSError(stale, "synthetic stale handle")
+                    return original_read(descriptor, size)
+
+                with (
+                    patch.object(mapping_store_module.os, "lstat", source_lstat),
+                    patch.object(mapping_store_module.os, "open", source_open),
+                    patch.object(mapping_store_module.os, "fstat", source_fstat),
+                    patch.object(mapping_store_module.os, "read", source_read),
+                ):
+                    self.assertEqual([row.system_id for row in reader.list_mappings()], ["seed"])
+                self.assertEqual(failed, [case])
+                # Every descriptor the reads opened is closed again.
+                for descriptor in descriptors:
+                    with self.assertRaises(OSError):
+                        original_fstat(descriptor)
+
+
+class MappingReadRefusalRouteTests(unittest.TestCase):
+    """A read that refuses reaches the browser as a named, retryable 503."""
+
+    def test_a_read_refusal_is_a_named_503_without_a_path(self) -> None:
+        refusal_type = read_busy_refusal_type(self)
+        refusal = refusal_type(Path("/app/data/slot_mappings.json"))
+        route = next(
+            route for route in app_main.app.routes if getattr(route, "path", None) == "/api/mappings/export"
+        )
+        service = Mock()
+        service.export_mapping_bundle = AsyncMock(side_effect=refusal)
+        registry = Mock()
+        registry.get_service.return_value = service
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+            # The route does not turn the refusal into an empty export.
+            with self.assertRaises(refusal_type):
+                asyncio.run(route.endpoint(system_id="system-a", enclosure_id="enc-a"))
+        handler = app_main.app.exception_handlers.get(refusal_type)
+        self.assertIsNotNone(handler, "no handler answers the read refusal; it would be a generic 500")
+        with self.assertLogs("app.main", level="WARNING") as logged:
+            response = asyncio.run(handler(Mock(), refusal))
+        # The service log names the refused read; the response does not.
+        self.assertIn("Mapping read refused", "\n".join(logged.output))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("Retry-After"), "1")
+        body = json.loads(response.body)
+        self.assertEqual(body, {"ok": False, "error": MAPPING_READ_BUSY, "detail": refusal_type.public_detail})
+        self.assertNotIn("/app/data", response.body.decode("utf-8"))
+
+
 class MappingImportRouteRefusalTests(unittest.TestCase):
     """The import route answers a storage or writer-lock refusal like a save does."""
 
