@@ -2134,10 +2134,36 @@ class InventoryService:
             selected_enclosure_id=selected_enclosure_id,
             stale_on_busy=True,
         )
-        if result.cache_state != "stale-hit":
+        if result.cache_state not in {"stale-hit", "trusted-fallback"}:
             return result.value, None
-        # _get_snapshot_result always prepends a note to a waited fallback.
+        # _get_snapshot_result always prepends a note to a waited fallback,
+        # and a view kept past an incomplete refresh always carries one (#1208).
         return result.value, result.value.warnings[0]
+
+    @staticmethod
+    def _retained_snapshot_response(retained: InventorySnapshot, attempt: InventorySnapshot) -> InventorySnapshot:
+        """A response copy of ``retained`` that discloses the incomplete ``attempt`` (#1208).
+
+        The slots and their read time stay those of the trusted snapshot. The
+        attempt's source status replaces the old one, and its warnings follow
+        a first warning that says the view is retained and when it was read.
+        ``retained`` itself is not changed.
+        """
+        read_at = retained.last_updated
+        if read_at.tzinfo is None:
+            read_at = read_at.replace(tzinfo=timezone.utc)
+        read_at_text = read_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        warning = (
+            "The latest inventory refresh was incomplete, so this view keeps the inventory "
+            f"read at {read_at_text}. Source status is from the latest refresh."
+        )
+        warnings = [warning]
+        for item in (*attempt.warnings, *retained.warnings):
+            if item not in warnings:
+                warnings.append(item)
+        return retained.model_copy(
+            update={"warnings": warnings, "sources": {**retained.sources, **attempt.sources}}
+        )
 
     async def _get_snapshot_result(
         self,
@@ -2510,7 +2536,10 @@ class InventoryService:
                             "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
                             cache_key,
                         )
-                        return CacheResult(cached, "trusted-fallback")
+                        # Keep the trusted facts, but answer with a copy that
+                        # says this refresh failed (#1208); the cache keeps
+                        # the last-good snapshot unchanged.
+                        return CacheResult(self._retained_snapshot_response(cached, snapshot), "trusted-fallback")
                     self._observe_inventory_snapshot_request(refresh_trigger)
                     self._remember_led_snapshot(
                         cache_key,

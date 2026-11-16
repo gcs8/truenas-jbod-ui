@@ -129,6 +129,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Storage Fabric event decoding no longer turns a CDB with a malformed byte
+  token into a different valid command with an invented address and length;
+  it is marked malformed and keeps its raw text. An ASC/ASCQ value that is not
+  two one- or two-digit hex bytes is no longer labelled as the sense code it
+  resembles; the first `asc:` field of a sense line is read whole, so such a
+  value is neither dropped nor replaced by a later `asc:` fragment, and it is
+  marked malformed with no fault family. A loginfo value that is wider than
+  32 bits or is not a hex number is no longer labelled as a known fault or
+  dropped; it stays unconfirmed, summaries count it as rejected instead of
+  listing the raw value, and long kernel text is shortened before it becomes
+  a summary key. Only the first `tgt`/`SMID`/`loginfo` tail of a controller
+  line is read: when its fields are not in the kernel's form it is marked
+  malformed and counted as rejected, and a later tail is never decoded in
+  its place (#1239).
 - Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
   stop other admin requests while slow storage writes or syncs the staged
   file, and a cancelled upload keeps its file until the write has finished.
@@ -156,6 +170,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   as `13:0`), a placed disk no longer takes the other controller's pool,
   topology and fault state; a slot key shared by several disks is no longer
   used for topology lookup (#1237, refs #1213).
+- When a refresh returns incomplete topology and the last trusted inventory
+  view is kept, the answer now says so: it keeps the trusted bays and their
+  read time, but shows the latest refresh's source status and warnings under
+  a warning that the view is retained, and the snapshot export reports the
+  same warning instead of the earlier successful status (#1242).
 - Fixed recovery of a crashed segmented restore that also restored
   configuration (#1196): recovery now returns configuration and history to the
   same generation, or refuses with a named reason and keeps its evidence,
