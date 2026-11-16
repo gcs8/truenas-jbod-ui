@@ -26,6 +26,7 @@ from app.route_support import (
     logger,
     mapped_exception_handler,
     mapping_durability_exception_handler,
+    mapping_read_busy_exception_handler,
     mapping_scope_conflict_exception_handler,
     split_known_hosts_paths,
     ui_writable_directories,
@@ -36,6 +37,7 @@ from app.routes import build_router
 from app.settings_reload import install_config_reload
 from app.services.mapping_store import (
     MappingDurabilityError,
+    MappingReadBusy,
     MappingScopeConflict,
 )
 from app.services.profile_registry import build_profile_reference_warnings
@@ -134,6 +136,7 @@ def create_app() -> FastAPI:
         MappingDurabilityError,
         mapping_durability_exception_handler,
     )
+    app.add_exception_handler(MappingReadBusy, mapping_read_busy_exception_handler)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:

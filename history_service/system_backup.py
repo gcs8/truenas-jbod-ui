@@ -71,13 +71,17 @@ from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.segmented_restore import (
+    IMPORT_SEAL_PURPOSE,
+    WHOLE_IMPORT_JOURNAL_VERSION,
     file_matches as restore_file_matches,
+    import_seal_path,
     record_file as record_restore_file,
     record_optional_file as record_optional_restore_file,
     record_optional_tree as record_optional_restore_tree,
     record_tree as record_restore_tree,
     remove_recorded_file as remove_recorded_restore_file,
     remove_recorded_tree as remove_recorded_restore_tree,
+    replace_restore_journal,
     tree_matches as restore_tree_matches,
     write_restore_journal,
 )
@@ -327,6 +331,14 @@ def _segmented_integrity_message(stage: str) -> str:
     logger.error("Segmented history restore integrity check failed at stage: %s.", stage)
     return (
         "The restore was stopped because a history file changed while it was being "
+        "copied or swapped into place."
+    )
+
+
+def _journaled_restore_integrity_message(stage: str) -> str:
+    logger.error("Journaled restore integrity check failed at stage: %s.", stage)
+    return (
+        "The restore was stopped because a restored file changed while it was being "
         "copied or swapped into place."
     )
 
@@ -807,6 +819,11 @@ class _ImportRollbackEntry:
     backup_path: Path | None = None
     history_store: HistoryStore | None = None
     mutated: bool = False
+    # Recorded staging name and candidate record of a journaled configuration
+    # target; rollback reuses the name so recovery can authenticate and remove
+    # a displaced candidate after process loss (#1196).
+    journal_staged_path: Path | None = None
+    journal_candidate_record: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -814,6 +831,70 @@ class _ImportRestoreDestination:
     group_key: str
     target_path: Path
     expected_kind: Literal["file", "directory"]
+
+
+def _configuration_restore_destinations(settings: Settings) -> dict[str, _ImportRestoreDestination]:
+    """Every configuration restore target the import derives from ``settings``."""
+    config_path = Path(settings.config_file)
+    config_root = config_path.parent
+    layout_paths = _derive_runtime_layout_paths(config_path)
+    targets: tuple[tuple[str, Path, Literal["file", "directory"]], ...] = (
+        (CONFIG_FILE_KEY, config_path, "file"),
+        (RUNTIME_OVERRIDES_FILE_KEY, Path(settings.paths.runtime_overrides_file), "file"),
+        (PROFILE_FILE_KEY, Path(settings.paths.profile_file), "file"),
+        (MAPPING_FILE_KEY, Path(settings.paths.mapping_file), "file"),
+        (SAS_FABRIC_ALIAS_FILE_KEY, Path(settings.paths.sas_fabric_alias_file), "file"),
+        (SLOT_DETAIL_FILE_KEY, Path(settings.paths.slot_detail_cache_file), "file"),
+        (SSH_KEYS_KEY, config_root / "ssh", "directory"),
+        (TLS_TRUST_KEY, config_root / "tls", "directory"),
+        (KNOWN_HOSTS_KEY, Path(layout_paths["known_hosts_path"]), "file"),
+    )
+    return {key: _ImportRestoreDestination(key, path, kind) for key, path, kind in targets}
+
+
+def restore_configuration_folders(settings: Settings | None = None) -> tuple[Path, ...]:
+    """Folders where a restore that also restores configuration keeps its records.
+
+    Recovery lists these folders, and only these, for restore records that a
+    journal may no longer name (#1196). They come from the application's own
+    settings through the derivation the import uses, plus the other layouts an
+    imported configuration may select (its own folder's layout, the default
+    layout and the legacy container layout), never from the history volume.
+    Destinations outside these folders are not checked.
+    """
+    if settings is None:
+        try:
+            settings = load_settings(create_directories=False)
+        except Exception:
+            # Settings that do not load still name their layout folders below.
+            settings = None
+    config_path = Path(
+        settings.config_file
+        if settings is not None
+        else os.getenv("APP_CONFIG_PATH", Settings().config_file)
+    )
+    candidates: list[Path] = []
+    if settings is not None:
+        candidates.extend(
+            destination.target_path
+            for destination in _configuration_restore_destinations(settings).values()
+        )
+    for layout_config_path in (
+        config_path,
+        Path(Settings().config_file),
+        Path("/app/config/config.yaml"),
+    ):
+        candidates.extend(
+            Path(value)
+            for key, value in _derive_runtime_layout_paths(layout_config_path).items()
+            if key != "log_file"
+        )
+    folders: list[Path] = []
+    for candidate in candidates:
+        folder = Path(os.path.abspath(candidate.parent))
+        if folder not in folders:
+            folders.append(folder)
+    return tuple(folders)
 
 
 @dataclass(slots=True)
@@ -999,6 +1080,22 @@ class _ImportActivationTransaction:
         self._rollback_completed = False
         self._prepared_segmented_restore: _PreparedSegmentedRestore | None = None
         self._preserve_segmented_evidence = False
+        # Durable whole-import journal (#1196): once bound, every activated
+        # target is indexed in it. The journal lives where lower-trust services
+        # can write, so recovery acts only on what the folder records list.
+        self._activation_journal: tuple[Path, dict[str, Any]] | None = None
+        self._activation_journal_payload: dict[str, Any] | None = None
+        # Journaled configuration artifacts are retired by an authenticated
+        # rename before recursive deletion, so process loss part-way through a
+        # delete never leaves a recorded path half removed.
+        self._recorded_artifacts: dict[Path, tuple[dict[str, Any], Literal["file", "directory"]]] = {}
+        # One record per configuration folder, keyed by folder path: [record
+        # path, current file record, payload, folder identity]. Each lists the
+        # targets in its folder; the first folder's record also lists every
+        # folder and holds the commit or rollback decision (see
+        # segmented_restore.import_seal_path).
+        self._import_seals: dict[str, list[Any]] = {}
+        self._anchor_folder: str | None = None
         try:
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.rollback_root.mkdir(parents=True, exist_ok=True)
@@ -1028,6 +1125,11 @@ class _ImportActivationTransaction:
                 f"deleted; the files needed to recover are preserved in {self.root}."
             ) from exc
         if exc is not None and not self._committed:
+            if self._anchor_folder is not None:
+                try:
+                    self._record_import_decision("rollback")
+                except Exception as decision_error:
+                    exc.add_note(f"Recording the rollback decision failed: {decision_error}")
             try:
                 self.rollback()
             except Exception as rollback_error:
@@ -1059,7 +1161,175 @@ class _ImportActivationTransaction:
         return False
 
     def commit(self) -> None:
+        if self._anchor_folder is not None:
+            self._record_import_decision("commit")
         self._committed = True
+
+    def bind_activation_journal(
+        self,
+        marker: tuple[Path, dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Record later targets and the import decision in this journal."""
+        self._activation_journal = marker
+        self._activation_journal_payload = json.loads(json.dumps(payload))
+
+    @property
+    def activation_journal(self) -> tuple[Path, dict[str, Any]] | None:
+        return self._activation_journal
+
+    def _update_activation_journal(self, **changes: Any) -> None:
+        if self._activation_journal is None or self._activation_journal_payload is None:
+            raise ValueError("Restore activation journal is not bound.")
+        payload = {**self._activation_journal_payload, **changes}
+        journal_path, journal_record = self._activation_journal
+        updated_record = replace_restore_journal(
+            journal_path,
+            payload,
+            current_record=journal_record,
+        )
+        self._activation_journal = (journal_path, updated_record)
+        self._activation_journal_payload = payload
+
+    def _journaled_sibling_paths(self, target_path: Path) -> tuple[Path, Path]:
+        assert self._activation_journal_payload is not None
+        transaction_id = self._activation_journal_payload["transaction_id"]
+        staged_path = target_path.parent / f".{target_path.name}.restore-{transaction_id}"
+        previous_path = target_path.parent / f".{target_path.name}.previous-{transaction_id}"
+        if self._path_exists(staged_path) or self._path_exists(previous_path):
+            raise ValueError("Restore artifact already exists.")
+        return staged_path, previous_path
+
+    def _journal_target(
+        self,
+        target_path: Path,
+        *,
+        kind: Literal["file", "directory"],
+        staged_path: Path,
+        previous_path: Path,
+        prior: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> None:
+        """Durably record one target in its folder, then index it, before it changes."""
+        assert self._activation_journal_payload is not None
+        parent = os.stat(target_path.parent, follow_symlinks=False)
+        entry = {
+            "path": os.path.abspath(target_path),
+            "kind": kind,
+            "parent": {"device": parent.st_dev, "inode": parent.st_ino},
+            "staged_name": staged_path.name,
+            "previous_name": previous_path.name,
+            "prior": prior,
+            "candidate": candidate,
+        }
+        self._seal_target(entry)
+        self._recorded_artifacts[staged_path] = (candidate, kind)
+        if prior.get("kind") != "missing":
+            self._recorded_artifacts[previous_path] = (prior, kind)
+        self._update_activation_journal(
+            targets=[*self._activation_journal_payload["targets"], entry],
+        )
+
+    def _seal_folder(self, folder_path: Path) -> None:
+        """Give a folder its restore record before anything is staged in it."""
+        assert self._activation_journal_payload is not None
+        folder = os.path.abspath(folder_path)
+        if folder in self._import_seals:
+            return
+        transaction_id = self._activation_journal_payload["transaction_id"]
+        metadata = os.stat(folder, follow_symlinks=False)
+        identity = {"path": folder, "device": metadata.st_dev, "inode": metadata.st_ino}
+        payload: dict[str, Any] = {
+            "purpose": IMPORT_SEAL_PURPOSE,
+            "transaction_id": transaction_id,
+            "folder": folder,
+            "targets": [],
+        }
+        if self._anchor_folder is None:
+            payload.update(
+                anchor=folder,
+                folders=[identity],
+                decision="pending",
+                history=self._recorded_history(),
+            )
+        else:
+            # The first folder's record lists a folder before anything in it
+            # changes, so a journal that omits the folder cannot skip it.
+            anchor = self._import_seals[self._anchor_folder][2]
+            self._replace_import_seal(
+                self._anchor_folder,
+                {**anchor, "folders": [*anchor["folders"], identity]},
+            )
+            payload["anchor"] = self._anchor_folder
+        seal_path = import_seal_path(Path(folder), transaction_id)
+        seal_record = write_restore_journal(seal_path, payload)
+        self._import_seals[folder] = [seal_path, seal_record, payload, identity]
+        if self._anchor_folder is None:
+            self._anchor_folder = folder
+            # From here the journal names the first folder's record, which
+            # lists every folder and target; recovery follows that record.
+            self._update_activation_journal(
+                journal_version=WHOLE_IMPORT_JOURNAL_VERSION,
+                anchor=identity,
+                targets=[],
+            )
+
+    def _recorded_history(self) -> list[dict[str, Any]]:
+        """The history this restore replaces and installs, as the journal has it.
+
+        The first folder's record keeps it so that records left after the
+        journal is gone can be checked against history, not only against
+        configuration (#1196). Recovery refuses a journal whose history
+        records are not exactly these.
+        """
+        prepared = self._prepared_segmented_restore
+        journal = self._activation_journal_payload
+        if prepared is None or journal is None or prepared.store.segment_catalog_path is None:
+            return []
+        return [
+            {
+                "path": os.path.abspath(path),
+                "kind": kind,
+                "prior": journal[name]["prior"],
+                "candidate": journal[name]["candidate"],
+            }
+            for name, kind, path in (
+                ("hot", "file", prepared.store.file_path),
+                ("segments", "directory", prepared.store.segment_catalog_path.parent),
+            )
+        ]
+
+    def _seal_target(self, entry: dict[str, Any]) -> None:
+        """Add ``entry`` to its folder's record (write, fsync, rename, fsync)."""
+        seal = self._import_seals.get(os.path.dirname(entry["path"]))
+        if seal is None or (seal[3]["device"], seal[3]["inode"]) != (
+            entry["parent"]["device"],
+            entry["parent"]["inode"],
+        ):
+            raise ValueError("Live restore target changed after validation.")
+        self._replace_import_seal(
+            os.path.dirname(entry["path"]),
+            {**seal[2], "targets": [*seal[2]["targets"], entry]},
+        )
+
+    def _replace_import_seal(self, folder: str, payload: dict[str, Any]) -> None:
+        seal = self._import_seals[folder]
+        seal[1] = replace_restore_journal(seal[0], payload, current_record=seal[1])
+        seal[2] = payload
+
+    def _record_import_decision(self, decision: str) -> None:
+        """Record commit or rollback in the first configuration folder's record."""
+        assert self._anchor_folder is not None
+        anchor = self._import_seals[self._anchor_folder][2]
+        self._replace_import_seal(self._anchor_folder, {**anchor, "decision": decision})
+
+    def remove_import_seals(self) -> None:
+        """Remove folder records once the journal that needs them is gone."""
+        # The first folder's record names the others, so it goes last.
+        for folder in reversed(list(self._import_seals)):
+            seal_path, seal_record, *_ = self._import_seals[folder]
+            remove_recorded_restore_file(seal_path, seal_record, label="restore import seal")
+            del self._import_seals[folder]
 
     @property
     def rollback_completed(self) -> bool:
@@ -1142,7 +1412,57 @@ class _ImportActivationTransaction:
         cls._fsync_directory(path.parent)
 
     def activate_file(self, target_path: Path, member_key: str) -> None:
+        if self._activation_journal is not None:
+            self._activate_journaled_file(target_path, member_key)
+            return
         self._activate_file(target_path, member_key, allow_history=False)
+
+    def _activate_journaled_file(self, target_path: Path, member_key: str) -> None:
+        entry = self._record_target(target_path, expected_kind="file")
+        staged_member = self._staged_member(member_key)
+        self._ensure_parent_hierarchy(target_path.parent)
+        self._seal_folder(target_path.parent)
+        staged_path, previous_path = self._journaled_sibling_paths(target_path)
+        file_owner = self._existing_owner(
+            target_path if entry.kind == "file" else target_path.parent,
+            directory=entry.kind != "file",
+        )
+        file_mode = (
+            target_path.stat(follow_symlinks=False).st_mode & 0o7777
+            if entry.kind == "file"
+            else self._MISSING_FILE_MODE
+        )
+        self._copy_file_exclusive(
+            staged_member,
+            staged_path,
+            owner=file_owner,
+            mode=file_mode,
+        )
+        self._sibling_artifacts[staged_path] = "file"
+        self._fsync_directory(target_path.parent)
+        entry.journal_staged_path = staged_path
+        prior = record_optional_restore_file(target_path)
+        if prior.get("kind") != entry.kind:
+            raise ValueError("Live restore target changed after validation.")
+        candidate = record_restore_file(staged_path)
+        entry.journal_candidate_record = candidate
+        self._journal_target(
+            target_path,
+            kind="file",
+            staged_path=staged_path,
+            previous_path=previous_path,
+            prior=prior,
+            candidate=candidate,
+        )
+        self._activate_prepared_target(
+            entry,
+            staged_path=staged_path,
+            previous_path=previous_path,
+            prior_record=prior,
+            candidate_record=candidate,
+            matcher=restore_file_matches,
+            integrity_message=_journaled_restore_integrity_message,
+        )
 
     def _activate_file(
         self,
@@ -1414,6 +1734,7 @@ class _ImportActivationTransaction:
         prior_record: dict[str, Any],
         candidate_record: dict[str, Any],
         matcher: Callable[[Path, Any], bool],
+        integrity_message: Callable[[str], str] = _segmented_integrity_message,
     ) -> None:
         prior_matches = (
             not self._path_exists(entry.target_path)
@@ -1422,7 +1743,7 @@ class _ImportActivationTransaction:
         )
         if not prior_matches or not matcher(staged_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError(_segmented_integrity_message("prepared artifact"))
+            raise ValueError(integrity_message("prepared artifact"))
         if entry.kind != "missing":
             if self._path_exists(previous_path):
                 raise ValueError("Segmented history prior restore artifact already exists.")
@@ -1433,14 +1754,14 @@ class _ImportActivationTransaction:
             self._fsync_directory(entry.target_path.parent)
             if not matcher(previous_path, prior_record):
                 self._preserve_segmented_evidence = True
-                raise ValueError(_segmented_integrity_message("parked prior"))
+                raise ValueError(integrity_message("parked prior"))
         os.replace(staged_path, entry.target_path)
         self._sibling_artifacts.pop(staged_path, None)
         entry.mutated = True
         self._fsync_directory(entry.target_path.parent)
         if not matcher(entry.target_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError(_segmented_integrity_message("activated candidate"))
+            raise ValueError(integrity_message("activated candidate"))
 
     def activate_segmented_history(
         self,
@@ -1523,12 +1844,19 @@ class _ImportActivationTransaction:
         entry = self._record_target(target_dir, expected_kind="directory")
         existing_directory = target_dir if entry.kind == "directory" else None
         self._ensure_parent_hierarchy(target_dir.parent)
-        staged_dir = Path(
-            tempfile.mkdtemp(
-                prefix=f".{target_dir.name}.restore-",
-                dir=target_dir.parent,
+        journaled = self._activation_journal is not None
+        if journaled:
+            self._seal_folder(target_dir.parent)
+            staged_dir, previous_dir = self._journaled_sibling_paths(target_dir)
+            staged_dir.mkdir(mode=0o700)
+        else:
+            previous_dir = None
+            staged_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{target_dir.name}.restore-",
+                    dir=target_dir.parent,
+                )
             )
-        )
         self._sibling_artifacts[staged_dir] = "directory"
         root_owner = self._existing_owner(
             existing_directory or target_dir.parent,
@@ -1583,13 +1911,40 @@ class _ImportActivationTransaction:
                     ),
                 )
             self._fsync_tree(staged_dir, files_already_synced=True)
-            self._park_original(entry)
-            os.replace(staged_dir, target_dir)
-            self._sibling_artifacts.pop(staged_dir, None)
-            entry.mutated = True
-            self._fsync_directory(target_dir.parent)
+            if previous_dir is not None:
+                entry.journal_staged_path = staged_dir
+                prior = record_optional_restore_tree(target_dir)
+                if prior.get("kind") != entry.kind:
+                    raise ValueError("Live restore target changed after validation.")
+                candidate = record_restore_tree(staged_dir)
+                entry.journal_candidate_record = candidate
+                self._journal_target(
+                    target_dir,
+                    kind="directory",
+                    staged_path=staged_dir,
+                    previous_path=previous_dir,
+                    prior=prior,
+                    candidate=candidate,
+                )
+                self._activate_prepared_target(
+                    entry,
+                    staged_path=staged_dir,
+                    previous_path=previous_dir,
+                    prior_record=prior,
+                    candidate_record=candidate,
+                    matcher=restore_tree_matches,
+                    integrity_message=_journaled_restore_integrity_message,
+                )
+            else:
+                self._park_original(entry)
+                os.replace(staged_dir, target_dir)
+                self._sibling_artifacts.pop(staged_dir, None)
+                entry.mutated = True
+                self._fsync_directory(target_dir.parent)
         finally:
-            self._cleanup_sibling_artifact(staged_dir)
+            # A failed integrity check keeps the staged tree as evidence.
+            if not self._preserve_segmented_evidence:
+                self._cleanup_sibling_artifact(staged_dir)
 
     def activate_history(self, store: HistoryStore, member_key: str) -> None:
         entry = self._record_history(store)
@@ -1750,7 +2105,20 @@ class _ImportActivationTransaction:
                 entry.target_path,
                 expected_kind=entry.expected_kind,
             )
-            displaced_path = self._new_sibling_path(entry.target_path, "restore")
+            if (
+                entry.journal_staged_path is not None
+                and entry.journal_candidate_record is not None
+                and not self._path_exists(entry.journal_staged_path)
+            ):
+                # The recorded staging name lets recovery authenticate and
+                # remove the displaced candidate after process loss.
+                displaced_path = entry.journal_staged_path
+                self._recorded_artifacts[displaced_path] = (
+                    entry.journal_candidate_record,
+                    entry.expected_kind,
+                )
+            else:
+                displaced_path = self._new_sibling_path(entry.target_path, "restore")
             os.replace(entry.target_path, displaced_path)
             self._sibling_artifacts[displaced_path] = entry.expected_kind
             self._fsync_directory(entry.target_path.parent)
@@ -1926,12 +2294,23 @@ class _ImportActivationTransaction:
 
     def _cleanup_sibling_artifact(self, artifact_path: Path) -> None:
         expected_kind = self._sibling_artifacts.get(artifact_path)
+        recorded = self._recorded_artifacts.get(artifact_path)
         if self._path_exists(artifact_path):
             if expected_kind is None:
                 raise RuntimeError("Untracked restore artifact cannot be removed.")
-            self._remove_path(artifact_path, expected_kind=expected_kind)
-            self._fsync_directory(artifact_path.parent)
+            if recorded is not None:
+                record, recorded_kind = recorded
+                remover = (
+                    remove_recorded_restore_file
+                    if recorded_kind == "file"
+                    else remove_recorded_restore_tree
+                )
+                remover(artifact_path, record, label="recorded restore artifact")
+            else:
+                self._remove_path(artifact_path, expected_kind=expected_kind)
+                self._fsync_directory(artifact_path.parent)
         self._sibling_artifacts.pop(artifact_path, None)
+        self._recorded_artifacts.pop(artifact_path, None)
 
     def _cleanup_root(self) -> None:
         if self.root.exists():
@@ -3430,6 +3809,7 @@ class SystemBackupService:
                                     self.store,
                                     marker_payload,
                                 )
+                                transaction.bind_activation_journal(marker, marker_payload)
                             extraction_root = cleanup_root
                             cleanup_root = None
                             self._cleanup_extracted_archive(extraction_root)
@@ -3446,11 +3826,19 @@ class SystemBackupService:
                     except Exception:
                         if marker is not None:
                             if transaction.rollback_completed:
-                                self._remove_segmented_activation_marker(marker)
+                                self._remove_segmented_activation_marker(
+                                    transaction.activation_journal or marker
+                                )
+                                transaction.remove_import_seals()
                             marker = None
                         raise
                     if marker is not None:
-                        self._remove_segmented_activation_marker(marker)
+                        # The journal may have been rewritten with each target
+                        # and the commit decision; remove its current record.
+                        self._remove_segmented_activation_marker(
+                            transaction.activation_journal or marker
+                        )
+                        transaction.remove_import_seals()
                         marker = None
                     return result
             except Exception:
@@ -3476,61 +3864,15 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
     ) -> dict[str, _ImportRestoreDestination]:
         trusted_settings = self._load_app_settings()
-        config_path = Path(trusted_settings.config_file)
-        config_root = config_path.parent
-        layout_paths = _derive_runtime_layout_paths(config_path)
-        destinations = {
-            CONFIG_FILE_KEY: _ImportRestoreDestination(
-                CONFIG_FILE_KEY,
-                config_path,
-                "file",
-            ),
-            RUNTIME_OVERRIDES_FILE_KEY: _ImportRestoreDestination(
-                RUNTIME_OVERRIDES_FILE_KEY,
-                Path(trusted_settings.paths.runtime_overrides_file),
-                "file",
-            ),
-            PROFILE_FILE_KEY: _ImportRestoreDestination(
-                PROFILE_FILE_KEY,
-                Path(trusted_settings.paths.profile_file),
-                "file",
-            ),
-            MAPPING_FILE_KEY: _ImportRestoreDestination(
-                MAPPING_FILE_KEY,
-                Path(trusted_settings.paths.mapping_file),
-                "file",
-            ),
-            SAS_FABRIC_ALIAS_FILE_KEY: _ImportRestoreDestination(
-                SAS_FABRIC_ALIAS_FILE_KEY,
-                Path(trusted_settings.paths.sas_fabric_alias_file),
-                "file",
-            ),
-            SLOT_DETAIL_FILE_KEY: _ImportRestoreDestination(
-                SLOT_DETAIL_FILE_KEY,
-                Path(trusted_settings.paths.slot_detail_cache_file),
-                "file",
-            ),
-            SSH_KEYS_KEY: _ImportRestoreDestination(
-                SSH_KEYS_KEY,
-                config_root / "ssh",
-                "directory",
-            ),
-            TLS_TRUST_KEY: _ImportRestoreDestination(
-                TLS_TRUST_KEY,
-                config_root / "tls",
-                "directory",
-            ),
-            KNOWN_HOSTS_KEY: _ImportRestoreDestination(
-                KNOWN_HOSTS_KEY,
-                Path(layout_paths["known_hosts_path"]),
-                "file",
-            ),
-            HISTORY_DB_KEY: _ImportRestoreDestination(
-                HISTORY_DB_KEY,
-                self.store.file_path,
-                "file",
-            ),
-        }
+        layout_paths = _derive_runtime_layout_paths(Path(trusted_settings.config_file))
+        # Recovery derives its configuration folders from the same targets
+        # (restore_configuration_folders), so the two cannot drift (#1196).
+        destinations = _configuration_restore_destinations(trusted_settings)
+        destinations[HISTORY_DB_KEY] = _ImportRestoreDestination(
+            HISTORY_DB_KEY,
+            self.store.file_path,
+            "file",
+        )
         self._validate_imported_restore_path_settings(
             manifest,
             group_entries,

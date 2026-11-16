@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import errno as errno_module
+import http.client
 import itertools
 import json
 import logging
+import os
 import random
+import re
+import socket
 import ssl
 import time
+import traceback
 import uuid
 import weakref
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Any, Awaitable, Callable, Iterator
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterator, Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
+from xml.etree import ElementTree
 
 from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
 from prometheus_client import REGISTRY
 from prometheus_client.core import GaugeMetricFamily
@@ -30,7 +39,11 @@ from app.config import (
     split_max_concurrent_calls,
 )
 from app.metrics import METRICS_NAMESPACE
-from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
+from app.services.tls_context import (
+    TlsTrustConfigurationError,
+    build_tls_client_context,
+    resolve_tls_server_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +66,44 @@ _DISK_IDENTITY_KEYS = (
 )
 
 
+MAX_REMOTE_REASON_LENGTH = 300
+_ERROR_NAME_TOKEN = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
+_METHOD_TOKEN = re.compile(r"[A-Za-z0-9_./-]{1,96}")
+
+
+def bounded_remote_reason(value: Any) -> str | None:
+    """Remote reason text, bounded in length and free of control characters."""
+
+    if value is None:
+        return None
+    text = "".join(character if character.isprintable() else " " for character in str(value))
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > MAX_REMOTE_REASON_LENGTH:
+        text = text[: MAX_REMOTE_REASON_LENGTH - 3].rstrip() + "..."
+    return text
+
+
+def error_name_token(value: Any) -> str | None:
+    """An error name such as ``EINVAL`` when it has that exact shape, else None."""
+
+    text = str(value or "").strip()
+    return text if _ERROR_NAME_TOKEN.fullmatch(text) else None
+
+
 class TrueNASAPIError(RuntimeError):
+    """A failed call to a platform API, BMC or appliance service.
+
+    The message (``str(exc)``) is written by this service from fixed words,
+    the method or endpoint constant and bounded tokens; it never carries text
+    the remote side produced. ``category``, ``code``, ``errname`` and ``method``
+    are the structured facts read responses and logs use. ``reason`` keeps the
+    remote reason apart from the message, bounded and without control
+    characters: only routes behind the mutation-authorization dependency read
+    it (``app.routes._authorized_action_failure_detail``).
+    """
+
     retryable = False
 
     def __init__(
@@ -62,11 +112,24 @@ class TrueNASAPIError(RuntimeError):
         errname: str | None = None,
         reason: str | None = None,
         code: int | None = None,
+        category: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(*args)
         self.errname = errname
-        self.reason = reason
+        # A local fault the adapter wrapped has no remote reason to carry.
+        self.reason = None if category == INTERNAL_FAILURE_CATEGORY else bounded_remote_reason(reason)
         self.code = code
+        self.category = category
+        self.method = method
+
+
+class LocalServiceError(TrueNASAPIError):
+    """A fixed sentence written by this service: a refusal, a missing slot or view.
+
+    The code that raises it vouches that the message holds no remote text, so
+    read responses show it unchanged (with the status code they always used).
+    """
 
 
 class TrueNASAPIBusyError(TrueNASAPIError):
@@ -83,23 +146,357 @@ class _LimiterBusyError(TrueNASAPIBusyError):
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_TOO_MANY_CONCURRENT_CALLS = -32000
 JSONRPC_METHOD_CALL_ERROR = -32001
+REMOTE_FAILURE_CATEGORIES = frozenset(
+    {
+        "authentication_failed",
+        "busy",
+        "certificate_verification",
+        "method_unavailable",
+        "remote_error",
+        "response_invalid",
+        "timeout",
+        "tls_failed",
+        "unreachable",
+    }
+)
+# The service's own fixed sentence (`LocalServiceError`, a CA bundle refusal).
+LOCAL_FAILURE_CATEGORY = "local"
+# An exception no remote adapter produces: a bug or a local fault in this service.
+INTERNAL_FAILURE_CATEGORY = "internal_error"
+MAX_PUBLIC_REMOTE_ERROR_CODE = 99999
+# Socket-level errno values. Any other errno on an OSError is a local fault
+# (a file, a permission, the disk), not the remote side.
+NETWORK_ERRNOS = frozenset(
+    number
+    for number in (
+        getattr(errno_module, name, None)
+        for name in (
+            "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET",
+            "EHOSTDOWN", "EHOSTUNREACH", "ENETDOWN", "ENETRESET", "ENETUNREACH",
+            "ENOTCONN", "EPIPE", "EPROTO", "ESHUTDOWN", "ETIMEDOUT",
+        )
+    )
+    if number is not None
+)
+_RESPONSE_INVALID_TYPES: tuple[type[BaseException], ...] = (
+    http.client.HTTPException,
+    json.JSONDecodeError,
+    UnicodeError,
+    ElementTree.ParseError,
+)
+
+
+def bounded_remote_error_code(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= MAX_PUBLIC_REMOTE_ERROR_CODE:
+        return value
+    return None
+
+
+def _websocket_status_code(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    return bounded_remote_error_code(getattr(response, "status_code", None))
+
+
+def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
+    """Return a fixed category and a bounded numeric code for a failure.
+
+    The decision uses the exception type, its errno and the structured fields
+    the adapters set, never the message text. (Where the older API dialect has
+    no structured field, its adapter sets the category from a known reply
+    marker: ``DDP_REPLY_MARKERS``.) Only adapter wrappers
+    (`TrueNASAPIError`, `URLError`) are looked through to their cause; any other
+    exception type an adapter does not raise is ``internal_error``.
+    """
+
+    if isinstance(exc, LocalServiceError):
+        if exc.category == INTERNAL_FAILURE_CATEGORY:
+            return INTERNAL_FAILURE_CATEGORY, None
+        if exc.category in REMOTE_FAILURE_CATEGORIES:
+            return exc.category, bounded_remote_error_code(exc.code)
+        return LOCAL_FAILURE_CATEGORY, None
+    if isinstance(exc, TlsTrustConfigurationError):
+        return LOCAL_FAILURE_CATEGORY, None
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    fallback_code: int | None = None
+    adapter_error = False
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return "certificate_verification", bounded_remote_error_code(getattr(current, "verify_code", None))
+        if isinstance(current, ssl.SSLError):
+            return "tls_failed", None
+        if isinstance(current, TrueNASAPIBusyError):
+            return "busy", bounded_remote_error_code(current.code)
+        if isinstance(current, TrueNASAPIError):
+            # A category the local code set survives wrapping.
+            if current.category == INTERNAL_FAILURE_CATEGORY:
+                return INTERNAL_FAILURE_CATEGORY, None
+            adapter_error = True
+            code = bounded_remote_error_code(current.code)
+            fallback_code = code if code is not None else fallback_code
+            if current.category in REMOTE_FAILURE_CATEGORIES:
+                return current.category, code
+            if code == JSONRPC_METHOD_NOT_FOUND:
+                return "method_unavailable", code
+            if code == JSONRPC_TOO_MANY_CONCURRENT_CALLS:
+                return "busy", code
+            for linked in (current.__cause__, current.__context__):
+                if isinstance(linked, BaseException):
+                    pending.append(linked)
+            continue
+        if isinstance(current, HTTPError):
+            code = bounded_remote_error_code(current.code)
+            return ("authentication_failed" if code in {401, 403} else "remote_error"), code
+        if isinstance(current, URLError):
+            if isinstance(current.reason, BaseException):
+                pending.append(current.reason)
+                continue
+            return "unreachable", None
+        if isinstance(current, InvalidStatus):
+            code = _websocket_status_code(current)
+            return ("authentication_failed" if code in {401, 403} else "remote_error"), code
+        if isinstance(current, ConnectionClosed):
+            return "unreachable", None
+        if isinstance(current, WebSocketException):
+            return "response_invalid", None
+        if isinstance(current, TimeoutError):
+            return "timeout", None
+        if isinstance(current, (ConnectionError, socket.gaierror, socket.herror)):
+            return "unreachable", None
+        if isinstance(current, OSError):
+            if current.errno is None or current.errno in NETWORK_ERRNOS:
+                return "unreachable", None
+            if adapter_error:
+                continue
+            return INTERNAL_FAILURE_CATEGORY, None
+        if isinstance(current, _RESPONSE_INVALID_TYPES):
+            return "response_invalid", None
+        if not adapter_error:
+            return INTERNAL_FAILURE_CATEGORY, None
+    return "remote_error", fallback_code
+
+
+def error_body_read_category(exc: BaseException) -> str:
+    """The category for a fault while reading an HTTP error response body.
+
+    The error status already arrived, so the call stays the error the remote
+    side reported; a local fault (decided by structure) stays internal.
+    """
+
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        return INTERNAL_FAILURE_CATEGORY
+    return "remote_error"
+
+
+def is_local_failure_message(exc: BaseException) -> bool:
+    """True when ``str(exc)`` is this service's own fixed sentence.
+
+    Decided by type: the raising code marks it (`LocalServiceError`), or it is
+    the CA bundle refusal this service writes. Everything else is remote or
+    unknown and is shown only as a fixed category.
+    """
+
+    return isinstance(exc, (LocalServiceError, TlsTrustConfigurationError))
+
+
+def failure_log_fields(exc: BaseException) -> str:
+    """Value-safe facts about a failure for a log line: never message text."""
+
+    category, code = classify_remote_failure(exc)
+    fields = [f"category={category}"]
+    if code is not None:
+        fields.append(f"code={code}")
+    method = errname = None
+    os_errno: int | None = None
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, TrueNASAPIError):
+            if method is None and isinstance(current.method, str) and _METHOD_TOKEN.fullmatch(current.method):
+                method = current.method
+            if errname is None:
+                errname = error_name_token(current.errname)
+        if os_errno is None and isinstance(current, OSError):
+            os_errno = bounded_remote_error_code(current.errno)
+        if isinstance(current, URLError) and isinstance(current.reason, BaseException):
+            pending.append(current.reason)
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    if method is not None:
+        fields.append(f"method={method}")
+    if errname is not None:
+        fields.append(f"errname={errname}")
+    if os_errno is not None:
+        fields.append(f"errno={os_errno}")
+    fields.append(f"exception={type(exc).__name__}")
+    return ", ".join(fields)
+
+
+MAX_LOGGED_FRAMES = 20
+_LOG_IDENTIFIER = re.compile(r"[A-Za-z0-9_/][A-Za-z0-9_.:/-]{0,95}")
+UNLISTED_LOG_IDENTIFIER = "(unlisted)"
+
+
+def log_identifier(value: Any) -> str:
+    """The one way an identifier (enclosure id, device, key) enters a log line.
+
+    Appliance identifiers are remote data: a value is written only when all of
+    it is printable ASCII from a short set, at most 96 characters; anything
+    else is written as a fixed placeholder.
+    """
+
+    if isinstance(value, str) and _LOG_IDENTIFIER.fullmatch(value):
+        return value
+    return UNLISTED_LOG_IDENTIFIER
+
+
+def _failure_origin(exc: BaseException) -> BaseException:
+    """The exception that started the chain: explicit cause first, else context."""
+
+    origin = exc
+    seen = {id(origin)}
+    while True:
+        linked = origin.__cause__ or (None if origin.__suppress_context__ else origin.__context__)
+        if linked is None or id(linked) in seen or len(seen) >= 16:
+            return origin
+        seen.add(id(linked))
+        origin = linked
+
+
+def failure_frames(exc: BaseException) -> str:
+    """Where a local fault happened, without paths, source text or message.
+
+    Lists the innermost ``MAX_LOGGED_FRAMES`` frames of the exception that
+    started the chain as ``  <file base name>:<line> in <function>``.
+    """
+
+    origin = _failure_origin(exc)
+    frames = traceback.extract_tb(origin.__traceback__ or exc.__traceback__)[-MAX_LOGGED_FRAMES:]
+    return "\n".join(
+        f"  {os.path.basename(frame.filename)}:{frame.lineno} in {frame.name}" for frame in frames
+    )
+
+
+def log_failure(
+    target_logger: logging.Logger,
+    operation: str,
+    exc: BaseException,
+    *,
+    level: int = logging.WARNING,
+    identifiers: Mapping[str, Any] | None = None,
+) -> None:
+    """Log a failure by its structured facts only.
+
+    ``operation`` is a fixed name. ``identifiers`` maps a fixed field name to
+    a value that is written only through ``log_identifier``.
+    An ``internal_error`` (a bug or local fault) is always ERROR and carries the
+    stack frames so it can be found, but not the exception message.
+    """
+
+    fields = failure_log_fields(exc)
+    internal = classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY
+    if internal:
+        origin = _failure_origin(exc)
+        if origin is not exc:
+            fields = f"{fields}, cause={type(origin).__name__}"
+    for name, value in (identifiers or {}).items():
+        if value is not None:
+            fields = f"{fields}, {name}={log_identifier(value)}"
+    if internal:
+        # ``exception`` with ``exc_info=False``: the ERROR call the catch-all
+        # sites always made, with the frames written as text instead of the
+        # traceback, which would carry the exception message.
+        target_logger.exception(
+            "%s failed (%s); stack frames, exception message omitted:\n%s",
+            operation,
+            fields,
+            failure_frames(exc) or "  (no frames recorded)",
+            exc_info=False,
+        )
+        return
+    target_logger.log(level, "%s failed (%s)", operation, fields)
 
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
 
-# The DDP endpoint reports a full call queue as ETOOMANYREFS (59 on CORE's
-# FreeBSD, 109 on SCALE's Linux) with this reason text.
-_DDP_BUSY_REASON = "maximum number of concurrent calls"
+# Origin is decided by structure. On the platform API and BMC read paths,
+# outside the two authorized action details (the bounded ``.reason``), remote
+# text is never shown or logged. SSH command failures are handled apart from
+# this, in the SSH probe and the inventory's failure records.
+# Sorting a remote failure into one of the fixed categories is different: the
+# older (DDP) dialect gives no structured field for these two conditions, so
+# each is recognised by a known marker in the appliance's own reply (``busy``:
+# a substring of the reason, compared in lower case; ``method_unavailable``:
+# the whole reason, or the error name). This gives the appliance no new power,
+# since it can already select any category by sending the matching code, and
+# the busy marker drives the back-off that keeps this service from
+# overloading the appliance. The reply words select a category only.
+DDP_REPLY_MARKERS: Mapping[str, str] = MappingProxyType(
+    {
+        "busy": "maximum number of concurrent calls",
+        "method_unavailable": "ENOMETHOD",
+    }
+)
+# A full call queue without a reason is ETOOMANYREFS (59 on CORE's FreeBSD,
+# 109 on SCALE's Linux).
 _DDP_BUSY_ERRNOS = frozenset({59, 109})
+
+
+def _api_failure_message(method: str, category: str, errname: str | None, code: int | None) -> str:
+    """``<method> failed (<category words>[, <ERRNAME>][, code N]).`` from local words only."""
+
+    words = {
+        "busy": "busy",
+        "method_unavailable": "method unavailable",
+    }.get(category, "remote error")
+    parts = [words]
+    if errname:
+        parts.append(errname)
+    if code is not None:
+        parts.append(f"code {code}")
+    return f"{method} failed ({', '.join(parts)})."
 
 
 def build_ddp_error(method: str, error: Any) -> TrueNASAPIError:
     busy = False
+    code: int | None = None
+    errname: str | None = None
+    raw_reason: Any = None
     if isinstance(error, dict):
-        reason = str(error.get("reason") or "").lower()
-        busy = _DDP_BUSY_REASON in reason or (not reason and error.get("error") in _DDP_BUSY_ERRNOS)
+        raw_reason = error.get("reason")
+        reason = str(raw_reason or "").lower()
+        code = bounded_remote_error_code(error.get("error"))
+        errname = error_name_token(error.get("errname"))
+        busy = DDP_REPLY_MARKERS["busy"] in reason or (not reason and code in _DDP_BUSY_ERRNOS)
     error_class = TrueNASAPIBusyError if busy else TrueNASAPIError
-    return error_class(f"{method} failed: {error}")
+    missing_method = DDP_REPLY_MARKERS["method_unavailable"]
+    method_unavailable = isinstance(error, dict) and (
+        errname == missing_method or str(raw_reason or "").strip().upper() == missing_method
+    )
+    if busy:
+        category = "busy"
+    elif method_unavailable:
+        category = "method_unavailable"
+        errname = missing_method
+    else:
+        category = "remote_error"
+    return error_class(
+        _api_failure_message(method, category, errname, code),
+        errname=errname,
+        reason=raw_reason,
+        code=code,
+        category=category,
+        method=method,
+    )
 
 
 class MiddlewareCallLimiter:
@@ -316,18 +713,34 @@ class MiddlewareCallLimitCollector:
 REGISTRY.register(MiddlewareCallLimitCollector())
 
 
-def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
-    """Map a JSON-RPC error object onto the app's API error.
+def is_method_unavailable(exc: BaseException) -> bool:
+    """True when the platform reported that the called method does not exist.
 
-    `data.trace` is middleware internals and is deliberately never carried into
-    the message the UI shows; `errname` and `reason` are what an operator acts on.
+    Read from the typed error name both dialects set, never from the message.
     """
+
+    return isinstance(exc, TrueNASAPIError) and exc.errname == "ENOMETHOD"
+
+
+def ddp_reply_object(message: Any, method: str | None = None) -> dict[str, Any]:
+    """A decoded DDP message, which must be an object; anything else is unusable."""
+
+    if isinstance(message, dict):
+        return message
+    raise TrueNASAPIError(
+        f"{method} returned an unusable reply." if method else "The websocket returned an unusable reply.",
+        category="response_invalid",
+        method=method,
+    )
+
+
+def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
+    """Map a JSON-RPC error object onto the app's typed API error."""
+
     code: int | None = None
     errname = reason = message_text = ""
     if isinstance(error, dict):
-        raw_code = error.get("code")
-        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
-            code = raw_code
+        code = bounded_remote_error_code(error.get("code"))
         message_text = str(error.get("message") or "").strip()
         data = error.get("data")
         if isinstance(data, dict):
@@ -335,23 +748,28 @@ def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
             reason = str(data.get("reason") or "").strip()
     if code == JSONRPC_METHOD_NOT_FOUND and not errname:
         errname = "ENOMETHOD"
-        reason = reason or message_text
-    detail = ": ".join(part for part in (errname, reason) if part) or message_text
-    if not detail:
-        detail = f"code {code}" if code is not None else "unspecified middleware error"
-    error_class = TrueNASAPIBusyError if code == JSONRPC_TOO_MANY_CONCURRENT_CALLS else TrueNASAPIError
+    errname_token = error_name_token(errname)
+    if code == JSONRPC_METHOD_NOT_FOUND or errname_token == "ENOMETHOD":
+        category = "method_unavailable"
+    elif code == JSONRPC_TOO_MANY_CONCURRENT_CALLS or errname_token == "EBUSY":
+        category = "busy"
+    else:
+        category = "remote_error"
+    error_class = TrueNASAPIBusyError if category == "busy" else TrueNASAPIError
     return error_class(
-        f"{method} failed: {detail}",
-        errname=errname or None,
-        reason=reason or None,
+        _api_failure_message(method, category, errname_token, code),
+        errname=errname_token,
+        reason=reason or message_text or None,
         code=code,
+        category=category,
+        method=method,
     )
 
 
 def normalize_disk_inventory_rows(value: Any, *, source: str = "disk inventory") -> list[dict[str, Any]]:
     if isinstance(value, list):
         if len(value) > MAX_DISK_INVENTORY_ROWS:
-            raise TrueNASAPIError(
+            raise LocalServiceError(
                 f"{source} returned {len(value)} rows; the supported maximum is {MAX_DISK_INVENTORY_ROWS}."
             )
         rows = value
@@ -472,7 +890,8 @@ class _MiddlewareCallDispatcher:
             # cancellation that initiated shutdown.
             pass
 
-    async def _handle_message(self, message: dict[str, Any]) -> None:
+    async def _handle_message(self, message: Any) -> None:
+        message = ddp_reply_object(message)
         if message.get("msg") == "ping":
             # DDP heartbeats are JSON messages, not WebSocket control frames.
             pong = {"msg": "pong"}
@@ -573,7 +992,7 @@ def build_websocket_url(host: str) -> str:
 
 def build_jsonrpc_url(host: str, api_version: str = "current") -> str:
     if not TRUENAS_API_VERSION_PATTERN.fullmatch(api_version or ""):
-        raise TrueNASAPIError(
+        raise LocalServiceError(
             f"Unsupported TrueNAS api_version {api_version!r}; expected 'current' or a pinned 'vX.Y.Z'."
         )
 
@@ -584,6 +1003,21 @@ def build_jsonrpc_url(host: str, api_version: str = "current") -> str:
     scheme = "wss" if parsed.scheme == "https" else "ws"
     path = parsed.path.rstrip("/")
     return urlunsplit((scheme, parsed.netloc, f"{path}/api/{api_version}", "", ""))
+
+
+def truenas_session_destination(config: TrueNASConfig) -> tuple[str, str | None]:
+    """The WebSocket URL a `TrueNASWebsocketClient` session opens and the TLS server name it presents.
+
+    The session is opened from this, and so is anything that has to know
+    where it goes (the persisted-detail binding). The URL depends on the
+    dialect (and, for JSON-RPC, the version); the server name is `None`
+    without TLS.
+    """
+    if config.api_dialect == "jsonrpc":
+        url = build_jsonrpc_url(config.host, config.api_version)
+    else:
+        url = build_websocket_url(config.host)
+    return url, resolve_tls_server_name(config) if url.startswith("wss://") else None
 
 
 @dataclass(slots=True)
@@ -668,9 +1102,7 @@ class TrueNASWebsocketClient:
         return self.config.api_dialect == "jsonrpc"
 
     def _endpoint_url(self) -> str:
-        if self._uses_jsonrpc:
-            return build_jsonrpc_url(self.config.host, self.config.api_version)
-        return build_websocket_url(self.config.host)
+        return truenas_session_destination(self.config)[0]
 
     def _make_dispatcher(self, ws: ClientConnection) -> _MiddlewareCallDispatcher:
         if self._uses_jsonrpc:
@@ -794,13 +1226,19 @@ class TrueNASWebsocketClient:
             try:
                 result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
             except TrueNASAPIError as exc:
-                if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
-                    raise TrueNASAPIError(
-                        "Detailed SMART JSON is not available through the SCALE websocket API on this system."
+                if self.config.platform == "scale" and is_method_unavailable(exc):
+                    raise LocalServiceError(
+                        "Detailed SMART JSON is not available through the SCALE websocket API on this system.",
+                        category="method_unavailable",
+                        method="disk.smartctl",
                     ) from exc
                 raise
             if not isinstance(result, str):
-                raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
+                raise TrueNASAPIError(
+                    "disk.smartctl returned an unexpected payload type.",
+                    category="response_invalid",
+                    method="disk.smartctl",
+                )
             return result
 
     async def smartctl_batch(
@@ -825,7 +1263,7 @@ class TrueNASWebsocketClient:
         if not isinstance(disks, (list, tuple)):
             raise ValueError("disks must be a finite list or tuple of disk names.")
         if len(disks) > MAX_DISK_INVENTORY_ROWS:
-            raise TrueNASAPIError(f"SMART batch exceeds the supported maximum of {MAX_DISK_INVENTORY_ROWS} disks.")
+            raise LocalServiceError(f"SMART batch exceeds the supported maximum of {MAX_DISK_INVENTORY_ROWS} disks.")
         if any(not isinstance(disk, str) or not disk for disk in disks):
             raise ValueError("disks must contain nonempty string disk names.")
         if not disks:
@@ -900,11 +1338,13 @@ class TrueNASWebsocketClient:
                             timeout=lambda: min(self.config.timeout_seconds, max(phase_deadline - loop.time(), 0.001)),
                         )
                 except TrueNASAPIError as exc:
-                    if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                    if self.config.platform == "scale" and is_method_unavailable(exc):
                         # Not about this disk: the method is absent, so nothing
                         # in this batch can succeed. Fail the whole batch.
-                        raise TrueNASAPIError(
-                            "Detailed SMART JSON is not available through the SCALE websocket API on this system."
+                        raise LocalServiceError(
+                            "Detailed SMART JSON is not available through the SCALE websocket API on this system.",
+                            category="method_unavailable",
+                            method="disk.smartctl",
                         ) from exc
                     if not return_exceptions:
                         raise
@@ -928,7 +1368,9 @@ class TrueNASWebsocketClient:
                     continue
                 if not isinstance(result, str):
                     payload_error = TrueNASAPIError(
-                        f"disk.smartctl returned unexpected payload type for {disk!r}."
+                        "disk.smartctl returned an unexpected payload type.",
+                        category="response_invalid",
+                        method="disk.smartctl",
                     )
                     if not return_exceptions:
                         raise payload_error
@@ -1002,12 +1444,18 @@ class TrueNASWebsocketClient:
     async def _perform_handshake(self, ws: ClientConnection, login: _PendingLogin) -> None:
         if not self._uses_jsonrpc:
             await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
-            response = json.loads(await ws.recv())
+            response = ddp_reply_object(json.loads(await ws.recv()))
             if response.get("msg") != "connected":
-                raise TrueNASAPIError(f"Unexpected websocket handshake response: {response}")
+                raise TrueNASAPIError(
+                    "Unexpected websocket handshake response.",
+                    category="response_invalid",
+                )
         # JSON-RPC 2.0 has no session handshake; authentication is the first call.
         if await self._login(ws, login) is not True:
-            raise TrueNASAPIError("TrueNAS API authentication failed.")
+            raise TrueNASAPIError(
+                "TrueNAS API authentication failed.",
+                category="authentication_failed",
+            )
 
     async def _login(self, ws: ClientConnection, login: _PendingLogin) -> Any:
         """Authenticate, remembering a login that is still in flight.
@@ -1148,7 +1596,7 @@ class TrueNASWebsocketClient:
         try:
             results = await call_method("smart.test.results", [])
         except TrueNASAPIError as exc:
-            if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+            if self.config.platform == "scale" and is_method_unavailable(exc):
                 logger.info("smart.test.results is unavailable on this SCALE system; continuing without SMART history.")
             else:
                 logger.warning("smart.test.results failed; continuing without SMART test overview.")
@@ -1166,7 +1614,7 @@ class TrueNASWebsocketClient:
                 rows = payload.get(bucket)
                 if isinstance(rows, list):
                     if len(combined) + len(rows) > MAX_DISK_INVENTORY_ROWS:
-                        raise TrueNASAPIError(
+                        raise LocalServiceError(
                             "disk.details returned more than "
                             f"{MAX_DISK_INVENTORY_ROWS} rows; the supported maximum is "
                             f"{MAX_DISK_INVENTORY_ROWS}."
@@ -1193,18 +1641,18 @@ class TrueNASWebsocketClient:
 
     @asynccontextmanager
     async def _session(self):
-        websocket_url = self._endpoint_url()
+        websocket_url, server_name = truenas_session_destination(self.config)
         ssl_context = self._ssl_context()
 
         if not self.config.api_key:
-            raise TrueNASAPIError("TRUENAS_API_KEY is required for API access.")
+            raise LocalServiceError("TRUENAS_API_KEY is required for API access.")
         # Fail fast while backing off: no connection, no login.
         self.call_limiter.check_open()
 
         connection = connect(
             websocket_url,
             ssl=ssl_context,
-            server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
+            server_hostname=server_name if ssl_context else None,
             open_timeout=self.config.timeout_seconds,
             close_timeout=self.config.timeout_seconds,
             ping_interval=20,
@@ -1295,7 +1743,7 @@ class TrueNASWebsocketClient:
     ) -> Any:
         while True:
             raw_message = await ws.recv()
-            message = json.loads(raw_message)
+            message = ddp_reply_object(json.loads(raw_message), method)
             msg_type = message.get("msg")
 
             if msg_type == "ping":
@@ -1317,7 +1765,11 @@ class TrueNASWebsocketClient:
                     raise build_ddp_error(method, message["error"])
                 return message.get("result")
 
-            raise TrueNASAPIError(f"Unexpected response for {method}: {message}")
+            raise TrueNASAPIError(
+                f"Unexpected response for {method}.",
+                category="response_invalid",
+                method=method,
+            )
 
     @staticmethod
     def _ensure_list(value: Any) -> list[dict[str, Any]]:

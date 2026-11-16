@@ -30,6 +30,7 @@ from history_service.diagnostics import (
     classify_collection_failure,
     classify_retention_failure,
 )
+from app.models.domain import slot_occupancy
 from app.request_context import request_id_headers
 from app.metrics import (
     observe_history_collection_run,
@@ -135,6 +136,9 @@ class HistoryCollectionPaused(RuntimeError):
 
 
 COLLECTION_PAUSED_REASON = "The history database is damaged; collection is paused to protect it."
+# A metric pass that read no SMART data is not a successful collection (#1205).
+SMART_METRICS_UNAVAILABLE_REASON = "No history SMART metrics could be collected; every SMART request failed."
+SMART_METRICS_PARTIAL_REASON = "Some history SMART metric requests failed; metric collection was partial."
 # Deferred chronological index builds (#910). Scheduled collection never
 # writes a pass to a database that has just refused an index build. The first
 # INDEX_BUILD_QUICK_RETRIES retries are INDEX_BUILD_RETRY_SECONDS apart, for a
@@ -328,8 +332,19 @@ class HistoryCollector:
         self.last_smart_failure_evidence_at: str | None = None
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
+        # Per-disk evidence behind the two aggregates above, keyed like
+        # smart_evidence_expected: (failed or temperature, observed at). A disk
+        # in an unread bay keeps only its own entry; a disk in no current scope
+        # is dropped when the aggregate is next replaced (#1218).
+        self._smart_failure_by_disk: dict[str, tuple[bool, str]] = {}
+        self._smart_temperature_by_disk: dict[str, tuple[float, str]] = {}
         self._scope_enumeration_complete = True
         self._scope_collection_degraded_reason: str | None = None
+        # Scopes whose SMART metric read failed, with the metric kinds ("fast",
+        # "slow") still owed. They are retried on the next pass even when the
+        # shared cadence is not due, and keep the collector degraded (#1205).
+        self._pending_smart_metric_scopes: dict[tuple[str, str | None], frozenset[str]] = {}
+        self._smart_metric_degraded_reason: str | None = None
         # Scopes the last scan read but did not record, with why (#927). None
         # until a scan has looked; a root-only scan updates only its own scope.
         self.last_skipped_scopes: list[dict[str, Any]] | None = None
@@ -479,8 +494,11 @@ class HistoryCollector:
         smart_temperature_observed: set[str] = set()
         smart_failure_evidence: set[str] = set()
         smart_temperatures: dict[str, float] = {}
+        smart_evidence_unread: set[str] = set()
         trusted_smart_scope_observed = False
         smart_scope_unavailable = False
+        smart_scopes_succeeded = 0
+        smart_scopes_failed = 0
         force_inventory = self._should_force_inventory_for_collection(
             collect_fast=collect_fast,
             collect_slow=collect_slow,
@@ -573,20 +591,33 @@ class HistoryCollector:
                 slot_count=len(slot_records),
             )
 
-            if not collect_fast and not collect_slow:
+            scope_key = (scope.system_id, scope.enclosure_id)
+            pending_kinds = self._pending_smart_metric_scopes.get(scope_key, frozenset())
+            # Only a scheduled pass pays a retry debt. A manual refresh reads
+            # just what it asked for, so a Quick refresh never turns into a
+            # fresh SMART read; an unpaid debt waits for the next scheduled pass.
+            scope_collect_fast = collect_fast or (include_due_intervals and "fast" in pending_kinds)
+            scope_collect_slow = collect_slow or (include_due_intervals and "slow" in pending_kinds)
+            if not scope_collect_fast and not scope_collect_slow:
                 continue
 
-            present_slots = [record.slot for record in slot_records if record.present]
+            # A disk recorded in a bay whose occupancy this pass did not read
+            # was not read either: it keeps its own earlier SMART evidence
+            # until a real read, and nothing else's (#1218).
+            for recorded in self._unread_bay_recorded_disks(slot_records):
+                smart_evidence_unread.add(self._smart_evidence_disk_key(recorded))
+            present_slots = [record.slot for record in slot_records if slot_occupancy(record) == "present"]
             if not present_slots:
+                self._pending_smart_metric_scopes.pop(scope_key, None)
                 continue
-            records_by_slot = {record.slot: record for record in slot_records if record.present}
+            records_by_slot = {record.slot: record for record in slot_records if slot_occupancy(record) == "present"}
             for record in records_by_slot.values():
                 smart_evidence_expected.add(self._smart_evidence_disk_key(record))
             self._set_collection_activity(f"collecting SMART metrics for {scope_label} ({scope_index}/{len(scopes)})")
             smart_started = time.perf_counter()
             self._enter_failure_stage("smart_read", scope.system_id)
             try:
-                summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
+                summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=scope_collect_slow)
             except HistoryCollectionStopping:
                 raise
             except Exception as exc:  # noqa: BLE001 - one slow scope should not fail the whole fleet pass.
@@ -604,14 +635,21 @@ class HistoryCollector:
                     enclosure_label=scope.enclosure_label,
                     scope_index=scope_index,
                     slot_count=len(present_slots),
-                    force_fresh=collect_slow,
+                    force_fresh=scope_collect_slow,
                     error=str(exc),
                 )
+                smart_scopes_failed += 1
+                owed_kinds = set(pending_kinds)
+                if scope_collect_fast:
+                    owed_kinds.add("fast")
+                if scope_collect_slow:
+                    owed_kinds.add("slow")
+                self._pending_smart_metric_scopes[scope_key] = frozenset(owed_kinds)
                 continue
             self._raise_if_stopping()
             self._enter_failure_stage("metric_write", scope.system_id)
             self._record_collection_stage(
-                "smart.fresh" if collect_slow else "smart.cached",
+                "smart.fresh" if scope_collect_slow else "smart.cached",
                 time.perf_counter() - smart_started,
                 system_id=scope.system_id,
                 system_label=scope.system_label,
@@ -620,7 +658,7 @@ class HistoryCollector:
                 scope_index=scope_index,
                 slot_count=len(present_slots),
                 summary_count=len(summaries),
-                force_fresh=collect_slow,
+                force_fresh=scope_collect_slow,
             )
             metric_samples: list[MetricSample] = []
             for record in slot_records:
@@ -638,11 +676,11 @@ class HistoryCollector:
                     previous_temperature = smart_temperatures.get(evidence_key)
                     if previous_temperature is None or temperature > previous_temperature:
                         smart_temperatures[evidence_key] = temperature
-                if collect_fast:
+                if scope_collect_fast:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, FAST_METRIC_FIELDS)
                     )
-                if collect_slow:
+                if scope_collect_slow:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, SLOW_METRIC_FIELDS)
                     )
@@ -660,20 +698,74 @@ class HistoryCollector:
                     scope_index=scope_index,
                     sample_count=len(metric_samples),
                 )
+            smart_scopes_succeeded += 1
+            collected_kinds = {
+                kind
+                for kind, collected in (("fast", scope_collect_fast), ("slow", scope_collect_slow))
+                if collected
+            }
+            remaining_kinds = pending_kinds - collected_kinds
+            if remaining_kinds:
+                self._pending_smart_metric_scopes[scope_key] = frozenset(remaining_kinds)
+            else:
+                self._pending_smart_metric_scopes.pop(scope_key, None)
+
+        if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
+            # A complete census is authoritative: a scope that left it owes nothing.
+            census_keys = {(scope.system_id, scope.enclosure_id) for scope in scopes}
+            for pending_key in list(self._pending_smart_metric_scopes):
+                if pending_key not in census_keys:
+                    del self._pending_smart_metric_scopes[pending_key]
+        if smart_scopes_failed and not smart_scopes_succeeded:
+            # Every SMART read this pass attempted failed, whether a due cadence
+            # or only a retry debt asked for it: nothing was collected, so the
+            # cadences stay where they were and the pass fails instead of succeeding.
+            self._enter_failure_stage("smart_read")
+            self._smart_metric_degraded_reason = SMART_METRICS_UNAVAILABLE_REASON
+            raise HistorySourceError.error_reply(SMART_METRICS_UNAVAILABLE_REASON)
+        if not self._pending_smart_metric_scopes:
+            self._smart_metric_degraded_reason = None
+        elif smart_scopes_succeeded or collect_fast or collect_slow:
+            self._smart_metric_degraded_reason = SMART_METRICS_PARTIAL_REASON
 
         if (
             (collect_fast or collect_slow)
             and trusted_smart_scope_observed
             and not smart_scope_unavailable
         ):
+            # Failure and temperature are separate readings with their own
+            # times: a summary may carry one without the other.
+            failure_at = dict.fromkeys(smart_failure_health_observed, observed_at)
+            temperature_at = dict.fromkeys(smart_temperature_observed, observed_at)
+            for key in smart_evidence_unread - smart_evidence_expected:
+                if (failure := self._smart_failure_by_disk.get(key)) is not None:
+                    smart_failure_health_observed.add(key)
+                    if failure[0]:
+                        smart_failure_evidence.add(key)
+                    failure_at[key] = failure[1]
+                if (temperature := self._smart_temperature_by_disk.get(key)) is not None:
+                    smart_temperature_observed.add(key)
+                    smart_temperatures[key] = temperature[0]
+                    temperature_at[key] = temperature[1]
             if smart_evidence_expected.issubset(smart_failure_health_observed):
+                self._smart_failure_by_disk = {
+                    key: (key in smart_failure_evidence, failure_at[key]) for key in smart_failure_health_observed
+                }
                 self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
-                self.last_smart_failure_evidence_at = observed_at
+                self.last_smart_failure_evidence_at = min(
+                    [observed_at, *(at for _failed, at in self._smart_failure_by_disk.values())]
+                )
             if smart_evidence_expected.issubset(smart_temperature_observed):
+                self._smart_temperature_by_disk = {
+                    key: (value, temperature_at[key])
+                    for key, value in smart_temperatures.items()
+                }
                 self.last_max_temperature_celsius = (
                     max(smart_temperatures.values()) if smart_temperatures else None
                 )
-                self.last_temperature_evidence_at = observed_at
+                self.last_temperature_evidence_at = min(
+                    [observed_at, *(at for _value, at in self._smart_temperature_by_disk.values())]
+                )
             if self.last_smart_failure_evidence_at and self.last_temperature_evidence_at:
                 self.last_smart_evidence_at = min(
                     self.last_smart_failure_evidence_at,
@@ -787,10 +879,12 @@ class HistoryCollector:
         """Why /healthz reports ``degraded``, or None when the service is healthy.
 
         Degraded means one of: the last background collection pass failed, an
-        inventory sweep had unavailable scopes, the history database is read-only,
-        or cleanup failed twice in a row. Other manual refresh failures alone do
-        not count; they are shown in "Last error" and cleared by the next
-        successful pass. Inventory degradation clears after a complete sweep.
+        inventory sweep had unavailable scopes, SMART metrics could not be read
+        for some or all scopes, the history database is read-only, or cleanup
+        failed twice in a row. Other manual refresh failures alone do not count;
+        they are shown in "Last error" and cleared by the next successful pass.
+        Inventory degradation clears after a complete sweep; SMART degradation
+        clears once every failed scope has been read again or left the census.
         """
 
         if self.collection_pause()[0]:
@@ -807,7 +901,7 @@ class HistoryCollector:
             return INDEX_BUILD_PAUSED_REASON
         if self._index_build_failures > 0:
             return INDEX_BUILD_DEGRADED_REASON
-        return self._scope_collection_degraded_reason
+        return self._scope_collection_degraded_reason or self._smart_metric_degraded_reason
 
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
@@ -1803,6 +1897,14 @@ class HistoryCollector:
 
         updates: list[SlotStateUpdate] = []
         for previous, record in zip(previous_records, slot_records, strict=True):
+            if slot_occupancy(record) == "unknown":
+                # Nothing was read about this bay's occupancy (#1218). Keep the
+                # recorded occupancy and disk and take only the new state, so an
+                # unread bay is never written as a removal or an insertion. A
+                # bay with no recorded row stays unrecorded until a real read.
+                if previous is None:
+                    continue
+                record = replace(previous, state=record.state, identify_active=record.identify_active)
             if self._should_backfill_extended_state(previous, record):
                 updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
@@ -2106,6 +2208,22 @@ class HistoryCollector:
             "detail": SCOPE_SKIP_REASONS[reason],
         }
 
+    def _unread_bay_recorded_disks(self, slot_records: list[SlotStateRecord]) -> list[SlotStateRecord]:
+        """Recorded occupied rows for the bays whose occupancy was not read."""
+
+        recorded_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
+        disks: list[SlotStateRecord] = []
+        for record in slot_records:
+            if slot_occupancy(record) != "unknown":
+                continue
+            scope_key = (record.system_id, record.enclosure_key)
+            if scope_key not in recorded_by_scope:
+                recorded_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
+            recorded = recorded_by_scope[scope_key].get(record.slot)
+            if recorded is not None and slot_occupancy(recorded) == "present":
+                disks.append(recorded)
+        return disks
+
     @staticmethod
     def _smart_evidence_disk_key(record: SlotStateRecord) -> str:
         if record.disk_identity_key:
@@ -2131,10 +2249,11 @@ class HistoryCollector:
         if normalize_text(summary.get("smart_health_status")):
             return True
         predictive_errors = summary.get("predictive_errors")
-        return (
-            isinstance(predictive_errors, int | float)
-            and not isinstance(predictive_errors, bool)
-            and math.isfinite(float(predictive_errors))
+        if isinstance(predictive_errors, bool):
+            return False
+        # An integer is always finite; converting a huge one to float would raise.
+        return isinstance(predictive_errors, int) or (
+            isinstance(predictive_errors, float) and math.isfinite(predictive_errors)
         )
 
     @staticmethod
@@ -2153,7 +2272,11 @@ class HistoryCollector:
         value = summary.get("temperature_c")
         if not isinstance(value, int | float) or isinstance(value, bool):
             return None
-        temperature = float(value)
+        try:
+            temperature = float(value)
+        except OverflowError:
+            # One value too large for a float is no reading, not a failed pass.
+            return None
         return temperature if math.isfinite(temperature) else None
 
     def _build_metric_samples(
@@ -2172,6 +2295,10 @@ class HistoryCollector:
                 value_integer = int(value)
                 value_real = None
             elif isinstance(value, int):
+                if not -(2**63) <= value < 2**63:
+                    # The store's integer column is signed 64-bit: a sample it
+                    # cannot hold is skipped so the other samples are written.
+                    continue
                 value_integer = value
                 value_real = None
             elif isinstance(value, float):
@@ -2522,7 +2649,8 @@ class HistoryCollector:
                     slot_index = int(slot_payload.get("slot_index"))
                 except (TypeError, ValueError):
                     continue
-                occupied = bool(slot_payload.get("occupied"))
+                occupancy = slot_occupancy(slot_payload)
+                occupied = occupancy == "present"
                 slot_payloads.append(
                     {
                         "slot": slot_index,
@@ -2530,6 +2658,7 @@ class HistoryCollector:
                         "enclosure_id": f"{STORAGE_VIEW_SCOPE_PREFIX}{view_id}",
                         "enclosure_label": view_label,
                         "present": occupied,
+                        **({"presence_known": False} if occupancy == "unknown" else {}),
                         "state": normalize_text(slot_payload.get("state")) or ("matched" if occupied else "empty"),
                         "identify_active": False,
                         "device_name": normalize_text(slot_payload.get("device_name")),

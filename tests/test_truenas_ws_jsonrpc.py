@@ -194,7 +194,10 @@ class JsonRpcMissingMethodTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(exception.errname, "ENOMETHOD")
                 self.assertFalse(exception.retryable)
                 self.assertIn("ENOMETHOD", str(exception))
-                self.assertIn("Unavailable here" if data else "Method not found", str(exception))
+                # The remote reason is kept apart from the message.
+                expected_reason = "Unavailable here" if data else "Method not found"
+                self.assertEqual(exception.reason, expected_reason)
+                self.assertNotIn(expected_reason, str(exception))
                 self.assertNotIn(SECRET_TRACE_MARKER, str(exception))
 
     def test_other_codes_and_explicit_errnames_keep_their_existing_meaning(self) -> None:
@@ -367,7 +370,7 @@ class JsonRpcTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exception.reason, "Slot 3 is not populated")
         self.assertEqual(exception.code, -32001)
         self.assertIn("EINVAL", str(exception))
-        self.assertIn("Slot 3 is not populated", str(exception))
+        self.assertNotIn("Slot 3 is not populated", str(exception))
         self.assertNotIn(SECRET_TRACE_MARKER, str(exception))
 
     async def test_too_many_concurrent_calls_is_a_distinct_retryable_error(self) -> None:

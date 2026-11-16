@@ -39,9 +39,16 @@ def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
 
 def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
+    malformed_phy_rows = 0
+    discovering_phys: list[int] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
+            continue
+        if stripped == "Discovery still in progress":
+            # mprutil prints this in place of the row of a PHY still being
+            # discovered and goes on; it holds that PHY's place, adds no row.
+            discovering_phys.append(len(detail["phy_rows"]) + len(discovering_phys))
             continue
         if stripped.endswith("Adapter:"):
             detail["name"] = stripped.removesuffix(" Adapter:")
@@ -52,7 +59,23 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
             continue
         if re.match(r"^\d+\s+", stripped):
             parts = stripped.split()
-            if len(parts) >= 8:
+            unattached = _MPR_UNATTACHED_ADAPTER_PHY.match(stripped)
+            if unattached:
+                # mprutil leaves both handles and the speed blank for a PHY
+                # with nothing attached; the row is still part of the table.
+                detail["phy_rows"].append(
+                    {
+                        "phy": parts[0],
+                        "controller_handle": None,
+                        "device_handle": None,
+                        "disabled": parts[1],
+                        "speed": None,
+                        "min": parts[2],
+                        "max": parts[3],
+                        "device": " ".join(parts[4:]),
+                    }
+                )
+            elif len(parts) >= 8:
                 detail["phy_rows"].append(
                     {
                         "phy": parts[0],
@@ -65,13 +88,37 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
                         "device": " ".join(parts[7:]),
                     }
                 )
-    detail["phy_count"] = len(detail.get("phy_rows") or [])
-    detail["linked_phy_count"] = sum(
-        1
-        for row in detail.get("phy_rows") or []
-        if row.get("device") and row.get("device") != "No Device"
-    )
+            else:
+                malformed_phy_rows += 1
+    rows = detail["phy_rows"]
+    # Counts come only from a PHY table that was read whole. No table, a
+    # malformed row, a repeated PHY number or a gap in the PHY numbers
+    # (0 to n-1, as mprutil lists them) leaves both counts unknown. A PHY
+    # still in discovery fills only its own position; printed rows are counted.
+    phy_numbers = [int(row["phy"]) for row in rows] + discovering_phys
+    table_size = len(phy_numbers)
+    if (
+        table_size
+        and not malformed_phy_rows
+        and len(set(phy_numbers)) == len(phy_numbers)
+        and all(number < table_size for number in phy_numbers)
+    ):
+        detail["phy_count"] = len(rows)
+        detail["linked_phy_count"] = sum(
+            1 for row in rows if row.get("device_handle") and row.get("device") and row.get("device") != "No Device"
+        )
+        detail["phy_table"] = "read"
+    else:
+        detail["phy_count"] = None
+        detail["linked_phy_count"] = None
+        # No table at all is "absent" (as before); rows that were seen but
+        # did not form a whole table are "rejected": not read, not zero.
+        detail["phy_table"] = "rejected" if rows or malformed_phy_rows else "absent"
     return detail
+
+
+_MPR_PHY_SPEED = r"(?:[\d.]+|\?\?\?|Unk)"
+_MPR_UNATTACHED_ADAPTER_PHY = re.compile(rf"^\d+\s+[YN]\s+{_MPR_PHY_SPEED}\s+{_MPR_PHY_SPEED}\s+\S.*$")
 
 
 def parse_mpr_devices(text: str) -> list[dict[str, str]]:
@@ -109,45 +156,152 @@ def parse_mpr_devices(text: str) -> list[dict[str, str]]:
     return rows
 
 
-def parse_mpr_enclosures(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:
+    rows: list[dict[str, str | None]] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not re.match(r"^\d+\s+[0-9a-fA-F]{8,}", stripped):
             continue
         parts = stripped.split()
-        if len(parts) < 5:
+        # mprutil prints the SEP handle as blanks for an enclosure that is not
+        # an SES device; only those printed columns make a one-handle row.
+        sep_handle = parts[2] if len(parts) >= 5 and re.fullmatch(r"[0-9a-fA-F]{4}", parts[3]) else None
+        handles = 2 if sep_handle else 1
+        if not sep_handle and not _MPR_ENCLOSURE_BLANK_SEP.match(line):
             continue
         rows.append(
             {
                 "slots": parts[0],
                 "logical_id": parts[1],
-                "sep_handle": parts[2],
-                "enc_handle": parts[3],
-                "type": " ".join(parts[4:]),
+                "sep_handle": sep_handle,
+                "enc_handle": parts[1 + handles],
+                "type": " ".join(parts[2 + handles:]),
             }
         )
     return rows
 
 
+# "  %.2d    %08x%08x    %s       %04x     %s" with a four-blank SEP column.
+_MPR_ENCLOSURE_BLANK_SEP = re.compile(r"^\s*\d+ {4}[0-9a-fA-F]{16} {15}[0-9a-fA-F]{4} {5}\S")
+
+
+def _skip_whitespace(line: str, index: int) -> int:
+    while index < len(line) and line[index].isspace():
+        index += 1
+    return index
+
+
+def _skip_rate_characters(line: str, index: int) -> int:
+    while index < len(line) and (line[index] == "." or line[index].isdecimal()):
+        index += 1
+    return index
+
+
+def _mpr_phy_rate_end(line: str, index: int) -> int | None:
+    """End of a `[\\d.]+` or `???` field at `index` that whitespace follows."""
+
+    end = _skip_rate_characters(line, index)
+    if end == index and line.startswith("???", index):
+        end = index + 3
+    return end if index < end < len(line) and line[end].isspace() else None
+
+
+def _mpr_phy_max_and_device(line: str, index: int) -> tuple[str, str] | None:
+    """`<max> <device>` from `index`; the device is the rest of the line."""
+
+    max_end = _mpr_phy_rate_end(line, index)
+    # At least one separator and one more character, which may be whitespace.
+    if max_end is None or len(line) - max_end < 2:
+        return None
+    return line[index:max_end], line[max_end:].strip()
+
+
+def _mpr_phy_min_max_and_device(line: str, index: int) -> tuple[str, str, str] | None:
+    min_end = _mpr_phy_rate_end(line, index)
+    if min_end is None:
+        return None
+    rest = _mpr_phy_max_and_device(line, _skip_whitespace(line, min_end))
+    return None if rest is None else (line[index:min_end], *rest)
+
+
+def _match_mpr_expander_phy_line(line: str) -> dict[str, str | None] | None:
+    """Read one `mprutil show expanders` PHY row with work linear in the line.
+
+    Same result as the pattern
+    `^\\s*(\\d+)\\s+(?:(\\d+)\\s+([0-9a-fA-F]{4})\\s+([\\d.]+)|)\\s*([\\d.]+|\\?\\?\\?)\\s+([\\d.]+|\\?\\?\\?)\\s+(.+?)\\s*$`
+    with the device stripped (#1216). That pattern retried overlapping
+    whitespace and digit runs from every position. Each field here is scanned
+    once: the full row (PHY, remote PHY, handle, speed, min, max, device) is
+    tried first, then the short row (PHY, min, max, device).
+    """
+
+    phy_start = _skip_whitespace(line, 0)
+    phy_end = _skip_rate_characters(line, phy_start)
+    if phy_end == phy_start or "." in line[phy_start:phy_end] or phy_end == len(line) or not line[phy_end].isspace():
+        return None
+    fields_start = _skip_whitespace(line, phy_end)
+    row: dict[str, str | None] = {
+        "phy": line[phy_start:phy_end],
+        "remote_phy": None,
+        "dev_handle": None,
+        "speed": None,
+        "min": None,
+        "max": None,
+        "device": None,
+    }
+
+    remote_end = _skip_rate_characters(line, fields_start)
+    handle_start = _skip_whitespace(line, remote_end)
+    handle_end = handle_start + 4
+    speed_start = _skip_whitespace(line, handle_end)
+    speed_end = _skip_rate_characters(line, speed_start)
+    if (
+        remote_end > fields_start
+        and "." not in line[fields_start:remote_end]
+        and handle_start > remote_end
+        and handle_end < len(line)
+        and not line[handle_start:handle_end].strip(_HEX_DIGITS)
+        and len(line[handle_start:handle_end]) == 4
+        and speed_start > handle_end
+        and speed_end > speed_start
+    ):
+        rates_start = _skip_whitespace(line, speed_end)
+        full = _mpr_phy_min_max_and_device(line, rates_start)
+        speed = line[speed_start:speed_end]
+        if full is None and speed_end - speed_start >= 2 and rates_start > speed_end:
+            # The pattern's backtracking: the last speed character becomes min.
+            rest = _mpr_phy_max_and_device(line, rates_start)
+            if rest is not None:
+                full = (speed[-1], *rest)
+                speed = speed[:-1]
+        if full is not None:
+            row.update(
+                remote_phy=line[fields_start:remote_end],
+                dev_handle=line[handle_start:handle_end],
+                speed=speed,
+            )
+            row["min"], row["max"], row["device"] = full
+            return row
+
+    short = _mpr_phy_min_max_and_device(line, fields_start)
+    if short is None:
+        return None
+    row["min"], row["max"], row["device"] = short
+    return row
+
+
 def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     expanders: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
-    header_pattern = re.compile(
-        r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
-    )
-    phy_pattern = re.compile(
-        r"^\s*(\d+)\s+(?:(\d+)\s+([0-9a-fA-F]{4})\s+([\d.]+)|)\s*([\d.]+|\?\?\?)\s+([\d.]+|\?\?\?)\s+(.+?)\s*$"
-    )
     for line in text.splitlines():
-        header = header_pattern.match(line)
+        header = _match_mpr_expander_header(line)
         if header:
             current = {
                 "num_phys": header.group(1),
                 "sas_address": header.group(2),
                 "dev_handle": header.group(3),
-                "parent": header.group(4),
-                "enc_handle": header.group(5),
+                "parent": header.group(4).strip() or None,
+                "enc_handle": header.group(5).strip() or None,
                 "sas_level": header.group(6),
                 "phys": [],
             }
@@ -155,28 +309,64 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
             continue
         if current is None:
             continue
-        phy = phy_pattern.match(line)
+        phy = _match_mpr_expander_phy_line(line)
         if not phy:
             continue
-        device = phy.group(7).strip()
-        if device.lower().startswith("phy "):
+        if str(phy["device"]).lower().startswith("phy "):
             continue
-        current["phys"].append(
-            {
-                "phy": phy.group(1),
-                "remote_phy": phy.group(2),
-                "dev_handle": phy.group(3),
-                "speed": phy.group(4),
-                "min": phy.group(5),
-                "max": phy.group(6),
-                "device": device,
-            }
-        )
-    for expander in expanders:
-        counts = Counter(str(row.get("device") or "unknown").strip() for row in expander.get("phys") or [])
-        expander["device_counts"] = dict(counts)
-        expander["linked_phys"] = sum(1 for row in expander.get("phys") or [] if row.get("device") != "No Device")
+        current["phys"].append(phy)
+    candidate_lines = _mpr_expander_phy_candidate_lines(text)
+    for expander, candidates in zip(expanders, candidate_lines):
+        # Counts come only from a PHY table read whole: one row per reported
+        # PHY, each PHY number unique and in range, and no rejected rows.
+        # Otherwise the linked count and device tally are unknown, not 0.
+        if _mpr_expander_phy_table_complete(expander, candidates):
+            counts = Counter(str(row.get("device") or "unknown").strip() for row in expander["phys"])
+            expander["device_counts"] = dict(counts)
+            expander["linked_phys"] = sum(1 for row in expander["phys"] if row.get("device") != "No Device")
+        else:
+            expander["device_counts"] = None
+            expander["linked_phys"] = None
     return expanders
+
+
+_MPR_EXPANDER_HEADER = re.compile(
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
+)
+# mprutil prints a zero parent or enclosure handle as four blanks in its fixed
+# columns ("%04x       %s     %s       %d"), so those headers are read by position.
+_MPR_EXPANDER_HEADER_BLANK_HANDLES = re.compile(
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4}) {7}([0-9a-fA-F]{4}| {4}) {5}([0-9a-fA-F]{4}| {4}) {7}(\d+)\s*$"
+)
+
+
+def _match_mpr_expander_header(line: str) -> re.Match[str] | None:
+    return _MPR_EXPANDER_HEADER.match(line) or _MPR_EXPANDER_HEADER_BLANK_HANDLES.match(line)
+
+
+def _mpr_expander_phy_candidate_lines(text: str) -> list[int]:
+    """Per expander header, the non-blank lines under it other than the column heading."""
+    counts: list[int] = []
+    for line in text.splitlines():
+        if _match_mpr_expander_header(line):
+            counts.append(0)
+            continue
+        stripped = line.strip()
+        if counts and stripped and not stripped.lower().startswith("phy "):
+            counts[-1] += 1
+    return counts
+
+
+def _mpr_expander_phy_table_complete(expander: dict[str, Any], candidate_lines: int) -> bool:
+    rows = expander.get("phys") or []
+    reported = str(expander.get("num_phys") or "")
+    # Zero rows are whole only under a header that reports zero PHYs.
+    if not reported.isdecimal() or len(rows) != int(reported) or candidate_lines != len(rows):
+        return False
+    numbers = [str(row.get("phy") or "") for row in rows]
+    if not all(number.isdecimal() and int(number) < int(reported) for number in numbers):
+        return False
+    return len({int(number) for number in numbers}) == len(numbers)
 
 
 def parse_mpr_iocfacts(text: str) -> dict[str, str]:
@@ -190,6 +380,14 @@ def parse_mpr_iocfacts(text: str) -> dict[str, str]:
         if normalized_key and value.strip():
             facts[normalized_key] = value.strip()
     return facts
+
+
+# `key=value` attributes. A match can only start where a key run starts: the
+# same matches as without the guard, because a run that fails at its start
+# fails at every later position too, but a long run without "=" is read once
+# instead of once per character (#1216).
+_PCICONF_ATTRIBUTE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]+)=([^\s]+)")
+_SYSCTL_LOCATION_ATTRIBUTE_PATTERN = re.compile(r"(?<![a-zA-Z_])([a-zA-Z_]+)=([^\s]+)")
 
 
 def parse_pciconf_sas_controllers(text: str) -> list[dict[str, str]]:
@@ -220,7 +418,7 @@ def parse_pciconf_sas_controllers(text: str) -> list[dict[str, str]]:
                     header.group("function"),
                 ),
             }
-            for key, value in re.findall(r"([A-Za-z0-9_]+)=([^\s]+)", header.group("attrs")):
+            for key, value in _PCICONF_ATTRIBUTE_PATTERN.findall(header.group("attrs")):
                 normalized_key = key.lower()
                 if normalized_key == "class":
                     current["class_code"] = value
@@ -322,7 +520,7 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
         if location_match:
             controller = f"mpr{location_match.group('unit')}"
             row = controllers.setdefault(controller, {"controller": controller, "unit": location_match.group("unit")})
-            for key, value in re.findall(r"([a-zA-Z_]+)=([^\s]+)", location_match.group("value")):
+            for key, value in _SYSCTL_LOCATION_ATTRIBUTE_PATTERN.findall(location_match.group("value")):
                 normalized_key = key.lower()
                 if normalized_key == "dbsf":
                     row["pci_location"] = value
@@ -341,11 +539,11 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
     return controllers
 
 
+_HEX_DIGITS = "0123456789abcdefABCDEF"
+
+
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
-    controller_pattern = re.compile(
-        r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
-    )
+    controller_pattern = re.compile(r"^(?P<controller>mpr\d+):\s+(?P<body>.+)$")
     disk_pattern = re.compile(
         r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
         r"(?P<target>\d+):(?P<lun>\d+)\):\s+(?P<message>.+)$"
@@ -386,19 +584,23 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         else:
             controller_match = controller_pattern.match(source_line)
             if controller_match:
-                message = controller_match.group("message").strip()
-                target = _bounded_numeric_token(controller_match.group("target"))
+                message, tail_match, rejected_tail = _split_mpr_controller_tail(controller_match.group("body"))
+                target = _bounded_numeric_token(tail_match.group("target")) if tail_match else None
                 event = {
                     "source": "controller",
                     "controller": controller_match.group("controller"),
                     "target": target,
-                    "smid": controller_match.group("smid"),
-                    "loginfo": controller_match.group("loginfo"),
+                    "smid": tail_match.group("smid") if tail_match else None,
+                    # An empty loginfo field is present but malformed, not absent.
+                    "loginfo": (tail_match.group("loginfo") or "") if tail_match else None,
                     "message": message,
                     "event_type": _mpr_dmesg_event_type(message),
                     "severity": "error",
                     "line": stripped,
                 }
+                if rejected_tail is not None:
+                    event["controller_tail_malformed"] = True
+                    event["controller_tail_raw"] = rejected_tail
                 if source_timestamp:
                     event["timestamp_raw"] = source_timestamp
         if not event:
@@ -432,6 +634,36 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             for key, summary in sorted(summaries["by_controller_target"].items())
         },
     }
+
+
+_CONTROLLER_TAIL_MARKERS = tuple(re.compile(marker, re.IGNORECASE) for marker in ("tgt", "SMID", "loginfo"))
+# The kernel prints "tgt %u SMID %u loginfo %x". The loginfo value is the whole
+# rest of the line, whatever it holds: the decoder decides whether it is a number.
+_CONTROLLER_TAIL = re.compile(r"tgt\s+(?P<target>[0-9]+)\s+SMID\s+(?P<smid>[0-9]+)\s+loginfo(?:\s+(?P<loginfo>.*))?")
+
+
+def _split_mpr_controller_tail(body: str) -> tuple[str, re.Match[str] | None, str | None]:
+    """Split a controller line into its message and its first tgt/SMID/loginfo tail.
+
+    The tail is found by its three markers, in order and in any case, before
+    any field is validated, so a later tail is never read in place of the
+    first. Returns the message, the tail match when every field is in the
+    kernel's form, and the raw tail text when it is present but rejected.
+    """
+    start = _CONTROLLER_TAIL_MARKERS[0].search(body)
+    if start is None:
+        return body.strip(), None, None
+    position = start.end()
+    for marker in _CONTROLLER_TAIL_MARKERS[1:]:
+        found = marker.search(body, position)
+        if found is None:
+            return body.strip(), None, None
+        position = found.end()
+    message, tail = body[: start.start()], body[start.start() :]
+    tail_match = _CONTROLLER_TAIL.fullmatch(tail) if message.strip() and message[-1].isspace() else None
+    if tail_match is None:
+        return message.strip() or body.strip(), None, tail
+    return message.strip(), tail_match, None
 
 
 def _bounded_numeric_token(value: str | None) -> str | None:
@@ -512,24 +744,66 @@ def _mpr_dmesg_severity(message: str) -> str:
     return "info"
 
 
+_SENSE_PREFIX = re.compile(r"SCSI sense:", re.IGNORECASE)
+_SENSE_ASC_MARKER = re.compile(r"asc:", re.IGNORECASE)
+_SENSE_REASON_OPENER = re.compile(r"\s\(")
+
+
 def _parse_mpr_sense_message(message: str) -> dict[str, str]:
-    match = re.search(r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)", message)
-    if not match:
+    """Split a sense line into sense key, ASC/ASCQ field and reason.
+
+    The kernel prints ``SCSI sense: <key> asc:%x,%x (<reason>)``. The first
+    ``asc:`` marker (any case) is the only ASC field read. Its complete raw
+    value, everything up to the reason, is kept whatever it contains, so the
+    strict reader decides whether it is a code. The sense key is the text
+    before that marker, so a malformed field is never absorbed into the key,
+    and a later ``asc:`` fragment is never read in its place. An empty field
+    is kept as ``""`` (present but malformed); no marker means no ASC field.
+    """
+    prefix = _SENSE_PREFIX.search(message)
+    if not prefix:
         return {}
+    body = message[prefix.end() :]
+    marker = _SENSE_ASC_MARKER.search(body)
+    if not marker:
+        return {}
+    sense = body[: marker.start()].strip()
+    rest = body[marker.end() :]
+    asc, reason = rest, None
+    opener = _SENSE_REASON_OPENER.search(rest)
+    close = rest.rfind(")")
+    if opener and close > opener.end():
+        end = opener.start()
+        while end and rest[end - 1].isspace():
+            end -= 1
+        asc = rest[:end]
+        reason = rest[opener.end() : close].strip()
+    parsed = {"sense": sense, "sense_key": sense.upper(), "asc": asc.lower()}
+    if reason is not None:
+        parsed["reason"] = reason
+    return parsed
+
+
+def admit_mpr_unit_number(token: str | None) -> int | None:
+    """A controller unit number is 1 to 4 ASCII digits; anything else is rejected."""
+    return int(token) if token is not None and _MPR_UNIT_NUMBER.fullmatch(token) else None
+
+
+def rejected_mpr_summary_unit_tokens(text: str) -> set[str]:
+    """Unit tokens of adapter summary rows naming an mpr device whose unit number was not admitted."""
     return {
-        "sense": match.group("sense").strip(),
-        "sense_key": match.group("sense").strip().upper(),
-        "asc": match.group("asc").lower(),
-        "reason": match.group("reason").strip(),
+        row["device"].removeprefix("/dev/mpr")
+        for row in parse_mpr_adapter_summary(text)
+        if row["device"].startswith("/dev/mpr") and admit_mpr_unit_number(row.get("unit")) is None
     }
 
 
 def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
     units: set[int] = set()
     for row in parse_mpr_adapter_summary(text):
-        unit = row.get("unit")
-        if unit is not None and str(unit).isdigit():
-            units.add(int(unit))
+        unit = admit_mpr_unit_number(row.get("unit"))
+        if unit is not None:
+            units.add(unit)
     return sorted(units)
 
 
@@ -570,5 +844,8 @@ def _freebsd_pci_location_to_address(location: str) -> str:
 def _mpr_unit_from_text(value: str | None) -> str | None:
     if not value:
         return None
-    match = re.search(r"\bmpr(?P<unit>\d+)\b", value)
+    match = re.search(r"\bmpr(?P<unit>[0-9]{1,4})\b", value)
     return match.group("unit") if match else None
+
+
+_MPR_UNIT_NUMBER = re.compile(r"[0-9]{1,4}")

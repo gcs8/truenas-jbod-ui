@@ -138,13 +138,14 @@ class InventoryStorageViewBatchTests(unittest.TestCase):
     def test_a_failing_direct_slot_gets_a_fallback_summary_not_a_failed_batch(self) -> None:
         service = _inventory_service(_runtime(2))
         service._get_slot_smart_summary_for_slot_view = AsyncMock(  # type: ignore[method-assign]
-            side_effect=TrueNASAPIError("no SSH")
+            side_effect=TrueNASAPIError("synthetic remote detail")
         )
 
         items = asyncio.run(service.get_storage_view_slot_smart_summaries(VIEW_ID, [0, 1]))
 
         self.assertEqual([item.slot for item in items], [0, 1])
-        self.assertIn("no SSH", items[1].summary.message or "")
+        self.assertEqual(items[1].summary.message, "SMART data collection failed.")
+        self.assertNotIn("synthetic remote detail", items[1].summary.model_dump_json())
 
 
 class StorageViewBatchRouteTests(unittest.TestCase):

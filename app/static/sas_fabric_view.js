@@ -958,14 +958,20 @@
     `;
   }
 
+  // A metric the producer lists in `not_read` was not read: say so, never omit it or show 0.
   function metricRows(metrics, labels = {}) {
+    const notRead = new Set(list(metrics?.not_read));
     return Object.entries(metrics || {})
-      .filter(([, value]) => value !== null && value !== undefined && value !== "" && !Array.isArray(value))
+      .filter(([key, value]) => notRead.has(key) || (value !== null && value !== undefined && value !== "" && !Array.isArray(value)))
       .slice(0, 10)
       .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), (
-        key === "kernel_diagnostics" ? diagnosticSummary(value) : value
+        notRead.has(key) ? "not read" : key === "kernel_diagnostics" ? diagnosticSummary(value) : value
       )))
       .join("");
+  }
+
+  function metricNotRead(node, key) {
+    return list(node?.metrics?.not_read).includes(key);
   }
 
   function evidenceChips(values) {
@@ -1512,6 +1518,10 @@
   }
 
   function formatInteger(value) {
+    // Number(null), Number(false) and Number("") are 0: an absent value is not a zero reading.
+    if (value === null || value === undefined || value === "" || typeof value === "boolean") {
+      return "";
+    }
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue.toLocaleString() : "";
   }
@@ -1535,28 +1545,45 @@
     if (!summary) {
       return "";
     }
-    // Null, missing and blank lifetime fields are unknown. Check presence
-    // before Number(): Number(null) and Number("") are 0, which would show
-    // unknown as "0 d" and hide a known hours value. A reported 0 stays 0.
-    const reported = (value) => {
-      if (typeof value === "number") {
-        return Number.isFinite(value) ? value : null;
-      }
-      if (typeof value === "string" && value.trim() !== "") {
-        const numberValue = Number(value);
-        return Number.isFinite(numberValue) ? numberValue : null;
-      }
-      return null;
-    };
-    const days = reported(summary.power_on_days);
-    if (days !== null) {
-      return `${formatInteger(days)} d`;
+    // An absent power-on time (null) is omitted like any other absent SMART
+    // field; smartPowerOnNotRead says when it was reported but not read.
+    const isCount = value => Number.isInteger(value) && value >= 0;
+    if (isCount(summary.power_on_days)) {
+      return `${formatInteger(summary.power_on_days)} d`;
     }
-    const hours = reported(summary.power_on_hours);
-    if (hours !== null) {
-      return `${formatInteger(hours)} h`;
+    if (isCount(summary.power_on_hours)) {
+      return `${formatInteger(summary.power_on_hours)} h`;
     }
     return "";
+  }
+
+  // The SMART JSON reported a power-on time but in a form that could not be
+  // read: say so instead of omitting it like an absent one.
+  function smartPowerOnNotRead(summary) {
+    const unread = Array.isArray(summary?.unread_fields) ? summary.unread_fields : [];
+    return !formatSmartPowerOn(summary) && (unread.includes("power_on_hours") || unread.includes("power_on_days"));
+  }
+
+  function formatSmartPowerOnFact(summary) {
+    return formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "not read" : "");
+  }
+
+  // A field listed in unread_fields was reported but could not be read: it is
+  // shown as not read, and the slot does not fill it (the summary API already
+  // took any inventory reading of that field).
+  function smartFieldNotRead(summary, ...fields) {
+    const unread = Array.isArray(summary?.unread_fields) ? summary.unread_fields : [];
+    return fields.some((field) => unread.includes(field));
+  }
+
+  // The disk Health fact: SMART health and temperature, else the inventory's.
+  function smartHealthFact(summary, slot) {
+    const health = summary?.smart_health_status
+      || (smartFieldNotRead(summary, "smart_health_status") ? "SMART health not read" : slot?.health || slot?.state);
+    const temperature = summary?.temperature_c != null ? `${summary.temperature_c} C`
+      : smartFieldNotRead(summary, "temperature_c") ? "temperature not read"
+        : slot?.temperature_c ? `${slot.temperature_c} C` : null;
+    return [health, temperature].filter(Boolean).join(" / ");
   }
 
   function smartSummaryLine(summary) {
@@ -1567,9 +1594,10 @@
       return summary.message || "SMART unavailable";
     }
     return [
-      summary.smart_health_status,
-      summary.temperature_c != null ? `${summary.temperature_c} C` : null,
-      formatSmartPowerOn(summary),
+      summary.smart_health_status || (smartFieldNotRead(summary, "smart_health_status") ? "health not read" : null),
+      summary.temperature_c != null ? `${summary.temperature_c} C`
+        : smartFieldNotRead(summary, "temperature_c") ? "temperature not read" : null,
+      formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "power on not read" : null),
     ].filter(Boolean).join(" / ");
   }
 
@@ -1586,32 +1614,39 @@
     if (summary.available === false) {
       return `<div class="fabric-identity-card"><span class="fabric-empty-note">${escapeHtml(summary.message || "SMART detail is unavailable for this disk.")}</span></div>`;
     }
-    const lastTest = [summary.last_test_type, summary.last_test_status].filter(Boolean).join(" / ");
+    // Each fact: its reading, "not read" when it was refused, else left out.
+    const notRead = (field, text = "not read") => (smartFieldNotRead(summary, field) ? text : null);
+    const lastTest = notRead("last_test_type") || notRead("last_test_status")
+      || [summary.last_test_type, summary.last_test_status].filter(Boolean).join(" / ");
     const ioTotals = [
-      formatSmartBytes(summary.bytes_read) ? `R ${formatSmartBytes(summary.bytes_read)}` : null,
-      formatSmartBytes(summary.bytes_written) ? `W ${formatSmartBytes(summary.bytes_written)}` : null,
+      formatSmartBytes(summary.bytes_read) ? `R ${formatSmartBytes(summary.bytes_read)}` : notRead("bytes_read", "R not read"),
+      formatSmartBytes(summary.bytes_written) ? `W ${formatSmartBytes(summary.bytes_written)}` : notRead("bytes_written", "W not read"),
     ].filter(Boolean).join(" / ");
     const errorCounts = [
-      summary.media_errors != null ? `media ${formatInteger(summary.media_errors)}` : null,
+      summary.media_errors != null ? `media ${formatInteger(summary.media_errors)}` : notRead("media_errors", "media not read"),
       summary.non_medium_errors != null ? `non-medium ${formatInteger(summary.non_medium_errors)}` : null,
-      summary.interface_crc_errors != null ? `CRC ${formatInteger(summary.interface_crc_errors)}` : null,
+      summary.interface_crc_errors != null
+        ? `CRC ${formatInteger(summary.interface_crc_errors)}` : notRead("interface_crc_errors", "CRC not read"),
     ].filter(Boolean).join(" / ");
     const transport = [
-      summary.transport_protocol || slot?.transport_protocol,
-      summary.negotiated_link_rate,
-      summary.sas_address || slot?.sas_address,
+      summary.transport_protocol || notRead("transport_protocol") || slot?.transport_protocol,
+      summary.negotiated_link_rate || notRead("negotiated_link_rate", "link rate not read"),
+      summary.sas_address || notRead("sas_address", "SAS address not read") || slot?.sas_address,
     ].filter(Boolean).join(" / ");
+    const health = summary.smart_health_status || notRead("smart_health_status");
+    const temperature = summary.temperature_c != null ? `${summary.temperature_c} C` : notRead("temperature_c");
+    const firmware = summary.firmware_version || notRead("firmware_version");
     return `
       <div class="fabric-identity-card fabric-smart-card">
         <div>
-          ${summary.smart_health_status ? `<span><em>Health</em>${escapeHtml(summary.smart_health_status)}</span>` : ""}
-          ${summary.temperature_c != null ? `<span><em>Temp</em>${escapeHtml(`${summary.temperature_c} C`)}</span>` : ""}
-          ${formatSmartPowerOn(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOn(summary))}</span>` : ""}
+          ${health ? `<span><em>Health</em>${escapeHtml(health)}</span>` : ""}
+          ${temperature ? `<span><em>Temp</em>${escapeHtml(temperature)}</span>` : ""}
+          ${formatSmartPowerOnFact(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOnFact(summary))}</span>` : ""}
           ${lastTest ? `<span><em>Last test</em>${escapeHtml(lastTest)}</span>` : ""}
           ${ioTotals ? `<span><em>I/O totals</em>${escapeHtml(ioTotals)}</span>` : ""}
           ${errorCounts ? `<span><em>Errors</em>${escapeHtml(errorCounts)}</span>` : ""}
           ${transport ? `<span><em>Transport</em>${escapeHtml(transport)}</span>` : ""}
-          ${summary.firmware_version ? `<span><em>Firmware</em>${escapeHtml(summary.firmware_version)}</span>` : ""}
+          ${firmware ? `<span><em>Firmware</em>${escapeHtml(firmware)}</span>` : ""}
         </div>
       </div>
     `;
@@ -1711,6 +1746,36 @@
       && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
   }
 
+  // A count is a measurement only when its read was whole. The producer says
+  // which controller-side counts were not read (CORE `raw.controller_read`).
+  // Payloads without that field keep their counts as before.
+  function fabricCountState(fabric, domain) {
+    const counts = fabric?.raw?.controller_read?.counts;
+    if (!counts || typeof counts !== "object") return "complete";
+    const value = counts[domain];
+    return value === "complete" || value === "partial" ? value : "not_read";
+  }
+
+  function fabricCountsIncomplete(fabric) {
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete")
+      || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
+  }
+
+  // "3", "at least 3" (some reads missing) or "not read". Never a bare 0
+  // for a count whose read did not happen.
+  function fabricCountText(fabric, domain, count) {
+    const readState = fabricCountState(fabric, domain);
+    if (readState === "complete") return String(count);
+    return readState === "partial" && count > 0 ? `at least ${count}` : "not read";
+  }
+
+  function fabricCountPhrase(fabric, domain, count, noun) {
+    const readState = fabricCountState(fabric, domain);
+    const plural = `${noun}s`;
+    if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
+  }
+
   function hostDiskSummary(fabric) {
     const slots = sortedSlots(list(fabric.traces).filter((trace) => trace.kind === "bay").flatMap((trace) => list(trace.slots)));
     const noun = aggregateDiskNoun(slots);
@@ -1737,10 +1802,10 @@
     `;
   }
 
-  function renderNodeGrid(nodes, limit = 12) {
+  function renderNodeGrid(nodes, limit = 12, emptyText = "No objects reported") {
     const visible = list(nodes).slice(0, limit);
     if (!visible.length) {
-      return '<span class="fabric-empty-note">No objects reported</span>';
+      return `<span class="fabric-empty-note">${escapeHtml(emptyText)}</span>`;
     }
     const overflow = nodes.length > limit ? `<span class="fabric-empty-note">+${nodes.length - limit} more</span>` : "";
     return `${visible.map((node) => renderNodeButton(node, { extra: "compact" })).join("")}${overflow}`;
@@ -1769,6 +1834,14 @@
     return `${chips}${overflow}`;
   }
 
+  // An empty lane list is "No objects reported" only when that list was read.
+  function laneListEmptyText(fabric, controllerName, listName) {
+    const read = fabric?.raw?.controller_read;
+    if (!read) return "No objects reported";
+    const state = read.lists?.[controllerName]?.[listName];
+    return state === "read" || state === "empty" ? "No objects reported" : "Not read";
+  }
+
   function renderLanesMode(fabric) {
     const copy = fabricViewCopy(fabric);
     const nodes = nodeMap(fabric);
@@ -1787,6 +1860,7 @@
         alias: node.alias,
         related_slots: node.related_slots,
       }));
+    const claimedSlots = new Set();
     const lanes = controllerRecords.map((controller) => {
       const controllerId = controller.id || `controller:${controller.name}`;
       const controllerNode = nodes.get(controllerId);
@@ -1801,6 +1875,7 @@
       expanders.forEach((node) => sortedSlots(node.related_slots).forEach((slot) => laneSlots.add(slot)));
       enclosures.forEach((node) => sortedSlots(node.related_slots).forEach((slot) => laneSlots.add(slot)));
       const slots = Array.from(laneSlots).sort((left, right) => left - right);
+      slots.forEach((slot) => claimedSlots.add(slot));
       const related = selectionTouchesNode(controllerId) || selectionTouchesSlots(slots);
       return `
         <section class="fabric-dedicated-lane${related ? " is-related" : ""}">
@@ -1817,11 +1892,11 @@
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.expanders)}</span>
-            <div class="fabric-node-grid">${renderNodeGrid(expanders, 8)}</div>
+            <div class="fabric-node-grid">${renderNodeGrid(expanders, 8, laneListEmptyText(fabric, controllerName, "expanders"))}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.enclosures)}</span>
-            <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
+            <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8, laneListEmptyText(fabric, controllerName, "enclosures"))}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(aggregateDiskNoun(slots) === "bay" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
@@ -1834,11 +1909,51 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${hostDiskSummary(fabric)}`,
+          meta: `${fabricCountPhrase(fabric, "controllers", controllerRecords.length, copy.hostControllerNoun)} / ${fabricCountPhrase(fabric, "paths", list(fabric.paths).length, "path")} / ${hostDiskSummary(fabric)}`,
           extra: "host",
         })}
       </div>
-      <div class="fabric-lane-board">${lanes || '<div class="warning-item muted compact">No controller lanes are available yet.</div>'}</div>
+      <div class="fabric-lane-board">${lanes ? `${lanes}${renderUnattachedInventory(fabric, copy, claimedSlots)}` : renderLanesWithoutController(fabric, copy)}</div>
+    `;
+  }
+
+  function inventoryBaySlots(fabric) {
+    return sortedSlots(list(fabric.nodes)
+      .filter((node) => node.kind === "bay")
+      .flatMap((node) => list(node.related_slots)));
+  }
+
+  // CORE without readable controller output still knows its bays: draw them
+  // instead of an empty board; the status and warning list say why.
+  function renderLanesWithoutController(fabric, copy) {
+    const slots = inventoryBaySlots(fabric);
+    if (fabric.platform !== "core" || !slots.length) {
+      return '<div class="warning-item muted compact">No controller lanes are available yet.</div>';
+    }
+    return renderInventoryBayGroup(copy, slots, (noun) => `Controller data could not be read. The ${noun} below come from the inventory.`);
+  }
+
+  // On a partial CORE read, bays no controller lane claims are still drawn,
+  // without guessing which controller or path they hang off.
+  function renderUnattachedInventory(fabric, copy, claimedSlots) {
+    if (fabric.platform !== "core" || !fabricCountsIncomplete(fabric)) return "";
+    const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
+    if (!slots.length) return "";
+    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. Some controller data was not read, so these ${noun} come from the inventory.`);
+  }
+
+  function renderInventoryBayGroup(copy, slots, notice) {
+    // Same location-aware noun as the controller lanes: Bays only when every
+    // drawn member has an affirmative physical location.
+    const physical = aggregateDiskNoun(slots) === "bay";
+    return `
+      <section class="fabric-dedicated-lane">
+        <div class="warning-item muted compact">${escapeHtml(notice(physical ? "bays" : "disks"))}</div>
+        <div class="fabric-stage">
+          <span class="fabric-stage-title">${escapeHtml(physical ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
+          <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
+        </div>
+      </section>
     `;
   }
 
@@ -2004,6 +2119,14 @@
     }
     const text = String(value);
     return /bps|gb|mb/i.test(text) ? text : `${text} Gbps`;
+  }
+
+  // Linked PHYs over reported PHYs. A null linked count was not read whole:
+  // no fact rather than 0 (0 itself is a real, fully read count).
+  function phyFact(linked, total, notRead = false) {
+    if (notRead) return "not read";
+    if (!Number.isInteger(linked)) return null;
+    return total !== null && total !== undefined && total !== "" ? `${linked}/${total}` : String(linked);
   }
 
   function formatCountMap(value) {
@@ -2999,7 +3122,7 @@
         subtitle: fabric.selected_enclosure_label || fabric.system_id || "",
         facts: [
           [location.kind, location.label],
-          [linuxSes || storageFabric ? "Sources" : "Controllers", list(fabric.controllers).length],
+          [linuxSes || storageFabric ? "Sources" : "Controllers", fabricCountText(fabric, "controllers", list(fabric.controllers).length)],
         ],
         hoverFacts: [
           ["System ID", fabric.system_id],
@@ -3017,9 +3140,7 @@
           [linuxSes ? "SES devices" : storageFabric ? "Source" : "PCIe slot", linuxSes ? controllerNode?.metrics?.ses_device_count : storageFabric ? controllerNode?.raw?.source : controllerNode?.metrics?.pcie_slot || controllerNode?.raw?.pcie_slot],
           ["FW", linuxSes || storageFabric ? null : controllerNode?.metrics?.firmware || controllerNode?.raw?.firmware],
           ["Temp", linuxSes || storageFabric ? null : controllerNode?.metrics?.temperature],
-          ["PHY", linuxSes || storageFabric ? null : controllerNode?.metrics?.linked_phy_count && controllerNode?.metrics?.phy_count
-            ? `${controllerNode.metrics.linked_phy_count}/${controllerNode.metrics.phy_count}`
-            : controllerNode?.metrics?.linked_phys],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(controllerNode?.metrics?.linked_phy_count, controllerNode?.metrics?.phy_count, metricNotRead(controllerNode, "linked_phy_count"))],
           ["IOC", linuxSes || storageFabric ? null : iocFacts.iocstatus],
           ["Events", linuxSes || storageFabric ? null : diagnosticSummary(controllerDiagnostics)],
         ],
@@ -3097,11 +3218,9 @@
         ].filter(Boolean).join(" / "),
         facts: [
           [linuxSes ? "SG device" : storageFabric ? "Evidence" : "WWN", linuxSes ? enclosureNode?.raw_id || seed.pathState?.ses_device : storageFabric ? enclosureNode?.raw?.source : expanderNode?.raw_id || enclosureNode?.raw_id],
-          ["PHY", linuxSes || storageFabric ? null : expanderNode?.metrics?.linked_phys && expanderNode?.metrics?.num_phys
-            ? `${expanderNode.metrics.linked_phys}/${expanderNode.metrics.num_phys}`
-            : expanderNode?.metrics?.linked_phys],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(expanderNode?.metrics?.linked_phys, expanderNode?.metrics?.num_phys, metricNotRead(expanderNode, "linked_phys"))],
           ["Enclosure", linuxSes ? enclosureNode?.raw?.enclosure_label : mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
-          ["Devices", linuxSes || storageFabric ? null : formatCountMap(expanderNode?.raw?.device_counts)],
+          ["Devices", linuxSes || storageFabric ? null : metricNotRead(expanderNode, "linked_phys") ? "not read" : formatCountMap(expanderNode?.raw?.device_counts)],
           ["PHY errors", linuxSes || storageFabric ? null : expanderNode?.metrics?.phy_error_counters],
         ],
         hoverFacts: [
@@ -3167,7 +3286,7 @@
         subtitle: diskSubtitle,
         facts: [
           ["Pool / vdev", [slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ")],
-          ["Health", [smartSummary?.smart_health_status || slot?.health || slot?.state, smartSummary?.temperature_c != null ? `${smartSummary.temperature_c} C` : slot?.temperature_c ? `${slot.temperature_c} C` : null].filter(Boolean).join(" / ")],
+          ["Health", smartHealthFact(smartSummary, slot)],
           ["SAS / LUN", mprDevice?.sas_address || diskSasAddress || diskLun],
           ["SMART", smartSummaryLine(smartSummary)],
           ["Member", mprDevice?.member_device_name || seed.device_name],
@@ -3185,7 +3304,7 @@
           ["GPTID", slot?.gptid],
           ["Multipath state", slot?.multipath?.state || slot?.multipath?.provider_state],
           ["SMART", smartSummaryLine(smartSummary)],
-          ["Power on", formatSmartPowerOn(smartSummary)],
+          ["Power on", formatSmartPowerOnFact(smartSummary)],
           ["Last SMART test", [slot?.last_smart_test_type, slot?.last_smart_test_status].filter(Boolean).join(" / ")],
           ["Transport", [slot?.transport_protocol, slot?.scsi_hctl, slot?.sg_device].filter(Boolean).join(" / ")],
           ["Attached SAS", slot?.attached_sas_address],
@@ -3728,10 +3847,10 @@
     setSummaryCardText(elements.summaryPaths, ...copy.summary.paths);
     setSummaryCardText(elements.summaryExpanders, ...copy.summary.expanders);
     setSummaryCardText(elements.summaryEnclosures, ...copy.summary.enclosures);
-    elements.summaryControllers.textContent = String(list(fabric.controllers).length);
-    elements.summaryPaths.textContent = String(list(fabric.paths).length);
-    elements.summaryExpanders.textContent = String(list(fabric.expanders).length);
-    elements.summaryEnclosures.textContent = String(list(fabric.enclosures).length);
+    elements.summaryControllers.textContent = fabricCountText(fabric, "controllers", list(fabric.controllers).length);
+    elements.summaryPaths.textContent = fabricCountText(fabric, "paths", list(fabric.paths).length);
+    elements.summaryExpanders.textContent = fabricCountText(fabric, "expanders", list(fabric.expanders).length);
+    elements.summaryEnclosures.textContent = fabricCountText(fabric, "enclosures", list(fabric.enclosures).length);
     elements.summaryTraces.textContent = String(list(fabric.traces).length);
     elements.summaryLinks.textContent = String(list(fabric.links).length);
     elements.lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated || fabric.generated_at);
@@ -3828,13 +3947,17 @@
       .map(([name]) => String(name).toUpperCase());
     const actionableWarnings = (Array.isArray(fabric?.warnings) ? fabric.warnings : [])
       .filter((warning) => !isSasFabricEnrichmentWarning(warning));
-    if (failedSources.length || actionableWarnings.length) {
+    // A count the producer marks as not read whole never leaves the page OK.
+    const unreadCounts = fabricCountsIncomplete(fabric);
+    if (failedSources.length || actionableWarnings.length || unreadCounts) {
       const details = [];
       if (failedSources.length) {
         details.push(`Failed sources: ${failedSources.join(", ")}.`);
       }
       if (actionableWarnings.length) {
         details.push(String(actionableWarnings[0]));
+      } else if (unreadCounts) {
+        details.push("Some controller data was not read.");
       }
       return {
         chipTone: "partial",

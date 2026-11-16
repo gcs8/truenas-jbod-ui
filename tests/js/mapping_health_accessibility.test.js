@@ -56,14 +56,15 @@ function cssDeclarationsForSelector(selector) {
 }
 
 test("mapping health separates matched empty unmatched and unknown bays", () => {
-  const { summarizeMappingHealth } = loadFunctions(APP_SOURCE, ["summarizeMappingHealth"]);
+  const { summarizeMappingHealth } = loadFunctions(APP_SOURCE, ["slotOccupancy", "summarizeMappingHealth"]);
+  // Live slot views always carry `present` (#1218).
   const result = summarizeMappingHealth([
-    { slot: 0, state: "healthy", mapping_source: "api" },
-    { slot: 1, state: "identify", mapping_source: "manual" },
-    { slot: 2, state: "fault", mapping_source: "ssh" },
-    { slot: 3, state: "empty", mapping_source: "empty" },
-    { slot: 4, state: "unmapped", mapping_source: "unknown" },
-    { slot: 5, state: "unknown", mapping_source: "unknown" },
+    { slot: 0, state: "healthy", present: true, mapping_source: "api" },
+    { slot: 1, state: "identify", present: true, mapping_source: "manual" },
+    { slot: 2, state: "fault", present: true, mapping_source: "ssh" },
+    { slot: 3, state: "empty", present: false, mapping_source: "empty" },
+    { slot: 4, state: "unmapped", present: true, mapping_source: "unknown" },
+    { slot: 5, state: "unknown", present: false, mapping_source: "unknown" },
   ], 7);
 
   assert.deepEqual(
@@ -73,11 +74,11 @@ test("mapping health separates matched empty unmatched and unknown bays", () => 
   assert.equal(result.total, 7);
   assert.equal(result.headline, "1 disk is not matched to a bay. Click it to assign one.");
   assert.equal(
-    summarizeMappingHealth([{ slot: 0, state: "unknown" }], 1).headline,
+    summarizeMappingHealth([{ slot: 0, state: "unknown", present: false }], 1).headline,
     "1 bay has an unknown state.",
   );
   assert.equal(
-    summarizeMappingHealth([{ slot: 0, state: "healthy" }], 1).headline,
+    summarizeMappingHealth([{ slot: 0, state: "healthy", present: true }], 1).headline,
     "The only disk is in a known bay.",
   );
 });
@@ -85,12 +86,12 @@ test("mapping health separates matched empty unmatched and unknown bays", () => 
 test("mapping health reports all matched and names the bay sources in plain words", () => {
   const { summarizeMappingHealth, mappingHealthSourceNote, mappingSourceLabel } = loadFunctions(
     APP_SOURCE,
-    ["summarizeMappingHealth", "mappingHealthSourceNote", "mappingSourceLabel", "platformMappingSourceLabel"],
+    ["slotOccupancy", "summarizeMappingHealth", "mappingHealthSourceNote", "mappingSourceLabel", "platformMappingSourceLabel"],
   );
   const slots = [
-    { slot: 0, state: "healthy", mapping_source: "api" },
-    { slot: 1, state: "healthy", mapping_source: "manual" },
-    { slot: 2, state: "empty", mapping_source: "empty" },
+    { slot: 0, state: "healthy", present: true, mapping_source: "api" },
+    { slot: 1, state: "healthy", present: true, mapping_source: "manual" },
+    { slot: 2, state: "empty", present: false, mapping_source: "empty" },
   ];
   assert.equal(summarizeMappingHealth(slots, 3).headline, "All 2 disks are in known bays.");
   assert.equal(mappingHealthSourceNote(slots), "Bay positions come from: TrueNAS API, saved assignment.");
@@ -114,7 +115,7 @@ test("mapping source tokens are shown as plain labels in the bay details", () =>
 test("mapping health scope follows the selected saved view", () => {
   const { mappingHealthScope, summarizeMappingHealth } = loadFunctions(
     APP_SOURCE,
-    ["mappingHealthScope", "summarizeMappingHealth"],
+    ["slotOccupancy", "mappingHealthScope", "summarizeMappingHealth"],
   );
   const scope = mappingHealthScope(
     {

@@ -4,9 +4,9 @@ import json
 import re
 import shlex
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from typing import Any
 
 from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
@@ -99,7 +99,7 @@ class ParsedSSHData:
     ses_slot_to_device: dict[int, str] = field(default_factory=dict)
     camcontrol_models: dict[str, str] = field(default_factory=dict)
     camcontrol_controllers: dict[str, str] = field(default_factory=dict)
-    camcontrol_peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    camcontrol_peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
     ses_enclosures: list["SESMapEnclosure"] = field(default_factory=list)
@@ -119,6 +119,8 @@ class ParsedSSHData:
     esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
     esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
     esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
+    # Each answered `/eall/sall` listing: whether its reply was a whole drive census.
+    esxi_storcli_drive_lists: dict[str, bool] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -228,11 +230,45 @@ class MultipathInfo:
     consumers: list[MultipathConsumer] = field(default_factory=list)
 
 
+class CamcontrolPeers(Sequence[str]):
+    """The other aliases a CAM row lists for one device, read from the row.
+
+    Every alias on a row shares one group record instead of holding its own
+    list of the others, so a row with N aliases costs N, not N squared (#1216).
+    It reads and compares like the list it replaces.
+    """
+
+    __slots__ = ("_group", "_key")
+
+    def __init__(self, group: tuple[tuple[str, str], ...], key: str) -> None:
+        self._group = group  # (alias, lower-case alias) in row order
+        self._key = key
+
+    def __iter__(self) -> Iterator[str]:
+        return (alias for alias, lowered in self._group if lowered != self._key)
+
+    def __len__(self) -> int:
+        return sum(1 for _alias, lowered in self._group if lowered != self._key)
+
+    def __getitem__(self, index):  # noqa: ANN001, ANN204
+        return list(self)[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (CamcontrolPeers, list, tuple)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return repr(list(self))
+
+
 @dataclass(slots=True)
 class CamcontrolInfo:
     models: dict[str, str] = field(default_factory=dict)
     controllers: dict[str, str] = field(default_factory=dict)
-    peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     # CAM target per device, recorded only under a known controller line. The
     # number is controller-local: the same target on another HBA is another
     # device.
@@ -350,12 +386,68 @@ def _format_scaled_size(size_bytes: int, base: int, suffixes: list[str]) -> str:
 
 
 def _coerce_non_negative_int(value: Any) -> int | None:
-    if isinstance(value, int) and value >= 0:
+    # Exact type: a JSON boolean is not a reading, and bool subclasses int.
+    if type(value) is int and value >= 0:
         return value
     return None
 
 
+def _json_text(value: Any) -> str | None:
+    """Reported JSON text, or None when the field is not a string."""
+    return normalize_text(value) if isinstance(value, str) else None
+
+
+# SMART summary fields are tri-state: a reading, absent (the source key was not
+# reported), or not read (the key was reported but not in its documented
+# shape). The readers below return the reading or None and add the summary
+# field names they could not read to ``unread``; a fallback source is consulted
+# only while its field is absent, never in place of one that was not read.
+def _reported_object(container: dict[str, Any], key: str, unread: set[str], *fields: str) -> dict[str, Any]:
+    """The object at ``key``; a reported non-object marks ``fields`` not read."""
+    if key not in container:
+        return {}
+    value = container[key]
+    if isinstance(value, dict):
+        return value
+    unread.update(fields)
+    return {}
+
+
+def _reported(container: dict[str, Any], key: str, admit: Any, unread: set[str], field: str) -> Any:
+    """``admit(value)`` for a reported key; a refused value marks ``field`` not read."""
+    if key not in container:
+        return None
+    value = admit(container[key])
+    if value is None:
+        unread.add(field)
+    return value
+
+
+def _reported_text(container: dict[str, Any], key: str, unread: set[str], field: str) -> str | None:
+    """Reported text; a non-string or blank value is not read."""
+    return _reported(container, key, _json_text, unread, field)
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _load_json_object(output: str) -> dict[str, Any] | None:
+    """Decode a JSON object, or None for any other root or undecodable input.
+
+    ``ValueError`` covers ``JSONDecodeError`` and an integer literal past the
+    interpreter's digit limit; deep nesting raises ``RecursionError``.
+    """
+    try:
+        payload = json.loads(output)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _coerce_int_like(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -374,28 +466,48 @@ def _coerce_int_like(value: Any) -> int | None:
         return None
 
 
+# A byte total at or above 2**64 is not a plausible drive counter. Refusing it
+# keeps the annualised and endurance estimates (float division) from
+# overflowing, and Decimal-to-int conversion from building an unbounded integer.
+_BYTE_COUNTER_LIMIT = 2**64
+# Largest gigabytes_processed value whose byte total stays under the limit.
+_SCSI_GIGABYTES_LIMIT = Decimal(_BYTE_COUNTER_LIMIT) / Decimal(1_000_000_000)
+
+
+def _bounded_byte_count(byte_count: int | None) -> int | None:
+    if byte_count is None or not 0 <= byte_count < _BYTE_COUNTER_LIMIT:
+        return None
+    return byte_count
+
+
 def _nvme_data_units_to_bytes(value: Any) -> int | None:
     units = _coerce_non_negative_int(value)
     if units is None:
         return None
     # NVMe SMART "data units" are reported in units of 1000 * 512 bytes.
-    return units * 512_000
+    return _bounded_byte_count(units * 512_000)
 
 
 def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
-    if isinstance(value, (int, float)):
-        try:
-            return int(Decimal(str(value)) * Decimal(1_000_000_000))
-        except (InvalidOperation, ValueError):
-            return None
-    if not isinstance(value, str):
+    if isinstance(value, bool):
         return None
-    text = value.strip()
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
     if not text:
         return None
     try:
-        return int(Decimal(text) * Decimal(1_000_000_000))
-    except (InvalidOperation, ValueError):
+        gigabytes = Decimal(text)
+        # Validate before arithmetic: an exponent past the Decimal context
+        # overflows on multiplication, and a tiny negative value rounds to -0.
+        # Non-finite, signed (including -0) or implausibly large counters stay unknown.
+        if not gigabytes.is_finite() or gigabytes.is_signed() or gigabytes >= _SCSI_GIGABYTES_LIMIT:
+            return None
+        return _bounded_byte_count(int(gigabytes * Decimal(1_000_000_000)))
+    except (DecimalException, ValueError, OverflowError):
         return None
 
 
@@ -410,15 +522,37 @@ def _annualize_bytes(
     return int(byte_count * 24 * 365 / power_on_hours)
 
 
+# NVMe reports composite temperature and its thresholds as 16-bit Kelvin words.
+_NVME_KELVIN_LIMIT = 0xFFFF
+
+
+# A drive temperature reading in Celsius is an integer in this range; any other
+# value is not read. The bound also keeps every consumer's float conversion safe.
+_CELSIUS_MIN, _CELSIUS_MAX = -100, 1000
+
+
+def _json_celsius(value: Any) -> int | None:
+    return value if type(value) is int and _CELSIUS_MIN <= value <= _CELSIUS_MAX else None
+
+
 def _kelvin_to_celsius(value: Any) -> int | None:
     kelvin = _coerce_non_negative_int(value)
-    if kelvin is None or kelvin == 0:
+    # Bounded before float arithmetic: an oversized integer cannot become a float.
+    if kelvin is None or kelvin == 0 or kelvin > _NVME_KELVIN_LIMIT:
         return None
-    return int(round(kelvin - 273.15))
+    return _json_celsius(int(round(kelvin - 273.15)))
+
+
+def _reported_kelvin(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
+    """An NVMe Kelvin word in Celsius; 0 K means "not reported" (absent)."""
+    if container.get(key) == 0 and type(container.get(key)) is int:
+        return None
+    return _reported(container, key, _kelvin_to_celsius, unread, field)
 
 
 def _format_nvme_version(value: Any) -> str | None:
-    if not isinstance(value, int) or value < 0:
+    # The version word is 32 bits wide; a wider value is not a version.
+    if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
         return None
     major = (value >> 16) & 0xFFFF
     minor = (value >> 8) & 0xFF
@@ -428,17 +562,70 @@ def _format_nvme_version(value: Any) -> str | None:
     return f"{major}.{minor}"
 
 
+# nvme-cli reports a namespace EUI-64 as 16 hex digits and an NGUID as 32; the
+# optional "eui." prefix is the form this formatter publishes.
+_NVME_EUI64_REGEX = re.compile(r"(?:[eE][uU][iI]\.)?([0-9a-fA-F]{16})")
+_NVME_NGUID_REGEX = re.compile(r"[0-9a-fA-F]{32}")
+
+
 def _format_nvme_eui64(value: Any) -> str | None:
-    text = normalize_value_text(value)
-    if not text:
-        return None
-    lowered = text.lower()
-    return lowered if lowered.startswith("eui.") else f"eui.{lowered}"
+    match = _NVME_EUI64_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return f"eui.{match.group(1).lower()}" if match else None
 
 
 def _format_nvme_nguid(value: Any) -> str | None:
-    text = normalize_value_text(value)
-    return text.lower() if text else None
+    match = _NVME_NGUID_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return match.group(0).lower() if match else None
+
+
+def _ata_attributes_unreadable(payload: dict[str, Any]) -> bool:
+    """True when the attribute table was reported but a row in it cannot be read.
+
+    Such a row may be any attribute, so an attribute the table does not
+    otherwise report is not read rather than absent.
+    """
+    block = payload.get("ata_smart_attributes")
+    if block is None and "ata_smart_attributes" not in payload:
+        return False
+    if not isinstance(block, dict):
+        return True
+    if "table" not in block:
+        return False
+    table = block["table"]
+    if not isinstance(table, list):
+        return True
+    # ATA attribute numbers are 1 to 255; any other id is not an identity.
+    return any(
+        not isinstance(entry, dict) or type(entry.get("id")) is not int or not 1 <= entry["id"] <= 255
+        for entry in table
+    )
+
+
+# smartctl's raw string for these attributes is the decimal count, optionally
+# followed by a parenthesised detail such as "(Min/Max 20/45)". ASCII digits
+# only, at most 20 of them (a 64-bit count), so conversion cannot fail.
+_ATA_RAW_STRING_REGEX = re.compile(r"([0-9]{1,20})(?: \(.*\))?")
+
+
+def _ata_raw_count(raw: Any) -> int | None:
+    """An attribute's raw count in a documented form, or None.
+
+    smartctl reports ``raw`` as ``{"value": <int>, "string": <text>}``; a bare
+    integer or string is the older compatibility form. When ``value`` is
+    reported it decides: a malformed ``value`` is not replaced by the string.
+    """
+    if isinstance(raw, dict):
+        if "value" in raw:
+            return _coerce_non_negative_int(raw["value"])
+        # ``string`` is text; the bare-integer compatibility form is not a member.
+        string = raw.get("string")
+        raw = string if isinstance(string, str) else None
+    if type(raw) is int:
+        return raw if raw >= 0 else None
+    if isinstance(raw, str):
+        match = _ATA_RAW_STRING_REGEX.fullmatch(raw.strip())
+        return int(match.group(1)) if match else None
+    return None
 
 
 def _iter_ata_attribute_entries(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -449,25 +636,30 @@ def _iter_ata_attribute_entries(payload: dict[str, Any]) -> Iterator[dict[str, A
     )
     if not isinstance(table, list):
         return
-    yield from (entry for entry in table if isinstance(entry, dict))
+    # Only rows with an exact integer id are attributes: a list or object id
+    # cannot be looked up, and a float or boolean id is not an attribute number.
+    yield from (
+        entry for entry in table if isinstance(entry, dict) and type(entry.get("id")) is int
+    )
 
 
-def _extract_ata_attribute_raw_value(payload: dict[str, Any], *attribute_ids: int) -> int | None:
-    attribute_id_set = set(attribute_ids)
-    for entry in _iter_ata_attribute_entries(payload):
-        if entry.get("id") not in attribute_id_set:
-            continue
-
-        raw_value = entry.get("raw")
-        if isinstance(raw_value, dict):
-            for candidate in (raw_value.get("value"), raw_value.get("string")):
-                parsed = _coerce_int_like(candidate)
-                if parsed is not None and parsed >= 0:
-                    return parsed
-        parsed = _coerce_int_like(raw_value)
-        if parsed is not None and parsed >= 0:
-            return parsed
-    return None
+def _extract_ata_attribute_raw_value(
+    payload: dict[str, Any],
+    *attribute_ids: int,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    """The first matching attribute's raw count; a malformed one is not read."""
+    unread = unread if unread is not None else set()
+    entry = _extract_ata_attribute_entry(payload, *attribute_ids)
+    if entry is None:
+        if _ata_attributes_unreadable(payload):
+            unread.add(field)
+        return None
+    value = _ata_raw_count(entry["raw"]) if "raw" in entry else None
+    if value is None:
+        unread.add(field)
+    return value
 
 
 def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -> dict[str, Any] | None:
@@ -478,35 +670,48 @@ def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -
     return None
 
 
-def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -> int | None:
-    raw_value = entry.get("raw")
-    parsed_raw_value = None
-    if isinstance(raw_value, dict):
-        for candidate in (raw_value.get("value"), raw_value.get("string")):
-            parsed_raw_value = _coerce_int_like(candidate)
-            if parsed_raw_value is not None and parsed_raw_value >= 0:
-                break
-    else:
-        parsed_raw_value = _coerce_int_like(raw_value)
+_ATA_UNIT_SCALES = {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+# The unit in a drive-database attribute name such as Host_Writes_32MiB or
+# Lifetime_Writes_GiB: an optional ASCII multiplier (no leading zero, at most
+# six digits) and a binary unit. Any other unit-like ending is not read.
+_ATA_UNIT_NAME_REGEX = re.compile(r"([1-9][0-9]{0,5})?(KiB|MiB|GiB|TiB)")
+_ATA_UNIT_LIKE_REGEX = re.compile(r".*[kmgtpe]i?b", re.IGNORECASE)
+_ATA_SECTOR_UNIT = 0
 
-    if parsed_raw_value is None or parsed_raw_value < 0:
+
+def _ata_attribute_unit_bytes(name: str) -> int | None:
+    """Bytes per raw count named by the attribute, ``_ATA_SECTOR_UNIT`` for a
+    sector count (no unit in the name), or None for an unreadable unit."""
+    head, separator, tail = name.rpartition("_")
+    if not _ATA_UNIT_LIKE_REGEX.fullmatch(tail):
+        return _ATA_SECTOR_UNIT
+    match = _ATA_UNIT_NAME_REGEX.fullmatch(tail) if separator and head else None
+    if match is None:
         return None
+    return int(match.group(1) or 1) * _ATA_UNIT_SCALES[match.group(2)]
 
-    attribute_name = normalize_text(entry.get("name")) or ""
-    name_match = re.search(r"_(\d+)(KiB|MiB|GiB|TiB)$", attribute_name)
-    if name_match:
-        unit_value = int(name_match.group(1))
-        unit_name = name_match.group(2)
-        unit_scale = {
-            "KiB": 1024,
-            "MiB": 1024**2,
-            "GiB": 1024**3,
-            "TiB": 1024**4,
-        }.get(unit_name)
-        if unit_scale is not None:
-            return parsed_raw_value * unit_value * unit_scale
 
-    return parsed_raw_value * sector_size
+def _ata_attribute_raw_value_to_bytes(
+    entry: dict[str, Any],
+    sector_size: int | None,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    unread = unread if unread is not None else set()
+    count = _ata_raw_count(entry["raw"]) if "raw" in entry else None
+    unit_bytes: int | None = _ATA_SECTOR_UNIT
+    if "name" in entry:
+        # A reported name decides the unit; one that cannot be read is not
+        # replaced by the sector reading an absent name keeps.
+        name = _json_text(entry["name"])
+        unit_bytes = _ata_attribute_unit_bytes(name) if name else None
+    if unit_bytes == _ATA_SECTOR_UNIT:
+        # A sector count without an admitted sector size has no byte total.
+        unit_bytes = sector_size
+    total = _bounded_byte_count(count * unit_bytes) if count is not None and unit_bytes is not None else None
+    if total is None:
+        unread.add(field)
+    return total
 
 
 def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -524,19 +729,66 @@ def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str,
         yield from (entry for entry in table if isinstance(entry, dict))
 
 
-def _extract_ata_device_stat_int(payload: dict[str, Any], stat_name: str) -> int | None:
-    for entry in _iter_ata_device_stat_entries(payload):
-        if normalize_text(entry.get("name")) != stat_name:
+def _ata_device_stats_unreadable(payload: dict[str, Any]) -> bool:
+    """True when device statistics were reported but part of them cannot be read."""
+    block = payload.get("ata_device_statistics")
+    if block is None and "ata_device_statistics" not in payload:
+        return False
+    if not isinstance(block, dict):
+        return True
+    if "pages" not in block:
+        return False
+    pages = block["pages"]
+    if not isinstance(pages, list):
+        return True
+    for page in pages:
+        if not isinstance(page, dict):
+            return True
+        if "table" not in page:
             continue
-        value = _coerce_int_like(entry.get("value"))
-        if value is not None and value >= 0:
-            return value
+        table = page["table"]
+        # A row without a non-blank name may be any statistic.
+        if not isinstance(table, list) or any(
+            not isinstance(entry, dict) or _json_text(entry.get("name")) is None for entry in table
+        ):
+            return True
+    return False
+
+
+def _extract_ata_device_stat_int(
+    payload: dict[str, Any],
+    stat_name: str,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    """The named statistic's count; smartctl omits ``value`` for one the drive
+    marks invalid (absent), and a reported malformed value is not read."""
+    unread = unread if unread is not None else set()
+    for entry in _iter_ata_device_stat_entries(payload):
+        if _json_text(entry.get("name")) != stat_name:
+            continue
+        return _reported(entry, "value", _coerce_non_negative_int, unread, field)
+    if _ata_device_stats_unreadable(payload):
+        unread.add(field)
     return None
 
 
-def _extract_ata_device_stat_bytes(payload: dict[str, Any], stat_name: str, sector_size: int) -> int | None:
-    value = _extract_ata_device_stat_int(payload, stat_name)
-    return value * sector_size if value is not None else None
+def _extract_ata_device_stat_bytes(
+    payload: dict[str, Any],
+    stat_name: str,
+    sector_size: int | None,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    unread = unread if unread is not None else set()
+    value = _extract_ata_device_stat_int(payload, stat_name, unread, field)
+    if value is None:
+        return None
+    # A sector count without an admitted sector size has no byte total.
+    total = _bounded_byte_count(value * sector_size) if sector_size is not None else None
+    if total is None:
+        unread.add(field)
+    return total
 
 
 def _parse_enabled_disabled(value: str | None) -> bool | None:
@@ -585,15 +837,47 @@ def parse_glabel_status(output: str) -> GlabelInfo:
         partitions_by_label.setdefault(label.lower(), set()).add(component.lower())
 
     info = GlabelInfo()
+    # A set beside each list, so a provider with many labels is not rescanned
+    # for every row (#1216).
+    listed_labels: dict[str, set[str]] = {}
     for gptid, _component, device in rows:
         if len(partitions_by_label[gptid.lower()]) > 1:
             continue
         info.gptid_to_device[gptid.lower()] = device
         info.device_to_gptid[device.lower()] = gptid
         labels = info.device_to_gptids.setdefault(device.lower(), [])
-        if gptid not in labels:
+        listed = listed_labels.setdefault(device.lower(), set())
+        if gptid not in listed:
+            listed.add(gptid)
             labels.append(gptid)
     return info
+
+
+_CAMCONTROL_DEVICE_LINE_PATTERN = re.compile(
+    r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)"
+)
+
+
+def _match_camcontrol_device_line(line: str) -> re.Match[str] | None:
+    """`_CAMCONTROL_DEVICE_LINE_PATTERN.search(line)` with work linear in the line.
+
+    An unanchored search retried the lazy scan for "target" from every "<", and
+    the device list from every "(" with no ")" after it (#1216). Only the first
+    "<" that has a model before its ">" can start the leftmost match: a later
+    one closes at the same or a later ">", so its search sees a subset of the
+    same text. The match must also end at or before the last ")". So one match
+    at that "<", confined to that end, finds the same match.
+    """
+
+    start = line.find("<")
+    while start >= 0:
+        model_end = line.find(">", start + 1)
+        if model_end < 0:
+            return None
+        if model_end > start + 1:
+            return _CAMCONTROL_DEVICE_LINE_PATTERN.match(line, start, line.rfind(")") + 1)
+        start = line.find("<", model_end + 1)
+    return None
 
 
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
@@ -608,10 +892,7 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             current_controller = normalize_text(bus_match.group("controller"))
             continue
 
-        match = re.search(
-            r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)",
-            line,
-        )
+        match = _match_camcontrol_device_line(line)
         if not match:
             continue
 
@@ -641,13 +922,12 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     # Only aliases explicitly listed on one CAM row describe the same device.
     # Model/target/LUN repeats across HBAs do not establish disk identity.
     for devices in device_rows:
-        deduped = list(dict.fromkeys(devices))
-        if len(deduped) < 2:
+        group = tuple((device, device.lower()) for device in dict.fromkeys(devices))
+        # A device has peers when the row names at least one other device.
+        if len({lowered for _device, lowered in group}) < 2:
             continue
-        for device in deduped:
-            peers = [peer for peer in deduped if peer.lower() != device.lower()]
-            if peers:
-                info.peer_devices[device.lower()] = peers
+        for _device, lowered in group:
+            info.peer_devices[lowered] = CamcontrolPeers(group, lowered)
     return info
 
 
@@ -793,11 +1073,28 @@ def _add_ses_device_name(slot: SESMapSlot, name: str) -> None:
     slot.device_names.sort(key=_device_name_sort_key)
 
 
-def _ses_input_exceeds_bounds(output: str, element_pattern: str) -> bool:
+def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], bool]) -> bool:
+    """Count element headers line by line, the way the parsers read them.
+
+    A pattern is matched against each stripped line, never the whole output: a
+    `^\\s*` that can cross line breaks rescans every run of blank lines, which
+    made this pre-count quadratic on small malformed output (#1216).
+    """
+
     if len(output) > MAX_SES_OUTPUT_CHARS:
         return True
+    if isinstance(element_line, str):
+        element_line_pattern = re.compile(element_line, re.IGNORECASE)
+
+        def is_element_line(line: str) -> bool:
+            return element_line_pattern.match(line) is not None
+    else:
+        is_element_line = element_line
     element_count = 0
-    for _match in re.finditer(element_pattern, output, re.MULTILINE | re.IGNORECASE):
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or not is_element_line(stripped):
+            continue
         element_count += 1
         if element_count > MAX_SES_ELEMENTS:
             return True
@@ -1518,6 +1815,14 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
         serial = normalize_text(columns[3]) if columns[3] != "-" else None
         status_text = normalize_text(columns[4]) or "Unknown"
         status_lower = status_text.lower()
+        # A device name is presence and "Not installed" is absence. A row with
+        # neither reports nothing about occupancy, so it stays unknown (#1218).
+        if "not installed" in status_lower:
+            present: bool | None = False
+        elif device_names:
+            present = True
+        else:
+            present = None
 
         current_enclosure.slots[slot_number] = SESMapSlot(
             slot_number=slot_number,
@@ -1530,8 +1835,8 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             serial=serial,
             model=model,
             size_text=None if "not installed" in status_lower else normalize_text(status_text.split(",", 1)[0]),
-            present=bool(device_names) and "not installed" not in status_lower,
-            presence_source="sesutil_show",
+            present=present,
+            presence_source="sesutil_show" if present is not None else None,
         )
 
     parsed = [item for item in enclosures if item.slots]
@@ -1827,6 +2132,82 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     return enclosure
 
 
+SG_SES_JOIN_ELEMENT_TYPE_LABEL = "element type:"
+
+
+def _skip_sg_ses_whitespace(line: str, index: int) -> int:
+    while index < len(line) and line[index].isspace():
+        index += 1
+    return index
+
+
+def _scan_sg_ses_signed_decimal(line: str, index: int) -> int | None:
+    if index < len(line) and line[index] == "-":
+        index += 1
+    digits_start = index
+    while index < len(line) and line[index].isdecimal():
+        index += 1
+    return index if index > digits_start else None
+
+
+def _match_sg_ses_join_element_header(
+    line: str,
+    *,
+    require_type: bool = True,
+) -> tuple[str | None, str, str, str] | None:
+    """Recognize `<descriptor> [<subenclosure>,<element>] Element type: <type>`.
+
+    `line` is already stripped. The regex this replaces paired a lazy
+    descriptor with a whitespace run, so a long run of spaces was rescanned
+    from every position (#1216). This scan reads each character a bounded
+    number of times and keeps the same rules: the first bracket that starts the
+    line or follows whitespace and completes a header wins, and the descriptor
+    is everything before it. Returns (descriptor, subenclosure, element, type),
+    or None. With `require_type=False` the type may be missing.
+    """
+
+    bracket = line.find("[")
+    while bracket >= 0:
+        if bracket == 0 or line[bracket - 1].isspace():
+            subenclosure_end = _scan_sg_ses_signed_decimal(line, bracket + 1)
+            element_end = None
+            if subenclosure_end is not None and line.startswith(",", subenclosure_end):
+                element_end = _scan_sg_ses_signed_decimal(line, subenclosure_end + 1)
+            if element_end is not None and line.startswith("]", element_end):
+                label_start = _skip_sg_ses_whitespace(line, element_end + 1)
+                label_end = label_start + len(SG_SES_JOIN_ELEMENT_TYPE_LABEL)
+                if (
+                    label_start > element_end + 1
+                    and line[label_start:label_end].lower() == SG_SES_JOIN_ELEMENT_TYPE_LABEL
+                ):
+                    type_start = _skip_sg_ses_whitespace(line, label_end)
+                    if not require_type or (label_end < type_start < len(line)):
+                        return (
+                            line[:bracket].rstrip() if bracket else None,
+                            line[bracket + 1 : subenclosure_end],
+                            line[subenclosure_end + 1 : element_end],
+                            line[type_start:].rstrip(),
+                        )
+        bracket = line.find("[", bracket + 1)
+    return None
+
+
+def _is_sg_ses_join_element_header(line: str) -> bool:
+    return _match_sg_ses_join_element_header(line) is not None
+
+
+def _starts_with_sg_ses_slot_bracket(lowered: str) -> bool:
+    """`slot<digits><whitespace>[` at the start of a lowercased line, scanned once."""
+
+    if not lowered.startswith("slot"):
+        return False
+    digits_end = 4
+    while digits_end < len(lowered) and lowered[digits_end].isdecimal():
+        digits_end += 1
+    bracket = _skip_sg_ses_whitespace(lowered, digits_end)
+    return digits_end > 4 and bracket > digits_end and lowered.startswith("[", bracket)
+
+
 def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | None:
     """
     Parse `sg_ses --join --filter /dev/sgN` output into slot metadata.
@@ -1837,10 +2218,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     through the same SESMapEnclosure model so AES/EC-only hosts keep working.
     """
 
-    if _ses_input_exceeds_bounds(
-        output,
-        r"^\s*(?:.*?)?\[-?\d+,-?\d+\]\s+Element type:",
-    ):
+    if _ses_input_exceeds_bounds(output, _is_sg_ses_join_element_header):
         return None
 
     ses_device = _extract_sg_ses_device(command)
@@ -1863,13 +2241,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             enclosure.enclosure_id = common_field[1]
             continue
 
-        element_header_match = re.match(
-            r"^(?:(?P<descriptor>.*?)\s+)?"
-            r"\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+"
-            r"Element type:\s+(?P<element_type>.+?)\s*$",
-            stripped,
-            re.IGNORECASE,
-        )
+        element_header_match = _match_sg_ses_join_element_header(stripped)
         if element_header_match:
             _apply_resolved_ses_descriptor_presence(
                 current_slot,
@@ -1886,13 +2258,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             current_slot = None
             descriptor_slot_number = None
             descriptor_presence_evidence = []
-            element_type = normalize_text(element_header_match.group("element_type")) or ""
+            header_descriptor, _subenclosure, header_element, header_type = element_header_match
+            element_type = normalize_text(header_type) or ""
             if not _is_ses_device_slot_type(element_type):
                 continue
-            element_id = int(element_header_match.group("element"))
+            element_id = int(header_element)
             if element_id < 0:
                 continue
-            descriptor = normalize_text(element_header_match.group("descriptor"))
+            descriptor = normalize_text(header_descriptor)
             descriptor_match = re.search(r"\bSlot(?P<slot>\d+)\b", descriptor or "", re.IGNORECASE)
             if descriptor_match:
                 descriptor_slot_number = int(descriptor_match.group("slot"))
@@ -2027,8 +2400,8 @@ def _extract_sg_ses_enclosure_name(output: str) -> str | None:
         if (
             lowered.startswith(stop_prefixes)
             or lowered.startswith(("element type:", "element index:", "overall descriptor:"))
-            or re.match(r"slot\d+\s+\[", lowered)
-            or re.match(r"(?:.*?\s+)?\[-?\d+,-?\d+\]\s+element type:", lowered)
+            or _starts_with_sg_ses_slot_bracket(lowered)
+            or _match_sg_ses_join_element_header(stripped, require_type=False) is not None
         ):
             break
         if lowered.startswith(ignored_prefixes):
@@ -2168,12 +2541,17 @@ def _ses_enclosures_share_identity(first: SESMapEnclosure, second: SESMapEnclosu
         return bool(first.ses_device and first.ses_device == second.ses_device)
     # Unkeyed redundant paths need disk and attached-enclosure evidence.
     # Host-local names and sg basenames are never cross-host identity proof.
+    # A zero or missing address, in any spelling, is absence rather than
+    # identity, and a bay the enclosure reports empty is no anchor (#1217).
     def bay_identities(enclosure):
-        addresses = Counter(slot.sas_address for slot in enclosure.slots.values() if slot.sas_address)
-        return {(slot.slot_number, slot.sas_address, slot.attached_sas_address)
-                for slot in enclosure.slots.values()
-                if slot.sas_address not in {None, "0x0"} and addresses[slot.sas_address] == 1
-                and slot.attached_sas_address not in {None, "0x0"}
+        bays = [(slot, normalize_hex_identifier(slot.sas_address),
+                 normalize_hex_identifier(slot.attached_sas_address))
+                for slot in enclosure.slots.values()]
+        addresses = Counter(address for _slot, address, _attached in bays if address not in {None, "0"})
+        return {(slot.slot_number, address, attached)
+                for slot, address, attached in bays
+                if address not in {None, "0"} and addresses[address] == 1
+                and attached not in {None, "0"} and slot.present is not False
                 and not slot.sas_address_conflict and not slot.sas_address_degraded}
     return bool(bay_identities(first) & bay_identities(second))
 
@@ -2209,6 +2587,9 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
     slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
     enclosure_ids: dict[str, str] = {}
     ses_device_keys: dict[tuple[str | None, str], str] = {}
+    # Identity candidates by host, with their order (#1216).
+    host_candidate_keys: dict[str | None, list[str]] = {}
+    candidate_positions: dict[str, int] = {}
 
     for enclosure in enclosures:
         key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
@@ -2220,10 +2601,20 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             ):
                 key = None
         if key is None and enclosure.ssh_host:
-            key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
-                        if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
-                                and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
-                        if _ses_enclosures_share_identity(candidate, enclosure)), None)
+            # Only a candidate on another host can match: on this host it would
+            # share the ID or be the device's first record, both looked up above.
+            matches = [
+                match
+                for candidate_host, candidate_keys in host_candidate_keys.items()
+                if candidate_host != enclosure.ssh_host
+                for match in [next((candidate_key for candidate_key in candidate_keys
+                                    if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
+                                            and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
+                                    if _ses_enclosures_share_identity(identity_enclosures[candidate_key], enclosure)),
+                                   None)]
+                if match is not None
+            ]
+            key = min(matches, key=candidate_positions.__getitem__, default=None)
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
             if key in merged:
@@ -2246,6 +2637,8 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             )
             slot_evidence[key] = []
             identity_enclosures[key] = enclosure
+            candidate_positions[key] = len(candidate_positions)
+            host_candidate_keys.setdefault(enclosure.ssh_host, []).append(key)
         target = merged[key]
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
@@ -2544,10 +2937,18 @@ def _merge_control_targets(
     *,
     strict: bool = True,
 ) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    by_pair: dict[tuple[Any, ...], dict[str, Any]] = {}
+    return _add_control_targets([], {}, base + overlay, strict=strict)
+
+
+def _add_control_targets(
+    merged: list[dict[str, Any]],
+    by_pair: dict[tuple[Any, ...], dict[str, Any]],
+    items: list[dict[str, Any]],
+    *,
+    strict: bool = True,
+) -> list[dict[str, Any]]:
     conflicting: set[tuple[Any, ...]] = set()
-    for item in base + overlay:
+    for item in items:
         if not isinstance(item, dict):
             continue
         ssh_host = normalize_text(item.get("ssh_host"))
@@ -2587,6 +2988,24 @@ def _merge_control_targets(
         by_pair[pair] = payload
         merged.append(payload)
     return merged
+
+
+def _ses_candidate_presence(slot: SESMapSlot) -> bool | None:
+    """Occupancy for an inventory candidate: decided evidence or unknown.
+
+    A truncated AES descriptor or a condition-only Enclosure Status record
+    leaves the bay undecided. That stays ``None`` so inventory does not read
+    it as a live empty report (#1218). Only device names are positive
+    evidence and only an explicit not-installed status is absence.
+    """
+
+    if slot.present is not None:
+        return slot.present
+    if "not installed" in (slot.status or "").lower():
+        return False
+    if slot.device_names:
+        return True
+    return None
 
 
 def _merge_candidate_presence(
@@ -2692,8 +3111,11 @@ def _merge_candidate_sas_address(
 def merge_slot_candidate_maps(
     base: dict[int, dict[str, Any]],
     overlay: dict[int, dict[str, Any]],
+    target_index: dict[int, dict[tuple[Any, ...], dict[str, Any]]] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    merged = {slot: dict(payload) for slot, payload in base.items()}
+    # With `target_index` (empty with an empty base at first), base is merged
+    # in place and its targets stay indexed, so no merge redoes earlier ones.
+    merged = base if target_index is not None else {slot: dict(payload) for slot, payload in base.items()}
 
     for slot, payload in overlay.items():
         target = merged.setdefault(slot, {})
@@ -2716,7 +3138,11 @@ def merge_slot_candidate_maps(
             if key == "ses_targets":
                 existing = target.get(key, [])
                 if isinstance(existing, list) and isinstance(value, list):
-                    combined = _merge_control_targets(existing, value, strict=False)
+                    combined = (
+                        _add_control_targets(existing, target_index.setdefault(slot, {}), value, strict=False)
+                        if target_index is not None
+                        else _merge_control_targets(existing, value, strict=False)
+                    )
                     if combined:
                         target[key] = combined
                 continue
@@ -2857,9 +3283,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "serial_hint": slot.serial,
                     "model_hint": slot.model,
                     "reported_size": slot.size_text,
-                    "present": slot.present
-                    if slot.present is not None
-                    else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
+                    "present": _ses_candidate_presence(slot),
                     "presence_source": slot.presence_source,
                     "presence_conflict": slot.presence_conflict,
                     "enclosure_id": enclosure.enclosure_id,
@@ -3337,80 +3761,109 @@ def parse_smart_test_results(results: list[dict[str, Any]]) -> dict[str, dict[st
     return parsed
 
 
+# The summary message when every reported field was refused: the source did
+# return fields, so "no fields were returned" would describe an absence.
+SMART_SUMMARY_UNREAD_MESSAGE = "SMART summary fields were returned for this disk but could not be read."
+
+
 def _finalize_summary(
     data: dict[str, Any],
     unavailable_message: str,
     *,
     availability_values: tuple[Any, ...] | None = None,
     available_message: str | None = None,
+    unread: set[str] | None = None,
 ) -> dict[str, Any]:
     values = availability_values if availability_values is not None else tuple(data.values())
     available = any(value is not None for value in values)
+    if unread is None:
+        # Readers that do not track refused fields keep their output shape.
+        return {"available": available, **data, "message": available_message if available else unavailable_message}
+    # Only fields left without a reading are "not read"; a later source that
+    # read the field supersedes the refusal of an earlier one.
+    unread_fields = sorted(name for name in unread if name in data and data[name] is None)
+    if not available and unread_fields:
+        unavailable_message = SMART_SUMMARY_UNREAD_MESSAGE
     return {
         "available": available,
         **data,
+        "unread_fields": unread_fields,
         "message": available_message if available else unavailable_message,
     }
+
+
+_NVME_HEALTH_FIELDS = (
+    "available_spare_percent", "available_spare_threshold_percent", "endurance_used_percent",
+    "bytes_read", "bytes_written", "media_errors", "unsafe_shutdowns",
+)
+
+
+def _derived_unread(unread: set[str], field: str, value: Any, inputs: dict[str, Any]) -> None:
+    """A derived value is not read when it is missing because an input was not
+    read; with any input simply absent it is absent too."""
+    if (
+        value is None
+        and any(name in unread for name in inputs)
+        and all(input_value is not None or name in unread for name, input_value in inputs.items())
+    ):
+        unread.add(field)
 
 
 def _extract_smartctl_traffic_and_wear(
     payload: dict[str, Any],
     power_on_hours: int | None,
-    sector_size_for_ata: int,
+    sector_size_for_ata: int | None,
+    unread: set[str] | None = None,
 ) -> dict[str, int | None]:
-    nvme_health = (
-        payload.get("nvme_smart_health_information_log")
-        if isinstance(payload.get("nvme_smart_health_information_log"), dict)
-        else {}
+    unread = unread if unread is not None else set()
+    nvme_health = _reported_object(payload, "nvme_smart_health_information_log", unread, *_NVME_HEALTH_FIELDS)
+    available_spare_percent = _reported(
+        nvme_health, "available_spare", _coerce_non_negative_int, unread, "available_spare_percent",
     )
-    available_spare_percent = _coerce_non_negative_int(nvme_health.get("available_spare"))
-    available_spare_threshold_percent = _coerce_non_negative_int(nvme_health.get("available_spare_threshold"))
-    endurance_used_percent = _coerce_non_negative_int(nvme_health.get("percentage_used"))
+    available_spare_threshold_percent = _reported(
+        nvme_health, "available_spare_threshold", _coerce_non_negative_int, unread, "available_spare_threshold_percent",
+    )
+    endurance_used_percent = _reported(
+        nvme_health, "percentage_used", _coerce_non_negative_int, unread, "endurance_used_percent",
+    )
+    bytes_read = _reported(nvme_health, "data_units_read", _nvme_data_units_to_bytes, unread, "bytes_read")
+    bytes_written = _reported(nvme_health, "data_units_written", _nvme_data_units_to_bytes, unread, "bytes_written")
+    media_errors = _reported(nvme_health, "media_errors", _coerce_non_negative_int, unread, "media_errors")
+    unsafe_shutdowns = _reported(nvme_health, "unsafe_shutdowns", _coerce_non_negative_int, unread, "unsafe_shutdowns")
+
+    # Each lower source is read only while the field is still absent: a
+    # source that reported the field in an unreadable shape stops the chain.
+    scsi_error_counter_log = _reported_object(payload, "scsi_error_counter_log", unread, "bytes_read", "bytes_written")
+
+    def lower_byte_sources(
+        value: int | None, byte_field: str, direction: str, stat_name: str, attribute_id: int,
+    ) -> int | None:
+        if value is None and byte_field not in unread:
+            log = _reported_object(scsi_error_counter_log, direction, unread, byte_field)
+            value = _reported(log, "gigabytes_processed", _scsi_gigabytes_processed_to_bytes, unread, byte_field)
+        if value is None and byte_field not in unread:
+            value = _extract_ata_device_stat_bytes(payload, stat_name, sector_size_for_ata, unread, byte_field)
+        if value is None and byte_field not in unread:
+            entry = _extract_ata_attribute_entry(payload, attribute_id)
+            if entry is not None:
+                value = _ata_attribute_raw_value_to_bytes(entry, sector_size_for_ata, unread, byte_field)
+            elif _ata_attributes_unreadable(payload):
+                unread.add(byte_field)
+        return value
+
+    bytes_read = lower_byte_sources(bytes_read, "bytes_read", "read", "Logical Sectors Read", 242)
+    bytes_written = lower_byte_sources(bytes_written, "bytes_written", "write", "Logical Sectors Written", 241)
+    if available_spare_percent is None and "available_spare_percent" not in unread:
+        available_spare_percent = _extract_ata_attribute_raw_value(
+            payload, 232, 169, unread=unread, field="available_spare_percent",
+        )
+    if endurance_used_percent is None and "endurance_used_percent" not in unread:
+        endurance_used_percent = _extract_ata_device_stat_int(
+            payload, "Percentage Used Endurance Indicator", unread, "endurance_used_percent",
+        )
     endurance_remaining_percent = (
         max(0, 100 - endurance_used_percent) if endurance_used_percent is not None else None
     )
-    bytes_read = _nvme_data_units_to_bytes(nvme_health.get("data_units_read"))
-    bytes_written = _nvme_data_units_to_bytes(nvme_health.get("data_units_written"))
-    media_errors = _coerce_non_negative_int(nvme_health.get("media_errors"))
-    unsafe_shutdowns = _coerce_non_negative_int(nvme_health.get("unsafe_shutdowns"))
-
-    scsi_error_counter_log = (
-        payload.get("scsi_error_counter_log")
-        if isinstance(payload.get("scsi_error_counter_log"), dict)
-        else {}
-    )
-    scsi_read_error_log = (
-        scsi_error_counter_log.get("read")
-        if isinstance(scsi_error_counter_log.get("read"), dict)
-        else {}
-    )
-    scsi_write_error_log = (
-        scsi_error_counter_log.get("write")
-        if isinstance(scsi_error_counter_log.get("write"), dict)
-        else {}
-    )
-    if bytes_read is None:
-        bytes_read = _scsi_gigabytes_processed_to_bytes(scsi_read_error_log.get("gigabytes_processed"))
-    if bytes_written is None:
-        bytes_written = _scsi_gigabytes_processed_to_bytes(scsi_write_error_log.get("gigabytes_processed"))
-    if bytes_read is None:
-        bytes_read = _extract_ata_device_stat_bytes(payload, "Logical Sectors Read", sector_size_for_ata)
-    if bytes_written is None:
-        bytes_written = _extract_ata_device_stat_bytes(payload, "Logical Sectors Written", sector_size_for_ata)
-    if bytes_read is None:
-        ata_read_entry = _extract_ata_attribute_entry(payload, 242)
-        if ata_read_entry is not None:
-            bytes_read = _ata_attribute_raw_value_to_bytes(ata_read_entry, sector_size_for_ata)
-    if bytes_written is None:
-        ata_write_entry = _extract_ata_attribute_entry(payload, 241)
-        if ata_write_entry is not None:
-            bytes_written = _ata_attribute_raw_value_to_bytes(ata_write_entry, sector_size_for_ata)
-    if available_spare_percent is None:
-        available_spare_percent = _extract_ata_attribute_raw_value(payload, 232, 169)
-    if endurance_used_percent is None:
-        endurance_used_percent = _extract_ata_device_stat_int(payload, "Percentage Used Endurance Indicator")
-    if endurance_remaining_percent is None and endurance_used_percent is not None:
-        endurance_remaining_percent = max(0, 100 - endurance_used_percent)
 
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
@@ -3425,6 +3878,26 @@ def _extract_smartctl_traffic_and_wear(
         max(estimated_lifetime_bytes_written - bytes_written, 0)
         if estimated_lifetime_bytes_written is not None and bytes_written is not None
         else None
+    )
+    _derived_unread(
+        unread, "endurance_remaining_percent", endurance_remaining_percent,
+        {"endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_read", annualized_bytes_read,
+        {"bytes_read": bytes_read, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_written", annualized_bytes_written,
+        {"bytes_written": bytes_written, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "estimated_lifetime_bytes_written", estimated_lifetime_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "estimated_remaining_bytes_written", estimated_remaining_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
     )
     return {
         "available_spare_percent": available_spare_percent,
@@ -3442,68 +3915,123 @@ def _extract_smartctl_traffic_and_wear(
     }
 
 
-def _extract_smartctl_latest_test(payload: dict[str, Any]) -> tuple[str | None, str | None, int | None]:
+_SMART_LATEST_TEST_FIELDS = ("last_test_type", "last_test_status", "last_test_lifetime_hours")
+# smartctl numbers the SCSI self-test log entries scsi_self_test_0 to _19,
+# newest first. Canonical ASCII decimal only, bounded before conversion.
+_SCSI_SELF_TEST_INDEX_REGEX = re.compile(r"0|[1-9][0-9]{0,5}")
+
+
+def _reported_test_text(
+    container: dict[str, Any], key: str, unread: set[str], field: str, *, allow_text: bool,
+) -> str | None:
+    """A self-test type or status: an object's ``string`` (else ``name``), or
+    plain text where that older form is accepted."""
+    if key not in container:
+        return None
+    value = container[key]
+    if isinstance(value, dict):
+        text = _reported_text(value, "string", unread, field)
+        if text is None and field not in unread:
+            text = _reported_text(value, "name", unread, field)
+        if text is None:
+            # An object without its text is a reported value that was not read.
+            unread.add(field)
+        return text
+    if allow_text:
+        return _reported_text(container, key, unread, field)
+    unread.add(field)
+    return None
+
+
+def _extract_smartctl_latest_test(
+    payload: dict[str, Any],
+    unread: set[str] | None = None,
+) -> tuple[str | None, str | None, int | None]:
+    unread = unread if unread is not None else set()
     latest_test_type: str | None = None
     latest_test_status: str | None = None
     latest_test_lifetime_hours: int | None = None
     scsi_tests: list[tuple[int, dict[str, Any]]] = []
     for key, value in payload.items():
-        if not (key.startswith("scsi_self_test_") and isinstance(value, dict)):
+        if not key.startswith("scsi_self_test_"):
             continue
         suffix = key.removeprefix("scsi_self_test_")
-        if suffix.isdigit():
-            scsi_tests.append((int(suffix), value))
+        if not (_SCSI_SELF_TEST_INDEX_REGEX.fullmatch(suffix) and isinstance(value, dict)):
+            # An entry that cannot be ordered may be the newest one, so no
+            # entry can be reported as the latest test.
+            unread.update(_SMART_LATEST_TEST_FIELDS)
+            return None, None, None
+        scsi_tests.append((int(suffix), value))
 
     if scsi_tests:
         _, latest_test = min(scsi_tests, key=lambda item: item[0])
-        code = latest_test.get("code") if isinstance(latest_test.get("code"), dict) else {}
-        result = latest_test.get("result") if isinstance(latest_test.get("result"), dict) else {}
-        lifetime = latest_test.get("power_on_time") if isinstance(latest_test.get("power_on_time"), dict) else {}
-        latest_test_type = normalize_text(code.get("string")) or normalize_text(code.get("name"))
-        latest_test_status = normalize_text(result.get("string")) or normalize_text(result.get("name"))
-        latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+        latest_test_type = _reported_test_text(latest_test, "code", unread, "last_test_type", allow_text=False)
+        latest_test_status = _reported_test_text(latest_test, "result", unread, "last_test_status", allow_text=False)
+        lifetime = _reported_object(latest_test, "power_on_time", unread, "last_test_lifetime_hours")
+        latest_test_lifetime_hours = _reported(
+            lifetime, "hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+        )
     else:
-        ata_log = payload.get("ata_smart_self_test_log") if isinstance(payload.get("ata_smart_self_test_log"), dict) else {}
-        standard = ata_log.get("standard") if isinstance(ata_log.get("standard"), dict) else {}
-        table = standard.get("table") if isinstance(standard.get("table"), list) else []
-        if table and isinstance(table[0], dict):
+        ata_log = _reported_object(payload, "ata_smart_self_test_log", unread, *_SMART_LATEST_TEST_FIELDS)
+        standard = _reported_object(ata_log, "standard", unread, *_SMART_LATEST_TEST_FIELDS)
+        table = standard.get("table", [])
+        if not isinstance(table, list) or (table and not isinstance(table[0], dict)):
+            unread.update(_SMART_LATEST_TEST_FIELDS)
+        elif table:
             latest_test = table[0]
-            latest_test_type = normalize_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else normalize_text(latest_test.get("type"))
-            latest_test_status = normalize_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else normalize_text(latest_test.get("status"))
-            raw_lifetime = latest_test.get("lifetime_hours")
-            if isinstance(raw_lifetime, dict):
-                raw_lifetime = raw_lifetime.get("hours")
-            latest_test_lifetime_hours = raw_lifetime if isinstance(raw_lifetime, int) else None
+            latest_test_type = _reported_test_text(latest_test, "type", unread, "last_test_type", allow_text=True)
+            latest_test_status = _reported_test_text(latest_test, "status", unread, "last_test_status", allow_text=True)
+            if isinstance(latest_test.get("lifetime_hours"), dict):
+                # The object form carries its value in ``hours``; without it the
+                # reported lifetime was not read.
+                lifetime = {"hours": None, **latest_test["lifetime_hours"]}
+                latest_test_lifetime_hours = _reported(
+                    lifetime, "hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+                )
+            else:
+                latest_test_lifetime_hours = _reported(
+                    latest_test, "lifetime_hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+                )
 
     return latest_test_type, latest_test_status, latest_test_lifetime_hours
 
 
+def _reported_sas_address(container: dict[str, Any], key: str, unread: set[str], field: str) -> str | None:
+    return _reported(container, key, lambda value: format_hex_identifier(_json_text(value)), unread, field)
+
+
 def _extract_smartctl_sas_phy(
     payload: dict[str, Any],
+    unread: set[str] | None = None,
 ) -> tuple[str | None, str | None, str | None] | None:
+    unread = unread if unread is not None else set()
     sas_port_phys: list[dict[str, Any]] = []
     for key, value in payload.items():
-        if not (key.startswith("scsi_sas_port_") and isinstance(value, dict)):
+        if not key.startswith("scsi_sas_port_"):
             continue
-        for subkey, phy in value.items():
-            if subkey.startswith("phy_") and isinstance(phy, dict):
-                sas_port_phys.append(phy)
+        phys = [phy for subkey, phy in value.items() if subkey.startswith("phy_")] if isinstance(value, dict) else None
+        if phys is None or not all(isinstance(phy, dict) for phy in phys):
+            # A port or PHY that cannot be read may be the attached one, so no
+            # PHY is reported as the disk's, and no other source stands in.
+            unread.update(("sas_address", "attached_sas_address", "negotiated_link_rate"))
+            return None, None, None
+        sas_port_phys.extend(phys)
 
     selected_phy = next(
         (
             phy
             for phy in sas_port_phys
-            if format_hex_identifier(phy.get("attached_sas_address")) not in {None, "0x0"}
-            or normalize_text(phy.get("attached_device_type")) not in {None, "no device attached"}
+            if format_hex_identifier(_json_text(phy.get("attached_sas_address"))) not in {None, "0x0"}
+            or _json_text(phy.get("attached_device_type")) not in {None, "no device attached"}
         ),
         sas_port_phys[0] if sas_port_phys else None,
     )
     if not selected_phy:
         return None
     return (
-        format_hex_identifier(selected_phy.get("sas_address")),
-        format_hex_identifier(selected_phy.get("attached_sas_address")),
-        normalize_text(selected_phy.get("negotiated_logical_link_rate")),
+        _reported_sas_address(selected_phy, "sas_address", unread, "sas_address"),
+        _reported_sas_address(selected_phy, "attached_sas_address", unread, "attached_sas_address"),
+        _reported_text(selected_phy, "negotiated_logical_link_rate", unread, "negotiated_link_rate"),
     )
 
 
@@ -3772,9 +4300,28 @@ def _smartctl_threshold_celsius(value: Any) -> int | None:
     return value if 20 <= value <= 150 else None
 
 
+# The documented "not available" limit values (see _smartctl_threshold_celsius).
+_SMARTCTL_THRESHOLD_NOT_AVAILABLE = frozenset({0, 255, -128})
+
+
+def _reported_threshold(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
+    """A reported limit; a documented "not available" value is absent, and any
+    other value that is not a plausible rating is not read."""
+    if key not in container:
+        return None
+    value = container[key]
+    if type(value) is int and value in _SMARTCTL_THRESHOLD_NOT_AVAILABLE:
+        return None
+    rating = _smartctl_threshold_celsius(value)
+    if rating is None:
+        unread.add(field)
+    return rating
+
+
 def _extract_smartctl_temperature_thresholds(
     payload: dict[str, Any],
     temperature: dict[str, Any],
+    unread: set[str] | None = None,
 ) -> tuple[int | None, int | None]:
     """Return the drive's own (warning, critical) temperature ratings.
 
@@ -3783,86 +4330,103 @@ def _extract_smartctl_temperature_thresholds(
     ``critical_limit_max``), ATA SCT/device statistics as the recommended
     ``op_limit_max`` and absolute ``limit_max``, and SCSI as ``drive_trip``.
     """
-    nvme_thresholds = payload.get("nvme_composite_temperature_threshold")
-    if not isinstance(nvme_thresholds, dict):
-        nvme_thresholds = {}
-    warning = _smartctl_threshold_celsius(nvme_thresholds.get("warning"))
-    if warning is None:
-        warning = _smartctl_threshold_celsius(temperature.get("op_limit_max"))
-    critical = _smartctl_threshold_celsius(nvme_thresholds.get("critical"))
+    unread = unread if unread is not None else set()
+    nvme_thresholds = _reported_object(
+        payload, "nvme_composite_temperature_threshold", unread, "warning_temperature_c", "critical_temperature_c",
+    )
+    warning = _reported_threshold(nvme_thresholds, "warning", unread, "warning_temperature_c")
+    if warning is None and "warning_temperature_c" not in unread:
+        warning = _reported_threshold(temperature, "op_limit_max", unread, "warning_temperature_c")
+    critical = _reported_threshold(nvme_thresholds, "critical", unread, "critical_temperature_c")
     for field_name in ("critical_limit_max", "limit_max", "drive_trip"):
-        if critical is None:
-            critical = _smartctl_threshold_celsius(temperature.get(field_name))
+        if critical is None and "critical_temperature_c" not in unread:
+            critical = _reported_threshold(temperature, field_name, unread, "critical_temperature_c")
     return warning, critical
 
 
+_SMARTCTL_TEMPERATURE_FIELDS = ("temperature_c", "warning_temperature_c", "critical_temperature_c")
+
+
+def _reported_namespace_eui64(payload: dict[str, Any], unread: set[str]) -> str | None:
+    """The first namespace's EUI-64 from its 24-bit OUI and 40-bit extension."""
+    if "nvme_namespaces" not in payload:
+        return None
+    namespaces = payload["nvme_namespaces"]
+    if not isinstance(namespaces, list) or (namespaces and not isinstance(namespaces[0], dict)):
+        unread.add("namespace_eui64")
+        return None
+    if not namespaces:
+        return None
+    eui64 = _reported_object(namespaces[0], "eui64", unread, "namespace_eui64")
+    if not eui64:
+        return None
+    oui, ext_id = eui64.get("oui"), eui64.get("ext_id")
+    if type(oui) is not int or type(ext_id) is not int or not 0 <= oui < 1 << 24 or not 0 <= ext_id < 1 << 40:
+        unread.add("namespace_eui64")
+        return None
+    return _format_nvme_eui64(f"{oui:06x}{ext_id:010x}")
+
+
+def _reported_cache_flag(payload: dict[str, Any], key: str, unread: set[str], field: str) -> bool | None:
+    block = _reported_object(payload, key, unread, field)
+    return _reported(block, "enabled", lambda value: value if isinstance(value, bool) else None, unread, field)
+
+
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
+        # The SSH reader tries its next candidate on exactly this message.
         return {"available": False, "message": "SMART JSON parsing failed."}
 
-    temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
-    environmental_reports = (
-        payload.get("scsi_environmental_reports")
-        if isinstance(payload.get("scsi_environmental_reports"), dict)
-        else {}
+    unread: set[str] = set()
+    temperature = _reported_object(payload, "temperature", unread, *_SMARTCTL_TEMPERATURE_FIELDS)
+    current_temperature = _reported(temperature, "current", _json_celsius, unread, "temperature_c")
+    if current_temperature is None and "temperature_c" not in unread:
+        environmental_reports = _reported_object(payload, "scsi_environmental_reports", unread, "temperature_c")
+        environmental_temperature = _reported_object(environmental_reports, "temperature_1", unread, "temperature_c")
+        current_temperature = _reported(environmental_temperature, "current", _json_celsius, unread, "temperature_c")
+    power_on_time = _reported_object(payload, "power_on_time", unread, "power_on_hours")
+    firmware_version = _reported_text(payload, "firmware_version", unread, "firmware_version")
+    nvme_version = _reported_object(payload, "nvme_version", unread, "protocol_version")
+    protocol_version = _reported_text(nvme_version, "string", unread, "protocol_version")
+    if protocol_version is None and "protocol_version" not in unread:
+        sata_version = _reported_object(payload, "sata_version", unread, "protocol_version")
+        protocol_version = _reported_text(sata_version, "string", unread, "protocol_version")
+    smart_status = _reported_object(payload, "smart_status", unread, "smart_health_status")
+    passed = _reported(
+        smart_status, "passed", lambda value: value if isinstance(value, bool) else None,
+        unread, "smart_health_status",
     )
-    environmental_temperature = (
-        environmental_reports.get("temperature_1")
-        if isinstance(environmental_reports.get("temperature_1"), dict)
-        else {}
+    smart_health_status = None if passed is None else ("PASSED" if passed else "FAILED")
+    rotation_rate = _reported(payload, "rotation_rate", _coerce_non_negative_int, unread, "rotation_rate_rpm")
+    form_factor = _reported_text(
+        _reported_object(payload, "form_factor", unread, "form_factor"), "name", unread, "form_factor",
     )
-    power_on_time = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
-    logical_block_size = payload.get("logical_block_size")
-    physical_block_size = payload.get("physical_block_size")
-    firmware_version = normalize_text(payload.get("firmware_version"))
-    protocol_version = (
-        normalize_text(payload.get("nvme_version", {}).get("string"))
-        if isinstance(payload.get("nvme_version"), dict)
-        else None
+    scsi_transport_protocol = _reported_object(payload, "scsi_transport_protocol", unread, "transport_protocol")
+    transport_protocol = _reported_text(scsi_transport_protocol, "name", unread, "transport_protocol")
+    if transport_protocol is None and "transport_protocol" not in unread:
+        device = _reported_object(payload, "device", unread, "transport_protocol")
+        transport_protocol = _reported_text(device, "protocol", unread, "transport_protocol")
+    logical_unit_id = _reported_sas_address(payload, "logical_unit_id", unread, "logical_unit_id")
+    power_on_hours = _reported(power_on_time, "hours", _coerce_non_negative_int, unread, "power_on_hours")
+    _derived_unread(unread, "power_on_days", power_on_hours, {"power_on_hours": power_on_hours})
+    power_cycle_count = _extract_ata_attribute_raw_value(payload, 12, unread=unread, field="power_cycle_count")
+    power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets", unread, "power_on_resets")
+    warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(
+        payload, temperature, unread,
     )
-    if not protocol_version:
-        protocol_version = (
-            normalize_text(payload.get("sata_version", {}).get("string"))
-            if isinstance(payload.get("sata_version"), dict)
-            else None
-        )
-    smart_status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
-    rotation_rate = payload.get("rotation_rate") if isinstance(payload.get("rotation_rate"), int) else None
-    form_factor = (
-        normalize_text(payload.get("form_factor", {}).get("name"))
-        if isinstance(payload.get("form_factor"), dict)
-        else None
-    )
-    transport_protocol = (
-        normalize_text(payload.get("scsi_transport_protocol", {}).get("name"))
-        if isinstance(payload.get("scsi_transport_protocol"), dict)
-        else None
-    )
-    if not transport_protocol:
-        transport_protocol = (
-            normalize_text(payload.get("device", {}).get("protocol"))
-            if isinstance(payload.get("device"), dict)
-            else None
-    )
-    logical_unit_id = format_hex_identifier(payload.get("logical_unit_id"))
-    smart_health_status = None
-    if smart_status:
-        passed = smart_status.get("passed")
-        if passed is True:
-            smart_health_status = "PASSED"
-        elif passed is False:
-            smart_health_status = "FAILED"
-    power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
-    power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
-    power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
-    warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(payload, temperature)
-    sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
+    logical_block_size_reported = "logical_block_size" in payload
+    logical_block_size = _reported(payload, "logical_block_size", _positive_int, unread, "logical_block_size")
+    physical_block_size = _reported(payload, "physical_block_size", _positive_int, unread, "physical_block_size")
+    # An absent size keeps the long-standing 512-byte sector default. A reported
+    # size that is not a positive integer is rejected, and is never replaced by
+    # that default: sector-valued counters then have no byte total.
+    sector_size_for_ata = logical_block_size if logical_block_size_reported else 512
     traffic_and_wear = _extract_smartctl_traffic_and_wear(
         payload,
         power_on_hours,
         sector_size_for_ata,
+        unread,
     )
     available_spare_percent = traffic_and_wear["available_spare_percent"]
     available_spare_threshold_percent = traffic_and_wear["available_spare_threshold_percent"]
@@ -3876,56 +4440,56 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     estimated_remaining_bytes_written = traffic_and_wear["estimated_remaining_bytes_written"]
     media_errors = traffic_and_wear["media_errors"]
     unsafe_shutdowns = traffic_and_wear["unsafe_shutdowns"]
-    read_commands = _extract_ata_device_stat_int(payload, "Number of Read Commands")
-    write_commands = _extract_ata_device_stat_int(payload, "Number of Write Commands")
-    hardware_resets = _extract_ata_device_stat_int(payload, "Number of Hardware Resets")
-    interface_crc_errors = _extract_ata_device_stat_int(payload, "Number of Interface CRC Errors")
-    if interface_crc_errors is None:
-        interface_crc_errors = _extract_ata_attribute_raw_value(payload, 199)
-    read_cache_enabled = (
-        payload.get("read_lookahead", {}).get("enabled")
-        if isinstance(payload.get("read_lookahead"), dict)
-        and isinstance(payload.get("read_lookahead", {}).get("enabled"), bool)
-        else None
+    read_commands = _extract_ata_device_stat_int(payload, "Number of Read Commands", unread, "read_commands")
+    write_commands = _extract_ata_device_stat_int(payload, "Number of Write Commands", unread, "write_commands")
+    hardware_resets = _extract_ata_device_stat_int(payload, "Number of Hardware Resets", unread, "hardware_resets")
+    interface_crc_errors = _extract_ata_device_stat_int(
+        payload, "Number of Interface CRC Errors", unread, "interface_crc_errors",
     )
-    writeback_cache_enabled = (
-        payload.get("write_cache", {}).get("enabled")
-        if isinstance(payload.get("write_cache"), dict)
-        and isinstance(payload.get("write_cache", {}).get("enabled"), bool)
-        else None
-    )
-    interface_speed = payload.get("interface_speed") if isinstance(payload.get("interface_speed"), dict) else {}
-    interface_speed_current = interface_speed.get("current") if isinstance(interface_speed.get("current"), dict) else {}
-    negotiated_link_rate = normalize_text(interface_speed_current.get("string"))
+    if interface_crc_errors is None and "interface_crc_errors" not in unread:
+        interface_crc_errors = _extract_ata_attribute_raw_value(
+            payload, 199, unread=unread, field="interface_crc_errors",
+        )
+    read_cache_enabled = _reported_cache_flag(payload, "read_lookahead", unread, "read_cache_enabled")
+    writeback_cache_enabled = _reported_cache_flag(payload, "write_cache", unread, "writeback_cache_enabled")
+    interface_speed = _reported_object(payload, "interface_speed", unread, "negotiated_link_rate")
+    interface_speed_current = _reported_object(interface_speed, "current", unread, "negotiated_link_rate")
+    negotiated_link_rate = _reported_text(interface_speed_current, "string", unread, "negotiated_link_rate")
 
-    if rotation_rate is None and transport_protocol and transport_protocol.upper() == "NVME":
+    # NVMe drives do not rotate; infer 0 only when no rotation rate was
+    # reported, never in place of a reported value that could not be read.
+    if (
+        rotation_rate is None
+        and "rotation_rate" not in payload
+        and transport_protocol
+        and transport_protocol.upper() == "NVME"
+    ):
         rotation_rate = 0
 
-    nvme_namespaces = payload.get("nvme_namespaces") if isinstance(payload.get("nvme_namespaces"), list) else []
-    namespace_eui64 = None
-    if nvme_namespaces and isinstance(nvme_namespaces[0], dict):
-        eui64_payload = nvme_namespaces[0].get("eui64")
-        if isinstance(eui64_payload, dict):
-            oui = eui64_payload.get("oui")
-            ext_id = eui64_payload.get("ext_id")
-            if isinstance(oui, int) and isinstance(ext_id, int):
-                namespace_eui64 = _format_nvme_eui64(f"{oui:06x}{ext_id:010x}")
+    namespace_eui64 = _reported_namespace_eui64(payload, unread)
 
-    sas_phy = _extract_smartctl_sas_phy(payload)
+    phy_unread: set[str] = set()
+    sas_phy = _extract_smartctl_sas_phy(payload, phy_unread)
     if sas_phy is None:
         sas_address = None
         attached_sas_address = None
     else:
+        # The selected PHY's link rate replaces the interface-speed one.
+        unread.discard("negotiated_link_rate")
+        unread.update(phy_unread)
         sas_address, attached_sas_address, negotiated_link_rate = sas_phy
 
-    latest_test_type, latest_test_status, latest_test_lifetime_hours = _extract_smartctl_latest_test(payload)
-
-    current_temperature = (
-        temperature.get("current")
-        if isinstance(temperature.get("current"), int)
-        else environmental_temperature.get("current")
-        if isinstance(environmental_temperature.get("current"), int)
+    latest_test_type, latest_test_status, latest_test_lifetime_hours = _extract_smartctl_latest_test(payload, unread)
+    last_test_age_hours = (
+        power_on_hours - latest_test_lifetime_hours
+        if isinstance(power_on_hours, int)
+        and isinstance(latest_test_lifetime_hours, int)
+        and power_on_hours >= latest_test_lifetime_hours
         else None
+    )
+    _derived_unread(
+        unread, "last_test_age_hours", last_test_age_hours,
+        {"power_on_hours": power_on_hours, "last_test_lifetime_hours": latest_test_lifetime_hours},
     )
 
     return _finalize_summary(
@@ -3941,15 +4505,9 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "last_test_type": latest_test_type,
             "last_test_status": latest_test_status,
             "last_test_lifetime_hours": latest_test_lifetime_hours,
-            "last_test_age_hours": (
-                power_on_hours - latest_test_lifetime_hours
-                if isinstance(power_on_hours, int)
-                and isinstance(latest_test_lifetime_hours, int)
-                and power_on_hours >= latest_test_lifetime_hours
-                else None
-            ),
-            "logical_block_size": logical_block_size if isinstance(logical_block_size, int) else None,
-            "physical_block_size": physical_block_size if isinstance(physical_block_size, int) else None,
+            "last_test_age_hours": last_test_age_hours,
+            "logical_block_size": logical_block_size,
+            "physical_block_size": physical_block_size,
             "available_spare_percent": available_spare_percent,
             "available_spare_threshold_percent": available_spare_threshold_percent,
             "endurance_used_percent": endurance_used_percent,
@@ -3983,27 +4541,34 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "sata_phy_events": _extract_smartctl_sata_phy_events(payload),
         },
         "No SMART summary fields were returned for this disk.",
+        unread=unread,
     )
 
 
 def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe smart-log JSON parsing failed."}
 
-    temperature_c = _kelvin_to_celsius(payload.get("temperature"))
-    power_on_hours = _coerce_non_negative_int(payload.get("power_on_hours"))
-    available_spare_percent = _coerce_non_negative_int(payload.get("avail_spare"))
-    available_spare_threshold_percent = _coerce_non_negative_int(payload.get("spare_thresh"))
-    endurance_used_percent = _coerce_non_negative_int(payload.get("percent_used"))
+    unread: set[str] = set()
+    temperature_c = _reported_kelvin(payload, "temperature", unread, "temperature_c")
+    power_on_hours = _reported(payload, "power_on_hours", _coerce_non_negative_int, unread, "power_on_hours")
+    available_spare_percent = _reported(
+        payload, "avail_spare", _coerce_non_negative_int, unread, "available_spare_percent",
+    )
+    available_spare_threshold_percent = _reported(
+        payload, "spare_thresh", _coerce_non_negative_int, unread, "available_spare_threshold_percent",
+    )
+    endurance_used_percent = _reported(
+        payload, "percent_used", _coerce_non_negative_int, unread, "endurance_used_percent",
+    )
     endurance_remaining_percent = (
         max(0, 100 - endurance_used_percent) if endurance_used_percent is not None else None
     )
-    bytes_read = _nvme_data_units_to_bytes(payload.get("data_units_read"))
-    bytes_written = _nvme_data_units_to_bytes(payload.get("data_units_written"))
-    media_errors = _coerce_non_negative_int(payload.get("media_errors"))
-    unsafe_shutdowns = _coerce_non_negative_int(payload.get("unsafe_shutdowns"))
+    bytes_read = _reported(payload, "data_units_read", _nvme_data_units_to_bytes, unread, "bytes_read")
+    bytes_written = _reported(payload, "data_units_written", _nvme_data_units_to_bytes, unread, "bytes_written")
+    media_errors = _reported(payload, "media_errors", _coerce_non_negative_int, unread, "media_errors")
+    unsafe_shutdowns = _reported(payload, "unsafe_shutdowns", _coerce_non_negative_int, unread, "unsafe_shutdowns")
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
@@ -4017,6 +4582,27 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
         max(estimated_lifetime_bytes_written - bytes_written, 0)
         if estimated_lifetime_bytes_written is not None and bytes_written is not None
         else None
+    )
+    _derived_unread(unread, "power_on_days", power_on_hours, {"power_on_hours": power_on_hours})
+    _derived_unread(
+        unread, "endurance_remaining_percent", endurance_remaining_percent,
+        {"endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_read", annualized_bytes_read,
+        {"bytes_read": bytes_read, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_written", annualized_bytes_written,
+        {"bytes_written": bytes_written, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "estimated_lifetime_bytes_written", estimated_lifetime_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "estimated_remaining_bytes_written", estimated_remaining_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
     )
 
     return _finalize_summary(
@@ -4055,19 +4641,20 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
             media_errors,
             unsafe_shutdowns,
         ),
+        unread=unread,
     )
 
 
 def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ctrl JSON parsing failed."}
 
-    firmware_version = normalize_text(payload.get("fr"))
-    protocol_version = _format_nvme_version(payload.get("ver"))
-    warning_temperature_c = _kelvin_to_celsius(payload.get("wctemp"))
-    critical_temperature_c = _kelvin_to_celsius(payload.get("cctemp"))
+    unread: set[str] = set()
+    firmware_version = _reported_text(payload, "fr", unread, "firmware_version")
+    protocol_version = _reported(payload, "ver", _format_nvme_version, unread, "protocol_version")
+    warning_temperature_c = _reported_kelvin(payload, "wctemp", unread, "warning_temperature_c")
+    critical_temperature_c = _reported_kelvin(payload, "cctemp", unread, "critical_temperature_c")
 
     return _finalize_summary(
         {
@@ -4077,22 +4664,27 @@ def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
             "critical_temperature_c": critical_temperature_c,
         },
         "No NVMe controller identity fields were returned for this disk.",
+        unread=unread,
     )
 
 
 def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ns JSON parsing failed."}
 
+    unread: set[str] = set()
     return _finalize_summary(
         {
-            "namespace_eui64": _format_nvme_eui64(payload.get("eui64")),
-            "namespace_nguid": _format_nvme_nguid(payload.get("nguid")),
+            "namespace_eui64": _reported(payload, "eui64", _format_nvme_eui64, unread, "namespace_eui64"),
+            "namespace_nguid": _reported(payload, "nguid", _format_nvme_nguid, unread, "namespace_nguid"),
         },
         "No NVMe namespace identity fields were returned for this disk.",
+        unread=unread,
     )
+
+
+_SATA_CURRENT_LINK_RATE_PATTERN = re.compile(r"\(current:\s*([^)]+)\)", re.IGNORECASE)
 
 
 def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
@@ -4134,7 +4726,10 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         elif line.startswith("SATA Version is:"):
             value = normalize_text(line.split(":", 1)[1])
             if value:
-                current_match = re.search(r"\(current:\s*([^)]+)\)", value, re.IGNORECASE)
+                # The match ends at a ")", so the search stops at the last
+                # one: with no ")" after it, a whitespace run after "current:"
+                # was retried from every position (#1216).
+                current_match = _SATA_CURRENT_LINK_RATE_PATTERN.search(value, 0, value.rfind(")") + 1)
                 if current_match:
                     negotiated_link_rate = normalize_text(current_match.group(1))
                     value = normalize_text(value[: current_match.start()].rstrip(" ,")) or value
@@ -4383,10 +4978,14 @@ def canonicalize_ssh_command(command: str) -> str:
     if not tokens:
         return command.strip()
 
-    while tokens and tokens[0] == "sudo":
-        tokens.pop(0)
-        while tokens and tokens[0].startswith("-"):
-            tokens.pop(0)
+    # Step over `sudo` and its options with an index and slice once: popping
+    # the front of the list moved every later word each time (#1216).
+    start = 0
+    while start < len(tokens) and tokens[start] == "sudo":
+        start += 1
+        while start < len(tokens) and tokens[start].startswith("-"):
+            start += 1
+    tokens = tokens[start:]
 
     if not tokens:
         return command.strip()
@@ -4505,6 +5104,33 @@ def parse_lsblk_json(output: str) -> list[dict[str, Any]]:
     return [item for item in blockdevices if isinstance(item, dict)]
 
 
+_LSSCSI_TRANSPORT_PATTERN = re.compile(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)")
+_LSSCSI_TRANSPORT_RUN_PATTERN = re.compile(r"[A-Za-z0-9_+-]+")
+_WORD_BOUNDARY_PATTERN = re.compile(r"\b")
+
+
+def _search_lsscsi_transport(detail: str) -> re.Match[str] | None:
+    """`_LSSCSI_TRANSPORT_PATTERN.search(detail)` with work linear in the text.
+
+    The unanchored search started again at every word boundary inside a run of
+    transport characters with no colon after it (`a-a-a-...`), and each start
+    read the rest of the run (#1216). Every start inside one run ends at the
+    same run end, so it succeeds or fails with the first start the word
+    boundary allows. One match there per run finds the same match.
+    """
+
+    for run in _LSSCSI_TRANSPORT_RUN_PATTERN.finditer(detail):
+        if detail[run.end() : run.end() + 1] != ":":
+            continue
+        boundary = _WORD_BOUNDARY_PATTERN.search(detail, run.start(), run.end())
+        if boundary is None or boundary.start() >= run.end():
+            continue
+        match = _LSSCSI_TRANSPORT_PATTERN.match(detail, boundary.start())
+        if match:
+            return match
+    return None
+
+
 def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxScsiDevice]:
     devices: list[LinuxScsiDevice] = []
     line_pattern = re.compile(r"^\[(?P<hctl>[^\]]+)\]\s+(?P<type>\S+)\s+(?P<body>.*)$")
@@ -4536,7 +5162,7 @@ def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxS
         )
 
         if transport:
-            transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
+            transport_match = _search_lsscsi_transport(detail)
             if transport_match:
                 parsed.transport = normalize_text(transport_match.group("transport").lower())
                 parsed.transport_address = normalize_text(transport_match.group("address").rstrip(",;"))
@@ -4608,14 +5234,22 @@ def parse_ubntstorage_json(output: str) -> list[dict[str, Any]]:
     return []
 
 
+_UNIFI_GPIO_LINE_HEAD_PATTERN = re.compile(r"gpio-\d+\s+\(", re.IGNORECASE)
+_UNIFI_GPIO_LINE_PATTERN = re.compile(
+    r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
+    re.IGNORECASE,
+)
+
+
 def parse_unifi_gpio_debug(output: str) -> dict[int, bool]:
     slot_states: dict[int, bool] = {}
-    line_pattern = re.compile(
-        r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
-        re.IGNORECASE,
-    )
     for raw_line in output.splitlines():
-        match = line_pattern.search(raw_line)
+        # Only the first `gpio-N (` can start the leftmost match: a later one
+        # opens after it, so its greedy scan for "|hdd@" sees a subset of the
+        # same text. One match there, instead of a search that rescanned the
+        # rest of the line from every `gpio-N (` (#1216).
+        head = _UNIFI_GPIO_LINE_HEAD_PATTERN.search(raw_line)
+        match = _UNIFI_GPIO_LINE_PATTERN.match(raw_line, head.start()) if head else None
         if not match:
             continue
         if match.group("direction").lower() != "out":
@@ -4895,17 +5529,19 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
     return details
 
 
-def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[Any]:
+    # Every entry, objects or not: the parser skips the others, and the census
+    # check refuses a reply that has any (#1218).
     rows = response_data.get("Drive Information") or response_data.get("PD LIST") or []
     if isinstance(rows, list) and rows:
-        return [row for row in rows if isinstance(row, dict)]
+        return list(rows)
 
-    fallback_rows: list[dict[str, Any]] = []
+    fallback_rows: list[Any] = []
     for key, value in response_data.items():
         if not isinstance(key, str) or not re.match(r"^Drive\s+/c\d+/e\d+/s\d+$", key, re.IGNORECASE):
             continue
         if isinstance(value, list):
-            fallback_rows.extend(item for item in value if isinstance(item, dict))
+            fallback_rows.extend(value)
         elif isinstance(value, dict):
             fallback_rows.append(value)
     return fallback_rows
@@ -5032,6 +5668,49 @@ def parse_storcli_physical_drives(
     return drives
 
 
+def storcli_physical_drive_list_complete(output: str) -> bool:
+    """True when a `/eall/sall show all J` reply is taken as the drive census (#1218).
+
+    Every controller block answered `Success`, the drive parser read at least
+    one drive record (from the `Drive Information`/`PD LIST` table or from
+    `Drive /cN/eM/sK` entries), every record names an enclosure and slot, and
+    no `Drive /cN/eM/sK` entry names a drive the records do not; a slot it
+    lists no drive in is then taken as empty. A failed or unparsed reply, one
+    with no drive record, a record without its enclosure and slot, or a
+    `Drive /cN/eM/sK` entry for a drive the records do not list proves no
+    absence. The check runs one way only (the records may list drives no such
+    entry names), and nothing compares the records with the controller's own
+    drive count or enclosure list: a well-formed reply that leaves drives out
+    is taken as the census, as before #1218.
+    """
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return False
+    controllers = payload.get("Controllers") if isinstance(payload, dict) else None
+    if not isinstance(controllers, list) or not controllers:
+        return False
+    for controller in controllers:
+        status = controller.get("Command Status") if isinstance(controller, dict) else None
+        response = controller.get("Response Data") if isinstance(controller, dict) else None
+        if not isinstance(status, dict) or str(status.get("Status") or "").strip().casefold() != "success":
+            return False
+        if not isinstance(response, dict):
+            return False
+        # The records the drive parser reads, in either form it accepts.
+        listed = [
+            _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2] if isinstance(row, dict) else None
+            for row in _collect_storcli_physical_drive_rows(response)
+        ]
+        named = {
+            _storcli_slot_key(detail.get("enclosure_id"), detail.get("slot"))
+            for detail in _collect_storcli_drive_details(response).values()
+        }
+        if not listed or None in listed or not named <= set(listed):
+            return False
+    return True
+
+
 def _collect_storcli_virtual_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     details: dict[str, dict[str, Any]] = {}
     for key, value in response_data.items():
@@ -5063,6 +5742,34 @@ def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[d
     return fallback_rows
 
 
+_STORCLI_PD_SECTION_HEADING_PATTERN = re.compile(r"\bPDs\s+for\s+VD\s+", re.IGNORECASE)
+_STORCLI_PD_SECTION_VD_PATTERN = re.compile(r"\w*")
+
+
+def _collect_storcli_pd_sections(response_data: dict[str, Any]) -> dict[str, list[list[Any]]]:
+    """Each "PDs for VD <n>" section value, indexed once by its VD number.
+
+    The VD loop used to search every response key again for each VD (#1216).
+    A decimal VD number names a section exactly when the word that follows the
+    heading is that number, so one pass over the keys answers every VD, in
+    key order, with the same sections as the per-VD search.
+    """
+
+    sections: dict[str, list[list[Any]]] = {}
+    for key, value in response_data.items():
+        if not isinstance(key, str):
+            continue
+        named: set[str] = set()
+        for heading in _STORCLI_PD_SECTION_HEADING_PATTERN.finditer(key):
+            vd_id = _STORCLI_PD_SECTION_VD_PATTERN.match(key, heading.end()).group(0)
+            if vd_id in named or not (vd_id.isascii() and vd_id.isdigit()):
+                continue
+            named.add(vd_id)
+            if isinstance(value, list):
+                sections.setdefault(vd_id, []).append(value)
+    return sections
+
+
 def _parse_storcli_virtual_drive_response(
     response_data: dict[str, Any],
     *,
@@ -5071,6 +5778,7 @@ def _parse_storcli_virtual_drive_response(
 ) -> list[dict[str, Any]]:
     rows = _collect_storcli_virtual_drive_rows(response_data)
     details_by_vd = _collect_storcli_virtual_drive_details(response_data)
+    pd_sections_by_vd = _collect_storcli_pd_sections(response_data)
     virtual_drives: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -5082,11 +5790,11 @@ def _parse_storcli_virtual_drive_response(
         if vd_id is None:
             vd_id = normalize_text(str(row.get("VD") if row.get("VD") is not None else ""))
         detail = details_by_vd.get(vd_id or "", {})
-        pd_rows = []
-        for key, value in response_data.items():
-            if isinstance(key, str) and re.search(rf"\bPDs\s+for\s+VD\s+{re.escape(vd_id or '')}\b", key, re.IGNORECASE):
-                if isinstance(value, list):
-                    pd_rows.extend(item for item in value if isinstance(item, dict))
+        # Only a decimal VD number names its sections. A row without one is
+        # given no section rather than every section in the response.
+        pd_rows = [
+            item for section in pd_sections_by_vd.get(vd_id or "", ()) for item in section if isinstance(item, dict)
+        ]
         physical_drives = []
         for pd_row in pd_rows:
             enclosure_id, slot, slot_key = _parse_storcli_eid_slot(pd_row.get("EID:Slt") or pd_row.get("EID:Slt "))
@@ -5226,7 +5934,15 @@ def parse_ssh_outputs(
     slot_count: int,
     enclosure_filter: str | None,
     selected_enclosure_id: str | None = None,
+    *,
+    enclosure_sysfs_slots: dict[str, dict[int, list[str]]] | None = None,
 ) -> ParsedSSHData:
+    """Parse one set of SSH command outputs.
+
+    `enclosure_sysfs_slots` is the already parsed host enclosure sysfs map, for
+    a caller that applies one host map to several devices' outputs; it is used
+    instead of any `enclosure sysfs map` output in `outputs`.
+    """
     parsed = ParsedSSHData()
     normalized_outputs: dict[str, str] = {}
 
@@ -5268,6 +5984,9 @@ def parse_ssh_outputs(
             )
         elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
             controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
+            parsed.esxi_storcli_drive_lists[command_key] = storcli_physical_drive_list_complete(
+                normalized_outputs[command_key]
+            )
             parsed.esxi_storcli_physical_drives.extend(
                 parse_storcli_physical_drives(
                     normalized_outputs[command_key],
@@ -5320,11 +6039,12 @@ def parse_ssh_outputs(
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
         # Kernel enclosure-driver hints are keyed by device slot number, so
         # they join the merged bays, not the per-page pre-merge records.
-        enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
-        if enclosure_sysfs_output:
-            enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
-            if enclosure_sysfs_slots:
-                _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
+        if enclosure_sysfs_slots is None:
+            enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
+            if enclosure_sysfs_output:
+                enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
+        if enclosure_sysfs_slots:
+            _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
         for enclosure in parsed.ses_enclosures:
             _flag_degraded_ses_sas_addresses(enclosure)
     if parsed.ses_enclosures or ses_map_output or ses_show_output:

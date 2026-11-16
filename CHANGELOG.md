@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- Last-good SMART values saved by earlier versions are not shown after the
+  upgrade, because they do not record which appliance they came from. Each
+  bay shows SMART again after its next successful SMART read (#1261).
+
 ### Changed
 
 - The image now installs every Python package, direct and transitive, from
@@ -38,13 +44,88 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Storage Fabric SSH failures now retain fixed reason categories, exit status,
+  and reviewed context in public snapshots and status messages; configured
+  command text and remote output stay private, while logs keep value-safe cause
+  and redacted command context. Connection, host-key, key-file,
+  authentication, refused-destination and internal failures are categorised
+  from the local error itself, and the service log records its type and errno;
+  the service's own refusal sentence stays in the warning, an internal error is
+  reported as one even beside successful reads, and its log record lists frames
+  by file name, function and line only. An SG device path found by discovery
+  is used only in the `/dev/sgN` form, and a QuantaStor-reported node address
+  only when it reads, as reported, as an IP address or a host name (plain
+  spaces at either end are trimmed; any other whitespace or control character
+  makes it unusable); other values are dropped and counted, never shown.
+  Discovery keeps up to 16,384 SG devices per host (lowest numbers first) and
+  256 addresses per reported address list; reaching either limit, or
+  dropping a reported address, is shown in Storage Fabric warnings with the
+  counts (#1259).
+- Inventory source status and `/healthz`, SMART responses, BMC warnings,
+  locator status, storage-view history and mapping-preview errors and snapshot
+  exports now show a fixed category for a failure the platform API, the BMC or
+  the network reports (authentication failed, timed out, could not be reached,
+  TLS connection failed, certificate verification failed with a named
+  certificate problem, an unusable response, a reported error with its code),
+  keep this service's own messages such as the SSH-off note, sudo guidance and
+  missing slot or view as before, and name an unexpected local error as one.
+  A reply that is not a JSON object where one is required counts as an
+  unusable response. Log lines carry the operation, category, method or
+  endpoint, error name, code, errno or exit status instead of exception text;
+  background refresh, layout, SMART batch and mapping-save failure lines name
+  a fixed operation, the locate-light refusal line keeps this service's own
+  message and adds those fields but never the reported reason, and an
+  enclosure id, view id or device appears in a log line only when it is a
+  plain identifier. Collector failures stay at
+  ERROR, and an unexpected local error, also when an adapter wrapped it or it
+  happened while an error response was being read, is reported as an internal
+  error and logs at ERROR with file base names, functions and line numbers (at
+  most 20 frames) but without its message. Locate-light and system-locator
+  action errors, including locate-light commands run over SSH, add the reason
+  the appliance, BMC or command reported after the fixed message, at most 300
+  characters and without control characters; a local fault during those
+  actions answers "<action> stopped on an internal error; see the service
+  log." The SMART-over-SSH fallback and the SSH transport log records are not
+  covered by this change (#1263).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
   world-readable when the host refuses the mode change (#1180).
+- Certificate imports now keep asynchronous file reads and responses bound to
+  the editor and TLS target that started them, so later editor state cannot
+  receive an earlier import's trust result (#1252).
 
 ### Fixed
 
+- Changing where a system's reads are configured to go while keeping its
+  system ID (its appliance address including any path prefix, the API
+  dialect or version where it is part of that address, the platform, the TLS
+  server name the connection presents, SSH hosts, their order or port, the
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address,
+  query included) no
+  longer serves the previous destination's saved SMART values or bay details:
+  each saved row records the configured destinations it was read under, and
+  only rows for the current configuration are read. This follows configured
+  routing only; it does not record which node of a system answered. An edit
+  that moves no read, such as a rename, a new key, or an extra SSH host on a
+  platform that reads only the primary host, keeps the saved values. The first SMART read served from saved values
+  after a restart now refreshes from the disk in the background on its own,
+  instead of waiting for a second request (#1261).
+- A history pass where every SMART metric read failed no longer counts as a
+  success: it fails, keeps both metric cadences, and the next pass reads the
+  metrics again. When only some scopes fail, the healthy ones keep their
+  samples and the failed ones are retried on the next pass while the
+  collector reports partial collection (#1241).
+- In the admin setup form, turning off One-Time Bootstrap or switching the
+  platform to VMware ESXi or a BMC-only system while a permission preview is
+  still loading now keeps the guidance for the form as it is; the older
+  preview's result or error no longer replaces it (#1236).
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
 - The streamed backup import check of the slot mapping, SAS alias and slot
   detail files no longer builds fields it ignores, so one entry with a large
   unused value cannot exhaust memory. An entry whose used fields exceed 65,536
@@ -57,9 +138,172 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   activated, instead of replacing live history with a database the service
   then refuses to start on. The message names the found and supported
   versions, and live history is left unchanged (#1193).
+- Creating the demo builder system no longer deletes its new chassis profile
+  when the config file was already replaced and only the directory fsync
+  failed; the profile is kept and the request reports an uncertain save
+  (#1240).
+- The CORE Storage Fabric view no longer invents an `mpr-1` controller when
+  no `mprutil` output was returned; it says no controller or path data is
+  available and still draws the bays, pools and vdevs the inventory knows.
+  Output that cannot be read as controller data no longer creates a
+  controller. A count or list is shown as measured only when the reply that
+  carries it was read: a controller, path, expander or enclosure count whose
+  read did not happen, was incomplete or could not be parsed reads "not
+  read" or "at least N" in the summary, host line, disk view and main-page
+  topology summary instead of 0, and a lane whose expander or enclosure list
+  was not read says "Not read" instead of "No objects reported". A list
+  printed with its column heading and no rows is still a measured zero, and
+  rows `mprutil` prints with blank columns (an expander's zero parent or
+  enclosure handle, a non-SES enclosure's SEP handle) are read. Every
+  supported `mprutil -u N` command, `show all` included, counts its unit as
+  attempted, and a `show all` reply is read through its `Adapter:`,
+  `Devices:`, `Enclosures:` and `Expanders:` sections (a dedicated reply for
+  the same list wins, and a section in which `mprutil` printed an error is
+  not read); a unit that could not be read is named in a warning
+  and keeps the view partial, and a unit number that is not 1 to 4 digits is
+  rejected and counted, never shown. An adapter or expander PHY table that
+  was not read whole (missing, short, malformed or repeated rows) shows its
+  PHY counts as "not read", is counted in a warning and keeps the view
+  partial; a whole table keeps its counts, including rows for PHYs with
+  nothing attached and an expander that reports zero PHYs, and a
+  "Discovery still in progress" line in place of a PHY row adds no warning.
+  Of these reads, an unread or rejected controller unit, an unread expander
+  or enclosure list and a PHY table not read whole make the status partial.
+  An enclosure's device count comes only from a device list that was read;
+  an unread device list shows that count as "not read" and, as before,
+  leaves the status alone. On a partial
+  read, inventory bays that no controller lane claims are drawn in their own
+  group, and the no-controller lanes say "disks" for unmapped inventory. An
+  empty numbered `mprutil -u N` result no longer hides the unnumbered
+  adapter details. When only the unnumbered `mprutil show ...` commands
+  answer, their board and firmware stay on one controller, and every link
+  and controller reference names a node that is in the map (#1244, refs
+  #1219).
+- System Setup no longer replaces a system configured only in the top-level
+  `truenas` and `ssh` settings (in `config.yaml` or `.env`, including one that
+  sets only a credential and uses the default host) when a system is added,
+  under any id, `default` included. The add is refused before anything is
+  written. The message says to save `default` in System Setup or move it into
+  a `systems` entry in `config.yaml`, and that its API key and passwords are
+  then stored in `config.yaml`; the Advanced Configuration wiki page has the
+  steps. Saving `default` from System Setup now keeps the settings the form
+  does not show and the exact user names in effect, and copies each key or
+  password it keeps into `config.yaml` with the value in effect, including one
+  from a `TRUENAS_*` or `SSH_*` variable or its `_FILE` file, without showing
+  it; when group or other accounts can read `config.yaml`, that save logs a
+  warning and the result says so. Demo creation applies the same check. Each
+  config save stages under its own private name; one that fails or is
+  interrupted before the new file is published leaves the previous file intact
+  and removes its own staging copy, best effort, and no other file. Saves
+  still rewrite `config.yaml` without its comments (#1253).
+- Backup retention no longer deletes the last good copy on the strength of a
+  kept copy it has not checked. Before deleting, grooming reads back the
+  newest kept copy and compares size and SHA-256; a missing or corrupt one is
+  marked unverified, the plan is worked out again and the next copy is tried,
+  at most three reads per class and location. A copy that cannot be read, a
+  spent read budget or too little scratch space stops deletion at that
+  location with a named reason, and a clean-up that marked copies unverified
+  says so on the backup page. A manual clean-up gets up to 10 minutes in all
+  for those reads. If no usable answer comes back, the page says, in the
+  warning colour, that no answer came back and the clean-up may have run, may
+  still be running or may not have started, and asks for a reload in a few
+  minutes; nothing later changes that message. When the backup scheduler
+  cannot be reached, so the request was never sent, the page says the clean-up
+  did not start. Reload admin pages that were open before upgrading. History sidecar snapshots are replaced only by
+  FULLs that pass the same fresh check, at most 14 local FULL content checks per
+  backup run including the kept-copy check (#1195).
+- Malformed controller, enclosure (SES), expander, PCI, disk list or SMART
+  output no longer ties up the parser for seconds: a few kilobytes of long
+  letter, digit or whitespace runs made the CDB decoder, the SES element
+  count, the `mprutil show expanders` PHY rows, the `pciconf` and sysctl
+  location attributes, the `camcontrol devlist` and UniFi GPIO lines, the SATA
+  link-rate field, the `glabel status` label list and the `lsscsi -t`
+  transport field rescan the same text. A `camcontrol devlist` row with many
+  aliases, StorCLI output with many virtual drives, an SSH command with many
+  `sudo` options, the enclosure sysfs map read once for each SES device, and
+  the SES overlay that merged each SES device into everything merged before it
+  no longer cost the square of their size. The work of each parser named here
+  now grows linearly with its output, except the SES merge for one enclosure
+  reached over many paths, which costs what it did before and is tracked
+  separately. Well-formed output parses as before, including the SES shelves,
+  bays and locate targets shown and the host chosen when several hosts read
+  the same shelves. With redundant paths to a shelf,
+  an empty bay and different element numbering on the paths, a bay can still
+  be merged into its neighbour, as before; that is tracked separately. An
+  operation name or a run of CDB bytes too long to be real is not decoded; a
+  StorCLI virtual drive without a decimal VD number is no longer given the
+  physical drives of every VD; and a configured SSH command longer than 4096
+  characters or 256 words is refused when the configuration loads (#1260).
+- SES evidence no longer misplaces or hides disks: zero SAS addresses no longer
+  merge unrelated shelves seen from different hosts or give a bay another
+  host's identify target; a bay whose SES occupancy is unknown, including a
+  CORE `sesutil show` row without a device name, keeps its mapped disk and
+  shows as unknown instead of empty on every platform. Such a bay is no longer
+  turned occupied by an `OK` status; history keeps its last recorded disk and
+  records no removal for it; a recorded SMART failure or temperature for that
+  disk stays in the alert metrics until it is read again, while evidence for a
+  disk no longer in any configured enclosure is dropped; mapping health counts
+  it, even with a locate or fault light on, as unknown rather than as a disk,
+  and reports a saved bay assignment there as one that cannot be verified;
+  storage-view tiles, saved-view bays the backing enclosure does not list and
+  manual-only layout bays show `Unknown` instead of `Empty`; Storage Fabric
+  shows its `present` value as `unknown`; disk retention accounting does not
+  count a saved assignment there as a rendered disk; a manual-only saved view
+  does not show a saved serial in such a bay as a disk;
+  saving or clearing a bay assignment there is refused with a message that the
+  disk could not be checked, not that it changed; and the bay-assignment
+  restore preview says its current disk cannot be checked instead of calling
+  the bay empty. Quantastor
+  no longer hides a known disk behind a zero SAS address when stronger
+  evidence says the bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
+- QuantaStor: two overlapping storage views on one node no longer both show
+  the same disk, and another node's pool-device row at the same local path
+  (such as `/dev/sda`) no longer moves a disk to that node's bay, gives it
+  that node's pool, or lists the disk as visible on that node. A pool-device
+  row's device path now matches only a disk on the row's own node, and a row
+  with no known node matches no disk by path when the grid has several nodes;
+  stable identifiers (physical disk ID, serial, SCSI ID) still match across
+  nodes, and single-node systems are unchanged (#1264).
+- The backup list's Verified column now says what the backup details say: a
+  copy uploaded to an FTP-style target, which checks only the remote size,
+  reads "Size only at upload" in both places until an explicit Verify reads
+  it back and matches its SHA-256. A remote copy whose upload check was never
+  recorded now says so instead of "Yes". A Verify of the local copy no longer
+  carries over to a remote copy made from it, and one malformed stored upload
+  check no longer stops the whole list from loading. A Verify result now names
+  the copy it read. A remote copy's result saved before this change is no
+  longer counted, because it may have been copied from the local copy: after
+  upgrading, such a copy reads as its upload check (size only, or not
+  recorded) until it is verified again. Listing reads nothing from the target
+  and rewrites no catalogue file. The Verify banner follows the Verify's own
+  result, so one that could not reach
+  the target no longer says "Backup verified.", and "Last check" says Worked
+  only for a passed check. The clean-up dialog no longer calls the copy it
+  keeps in each place the newest verified copy: it is the newest copy that
+  passed its last completed check, which can be a size check, and the
+  clean-up refusal for that copy says the same instead of "the newest verified
+  copy". An S3 upload whose ETag matched is no longer recorded or shown as read
+  back: it says it was checked by the provider's checksum. A copy recorded as
+  read back, which earlier versions also recorded for a matching S3 ETag, says
+  provider's checksum or read-back when its target is S3 or no longer
+  configured. Both hold until the copy's own Verify passes. A Verify or
+  clean-up that stopped now shows its own result on the page instead of a
+  generic request failure. A Verify now reports whether the copy was read and
+  matched, read and did not match, or could not be read; one that could not
+  read the copy says nothing was checked and its earlier status is unchanged,
+  instead of reading as a failed check. Once the size or content check has
+  rejected a copy, a later failure (closing the connection, or removing the
+  partial download or the fetched temporary copy) no longer replaces that
+  result: the copy is still reported and marked as not matching, and a
+  download of it is refused as a mismatch, as is now a download larger than
+  catalogued. A rejection the caller was already handling when the Verify or
+  download began is not counted against this copy. An operating-system error
+  while removing the fetched temporary copy after a match no longer hides the
+  match and is logged. Interruption and cancellation still stop the Verify
+  (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
@@ -91,6 +335,126 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Storage Fabric event decoding no longer turns a CDB with a malformed byte
+  token into a different valid command with an invented address and length;
+  it is marked malformed and keeps its raw text. An ASC/ASCQ value that is not
+  two one- or two-digit hex bytes is no longer labelled as the sense code it
+  resembles; the first `asc:` field of a sense line is read whole, so such a
+  value is neither dropped nor replaced by a later `asc:` fragment, and it is
+  marked malformed with no fault family. A loginfo value that is wider than
+  32 bits or is not a hex number is no longer labelled as a known fault or
+  dropped; it stays unconfirmed, summaries count it as rejected instead of
+  listing the raw value, and long kernel text is shortened before it becomes
+  a summary key. Only the first `tgt`/`SMID`/`loginfo` tail of a controller
+  line is read: when its fields are not in the kernel's form it is marked
+  malformed and counted as rejected, and a later tail is never decoded in
+  its place (#1239).
+- Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
+  stop other admin requests while slow storage writes or syncs the staged
+  file, and a cancelled upload keeps its file until the write has finished.
+  The timing settings save now refuses a `values` field that is not a
+  mapping with a 400 instead of reporting success or failing with a 500
+  (#1250).
+- CORE expander counter output that repeats a PHY marker, carries an invalid
+  one such as `ff`, repeats its header, or carries anything after its end
+  marker (such as a second answer) is now refused as a whole: those PHYs read
+  unknown (`rejected_output`) instead of keeping whichever frame came first
+  as a measured zero or error count (#1238).
+- The history service no longer fails to start when an interrupted segmented
+  rotation or restore left its activation marker. It now stays up with
+  history stopped, and `/healthz` reports down with the recovery command,
+  leaving the marker and database untouched (#1243).
+- Fixed three admin Backups page bugs: adding or removing a target in Backup
+  settings discarded unsaved class settings, a reply from a closed settings
+  dialog could replace the open dialog's targets so Save dropped one, and a
+  copy could stay Kept after Stop keeping because the reload after a change
+  reused a read that started before it (#1254).
+- With zero-based API slot numbering, a disk whose nested enclosure slot is
+  the integer 0 now stays bound to bay 0 instead of losing its bay, matching
+  the string "0"; a boolean slot value is no longer read as a bay (#1235).
+- On ESXi hosts where two RAID controllers report the same local slot (such
+  as `13:0`), a placed disk no longer takes the other controller's pool,
+  topology and fault state; a slot key shared by several disks is no longer
+  used for topology lookup (#1237, refs #1213).
+- When a refresh returns incomplete topology and the last trusted inventory
+  view is kept, the answer now says so: it keeps the trusted bays and their
+  read time, but shows the latest refresh's source status and warnings under
+  a warning that the view is retained, and the snapshot export reports the
+  same warning instead of the earlier successful status (#1242).
+- Fixed recovery of a crashed segmented restore that also restored
+  configuration (#1196): recovery now returns configuration and history to the
+  same generation, or refuses with a named reason and keeps its evidence,
+  instead of reporting the prior generation restored while candidate
+  configuration stayed active. The history records recovery acts on must
+  match the restore's own record in the first configuration folder; a journal
+  whose history records differ is refused (`history-target-unrecorded`) and
+  nothing is changed. While a configuration folder that the
+  application's settings name still holds a restore record that recovery did
+  not settle, it reports `configuration-recovery-incomplete`, changes nothing
+  and exits with status 3; a folder it lists past its scan bound gives
+  `recovery-scan-limit-reached` the same way. Run such a recovery through the
+  admin service, which mounts the configuration volume; a receipt printed
+  without `APP_SERVICE_ROLE=admin` (the history container, or an older Compose
+  file with no roles) says the configuration folders were not checked there and
+  gives the admin command, which sets that role. The guide's check for records
+  left after the journal calls them stale only when configuration and history
+  both hold the generation the restore's recorded decision selects (#1265).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file was replaced between its check and its open reads again, and
+  after three such rereads refuses with `mapping_read_busy` (503,
+  `Retry-After`) instead of waiting. A read that already opened the file
+  returns that complete version. A mapping path that is not a regular file,
+  including one swapped in during a read, is refused without blocking and is
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
+  revision from the same read. A refused import now gets the named 503
+  instead of a generic error (#1256).
+- SMART and NVMe JSON with an unexpected shape no longer breaks the SMART
+  summary. A non-object payload reports SMART as unavailable. Each scalar
+  field the summary readers publish is checked against its documented JSON
+  form (an integer, text, a boolean, a hex identifier of the documented
+  width) and, where one is set, a range: Celsius readings -100 to 1000,
+  temperature limits 20 to 150 C, byte totals below 2^64, a 32-bit NVMe
+  version word, ATA attribute ids 1 to 255. A field reported in any other form
+  is "not read": its value is null, no default or lower-priority source in the
+  same output stands in for it, and the SMART summary API lists it in a new
+  `unread_fields` list. Documented "not available" limits stay absent, and
+  large integers in fields with no set range (hours, counters, sizes) are
+  still published as reported. A reported but invalid logical block size no
+  longer falls back to 512 bytes, and an invalid NVMe rotation rate is no
+  longer shown as SSD. A power-on time that is a negative whole number after
+  the existing conversion, from QuantaStor or from a saved slot-detail entry,
+  is not read either; when the disk also reported another SMART value, the
+  saved slot-detail cache keeps that refusal, and a QuantaStor disk that
+  reports nothing else says its power-on time was not read. Disk and
+  storage-view details
+  and the SMART tooltip (live and in the saved HTML copy), the live heat map
+  tooltip and Storage
+  Fabric show `not read` for such a field
+  instead of hiding it, showing `n/a` or `0 d`, or filling it from the slot;
+  an absent field keeps its existing text, and a summary whose every field
+  was unreadable says "SMART summary fields were returned for this disk but
+  could not be read." The Attention Score adds the reason "SMART inputs not
+  read" when an input it weighs was not read, and shows "not scored: SMART
+  inputs not read" instead of 0 when none was read and nothing else scored.
+  The history collector treats a temperature it cannot convert, or a value
+  its database cannot store, as no sample instead of failing the pass. Stored
+  history, the saved slot-detail cache (apart from a refused power-on time),
+  the heat-map timeline and the per-row
+  SAS port and SATA PHY counters do not yet keep "not read" apart from absent
+  (#1249).
 
 ### Performance
 
@@ -103,6 +467,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, a `--root` below a directory another user could rename
+  entries in, and missing fixtures before running any command. Every write,
+  move or removal inside the directory it created first checks, by device and
+  inode for the root and every parent, that it is still that directory, and a
+  recursive removal first checks every deployment directory it created inside
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
+  verified, also between the admin scenario's two phases, and keeps the root
+  and exits nonzero when cleanup fails or is unknown. Its header states what
+  this does not cover: a process running as the same user or as root that
+  swaps directories while it runs (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,
@@ -113,6 +492,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   build cannot replace the image a deployment follows; manual inputs are split
   without filename expansion, and branch, sha and custom tags are unchanged
   (#1179).
+- The release-wrap validator now fails a checklist table that repeats a gate,
+  so a later Pass row can no longer hide an earlier Blocked one. It also
+  reports malformed rows, including a row missing an outer pipe, instead of
+  skipping them or ending the table there, and rejects "Not enough time" as an
+  N/A reason (#1233).
 
 ## v0.24.0-rc.1 - 2026-11-11
 

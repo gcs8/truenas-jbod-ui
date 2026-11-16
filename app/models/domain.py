@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
@@ -11,6 +12,36 @@ from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+SlotOccupancy = Literal["present", "empty", "unknown"]
+
+
+def slot_occupancy(slot: Any) -> SlotOccupancy:
+    """The one reader of a bay's occupancy (#1218): present, empty or unknown.
+
+    Slot views and history rows say ``present``, storage-view runtime slots say
+    ``occupied``, and ``presence_known`` says whether occupancy was read at all.
+    The legacy boolean alone cannot tell an empty bay from an unread one, so
+    every place that states emptiness, counts a disk or words a message about
+    the current occupant asks this function. ``slotOccupancy`` in
+    ``app/static/app.js`` is the page's twin. A slot with no boolean occupancy
+    is unknown.
+    """
+
+    if slot is None:
+        return "unknown"
+    if isinstance(slot, Mapping):
+        known = slot.get("presence_known")
+        flag = slot.get("present") if "present" in slot else slot.get("occupied")
+    else:
+        known = getattr(slot, "presence_known", True)
+        flag = getattr(slot, "present", None)
+        if flag is None:
+            flag = getattr(slot, "occupied", None)
+    if known is False or not isinstance(flag, bool):
+        return "unknown"
+    return "present" if flag else "empty"
 
 
 def trim_optional_text(value: str | None, *, max_length: int) -> str | None:
@@ -232,6 +263,10 @@ class SmartSummaryView(BaseModel):
     # SMART command or checksum problem with output still read (#1171).
     smartctl_exit_status: int | None = None
     smartctl_status_flags: list[str] | None = None
+    # Names of fields above that the source reported in a shape that could not
+    # be read. Such a field is "not read": its value is None, but unlike an
+    # absent field the source did report it, and it is never a zero.
+    unread_fields: list[str] = Field(default_factory=list)
     message: str | None = None
 
 
@@ -276,6 +311,12 @@ class SlotView(BaseModel):
     enclosure_label: str | None = None
     enclosure_name: str | None = None
     present: bool = False
+    # False when no evidence decided this bay's occupancy (#1218). `present`
+    # is then False too, but means "not known to hold a disk", not "empty":
+    # consumers must not draw, count, store or alert on the bay as either.
+    # Known is the default, so it is serialized only when False and saved
+    # snapshots without it read as before.
+    presence_known: bool = Field(default=True, exclude_if=lambda value: value is True)
     state: SlotState = SlotState.unknown
     # Live producers record the same state predicate before the locate mask.
     # Older saved snapshots omit it; never treat identify itself as a base state.
@@ -969,6 +1010,10 @@ class StorageViewRuntimeSlot(BaseModel):
     target_system_id: str | None = None
     target_system_label: str | None = None
     occupied: bool = False
+    # False when the backing enclosure bay's occupancy was not read (#1218):
+    # `occupied` is then False without meaning empty. Serialized only when
+    # False, like SlotView.presence_known.
+    presence_known: bool = Field(default=True, exclude_if=lambda value: value is True)
     state: str = "empty"
     source: Literal["snapshot_slot", "inventory_candidate", "manual_mapping", "placeholder"] = "placeholder"
     # The view draws a layout whose bay order is unvalidated (#1068): this bay

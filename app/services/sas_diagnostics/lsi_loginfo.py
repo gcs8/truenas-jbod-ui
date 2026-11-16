@@ -264,10 +264,67 @@ LSI_SAS_PL_ENCLOSURE_MGMT_ERRORS = {
 }
 
 
+MAX_LOGINFO_HEX_DIGITS = 8
+MAX_REJECTED_LOGINFO_LENGTH = 32
+
+
+def _over_width_loginfo(raw: str) -> dict[str, Any]:
+    # A loginfo is a 32-bit value. Masking a wider token to its low 32 bits
+    # would select a known fault from a suffix, so it stays raw evidence.
+    return _undecoded_loginfo(
+        raw, "Loginfo value is wider than 32 bits, so it was not decoded against the LSI reference table."
+    )
+
+
+def malformed_loginfo_result(raw: str) -> dict[str, Any]:
+    """Result for a loginfo field whose value is not a hexadecimal number."""
+    return _undecoded_loginfo(
+        raw,
+        "Loginfo value is malformed (it must be hexadecimal digits), so it was not decoded "
+        "against the LSI reference table.",
+    )
+
+
+def malformed_controller_tail_result(raw: str) -> dict[str, Any]:
+    """Result for a tgt/SMID/loginfo tail whose fields are not in the kernel's form."""
+    result = _undecoded_loginfo(
+        raw,
+        "The tgt/SMID/loginfo fields of this controller line are malformed (target and SMID must be "
+        "decimal, each field separated from its name), so they were not decoded and no later fields "
+        "on the line were read.",
+    )
+    result["controller_tail_raw"] = result.pop("loginfo")
+    result["controller_tail_malformed"] = True
+    return result
+
+
+def _undecoded_loginfo(raw: str, note: str) -> dict[str, Any]:
+    bounded = raw
+    if len(bounded) > MAX_REJECTED_LOGINFO_LENGTH:
+        bounded = f"{bounded[: MAX_REJECTED_LOGINFO_LENGTH - 3]}..."
+    return {
+        "label": "Controller terminated SCSI IO",
+        "family": "controller_terminated_io",
+        "likely_layer": fault_family_likely_layer("controller_terminated_io"),
+        "description": "The HBA reported an IO terminated before normal completion; its loginfo value was not decoded.",
+        "loginfo": bounded,
+        "decode_confidence": "unconfirmed",
+        "decoder_note": note,
+    }
+
+
+def loginfo_is_rejected(loginfo: Any) -> bool:
+    """True unless the loginfo is a hex number of at most 32 bits."""
+    raw = str(loginfo or "").strip().lower().removeprefix("0x")
+    return not (raw and re.fullmatch(r"[0-9a-f]+", raw) and len(raw) <= MAX_LOGINFO_HEX_DIGITS)
+
+
 def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:
     raw = str(loginfo or "").strip().lower().removeprefix("0x")
     if not raw or not re.fullmatch(r"[0-9a-f]+", raw):
         return None
+    if len(raw) > MAX_LOGINFO_HEX_DIGITS:
+        return _over_width_loginfo(raw)
     value = int(raw, 16)
     type_bits = value & 0xF0000000
     origin_bits = value & 0x0F000000

@@ -8,18 +8,31 @@ import re
 import ssl
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
 
 from app.config import BMCConfig, normalize_text, normalize_value_text
 from app.services.tls_context import SameOriginRedirectHandler
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
+    LocalServiceError,
+    TrueNASAPIError,
+    classify_remote_failure,
+    error_body_read_category,
+    is_local_failure_message,
+    log_failure,
+)
 
 logger = logging.getLogger(__name__)
 
 SUPER_MICRO_STORAGE_PAGE = "/cgi/url_redirect.cgi?url_name=sys_storage"
+SUPER_MICRO_LOGIN_PATH = "/cgi/login.cgi"
+# Only the Redfish error object's message is kept, as the error's separate
+# remote reason; the body is never part of the error message.
+REDFISH_ERROR_BODY_LIMIT = 64 * 1024
 # #737: bound web-XML discovery. One inventory pass makes four fixed requests
 # plus three per controller, so the controller cap is also its request budget
 # (52 requests at the cap).
@@ -90,6 +103,16 @@ def _normalize_bmc_host(host: str) -> str:
     return f"https://{trimmed.rstrip('/')}"
 
 
+def bmc_request_url(base_url: str, path: str) -> str:
+    """The URL a BMC request goes to: the request path appended to the base URL as text.
+
+    Everything the base URL carries is kept, a query included (a gateway in
+    front of several BMCs can route by it). The persisted-detail binding
+    reads where requests go from this function too.
+    """
+    return base_url + path
+
+
 def _int_from_hex(value: Any) -> int | None:
     text = normalize_value_text(value)
     if not text or text == "0":
@@ -110,6 +133,33 @@ def _int_from_decimal(value: Any) -> int | None:
         return None
 
 
+def _log_bmc_failure(operation: str, exc: BaseException) -> None:
+    log_failure(logger, operation, exc)
+
+
+def _redfish_error_message(body: bytes) -> str | None:
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error_block = payload.get("error")
+    if not isinstance(error_block, dict):
+        return None
+    return normalize_text(error_block.get("message"))
+
+
+def _bmc_warning(exc: TrueNASAPIError, operation: str, fixed_text: str) -> str:
+    """This service's own sentence as it is; anything from the BMC as fixed text."""
+
+    if is_local_failure_message(exc):
+        return str(exc)
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        return f"{operation} stopped on an internal error; see the service log."
+    return fixed_text
+
+
 class SupermicroBMCService:
     def __init__(self, config: BMCConfig) -> None:
         self.config = config
@@ -127,13 +177,15 @@ class SupermicroBMCService:
         try:
             self._populate_redfish_inventory(inventory)
         except TrueNASAPIError as exc:
-            inventory.warnings.append(str(exc))
+            _log_bmc_failure("BMC Redfish inventory", exc)
+            inventory.warnings.append(_bmc_warning(exc, "BMC Redfish inventory", "BMC Redfish inventory unavailable."))
             inventory.source_details["redfish_ok"] = False
 
         try:
             self._populate_web_inventory(inventory)
         except TrueNASAPIError as exc:
-            inventory.warnings.append(str(exc))
+            _log_bmc_failure("BMC web inventory", exc)
+            inventory.warnings.append(_bmc_warning(exc, "BMC web inventory", "BMC web inventory unavailable."))
             inventory.source_details["web_xml_ok"] = False
             if not inventory.drives:
                 self._populate_redfish_simple_storage_fallback(inventory)
@@ -153,7 +205,7 @@ class SupermicroBMCService:
         root = self._post_web_xml(opener, csrf, "/cgi/ipmi.cgi", {"op": "GET_UID_STATUS.XML", "r": "(0,0)"})
         uid_node = root.find("UID_INFO")
         if uid_node is None:
-            raise TrueNASAPIError("Supermicro BMC UID status did not return a UID_INFO node.")
+            raise LocalServiceError("Supermicro BMC UID status did not return a UID_INFO node.", category="response_invalid")
         return uid_node.get("uid_status") == "1"
 
     def set_uid_active(self, active: bool) -> bool:
@@ -166,7 +218,7 @@ class SupermicroBMCService:
             referer=self.base_url + SUPER_MICRO_STORAGE_PAGE,
         )
         if "ok" not in response.lower():
-            raise TrueNASAPIError("Supermicro BMC UID control did not confirm success.")
+            raise LocalServiceError("Supermicro BMC UID control did not confirm success.", category="response_invalid")
         return self.get_uid_status()
 
     def set_drive_identify(self, controller_id: int, physical_index: int, active: bool) -> None:
@@ -183,7 +235,7 @@ class SupermicroBMCService:
         )
         result = root.find("RESULT")
         if result is None or normalize_text(result.get("STATUS")) != "SUCCESS":
-            raise TrueNASAPIError("Supermicro BMC drive identify request did not return success.")
+            raise LocalServiceError("Supermicro BMC drive identify request did not return success.", category="response_invalid")
 
     def _populate_redfish_inventory(self, inventory: BMCInventory) -> None:
         system_payload = self._redfish_get_json("/redfish/v1/Systems/1")
@@ -195,8 +247,13 @@ class SupermicroBMCService:
         try:
             self._redfish_get_json("/redfish/v1/Systems/1/Storage")
         except TrueNASAPIError as exc:
+            _log_bmc_failure("BMC Redfish storage inventory", exc)
             inventory.source_details["redfish_storage_ok"] = False
-            inventory.source_details["redfish_storage_error"] = str(exc)
+            inventory.source_details["redfish_storage_error"] = _bmc_warning(
+                exc,
+                "BMC Redfish storage inventory",
+                "BMC Redfish storage inventory unavailable.",
+            )
         else:
             inventory.source_details["redfish_storage_ok"] = True
 
@@ -244,13 +301,14 @@ class SupermicroBMCService:
         ctrl_attr_node = ctrl_attr_root.find("BrcmStorCtrlAttr")
         controller_count = _int_from_decimal(ctrl_attr_node.get("ctrl_found_num")) if ctrl_attr_node is not None else None
         if not controller_count:
-            raise TrueNASAPIError("Supermicro BMC did not report any Broadcom controllers.")
+            raise LocalServiceError("Supermicro BMC did not report any Broadcom controllers.", category="response_invalid")
         # #737: the reported count sets how many requests follow (three per
         # controller), so an implausible value is refused before any of them.
         if not 0 < controller_count <= BMC_MAX_CONTROLLERS:
-            raise TrueNASAPIError(
+            raise LocalServiceError(
                 f"Supermicro BMC reported an unsupported Broadcom controller count "
-                f"(supported: 1 to {BMC_MAX_CONTROLLERS})."
+                f"(supported: 1 to {BMC_MAX_CONTROLLERS}).",
+                category="response_invalid",
             )
 
         uid_root = self._post_web_xml(opener, csrf, "/cgi/ipmi.cgi", {"op": "GET_UID_STATUS.XML", "r": "(0,0)"})
@@ -298,9 +356,10 @@ class SupermicroBMCService:
                 continue
             drive_nodes = hdd_info.findall("HDD")
             if len(drive_nodes) > BMC_MAX_DRIVES_PER_CONTROLLER:
-                raise TrueNASAPIError(
+                raise LocalServiceError(
                     f"Supermicro BMC reported more physical drives on controller {controller_id} "
-                    f"than the supported {BMC_MAX_DRIVES_PER_CONTROLLER}."
+                    f"than the supported {BMC_MAX_DRIVES_PER_CONTROLLER}.",
+                    category="response_invalid",
                 )
             for physical_index, drive_node in enumerate(drive_nodes):
                 drive = self._parse_web_drive_node(controller_id, physical_index, drive_node)
@@ -372,9 +431,9 @@ class SupermicroBMCService:
 
     def _redfish_get_json(self, path: str) -> dict[str, Any]:
         if not self.base_url:
-            raise TrueNASAPIError("BMC host is not configured.")
+            raise LocalServiceError("BMC host is not configured.")
         request = Request(
-            self.base_url + path,
+            bmc_request_url(self.base_url, path),
             headers={
                 "Accept": "application/json",
                 **self._basic_auth_header,
@@ -382,29 +441,57 @@ class SupermicroBMCService:
         )
         try:
             with self._build_https_opener().open(request, timeout=self.config.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8", "replace"))
+                payload = json.loads(response.read().decode("utf-8", "replace"))
         except HTTPError as exc:
             try:
-                payload = json.loads(exc.read().decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001
-                payload = None
-            if isinstance(payload, dict):
-                error_block = payload.get("error") or {}
-                message = normalize_text(error_block.get("message"))
-                if message:
-                    raise TrueNASAPIError(message) from exc
-            raise TrueNASAPIError(f"Redfish request failed with HTTP {exc.code} for {path}.") from exc
-        except (URLError, OSError, json.JSONDecodeError) as exc:
-            raise TrueNASAPIError(f"Redfish request failed for {path}: {exc}") from exc
+                with exc:
+                    body = exc.read(REDFISH_ERROR_BODY_LIMIT)
+            except (OSError, HTTPException) as read_exc:
+                raise TrueNASAPIError(
+                    f"Redfish request failed with HTTP {exc.code}; error response could not be read.",
+                    code=exc.code,
+                    category=error_body_read_category(read_exc),
+                    method=path,
+                ) from read_exc
+            category = "authentication_failed" if exc.code in {401, 403} else "remote_error"
+            raise TrueNASAPIError(
+                f"Redfish request failed with HTTP {exc.code}.",
+                code=exc.code,
+                category=category,
+                method=path,
+                reason=_redfish_error_message(body),
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise TrueNASAPIError(
+                "Redfish returned invalid JSON.",
+                category="response_invalid",
+                method=path,
+            ) from exc
+        except (URLError, OSError) as exc:
+            category, _code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                "Redfish request failed.",
+                category=category,
+                method=path,
+                reason=str(exc),
+            ) from exc
+        # Every Redfish resource is a JSON object; any other root is unusable.
+        if not isinstance(payload, dict):
+            raise TrueNASAPIError(
+                "Redfish returned an unusable response.",
+                category="response_invalid",
+                method=path,
+            )
+        return payload
 
     def _open_web_session(self):
         if not self.base_url:
-            raise TrueNASAPIError("BMC host is not configured.")
+            raise LocalServiceError("BMC host is not configured.")
         cookie_jar = http.cookiejar.CookieJar()
         opener = self._build_https_opener(cookie_jar)
         login_body = urlencode({"name": self.config.username, "pwd": self.config.password}).encode("utf-8")
         request = Request(
-            self.base_url + "/cgi/login.cgi",
+            bmc_request_url(self.base_url, SUPER_MICRO_LOGIN_PATH),
             data=login_body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
@@ -412,15 +499,30 @@ class SupermicroBMCService:
             with opener.open(request, timeout=self.config.timeout_seconds) as response:
                 body = response.read().decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
-            raise TrueNASAPIError(f"Supermicro BMC web login failed: {exc}") from exc
+            category, code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                "Supermicro BMC web login failed.",
+                code=code,
+                category=category,
+                method=SUPER_MICRO_LOGIN_PATH,
+                reason=str(exc),
+            ) from exc
         if not list(cookie_jar):
-            raise TrueNASAPIError("Supermicro BMC web login did not establish a session cookie.")
+            raise LocalServiceError(
+                "Supermicro BMC web login did not establish a session cookie.",
+                category="authentication_failed",
+                method=SUPER_MICRO_LOGIN_PATH,
+            )
         if "Invalid Username or Password" in body:
-            raise TrueNASAPIError("Supermicro BMC rejected the configured username or password.")
-        page = self._fetch_web_text(opener, self.base_url + SUPER_MICRO_STORAGE_PAGE)
+            raise LocalServiceError(
+                "Supermicro BMC rejected the configured username or password.",
+                category="authentication_failed",
+                method=SUPER_MICRO_LOGIN_PATH,
+            )
+        page = self._fetch_web_text(opener, bmc_request_url(self.base_url, SUPER_MICRO_STORAGE_PAGE))
         csrf_match = re.search(r'SmcCsrfInsert\s*\(\s*"CSRF-TOKEN"\s*,\s*"([^"]+)"', page)
         if not csrf_match:
-            raise TrueNASAPIError("Supermicro BMC storage page did not expose a CSRF token.")
+            raise LocalServiceError("Supermicro BMC storage page did not expose a CSRF token.", category="response_invalid")
         return opener, csrf_match.group(1)
 
     def _post_web_xml(self, opener, csrf: str, path: str, params: dict[str, Any]) -> ET.Element:
@@ -428,7 +530,11 @@ class SupermicroBMCService:
         try:
             return ET.fromstring(text)
         except ET.ParseError as exc:
-            raise TrueNASAPIError("Supermicro BMC returned invalid XML.") from exc
+            raise LocalServiceError(
+                "Supermicro BMC returned invalid XML.",
+                category="response_invalid",
+                method=path,
+            ) from exc
 
     def _post_web_text(
         self,
@@ -440,7 +546,7 @@ class SupermicroBMCService:
         referer: str,
     ) -> str:
         request = Request(
-            self.base_url + path,
+            bmc_request_url(self.base_url, path),
             data=urlencode(params).encode("utf-8"),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -453,14 +559,28 @@ class SupermicroBMCService:
             with opener.open(request, timeout=self.config.timeout_seconds) as response:
                 return response.read().decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
-            raise TrueNASAPIError(f"Supermicro BMC request failed for {path}: {exc}") from exc
+            category, code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                "Supermicro BMC request failed.",
+                code=code,
+                category=category,
+                method=path,
+                reason=str(exc),
+            ) from exc
 
     def _fetch_web_text(self, opener, url: str) -> str:
         try:
             with opener.open(url, timeout=self.config.timeout_seconds) as response:
                 return response.read().decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
-            raise TrueNASAPIError(f"Supermicro BMC request failed for {url}: {exc}") from exc
+            category, code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                "Supermicro BMC request failed.",
+                code=code,
+                category=category,
+                method=urlsplit(url).path,
+                reason=str(exc),
+            ) from exc
 
     def _build_https_opener(self, cookie_jar: http.cookiejar.CookieJar | None = None):
         context = ssl.create_default_context() if self.config.verify_ssl else ssl._create_unverified_context()

@@ -616,6 +616,9 @@ class PhyErrorLogResult:
     phy_range: str | None = None
     ended: bool = False
     rejected: bool = False
+    # A repeated or invalid header or PHY marker: the output is ambiguous, so
+    # parse_chunk_output() refuses it instead of keeping one frame (#1220).
+    malformed: bool = False
 
     @property
     def unit(self) -> int | None:
@@ -651,6 +654,9 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
     identity: str | None = None
     phy_range: str | None = None
     ended = False
+    malformed = False
+    header_seen = False
+    stopped = False
     rows: list[dict[str, Any]] = []
     current: int | None = None
     lines: list[str] = []
@@ -664,35 +670,55 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
 
     for raw_line in str(stdout or "").splitlines():
         line = raw_line.strip()
-        if line.startswith(f"{SMP_PHY_ERROR_LOG_MARKER}:") and identity is None:
+        if ended or (stopped and line and line != "@end"):
+            # One answer per output: after its end marker, or after the PHY
+            # that gave no answer, only blank lines (and then that end marker)
+            # may follow. Anything else, such as a second concatenated
+            # answer, makes the whole output ambiguous (#1220).
+            if line:
+                malformed = True
+            continue
+        if line.startswith(f"{SMP_PHY_ERROR_LOG_MARKER}:"):
+            # The command prints exactly one header, first.
             parts = line[len(SMP_PHY_ERROR_LOG_MARKER) + 1:].split(":")
             if (
-                len(parts) == 4 and parts[0].isdigit() and _SAS_ADDRESS.fullmatch(parts[1])
+                not header_seen and current is None and not rows
+                and len(parts) == 4 and parts[0].isdigit() and _SAS_ADDRESS.fullmatch(parts[1])
                 and _PASS_DEVICE.fullmatch(parts[2]) and re.fullmatch(r"[0-9a-f]{2}-[0-9a-f]{2}", parts[3])
             ):
                 identity = ":".join(parts[:3])
                 phy_range = parts[3]
+            else:
+                malformed = True
+            header_seen = True
             continue
-        phy_marker = re.fullmatch(r"@phy=([0-9a-f]{2})", line)
-        if phy_marker:
+        if line.startswith("@phy="):
             flush()
-            phy = int(phy_marker.group(1), 16)
-            current = phy if phy <= 254 and all(row["phy"] != phy for row in rows) else None
+            phy_marker = re.fullmatch(r"@phy=([0-9a-f]{2})", line)
+            phy = int(phy_marker.group(1), 16) if phy_marker else None
+            if phy is None or phy > 254 or any(row["phy"] == phy for row in rows):
+                # Invalid, out of range or repeated: never keep one frame of
+                # an ambiguous answer.
+                malformed = True
+                phy = None
+            current = phy
             continue
         if line == "@no-response":
+            if current is None:
+                malformed = True
             flush(no_response=True)
+            stopped = True
             continue
         if line == "@end":
             flush()
             ended = True
-            break
+            continue
         if current is not None and line:
             lines.append(line)
-    else:
+    if not ended and current is not None:
         # No end marker: the batch was cut short; the open PHY is unknown.
-        if current is not None:
-            rows.append(_unknown_row(current, "unknown", "incomplete_output"))
-    return PhyErrorLogResult(identity, rows, phy_range, ended)
+        rows.append(_unknown_row(current, "unknown", "incomplete_output"))
+    return PhyErrorLogResult(identity, rows, phy_range, ended, malformed=malformed)
 
 
 def chunk_output_span(output_key: str | None) -> tuple[str, list[int]] | None:
@@ -719,7 +745,9 @@ def parse_chunk_output(output_key: str | None, stdout: object) -> PhyErrorLogRes
     None when the key is not a counter key. Output larger than the chunk can
     legitimately print is refused unparsed; so is output whose marker names
     another expander or pass device, that reports a PHY outside the key's
-    range, or that lacks its end marker. A refused output's PHYs read as
+    range, that repeats or garbles a header or PHY marker, that carries
+    anything but blank lines after its end marker (such as a second answer),
+    or that lacks its end marker. A refused output's PHYs read as
     ``unknown`` / ``rejected_output``: an error, never counters.
     """
     span = chunk_output_span(output_key)
@@ -735,19 +763,22 @@ def parse_chunk_output(output_key: str | None, stdout: object) -> PhyErrorLogRes
         return rejected
     parsed = parse_phy_error_log_output(text)
     if (
-        parsed.target_identity != identity or not parsed.ended
+        parsed.target_identity != identity or not parsed.ended or parsed.malformed
         or any(row["phy"] not in phys for row in parsed.rows)
     ):
         return rejected
     return parsed
 
 
-def chunk_stop(output_key: str | None, ok: bool, stdout: object, stderr: object = "") -> tuple[str, int] | None:
+def chunk_stop(
+    output_key: str | None, ok: bool, stdout: object, *, timed_out: bool = False
+) -> tuple[str, int] | None:
     """Why an expander's read must stop after this chunk, and at which PHY.
 
-    A chunk past the SSH command deadline or with a call that gave no answer
-    is ``no_response`` (the expander is hung); a refused output is
-    ``rejected_output``; any other failed command is ``command_failed``; a
+    A chunk past the SSH command deadline (``timed_out``, a structural fact
+    the caller owns) or with a call that
+    gave no answer is ``no_response`` (the expander is hung); a refused output
+    is ``rejected_output``; any other failed command is ``command_failed``; a
     chunk whose every call sudo refused is ``permission_denied``. None means
     the next chunk may run.
     """
@@ -756,7 +787,6 @@ def chunk_stop(output_key: str | None, ok: bool, stdout: object, stderr: object 
         return None
     first = span[1][0]
     if not ok:
-        timed_out = "timed out" in str(stderr or "").lower()
         return ("no_response" if timed_out else "command_failed", first)
     parsed = parse_chunk_output(output_key, stdout)
     if parsed is None or parsed.rejected:

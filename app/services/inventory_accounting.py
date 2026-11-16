@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+from app.models.domain import slot_occupancy
 from app.services.parsers import (
     normalize_device_name,
     normalize_gptid,
@@ -104,6 +105,10 @@ def logical_disk_identity_tokens(
 
 def slot_identity_tokens(slot: Any) -> frozenset[str]:
     """Identity tokens of a rendered slot, or an empty set for an empty bay."""
+    # A bay whose occupancy was not read renders no disk, whatever saved
+    # assignment it still names (#1218).
+    if slot_occupancy(slot) == "unknown":
+        return frozenset()
     # Bay-scoped attributes (sas_address, slot number, enclosure id) are
     # deliberately not identity: they describe the bay, not its occupant.  An
     # occupied bay that carries none of the disk-scoped identifiers below

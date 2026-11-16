@@ -720,6 +720,334 @@ test("a size-only copy that passed an explicit Verify shows Yes", async () => {
   assert.doesNotMatch(elements.dialog.textContent, /Size only at upload/);
 });
 
+// #1202: the list's Verified column and the details' Verified fact must make
+// the same claim. The list row carries the upload check and the outcome of the
+// last explicit Verify (without its text); the details carry the full result.
+const SIZE_ONLY_TEXT = "Size only at upload; Verify re-reads and hashes it";
+
+function verifiedColumn(elements, id) {
+  const headers = elements.artifacts.querySelectorAll("th").map((cell) => cell.textContent);
+  const row = rowFor(elements, id);
+  const columns = row.children.filter((cell) => cell.tagName === "TD");
+  return columns[headers.indexOf("Verified")].textContent;
+}
+
+function verifiedFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Verified");
+  assert.notEqual(index, -1, "details dialog has a Verified fact");
+  return facts[index + 1].textContent;
+}
+
+async function listAndDetails(listFields, detailFields = listFields) {
+  const api = fakeApi();
+  Object.assign(api.data.artifacts[4], listFields);
+  const detail = { ...api.data.artifacts[4], ...detailFields };
+  const { elements, library } = mount({
+    api: { ...api, fetchJson: (url, options) => (url === "/api/admin/backups/full-odd" ? Promise.resolve(detail) : api.fetchJson(url, options)) },
+  });
+  await library.load();
+  const column = verifiedColumn(elements, "full-odd");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  return { column, fact: verifiedFact(elements) };
+}
+
+test("a size-only copy reads as size only in the list and the details until Verify (#1202)", async () => {
+  const before = await listAndDetails(
+    { upload_check: "size", last_verify: null },
+  );
+  assert.deepEqual(before, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // A failed or unreachable explicit Verify does not upgrade the claim either.
+  const failed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false } },
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false, detail: "target unreachable" } },
+  );
+  assert.deepEqual(failed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // Only a boolean true counts as a passed Verify, in both views.
+  const malformed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: "true" } },
+  );
+  assert.deepEqual(malformed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+});
+
+test("a successful explicit Verify turns the list and the details to Yes together (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/full-odd/verify": () => {
+      api.data.artifacts[4].last_verify = { at: "2026-09-21T10:05:00Z", ok: true };
+      return { ok: true, artifact: api.data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." };
+    },
+    "GET /api/admin/backups/full-odd": () => ({ ...api.data.artifacts[4], last_verify: { ...api.data.artifacts[4].last_verify, detail: "" } }),
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  assert.equal(verifiedColumn(elements, "full-odd"), SIZE_ONLY_TEXT);
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup verified.", "success"]);
+  assert.equal(verifiedColumn(elements, "full-odd"), "Yes");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(verifiedFact(elements), "Yes");
+});
+
+test("the Verify banner follows the operation's own result, not the copy's catalogue flag (#1202)", async () => {
+  // What the scheduler returns when the target cannot be reached: the
+  // operation failed and nothing was read, but the catalogue keeps the copy's flag.
+  const unreachable = {
+    ok: false,
+    artifact: { ...syntheticLibrary().artifacts[4], verified: true, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } },
+    detail: "ConnectionRefusedError: connection refused",
+  };
+  const responses = [
+    [unreachable, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ ...unreachable, verified: true }, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    [{ ok: "true", artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    // Control: a Verify that read the copy back and matched.
+    [{ ok: true, artifact: { ...unreachable.artifact, last_verify: { at: "2026-09-24T12:00:00+00:00", ok: true } }, detail: "Readback matched the catalogued size and SHA-256." }, ["Backup verified.", "success"]],
+  ];
+  for (const [response, banner] of responses) {
+    const api = fakeApi({
+      "POST /api/admin/backups/full-odd/verify": () => {
+        Object.assign(api.data.artifacts[4], response.artifact);
+        return response;
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, JSON.stringify(response));
+    assert.equal(verifiedColumn(elements, "full-odd"), banner[1] === "success" ? "Yes" : SIZE_ONLY_TEXT);
+  }
+});
+
+test("Last check says Worked only for a Verify whose result is boolean true (#1202)", async () => {
+  async function lastCheck(lastVerify) {
+    const api = fakeApi({
+      "GET /api/admin/backups/full-odd": () => ({ ...syntheticLibrary().artifacts[4], upload_check: "size", last_verify: lastVerify }),
+    });
+    const { elements, library } = mount({ api });
+    await library.load();
+    await library.actions.showDetails("full-odd");
+    await settle();
+    const facts = elements.dialog.querySelector("dl").children;
+    const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+    return { verified: verifiedFact(elements), lastCheck: index === -1 ? null : facts[index + 1].textContent };
+  }
+  for (const ok of ["true", 1, "yes", {}]) {
+    const result = await lastCheck({ at: "2026-09-21T10:05:00Z", ok, detail: "" });
+    assert.equal(result.verified, SIZE_ONLY_TEXT, JSON.stringify(ok));
+    assert.doesNotMatch(result.lastCheck, /Worked/, JSON.stringify(ok));
+    assert.match(result.lastCheck, /^Failed/, JSON.stringify(ok));
+  }
+  // Controls: a passed and a failed Verify of this copy.
+  assert.deepEqual(await lastCheck({ at: "2026-09-21T10:05:00Z", ok: true, detail: "" }), { verified: "Yes", lastCheck: "Worked (T(2026-09-21T10:05:00Z))" });
+  assert.deepEqual(
+    await lastCheck({ at: "2026-09-21T10:05:00Z", ok: false, detail: "Readback does not match" }),
+    { verified: SIZE_ONLY_TEXT, lastCheck: "Failed: Readback does not match (T(2026-09-21T10:05:00Z))" },
+  );
+  // No Verify of this copy recorded: no Last check line.
+  assert.deepEqual(await lastCheck(null), { verified: SIZE_ONLY_TEXT, lastCheck: null });
+});
+
+const NOT_RECORDED_TEXT = "Upload check not recorded; Verify re-reads and hashes it";
+
+test("rows without upload-check provenance say so, the same way in both views (#1202)", async () => {
+  // A remote copy catalogued before #722 has no recorded upload check: unknown,
+  // not Yes, until an explicit Verify reads it back.
+  assert.deepEqual(await listAndDetails({}), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(await listAndDetails({ upload_check: null, last_verify: null }), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(
+    await listAndDetails({ upload_check: null, last_verify: { at: "2026-09-21T10:05:00Z", ok: true } }),
+    { column: "Yes", fact: "Yes" },
+  );
+  // A remote copy read back at upload, and a local copy, are plainly verified.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+  assert.deepEqual(await listAndDetails({ location: "local", upload_check: null, last_verify: null }), { column: "Yes", fact: "Yes" });
+  // A copy that is not verified stays "Not yet", whatever the upload check was.
+  assert.deepEqual(await listAndDetails({ verified: false }), { column: "Not yet", fact: "Not yet" });
+  assert.deepEqual(await listAndDetails({ verified: false, upload_check: "size", last_verify: null }), { column: "Not yet", fact: "Not yet" });
+});
+
+// A checksum the storage provider reports at upload is not this application
+// reading the copy back (#1202).
+const PROVIDER_CHECKSUM_TEXT = "Checked by the provider's checksum at upload; Verify re-reads and hashes it";
+const EITHER_TEXT = "Checked at upload by the provider's checksum or by read-back; Verify re-reads and hashes it";
+
+test("a provider-checksum copy says so in both views until its own Verify passes (#1202)", async () => {
+  const own = { at: "2026-09-21T10:05:00Z", ok: true };
+  for (const [uploadCheck, text] of [["provider_checksum", PROVIDER_CHECKSUM_TEXT], ["provider_checksum_or_readback", EITHER_TEXT]]) {
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: null }), { column: text, fact: text }, uploadCheck);
+    // A failed, unreachable or malformed Verify does not upgrade it.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: false } }), { column: text, fact: text }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: "true" } }), { column: text, fact: text }, uploadCheck);
+    // Its own passed Verify read it back.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: own }), { column: "Yes", fact: "Yes" }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, verified: false }), { column: "Not yet", fact: "Not yet" }, uploadCheck);
+  }
+  // Control: a copy this application read back at upload.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+});
+
+test("a provider-checksum target test does not read as a readback (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "s3 archive destination is writable; the provider's checksum matched the bytes sent (the content was not read back).", duration_ms: 42, provider: "s3", transport_encrypted: true, upload_check: "provider_checksum" }),
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.testTarget("legacy-ftp");
+  const row = elements.targets.querySelector('tr[data-target-id="legacy-ftp"]').textContent;
+  assert.match(row, /Works \(42 ms\)\. Provider checksum checked only; Verify re-reads a backup\./);
+});
+
+// The page's real shared transport over a synthetic fetch, so a body with
+// ok:false reaches the library exactly as the browser delivers it.
+function realTransportApi(replies) {
+  const base = fakeApi();
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    fetch: async (url, options = {}) => {
+      const key = `${String(options.method || "GET").toUpperCase()} ${url.split("?")[0]}`;
+      if (replies[key]) return jsonResponse(...replies[key](base.data));
+      return jsonResponse(200, await base.fetchJson(url, options));
+    },
+  });
+  return { ...base, fetchJson: transport.fetchJson };
+}
+
+test("a failed Verify shows its own result through the page's real transport (#1202)", async () => {
+  // Exactly what the scheduler and the admin route return (HTTP 200).
+  const artifact = (data, verified) => ({ ...data.artifacts[4], verified, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } });
+  const cases = [
+    ["unreachable", (data) => [200, { ok: false, artifact: artifact(data, true), detail: "ConnectionRefusedError" }],
+      ["Backup did not verify: ConnectionRefusedError", "error"], SIZE_ONLY_TEXT],
+    ["mismatch", (data) => [200, { ok: false, artifact: artifact(data, false), detail: "Readback does not match the catalogued size and SHA-256." }],
+      ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet"],
+  ];
+  for (const [name, reply, banner, column] of cases) {
+    const api = realTransportApi({
+      "POST /api/admin/backups/full-odd/verify": (data) => {
+        const [status, body] = reply(data);
+        Object.assign(data.artifacts[4], body.artifact);
+        return [status, body];
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, name);
+    assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+  }
+  // Controls: a passed Verify, and a refusal status, through the same transport.
+  const passed = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: true, artifact: data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." }],
+  });
+  let mounted = mount({ api: passed });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.deepEqual(mounted.banners.at(-1), ["Backup verified.", "success"]);
+  const missing = realTransportApi({ "POST /api/admin/backups/full-odd/verify": () => [404, { detail: "Artifact not found." }] });
+  mounted = mount({ api: missing });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.equal(mounted.banners.at(-1)[1], "error");
+  assert.match(mounted.banners.at(-1)[0], /^Verify failed: Artifact not found\./);
+});
+
+function lastCheckFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+  return index === -1 ? null : facts[index + 1].textContent;
+}
+
+// #1202: a Verify has three outcomes and the page says which one happened.
+// These are the scheduler's real response shapes (VerifyOutcomeTests in
+// tests/test_backup_list_assurance.py), delivered through the real transport.
+const NOT_READ_BANNER = "This Verify could not read the copy, so nothing was checked: ConnectionRefusedError. Its earlier status is unchanged.";
+
+test("a Verify says whether the copy was read and matched, read and did not match, or could not be read (#1202)", async () => {
+  const at = "2026-09-24T12:00:00+00:00";
+  const notReadLastCheck = `Could not read the copy, nothing checked: ConnectionRefusedError; earlier status unchanged (T(${at}))`;
+  const kinds = [["readback", "Yes"], ["size", SIZE_ONLY_TEXT], ["provider_checksum", PROVIDER_CHECKSUM_TEXT]];
+  for (const [uploadCheck, uploadText] of kinds) {
+    const outcomes = [
+      ["matched", true, true, "Readback matched the catalogued size and SHA-256.",
+        ["Backup verified.", "success"], "Yes", `Worked (T(${at}))`],
+      ["not_read", false, true, "ConnectionRefusedError",
+        [NOT_READ_BANNER, "error"], uploadText, notReadLastCheck],
+      ["mismatch", false, false, "Readback does not match the catalogued size and SHA-256.",
+        ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet",
+        `Failed: Readback does not match the catalogued size and SHA-256. (T(${at}))`],
+    ];
+    for (const [outcome, ok, verified, detail, banner, column, lastCheck] of outcomes) {
+      const name = `${uploadCheck}/${outcome}`;
+      const api = realTransportApi({
+        "POST /api/admin/backups/full-odd/verify": (data) => {
+          Object.assign(data.artifacts[4], { verified, upload_check: uploadCheck, last_verify: { at, ok } });
+          return [200, { ok, outcome, artifact: data.artifacts[4], detail }];
+        },
+        "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok, outcome, detail } }],
+      });
+      Object.assign(api.data.artifacts[4], { upload_check: uploadCheck, last_verify: null });
+      const { elements, library, banners } = mount({ api });
+      await library.load();
+      await library.actions.verify("full-odd");
+      assert.deepEqual(banners.at(-1), banner, name);
+      assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+      await library.actions.showDetails("full-odd");
+      await settle();
+      assert.equal(verifiedFact(elements), column, name);
+      assert.equal(lastCheckFact(elements), lastCheck, name);
+    }
+  }
+  // Control: a result from an earlier release carries no outcome and keeps today's wording.
+  const api = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: false, artifact: data.artifacts[4], detail: "ConnectionRefusedError" }],
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: false, detail: "ConnectionRefusedError" } }],
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: { at, ok: false } });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup did not verify: ConnectionRefusedError", "error"]);
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(elements), `Failed: ConnectionRefusedError (T(${at}))`);
+  // A not-read outcome beside a passed result is malformed and never reads as unread.
+  const odd = realTransportApi({
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: true, outcome: "not_read", detail: "" } }],
+  });
+  const mounted = mount({ api: odd });
+  await mounted.library.load();
+  await mounted.library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(mounted.elements), `Worked (T(${at}))`);
+});
+
+test("a clean-up refused by its guard shows the refusal through the page's real transport (#1202)", async () => {
+  const refusal = "CatalogError: Artifact is the newest copy of its class at this location that passed its last completed check (the upload check or a later Verify), so it is kept.";
+  const api = realTransportApi({
+    "POST /api/admin/backups/lifecycle/apply": () => [200, { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: refusal }, not_attempted: [], downgraded: [], kept_after_replan: [] }],
+  });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), [`Clean up stopped after 0 of 1: ${refusal}`, "error"]);
+  assert.match(elements.dialog.textContent, /Clean up stopped after 0 of 1: CatalogError: Artifact is the newest copy/);
+  assert.doesNotMatch(banners.at(-1)[0], /verified copy|Request failed|may already be gone/);
+});
+
+test("a long unbroken value wraps inside the details dialog (#1202)", () => {
+  const rule = STYLES.match(/\.backup-policy-list dd \{[^}]*\}/)?.[0] || "";
+  assert.match(rule, /overflow-wrap:\s*anywhere/);
+});
+
 test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
   const { elements, library, api, banners, refreshes } = mount();
   await library.load();
@@ -777,7 +1105,11 @@ test("clean up shows the dry-run plan and applies exactly its token", async () =
   assert.match(text, /These 2 copies will be deleted/);
   assert.match(text, /only 1 copies are kept and this is number 2/);
   assert.match(text, /never verified, and older than 1 day \(it is 2 days old\)/);
-  assert.match(text, /1 more is over a limit but kept, because it is the newest verified copy in its place/);
+  // The plan knows only the catalogue's check result, which can be a size
+  // check at upload, so it promises no more than that (#1202).
+  assert.match(text, /These 2 copies will be deleted\. Kept copies and the newest copy in each place that passed its last completed check are never deleted\./);
+  assert.match(text, /1 more is over a limit but kept, because it is the newest copy in its place that passed its last completed check\. That check may have been by size only; the Verified column says which\./);
+  assert.doesNotMatch(text, /newest verified copy/);
   assert.equal(action(elements.dialog, "cleanup-apply").textContent, "Delete 2");
   await library.actions.applyCleanup();
   const apply = api.calls.find((call) => call.url.endsWith("/lifecycle/apply"));
@@ -801,6 +1133,437 @@ test("clean up reports a partial run and a stale plan plainly", async () => {
   await mounted.library.actions.openCleanup();
   await mounted.library.actions.applyCleanup();
   assert.match(mounted.elements.dialog.textContent, /The list changed since this plan was made, so nothing was deleted/);
+});
+
+test("clean up that kept copies after a failed keeper check says so, not plain success (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: [], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["full-new"], kept_after_replan: ["cfg-old", "full-part"] }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  assert.match(elements.dialog.textContent, /These 2 copies will be deleted/);
+  await library.actions.applyCleanup();
+  const text = "Deleted 0 copies. 1 of the copies it kept failed the size and SHA-256 check and was marked unverified. "
+    + "2 planned deletions were not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copy marked unverified: if it passes, clean up again; if not, back up again to replace it.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.deepEqual(banners.at(-1), [text, "error"]);
+  // Once a result is shown, the plan's introduction no longer promises deletions.
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\./);
+  assert.doesNotMatch(elements.dialog.textContent, /The result is below/);
+  // The result carries the same problem tone as the banner, not the muted note colour.
+  const result = elements.dialog.querySelector(".backup-dialog-result");
+  assert.match(result.className, /(^|\s)is-bad(\s|$)/);
+  assert.match(STYLES, /\.backup-dialog-result\.is-bad[\s,{]/, "the problem tone has a style");
+});
+
+test("a plain clean-up result keeps the muted tone and the past-tense introduction (#1188)", async () => {
+  const { elements, library, banners } = mount();
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), ["Deleted 2 copies.", "success"]);
+  assert.doesNotMatch(elements.dialog.querySelector(".backup-dialog-result").className, /is-bad/);
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\./);
+  assert.doesNotMatch(elements.dialog.textContent, /The result is below/);
+});
+
+test("several kept copies that failed the check read in the plural, with no copy/copies shortcut (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: ["cfg-old"], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["k1", "k2", "k3"], kept_after_replan: ["full-part"] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "Deleted 1 copy. 3 of the copies it kept failed the size and SHA-256 check and were marked unverified. "
+    + "1 planned deletion was not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copies marked unverified: if they pass, clean up again; if not, back up again to replace them.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(LIBRARY_SOURCE, /copy\/copies|deletion\/deletions/);
+});
+
+// #1188: the one thing the page says when no usable answer to a clean-up came
+// back. It matches the route's detail.
+const CLEANUP_STATE_UNKNOWN = "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+  + "started. Reload this page in a few minutes and check Last clean-up before starting another.";
+
+function resultNode(elements) {
+  return elements.dialog.querySelector(".backup-dialog-result");
+}
+
+function listReads(api) {
+  return api.calls.filter(({ method, url }) => method === "GET" && url === "/api/admin/backups").length;
+}
+
+test("a clean-up with no answer says so in the warning tone, reads nothing more, and no later read changes it (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_state_unknown", detail: "ignored server text" }) });
+  // A clean-up shows as running at the first read, so the ordinary running poll is on.
+  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
+  const timers = [];
+  const { elements, library, banners } = mount({ api, deps: { setTimeout: (callback) => timers.push(callback), isVisible: () => true } });
+  await library.load();
+  assert.match(elements.status.textContent, /A clean-up is running\./);
+  assert.equal(timers.length, 1, "the ordinary running poll");
+  await library.actions.openCleanup();
+  const reads = listReads(api);
+  await library.actions.applyCleanup();
+  assert.ok(elements.dialog.textContent.includes(CLEANUP_STATE_UNKNOWN), elements.dialog.textContent);
+  assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
+  assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
+  assert.match(STYLES, /\.backup-dialog-result\.is-warning[\s,{]/, "the warning tone has a style");
+  assert.equal(listReads(api), reads, "no list or status read after the lost answer");
+  assert.equal(timers.length, 1, "no poll of its own");
+  // The ordinary poll and a manual refresh show the newer Last clean-up line, and leave the message alone.
+  const bannerCount = banners.length;
+  api.data.running = null;
+  api.data.grooming = { at: "2026-09-24T12:05:00Z", ok: true, deleted: 2, detail: null, failed_locations: {} };
+  timers.shift()();
+  await settle();
+  await settle();
+  await library.load();
+  assert.equal(banners.length, bannerCount, "no read replaces the message");
+  assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN);
+  assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
+  assert.match(elements.status.textContent, /Last clean-up: T\(2026-09-24T12:05:00Z\), 2 removed\./);
+  assert.doesNotMatch(elements.status.textContent, /A clean-up is running/);
+  assert.equal(timers.length, 0);
+});
+
+test("an apply answer with no result is not known, never a result (#1188)", async () => {
+  for (const answer of [{}, { state: "still_running", detail: "x" }, { state: "cleanup_running" }, { state: "cleanup_not_running" }, { state: "something-new" }, { ok: true }]) {
+    const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => answer });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.openCleanup();
+    await library.actions.applyCleanup();
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], JSON.stringify(answer));
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, JSON.stringify(answer));
+  }
+  assert.doesNotMatch(LIBRARY_SOURCE, /cleanup_running|no longer running|cleanupWatch|bannerRevision/);
+});
+
+test("when the page's own timer ends the apply wait, the clean-up is not known, not failed (#1188)", async () => {
+  const timers = new Map();
+  let timerId = 0;
+  let applied = 0;
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    setTimeout(callback, ms) { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: async (url) => {
+      if (url.endsWith("/lifecycle/apply")) {
+        applied += 1;
+        return new Promise(() => {}); // the answer never comes
+      }
+      if (url.endsWith("/lifecycle/plan")) {
+        return jsonResponse(200, { plan_token: "plan-token-1", items: [
+          { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+      }
+      return jsonResponse(200, syntheticLibrary());
+    },
+  });
+  const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+  await library.load();
+  await library.actions.openCleanup();
+  const applying = library.actions.applyCleanup();
+  await settle();
+  assert.equal(applied, 1);
+  const pageTimer = [...timers.values()].find(({ ms }) => ms === 15 * 60 * 1000);
+  assert.ok(pageTimer, "the apply has the page's 15-minute timer");
+  pageTimer.callback();
+  await applying;
+  assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
+  assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN);
+  assert.doesNotMatch(elements.dialog.textContent, /failed|not available|isn't running/);
+});
+
+test("a lost connection or an undecided HTTP error after the apply went out is not known, never failed (#1188)", async () => {
+  const answers = {
+    "lost connection": () => Promise.reject(new TypeError("Failed to fetch")),
+    "HTTP 500": () => jsonResponse(500, { detail: "Internal Server Error" }),
+    "HTTP 502": () => jsonResponse(502, { detail: "Bad Gateway" }),
+    "HTTP 503": () => jsonResponse(503, { detail: "The backup scheduler service is not available." }),
+    "HTTP 504": () => jsonResponse(504, { detail: "Gateway Timeout" }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    let lists = 0;
+    const transport = loadAdminFunctions(transportNames, {
+      navigator: { onLine: true },
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      fetch: async (url) => {
+        if (url.endsWith("/lifecycle/apply")) return answer();
+        if (url.endsWith("/lifecycle/plan")) {
+          return jsonResponse(200, { plan_token: "plan-token-1", items: [
+            { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+        }
+        lists += 1;
+        return jsonResponse(200, syntheticLibrary());
+      },
+    });
+    const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+    await library.load();
+    await library.actions.openCleanup();
+    const before = lists;
+    await library.actions.applyCleanup();
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|isn't running/, name);
+    assert.equal(lists, before, `${name}: no read after the lost answer`);
+  }
+  // A decided refusal from the admin service still says the clean-up failed.
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(new Error("Forbidden"), { status: 403, adminOutcome: "error" }) });
+  const { library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.match(banners.at(-1)[0], /^Clean up failed: Forbidden/);
+  assert.equal(banners.at(-1)[1], "error");
+});
+
+const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
+const NOT_SENT_BODY = {
+  ok: false,
+  state: "cleanup_not_sent",
+  detail: "The backup scheduler service is not available.",
+  request_id: "0123456789abcdef0123456789abcdef",
+};
+
+async function applyThroughTransport(answer) {
+  let lists = 0;
+  let applies = 0;
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async (url) => {
+      if (url.endsWith("/lifecycle/apply")) {
+        applies += 1;
+        return answer();
+      }
+      if (url.endsWith("/lifecycle/plan")) {
+        return jsonResponse(200, { plan_token: "plan-token-1", items: [
+          { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+      }
+      lists += 1;
+      return jsonResponse(200, syntheticLibrary());
+    },
+  });
+  const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+  await library.load();
+  await library.actions.openCleanup();
+  const before = lists;
+  await library.actions.applyCleanup();
+  return { elements, banners, extraReads: lists - before, applies };
+}
+
+const EMPTY_RESULT = { deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [], kept_after_replan: [] };
+
+test("a stopped or refused clean-up answered with ok: false shows its result through the page's own transport (#1188)", async () => {
+  // The scheduler answers a run that stopped, or that a keeper check refused,
+  // with HTTP 200 and ok: false. The admin transport treats ok: false as a
+  // failed request unless the caller accepts the result.
+  const reason = "Kept copy could not be checked (keeper-check-budget-exhausted).";
+  const cases = {
+    "keeper check refused after three damaged copies": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: reason }, not_attempted: [],
+        downgraded: ["full-a", "full-b", "full-c"], kept_after_replan: [] },
+      `Clean up stopped after 0 of 1: ${reason} `
+        + "3 of the copies it kept failed the size and SHA-256 check and were marked unverified. "
+        + "Run Verify on the copies marked unverified, or back up again to replace them.",
+    ],
+    "a deletion failed": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: "permission denied" }, not_attempted: [],
+        downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1: permission denied",
+    ],
+    "nothing attempted": [
+      { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: ["cfg-old"], downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1.",
+    ],
+  };
+  for (const [name, [answer, text]] of Object.entries(cases)) {
+    const { elements, banners, applies } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.equal(applies, 1, name);
+    assert.equal(resultNode(elements).textContent, text, name);
+    assert.deepEqual(banners.at(-1), [text, "error"], name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|Request failed with 200/, name);
+  }
+});
+
+test("an ok: false answer that is not a clean-up result is still a failed request (#1188)", async () => {
+  // Control: only the scheduler's own result shape is accepted.
+  const answers = {
+    "no result": { ok: false, detail: "synthetic refusal" },
+    "a result list that is not a list": { ok: false, deleted: "cfg-old" },
+    "a named state beside a result": { ok: false, state: "cleanup_state_unknown", deleted: [] },
+    // One list is not the result: every list must be there and well formed, and so must a failed entry when one is given.
+    "only the deleted list": { ok: false, deleted: [] },
+    "a deleted entry that is not an id": { ...EMPTY_RESULT, ok: false, deleted: [null] },
+    "a missing list": { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [] },
+    "a list entry that is not an id": { ...EMPTY_RESULT, ok: false, not_attempted: [{ id: "cfg-old" }] },
+    "a failed entry without its error": { ...EMPTY_RESULT, ok: false, failed: { id: "cfg-old" } },
+    "a failed entry that is text": { ...EMPTY_RESULT, ok: false, failed: "cfg-old" },
+    "a named state beside a whole result": { ...EMPTY_RESULT, ok: false, state: "cleanup_state_unknown" },
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.match(resultNode(elements).textContent, /^Clean up failed: /, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up stopped|Deleted \d/, name);
+    assert.equal(banners.at(-1)[1], "error", name);
+  }
+});
+
+test("a clean-up that reports itself incomplete never reads as a plain success (#1188)", async () => {
+  // The scheduler does not send this (incomplete means a failed or unattempted
+  // deletion), but the page must not turn "not complete" into "Deleted 0 copies."
+  const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: false }));
+  assert.equal(resultNode(elements).textContent, "Clean up stopped after 0 of 0.");
+  assert.deepEqual(banners.at(-1), ["Clean up stopped after 0 of 0.", "error"]);
+  // Control: the same lists with ok: true are a finished clean-up.
+  const done = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: true }));
+  assert.equal(resultNode(done.elements).textContent, "Deleted 0 copies.");
+  assert.deepEqual(done.banners.at(-1), ["Deleted 0 copies.", "success"]);
+});
+
+test("a clean-up the admin service never sent says it did not start, and reads nothing more (#1188)", async () => {
+  const { elements, banners, extraReads, applies } = await applyThroughTransport(() => jsonResponse(503, NOT_SENT_BODY));
+  assert.equal(applies, 1);
+  assert.deepEqual(banners.at(-1), [CLEANUP_NOT_STARTED, "info"]);
+  assert.equal(resultNode(elements).textContent, CLEANUP_NOT_STARTED);
+  assert.doesNotMatch(resultNode(elements).className, /is-warning|is-bad/, "the busy refusal's plain tone");
+  assert.doesNotMatch(elements.dialog.textContent, /No answer came back|may have run|Clean up failed/);
+  assert.equal(extraReads, 0, "no list or status read after the refusal");
+});
+
+test("only the admin's not-sent 503 says did not start; a gateway's 5xx or a lost send stays not known (#1188)", async () => {
+  const answers = {
+    "plain HTTP 503": () => jsonResponse(503, { ok: false, detail: NOT_SENT_BODY.detail, request_id: NOT_SENT_BODY.request_id }),
+    "HTTP 503 with another state": () => jsonResponse(503, { ...NOT_SENT_BODY, state: "cleanup_state_unknown" }),
+    "HTTP 500 with the state": () => jsonResponse(500, NOT_SENT_BODY),
+    "HTTP 502 with the state": () => jsonResponse(502, NOT_SENT_BODY),
+    "HTTP 504 with the state": () => jsonResponse(504, NOT_SENT_BODY),
+    "send failed": () => Promise.reject(new TypeError("Failed to fetch")),
+    "202 with the state": () => jsonResponse(202, { state: "cleanup_not_sent", detail: NOT_SENT_BODY.detail }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements, banners, extraReads } = await applyThroughTransport(answer);
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /did not start|Clean up failed/, name);
+    assert.equal(extraReads, 0, `${name}: no read after the lost answer`);
+  }
+});
+
+test("the clean-up result sits directly under the plan's introduction, which no longer points below (#1188)", async () => {
+  const outcomes = {
+    success: () => ({ ok: true, deleted: ["cfg-old", "full-part"], already_missing: [], failed: null, not_attempted: [] }),
+    "not known": () => ({ state: "cleanup_state_unknown" }),
+    busy: () => Object.assign(new Error("A backup or grooming run is already in progress."), { status: 409 }),
+    stale: () => Object.assign(new Error("gone"), { status: 409 }),
+  };
+  for (const [name, answer] of Object.entries(outcomes)) {
+    const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": answer });
+    const { elements, library } = mount({ api });
+    await library.load();
+    await library.actions.openCleanup();
+    await library.actions.applyCleanup();
+    const body = elements.dialog.querySelector(".backup-dialog-body");
+    const [first, second, third] = body.children;
+    assert.equal(first.className, "backup-cleanup-intro", name);
+    assert.equal(first.textContent, "These 2 copies were in the clean-up plan.", name);
+    assert.match(second.className, /backup-dialog-result/, name);
+    assert.match(third.className, /backup-cleanup-list/, name);
+    assert.equal(elements.dialog.querySelectorAll(".backup-dialog-result").length, 1, name);
+    assert.doesNotMatch(elements.dialog.textContent, /The result is below/, name);
+  }
+});
+
+test("a one-copy plan reads in the singular before and after Delete (#1188)", async () => {
+  const api = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t1", items: [
+    { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] }),
+  "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: ["cfg-old"], already_missing: [], failed: null, not_attempted: [] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  const intro = elements.dialog.querySelector(".backup-cleanup-intro");
+  assert.match(intro.textContent, /^This copy will be deleted\. /);
+  assert.doesNotMatch(elements.dialog.textContent, /These 1 cop/);
+  await library.actions.applyCleanup();
+  assert.equal(elements.dialog.querySelector(".backup-cleanup-intro").textContent, "This copy was in the clean-up plan.");
+});
+
+test("a long clean-up plan scrolls inside its list, so the introduction, result and buttons stay in view (#1188)", async () => {
+  const items = Array.from({ length: 14 }, (_, index) => ({ id: `copy-${index}`, location: "local", backup_class: "full", reason: "x", kind: "retention" }));
+  const api = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t14", items }),
+    "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: items.map(({ id }) => id), already_missing: [], failed: null, not_attempted: [] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  // The structure the styles rely on: the list is a direct child of the dialog
+  // body, after the introduction and the result; the buttons sit outside the body.
+  const dialogChildren = elements.dialog.children.map((node) => node.className);
+  const body = elements.dialog.querySelector(".backup-dialog-body");
+  assert.deepEqual(body.children.slice(0, 3).map((node) => node.className.split(" ").find((name) => name.startsWith("backup-"))),
+    ["backup-cleanup-intro", "backup-dialog-result", "backup-change-list"]);
+  assert.match(body.children[2].className, /(^|\s)backup-cleanup-list(\s|$)/);
+  assert.equal(body.children[2].children.length, 14);
+  assert.ok(dialogChildren.some((name) => /backup-dialog-actions/.test(name)), dialogChildren.join());
+  assert.equal(body.querySelector(".backup-dialog-actions"), null);
+  const rule = (selector) => {
+    const start = STYLES.indexOf(`${selector} {`);
+    assert.ok(start >= 0, `missing style ${selector}`);
+    return STYLES.slice(start, STYLES.indexOf("}", start));
+  };
+  assert.match(rule(".backup-dialog[open]:has(.backup-cleanup-list)"), /display:\s*flex;[\s\S]*flex-direction:\s*column;/);
+  assert.match(rule(".backup-dialog-body:has(> .backup-cleanup-list)"), /display:\s*flex;[\s\S]*min-height:\s*0;/);
+  assert.match(rule(".backup-cleanup-list"), /overflow-y:[ ]*auto;/);
+});
+
+test("a clean-up applied while another run holds the scheduler says why nothing happened (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(
+    new Error("A backup or grooming run is already in progress."), { status: 409 }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  // True whether the running job is a backup or a clean-up: no promise about which line shows its result.
+  const text = "A backup or clean-up is already running on the backup service, so this clean-up did not start "
+    + "and deleted nothing. Open Clean up again after it finishes.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(elements.dialog.textContent, /The list changed since this plan was made/);
+  assert.doesNotMatch(LIBRARY_SOURCE, /When the running one finishes, its result shows in the Last clean-up line/);
+  assert.deepEqual(banners.at(-1), [text, "info"]);
+});
+
+test("the admin banner has a warning tone (#1188)", () => {
+  const classes = new Set(["is-error", "is-success"]);
+  const banner = { textContent: "", classList: {
+    add: (...names) => names.forEach((name) => classes.add(name)),
+    remove: (...names) => names.forEach((name) => classes.delete(name)),
+  } };
+  const context = loadAdminFunctions(["setBanner"], { state: {}, elements: { banner } });
+  context.setBanner("Not known.", "warning");
+  assert.deepEqual([...classes], ["is-warning"]);
+  context.setBanner("Fine.", "success");
+  assert.deepEqual([...classes], ["is-success"]);
+  assert.match(STYLES, /\.status-banner\.is-warning\s*\{/);
+});
+
+test("the status line shows a clean-up that finished but marked copies unverified (#1188)", async () => {
+  const api = fakeApi();
+  api.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 0,
+    detail: "1 of the copies it kept failed the size and SHA-256 check and was marked unverified.", failed_locations: {} };
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-ok"), null);
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-bad").textContent,
+    "Last clean-up: T(2026-09-24T12:00:00Z), 0 removed. 1 of the copies it kept failed the size and SHA-256 check and was marked unverified.");
 });
 
 test("clean up with nothing to do, or without a token, never applies", async () => {

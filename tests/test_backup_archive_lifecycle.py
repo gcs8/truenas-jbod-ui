@@ -58,6 +58,12 @@ class FakeTarget:
         self.deleted.append(name)
 
 
+def catalog_matching_digest(record: ArtifactRecord, _target) -> tuple[int, str]:
+    """Keeper readback stand-in for tests about apply() mechanics, not keeper checks (#1188)."""
+
+    return record.size, record.sha256
+
+
 def make_record(
     index: int,
     *,
@@ -356,6 +362,7 @@ class LifecycleApplyTests(CatalogCase):
         self.manager = LifecycleManager(
             self.catalog,
             (RetentionRule("config", "local", keep_count=3), RetentionRule("config", "nas-1", keep_count=5)),
+            payload_digest=catalog_matching_digest,
         )
         self.resolver = local_target_resolver(self.backup_dir, remote={"nas-1": self.remote}.__getitem__)
 
@@ -489,7 +496,10 @@ class LifecycleApplyTests(CatalogCase):
         self.assertEqual([i.record.artifact_id for i in plan.items], [record.artifact_id])
         self.catalog.record_deletion("config-solo-0001", reason="manual", actor="op")
         result = manager.apply(plan, lambda _location: FakeTarget({record.name: record.size}))
-        self.assertIn("newest verified", str(result.error))
+        # #1188: no checked copy would stay, so the keeper check keeps the item
+        # before the catalog's newest-verified guard is reached.
+        self.assertEqual(result.deleted, ())
+        self.assertEqual([i.record.artifact_id for i in result.kept_after_replan], [record.artifact_id])
         self.assertIsNotNone(self.catalog.get(record.artifact_id))
 
     def test_pin_during_delete_is_refused_and_object_state_stays_consistent(self) -> None:
@@ -541,7 +551,7 @@ class LifecycleApplyTests(CatalogCase):
 
     def test_claim_refuses_preserved_and_newest_verified(self) -> None:
         newest = self.local_records[0]
-        with self.assertRaisesRegex(CatalogError, "newest verified"):
+        with self.assertRaisesRegex(CatalogError, r"^Artifact is the newest copy of its class at this location that passed its last completed check \(the upload check or a later Verify\), so it is kept\.$"):
             self.catalog.claim_deletion(newest, actor="op")
         pinned = self.catalog.set_preserve(self.local_records[7].artifact_id, reason="hold", actor="admin")
         with self.assertRaisesRegex(CatalogError, "preserved"):
@@ -557,6 +567,132 @@ class LifecycleApplyTests(CatalogCase):
         result = manager.apply(manager.plan(NOW), local_target_resolver(self.backup_dir))
         self.assertIn("LookupError", str(result.error))
         self.assertEqual(result.deleted, ())
+
+
+class KeeperPayloadCheckTests(CatalogCase):
+    """#1188: grooming confirms each kept copy's bytes before it deletes anything."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.backup_dir = Path(self._tmp.name) / "backups"
+        (self.backup_dir / "full").mkdir(parents=True)
+
+    def add_copy(self, index: int, content: bytes, *, location: str = "local") -> tuple[ArtifactRecord, Path]:
+        name = f"full/{location}-{index:04d}.tar.zst"
+        path = self.backup_dir / name
+        if location == "local":
+            path.write_bytes(content)
+        record = ArtifactRecord(
+            artifact_id=f"full-{location}-{index:04d}",
+            backup_class="full",
+            location=location,
+            name=name,
+            created_at=NOW - timedelta(days=index),
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            verified=True,
+        )
+        return self.catalog.add(record, now=NOW), path
+
+    def groom(self, *, location: str = "local", resolver=None) -> ApplyResult:
+        manager = LifecycleManager(self.catalog, (RetentionRule("full", location, keep_count=1),))
+        plan = manager.plan(NOW)
+        return manager.apply(plan, resolver or local_target_resolver(self.backup_dir), now=lambda: NOW)
+
+    def test_missing_newest_keeper_is_downgraded_and_the_older_copy_survives(self) -> None:
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest copy, lost after it was verified")
+        newest_path.unlink()
+
+        result = self.groom()
+
+        self.assertTrue(older_path.exists(), "the only surviving copy must not be groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertTrue(result.complete)
+        self.assertFalse(self.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(self.catalog.get(older.artifact_id).verified)
+        self.assertEqual([record.artifact_id for record in result.downgraded], [newest.artifact_id])
+        self.assertEqual(self.catalog.tombstones(), [])
+
+    def test_same_size_corrupt_keeper_is_downgraded_and_the_older_copy_survives(self) -> None:
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest copy, corrupted later")
+        newest_path.write_bytes(b"X" * newest.size)
+
+        result = self.groom()
+
+        self.assertTrue(older_path.exists(), "a same-size corrupt keeper must not justify a deletion")
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(self.catalog.get(newest.artifact_id).verified)
+        # The corrupt copy is downgraded, not deleted in the same run.
+        self.assertTrue(newest_path.exists())
+        self.assertEqual([record.artifact_id for record in result.downgraded], [newest.artifact_id])
+
+    def test_intact_keeper_lets_retention_delete_the_older_copy(self) -> None:
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest good copy")
+
+        result = self.groom()
+
+        self.assertTrue(result.complete)
+        self.assertEqual([item.record.artifact_id for item in result.deleted], [older.artifact_id])
+        self.assertFalse(older_path.exists())
+        self.assertTrue(newest_path.exists())
+        self.assertTrue(self.catalog.get(newest.artifact_id).verified)
+
+    @unittest.skipIf(not hasattr(os, "geteuid") or os.geteuid() == 0, "root can read a mode-000 file")
+    def test_unreadable_keeper_refuses_the_deletion_with_a_named_reason(self) -> None:
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest copy that cannot be read")
+        newest_path.chmod(0)
+        self.addCleanup(newest_path.chmod, 0o600)
+
+        result = self.groom()
+
+        self.assertTrue(older_path.exists())
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(result.complete)
+        self.assertIn("keeper-unreadable", result.failed_locations["local"])
+        self.assertTrue(self.catalog.get(newest.artifact_id).verified, "an unchecked keeper is not downgraded")
+        self.assertIsNotNone(self.catalog.get(older.artifact_id))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs POSIX FIFOs")
+    def test_fifo_in_place_of_a_keeper_is_refused_without_blocking(self) -> None:
+        import threading
+
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest copy replaced by a FIFO")
+        newest_path.unlink()
+        os.mkfifo(newest_path)
+        outcome: list[ApplyResult] = []
+        worker = threading.Thread(target=lambda: outcome.append(self.groom()), daemon=True)
+        worker.start()
+        worker.join(10)
+        if worker.is_alive():
+            # Unblock the reader so the daemon thread can finish, then fail.
+            with open(os.open(newest_path, os.O_WRONLY | os.O_NONBLOCK), "wb"):
+                pass
+            self.fail("opening a FIFO keeper blocked grooming")
+
+        [result] = outcome
+        self.assertTrue(older_path.exists())
+        self.assertEqual(result.deleted, ())
+        self.assertIn("keeper-unreadable", result.failed_locations["local"])
+
+    def test_remote_keeper_that_cannot_be_content_verified_refuses_the_deletion(self) -> None:
+        older, _ = self.add_copy(2, b"older remote copy", location="nas-1")
+        newest, _ = self.add_copy(1, b"newest remote copy", location="nas-1")
+        # A target that can list and delete but offers no way to read bytes back.
+        target = FakeTarget({older.name: older.size, newest.name: newest.size})
+
+        result = self.groom(location="nas-1", resolver=lambda _location: target)
+
+        self.assertEqual(target.deleted, [])
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(result.location_complete("nas-1"))
+        self.assertIn("keeper-unverifiable", result.failed_locations["nas-1"])
+        self.assertIsNotNone(self.catalog.get(older.artifact_id))
+        self.assertTrue(self.catalog.get(newest.artifact_id).verified)
 
 
 class LocalBackupDirectoryTests(unittest.TestCase):
@@ -618,7 +754,9 @@ class ReconcileTests(CatalogCase):
         target = FakeTarget({r.name: r.size for r in records})
         for i in range(10):
             target.objects[f"config/stranger-{i}.tar.zst"] = 1
-        manager = LifecycleManager(self.catalog, (RetentionRule("config", "nas-1", keep_count=1),))
+        manager = LifecycleManager(
+            self.catalog, (RetentionRule("config", "nas-1", keep_count=1),), payload_digest=catalog_matching_digest
+        )
         result = manager.apply(manager.plan(NOW), lambda _loc: target)
         self.assertTrue(result.complete)
         self.assertEqual(sorted(target.deleted), sorted(r.name for r in records[1:]))

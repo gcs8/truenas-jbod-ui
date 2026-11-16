@@ -114,7 +114,15 @@ from app.services.snapshot_export import (
 )
 from app.services.storage_writability import StorageDirectoryUnwritable
 from app.services.tls_context import TlsTrustConfigurationError
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
+    TrueNASAPIError,
+    bounded_remote_reason,
+    classify_remote_failure,
+    failure_log_fields,
+    is_local_failure_message,
+    log_failure,
+)
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HISTORY_READ_BUSY_DETAIL,
@@ -223,6 +231,52 @@ def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
     if isinstance(exc, SMART_BATCH_TRANSPORT_EXCEPTIONS):
         return True
     return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
+
+
+SMART_REMOTE_FAILURE_DETAIL = "SMART data could not be loaded."
+STORAGE_VIEW_HISTORY_FAILURE_DETAIL = "Storage view data could not be loaded."
+MAPPING_PREVIEW_FAILURE_DETAIL = "The mapping import preview could not be prepared."
+
+
+def _read_failure_http_exception(
+    exc: TrueNASAPIError,
+    *,
+    operation: str,
+    detail: str,
+) -> HTTPException:
+    """A read route's 400: this service's own sentence as it is, else fixed text."""
+
+    if is_local_failure_message(exc):
+        return HTTPException(status_code=400, detail=str(exc))
+    log_failure(_routes_logger, operation, exc)
+    return HTTPException(status_code=400, detail=detail)
+
+
+def _smart_remote_http_exception(exc: TrueNASAPIError) -> HTTPException:
+    return _read_failure_http_exception(
+        exc,
+        operation="SMART request",
+        detail=SMART_REMOTE_FAILURE_DETAIL,
+    )
+
+
+def _authorized_action_failure_detail(exc: TrueNASAPIError, *, operation: str) -> str:
+    """Failure text for a route behind ``require_read_ui_mutation_authorization``.
+
+    It adds the remote reason the error keeps apart from its message (bounded,
+    without control characters). Only those routes may call this; read routes,
+    exports, source status and log lines use the message or a fixed category.
+    A local fault, wrapped or not, gets fixed text and an ERROR record instead.
+    """
+
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        log_failure(_routes_logger, operation, exc)
+        return f"{operation} stopped on an internal error; see the service log."
+    message = str(exc)
+    reason = bounded_remote_reason(getattr(exc, "reason", None))
+    if not reason or is_local_failure_message(exc):
+        return message
+    return f"{message.rstrip('.')}: {reason}"
 
 
 # The other half of that split: a filesystem failure on the SMART path is the
@@ -651,14 +705,20 @@ def build_router() -> APIRouter:
             )
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "2"}) from exc
         except TrueNASAPIError as exc:
+            # The message is this service's own sentence; the remote reason,
+            # kept apart on the error, is not logged.
             logger.info(
-                "Locate light refusal system=%s bay %s action=%s reason=%s",
+                "Locate light refusal system=%s bay %s action=%s reason=%s (%s)",
                 service.system.id,
                 slot,
                 payload.action.value,
                 exc,
+                failure_log_fields(exc),
             )
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_authorized_action_failure_detail(exc, operation="Locate light action"),
+            ) from exc
         service.schedule_led_snapshot_refresh(enclosure_id=enclosure_id)
         return JSONResponse(
             {
@@ -718,7 +778,10 @@ def build_router() -> APIRouter:
         try:
             return await service.set_system_locator(payload.active)
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_authorized_action_failure_detail(exc, operation="System locator action"),
+            ) from exc
 
     @router.post(
         "/api/slots/{slot}/mapping",
@@ -776,7 +839,7 @@ def build_router() -> APIRouter:
                         "another path failed and may still be lit."
                     )
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
-                logger.warning("Failed to clear identify LED after saving slot %s mapping: %s", slot, exc)
+                log_failure(logger, "Mapping identify-light clear", exc, identifiers={"bay": str(slot)})
                 led_warning = "Saved mapping, but failed to clear the identify LED; see application logs."
 
         service.invalidate_physical_enclosure_snapshot_cache(
@@ -872,7 +935,11 @@ def build_router() -> APIRouter:
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _read_failure_http_exception(
+                exc,
+                operation="Mapping import preview",
+                detail=MAPPING_PREVIEW_FAILURE_DETAIL,
+            ) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         return JSONResponse(preview)
@@ -911,6 +978,9 @@ def build_router() -> APIRouter:
                     "current_import_digest": exc.current_import_digest,
                 },
             )
+        except StorageDirectoryUnwritable as exc:
+            # The same named refusal as a single save, not a generic 500 (#1228).
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
@@ -971,7 +1041,7 @@ def build_router() -> APIRouter:
                 update={"layout_bounds": layout_bounds}
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
 
     @router.get("/api/storage-views/{view_id}/slots/{slot_index}/smart", response_model=SmartSummaryView)
     async def get_storage_view_slot_smart_summary(
@@ -996,7 +1066,7 @@ def build_router() -> APIRouter:
                 bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
 
     @router.get("/api/storage-views/{view_id}/slots/{slot_index}/history")
     async def get_storage_view_slot_history(
@@ -1085,16 +1155,17 @@ def build_router() -> APIRouter:
                     bypass_negative_cache=fresh,
                 )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
         except TlsTrustConfigurationError as exc:
             # Classified before the broad OSError branch below, which
             # would otherwise report a missing CA bundle's ENOENT as a
             # slot-detail-cache write failure and name the wrong path.
-            logger.error(
-                "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
-                enclosure_id,
+            log_failure(
+                logger,
+                "SMART batch TLS CA bundle load",
                 exc,
-                exc_info=exc,
+                level=logging.ERROR,
+                identifiers={"enclosure": enclosure_id},
             )
             raise HTTPException(
                 status_code=500,
@@ -1111,12 +1182,12 @@ def build_router() -> APIRouter:
             # log line an operator needs to find it, rather than as a shelf
             # outage they are invited to wait out.
             if not _is_smart_batch_transport_failure(exc):
-                logger.error(
-                    "SMART batch could not write the slot-detail cache for "
-                    "enclosure %s; the data directory is not usable: %s",
-                    enclosure_id,
+                log_failure(
+                    logger,
+                    "SMART batch slot-detail cache write",
                     exc,
-                    exc_info=exc,
+                    level=logging.ERROR,
+                    identifiers={"enclosure": enclosure_id},
                 )
                 raise HTTPException(
                     status_code=500,
@@ -1157,23 +1228,24 @@ def build_router() -> APIRouter:
                 bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
         except TlsTrustConfigurationError as exc:
-            logger.error(
-                "Storage-view SMART batch could not load the TLS CA bundle for view %s: %s",
-                view_id,
+            log_failure(
+                logger,
+                "Storage-view SMART batch TLS CA bundle load",
                 exc,
-                exc_info=exc,
+                level=logging.ERROR,
+                identifiers={"view": view_id},
             )
             raise HTTPException(status_code=500, detail=SMART_BATCH_TLS_TRUST_DETAIL) from exc
         except (OSError, ConnectionClosed) as exc:
             if not _is_smart_batch_transport_failure(exc):
-                logger.error(
-                    "Storage-view SMART batch could not write the slot-detail cache for "
-                    "view %s; the data directory is not usable: %s",
-                    view_id,
+                log_failure(
+                    logger,
+                    "Storage-view SMART batch slot-detail cache write",
                     exc,
-                    exc_info=exc,
+                    level=logging.ERROR,
+                    identifiers={"view": view_id},
                 )
                 raise HTTPException(status_code=500, detail=SMART_BATCH_LOCAL_STORAGE_DETAIL) from exc
             raise HTTPException(
@@ -1387,7 +1459,11 @@ def build_router() -> APIRouter:
                 selected_enclosure_id=enclosure_id,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _read_failure_http_exception(
+                exc,
+                operation="Storage view history request",
+                detail=STORAGE_VIEW_HISTORY_FAILURE_DETAIL,
+            ) from exc
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
             raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')

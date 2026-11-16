@@ -762,6 +762,259 @@ the live candidate and parked prior generation. The shared history lock and mark
 remain held through commit cleanup or rollback cleanup, and the marker is removed
 last.
 
+When the same import also restores configuration files or folders (config,
+runtime overrides, profiles, mappings, aliases, slot cache, SSH keys, TLS trust or
+known hosts), the marker becomes a whole-import journal (version 2). Before
+anything is staged in a configuration folder, the import writes a private record
+there, `.truenas-jbod-ui-import-seal-<transaction>`. Before each target changes,
+the import rewrites its folder's record (write, fsync, rename, folder fsync) to
+add the target's absolute path, the identity of its folder, its fixed staging
+and prior names, and the exact prior and candidate records. The first folder's
+record also lists every folder before anything in that folder changes, and holds
+the decision: `pending`, then `commit` before commit cleanup or `rollback` before
+an in-process rollback. It also keeps the journal's prior and candidate records
+of the history database and the segments folder, with their paths, written
+before anything is staged. The journal lives in the
+history folder, which lower-trust services can write, so it is only an index:
+it names the transaction
+and the first folder, and repeats each target and the history records for a
+cross-check. Recovery acts
+only on targets the folder records list, converges every folder the first record
+lists, and takes the decision from that record, never from the journal: `commit`
+finishes forward, and `pending` or `rollback` returns every target and the
+history to the prior generation. Parked prior and displaced configuration copies
+are retired by an authenticated rename before they are deleted, so a crash
+part-way through a delete never leaves a recorded path half removed. With the
+journal the restore wrote, recovery reports `prior-generation-restored` or
+`candidate-finalized` only after history and every target the folder records
+list agree, then removes the journal and the folder records. Before it changes
+anything, recovery also lists, by name only, the configuration folders that the
+application's own settings name: the folders of the files and folders above, for
+the configured layout, the default layout and the legacy container layout, never
+a folder named on the history volume. If one of them holds a restore record this
+recovery does not settle (the journal was removed, broken, rewritten as a
+history-only journal or replaced by one that does not name that record, the
+record belongs to another restore, or a crash came after the journal was removed
+and before the records were), recovery changes nothing and returns
+`configuration-recovery-incomplete` with the folders that hold such records
+under `folders`. A folder that exists but cannot be listed is reported under
+`unreadable_folders` as not read, never as holding records: make it readable
+and searchable by the user that runs recovery and run recovery again. Every
+folder recovery lists while it holds the history lock (these settings folders,
+the history folder and the segments folder) is listed with a bound of 1,000,000
+entries and 1,000 names that match what recovery looks for; past either bound
+recovery changes nothing and returns `recovery-scan-limit-reached` with the
+folder's role and the counts. A receipt or refusal names at most ten files or
+folders, each as printable ASCII or as `<name not shown>`, and gives the total.
+The recovery command prints both receipts and exits with status 3; it exits 0
+for every other receipt and 1 for a refusal, and it runs its SQLite
+temporary-file maintenance only after a recovery that completed with `--apply`.
+Records left after the journal is gone are cleaned up as described in "Clean up
+restore records left after an interrupted restore" below. It refuses,
+changes nothing and keeps the journal with a named `reason`
+when the journal is malformed or overlaps history (`journal-invalid`), was
+written by another user (`journal-owner-mismatch`), a folder is missing or is
+not the one the restore used (`configuration-target-unavailable`), a folder
+record is missing, malformed or does not belong to the first folder's record
+(`configuration-target-unsealed`), the journal names a target that its folder's
+record does not list exactly (`configuration-target-unrecorded`), the
+journal's history records are not exactly the ones the first folder's record
+holds, the history paths recovery was given are not the recorded ones (a
+symbolic link above the history folder is followed before the comparison; the
+folder's own name and the names inside it must be the recorded ones), or that
+record holds none (`history-target-unrecorded`), a recorded
+file changed (`configuration-target-divergent`), the prior copy is gone
+(`prior-generation-unavailable`), or a committed import no longer holds the
+candidate (`committed-generation-incomplete`). Builds that only know version 1
+refuse a version 2 journal rather than recovering history alone (#1196).
+
+What this protects: recovery deletes, replaces or renames a configuration path
+only when the record in that path's own folder, written by the restore before
+the path changed, names it, and it moves the listed targets together to their
+recorded prior or candidate as the restore's recorded decision says. Editing
+the journal cannot change that. A writer of the history folder can still delete,
+break or rewrite the journal so that recovery leaves configuration as the
+interrupted import left it; recovery then reports
+`configuration-recovery-incomplete` instead of success, as long as the records
+are in a folder the settings name and recovery runs where that folder is
+mounted. Such a writer can also make recovery refuse. The history records
+recovery acts on are the ones the first folder's record holds, so editing them
+in the journal cannot choose which history recovery keeps: recovery refuses
+with `history-target-unrecorded` before it changes anything, on either volume.
+Recovery reports success only when the history database and the segments
+folder match, by content, the copy those records give for the recorded
+decision. Such a writer can still delete or change the history files
+themselves, so that recovery refuses and history cannot return to the side the
+decision selects, and can change history after recovery finishes. A writer of a configuration folder can change those files
+directly; recovery gives it no more than that.
+
+Limits: a configuration destination outside the folders the settings name is not
+checked, and a recovery run where the configuration folders are not mounted
+(the history container) cannot see their records. Only a recovery run with
+`APP_SERVICE_ROLE=admin` prints a receipt that reads as if the folders were
+checked. With the role `history`, unset (as in a Compose file from before the
+roles existed), blank or anything else, the receipt carries
+`configuration_folders_checked: false` and a message that says the folders were
+not checked there and gives the admin-service command that checks them; the
+history service's startup message for a pending activation names the same
+command. The role changes only this label, not what recovery reads or changes. When an interrupted import may have restored configuration, run
+recovery through the admin service as described below.
+
+The history container does not mount the configuration volume, and in the base
+Compose file the admin service that ran the restore writes the journal as root.
+Recovery from the history container therefore refuses such a journal with
+`journal-owner-mismatch` or `configuration-target-unavailable`. Run the same
+`scripts/rotate_segmented_history.py --source ... --segments-dir ... --recover`
+arguments shown in the rotation section above through the admin service instead:
+`docker compose --profile admin run --rm --no-deps -e APP_SERVICE_ROLE=admin
+--entrypoint python enclosure-admin` with no `--user` override, since that
+service mounts configuration, data and history as the identity that ran the
+restore. The command sets the role itself, so it gives the checked receipt on
+an installation that kept an older Compose file with no role entries. Add
+`--apply` only after reviewing the reported state. A history-only restore keeps
+the version 1 journal and the history-container command unchanged; only a
+recovery run through the admin service also checks the configuration folders.
+
+Clean up restore records left after an interrupted restore. A crash after the
+restore, or its recovery, removed the journal and before it removed the folder
+records leaves configuration and history in one generation and the records in
+place. Recovery then reports `configuration-recovery-incomplete` on every run
+and changes nothing, because without the journal it cannot tell these records
+from ones an edited journal left behind. To settle that case by hand:
+
+1. Stop the services: `docker compose stop`. Keep them stopped until step 6.
+2. Run the recovery dry run through the admin service (the command above,
+   without `--apply`). It must exit with status 3, report
+   `configuration-recovery-incomplete` and list folders under `folders`. If it
+   reports anything else, or lists `unreadable_folders`, resolve that first;
+   this procedure does not apply.
+3. Confirm that no journal remains: `./history/.history.db.segmented-activation-pending.json`
+   must not exist. If it exists, the restore is still pending: remove nothing
+   and recover it with the journal.
+4. Save the check below as `check-restore-records.py` and run it through the
+   admin service, which takes the folders from the application's settings:
+   `docker compose --profile admin run --rm --no-deps -T --entrypoint python
+   enclosure-admin - < check-restore-records.py`. It reads only. For each restore
+   transaction it prints the decision held by the first folder's record and,
+   for the history database, the segments folder and every file the records
+   list, whether it holds the prior copy, the restored copy (`candidate`) or
+   neither.
+5. If it prints `STALE`, configuration and history both hold the generation
+   that decision selects (`commit`: the restored copies; `pending` or
+   `rollback`: the prior copies), so the restore or its recovery had finished.
+   Remove exactly the files it prints after `remove`, in that order; the first
+   folder's record comes last because it names the others. If it prints
+   `KEEP`, remove nothing yet: a listed file or the history holds the other
+   copy or neither, a record cannot be read, the first folder's record is
+   missing or does not name the history, or a journal exists.
+6. Run the dry run again. With no record left it ends with
+   `Segment rotation recovery is not pending.` and status 1, the normal answer
+   when nothing is pending. Then start the services; the history service no
+   longer reports a pending activation.
+
+The check compares the history database and the segments folder with the prior
+and restored copies that the first folder's record names, so it does not call
+records stale while configuration and history hold different generations, and
+it never calls them stale while a journal exists. It compares the history
+database byte for byte: once the history service has written to it, the check
+cannot tell which generation it holds and prints `KEEP`, so run it before the
+services start again. If it prints `KEEP` and no journal exists, nothing on the
+two volumes says which generation is whole. The way out is to restore a known
+good backup that carries both history and configuration, then remove the old
+transaction's `.truenas-jbod-ui-import-seal-<transaction>` records from the
+folders the dry run lists, the first folder's record (the one with `decision`)
+last, and continue with step 6.
+
+Lines starting `leftover` name a staging or prior copy beside a listed file
+(`.<name>.restore-<transaction>` or `.<name>.previous-<transaction>`); a crash
+just before a record listed such a copy can leave one, and a crash during a
+record update can leave an unreadable `<record>.next-<transaction>`. Neither is
+live configuration and recovery leaves both for review; remove them by hand
+after step 6.
+
+```python
+# check-restore-records: list the restore records left in the configuration
+# folders and say whether they are stale. It reads only; it changes nothing.
+import json
+import os
+from pathlib import Path
+
+from history_service.segment_catalog import activation_pending_path
+from history_service.segmented_restore import file_matches, tree_matches
+from history_service.system_backup import restore_configuration_folders
+
+PREFIX = ".truenas-jbod-ui-import-seal-"
+journal = activation_pending_path(os.environ.get("HISTORY_SQLITE_PATH", "/app/history/history.db"))
+
+
+def holds(entry):
+    """Whether a recorded path holds its prior copy, its candidate or neither."""
+    path = Path(entry["path"])
+    match = file_matches if entry["kind"] == "file" else tree_matches
+    prior = entry["prior"]
+    if match(path, entry["candidate"]):
+        return "candidate"
+    if match(path, prior) or (prior.get("kind") == "missing" and not os.path.lexists(path)):
+        return "prior"
+    return "neither"
+
+
+transactions = {}
+for folder in restore_configuration_folders():
+    if folder.is_dir():
+        for path in sorted(folder.iterdir()):
+            if path.name.startswith(PREFIX):
+                transaction = path.name[len(PREFIX):].split(".next-", 1)[0]
+                transactions.setdefault(transaction, []).append(path)
+if not transactions:
+    print("No restore records found.")
+for transaction, paths in sorted(transactions.items()):
+    records, updates, problems = {}, [], []
+    for path in paths:
+        if ".next-" in path.name:
+            updates.append(path)
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
+                raise ValueError(path)
+            records[path] = payload
+        except (OSError, ValueError):
+            problems.append(f"record {path} cannot be read")
+    anchors = [path for path, payload in records.items() if payload.get("anchor") == payload.get("folder")]
+    anchor = records[anchors[0]] if len(anchors) == 1 else {}
+    decision = anchor.get("decision")
+    print(f"transaction {transaction} decision {decision}")
+    expected = "candidate" if decision == "commit" else "prior"
+    if journal.exists():
+        problems.append(f"the journal {journal} exists")
+    if decision is None:
+        problems.append("the first folder's record is missing or cannot be read")
+    history = anchor.get("history")
+    if not isinstance(history, list) or not history:
+        problems.append("the first folder's record does not name the history")
+        history = []
+    checked = [("history", entry) for entry in history]
+    checked += [("target", entry) for payload in records.values() for entry in payload["targets"]]
+    for label, entry in checked:
+        try:
+            state = holds(entry)
+            print(f"{label} {entry['path']} holds {state}")
+            if state != expected:
+                problems.append(f"{label} {entry['path']} does not hold the {expected} copy")
+            for name in (entry.get("staged_name"), entry.get("previous_name")):
+                if name and os.path.lexists(Path(entry["path"]).parent / name):
+                    print(f"leftover {Path(entry['path']).parent / name}")
+        except (KeyError, TypeError, AttributeError):
+            problems.append(f"a record lists a {label} it does not describe")
+    if problems:
+        print("KEEP: " + "; ".join(problems))
+        continue
+    print("STALE: configuration and history hold the generation the decision selects")
+    for path in [*updates, *[path for path in records if path not in anchors], *anchors]:
+        print(f"remove {path}")
+```
+
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2
 FULL backups use the encrypted `tar.zst` stream format (TJBENC02) by default,

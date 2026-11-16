@@ -70,6 +70,28 @@ commands.
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
 publishes the candidate to a local registry so ``pull`` works unchanged.
+
+Deletion safety and its threat model (#1224, #1225). The script creates its
+deployment root itself and removes only that directory. It protects against
+mistakes (a ``--root`` that already holds something, a directory replaced by a
+scenario step or by an operator while it runs) and against other unprivileged
+users on the host: the root and every directory above it must be owned by the
+invoking user or root and must not let another user rename entries in it
+(group- or other-writable without the sticky bit). The root itself is created
+mode 0700 and must stay private to the invoking user for the whole run, so no
+other user can reach anything inside it, including the directories the
+hardened scenario hands to the app and backup identities. Ownership changes
+never follow a symlink and change a directory only after every entry below it,
+each as its own checked command. Every write, move or
+removal inside a root, privileged or not, first passes one ownership check: the
+device and inode of the root and of every directory above it are still the
+ones recorded when this run created it. Nothing is removed recursively until
+every root this run created beneath it has passed its own check. On any doubt
+the script refuses and leaves the tree in place. It does not claim protection
+against a process running as the same user or as root that swaps directories
+while it runs: such a process can already change anything the script can, and
+a path-based command cannot close the instant between the last check and the
+command itself.
 """
 
 from __future__ import annotations
@@ -82,7 +104,7 @@ import json
 import os
 import queue
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -94,6 +116,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 UI_PORT = 18180
 HISTORY_PORT = 18181
@@ -117,6 +140,9 @@ APP_UID = 10001
 # as wiki/Troubleshooting.md documents it ("A non-root container gets
 # permission denied"); a contract test keeps the two identical. It runs once,
 # before the hardened install first starts, never as part of an upgrade.
+# The documented operator step (wiki/Troubleshooting.md), kept verbatim as the
+# reference. The smoke runs it as hardened_ownership_commands(): the same
+# entries and owners, as separate checked commands that follow no link.
 HARDENED_OWNERSHIP_PREP = (
     'app_uid="${APP_UID:-10001}"',
     'app_gid="${APP_GID:-10001}"',
@@ -178,10 +204,18 @@ class Deployment:
         self.environment: dict[str, str] | None = None
 
     def file_args(self) -> list[str]:
-        return [arg for name in self.files for arg in ("-f", name)]
+        # The project is pinned explicitly, so an inherited COMPOSE_PROJECT_NAME,
+        # a `.env` entry or a top-level `name:` can never move startup to a
+        # project the cleanup readback does not check.
+        return ["--project-name", compose_project_name(self.root),
+                *(arg for name in self.files for arg in ("-f", name))]
+
+    def checked_root(self) -> Path:
+        """The root after the ownership check: Docker acts on these files as root."""
+        return _owned_root(self.root)[0]
 
     def compose(self, *args: str, timeout: int = 600) -> str:
-        return run(["docker", "compose", *self.file_args(), *args], cwd=self.root, timeout=timeout,
+        return run(["docker", "compose", *self.file_args(), *args], cwd=self.checked_root(), timeout=timeout,
                    env=self.environment)
 
     def _write_environment(self) -> None:
@@ -197,9 +231,7 @@ class Deployment:
                 "",
             )
         )
-        path = self.root / ".env"
-        path.write_text(env, encoding="utf-8")
-        path.chmod(0o600)
+        owned_write(self.root, self.root / ".env", env, 0o600)
 
     def set_image(self, image: str) -> None:
         self.image = image
@@ -220,7 +252,7 @@ class Deployment:
     def exec_python(self, service: str, script: str) -> dict:
         output = run(
             ["docker", "compose", *self.file_args(), "exec", "-T", service, "python", "-"],
-            cwd=self.root,
+            cwd=self.checked_root(),
             input_text=textwrap.dedent(script),
             timeout=180,
             env=self.environment,
@@ -231,7 +263,7 @@ class Deployment:
         """Run a script in a one-off container of a stopped service (same image, mounts and user)."""
         output = run(
             ["docker", "compose", *self.file_args(), "run", "--rm", "--no-deps", "-T", *extra, service, "python", "-"],
-            cwd=self.root,
+            cwd=self.checked_root(),
             input_text=textwrap.dedent(script),
             timeout=180,
             env=self.environment,
@@ -239,21 +271,257 @@ class Deployment:
         return json.loads(output.strip().splitlines()[-1])
 
 
-def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroot_fixture: Path | None = None) -> None:
-    if root.exists():
-        run(["sudo", "rm", "-rf", str(root)])
-    root.mkdir(parents=True)
-    shutil.copyfile(compose_fixture, root / "docker-compose.yml")
+# Deployment roots this invocation created itself (#1224), keyed by the one
+# real path admitted for them. Authority belongs to the directory generation
+# that was created (device and inode of the root and of every ancestor), never
+# to a pathname: a replaced root or ancestor is refused, not removed.
+class _OwnedRoot(NamedTuple):
+    identity: tuple[tuple[int, int], ...]
+    project: str
+
+
+_OWNED_ROOTS: dict[Path, _OwnedRoot] = {}
+
+
+def compose_project_name(root: Path) -> str:
+    """The Compose project for a root: its directory name, normalized as Compose does it."""
+    return re.sub(r"[^a-z0-9_-]", "", root.name.lower()).lstrip("_-")
+
+
+def admitted_root(root: Path) -> Path:
+    """The one real path a supplied --root names, before anything is created or removed.
+
+    A ``..`` component is refused: after a symlink it names a different
+    directory than the lexical path does. Ancestor symlinks are resolved once
+    here; the final component is never followed, so a symlinked root is still
+    seen (and refused) as a symlink.
+    """
+    absolute = root if root.is_absolute() else Path.cwd() / root
+    expect(".." not in absolute.parts,
+           f"deployment root {root} contains '..'; pass a path without parent traversal")
+    expect(absolute.name not in ("", ".", ".."), f"deployment root {root} does not name a directory")
+    try:
+        parent = Path(os.path.realpath(absolute.parent, strict=True))
+    except OSError:
+        raise SmokeError(f"deployment root parent {absolute.parent} is not an existing directory") from None
+    expect(parent.is_dir(), f"deployment root parent {absolute.parent} is not an existing directory")
+    return parent / absolute.name
+
+
+def _others_can_rename_entries(info: os.stat_result) -> bool:
+    """Whether a user other than the owner could rename or replace entries in this directory."""
+    if info.st_uid not in (os.geteuid(), 0):
+        return True
+    return bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not info.st_mode & stat.S_ISVTX
+
+
+def _root_identity(root: Path) -> tuple[tuple[int, int], ...]:
+    """(device, inode) of every component from / down to root.
+
+    Each must be a real directory (never a symlink) that only this user or
+    root can rename entries in, so no other unprivileged user can swap the
+    root or anything above it.
+    """
+    identity = []
+    for path in (*reversed(root.parents), root):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise SmokeError(f"{path} cannot be read") from None
+        expect(stat.S_ISDIR(info.st_mode), f"{path} is not a real directory")
+        expect(not _others_can_rename_entries(info),
+               f"{path} could let another user rename or replace the deployment root (it must be owned by this "
+               "user or root and not group- or other-writable without the sticky bit); refusing to use it")
+        identity.append((info.st_dev, info.st_ino))
+    return tuple(identity)
+
+
+def _record_created_root(root: Path) -> Path:
+    """Record the directory generation now at root as created by this run."""
+    root = admitted_root(root)
+    project = compose_project_name(root)
+    expect(bool(project), f"deployment root name {root.name!r} does not give a Compose project name")
+    _OWNED_ROOTS[root] = _OwnedRoot(_root_identity(root), project)
+    return root
+
+
+def _owned_root(root: Path) -> tuple[Path, _OwnedRoot]:
+    """The record for root, after checking it is still the generation this run created."""
+    key = Path(os.path.abspath(root))
+    if key not in _OWNED_ROOTS or ".." in Path(root).parts:
+        try:
+            key = admitted_root(root)
+        except SmokeError:
+            key = None
+    record = _OWNED_ROOTS.get(key) if key is not None else None
+    expect(record is not None, f"deployment root {root} was not created by this run; leaving it untouched")
+    try:
+        current = _root_identity(key)
+    except SmokeError as exc:
+        raise SmokeError(f"deployment root {key} is no longer the directory this run created ({exc}); "
+                         "leaving it untouched") from None
+    expect(current == record.identity, f"deployment root {key} is no longer the directory this run created "
+                                       "(it or a parent was replaced); leaving it untouched")
+    try:
+        mode = stat.S_IMODE(os.lstat(key).st_mode)
+    except OSError:
+        raise SmokeError(f"deployment root {key} cannot be read; leaving it untouched") from None
+    # Private for the whole run: another user must not reach a directory this run handed to it.
+    expect(not mode & 0o077, f"deployment root {key} is open to other users (mode {mode:04o}); it must stay "
+                             "private to this user while the run works in it; leaving it untouched")
+    return key, record
+
+
+def _checked_tree_for_removal(root: Path) -> Path:
+    """Immediately before a recursive removal: root and every root this run created beneath it pass the check."""
+    root, _ = _owned_root(root)
+    for child in [path for path in _OWNED_ROOTS if path != root and path.is_relative_to(root)]:
+        _owned_root(child)
+    return root
+
+
+def _forget_tree(root: Path) -> None:
+    for path in [path for path in _OWNED_ROOTS if path == root or path.is_relative_to(root)]:
+        del _OWNED_ROOTS[path]
+
+
+def owned_run(root: Path, command: list[str], **kwargs) -> str:
+    """run() for a command that writes, moves or removes inside root, after the ownership check."""
+    _owned_root(root)
+    return run(command, **kwargs)
+
+
+def _inside(root: Path, path: Path) -> Path:
+    key, _ = _owned_root(root)
+    path = Path(os.path.abspath(path))
+    expect(path != key and path.is_relative_to(key), f"{path} is not inside the deployment root {key}")
+    return path
+
+
+def owned_write(root: Path, path: Path, data: str | bytes, mode: int, *, exclusive: bool = False) -> None:
+    """Write a file inside root after the ownership check, never through a symlink at its name."""
+    path = _inside(root, path)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        raise SmokeError(f"cannot write {path}: {type(exc).__name__}") from None
+    with os.fdopen(descriptor, "wb") as handle:
+        os.fchmod(handle.fileno(), mode)
+        handle.write(data.encode("utf-8") if isinstance(data, str) else data)
+
+
+def owned_unlink(root: Path, path: Path) -> None:
+    os.unlink(_inside(root, path))
+
+
+def owned_mkdir(root: Path, path: Path, mode: int) -> None:
+    os.mkdir(_inside(root, path), mode)
+
+
+def remove_owned_tree(root: Path, *, failure: str, env: dict[str, str] | None = None) -> None:
+    """Recursively remove a root this run created, checked with every root beneath it immediately before."""
+    root = _checked_tree_for_removal(root)
+    run(["sudo", "rm", "-rf", "--", str(root)], env=env)
+    expect(not os.path.lexists(root), failure)
+    _forget_tree(root)
+
+
+def _create_owned_directory(root: Path, mode: int) -> None:
+    """Create root exclusively and record it, only if it is the new, empty directory this run made."""
+    _root_identity(root.parent)  # no other user can rename entries in any directory above it
+    try:
+        os.mkdir(root, mode)
+    except FileExistsError:
+        raise SmokeError(f"deployment root {root} already exists; pass an absent path") from None
+    try:
+        info = os.lstat(root)
+        fresh = (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077
+                 and not os.listdir(root))
+    except OSError:
+        fresh = False
+    expect(fresh, f"deployment root {root} is not the empty directory this run just created; leaving it untouched")
+    _record_created_root(root)
+
+
+def _ownership_identity(name: str, default: str) -> str:
+    """The id the documented step's ``${NAME:-default}`` gives: the environment value unless unset or empty."""
+    value = os.environ.get(name) or default
+    expect(value.isascii() and value.isdigit() and len(value) <= 10,
+           f"{name} must be a numeric id for the hardened ownership step; refusing before creating the root")
+    return value
+
+
+def hardened_ownership_commands() -> list[list[str]]:
+    """The documented ownership step as separate privileged commands that follow no link.
+
+    Same entries and owners as HARDENED_OWNERSHIP_PREP: ./config except
+    config/backup-secrets, then ./data, ./logs and ./history recursively, then
+    ./backup-status for the backup identity. find lists ./config deepest
+    first and ``chown -h`` changes each entry itself, so no directory is handed
+    over while an entry below it still waits for its change; ``chown -R``
+    without -H or -L walks by descriptor and never follows a link. Each is its
+    own command with its own ownership check, run from the root.
+    """
+    app_uid = _ownership_identity("APP_UID", "10001")
+    app_gid = _ownership_identity("APP_GID", "10001")
+    backup_uid = _ownership_identity("BACKUP_UID", "1000")
+    app = f"{app_uid}:{app_gid}"
+    return [
+        ["sudo", "find", "-P", "./config", "-depth", "!", "-path", "./config/backup-secrets",
+         "!", "-path", "./config/backup-secrets/*", "-exec", "chown", "-h", app, "{}", "+"],
+        *(["sudo", "chown", "-h", "-R", "-P", app, "--", f"./{name}"] for name in ("data", "logs", "history")),
+        ["sudo", "install", "-d", "-o", backup_uid, "-g", app_gid, "-m", "2750", "./backup-status"],
+    ]
+
+
+def owns_root(root: Path) -> bool:
+    """True only for a root this invocation created that is still that same directory."""
+    try:
+        _owned_root(root)
+    except SmokeError:
+        return False
+    return True
+
+
+def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroot_fixture: Path | None = None) -> Path:
+    """Create a new deployment root at its admitted real path and return that path.
+
+    Fixtures are checked first. A path with ``..``, an existing directory, an
+    existing empty directory and any symlink (dangling or not) are refused
+    before any command runs, so a mistaken --root never acquires
+    recursive-deletion authority. Nothing is ever removed here; a scenario
+    that rebuilds its root goes through the checked cleanup first.
+    """
+    for label, fixture in (("compose", compose_fixture), ("config", config_fixture), ("nonroot", nonroot_fixture)):
+        if fixture is not None:
+            expect(fixture.is_file(), f"{label} fixture {fixture} is missing or not a regular file")
+    ownership = hardened_ownership_commands() if nonroot_fixture is not None else []
+    admitted = admitted_root(root)
+    expect(admitted == Path(os.path.abspath(root)),
+           f"deployment root {root} is reached through a symlink; pass its real path {admitted}")
+    root = admitted
+    expect(not root.is_symlink(), f"deployment root {root} is a symlink; refusing to use or replace it")
+    expect(not os.path.lexists(root),
+           f"deployment root {root} already exists; pass an absent path, the smoke never replaces existing files")
+    expect(bool(compose_project_name(root)), f"deployment root name {root.name!r} does not give a Compose project name")
+    # 0700 for the whole run: no other user can reach what the run hands to it.
+    _create_owned_directory(root, 0o700)
+    owned_write(root, root / "docker-compose.yml", compose_fixture.read_bytes(), 0o644)
     # Existing installs created these as root; the base Compose must accept
     # them without any ownership migration.
     for name in ("config", "config/ssh", "data", "logs", "history", "backup-status"):
-        run(["sudo", "install", "-d", "-m", "0755", "-o", "0", "-g", "0", str(root / name)])
-    run(["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", str(config_fixture), str(root / "config" / "config.yaml")])
+        owned_run(root, ["sudo", "install", "-d", "-m", "0755", "-o", "0", "-g", "0", str(root / name)])
+    owned_run(root, ["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", str(config_fixture),
+                     str(root / "config" / "config.yaml")])
     if nonroot_fixture is not None:
         # Adopting the overlay is a separate, one-time change made before the
-        # hardened install first starts: the documented ownership step, verbatim.
-        shutil.copyfile(nonroot_fixture, root / "docker-compose.nonroot.yml")
-        run(["bash", "-euo", "pipefail", "-c", "\n".join(HARDENED_OWNERSHIP_PREP)], cwd=root)
+        # hardened install first starts: the documented ownership step, as
+        # hardened_ownership_commands() runs it, one checked command at a time.
+        owned_write(root, root / "docker-compose.nonroot.yml", nonroot_fixture.read_bytes(), 0o644)
+        for command in ownership:
+            owned_run(root, command, cwd=root)
+    return root
 
 
 SEED_UI = f"""
@@ -609,7 +877,7 @@ def seed_previous_release(deployment: Deployment, args: argparse.Namespace) -> t
 
 def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
     """Image-only upgrade and rollback on the base file, or the base file plus the nonroot overlay."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture, args.nonroot_fixture if hardened else None)
     deployment = Deployment(root, HARDENED_FILES if hardened else ())
     # Base installs stay root-owned and run as root; the hardened install runs
@@ -705,7 +973,7 @@ def seed_segmented_catalog(
 
 def segmented_catalog_upgrade(args: argparse.Namespace) -> str:
     """Preserve a v0.22.2 segmented catalog byte-for-byte across upgrade and rollback."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_path = root / "config" / "config.yaml"
@@ -776,7 +1044,7 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
     """
     command = ["docker", "compose", *deployment.file_args(), "run", "--rm", "--no-deps", "-T",
                "--name", name, "enclosure-history", "python", "-"]
-    process = subprocess.Popen(command, cwd=deployment.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    process = subprocess.Popen(command, cwd=deployment.checked_root(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
     lines: queue.Queue[str | None] = queue.Queue()
 
@@ -813,12 +1081,16 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+        try:  # bounded, so a hung removal cannot keep the run from its final cleanup
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False,
+                           timeout=CLEANUP_COMMAND_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"interrupted-startup container removal failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def interrupted_migration(args: argparse.Namespace) -> str:
     """Kill candidate startup at each schema-initialization seam, then restart normally."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
 
@@ -832,10 +1104,11 @@ def interrupted_migration(args: argparse.Namespace) -> str:
 
     # 3. The end state an uninterrupted upgrade produces, from a copy.
     reference_dir = root / "reference"
-    run(["sudo", "install", "-d", "-m", "0700", "-o", "0", "-g", "0", str(reference_dir)])
+    owned_run(root, ["sudo", "install", "-d", "-m", "0700", "-o", "0", "-g", "0", str(reference_dir)])
     # After a clean stop the WAL is normally checkpointed away; copy it if not.
-    run(["sudo", "sh", "-c", 'for f in history.db history.db-wal; do [ ! -e "$1/$f" ] || cp -p "$1/$f" "$2/"; done',
-         "sh", str(root / "history"), str(reference_dir)])
+    owned_run(root, ["sudo", "sh", "-c",
+                     'for f in history.db history.db-wal; do [ ! -e "$1/$f" ] || cp -p "$1/$f" "$2/"; done',
+                     "sh", str(root / "history"), str(reference_dir)])
     reference = deployment.run_python(
         "enclosure-history",
         end_state_script("/reference/history.db", UNINTERRUPTED_REFERENCE),
@@ -968,20 +1241,20 @@ print(json.dumps({"ok": True}))
 
 def install_enospc_history_mount(deployment: Deployment) -> None:
     # Create the cleanup marker before mounting, including on partial setup.
-    (deployment.root / ENOSPC_FILES[-1]).write_text(json.dumps({
+    owned_write(deployment.root, deployment.root / ENOSPC_FILES[-1], json.dumps({
         "services": {"enclosure-history": {"volumes": ["./history:/app/history:rw"]}},
-    }) + "\n", encoding="utf-8")
+    }) + "\n", 0o644)
     deployment.files = ENOSPC_FILES
-    run(["sudo", "mount", "-t", "tmpfs", "-o", "size=8m,nr_inodes=256", "tmpfs",
-         str(deployment.root / "history")])
+    owned_run(deployment.root, ["sudo", "mount", "-t", "tmpfs", "-o", "size=8m,nr_inodes=256", "tmpfs",
+                                str(deployment.root / "history")])
 
 
 def install_readonly_history_mount(deployment: Deployment) -> None:
     # Compose merges volumes by container target. Only the history bind changes;
     # retain the published command, restart policy, healthcheck and UI mounts.
-    (deployment.root / READONLY_FILES[-1]).write_text(json.dumps({
+    owned_write(deployment.root, deployment.root / READONLY_FILES[-1], json.dumps({
         "services": {"enclosure-history": {"volumes": ["./history:/app/history:ro"]}},
-    }) + "\n", encoding="utf-8")
+    }) + "\n", 0o644)
     deployment.files = READONLY_FILES
 
 
@@ -1050,7 +1323,7 @@ def check_readonly_runtime(deployment: Deployment, args: argparse.Namespace) -> 
 
 def readonly_state(args: argparse.Namespace) -> str:
     """Exercise one literal read-only required-state mount on synthetic released state."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1103,7 +1376,7 @@ def check_enospc_runtime(deployment: Deployment, args: argparse.Namespace) -> di
 
 def enospc_state(args: argparse.Namespace) -> str:
     """Exhaust a disposable required-state filesystem, then explicitly free it."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1224,7 +1497,7 @@ def admit_clean_host_root(root: Path, *, consent: bool) -> None:
            and root.parent.is_dir() and root.is_relative_to(Path(tempfile.gettempdir()).resolve()),
            "clean-host root must be an absent nonsymlink jbod-clean-host-* directory below TMPDIR")
     expect(not root.exists(), "clean-host root already exists; refusing to replace recovery files")
-    root.mkdir(mode=0o700)
+    _create_owned_directory(root, 0o700)
 
 
 def clean_host_absent(project: str, env: dict[str, str]) -> None:
@@ -1339,19 +1612,18 @@ def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = Non
     root = args.root.absolute()
     admit_clean_host_root(root, consent=args.disposable_clean_host_restore)
     client = root / "docker-client"
-    client.mkdir(mode=0o700)
+    owned_mkdir(root, client, 0o700)
     env = {"PATH": os.environ.get("PATH", os.defpath), "DOCKER_HOST": "unix:///var/run/docker.sock",
            "DOCKER_CONFIG": str(client), "APP_BIND_ADDRESS": "127.0.0.1"}
     project = root.name
     clean_host_absent(project, env)  # before daemon mutation or teardown ownership
     recovery = root / "recovery"
-    recovery.mkdir(mode=0o700)
+    owned_mkdir(root, recovery, 0o700)
     passphrase = os.urandom(32).hex()  # synthetic key input, never a real credential
     if secrets is not None:
         secrets.append(passphrase)
     key = recovery / "operator-key-input"
-    key.write_text(passphrase, encoding="utf-8")
-    key.chmod(0o600)
+    owned_write(root, key, passphrase, 0o600)
     archive = recovery / "backup.7z"
     deployment = CleanHostDeployment(root / "source", project, env)
     completed = False
@@ -1373,19 +1645,17 @@ def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = Non
             content = response.read(16 * 1024 * 1024 + 1)
         expect(content.startswith(b"7z\xbc\xaf\x27\x1c") and len(content) <= 16 * 1024 * 1024,
                "predecessor did not export the bounded supported 7z archive")
-        archive.write_bytes(content)
-        archive.chmod(0o600)
+        owned_write(root, archive, content, 0o600)
         del payload, content, request
         clean_host_down(deployment, project, env)
-        run(["sudo", "rm", "-rf", "--", str(deployment.root)], env=env)
-        expect(not deployment.root.exists(), "original installation was not removed")
+        remove_owned_tree(deployment.root, failure="original installation was not removed", env=env)
         # New current Compose and bootstrap fixture, never copied source state.
         deployment = CleanHostDeployment(root / "target", project, env)
         bootstrap = root / "fresh-bootstrap.yaml"
-        bootstrap.write_bytes(args.config_fixture.read_bytes().replace(b"WARNING", b"ERROR"))
+        owned_write(root, bootstrap, args.config_fixture.read_bytes().replace(b"WARNING", b"ERROR"), 0o600)
         expect(bootstrap.read_bytes() != args.config_fixture.read_bytes(), "fresh bootstrap must differ from source config")
         prepare_root(deployment.root, repository / "docker-compose.yml", bootstrap)
-        bootstrap.unlink()
+        owned_unlink(root, bootstrap)
         deployment.image = args.candidate_image
         deployment.runtime_environment.update(CLEAN_HOST_ENVIRONMENT)
         deployment.set_image(args.candidate_image)
@@ -1413,8 +1683,8 @@ def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = Non
         # failure, failed teardown, failed list queries, or residual resources.
         clean_host_down(deployment, project, env)
         if completed:
-            run(["sudo", "rm", "-rf", "--", str(root)], env=env)
-            expect(not root.exists(), "clean-host fixture cleanup failed")
+            # The target deployment inside it is checked too, not only this outer directory.
+            remove_owned_tree(root, failure="clean-host fixture cleanup failed", env=env)
     return (f"{SUCCESS_PREFIX} scenario=clean-host-restore previous={args.previous_version} "
             f"candidate={args.candidate_version} revision={args.candidate_revision} "
             "archive=7z encrypted=true original_installation=removed mappings=3 history_rows=18 "
@@ -1522,28 +1792,28 @@ def install_backup_secrets(root: Path) -> None:
     root. The value is synthetic and exists only at run time.
     """
     secrets = root / "config" / "backup-secrets"
-    run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0700", str(secrets)])
+    owned_run(root, ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0700", str(secrets)])
     temporary = root / "backup-passphrase.tmp"
     # Private from creation: no umask-dependent window before a later chmod.
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="ascii") as handle:
-        handle.write(uuid.uuid4().hex + "\n")
-    run(["sudo", "install", "-m", "0600", "-o", "0", "-g", "0",
-         str(temporary), str(secrets / "backup-passphrase")])
-    temporary.unlink()
+    owned_write(root, temporary, (uuid.uuid4().hex + "\n").encode("ascii"), 0o600, exclusive=True)
+    owned_run(root, ["sudo", "install", "-m", "0600", "-o", "0", "-g", "0",
+                     str(temporary), str(secrets / "backup-passphrase")])
+    owned_unlink(root, temporary)
 
 
 def install_backup_scheduler_with_target(deployment: Deployment) -> None:
     """Add the candidate's backup scheduler service with one available target."""
     root = deployment.root
-    (root / UNAVAILABLE_BACKUP_FILES[-1]).write_text(json.dumps(BACKUP_SCHEDULER_OVERLAY) + "\n", encoding="utf-8")
+    owned_write(root, root / UNAVAILABLE_BACKUP_FILES[-1], json.dumps(BACKUP_SCHEDULER_OVERLAY) + "\n", 0o644)
     # write_shared_status demands root:APP_GID mode 2750 (chown first: chown
     # clears the setgid bit); _prepare_socket demands no access for others.
-    run(["sudo", "chown", "0:10001", str(root / "backup-status")])
-    run(["sudo", "chmod", "2750", str(root / "backup-status")])
+    owned_run(root, ["sudo", "chown", "0:10001", str(root / "backup-status")])
+    owned_run(root, ["sudo", "chmod", "2750", str(root / "backup-status")])
     for name, mode in (("backups", "0755"), ("backup-journal", "0755"),
                        ("backup-api", "2750"), ("backup-targets", "0755")):
-        run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", mode, str(root / name)])
-    run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets" / "remote")])
+        owned_run(root, ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", mode, str(root / name)])
+    owned_run(root, ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755",
+                     str(root / "backup-targets" / "remote")])
     deployment.files = UNAVAILABLE_BACKUP_FILES
 
 
@@ -1555,8 +1825,10 @@ def make_backup_target_unavailable(root: Path) -> float:
     Returns the host injection timestamp: the readback window starts there,
     because the refused archive's build predates its own refusal record.
     """
-    run(["sudo", "mv", str(root / "backup-targets" / "remote"), str(root / "backup-targets" / "remote.held")])
-    run(["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", "/dev/null", str(root / "backup-targets" / "remote")])
+    owned_run(root, ["sudo", "mv", str(root / "backup-targets" / "remote"),
+                     str(root / "backup-targets" / "remote.held")])
+    owned_run(root, ["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", "/dev/null",
+                     str(root / "backup-targets" / "remote")])
     return time.time()
 
 
@@ -1566,8 +1838,9 @@ def make_backup_target_available(root: Path) -> float:
     Returns the host restore timestamp: the readback window ends there, and
     every archive built at/after it must ship (the recovery proof).
     """
-    run(["sudo", "rm", str(root / "backup-targets" / "remote")])
-    run(["sudo", "mv", str(root / "backup-targets" / "remote.held"), str(root / "backup-targets" / "remote")])
+    owned_run(root, ["sudo", "rm", str(root / "backup-targets" / "remote")])
+    owned_run(root, ["sudo", "mv", str(root / "backup-targets" / "remote.held"),
+                     str(root / "backup-targets" / "remote")])
     return time.time()
 
 
@@ -1756,7 +2029,7 @@ def record_backup_phase_change(deployment: Deployment, notes: str) -> None:
 
 def unavailable_backup_storage(args: argparse.Namespace) -> str:
     """Exercise one unavailable filesystem backup target on synthetic released state."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1949,8 +2222,12 @@ def state_identity(deployment: Deployment, root: Path) -> dict:
 
 
 def print_admin_logs(deployment: Deployment) -> None:
-    subprocess.run(["docker", "compose", *deployment.file_args(), "--profile", "admin", "logs", "--tail", "80",
-                    ADMIN_SERVICE], cwd=deployment.root, check=False)
+    """Best-effort admin logs for the job log, bounded so the final cleanup is always reached."""
+    try:
+        subprocess.run(["docker", "compose", *deployment.file_args(), "--profile", "admin", "logs", "--tail", "80",
+                        ADMIN_SERVICE], cwd=deployment.root, check=False, timeout=CLEANUP_CENSUS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"admin log diagnostic failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def remove_admin_service(deployment: Deployment) -> None:
@@ -1963,7 +2240,7 @@ def remove_admin_service(deployment: Deployment) -> None:
 
 def admin_during_upgrade(args: argparse.Namespace) -> str:
     """The admin service across an image-only upgrade, and its dormancy where never enabled."""
-    root = args.root.resolve()
+    root = admitted_root(args.root)
 
     # 1. Never enabled: the literal update must not start the admin profile.
     prepare_root(root, args.compose_fixture, args.config_fixture)
@@ -1974,7 +2251,10 @@ def admin_during_upgrade(args: argparse.Namespace) -> str:
     dormant.pull_and_up()
     check_runtime(dormant, args.candidate_image, args.candidate_version, args.candidate_revision)
     check_admin_dormant(dormant)
-    dormant.compose("down", "--volumes", "--remove-orphans")
+    # Phase one leaves through the same checked boundary as the final cleanup:
+    # teardown, independent absence readback, then removal of this run's own
+    # directory. Unverified teardown fails here and keeps phase one's files.
+    cleanup(root)
 
     # 2. A fresh released install whose operator starts the admin service.
     prepare_root(root, args.compose_fixture, args.config_fixture)
@@ -2058,19 +2338,87 @@ def compose_chain(root: Path) -> list[str]:
     return []
 
 
+CLEANUP_COMMAND_TIMEOUT = 180
+CLEANUP_CENSUS_TIMEOUT = 30
+
+
+def _cleanup_command(command: list[str], *, cwd: Path | None = None,
+                     timeout: int = CLEANUP_COMMAND_TIMEOUT) -> tuple[bool, str]:
+    """Run one bounded cleanup command. A failure, timeout or launch error is (False, "")."""
+    try:
+        result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    if result.returncode != 0:
+        return False, ""
+    return True, result.stdout if isinstance(result.stdout, str) else ""
+
+
+def cleanup_resource_census(project: str) -> list[str]:
+    """Problems found reading back this project's containers, networks and volumes; empty means absent."""
+    if not project:
+        return ["Compose project name is unknown"]
+    label = f"label=com.docker.compose.project={project}"
+    problems = []
+    for kind, command in (
+        ("container", ["docker", "container", "ls", "--all", "--quiet", "--filter", label]),
+        ("network", ["docker", "network", "ls", "--quiet", "--filter", label]),
+        ("volume", ["docker", "volume", "ls", "--quiet", "--filter", label]),
+    ):
+        ok, output = _cleanup_command(command, timeout=CLEANUP_CENSUS_TIMEOUT)
+        if not ok:
+            problems.append(f"{kind} census unknown")
+        elif output.strip():
+            problems.append(f"{kind}s remain")
+    return problems
+
+
+def compose_args(root: Path, project: str) -> list[str]:
+    """The pinned project and the scenario's `-f` chain for a cleanup or diagnostic command."""
+    return ["--project-name", project, *compose_chain(root)]
+
+
 def cleanup(root: Path) -> None:
+    """Tear down, read back absence, and only then remove the root this run created.
+
+    Raises SmokeError naming every problem when teardown fails or times out,
+    resources remain or cannot be listed, or removal fails. The deployment
+    root (configuration, history and Compose files) is then left in place.
+    The root, and every parent, must still be the directory this run created,
+    checked before any command, again before an unmount inside it, and again,
+    with every root this run created beneath it, immediately before removal.
+    """
+    root, record = _owned_root(root)
+    problems = []
+    teardown_ok = True
     if (root / "docker-compose.yml").exists():
-        subprocess.run(["docker", "compose", *compose_chain(root), "down", "--volumes", "--remove-orphans"],
-                       cwd=root, check=False)
-    if (root / ENOSPC_FILES[-1]).exists() and os.path.ismount(root / "history"):
-        result = subprocess.run(["sudo", "umount", str(root / "history")], check=False)
-        expect(result.returncode == 0, "ENOSPC fixture unmount failed; leaving the deployment root intact")
-    subprocess.run(["sudo", "rm", "-rf", str(root)], check=False)
+        teardown_ok, _ = _cleanup_command(
+            ["docker", "compose", *compose_args(root, record.project), *ADMIN_PROFILES,
+             "down", "--volumes", "--remove-orphans"],
+            cwd=root)
+        if not teardown_ok:
+            problems.append("Compose teardown failed or timed out")
+    if teardown_ok and (root / ENOSPC_FILES[-1]).exists() and os.path.ismount(root / "history"):
+        _owned_root(root)  # checked again immediately before the unmount inside it
+        unmounted, _ = _cleanup_command(["sudo", "umount", str(root / "history")])
+        if not unmounted:
+            problems.append("ENOSPC fixture unmount failed")
+    # Independent readback of the same pinned project, even after a failed
+    # teardown: query failure is unknown, never absence.
+    problems.extend(cleanup_resource_census(record.project))
+    if problems:
+        raise SmokeError(f"cleanup not verified ({'; '.join(problems)}); "
+                         f"teardown failed or is unknown, retaining {root} for recovery")
+    _checked_tree_for_removal(root)  # immediately before removal, with every root created beneath it
+    removed, _ = _cleanup_command(["sudo", "rm", "-rf", "--", str(root)])
+    if not removed or os.path.lexists(root):
+        raise SmokeError(f"cleanup removal of {root} failed after verified teardown")
+    _forget_tree(root)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--root", type=Path, required=True, help="Disposable deployment directory.")
+    parser.add_argument("--root", type=Path, required=True, help="An absent path to create for this run (never an existing directory or symlink, and without '..'); it is removed only after verified cleanup.")
     parser.add_argument("--compose-fixture", type=Path, required=True, help="The previous release's Compose file.")
     parser.add_argument("--config-fixture", type=Path, required=True)
     parser.add_argument("--previous-image", required=True)
@@ -2104,16 +2452,40 @@ def main(argv: list[str] | None = None) -> int:
             print("clean-host restore failed; recovery files retained: "
                   + clean_host_failure_message(exc, secrets), file=sys.stderr)
             return 1
+    result: str | None = None
+    cleaned = False
     try:
-        print(smoke(args) + f" seconds={int(time.monotonic() - started)}")
+        result = smoke(args)
     except SmokeError as exc:
         print(f"image upgrade smoke failed: {exc}", file=sys.stderr)
-        chain = compose_chain(args.root.resolve())
-        subprocess.run(["docker", "compose", *chain, "ps", "-a"], cwd=args.root, check=False)
-        subprocess.run(["docker", "compose", *chain, "logs", "--tail", "80"], cwd=args.root, check=False)
-        return 1
+        # Only directories this run created, still unchanged, are read or acted on.
+        for root, record in list(_OWNED_ROOTS.items()):
+            if not owns_root(root):
+                continue
+            for diagnostic in (["ps", "-a"], ["logs", "--tail", "80"]):
+                try:  # best-effort output to the job log, bounded like every cleanup command
+                    subprocess.run(["docker", "compose", *compose_args(root, record.project), *diagnostic],
+                                   cwd=root, check=False, timeout=CLEANUP_CENSUS_TIMEOUT)
+                except (OSError, subprocess.SubprocessError):
+                    print(f"diagnostic `docker compose {' '.join(diagnostic)}` failed", file=sys.stderr)
     finally:
-        cleanup(args.root.resolve())
+        # Runs on success, scenario failure and any other exception; its own
+        # failure is reported without replacing the scenario's. Cleanup acts
+        # on what this run created, never on the --root pathname itself.
+        owned = list(_OWNED_ROOTS)
+        cleaned = bool(owned)
+        for root in owned:
+            if root not in _OWNED_ROOTS:
+                continue  # already removed with the root that contains it
+            try:
+                cleanup(root)
+            except SmokeError as exc:
+                cleaned = False
+                print(f"image upgrade smoke cleanup failed: {exc}", file=sys.stderr)
+    # Success only after verified cleanup.
+    if result is None or not cleaned:
+        return 1
+    print(result + f" seconds={int(time.monotonic() - started)}")
     return 0
 
 
