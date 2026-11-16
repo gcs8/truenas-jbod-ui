@@ -130,11 +130,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   partial download or the fetched temporary copy) no longer replaces that
   result: the copy is still reported and marked as not matching, and a
   download of it is refused as a mismatch, as is now a download larger than
-  catalogued. Only a rejection raised while that copy was being read counts,
-  never one the caller was already handling for another copy. An
-  operating-system error while removing the fetched temporary copy after a
-  match no longer hides the match and is logged. Interruption and cancellation
-  still stop the Verify (#1255).
+  catalogued. A rejection the caller was already handling when the Verify or
+  download began is not counted against this copy. An operating-system error
+  while removing the fetched temporary copy after a match no longer hides the
+  match and is logged. Interruption and cancellation still stop the Verify
+  (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

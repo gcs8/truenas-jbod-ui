@@ -1671,8 +1671,11 @@ def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:
 def rejected_copy_error(exc: BaseException, ambient: BaseException | None = None) -> BaseException | None:
     """The size or content check's rejection behind ``exc``, by type, or None (#1202).
 
-    ``ambient`` is the exception the caller was handling before the attempt began;
-    the walk stops there, because it and everything behind it concern something else.
+    ``ambient`` is the exception the caller was handling when the attempt began.
+    That one object is skipped, and so is anything reached only through it, so a
+    rejection the caller was already handling is not taken for this copy. Nothing
+    else ties an exception to an attempt: an exception object kept from earlier
+    and chained in later is examined like any other.
     """
 
     pending, seen = [exc], set()
