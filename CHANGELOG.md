@@ -54,7 +54,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   it back and matches its SHA-256. A remote copy whose upload check was never
   recorded now says so instead of "Yes". A Verify of the local copy no longer
   carries over to a remote copy made from it, and one malformed stored upload
-  check no longer stops the whole list from loading (#1255).
+  check no longer stops the whole list from loading. A Verify result now names
+  the copy it read. A remote copy's result saved before this change is no
+  longer counted, because it may have been copied from the local copy: after
+  upgrading, such a copy reads as its upload check (size only, or not
+  recorded) until it is verified again. Listing reads nothing from the target
+  and rewrites no catalogue file. The Verify banner follows the Verify's own
+  result, so one that could not reach
+  the target no longer says "Backup verified.", and "Last check" says Worked
+  only for a passed check. The clean-up dialog no longer calls the copy it
+  keeps in each place the newest verified copy: it is the newest copy that
+  passed its last completed check, which can be a size check (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

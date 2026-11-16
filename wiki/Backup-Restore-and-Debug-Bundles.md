@@ -472,7 +472,9 @@ Some copies are never deleted:
 
 - A preserved (pinned) backup is never deleted and does not count toward keep-N.
   Preserve one before an upgrade or migration and give a reason.
-- The newest verified copy of each class at each location is always kept.
+- The newest copy of each class at each location that passed its last
+  completed check is always kept. For an FTP copy that check can be the
+  upload's size check; its Verified column says so until **Verify** re-reads it.
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
 

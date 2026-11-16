@@ -96,10 +96,11 @@ class BackupListAssuranceTests(backup_fixtures.SchedulerTestBase):
 
     def test_list_row_drops_unrecognised_provenance(self) -> None:
         scheduler, _local, remote = self._scheduler_with_size_only_copy()
+        own = remote.artifact_id  # results bound to this copy, so the sanitiser is reached
         with scheduler._state_lock:
             meta = scheduler._meta[remote.artifact_id]
             meta["upload_check"] = "checksum-of-the-moon"
-            meta["last_verify"] = {"at": "2026-09-24T12:00:00Z", "ok": "true", "detail": "x"}
+            meta["last_verify"] = {"at": "2026-09-24T12:00:00Z", "ok": "true", "detail": "x", "artifact_id": own}
         row = self._row(scheduler, remote.artifact_id)
         self.assertIsNone(row["upload_check"])
         self.assertEqual(row["last_verify"], {"at": "2026-09-24T12:00:00Z", "ok": False})
@@ -107,7 +108,7 @@ class BackupListAssuranceTests(backup_fixtures.SchedulerTestBase):
             scheduler._meta[remote.artifact_id]["last_verify"] = "yes"
         self.assertIsNone(self._row(scheduler, remote.artifact_id)["last_verify"])
         with scheduler._state_lock:
-            scheduler._meta[remote.artifact_id]["last_verify"] = {"at": 1758715200, "ok": True}
+            scheduler._meta[remote.artifact_id]["last_verify"] = {"at": 1758715200, "ok": True, "artifact_id": own}
         self.assertEqual(self._row(scheduler, remote.artifact_id)["last_verify"], {"at": None, "ok": True})
 
     def test_one_container_valued_upload_check_does_not_break_the_list(self) -> None:
@@ -212,6 +213,8 @@ class RemoteCopyVerifyIsPerCopyTests(backup_fixtures.SchedulerTestBase):
             scheduler._meta[local.artifact_id]["last_verify"] = {"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "x"}
             scheduler._meta[local.artifact_id]["publication"] = {"name": "planted"}
             scheduler._meta[local.artifact_id]["future_per_copy_fact"] = 1
+            scheduler._meta[local.artifact_id]["history_replacement"] = True
+        local_meta["history_replacement"] = True
         copy = dataclasses.replace(remote, artifact_id=new_artifact_id(), location="second")
         scheduler._catalog_remote(local, copy, upload_check="readback")
         copy_meta = scheduler._metadata_snapshot(copy.artifact_id)
@@ -219,11 +222,155 @@ class RemoteCopyVerifyIsPerCopyTests(backup_fixtures.SchedulerTestBase):
         self.assertNotIn("publication", copy_meta)
         self.assertNotIn("future_per_copy_fact", copy_meta)
         self.assertEqual(copy_meta["upload_check"], "readback")
-        for key in ("app_version", "schema_version", "packaging", "groups"):
-            self.assertEqual(copy_meta.get(key), local_meta.get(key), key)
+        for key in ("app_version", "schema_version", "packaging", "groups", "history_replacement"):
+            self.assertIn(key, copy_meta, key)
+            self.assertEqual(copy_meta[key], local_meta.get(key), key)
 
     def _row(self, scheduler, artifact_id):
         return next(item for item in scheduler.library()["artifacts"] if item["id"] == artifact_id)
+
+
+LEGACY_RESULT = {"at": "2026-09-24T11:00:00+00:00", "ok": True, "detail": "Readback matched the catalogued size and SHA-256."}
+
+
+class VerifyResultIsBoundToItsCopyTests(backup_fixtures.SchedulerTestBase):
+    """A Verify result counts only for the copy whose own bytes it read.
+
+    Earlier releases copied the local copy's whole metadata, Verify result
+    included, into each remote copy. Such state survives an upgrade: the
+    remote copy must read as unknown (its upload check only) until its own
+    Verify reads it back. Listing never reads a remote copy and never rewrites
+    the metadata file.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ftp = GatedFTP()
+        self.ftp.release.set()
+
+    def open_target(self, settings):
+        @contextlib.contextmanager
+        def opened():
+            yield FtpTarget(self.ftp, "/backups", encrypted=False)
+
+        return opened()
+
+    def _config(self):
+        return {"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]}
+
+    def _legacy_state(self):
+        """Catalogue and metadata files as the earlier release left them."""
+
+        scheduler = self.make(self._config())
+        local = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        with scheduler._state_lock:
+            # The earlier Verify wrote no copy binding, and the earlier upload
+            # copied the local copy's result into the remote copy's metadata.
+            scheduler._meta[local.artifact_id]["last_verify"] = dict(LEGACY_RESULT)
+            scheduler._meta[remote.artifact_id]["last_verify"] = dict(LEGACY_RESULT)
+            scheduler._save_meta()
+        scheduler.close()
+        return local, remote
+
+    def _row(self, scheduler, artifact_id):
+        return next(item for item in scheduler.library()["artifacts"] if item["id"] == artifact_id)
+
+    def _http(self, app, method, path, body=None):
+        status, payload = backup_fixtures.asgi_call(app, method, path, body)
+        self.assertEqual(status, 200, payload)
+        return json.loads(payload)
+
+    def test_an_inherited_result_from_an_earlier_release_is_unknown_after_restart(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        self.ftp.alter_same_length = True  # the stored bytes differ, the size matches
+        local, remote = self._legacy_state()
+        meta_path = self._paths.state_dir / "artifact-meta.json"
+        before = meta_path.read_bytes()
+
+        scheduler = self.make(self._config())  # restart on the new code
+        app = build_app(scheduler)
+        row = self._row(scheduler, remote.artifact_id)
+        self.assertEqual(row["upload_check"], "size")
+        self.assertIsNone(row["last_verify"], "an inherited Verify result counted for the remote copy")
+        self.assertIsNone(scheduler.detail(remote.artifact_id)["last_verify"])
+        listed = {item["id"]: item for item in self._http(app, "GET", "/internal/backups")["artifacts"]}
+        self.assertIsNone(listed[remote.artifact_id]["last_verify"])
+        self.assertIsNone(self._http(app, "GET", f"/internal/backups/{remote.artifact_id}")["last_verify"])
+        kept = self._http(app, "POST", f"/internal/backups/{remote.artifact_id}/preserve", {"reason": "synthetic keep"})
+        self.assertIsNone(kept["artifact"]["last_verify"])
+        released = self._http(app, "DELETE", f"/internal/backups/{remote.artifact_id}/preserve")
+        self.assertIsNone(released["artifact"]["last_verify"])
+        # Control: the local copy's own result, written by its own Verify, still counts.
+        self.assertEqual(self._row(scheduler, local.artifact_id)["last_verify"], {"at": LEGACY_RESULT["at"], "ok": True})
+        self.assertIs(scheduler.detail(local.artifact_id)["last_verify"]["ok"], True)
+        # Nothing read the remote copy, and nothing rewrote the metadata file.
+        self.assertEqual(self.ftp.retr_calls, 0)
+        self.assertEqual(meta_path.read_bytes(), before)
+
+        # The remote copy's own Verify reads it back and finds the altered bytes.
+        result = scheduler.verify(remote.artifact_id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ftp.retr_calls, 1)
+        self.assertEqual(result["artifact"]["last_verify"]["ok"], False)
+        self.assertIs(self._row(scheduler, remote.artifact_id)["last_verify"]["ok"], False)
+
+    def test_the_copys_own_verify_after_the_upgrade_counts(self) -> None:
+        _local, remote = self._legacy_state()
+        scheduler = self.make(self._config())
+        self.assertIsNone(self._row(scheduler, remote.artifact_id)["last_verify"])
+        result = scheduler.verify(remote.artifact_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.ftp.retr_calls, 1)
+        row = self._row(scheduler, remote.artifact_id)
+        self.assertIs(row["last_verify"]["ok"], True)
+        self.assertEqual(row["last_verify"], result["artifact"]["last_verify"])
+        detail = scheduler.detail(remote.artifact_id)["last_verify"]
+        self.assertEqual(set(detail), {"at", "ok", "detail"})
+        self.assertIs(detail["ok"], True)
+        # The stored result names the copy it read.
+        self.assertEqual(scheduler._metadata_snapshot(remote.artifact_id)["last_verify"]["artifact_id"], remote.artifact_id)
+
+    def test_a_result_bound_to_another_copy_never_counts(self) -> None:
+        scheduler = self.make(self._config())
+        local = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        self.assertTrue(scheduler.verify(local.artifact_id)["ok"])
+        own = scheduler._metadata_snapshot(local.artifact_id)["last_verify"]
+        self.assertEqual(own.get("artifact_id"), local.artifact_id)
+        # Whatever path copies it, the local copy's result is not the remote copy's.
+        with scheduler._state_lock:
+            scheduler._meta[remote.artifact_id]["last_verify"] = dict(own)
+        self.assertIsNone(self._row(scheduler, remote.artifact_id)["last_verify"])
+        self.assertIsNone(scheduler.detail(remote.artifact_id)["last_verify"])
+        self.assertIsNone(scheduler.serialize(remote)["last_verify"])
+        self.assertEqual(self.ftp.retr_calls, 0)
+        # Control: the local copy keeps it.
+        self.assertIs(self._row(scheduler, local.artifact_id)["last_verify"]["ok"], True)
+
+    def test_details_count_only_a_boolean_true_as_passed(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        app = build_app(scheduler)
+        cases = (
+            ({"at": "2026-09-24T12:00:00Z", "ok": "true", "detail": "x"}, {"at": "2026-09-24T12:00:00Z", "ok": False, "detail": "x"}),
+            ({"at": 1758715200, "ok": 1, "detail": ["x"]}, {"at": None, "ok": False, "detail": None}),
+            ({"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "y"}, {"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "y"}),
+            ({"at": "2026-09-24T12:00:00Z", "ok": False, "detail": "z"}, {"at": "2026-09-24T12:00:00Z", "ok": False, "detail": "z"}),
+        )
+        for stored, expected in cases:
+            with self.subTest(stored=stored):
+                with scheduler._state_lock:
+                    scheduler._meta[remote.artifact_id]["last_verify"] = {**stored, "artifact_id": remote.artifact_id}
+                self.assertEqual(scheduler.detail(remote.artifact_id)["last_verify"], expected)
+                self.assertEqual(self._http(app, "GET", f"/internal/backups/{remote.artifact_id}")["last_verify"], expected)
+                self.assertEqual(
+                    self._row(scheduler, remote.artifact_id)["last_verify"], {"at": expected["at"], "ok": expected["ok"]}
+                )
 
 
 if __name__ == "__main__":

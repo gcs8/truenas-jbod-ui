@@ -1339,7 +1339,7 @@ class BackupScheduler:
             # #1202: the list says what the details say. None for local copies
             # and copies catalogued before #722.
             "upload_check": _upload_check(meta),
-            "last_verify": _list_last_verify(meta),
+            "last_verify": _list_last_verify(record, meta),
         }
 
     def detail(self, artifact_id: str) -> dict[str, Any]:
@@ -1373,7 +1373,7 @@ class BackupScheduler:
             if meta
             else None
         )
-        payload["last_verify"] = meta.get("last_verify")
+        payload["last_verify"] = _detail_last_verify(record, meta)
         return payload
 
     def library(self) -> dict[str, Any]:
@@ -1522,7 +1522,8 @@ class BackupScheduler:
             detail = describe_error(exc)
         with self._state_lock:
             meta = self._meta.setdefault(artifact_id, {})
-            meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
+            # The result names the copy it read, so it never counts for another (#1202).
+            meta["last_verify"] = {"at": at, "ok": ok, "detail": detail, "artifact_id": artifact_id}
             self._save_meta()
         # Re-publish (or clear) verified_full from the catalog's current flag so
         # the history sidecar never suppresses its own copy after a failed
@@ -1562,19 +1563,47 @@ def _upload_check(meta: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value in {"readback", "size"} else None
 
 
-def _list_last_verify(meta: Mapping[str, Any]) -> dict[str, Any] | None:
-    """When the last explicit Verify ran and whether it passed, without its text.
+def _own_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The last explicit Verify result of this copy, or None.
 
-    Only a boolean ``True`` counts as passed, so a malformed record never
-    upgrades a size-only copy. The full result, detail text included, stays in
-    the artifact details.
+    A result counts only when it names this copy. Earlier releases wrote no
+    name and copied the local copy's result into each remote copy's metadata,
+    so an unnamed result on a remote copy says nothing about that copy's bytes:
+    the copy reads as its upload check until its own Verify reads it back. A
+    local copy's metadata is written only by its own run and its own Verify,
+    so its unnamed result is its own (#1202).
     """
 
     value = meta.get("last_verify")
     if not isinstance(value, Mapping):
         return None
+    if "artifact_id" in value:
+        return value if value["artifact_id"] == record.artifact_id else None
+    return value if record.location == LOCAL_LOCATION else None
+
+
+def _list_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """When this copy's last explicit Verify ran and whether it passed, without its text.
+
+    Only a boolean ``True`` counts as passed, so a malformed record never
+    upgrades a size-only copy. The details add the result's text.
+    """
+
+    value = _own_last_verify(record, meta)
+    if value is None:
+        return None
     at = value.get("at")
     return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
+
+
+def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The list summary of this copy's last Verify plus its text, by the same rules."""
+
+    value = _own_last_verify(record, meta)
+    if value is None:
+        return None
+    detail = value.get("detail")
+    return {**_list_last_verify(record, meta), "detail": detail if isinstance(detail, str) else None}
 
 
 # Metadata that describes the archive content and so holds for every copy of it.

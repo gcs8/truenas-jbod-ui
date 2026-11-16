@@ -21,7 +21,7 @@
     "test_backup_archive_lifecycle": 40,
     "test_backup_archive_transport": 78,
     "test_backup_integration": 136,
-    "test_backup_list_assurance": 7,
+    "test_backup_list_assurance": 11,
     "test_bash_ci_contract": 6,
     "test_changelog_entry_gate": 23,
     "test_ci_contract": 58,

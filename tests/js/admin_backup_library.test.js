@@ -793,6 +793,67 @@ test("a successful explicit Verify turns the list and the details to Yes togethe
   assert.equal(verifiedFact(elements), "Yes");
 });
 
+test("the Verify banner follows the operation's own result, not the copy's catalogue flag (#1202)", async () => {
+  // What the scheduler returns when the target cannot be reached: the
+  // operation failed and nothing was read, but the catalogue keeps the copy's flag.
+  const unreachable = {
+    ok: false,
+    artifact: { ...syntheticLibrary().artifacts[4], verified: true, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } },
+    detail: "ConnectionRefusedError: connection refused",
+  };
+  const responses = [
+    [unreachable, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ ...unreachable, verified: true }, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    [{ ok: "true", artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    // Control: a Verify that read the copy back and matched.
+    [{ ok: true, artifact: { ...unreachable.artifact, last_verify: { at: "2026-09-24T12:00:00+00:00", ok: true } }, detail: "Readback matched the catalogued size and SHA-256." }, ["Backup verified.", "success"]],
+  ];
+  for (const [response, banner] of responses) {
+    const api = fakeApi({
+      "POST /api/admin/backups/full-odd/verify": () => {
+        Object.assign(api.data.artifacts[4], response.artifact);
+        return response;
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, JSON.stringify(response));
+    assert.equal(verifiedColumn(elements, "full-odd"), banner[1] === "success" ? "Yes" : SIZE_ONLY_TEXT);
+  }
+});
+
+test("Last check says Worked only for a Verify whose result is boolean true (#1202)", async () => {
+  async function lastCheck(lastVerify) {
+    const api = fakeApi({
+      "GET /api/admin/backups/full-odd": () => ({ ...syntheticLibrary().artifacts[4], upload_check: "size", last_verify: lastVerify }),
+    });
+    const { elements, library } = mount({ api });
+    await library.load();
+    await library.actions.showDetails("full-odd");
+    await settle();
+    const facts = elements.dialog.querySelector("dl").children;
+    const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+    return { verified: verifiedFact(elements), lastCheck: index === -1 ? null : facts[index + 1].textContent };
+  }
+  for (const ok of ["true", 1, "yes", {}]) {
+    const result = await lastCheck({ at: "2026-09-21T10:05:00Z", ok, detail: "" });
+    assert.equal(result.verified, SIZE_ONLY_TEXT, JSON.stringify(ok));
+    assert.doesNotMatch(result.lastCheck, /Worked/, JSON.stringify(ok));
+    assert.match(result.lastCheck, /^Failed/, JSON.stringify(ok));
+  }
+  // Controls: a passed and a failed Verify of this copy.
+  assert.deepEqual(await lastCheck({ at: "2026-09-21T10:05:00Z", ok: true, detail: "" }), { verified: "Yes", lastCheck: "Worked (T(2026-09-21T10:05:00Z))" });
+  assert.deepEqual(
+    await lastCheck({ at: "2026-09-21T10:05:00Z", ok: false, detail: "Readback does not match" }),
+    { verified: SIZE_ONLY_TEXT, lastCheck: "Failed: Readback does not match (T(2026-09-21T10:05:00Z))" },
+  );
+  // No Verify of this copy recorded: no Last check line.
+  assert.deepEqual(await lastCheck(null), { verified: SIZE_ONLY_TEXT, lastCheck: null });
+});
+
 const NOT_RECORDED_TEXT = "Upload check not recorded; Verify re-reads and hashes it";
 
 test("rows without upload-check provenance say so, the same way in both views (#1202)", async () => {
@@ -869,7 +930,11 @@ test("clean up shows the dry-run plan and applies exactly its token", async () =
   assert.match(text, /These 2 copies will be deleted/);
   assert.match(text, /only 1 copies are kept and this is number 2/);
   assert.match(text, /never verified, and older than 1 day \(it is 2 days old\)/);
-  assert.match(text, /1 more is over a limit but kept, because it is the newest verified copy in its place/);
+  // The plan knows only the catalogue's check result, which can be a size
+  // check at upload, so it promises no more than that (#1202).
+  assert.match(text, /These 2 copies will be deleted\. Kept copies and the newest copy in each place that passed its last completed check are never deleted\./);
+  assert.match(text, /1 more is over a limit but kept, because it is the newest copy in its place that passed its last completed check\. That check may have been by size only; the Verified column says which\./);
+  assert.doesNotMatch(text, /newest verified copy/);
   assert.equal(action(elements.dialog, "cleanup-apply").textContent, "Delete 2");
   await library.actions.applyCleanup();
   const apply = api.calls.find((call) => call.url.endsWith("/lifecycle/apply"));

@@ -293,9 +293,11 @@
     if (!lastRun || typeof lastRun !== "object") {
       return { tone: "", text: "Not used yet" };
     }
+    // Only a boolean true is a pass; a malformed result never reads as Worked.
+    const worked = lastRun.ok === true;
     return {
-      tone: lastRun.ok ? "is-ok" : "is-bad",
-      text: lastRun.ok ? "Worked" : `Failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
+      tone: worked ? "is-ok" : "is-bad",
+      text: worked ? "Worked" : `Failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
       at: lastRun.at || "",
     };
   }
@@ -1061,8 +1063,9 @@
             body: "{}",
             timeoutMs: LONG_TIMEOUT_MS,
           });
-          const item = payload.artifact || payload;
-          const ok = item.verified !== false && payload.verified !== false;
+          // The operation's own result: a copy the catalogue still counts as
+          // verified was not read back when the Verify could not reach it.
+          const ok = payload?.ok === true;
           setBanner(ok ? "Backup verified." : `Backup did not verify${payload.detail ? `: ${scrubText(payload.detail)}` : "."}`, ok ? "success" : "error");
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
@@ -1305,7 +1308,7 @@
           state.cleanupPlan = plan;
           const body = scope.body();
           const guardedNote = plan.guarded
-            ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest verified copy in its place.` })
+            ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest copy in its place that passed its last completed check. That check may have been by size only; the Verified column says which.` })
             : null;
           if (!plan.items.length) {
             body?.replaceChildren(el("p", { text: "Nothing to clean up. Every copy is within its limits." }), guardedNote || "");
@@ -1316,7 +1319,7 @@
             throw new Error("The plan came back without a token, so it can't be applied safely.");
           }
           body?.replaceChildren(
-            el("p", { text: `These ${plan.items.length} ${plan.items.length === 1 ? "copy" : "copies"} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
+            el("p", { text: `These ${plan.items.length} ${plan.items.length === 1 ? "copy" : "copies"} will be deleted. Kept copies and the newest copy in each place that passed its last completed check are never deleted.` }),
             el("ul", { className: "backup-change-list backup-cleanup-list" }, plan.items.map((item) => {
               const artifact = findArtifact(item.id);
               const what = artifact
