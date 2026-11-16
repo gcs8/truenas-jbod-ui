@@ -488,12 +488,13 @@ Some copies are never deleted:
   yourself are left alone.
 
 Before grooming deletes a copy of a class at a location, it makes sure at
-least one copy it is keeping is still good. It reads back the newest verified
-copy that stays and checks its size and SHA-256 against the catalog. If that
-copy matches, the check ends and the deletions go ahead. If it is missing or no
-longer matches, it is marked unverified, the plan is worked out again (which
-can only remove deletions, never add one), and the next newest verified copy is
-read. The check stops as soon as nothing is left to delete. The clean-up result
+least one copy it is keeping is still good. Of the copies that stay, it reads
+back the newest one that passed its last completed check, and checks its size
+and SHA-256 against the catalog. If that copy matches, the check ends and the
+deletions go ahead. If it is missing or no longer matches, it is marked
+unverified, the plan is worked out again (which can only remove deletions,
+never add one), and the next newest such copy is read. The check stops as soon
+as nothing is left to delete. The clean-up result
 and the backup page's "Last clean-up" status line both say how many copies were
 marked unverified, even when the clean-up otherwise finished, in the same words
 ("3 of the copies it kept failed the size and SHA-256 check and were marked

@@ -542,7 +542,7 @@ class CleanupRefusalWordingTests(backup_fixtures.SchedulerTestBase):
 
         return opened()
 
-    def test_a_size_only_copy_refused_in_a_race_is_not_called_verified(self) -> None:
+    def test_a_size_only_copy_kept_in_a_race_and_the_guard_asked_directly_is_not_called_verified(self) -> None:
         from datetime import timedelta
 
         from history_service.backup_scheduler.api import build_app
@@ -591,6 +591,71 @@ class CleanupRefusalWordingTests(backup_fixtures.SchedulerTestBase):
         self.assertEqual(str(refused.exception), GUARD_REFUSAL)
         self.assertNotIn("verified", str(refused.exception))
         self.assertEqual(self.ftp.files, files)
+
+    def test_the_clean_up_route_returns_the_guards_refusal_for_a_size_only_copy(self) -> None:
+        from datetime import timedelta
+
+        from history_service.backup_scheduler.api import build_app
+
+        config = {"full": {"enabled": True, "remote_keep": 3}, "targets": [backup_fixtures.TARGET]}
+        scheduler = self.make(config)
+        for _ in range(3):
+            scheduler.run_now("full")
+            self.now += timedelta(days=1)
+        oldest, middle, newest = scheduler.catalog.list(location="nas")
+        # A preserved copy stays whatever the plan says, so a checked copy is
+        # left to read back and the clean-up goes on to ask the guard.
+        scheduler.preserve(oldest.artifact_id, reason="synthetic retained copy", actor="op")
+        scheduler.close()
+        scheduler = self.make({**config, "full": {"enabled": True, "remote_keep": 1}})
+        app = build_app(scheduler)
+
+        def call(method, path, body=None):
+            status, payload = backup_fixtures.asgi_call(app, method, path, body)
+            self.assertEqual(status, 200, payload)
+            return json.loads(payload)
+
+        plan = call("GET", "/internal/backups/lifecycle/plan")
+        self.assertEqual([item["id"] for item in plan["items"]], [middle.artifact_id])
+        # The newest copy is damaged and its own Verify clears its flag, so the
+        # planned middle copy becomes the newest one the guard protects.
+        key = "/backups/" + newest.name
+        self.ftp.files[key] = b"X" * len(self.ftp.files[key])
+        self.assertIs(call("POST", f"/internal/backups/{newest.artifact_id}/verify", {})["ok"], False)
+        for artifact in (oldest, middle):
+            row = scheduler.serialize(scheduler.get(artifact.artifact_id))
+            self.assertEqual((row["upload_check"], row["last_verify"], row["verified"]), ("size", None, True))
+        reads, files = self.ftp.retr_calls, dict(self.ftp.files)
+
+        status, result = _admin_call(app, "/api/admin/backups/lifecycle/apply", None, {"plan_token": plan["plan_token"]})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "deleted": [],
+                "already_missing": [],
+                "failed": {"id": middle.artifact_id, "error": "CatalogError: " + GUARD_REFUSAL},
+                "not_attempted": [],
+                "downgraded": [],
+                "kept_after_replan": [],
+            },
+        )
+        self.assertNotIn("verified", result["failed"]["error"])
+        self.assertEqual(self.ftp.files, files)  # nothing deleted
+        self.assertEqual(self.ftp.retr_calls, reads + 1)  # the preserved keeper, read back once
+
+    def test_the_wiki_does_not_call_the_copy_read_before_a_clean_up_verified(self) -> None:
+        from pathlib import Path
+
+        page = (Path(__file__).resolve().parents[1] / "wiki" / "Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        # The copy grooming reads back is chosen by its catalogue flag, which a
+        # size-only or provider-checksum upload also sets.
+        self.assertNotIn("newest verified", " ".join(page.split()))
+        self.assertIn("passed its last completed check", " ".join(page.split()))
 
 
 GUARD_REFUSAL = (
