@@ -59,6 +59,7 @@ from app.services.inventory_registry import InventoryRegistry, SystemNotConfigur
 from app.services.ssh_probe import SSH_CONNECTION_IDLE_SECONDS
 from app.services.mapping_store import (
     MappingDurabilityError,
+    MappingReadBusy,
     MappingScopeConflict,
 )
 from app.services.release_status import ReleaseStatusService
@@ -197,6 +198,25 @@ async def mapping_scope_conflict_exception_handler(
             "detail": MappingScopeConflict.public_detail,
         },
         status_code=409,
+    )
+
+
+async def mapping_read_busy_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    # A read met a newer mapping file on every reread (#1228). Readers never
+    # wait for a writer, so this is a prompt, retryable refusal; the log line
+    # carries the configured file, the response does not.
+    logger.warning("%s", getattr(exc, "operator_message", MappingReadBusy.public_detail))
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": MappingReadBusy.error_code,
+            "detail": MappingReadBusy.public_detail,
+        },
+        status_code=503,
+        headers={"Retry-After": "1"},
     )
 
 

@@ -320,6 +320,52 @@ class StorageFabricBootstrapTests(unittest.TestCase):
         self.assertNotIn(chr(0x2028), script_body)
 
 
+class StorageFabricSummaryCountTests(unittest.TestCase):
+    """The server-rendered summary follows the same not-read rule as the page script (#1219)."""
+
+    @staticmethod
+    def _render_summary(fabric: SasFabricSnapshot) -> dict[str, str]:
+        html = templates.get_template("sas_fabric.html").render(
+            {
+                "request": build_request("/sas-fabric"),
+                "snapshot": InventorySnapshot(slots=[], refresh_interval_seconds=30),
+                "fabric": fabric.model_dump(mode="json"),
+                "settings": Settings(),
+                "app_version": "0.0.0-test",
+                "bootstrap_json": "{}",
+            }
+        )
+        return {
+            key: re.search(rf'id="fabric-summary-{key}">([^<]*)<', html).group(1)  # type: ignore[union-attr]
+            for key in ("controllers", "paths", "expanders", "enclosures", "traces")
+        }
+
+    def test_unread_counts_render_as_not_read(self) -> None:
+        fabric = SasFabricSnapshot(
+            available=True,
+            platform="core",
+            controllers=[{"id": "controller:mpr0", "name": "mpr0"}],
+            raw={"controller_read": {"counts": {
+                "controllers": "partial", "paths": "complete", "expanders": "not_read", "enclosures": "partial",
+            }}},
+        )
+
+        self.assertEqual(
+            self._render_summary(fabric),
+            {"controllers": "at least 1", "paths": "0", "expanders": "not read", "enclosures": "not read", "traces": "0"},
+        )
+
+    def test_whole_or_unlabelled_counts_render_as_numbers(self) -> None:
+        complete = {"controllers": "complete", "paths": "complete", "expanders": "complete", "enclosures": "complete"}
+        for raw in ({}, {"controller_read": {"counts": complete}}):
+            with self.subTest(raw=raw):
+                fabric = SasFabricSnapshot(available=True, platform="core", controllers=[{"id": "controller:mpr0"}], raw=raw)
+                self.assertEqual(
+                    self._render_summary(fabric),
+                    {"controllers": "1", "paths": "0", "expanders": "0", "enclosures": "0", "traces": "0"},
+                )
+
+
 class SnapshotExportBootstrapTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         EXPORT_HISTORY_CACHE.clear()

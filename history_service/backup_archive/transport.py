@@ -199,15 +199,29 @@ def _is_listable_name(name: str) -> bool:
 
 @contextmanager
 def _open_local_source(local_path: Path) -> Iterator[tuple[BinaryIO, int]]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK: a FIFO in place of the source (an upload file, or a kept copy
+    # on a filesystem/NFS target read back by grooming) must not block the open
+    # before the regular-file check refuses it (#1188). A regular file is put
+    # back into blocking mode, so its reads are unchanged.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(Path(local_path), flags)
     except OSError as exc:
         raise ArchiveTransportError("Archive source must be a readable regular file.") from exc
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode):
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ArchiveTransportError("Archive source must be a readable regular file.")
+        if getattr(os, "O_NONBLOCK", 0):
+            os.set_blocking(descriptor, True)
+    except BaseException:
         os.close(descriptor)
-        raise ArchiveTransportError("Archive source must be a readable regular file.")
+        raise
     handle = os.fdopen(descriptor, "rb")
     try:
         yield handle, metadata.st_size
