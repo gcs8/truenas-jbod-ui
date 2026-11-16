@@ -62,6 +62,7 @@ const FABRIC_FUNCTIONS = [
   "storageViewSlotIsManualOnly",
   "sasFabricViewSlotForBay",
   "sasFabricBayForViewSlot",
+  "slotOccupancy",
   "sasFabricViewSlotNote",
   "selectSlotForBay",
   "defaultSasFabricTraceId",

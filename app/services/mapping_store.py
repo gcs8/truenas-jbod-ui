@@ -136,6 +136,17 @@ class MappingSlotDiskChangedBeforeClear(MappingSlotDiskChanged):
     public_detail = "The disk in this bay changed. Reload to see it, then clear again."
 
 
+class MappingSlotDiskUnverifiable(MappingRevisionConflict):
+    """The pre-write read could not tell what is in the bay, so nothing is written (#1218)."""
+
+    public_detail = "The disk in this bay could not be checked right now. Nothing was saved. Reload and try again."
+    error_code = "mapping_disk_unverifiable"
+
+
+class MappingSlotDiskUnverifiableBeforeClear(MappingSlotDiskUnverifiable):
+    public_detail = "The disk in this bay could not be checked right now. Nothing was cleared. Reload and try again."
+
+
 class MappingImportBaysChanged(MappingRevisionConflict):
     """A bay the confirmed restore writes holds another disk than at its preview (#1141)."""
 

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from fnmatch import fnmatchcase
 from functools import lru_cache
 from contextlib import closing
 from pathlib import Path
@@ -17,7 +18,9 @@ from typing import Any
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     SEGMENT_ID_PATTERN,
+    describe_names,
     path_entry_exists,
+    scan_folder,
 )
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.segment_sealer import (
@@ -210,7 +213,14 @@ def _unreferenced_segment_temporary_paths(
                 )
 
     unreferenced_paths: list[Path] = []
-    for candidate in sorted(segments_directory.glob(".segment-*.sqlite3"), key=str):
+    # A bounded listing: a writer of the history volume can create any number
+    # of these names (#1196).
+    for name in scan_folder(
+        segments_directory,
+        role="segments folder",
+        matches=lambda entry_name: fnmatchcase(entry_name, ".segment-*.sqlite3"),
+    ):
+        candidate = segments_directory / name
         if referenced_identity is not None:
             try:
                 candidate_metadata = os.stat(candidate, follow_symlinks=False)
@@ -239,8 +249,9 @@ def _raise_for_unreferenced_segment_temporaries(
         return
     noun = "artifact" if len(paths) == 1 else "artifacts"
     raise ValueError(
-        f"{label} found unreferenced segment temporary {noun}: "
-        + ", ".join(json.dumps(str(path)) for path in paths)
+        f"{label} found {len(paths)} unreferenced segment temporary {noun} in the "
+        "segments folder: "
+        + describe_names([path.name for path in paths])
         + "."
     )
 

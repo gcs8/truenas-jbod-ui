@@ -119,6 +119,8 @@ class ParsedSSHData:
     esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
     esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
     esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
+    # Each answered `/eall/sall` listing: whether its reply was a whole drive census.
+    esxi_storcli_drive_lists: dict[str, bool] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -1813,6 +1815,14 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
         serial = normalize_text(columns[3]) if columns[3] != "-" else None
         status_text = normalize_text(columns[4]) or "Unknown"
         status_lower = status_text.lower()
+        # A device name is presence and "Not installed" is absence. A row with
+        # neither reports nothing about occupancy, so it stays unknown (#1218).
+        if "not installed" in status_lower:
+            present: bool | None = False
+        elif device_names:
+            present = True
+        else:
+            present = None
 
         current_enclosure.slots[slot_number] = SESMapSlot(
             slot_number=slot_number,
@@ -1825,8 +1835,8 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             serial=serial,
             model=model,
             size_text=None if "not installed" in status_lower else normalize_text(status_text.split(",", 1)[0]),
-            present=bool(device_names) and "not installed" not in status_lower,
-            presence_source="sesutil_show",
+            present=present,
+            presence_source="sesutil_show" if present is not None else None,
         )
 
     parsed = [item for item in enclosures if item.slots]
@@ -2531,12 +2541,17 @@ def _ses_enclosures_share_identity(first: SESMapEnclosure, second: SESMapEnclosu
         return bool(first.ses_device and first.ses_device == second.ses_device)
     # Unkeyed redundant paths need disk and attached-enclosure evidence.
     # Host-local names and sg basenames are never cross-host identity proof.
+    # A zero or missing address, in any spelling, is absence rather than
+    # identity, and a bay the enclosure reports empty is no anchor (#1217).
     def bay_identities(enclosure):
-        addresses = Counter(slot.sas_address for slot in enclosure.slots.values() if slot.sas_address)
-        return {(slot.slot_number, slot.sas_address, slot.attached_sas_address)
-                for slot in enclosure.slots.values()
-                if slot.sas_address not in {None, "0x0"} and addresses[slot.sas_address] == 1
-                and slot.attached_sas_address not in {None, "0x0"}
+        bays = [(slot, normalize_hex_identifier(slot.sas_address),
+                 normalize_hex_identifier(slot.attached_sas_address))
+                for slot in enclosure.slots.values()]
+        addresses = Counter(address for _slot, address, _attached in bays if address not in {None, "0"})
+        return {(slot.slot_number, address, attached)
+                for slot, address, attached in bays
+                if address not in {None, "0"} and addresses[address] == 1
+                and attached not in {None, "0"} and slot.present is not False
                 and not slot.sas_address_conflict and not slot.sas_address_degraded}
     return bool(bay_identities(first) & bay_identities(second))
 
@@ -2975,6 +2990,24 @@ def _add_control_targets(
     return merged
 
 
+def _ses_candidate_presence(slot: SESMapSlot) -> bool | None:
+    """Occupancy for an inventory candidate: decided evidence or unknown.
+
+    A truncated AES descriptor or a condition-only Enclosure Status record
+    leaves the bay undecided. That stays ``None`` so inventory does not read
+    it as a live empty report (#1218). Only device names are positive
+    evidence and only an explicit not-installed status is absence.
+    """
+
+    if slot.present is not None:
+        return slot.present
+    if "not installed" in (slot.status or "").lower():
+        return False
+    if slot.device_names:
+        return True
+    return None
+
+
 def _merge_candidate_presence(
     target: dict[str, Any],
     incoming: dict[str, Any],
@@ -3250,9 +3283,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "serial_hint": slot.serial,
                     "model_hint": slot.model,
                     "reported_size": slot.size_text,
-                    "present": slot.present
-                    if slot.present is not None
-                    else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
+                    "present": _ses_candidate_presence(slot),
                     "presence_source": slot.presence_source,
                     "presence_conflict": slot.presence_conflict,
                     "enclosure_id": enclosure.enclosure_id,
@@ -5498,17 +5529,19 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
     return details
 
 
-def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[Any]:
+    # Every entry, objects or not: the parser skips the others, and the census
+    # check refuses a reply that has any (#1218).
     rows = response_data.get("Drive Information") or response_data.get("PD LIST") or []
     if isinstance(rows, list) and rows:
-        return [row for row in rows if isinstance(row, dict)]
+        return list(rows)
 
-    fallback_rows: list[dict[str, Any]] = []
+    fallback_rows: list[Any] = []
     for key, value in response_data.items():
         if not isinstance(key, str) or not re.match(r"^Drive\s+/c\d+/e\d+/s\d+$", key, re.IGNORECASE):
             continue
         if isinstance(value, list):
-            fallback_rows.extend(item for item in value if isinstance(item, dict))
+            fallback_rows.extend(value)
         elif isinstance(value, dict):
             fallback_rows.append(value)
     return fallback_rows
@@ -5633,6 +5666,49 @@ def parse_storcli_physical_drives(
             )
         )
     return drives
+
+
+def storcli_physical_drive_list_complete(output: str) -> bool:
+    """True when a `/eall/sall show all J` reply is taken as the drive census (#1218).
+
+    Every controller block answered `Success`, the drive parser read at least
+    one drive record (from the `Drive Information`/`PD LIST` table or from
+    `Drive /cN/eM/sK` entries), every record names an enclosure and slot, and
+    no `Drive /cN/eM/sK` entry names a drive the records do not; a slot it
+    lists no drive in is then taken as empty. A failed or unparsed reply, one
+    with no drive record, a record without its enclosure and slot, or a
+    `Drive /cN/eM/sK` entry for a drive the records do not list proves no
+    absence. The check runs one way only (the records may list drives no such
+    entry names), and nothing compares the records with the controller's own
+    drive count or enclosure list: a well-formed reply that leaves drives out
+    is taken as the census, as before #1218.
+    """
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return False
+    controllers = payload.get("Controllers") if isinstance(payload, dict) else None
+    if not isinstance(controllers, list) or not controllers:
+        return False
+    for controller in controllers:
+        status = controller.get("Command Status") if isinstance(controller, dict) else None
+        response = controller.get("Response Data") if isinstance(controller, dict) else None
+        if not isinstance(status, dict) or str(status.get("Status") or "").strip().casefold() != "success":
+            return False
+        if not isinstance(response, dict):
+            return False
+        # The records the drive parser reads, in either form it accepts.
+        listed = [
+            _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2] if isinstance(row, dict) else None
+            for row in _collect_storcli_physical_drive_rows(response)
+        ]
+        named = {
+            _storcli_slot_key(detail.get("enclosure_id"), detail.get("slot"))
+            for detail in _collect_storcli_drive_details(response).values()
+        }
+        if not listed or None in listed or not named <= set(listed):
+            return False
+    return True
 
 
 def _collect_storcli_virtual_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -5908,6 +5984,9 @@ def parse_ssh_outputs(
             )
         elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
             controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
+            parsed.esxi_storcli_drive_lists[command_key] = storcli_physical_drive_list_complete(
+                normalized_outputs[command_key]
+            )
             parsed.esxi_storcli_physical_drives.extend(
                 parse_storcli_physical_drives(
                     normalized_outputs[command_key],

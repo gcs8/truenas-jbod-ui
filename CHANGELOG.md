@@ -61,6 +61,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   256 addresses per reported address list; reaching either limit, or
   dropping a reported address, is shown in Storage Fabric warnings with the
   counts (#1259).
+- Inventory source status and `/healthz`, SMART responses, BMC warnings,
+  locator status, storage-view history and mapping-preview errors and snapshot
+  exports now show a fixed category for a failure the platform API, the BMC or
+  the network reports (authentication failed, timed out, could not be reached,
+  TLS connection failed, certificate verification failed with a named
+  certificate problem, an unusable response, a reported error with its code),
+  keep this service's own messages such as the SSH-off note, sudo guidance and
+  missing slot or view as before, and name an unexpected local error as one.
+  A reply that is not a JSON object where one is required counts as an
+  unusable response. Log lines carry the operation, category, method or
+  endpoint, error name, code, errno or exit status instead of exception text;
+  background refresh, layout, SMART batch and mapping-save failure lines name
+  a fixed operation, the locate-light refusal line keeps this service's own
+  message and adds those fields but never the reported reason, and an
+  enclosure id, view id or device appears in a log line only when it is a
+  plain identifier. Collector failures stay at
+  ERROR, and an unexpected local error, also when an adapter wrapped it or it
+  happened while an error response was being read, is reported as an internal
+  error and logs at ERROR with file base names, functions and line numbers (at
+  most 20 frames) but without its message. Locate-light and system-locator
+  action errors, including locate-light commands run over SSH, add the reason
+  the appliance, BMC or command reported after the fixed message, at most 300
+  characters and without control characters; a local fault during those
+  actions answers "<action> stopped on an internal error; see the service
+  log." The SMART-over-SSH fallback and the SSH transport log records are not
+  covered by this change (#1263).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
@@ -209,6 +235,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   StorCLI virtual drive without a decimal VD number is no longer given the
   physical drives of every VD; and a configured SSH command longer than 4096
   characters or 256 words is refused when the configuration loads (#1260).
+- SES evidence no longer misplaces or hides disks: zero SAS addresses no longer
+  merge unrelated shelves seen from different hosts or give a bay another
+  host's identify target; a bay whose SES occupancy is unknown, including a
+  CORE `sesutil show` row without a device name, keeps its mapped disk and
+  shows as unknown instead of empty on every platform. Such a bay is no longer
+  turned occupied by an `OK` status; history keeps its last recorded disk and
+  records no removal for it; a recorded SMART failure or temperature for that
+  disk stays in the alert metrics until it is read again, while evidence for a
+  disk no longer in any configured enclosure is dropped; mapping health counts
+  it, even with a locate or fault light on, as unknown rather than as a disk,
+  and reports a saved bay assignment there as one that cannot be verified;
+  storage-view tiles, saved-view bays the backing enclosure does not list and
+  manual-only layout bays show `Unknown` instead of `Empty`; Storage Fabric
+  shows its `present` value as `unknown`; disk retention accounting does not
+  count a saved assignment there as a rendered disk; a manual-only saved view
+  does not show a saved serial in such a bay as a disk;
+  saving or clearing a bay assignment there is refused with a message that the
+  disk could not be checked, not that it changed; and the bay-assignment
+  restore preview says its current disk cannot be checked instead of calling
+  the bay empty. Quantastor
+  no longer hides a known disk behind a zero SAS address when stronger
+  evidence says the bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
@@ -334,6 +382,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed recovery of a crashed segmented restore that also restored
+  configuration (#1196): recovery now returns configuration and history to the
+  same generation, or refuses with a named reason and keeps its evidence,
+  instead of reporting the prior generation restored while candidate
+  configuration stayed active. The history records recovery acts on must
+  match the restore's own record in the first configuration folder; a journal
+  whose history records differ is refused (`history-target-unrecorded`) and
+  nothing is changed. While a configuration folder that the
+  application's settings name still holds a restore record that recovery did
+  not settle, it reports `configuration-recovery-incomplete`, changes nothing
+  and exits with status 3; a folder it lists past its scan bound gives
+  `recovery-scan-limit-reached` the same way. Run such a recovery through the
+  admin service, which mounts the configuration volume; a receipt printed
+  without `APP_SERVICE_ROLE=admin` (the history container, or an older Compose
+  file with no roles) says the configuration folders were not checked there and
+  gives the admin command, which sets that role. The guide's check for records
+  left after the journal calls them stale only when configuration and history
+  both hold the generation the restore's recorded decision selects (#1265).
 - Fixed a lost bay-assignment change when two owners of one mapping file (a
   second app process, or a second store in one process) both reported a
   successful save. Saves, clears and imports now hold a writer lock

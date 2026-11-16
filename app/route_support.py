@@ -41,6 +41,7 @@ from app.models.domain import (
     InventorySnapshot,
     SnapshotExportRequest,
     StorageViewRuntimePayload,
+    slot_occupancy,
 )
 from app.perf import add_perf_metadata, perf_stage
 from app.script_json import register_script_json_filters
@@ -53,6 +54,7 @@ from app.services.inventory import (
     SplitEnclosureError,
     SystemRetentionTooLargeError,
     UnknownEnclosureError,
+    public_smart_failure_message,
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.ssh_probe import SSH_CONNECTION_IDLE_SECONDS
@@ -72,7 +74,7 @@ from app.services.storage_writability import (
     probe_read_only_known_hosts_files,
     probe_writable_directories,
 )
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import TrueNASAPIError, is_local_failure_message, log_failure
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -499,7 +501,7 @@ async def _load_storage_view_export_source(
     for view in filtered_runtime.views:
         slot_cache: dict[str, dict[str, Any]] = {}
         for runtime_slot in view.slots:
-            if not runtime_slot.occupied:
+            if slot_occupancy(runtime_slot) != "present":
                 continue
             try:
                 summary = await service.get_storage_view_slot_smart_summary(
@@ -509,9 +511,11 @@ async def _load_storage_view_export_source(
                     allow_stale_cache=True,
                 )
             except TrueNASAPIError as exc:
+                if not is_local_failure_message(exc):
+                    log_failure(logger, "Snapshot export storage-view SMART read", exc)
                 slot_cache[str(runtime_slot.slot_index)] = {
                     "available": False,
-                    "message": str(exc),
+                    "message": public_smart_failure_message(exc),
                 }
                 continue
             slot_cache[str(runtime_slot.slot_index)] = summary.model_dump(mode="json")
@@ -821,7 +825,8 @@ async def resolve_layout_slots(
     except (UnknownEnclosureError, SnapshotStateBusyError) as exc:
         raise http_exception_for(exc) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
-        logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
+        # DEBUG for a remote failure as before; an internal error is ERROR with frames.
+        log_failure(logger, "Slot bounds layout read", exc, level=logging.DEBUG)
         raise HTTPException(
             status_code=503,
             detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL,

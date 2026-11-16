@@ -18,7 +18,13 @@ from app.services.tls_context import (
     tls_checks_hostname,
     urlopen_with_tls_config,
 )
-from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
+from app.services.truenas_ws import (
+    LocalServiceError,
+    TrueNASAPIError,
+    TrueNASRawData,
+    classify_remote_failure,
+    error_body_read_category,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,14 +102,26 @@ class QuantastorRESTClient:
     def _fetch_required_list(self, endpoint: str) -> list[dict[str, Any]]:
         payload = self._request_json(endpoint, {"flags": 0})
         if self._is_error_payload(payload):
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned an API error payload: {payload}")
+            raise TrueNASAPIError(
+                f"Quantastor endpoint {endpoint} reported an API error.",
+                category="remote_error",
+                method=endpoint,
+            )
         if not self._is_valid_collection_payload(payload):
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned no usable rows.")
+            raise TrueNASAPIError(
+                f"Quantastor endpoint {endpoint} returned no usable rows.",
+                category="response_invalid",
+                method=endpoint,
+            )
         rows = self._ensure_list(payload)
         if not rows:
             allows_empty = endpoint in REQUIRED_ENDPOINTS_ALLOWING_EMPTY_ROWS
             if not allows_empty or not self._is_explicit_empty_collection(payload):
-                raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned no usable rows.")
+                raise TrueNASAPIError(
+                    f"Quantastor endpoint {endpoint} returned no usable rows.",
+                    category="response_invalid",
+                    method=endpoint,
+                )
         return rows
 
     @staticmethod
@@ -148,7 +166,9 @@ class QuantastorRESTClient:
 
     def _request_json(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
         if not self.config.api_user or not self.config.api_password:
-            raise TrueNASAPIError("Quantastor API access requires TRUENAS_API_USER and TRUENAS_API_PASSWORD.")
+            raise LocalServiceError(
+                "Quantastor API access requires TRUENAS_API_USER and TRUENAS_API_PASSWORD."
+            )
 
         base_url, server_name = quantastor_request_destination(self.config)
         query = urlencode({key: value for key, value in (params or {}).items() if value is not None})
@@ -181,22 +201,45 @@ class QuantastorRESTClient:
         except HTTPError as exc:
             try:
                 with exc:
-                    detail = exc.read().decode("utf-8", errors="replace").strip()
+                    exc.read()
             except (OSError, HTTPException) as read_exc:
                 raise TrueNASAPIError(
-                    f"Quantastor endpoint {endpoint} failed ({exc.code}); error response could not be read."
+                    f"Quantastor endpoint {endpoint} failed ({exc.code}); error response could not be read.",
+                    code=exc.code,
+                    category=error_body_read_category(read_exc),
+                    method=endpoint,
                 ) from read_exc
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} failed ({exc.code}): {detail or exc.reason}") from exc
+            category = "authentication_failed" if exc.code in {401, 403} else "remote_error"
+            raise TrueNASAPIError(
+                f"Quantastor endpoint {endpoint} failed ({exc.code}).",
+                code=exc.code,
+                category=category,
+                method=endpoint,
+            ) from exc
         except URLError as exc:
-            raise TrueNASAPIError(f"Quantastor API request to {endpoint} failed: {exc.reason}") from exc
+            category, _code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                f"Quantastor API request to {endpoint} failed.",
+                category=category,
+                method=endpoint,
+            ) from exc
         except (OSError, HTTPException) as exc:
-            raise TrueNASAPIError(f"Quantastor API request to {endpoint} failed ({type(exc).__name__}).") from exc
+            category, _code = classify_remote_failure(exc)
+            raise TrueNASAPIError(
+                f"Quantastor API request to {endpoint} failed ({type(exc).__name__}).",
+                category=category,
+                method=endpoint,
+            ) from exc
 
         try:
             payload = body.decode(charset)
         except (UnicodeError, LookupError) as exc:
             # Limit codec lookup handling to decode, not unrelated client code.
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned an undecodable response.") from exc
+            raise TrueNASAPIError(
+                f"Quantastor endpoint {endpoint} returned an undecodable response.",
+                category="response_invalid",
+                method=endpoint,
+            ) from exc
 
         # Do not retain the raw response alongside decoded text during parsing.
         del body
@@ -204,7 +247,11 @@ class QuantastorRESTClient:
         try:
             return json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned invalid JSON.") from exc
+            raise TrueNASAPIError(
+                f"Quantastor endpoint {endpoint} returned invalid JSON.",
+                category="response_invalid",
+                method=endpoint,
+            ) from exc
 
     @staticmethod
     def _ensure_list(payload: Any) -> list[dict[str, Any]]:

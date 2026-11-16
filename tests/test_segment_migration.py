@@ -1163,8 +1163,9 @@ action(source=Path(source), segments_directory=Path(segments), apply=True)
 
             self.assertEqual(
                 str(raised.exception),
-                "Segmented history recovery found unreferenced segment temporary artifact: "
-                + json.dumps(str(orphan_path))
+                "Segmented history recovery found 1 unreferenced segment temporary artifact "
+                "in the segments folder: "
+                + json.dumps(orphan_path.name)
                 + ".",
             )
             self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
@@ -1194,9 +1195,9 @@ action(source=Path(source), segments_directory=Path(segments), apply=True)
             message = str(raised.exception)
             self.assertEqual(
                 message,
-                "Segmented history recovery found unreferenced segment temporary artifact: "
-                + json.dumps(str(orphan_path))
-                + ".",
+                # A name outside the printable set is replaced, not escaped.
+                "Segmented history recovery found 1 unreferenced segment temporary artifact "
+                'in the segments folder: "<name not shown>".',
             )
             self.assertNotIn("\n", message)
             self.assertNotIn("\x1b", message)
