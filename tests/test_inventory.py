@@ -64,6 +64,7 @@ from app.services.inventory import (
     lunid_alias_tier_sets,
     parse_size_to_bytes,
     resolve_persistent_id,
+    slot_detail_collection_binding,
 )
 from app.services.mapping_store import (
     MappingRevisionConflict,
@@ -7799,6 +7800,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.slot_detail_store.save_entries([
                 SlotDetailCacheEntry(
+                    collection_binding=slot_detail_collection_binding(service.system),
                     system_id="nvr", enclosure_id="enc", slot=3, identifiers=["sanitized-mapped-1"],
                     slot_fields={"serial": "SANITIZED-MAPPED-1", "model": "Synthetic",
                                  "sas_address": "SLOTIDX-sas", "enclosure_identifier": "SLOTIDX-descriptor"},
@@ -10977,6 +10979,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             store.save_entries(
                 [
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id=enclosure_id,
                         slot=5,
@@ -15362,6 +15365,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                             device_name="da0", **current,
                         )
                         entry = SlotDetailCacheEntry(
+                            collection_binding=slot_detail_collection_binding(service.system),
                             system_id="default", enclosure_id="enc-1", slot=0,
                             identifiers=["da0", *historical.values()],
                             slot_fields={"model": "cached-model", **historical},
@@ -15855,6 +15859,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             store.save_entries(
                 [
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=slot,
@@ -15947,6 +15952,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.slot_detail_store.save_entries([
                 SlotDetailCacheEntry(
+                    collection_binding=slot_detail_collection_binding(service.system),
                     system_id=system.id, enclosure_id="enc-1", slot=0,
                     identifiers=["da0", "synth-1"],
                     slot_fields={
@@ -16027,6 +16033,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             store.save_entries(
                 [
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=0,
@@ -16034,6 +16041,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         slot_fields={"model": "cached-model", "serial": "SER-INVENTED-0"},
                     ),
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=1,
@@ -16041,6 +16049,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         slot_fields={"model": "stale-model", "serial": "SER-INVENTED-1"},
                     ),
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=2,
@@ -18721,9 +18730,17 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             returned = await service.get_snapshot(selected_enclosure_id="node-a")
 
-            self.assertIs(returned, trusted_snapshot)
+            # The answer keeps the trusted facts and their read time but says
+            # the latest refresh was incomplete (#1208); the cache is unchanged.
+            self.assertEqual(returned.slots[0].vdev_name, "mirror-0")
+            self.assertEqual(returned.last_updated, trusted_snapshot.last_updated)
+            self.assertTrue(
+                any("latest inventory refresh was incomplete" in warning for warning in returned.warnings),
+                returned.warnings,
+            )
             self.assertIs(service._cache["node-a"], trusted_snapshot)
             self.assertEqual(service._cache["node-a"].slots[0].vdev_name, "mirror-0")
+            self.assertEqual(service._cache["node-a"].warnings, [])
 
     async def test_get_snapshot_reuses_shared_source_bundle_across_enclosure_switches(self) -> None:
         class DummyTrueNASClient:
@@ -18904,6 +18921,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service.slot_detail_store.save_entries(
                 [
                     SlotDetailCacheEntry(
+                        collection_binding=slot_detail_collection_binding(service.system),
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=0,
