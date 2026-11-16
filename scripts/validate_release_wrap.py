@@ -51,6 +51,8 @@ POST_PUBLISH_GATES = {
 
 OWNER_PUBLICATION_TARGETS = {"external wiki", "public demo"}
 VALID_RESULTS = {"pass", "blocked", "n/a", "deferred"}
+# docs/RELEASE_CHECKLIST.md: "Not enough time" is not a valid N/A reason.
+FORBIDDEN_NA_REASON_RE = re.compile(r"\bnot\s+enough\s+time\b", re.IGNORECASE)
 WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
 CHANGELOG_COVERAGE_REQUIRED_FROM = (0, 22, 3)
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
@@ -148,8 +150,17 @@ def _is_separator_row(cells: list[str]) -> bool:
 
 
 def parse_checklist_evidence_table(text: str) -> dict[str, list[str]]:
-    """Return release-wrap checklist evidence rows keyed by lower-case gate."""
+    """Return release-wrap checklist evidence rows keyed by lower-case gate.
 
+    A repeated gate keeps its first row; ``validate_release_wrap_text`` reports
+    the repeat and any unreadable row, so neither can pass validation.
+    """
+
+    rows, _issues = _parse_checklist_evidence_rows(text)
+    return rows
+
+
+def _parse_checklist_evidence_rows(text: str) -> tuple[dict[str, list[str]], list[ValidationIssue]]:
     lines = text.splitlines()
     header_index: int | None = None
     for index, line in enumerate(lines):
@@ -159,23 +170,49 @@ def parse_checklist_evidence_table(text: str) -> dict[str, list[str]]:
             break
 
     if header_index is None:
-        return {}
+        return {}, []
 
     rows: dict[str, list[str]] = {}
-    for line in lines[header_index + 1 :]:
+    issues: list[ValidationIssue] = []
+    started = False
+    for line_number, line in enumerate(lines[header_index + 1 :], start=header_index + 2):
         cells = _split_markdown_row(line)
         if cells is None:
-            if rows:
+            if "|" in line:
+                # A pipe-bearing line missing an outer pipe is still table content.
+                # Ending the table here would hide it and every later row.
+                inner = line.strip().removeprefix("|").removesuffix("|")
+                if _is_separator_row([cell.strip() for cell in inner.split("|")]):
+                    continue
+                started = True
+                issues.append(
+                    ValidationIssue(f"malformed checklist evidence row {line_number}: missing outer table pipe")
+                )
+                continue
+            if started:
                 break
             continue
         if _is_separator_row(cells):
             continue
+        started = True
         if len(cells) != 5:
+            issues.append(
+                ValidationIssue(
+                    f"malformed checklist evidence row {line_number}: expected 5 cells, found {len(cells)}"
+                )
+            )
             continue
         gate = cells[0].strip()
-        if gate:
-            rows[gate.lower()] = cells
-    return rows
+        if not gate:
+            issues.append(ValidationIssue(f"malformed checklist evidence row {line_number}: gate name is empty"))
+            continue
+        key = gate.lower()
+        if key in rows:
+            # Never let a later row overwrite earlier evidence for the same gate.
+            issues.append(ValidationIssue(f"duplicate checklist evidence row: {gate}"))
+            continue
+        rows[key] = cells
+    return rows, issues
 
 
 def _has_pending_owner_publication_evidence(evidence: str) -> bool:
@@ -226,7 +263,8 @@ def validate_release_wrap_text(
             )
         )
 
-    rows = parse_checklist_evidence_table(text)
+    rows, row_issues = _parse_checklist_evidence_rows(text)
+    issues.extend(row_issues)
     if not rows:
         issues.append(ValidationIssue("release wrap is missing the checklist evidence table"))
         return issues
@@ -271,6 +309,10 @@ def validate_release_wrap_text(
             )
         if normalized_result == "n/a" and reason.lower() in {"", "-", "n/a", "none", "reason"}:
             issues.append(ValidationIssue(f"{gate}: N/A requires a concrete reason"))
+        if normalized_result == "n/a" and FORBIDDEN_NA_REASON_RE.search(reason):
+            issues.append(
+                ValidationIssue(f"{gate}: N/A reason 'Not enough time' is not allowed; stop the release instead")
+            )
 
     issues.extend(
         narrow_beta_issues(
