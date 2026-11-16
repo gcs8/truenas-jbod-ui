@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
-from app.services.inventory import InventoryService
+from app.services.inventory import InventoryService, slot_detail_collection_binding
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     parse_nvme_id_ctrl_summary,
@@ -1064,6 +1064,7 @@ class NegativePowerOnTimeTests(unittest.TestCase):
             service.slot_detail_store.save_entries([SlotDetailCacheEntry(
                 system_id="synthetic", enclosure_id="enc-1", slot=0, identifiers=["SYNTHETIC-SERIAL"],
                 slot_fields={"serial": "SYNTHETIC-SERIAL"}, smart_fields=smart_fields,
+                collection_binding=slot_detail_collection_binding(service.system),
             )])
             slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="enc-1",
                             present=True, serial="SYNTHETIC-SERIAL")
@@ -1186,6 +1187,7 @@ class RefusedPowerOnStoreTests(unittest.TestCase):
         SlotDetailStore(str(self.path)).save_entries([SlotDetailCacheEntry(
             system_id="synthetic", enclosure_id="enc-1", slot=0, identifiers=[self.SERIAL],
             slot_fields={"serial": self.SERIAL}, smart_fields=smart_fields,
+            collection_binding=slot_detail_collection_binding(SystemConfig(id="synthetic")),
         )])
 
     def _readers(self) -> dict[str, SmartSummaryView | None]:
