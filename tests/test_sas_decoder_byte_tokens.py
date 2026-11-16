@@ -109,11 +109,21 @@ class MalformedAscSenseTests(unittest.TestCase):
                 self.assertEqual(decoded["sense_key"], SENSE_KEY)
 
     def test_absent_asc_is_not_reported_malformed(self) -> None:
+        for event in (
+            {"reason": REASON, "sense_key": SENSE_KEY},
+            {"asc": None, "reason": REASON, "sense_key": SENSE_KEY},
+        ):
+            with self.subTest(asc=event.get("asc", "missing")):
+                decoded = decode_scsi_sense_event(event)
+                self.assertNotIn("asc_malformed", decoded)
+                self.assertEqual(decoded["family"], "aborted_command")
+                self.assertEqual(decoded["decode_confidence"], "observed")
+
+    def test_empty_asc_field_is_malformed_not_absent(self) -> None:
+        # The line parser passes an "asc:" field with nothing in it as "".
         decoded = decode_scsi_sense_event({"asc": "", "reason": REASON, "sense_key": SENSE_KEY})
 
-        self.assertNotIn("asc_malformed", decoded)
-        self.assertEqual(decoded["family"], "aborted_command")
-        self.assertEqual(decoded["decode_confidence"], "observed")
+        self.assert_undecodable(decoded)
 
     def test_valid_control_decodes_through_the_event_pipeline(self) -> None:
         for text in ("4b,4", "4b,04"):
@@ -141,6 +151,90 @@ class MalformedAscSenseTests(unittest.TestCase):
                 self.assertEqual(summary["fault_family_counts"], {})
                 self.assertEqual(summary["top_findings"], [])
                 self.assertEqual(summary["sense_count"], 1)
+
+
+# Every rejected shape can stand in the first "asc:" field of a sense line,
+# except trailing whitespace, which the line cannot tell apart from the
+# separator before "(reason)"; the direct decoder test covers that one. An
+# empty field and a field followed by another "asc:" are malformed too.
+LINE_REJECTED_ASC = tuple(text for text in REJECTED_ASC if text != "4b,04 ") + (
+    "",
+    "+4b,04 asc:4b,04",
+    "4_b,04 asc:4b,04",
+    "gg,04 asc:4b,04",
+    "\u0664b,04 asc:4b,04",
+    "4b,04,1 asc:4b,04",
+    "4b,04 asc:4b,04",
+    "4b,04 ASC:4b,04",
+)
+
+
+class SenseLineFirstFieldTests(unittest.TestCase):
+    """The first "asc:" field of a sense line is the only one read, whole."""
+
+    def assert_valid_control(self) -> None:
+        row, events = _parse_one(_sense_line("4b,04"))
+        summary = events["by_controller"]["mpr0"]
+        self.assertEqual(row["asc_label"], NAK_LABEL)
+        self.assertEqual(row["family"], "sas_protocol")
+        self.assertEqual(row["decode_confidence"], "standard")
+        self.assertEqual(row["sense_key"], SENSE_KEY)
+        self.assertEqual(summary["fault_family_counts"], {"sas_protocol": 1})
+        self.assertEqual(len(summary["top_findings"]), 1)
+
+    def assert_malformed_line(self, line: str, raw: str, *, reason: str | None = REASON) -> None:
+        row, events = _parse_one(line)
+        MalformedAscSenseTests.assert_undecodable(self, row["decoded"])
+        self.assertIs(row.get("asc_malformed"), True)
+        self.assertNotIn("asc_label", row)
+        self.assertNotIn("family", row)
+        self.assertNotIn("likely_layer", row)
+        self.assertEqual(row.get("decode_confidence"), "unconfirmed")
+        self.assertIn("malformed", row.get("decoder_note", ""))
+        # The complete raw value is kept; nothing is absorbed into the key.
+        self.assertEqual(row.get("asc"), raw.lower())
+        self.assertEqual(row.get("sense_key"), SENSE_KEY)
+        summary = events["by_controller"]["mpr0"]
+        self.assertEqual(summary["fault_family_counts"], {})
+        self.assertEqual(summary["top_findings"], [])
+        self.assertIsNone(summary["primary_fault"])
+        self.assertEqual(summary["sense_count"], 1)
+        if reason is not None:
+            self.assertEqual(row["label"], reason)
+            self.assertEqual(summary["sense_counts"], {reason: 1})
+
+    def test_rejected_first_field_shapes_through_the_event_pipeline(self) -> None:
+        for text in LINE_REJECTED_ASC:
+            with self.subTest(asc=text):
+                self.assert_malformed_line(_sense_line(text), text)
+                self.assert_valid_control()
+
+    def test_a_later_marker_is_never_read_in_place_of_the_first(self) -> None:
+        prefix = "(da0:mpr0:0:1:0): SCSI sense: "
+        for body, raw in (
+            (f"{SENSE_KEY} ASC:+4b,04 asc:4b,04 ({REASON})", "+4b,04 asc:4b,04"),
+            (f"{SENSE_KEY}asc:+4b,04 asc:4b,04 ({REASON})", "+4b,04 asc:4b,04"),
+            (f"{SENSE_KEY} Asc:gg,04 asc:4b,04 ({REASON})", "gg,04 asc:4b,04"),
+        ):
+            with self.subTest(body=body):
+                self.assert_malformed_line(prefix + body, raw)
+                self.assert_valid_control()
+
+    def test_a_field_without_a_reason_is_still_read(self) -> None:
+        for body, raw in ((f"{SENSE_KEY} asc:+4b,04", "+4b,04"), (f"{SENSE_KEY} asc:", "")):
+            with self.subTest(body=body):
+                self.assert_malformed_line("(da0:mpr0:0:1:0): SCSI sense: " + body, raw, reason=None)
+                self.assert_valid_control()
+
+    def test_a_lowercase_sense_prefix_is_read_like_the_classifier_reads_it(self) -> None:
+        self.assert_malformed_line(f"(da0:mpr0:0:1:0): scsi sense: {SENSE_KEY} asc:+4b,04 ({REASON})", "+4b,04")
+        self.assert_valid_control()
+
+    def test_a_line_without_an_asc_field_is_not_reported_malformed(self) -> None:
+        row, _events = _parse_one(f"(da0:mpr0:0:1:0): SCSI sense: {SENSE_KEY} ({REASON})")
+
+        self.assertNotIn("asc_malformed", row)
+        self.assertNotIn("asc", row)
 
 
 class CamErrorNumberTests(unittest.TestCase):

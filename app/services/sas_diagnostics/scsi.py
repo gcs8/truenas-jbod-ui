@@ -594,7 +594,9 @@ def decode_scsi_sense_event(event: dict[str, Any]) -> dict[str, Any]:
     sense_key = str(event.get("sense_key") or event.get("sense") or "").upper()
     asc = str(event.get("asc") or "").lower()
     asc_tuple = parse_asc_ascq(asc)
-    if asc and asc_tuple is None:
+    # A present field ("" included: the line had an empty "asc:") that the
+    # reader rejects is malformed; only a missing field is absent.
+    if event.get("asc") is not None and asc_tuple is None:
         return _malformed_asc_sense_event(asc, sense_key)
     asc_label = SCSI_ASC_ASCQ_LABELS.get(asc_tuple) if asc_tuple else None
     family = _sense_fault_family(reason, sense_key, asc_tuple)

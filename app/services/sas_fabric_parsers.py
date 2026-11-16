@@ -512,16 +512,44 @@ def _mpr_dmesg_severity(message: str) -> str:
     return "info"
 
 
+_SENSE_PREFIX = re.compile(r"SCSI sense:", re.IGNORECASE)
+_SENSE_ASC_MARKER = re.compile(r"asc:", re.IGNORECASE)
+_SENSE_REASON_OPENER = re.compile(r"\s\(")
+
+
 def _parse_mpr_sense_message(message: str) -> dict[str, str]:
-    match = re.search(r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)", message)
-    if not match:
+    """Split a sense line into sense key, ASC/ASCQ field and reason.
+
+    The kernel prints ``SCSI sense: <key> asc:%x,%x (<reason>)``. The first
+    ``asc:`` marker (any case) is the only ASC field read. Its complete raw
+    value, everything up to the reason, is kept whatever it contains, so the
+    strict reader decides whether it is a code. The sense key is the text
+    before that marker, so a malformed field is never absorbed into the key,
+    and a later ``asc:`` fragment is never read in its place. An empty field
+    is kept as ``""`` (present but malformed); no marker means no ASC field.
+    """
+    prefix = _SENSE_PREFIX.search(message)
+    if not prefix:
         return {}
-    return {
-        "sense": match.group("sense").strip(),
-        "sense_key": match.group("sense").strip().upper(),
-        "asc": match.group("asc").lower(),
-        "reason": match.group("reason").strip(),
-    }
+    body = message[prefix.end() :]
+    marker = _SENSE_ASC_MARKER.search(body)
+    if not marker:
+        return {}
+    sense = body[: marker.start()].strip()
+    rest = body[marker.end() :]
+    asc, reason = rest, None
+    opener = _SENSE_REASON_OPENER.search(rest)
+    close = rest.rfind(")")
+    if opener and close > opener.end():
+        end = opener.start()
+        while end and rest[end - 1].isspace():
+            end -= 1
+        asc = rest[:end]
+        reason = rest[opener.end() : close].strip()
+    parsed = {"sense": sense, "sense_key": sense.upper(), "asc": asc.lower()}
+    if reason is not None:
+        parsed["reason"] = reason
+    return parsed
 
 
 def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
