@@ -366,18 +366,30 @@ npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
 ```
 
-CI runs the fixture-only browser specs on every pull request, in the
-`Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
-`qa/chassis-row-overflow.spec.js`, `qa/connections-clear-selection.spec.js`,
-`qa/connections-overflow.spec.js`, `qa/header-and-disk-path-layout.spec.js`,
-`qa/heatmap-temperature-bands.spec.js`, `qa/offline-snapshot.spec.js`,
-`qa/saved-view-selection.spec.js`, `qa/ui-a11y-narrow-layout.spec.js`, `qa/ui-coverage.spec.js`,
+CI runs the fixture-only browser specs on every pull request:
+`qa/admin-draft-target-ownership.spec.js`, `qa/chassis-row-overflow.spec.js`,
+`qa/connections-clear-selection.spec.js`, `qa/connections-overflow.spec.js`,
+`qa/header-and-disk-path-layout.spec.js`, `qa/heatmap-temperature-bands.spec.js`,
+`qa/offline-snapshot.spec.js`, `qa/release-contract.spec.js`,
+`qa/saved-view-selection.spec.js`, `qa/ui-a11y-narrow-layout.spec.js`,
+`qa/ui-coverage.spec.js`, `qa/ui-coverage-primary-crawl.spec.js`,
 `qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
 own synthetic fixtures and need no running stack:
 
 ```bash
-npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-coverage.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
+npx playwright test qa/admin-draft-target-ownership.spec.js qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/release-contract.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-coverage.spec.js qa/ui-coverage-primary-crawl.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
+
+In CI they run as four parallel `Fixture browser specs (leg N)` jobs. Each leg
+runs the explicit spec list in its matrix entry in `.github/workflows/ci.yml`,
+in the `Run fixture-only browser specs` step, with one Playwright worker; leg 1
+also runs the public demo checks and the current-source demo smoke once. The
+required `Checked-in public demo artifact` check waits for all four legs and
+fails unless every one succeeded. A new fixture spec must be added to exactly
+one leg (pick the one with the least measured time); a spec that should not run
+there goes in `NOT_ON_A_FIXTURE_LEG` in `tests/test_ci_browser_legs.py` with
+the place it runs instead. That test fails on a spec that is on no leg or on
+two.
 
 `qa/header-and-disk-path-layout.spec.js` also registers the Storage Fabric
 stale-refresh suite from `qa/fixture-suites/`. Its standalone entry point is
@@ -435,7 +447,8 @@ tooling exists to catch those automatically.
   in a state's `covers` or in `ignored_controls` with a reason. A hook with a
   literal value is keyed by that value (`[data-admin-view-button=backups]`), so
   a new tab or mode that reuses a hook still needs its own entry; dynamic
-  values (bays) share one key. The spec also crawls the `ci: true` states on
+  values (bays) share one key. Its companion `qa/ui-coverage-primary-crawl.spec.js`
+  (a separate file so CI can run it on its own leg) crawls the `ci: true` states on
   synthetic fixtures (including fixture variants for configurations such as
   write sign-in) at the `ci` widths and fails on any unexplained layout,
   contrast, heat-map or console finding, on an accessibility checker that did
