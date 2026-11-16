@@ -8,26 +8,34 @@ A pull request records itself in one small file instead of editing
 ``<slug>`` is 3 to 60 lowercase letters, digits and hyphens, starting with a
 letter or digit. ``<section>`` is one of ``breaking``, ``upgrade``,
 ``security``, ``added``, ``changed``, ``fixed``, ``performance``, ``docs`` or
-``internal``. The file holds the text of one bullet: past tense, no leading
-``- ``, no heading, no pull request number, at most 4096 bytes. It may wrap
-over several lines.
+``internal``. The file holds the text of one bullet as one inline paragraph:
+past tense, no leading ``- ``, no heading, no HTML comment, no link reference
+definition, at most 4096 bytes, and no ``#N`` inside parentheses (the release
+tooling reads every ``(#N)`` as a pull request reference). It may wrap over
+several lines.
 
 A fragment belongs to the commit that added it on the release branch. The
 collector reads the pull request number from that commit's subject (a squash
 subject ends in ``(#N)``) and appends ``(#N)`` to the bullet. It never guesses:
-a fragment whose adding commit carries no number stops ``collect`` unless the
-release preparer passes ``--pr <file>=<N>``.
+a fragment is bound only when the repository is not shallow, the file is
+committed at ``--ref`` with the same bytes, and the adding commit added it as a
+new file rather than renaming or copying another fragment. Any other fragment
+stops ``collect`` unless the release preparer passes ``--pr <file>=<N>``; a
+``--pr`` for one fragment of a commit must be given for every fragment that
+commit added.
 
 Usage::
 
     python scripts/changelog_fragments.py check
-    python scripts/changelog_fragments.py preview
-    python scripts/changelog_fragments.py collect --version 0.25.0 --date 2026-12-01
+    python scripts/changelog_fragments.py preview [--pr <file>=<N> ...]
+    python scripts/changelog_fragments.py collect --version 0.25.0 --date 2026-12-01 [--pr <file>=<N> ...]
 
 ``collect`` writes the fragments into ``CHANGELOG.md`` under ``## Unreleased``,
-renames that heading to ``## vX.Y.Z - YYYY-MM-DD``, deletes exactly the
-fragment files it read and prints them. It refuses a version that already has
-a section, so a second run cannot insert the same entries twice.
+renames that heading to ``## vX.Y.Z - YYYY-MM-DD``, deletes the fragment files
+it read and prints them. It re-reads every fragment just before writing and
+refuses if one changed; it deletes a file only while its bytes are still the
+bytes it read. It refuses a version that already has a section, so a second
+run cannot insert the same entries twice.
 """
 
 from __future__ import annotations
@@ -40,7 +48,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 CHANGELOG_PATH = "CHANGELOG.md"
@@ -65,7 +73,11 @@ SECTIONS = {
 SUBSECTION_ORDER = ("Highlights", *SECTIONS.values())
 
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,59}")
-HEADING_LINE = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
+# Checked on the stripped lines the renderer receives, so indentation cannot hide them.
+HEADING_LINE = re.compile(r"^#{1,6}(?:\s|$)")
+SETEXT_UNDERLINE = re.compile(r"^(?:=+|-+)$")
+LINK_DEFINITION = re.compile(r"^\[(?:[^\]\\]|\\.)+\]:")
+COMMENT_DELIMITER = ("<!--", "-->")
 FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
 LIST_MARKER = re.compile(r"^\s*[-*+]\s")
 PARENTHETICAL = re.compile(r"\(([^()]*)\)")
@@ -78,8 +90,19 @@ VERSION = re.compile(
 )
 
 
+RECOVERY_TEXT = "Delete the ones already in that section and commit, or restore CHANGELOG.md from Git and collect again."
+
+
 class CollectError(ValueError):
     """Raised when fragments cannot be collected; nothing has been written."""
+
+
+class CleanupIncomplete(CollectError):
+    """CHANGELOG.md was written, but some fragments were left in place."""
+
+    def __init__(self, message: str, result: CollectResult) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 @dataclass(frozen=True)
@@ -88,6 +111,7 @@ class Fragment:
     slug: str
     section: str
     lines: tuple[str, ...]
+    data: bytes = field(default=b"", repr=False, compare=False)
 
     @property
     def heading(self) -> str:
@@ -140,11 +164,22 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
         lines.pop()
     if not lines:
         return (), "is empty; write one past-tense sentence"
+    normalized = [line.strip() for line in lines]
     for line in lines:
-        if HEADING_LINE.match(line):
-            return (), "contains a heading line; write only the bullet text"
         if FENCE_LINE.match(line):
             return (), "contains a code fence; keep a fragment to one paragraph"
+    for line in normalized:
+        if HEADING_LINE.match(line):
+            return (), "contains a heading line; write only the bullet text"
+    if any(delimiter in text for delimiter in COMMENT_DELIMITER):
+        return (), "contains an HTML comment delimiter ('<!--' or '-->'); it can hide the entries after it"
+    if any(LINK_DEFINITION.match(line) for line in normalized):
+        return (), (
+            "contains a link reference definition ('[label]: target'); it can change links elsewhere "
+            "in CHANGELOG.md, so write an inline link '[text](target)' instead"
+        )
+    if any(SETEXT_UNDERLINE.match(line) for line in normalized[1:]):
+        return (), "contains a setext heading underline (a line of only '=' or '-'); write only the bullet text"
     if LIST_MARKER.match(lines[0]):
         return (), "starts with a list marker such as '- '; write the text without it"
     if any(LIST_MARKER.match(line) for line in lines[1:]):
@@ -156,10 +191,12 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
         token = PR_TOKEN.search(group.group(1))
         if token is not None:
             return (), (
-                f"names pull request number #{token.group(1)} in parentheses; leave it out, "
-                "the collector adds the number of the pull request that merged the fragment"
+                f"names pull request number #{token.group(1)} in parentheses; the release tooling reads "
+                "every '(#N)' as a pull request reference. Leave out this pull request's own number (the "
+                "collector adds it) and mention another issue or pull request without parentheses, for "
+                "example 'see #N'"
             )
-    return tuple(line.strip() for line in lines), None
+    return tuple(normalized), None
 
 
 def fragment_problem(path: str, data: bytes, *, regular_file: bool = True) -> str | None:
@@ -178,7 +215,30 @@ def parse_fragment(path: str, data: bytes) -> Fragment:
     if problem is not None:
         raise ValueError(f"{path}: {problem}")
     slug, section, _suffix = path.split("/", 1)[1].split(".")
-    return Fragment(path=path, slug=slug, section=section, lines=text_lines(data)[0])
+    return Fragment(path=path, slug=slug, section=section, lines=text_lines(data)[0], data=data)
+
+
+def text_in_section(data: bytes, section: str) -> bool:
+    """True when the text of fragment ``data`` appears in rendered ``section``.
+
+    Whitespace is normalised and the final full stop dropped, because the
+    rendered bullet puts `` (#N)`` before it.
+    """
+
+    lines = text_lines(data)[0] or tuple(data.decode("utf-8", "replace").split("\n"))
+    body = " ".join(" ".join(lines).split()).removesuffix(".")
+    return not body or body in " ".join(section.split())
+
+
+def _read_regular(path: Path) -> bytes | None:
+    """Bytes of ``path`` when it is a regular file, else None."""
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 def load_fragments(root: Path) -> tuple[list[Fragment], list[str]]:
@@ -217,6 +277,19 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _git_bytes(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(["git", "-C", str(root), *args], check=False, capture_output=True)
+
+
+def is_shallow(root: Path) -> bool | None:
+    """True for a shallow clone, False for full history, None outside Git."""
+
+    completed = _git(root, "rev-parse", "--is-shallow-repository")
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() == "true"
+
+
 def adding_commit(root: Path, path: str, ref: str = "HEAD") -> tuple[str, str] | None:
     """Return (sha, subject) of the latest first-parent commit on ``ref`` that added ``path``."""
 
@@ -240,6 +313,123 @@ def adding_commit(root: Path, path: str, ref: str = "HEAD") -> tuple[str, str] |
     return sha, subject
 
 
+def _committed_bytes(root: Path, ref: str, path: str) -> bytes | None:
+    """Bytes of ``path`` at ``ref`` when it is a regular file there, else None."""
+
+    listed = _git_bytes(root, "ls-tree", "-z", ref, "--", path)
+    meta = listed.stdout.decode("utf-8", "surrogateescape").partition("\t")[0].split(" ")
+    if listed.returncode != 0 or len(meta) != 3 or meta[0] not in {"100644", "100755"} or meta[1] != "blob":
+        return None
+    blob = _git_bytes(root, "cat-file", "blob", meta[2])
+    return blob.stdout if blob.returncode == 0 else None
+
+
+def _rename_source(root: Path, sha: str, path: str) -> str | None:
+    """Why ``path`` in commit ``sha`` is not a plain addition, or None.
+
+    Rename and copy detection runs against the first parent and only among
+    fragment paths, so a fragment renamed or copied from another one is caught.
+    """
+
+    parents = _git(root, "rev-list", "--parents", "-n", "1", sha).stdout.split()
+    if len(parents) < 2:
+        return None
+    completed = _git_bytes(
+        root, "diff-tree", "-r", "-z", "--name-status", "-M", "-C", "--find-copies-harder",
+        parents[1], sha, "--", f"{FRAGMENT_DIR}/",
+    )
+    fields = completed.stdout.decode("utf-8", "surrogateescape").split("\0")
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index][0]
+        if status in "RC":
+            source, target = fields[index + 1], fields[index + 2]
+            if target == path:
+                return f"{'renamed' if status == 'R' else 'copied'} in {sha[:12]} from {source}"
+            index += 3
+        else:
+            index += 2
+    return None
+
+
+@dataclass(frozen=True)
+class Binding:
+    """How one fragment gets its pull request number."""
+
+    path: str
+    commit: str | None  # the adding commit, when the fragment is committed at the ref
+    subject: str
+    number: int | None
+    reason: str | None  # why there is no number
+    explicit: bool = False  # given with --pr
+
+
+def bind_fragments(
+    root: Path,
+    fragments: list[Fragment],
+    ref: str = "HEAD",
+    pr_overrides: dict[str, int] | None = None,
+) -> dict[str, Binding]:
+    """Bind every fragment to a pull request number, never by guessing.
+
+    Raises CollectError for a shallow repository, for a ``--pr`` that names no
+    fragment, and for a ``--pr`` that covers only some of the fragments one
+    commit added.
+    """
+
+    overrides = _resolve_overrides(fragments, pr_overrides or {})
+    shallow = is_shallow(root) if fragments else False
+    if shallow:
+        raise CollectError(
+            f"{root} is a shallow clone, so the commit that added a fragment cannot be proved; "
+            "fetch the full history first (git fetch --unshallow) and run again"
+        )
+    bindings: dict[str, Binding] = {}
+    for fragment in fragments:
+        path = fragment.path
+        if shallow is None:
+            bindings[path] = Binding(path, None, "", None, "not in a Git checkout")
+            continue
+        committed = _committed_bytes(root, ref, path)
+        if committed is None:
+            bindings[path] = Binding(path, None, "", None, f"not committed at {ref}")
+            continue
+        commit = adding_commit(root, path, ref)
+        if commit is None:
+            bindings[path] = Binding(path, None, "", None, f"no first-parent commit on {ref} added it")
+            continue
+        sha, subject = commit
+        reason: str | None = None
+        number: int | None = None
+        if committed != fragment.data:
+            reason = f"the file differs from the one committed at {ref}"
+        else:
+            reason = _rename_source(root, sha, path)
+        if reason is None:
+            match = SQUASH_SUBJECT.search(subject)
+            if match is None:
+                reason = f"the commit that added it ({sha[:12]} {subject!r}) does not end in '(#N)'"
+            else:
+                number = int(match.group(1))
+        bindings[path] = Binding(path, sha, subject, number, reason)
+
+    partial: list[str] = []
+    for path in sorted(overrides):
+        sha = bindings[path].commit
+        if sha is None:
+            continue
+        siblings = sorted(p for p, b in bindings.items() if b.commit == sha and p not in overrides)
+        if siblings:
+            partial.append(f"  {sha[:12]} {bindings[path].subject!r}: also pass --pr for " + ", ".join(siblings))
+    if partial:
+        raise CollectError(
+            "--pr must name every fragment the same commit added, or none of them:\n" + "\n".join(partial)
+        )
+    for path, number in overrides.items():
+        bindings[path] = replace(bindings[path], number=number, reason=None, explicit=True)
+    return bindings
+
+
 def bind_numbers(
     root: Path, fragments: list[Fragment], ref: str = "HEAD"
 ) -> tuple[dict[str, int], dict[str, str]]:
@@ -248,22 +438,28 @@ def bind_numbers(
     Returns the bound numbers and, for every unbound fragment, the reason.
     """
 
-    numbers: dict[str, int] = {}
-    unbound: dict[str, str] = {}
-    for fragment in fragments:
-        commit = adding_commit(root, fragment.path, ref)
-        if commit is None:
-            unbound[fragment.path] = f"no commit on {ref} added it (not committed yet?)"
-            continue
-        sha, subject = commit
-        match = SQUASH_SUBJECT.search(subject)
-        if match is None:
-            unbound[fragment.path] = (
-                f"the commit that added it ({sha[:12]} {subject!r}) does not end in '(#N)'"
-            )
-            continue
-        numbers[fragment.path] = int(match.group(1))
+    bindings = bind_fragments(root, fragments, ref)
+    numbers = {path: b.number for path, b in bindings.items() if b.number is not None}
+    unbound = {path: b.reason or "" for path, b in bindings.items() if b.number is None}
     return numbers, unbound
+
+
+def binding_notes(bindings: dict[str, Binding]) -> list[str]:
+    """One line per adding commit naming the fragments it added and their numbers."""
+
+    by_commit: dict[str, list[Binding]] = {}
+    for binding in bindings.values():
+        if binding.commit is not None:
+            by_commit.setdefault(binding.commit, []).append(binding)
+    notes = []
+    for sha, group in sorted(by_commit.items(), key=lambda item: min(b.path for b in item[1])):
+        listed = ", ".join(
+            f"{b.path} ({'#' + str(b.number) if b.number is not None else 'no number'}"
+            f"{', from --pr' if b.explicit else ''})"
+            for b in sorted(group, key=lambda b: b.path)
+        )
+        notes.append(f"commit {sha[:12]} {group[0].subject!r} added {listed}")
+    return notes
 
 
 def render_bullet(fragment: Fragment, number: int | None) -> list[str]:
@@ -370,18 +566,36 @@ def merge_into_unreleased(text: str, bullets: dict[str, list[list[str]]]) -> str
     return "\n".join(lines)
 
 
-def combined_changelog(root: Path, text: str, *, ref: str = "HEAD") -> tuple[str, list[str]]:
+def combined_view(
+    root: Path, text: str, *, ref: str = "HEAD", pr_overrides: dict[str, int] | None = None
+) -> tuple[str, list[str], dict[str, Binding]]:
     """``text`` with every valid fragment under ``root`` merged into Unreleased.
 
     Fragments bound to a pull request carry ``(#N)``; the others show without a
-    number. Returns the text and notes about invalid or unbound fragments.
+    number. Returns the text, notes about invalid, unbound and per-commit
+    fragments, and the binding of each fragment.
     """
 
     fragments, problems = load_fragments(root)
-    numbers, unbound = bind_numbers(root, fragments, ref) if fragments else ({}, {})
+    bindings = bind_fragments(root, fragments, ref, pr_overrides)
+    numbers = {path: b.number for path, b in bindings.items() if b.number is not None}
     notes = [f"invalid fragment {problem}" for problem in problems]
-    notes += [f"{path} shows without a pull request number: {reason}" for path, reason in sorted(unbound.items())]
-    return merge_into_unreleased(text, bullets_by_section(fragments, numbers)), notes
+    notes += [
+        f"{path} shows without a pull request number: {b.reason}"
+        for path, b in sorted(bindings.items())
+        if b.number is None
+    ]
+    notes += binding_notes(bindings)
+    return merge_into_unreleased(text, bullets_by_section(fragments, numbers)), notes, bindings
+
+
+def combined_changelog(
+    root: Path, text: str, *, ref: str = "HEAD", pr_overrides: dict[str, int] | None = None
+) -> tuple[str, list[str]]:
+    """``combined_view`` without the bindings."""
+
+    combined, notes, _bindings = combined_view(root, text, ref=ref, pr_overrides=pr_overrides)
+    return combined, notes
 
 
 def section_text(text: str, heading: str) -> str:
@@ -431,6 +645,23 @@ def _remove_fragment(path: Path) -> None:
     path.unlink()
 
 
+def _recovery_lines(root: Path, heading: str, released: str) -> list[str]:
+    """Each fragment still on disk, whether its text is in ``released``, and what to do."""
+
+    fragments, _problems = load_fragments(root)
+    if not fragments:
+        return []
+    lines = [
+        "These fragments are still in changelog.d/ (a previous collect may have been interrupted "
+        "after writing CHANGELOG.md):"
+    ]
+    for fragment in fragments:
+        where = "already in" if text_in_section(fragment.data, released) else "not in"
+        lines.append(f"  {fragment.path}: {where} '{heading}'")
+    lines.append(RECOVERY_TEXT)
+    return lines
+
+
 def _write_changelog(path: Path, text: str) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".CHANGELOG.", suffix=".tmp", dir=path.parent)
     try:
@@ -455,9 +686,12 @@ def collect(
 ) -> CollectResult:
     """Fold every fragment into ``CHANGELOG.md`` as the ``version`` section.
 
-    Everything is checked before anything is written. The changelog is written
-    first (to a temporary file, then renamed over), then exactly the fragment
-    files read in this run are deleted. That is two steps, not one atomic
+    Everything is checked before anything is written, and every fragment is
+    read again just before the write: if one changed or disappeared, nothing is
+    written. The changelog is written first (to a temporary file, then renamed
+    over), then each fragment read in this run is deleted while its bytes are
+    still the bytes that were read; a changed or missing one is left in place
+    and reported with CleanupIncomplete. That is two steps, not one atomic
     change: if the deletions are interrupted, the next run for the same version
     refuses and lists the fragments that are already in the section.
     """
@@ -479,33 +713,15 @@ def collect(
     fragments, problems = load_fragments(root)
     if existing is not None:
         message = [f"{CHANGELOG_PATH} already has '{existing}'; refusing to collect v{version.removeprefix('v')} twice."]
-        released = section_text(text, existing)
-        remaining = [*fragments]
-        if remaining:
-            message.append(
-                "These fragments are still in changelog.d/ (a previous collect may have been interrupted "
-                "after writing CHANGELOG.md):"
-            )
-            joined_section = " ".join(released.split())
-            for fragment in remaining:
-                # The rendered bullet is the fragment text with " (#N)" before
-                # its final full stop, so compare the text without that stop.
-                body = " ".join(" ".join(fragment.lines).split()).removesuffix(".")
-                where = "already in" if body in joined_section else "not in"
-                message.append(f"  {fragment.path}: {where} '{existing}'")
-            message.append(
-                "Delete the ones already in that section and commit, or restore CHANGELOG.md from Git and "
-                "collect again."
-            )
+        message += _recovery_lines(root, existing, section_text(text, existing))
         for problem in problems:
             message.append(f"  invalid fragment {problem}")
         raise CollectError("\n".join(message))
     if problems:
         raise CollectError("invalid fragments; fix them before collecting:\n" + "\n".join(f"  {p}" for p in problems))
-    overrides = _resolve_overrides(fragments, pr_overrides or {})
-    numbers, unbound = bind_numbers(root, fragments, ref)
-    numbers.update(overrides)
-    missing = {path: reason for path, reason in unbound.items() if path not in overrides}
+    bindings = bind_fragments(root, fragments, ref, pr_overrides)
+    numbers = {path: b.number for path, b in bindings.items() if b.number is not None}
+    missing = {path: b.reason for path, b in bindings.items() if b.number is None}
     if missing:
         raise CollectError(
             "no pull request number for these fragments; pass --pr <file>=<N> for each after checking it:\n"
@@ -518,16 +734,59 @@ def collect(
     bounds = _unreleased_bounds(merged)
     assert bounds is not None
     merged[bounds[0]] = heading
+    changed = [fragment.path for fragment in fragments if _read_regular(root / fragment.path) != fragment.data]
+    if changed:
+        raise CollectError(
+            "these fragments changed or disappeared after they were read; nothing was written:\n"
+            + "\n".join(f"  {path}" for path in changed)
+        )
     _write_changelog(changelog_path, "\n".join(merged))
 
     result = CollectResult(heading=heading, numbers={path: numbers[path] for path in sorted(numbers)})
+    left: list[str] = []
     for fragment in sorted(fragments, key=lambda item: item.path):
-        _remove_fragment(root / fragment.path)
+        path = root / fragment.path
+        current = _read_regular(path)
+        if current != fragment.data:
+            left.append(f"  {fragment.path}: {'gone' if current is None else 'changed'} after it was read")
+            continue
+        try:
+            _remove_fragment(path)
+        except FileNotFoundError:
+            left.append(f"  {fragment.path}: gone after it was read")
+            continue
         result.consumed.append(fragment.path)
+    if left:
+        message = [
+            f"Wrote '{heading}' to {CHANGELOG_PATH} and deleted {len(result.consumed)} fragment(s), but left "
+            "these in place because they are no longer the bytes that were read:",
+            *left,
+            *_recovery_lines(root, heading, section_text("\n".join(merged), heading)),
+        ]
+        if RECOVERY_TEXT not in message:
+            message.append(RECOVERY_TEXT)
+        raise CleanupIncomplete("\n".join(message), result)
     return result
 
 
-def _parse_pr_option(values: list[str]) -> dict[str, int]:
+def add_pr_option(parser: argparse.ArgumentParser) -> None:
+    """The one --pr option shared by preview, collect and the coverage check."""
+
+    parser.add_argument(
+        "--pr",
+        action="append",
+        default=[],
+        metavar="FILE=N",
+        help=(
+            "Pull request number for a fragment that history does not bind. Repeatable. Give it for every "
+            "fragment the same commit added, or for none of them."
+        ),
+    )
+
+
+def parse_pr_option(values: list[str]) -> dict[str, int]:
+    """Parse repeated ``--pr <file>=<N>`` values; validation happens when binding."""
+
     overrides: dict[str, int] = {}
     for value in values:
         name, separator, number = value.rpartition("=")
@@ -547,23 +806,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="{check,preview,collect}")
     commands.add_parser("check", help="Validate every fragment in changelog.d/.")
-    commands.add_parser(
+    preview_parser = commands.add_parser(
         "preview",
         help="Print the Unreleased section with every fragment merged in; unbound ones show without (#N).",
     )
+    add_pr_option(preview_parser)
     collect_parser = commands.add_parser(
         "collect",
         help="Write the fragments into CHANGELOG.md as a release section and delete them.",
     )
     collect_parser.add_argument("--version", required=True, help="Release version, X.Y.Z or X.Y.Z-pre.")
     collect_parser.add_argument("--date", required=True, help="Release date, YYYY-MM-DD.")
-    collect_parser.add_argument(
-        "--pr",
-        action="append",
-        default=[],
-        metavar="FILE=N",
-        help="Pull request number for a fragment whose adding commit has none. Repeatable.",
-    )
+    add_pr_option(collect_parser)
     args = parser.parse_args(argv)
     root: Path = args.repo
 
@@ -579,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preview":
         try:
             text = (root / CHANGELOG_PATH).read_text(encoding="utf-8")
-            combined, notes = combined_changelog(root, text, ref=args.ref)
+            combined, notes = combined_changelog(root, text, ref=args.ref, pr_overrides=parse_pr_option(args.pr))
         except (OSError, CollectError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -593,7 +847,7 @@ def main(argv: list[str] | None = None) -> int:
             root,
             version=args.version,
             date=args.date,
-            pr_overrides=_parse_pr_option(args.pr),
+            pr_overrides=parse_pr_option(args.pr),
             ref=args.ref,
         )
     except (OSError, CollectError) as exc:

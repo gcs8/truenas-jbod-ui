@@ -1,7 +1,12 @@
 """Pull-request gate: require a changelog fragment under changelog.d/.
 
 The gate reads the ``base...head`` diff of one pull request with ``git`` only.
-It never talks to the network. A pull request must either carry the
+It never talks to the network. First, a pull request may not delete or rename
+a fragment that is already on the base branch: those belong to other pull
+requests. A release cut may delete fragments whose text is in the release
+section it adds. The ``changelog-removal-ok`` label, applied by a maintainer
+after reading, allows a deletion (for example on a revert); the exemption
+labels and advisory mode do not. Then a pull request must either carry the
 ``no-changelog`` or ``dependencies`` escape label, or add at least one valid
 fragment file ``changelog.d/<slug>.<section>.md`` that did not exist at the
 base (see ``scripts/changelog_fragments.py`` for the format). Every fragment
@@ -54,6 +59,9 @@ NO_CHANGELOG_LABEL = "no-changelog"
 # release body under "Dependencies" through .github/release.yml.
 SKIP_LABELS = (NO_CHANGELOG_LABEL, "dependencies")
 BREAKING_LABEL = "breaking"
+# Applied by a maintainer after reading: allows deleting or renaming a fragment
+# that another pull request added.
+REMOVAL_LABEL = "changelog-removal-ok"
 
 ALLOWED_SUBSECTIONS = (
     "Breaking changes",
@@ -117,6 +125,9 @@ class Entry:
 class GateResult:
     ok: bool
     messages: list[str] = field(default_factory=list)
+    # A refusal the author can fix alone (restore a deleted fragment), so
+    # advisory mode does not turn it into a pass.
+    protected: bool = False
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -258,7 +269,7 @@ def evaluate(
     """
 
     result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
-    if result.ok or not advisory:
+    if result.ok or not advisory or result.protected:
         return result
     return GateResult(True, [ADVISORY_PREFIX, *result.messages])
 
@@ -271,24 +282,75 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
     return completed.stdout
 
 
-def fragment_changes(repo: Path, base: str, head: str) -> list[tuple[str, str]]:
-    """(status letter, new path) for every changelog.d/ path the diff touches."""
+def _fragment_diff(repo: Path, base: str, head: str) -> list[tuple[str, str, str]]:
+    """(status letter, old path, new path) for every changelog.d/ path the diff touches."""
 
     raw = _git_bytes(
         repo, "diff", "--name-status", "-z", "--find-renames", f"{base}...{head}", "--", f"{fragments.FRAGMENT_DIR}/"
     )
     fields = raw.decode("utf-8", "surrogateescape").split("\0")
-    changes: list[tuple[str, str]] = []
+    changes: list[tuple[str, str, str]] = []
     index = 0
     while index < len(fields) and fields[index]:
         status = fields[index][0]
         if status in "RC":
-            changes.append((status, fields[index + 2]))
+            changes.append((status, fields[index + 1], fields[index + 2]))
             index += 3
         else:
-            changes.append((status, fields[index + 1]))
+            changes.append((status, fields[index + 1], fields[index + 1]))
             index += 2
     return changes
+
+
+def fragment_changes(repo: Path, base: str, head: str) -> list[tuple[str, str]]:
+    """(status letter, new path) for every changelog.d/ path the diff touches."""
+
+    return [(status, new) for status, _old, new in _fragment_diff(repo, base, head)]
+
+
+def _removal_result(
+    repo: Path, base: str, head: str, pr_number: int, labels: set[str], paths: list[str]
+) -> GateResult | None:
+    """Refuse deleting or renaming a fragment that is already on the base branch.
+
+    A release cut may delete fragments whose text is in the release section it
+    adds. ``changelog-removal-ok`` allows any deletion.
+    """
+
+    readme = f"{fragments.FRAGMENT_DIR}/{fragments.README_NAME}"
+    removed = sorted(
+        old for status, old, _new in _fragment_diff(repo, base, head) if status in "DR" and old != readme
+    )
+    if not removed or REMOVAL_LABEL in labels:
+        return None
+    heading = _added_release_heading(repo, base, head, paths)
+    if heading is not None:
+        section = fragments.section_text("\n".join(_head_changelog_lines(repo, head)), heading)
+        merge_base = _git(repo, "merge-base", base, head).strip()
+        dropped = [path for path in removed if not fragments.text_in_section(_fragment_at(repo, merge_base, path)[0], section)]
+        if not dropped:
+            return None
+        return GateResult(
+            False,
+            [
+                f"#{pr_number} cuts '{heading}' but deletes changelog fragments whose text is not in it:",
+                *(f"  {path}" for path in dropped),
+                "Collect them with scripts/changelog_fragments.py collect, or restore them. A maintainer may "
+                f"apply the '{REMOVAL_LABEL}' label after checking.",
+            ],
+            protected=True,
+        )
+    return GateResult(
+        False,
+        [
+            f"#{pr_number} deletes or renames changelog fragments that are already on the base branch; "
+            "they belong to other pull requests:",
+            *(f"  {path}" for path in removed),
+            "Restore them; the exemption labels do not allow this. A maintainer may apply the "
+            f"'{REMOVAL_LABEL}' label after reading, for example on a revert.",
+        ],
+        protected=True,
+    )
 
 
 def _fragment_at(repo: Path, head: str, path: str) -> tuple[bytes, bool]:
@@ -337,6 +399,10 @@ def _evaluate(
     labels: set[str],
 ) -> GateResult:
     paths = changed_paths(repo, base, head)
+
+    removal = _removal_result(repo, base, head, pr_number, labels, paths)
+    if removal is not None:
+        return removal
 
     skipping = [label for label in SKIP_LABELS if label in labels]
     if skipping:
@@ -397,13 +463,12 @@ def _release_cut_result(
     request in that new section.
     """
 
-    if CHANGELOG_PATH not in paths:
+    selected_heading = _added_release_heading(repo, base, head, paths)
+    if selected_heading is None:
         return None
     head_lines = _head_changelog_lines(repo, head)
     added = added_line_numbers(repo, base, head, CHANGELOG_PATH)
-    selected_heading, entries = current_entries(head_lines)
-    if selected_heading == UNRELEASED_HEADING or not _heading_was_added(head_lines, selected_heading, added):
-        return None
+    _heading, entries = current_entries(head_lines)
     touched = [
         entry
         for entry in entries
@@ -427,6 +492,19 @@ def _release_cut_result(
         True,
         [f"CHANGELOG entry for #{pr_number} found in {selected_heading} under: {', '.join(subsections)}."],
     )
+
+
+def _added_release_heading(repo: Path, base: str, head: str, paths: list[str]) -> str | None:
+    """The release heading this pull request introduces in CHANGELOG.md, or None."""
+
+    if CHANGELOG_PATH not in paths:
+        return None
+    head_lines = _head_changelog_lines(repo, head)
+    selected_heading, _entries = current_entries(head_lines)
+    added = added_line_numbers(repo, base, head, CHANGELOG_PATH)
+    if selected_heading == UNRELEASED_HEADING or not _heading_was_added(head_lines, selected_heading, added):
+        return None
+    return selected_heading
 
 
 def _heading_was_added(lines: list[str], heading: str, added: set[int]) -> bool:

@@ -920,10 +920,21 @@ fragments. A pull request does not edit `CHANGELOG.md`. The rules:
   `<slug>` is 3 to 60 lowercase letters, digits and hyphens (the branch topic
   works); `<section>` is one of `breaking`, `upgrade`, `security`, `added`,
   `changed`, `fixed`, `performance`, `docs`, `internal`. The file holds the
-  text of one bullet: past tense, no leading `- `, no heading, no pull request
-  number, at most 4096 bytes, wrapped at about 80 columns.
-  `changelog.d/README.md` has the format and two examples. A pull request may
-  add more than one fragment (for example `fixed` and `upgrade`).
+  text of one bullet as one inline paragraph: past tense, no leading `- `, no
+  heading, no HTML comment, no link reference definition, at most 4096 bytes,
+  wrapped at about 80 columns. `changelog.d/README.md` has the format and two
+  examples. A pull request may add more than one fragment (for example `fixed`
+  and `upgrade`).
+- **No `#N` inside parentheses.** Do not write your own pull request number;
+  the release adds it. Any `#N` inside parentheses is refused, because the
+  release tooling reads every `(#N)` as a pull request reference. A plain
+  mention of an issue or another pull request in the sentence is allowed, for
+  example `see #123`.
+- **Other pull requests' fragments stay.** A pull request may edit the text of
+  a fragment that is already on `main` (it must stay valid and does not count
+  as an entry), but deleting or renaming one is refused, even with
+  `no-changelog` or `dependencies`. A maintainer applies the
+  `changelog-removal-ok` label after reading, for example on a revert.
 - **The number comes from Git.** A fragment belongs to the commit that added it
   on `main`; the release reads `(#N)` from that commit's squash subject and
   appends it to the bullet. The author never needs the number, so the first CI
@@ -986,19 +997,25 @@ Three scripts enforce this:
   requires the diff to add at least one valid fragment that did not exist at
   the base, and a `breaking` or `upgrade` fragment when `breaking` is set. An
   invalid fragment (bad name, unknown section, empty, longer than 4096 bytes,
-  a heading, a `(#N)` reference) fails with the file and the reason. An edit
-  to `CHANGELOG.md` alone does not count; the failure names the fragment to
-  add. The one exception is a release cut: a pull request that introduces the
-  first release heading and adds a bullet naming itself in that new section
-  passes as before.
+  a heading, an HTML comment, a link reference definition, a `#N` inside
+  parentheses) fails with the file and the reason. An edit to `CHANGELOG.md`
+  alone does not count; the failure names the fragment to add. The one
+  exception is a release cut: a pull request that introduces the first release
+  heading and adds a bullet naming itself in that new section passes as
+  before. Before any of that, and before the labels, it refuses a pull request
+  that deletes or renames a fragment already on the base, unless the pull
+  request is a release cut whose new section holds that fragment's text or
+  carries `changelog-removal-ok`.
 - `scripts/changelog_fragments.py` validates fragments (`check`), prints
   `## Unreleased` with the fragments merged in (`preview`; a fragment not yet
   merged shows without a number) and, at release time, writes them into
-  `CHANGELOG.md` (`collect --version X.Y.Z --date YYYY-MM-DD`). `collect`
-  stops and names the file when a fragment's adding commit has no `(#N)`
-  subject; check the pull request and pass `--pr <file>=<N>`. It deletes
-  exactly the fragments it read and refuses to collect the same version
-  twice.
+  `CHANGELOG.md` (`collect --version X.Y.Z --date YYYY-MM-DD`). A fragment is
+  numbered from history only in a full clone, when it is committed unchanged
+  and its adding commit added it as a new file; `collect` stops and names any
+  other one; check the pull request and pass `--pr <file>=<N>` (for every
+  fragment that commit added). `preview` takes the same `--pr`. `collect`
+  deletes only fragments whose bytes are still the ones it read and refuses
+  to collect the same version twice.
 - `scripts/check_release_changelog_coverage.py <previous tag> "<section
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
@@ -1006,7 +1023,10 @@ Three scripts enforce this:
   `gh pr list --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository`
   (squash subjects lose the number when the merge title is edited). For
   `"## Unreleased"` the target section includes the fragments, each numbered
-  from the commit that added it; a released section is read as written. It removes
+  from the commit that added it or by the same `--pr <file>=<N>` as
+  `collect`; a fragment bound to a pull request that merged a squashed
+  intermediate branch is reported as ambiguous until it is given `--pr`. A
+  released section is read as written. It removes
   pull requests labelled `no-changelog` or `dependencies`, uses candidate and
   previous-tag ancestry to seed a timestamp-bounded walk through the pull
   request base/head branch graph, then fails when any remaining number is

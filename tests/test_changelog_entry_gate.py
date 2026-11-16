@@ -248,6 +248,55 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
 
     def test_wrapped_pr_reference_on_continuation_line_passes(self) -> None:
+        # A release cut still names its own pull request in CHANGELOG.md, and
+        # the (#42) may sit on the wrapped continuation line of the bullet.
+        self._write("docker-compose.yml", "services: {}\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1)
+        text = text.replace(
+            "### Fixed\n\n",
+            "### Fixed\n\n"
+            "- Hardened the default Compose runtime with a long description that wraps\n"
+            "  past eighty columns before the reference (#42).\n",
+            1,
+        )
+        self._write("CHANGELOG.md", text)
+        self._commit("chore: cut v0.2.0")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("v0.2.0", result.messages[0])
+
+    def test_breaking_release_cut_with_wrapped_upgrade_reference_passes(self) -> None:
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1)
+        for upgrade, expected in ((True, True), (False, False)):
+            with self.subTest(upgrade=upgrade):
+                _git(self.repo, "reset", "-q", "--hard", "main")
+                self._write("docker-compose.yml", "services: {}\n")
+                body = "### Fixed\n\n"
+                if upgrade:
+                    body = (
+                        "### Upgrade notes\n\n"
+                        "- `VALUE` now defaults to 2; set it explicitly before upgrading, as\n"
+                        "  the wrapped reference shows (#42).\n\n" + body
+                    )
+                else:
+                    body += (
+                        "- Hardened the default Compose runtime, with a reference that\n"
+                        "  wraps (#42).\n"
+                    )
+                self._write("CHANGELOG.md", text.replace("### Fixed\n\n", body, 1))
+                self._commit("chore: cut v0.2.0")
+
+                result = self._evaluate(labels={"breaking"})
+
+                self.assertEqual(result.ok, expected, result.messages)
+                if not expected:
+                    self.assertIn("'### Upgrade notes'", "\n".join(result.messages))
+
+    def test_wrapped_fragment_text_passes(self) -> None:
         self._write("docker-compose.yml", "services: {}\n")
         self._add_fragment(
             "compose-runtime.changed.md",

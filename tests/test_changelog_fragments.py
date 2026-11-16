@@ -182,7 +182,12 @@ class FragmentGateTests(unittest.TestCase):
                 result = self._evaluate()
 
                 self.assertFalse(result.ok, result.messages)
-                self.assertIn("changelog.d/<short-name>.", "\n".join(result.messages))
+                if label == "renamed":
+                    # Renaming another pull request's fragment is refused
+                    # outright (see FragmentProtectionGateTests).
+                    self.assertIn("changelog.d/older-change.fixed.md", "\n".join(result.messages))
+                else:
+                    self.assertIn("changelog.d/<short-name>.", "\n".join(result.messages))
 
     def test_each_invalid_fragment_fails_with_its_file_and_reason(self) -> None:
         cases = (
@@ -882,6 +887,703 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("changelog.d/late-fix.fixed.md", issues[0].message)
         code, output = self._validate_wrap("0.2.0-rc.1")
         self.assertEqual(code, 1, output)
+
+
+REMOVAL_LABEL = "changelog-removal-ok"
+RECOVERY_TEXT = "Delete the ones already in that section and commit, or restore CHANGELOG.md from Git and collect again."
+
+
+def _cli(main, *argv: str) -> tuple[int, str]:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        code = main(list(argv))
+    return code, output.getvalue()
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class FragmentProtectionGateTests(unittest.TestCase):
+    """A pull request cannot drop another pull request's pending fragment."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = ScratchRepository(Path(self._tmp.name))
+        self.repo.write("changelog.d/older-change.fixed.md", "Fixed an older thing.\n")
+        self.repo.write("changelog.d/older-change.upgrade.md", "Set `OLD_SETTING` before upgrading.\n")
+        self.repo.commit("fix: older change (#7)")
+        _git(self.repo.root, "checkout", "-q", "-b", "topic")
+
+    def _reset(self) -> None:
+        _git(self.repo.root, "reset", "-q", "--hard", "main")
+        _git(self.repo.root, "clean", "-qfdx")
+
+    def _evaluate(self, labels: set[str] | None = None, advisory: bool = False) -> gate.GateResult:
+        return gate.evaluate(
+            self.repo.root, base="main", head="topic", pr_number=42, labels=labels or set(), advisory=advisory
+        )
+
+    def _own_fragment(self) -> None:
+        self.repo.write("app/service.py", "VALUE = 2\n")
+        self.repo.write("changelog.d/new-change.fixed.md", "Fixed the new thing.\n")
+
+    def test_deleting_another_fragment_is_refused_and_named(self) -> None:
+        self._own_fragment()
+        (self.repo.root / "changelog.d/older-change.upgrade.md").unlink()
+        self.repo.commit("fix: new thing")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok, result.messages)
+        joined = "\n".join(result.messages)
+        self.assertIn("changelog.d/older-change.upgrade.md", joined)
+        self.assertNotIn("changelog.d/older-change.fixed.md", joined)
+        self.assertIn(REMOVAL_LABEL, joined)
+
+    def test_renaming_another_fragment_is_refused(self) -> None:
+        self._own_fragment()
+        _git(self.repo.root, "mv", "changelog.d/older-change.upgrade.md", "changelog.d/renamed-change.upgrade.md")
+        self.repo.commit("fix: new thing")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok, result.messages)
+        self.assertIn("changelog.d/older-change.upgrade.md", "\n".join(result.messages))
+
+    def test_protection_runs_before_the_exemption_labels_and_advisory_mode(self) -> None:
+        for labels in (set(), {"no-changelog"}, {"dependencies"}, {"no-changelog", "bug"}):
+            for advisory in (False, True):
+                with self.subTest(labels=sorted(labels), advisory=advisory):
+                    self._reset()
+                    self.repo.write("app/service.py", "VALUE = 3\n")
+                    (self.repo.root / "changelog.d/older-change.upgrade.md").unlink()
+                    self.repo.commit("chore: tidy")
+
+                    result = self._evaluate(labels=labels, advisory=advisory)
+
+                    self.assertFalse(result.ok, result.messages)
+                    joined = "\n".join(result.messages)
+                    self.assertIn("changelog.d/older-change.upgrade.md", joined)
+                    self.assertNotIn("Advisory", joined)
+
+    def test_removal_label_allows_the_deletion(self) -> None:
+        for labels, own, expected in (
+            ({REMOVAL_LABEL}, True, True),
+            ({REMOVAL_LABEL}, False, False),
+            ({REMOVAL_LABEL, "no-changelog"}, False, True),
+        ):
+            with self.subTest(labels=sorted(labels), own=own):
+                self._reset()
+                self.repo.write("app/service.py", "VALUE = 4\n")
+                if own:
+                    self._own_fragment()
+                (self.repo.root / "changelog.d/older-change.upgrade.md").unlink()
+                self.repo.commit("revert: older change")
+
+                result = self._evaluate(labels=labels)
+
+                self.assertEqual(result.ok, expected, result.messages)
+                if not expected:
+                    # The label waives the protection, not the need for an entry.
+                    self.assertIn("changelog.d/<short-name>.", "\n".join(result.messages))
+
+    def test_editing_another_fragment_stays_allowed_but_must_stay_valid(self) -> None:
+        for text, expected in (("Fixed an older thing, reworded.\n", True), ("### Fixed\n", False)):
+            with self.subTest(text=text):
+                self._reset()
+                self._own_fragment()
+                self.repo.write("changelog.d/older-change.fixed.md", text)
+                self.repo.commit("fix: new thing")
+
+                result = self._evaluate()
+
+                self.assertEqual(result.ok, expected, result.messages)
+                if not expected:
+                    joined = "\n".join(result.messages)
+                    self.assertIn("changelog.d/older-change.fixed.md", joined)
+                    self.assertIn("heading", joined)
+
+    def test_release_cut_must_carry_the_text_of_every_fragment_it_deletes(self) -> None:
+        cut = self.repo.read("CHANGELOG.md").replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1)
+        carried = cut.replace(
+            "### Fixed\n\n",
+            "### Upgrade notes\n\n- Set `OLD_SETTING` before\n  upgrading (#7).\n\n"
+            "### Fixed\n\n- Fixed an older thing (#7).\n- Prepared the release (#42).\n",
+            1,
+        )
+        dropped = cut.replace(
+            "### Fixed\n\n", "### Fixed\n\n- Fixed an older thing (#7).\n- Prepared the release (#42).\n", 1
+        )
+        for name, text, expected in (("carried", carried, True), ("dropped", dropped, False)):
+            with self.subTest(case=name):
+                self._reset()
+                self.repo.write("CHANGELOG.md", text)
+                (self.repo.root / "changelog.d/older-change.fixed.md").unlink()
+                (self.repo.root / "changelog.d/older-change.upgrade.md").unlink()
+                self.repo.commit("chore: release v0.2.0")
+
+                result = self._evaluate()
+
+                self.assertEqual(result.ok, expected, result.messages)
+                if not expected:
+                    joined = "\n".join(result.messages)
+                    self.assertIn("changelog.d/older-change.upgrade.md", joined)
+                    self.assertNotIn("changelog.d/older-change.fixed.md", joined)
+
+
+class FragmentContentTests(unittest.TestCase):
+    """A fragment is one inline paragraph; only parenthesised numbers are refused."""
+
+    def _problem(self, text: str) -> str | None:
+        return _fragments().fragment_problem("changelog.d/sample-entry.fixed.md", text.encode("utf-8"))
+
+    def test_document_scoped_markdown_is_refused_with_its_own_reason(self) -> None:
+        cases = (
+            ("Fixed a thing <!-- hidden\n", "HTML comment"),
+            ("Fixed a thing\nthat wraps --> here.\n", "HTML comment"),
+            ("[target]: https://example.test/replaced\n", "link reference definition"),
+            ("   [target]: https://example.test/replaced\n", "link reference definition"),
+            ("Fixed a thing\n[target]: https://example.test/replaced\n", "link reference definition"),
+            ("Fixed a thing\n    ### Hidden heading\n", "heading"),
+            ("Fixed a thing\n---\nand more.\n", "setext"),
+            ("Fixed a thing\n===\nand more.\n", "setext"),
+            ("Fixed a thing\n  ---\n", "setext"),
+        )
+        for text, reason in cases:
+            with self.subTest(text=text):
+                problem = self._problem(text)
+                self.assertIsNotNone(problem)
+                self.assertIn(reason, problem)
+
+    def test_ordinary_inline_markdown_is_accepted(self) -> None:
+        for text in (
+            "Fixed the alpha path\nacross two wrapped lines.\n",
+            "Set `EXAMPLE_SETTING=on` before upgrading.\n",
+            "Linked the [troubleshooting page](https://example.test/docs#saving) from the error.\n",
+            'Answered "<action> stopped on an internal error" for a local fault.\n',
+            "Kept the value - and its unit - visible when the count is >= 2.\n",
+            "Fixed a thing\nwhose wrapped line starts with -- two dashes.\n",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self._problem(text))
+
+    def test_unreleased_bullets_pass_the_content_rules(self) -> None:
+        # The bullets already under Unreleased, without their (#N) suffix, must
+        # be valid fragment text: the rules refuse markup, not ordinary entries.
+        module = _fragments()
+        real = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        if "\n## Unreleased\n" not in real:
+            self.skipTest("CHANGELOG.md has no Unreleased section")
+        body = real.split("\n## Unreleased\n", 1)[1].split("\n## ", 1)[0]
+        bullets: list[list[str]] = []
+        for line in body.split("\n"):
+            if line.startswith("- "):
+                bullets.append([line[2:]])
+            elif bullets and line.startswith("  ") and line.strip():
+                bullets[-1].append(line.strip())
+        self.assertTrue(bullets)
+        refused = []
+        for lines in bullets:
+            text = "\n".join(lines)
+            text = module.PARENTHETICAL.sub(
+                lambda group: "" if module.PR_TOKEN.search(group.group(1)) else group.group(0), text
+            )
+            problem = self._problem(text + "\n")
+            if problem is not None:
+                refused.append((lines[0], problem))
+        self.assertEqual(refused, [])
+
+    def test_only_parenthesised_numbers_are_refused(self) -> None:
+        for text in ("Fixed a thing (#7).\n", "Fixed a thing (see #7).\n", "Fixed a thing\n(#7, #8).\n"):
+            with self.subTest(text=text):
+                problem = self._problem(text)
+                self.assertIsNotNone(problem)
+                self.assertIn("in parentheses", problem)
+                self.assertIn("pull request reference", problem)
+        for text in (
+            "Fixed the regression reported in #7.\n",
+            "Fixed the regression reported as GH-7.\n",
+            "Fixed the regression from https://github.com/example/repo/pull/7.\n",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self._problem(text))
+
+    def test_documents_state_the_number_and_removal_rules(self) -> None:
+        contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        readme = (REPOSITORY_ROOT / "changelog.d" / "README.md").read_text(encoding="utf-8")
+        for name, text in (("CONTRIBUTING.md", contributing), ("changelog.d/README.md", readme)):
+            with self.subTest(document=name):
+                flat = " ".join(text.split())
+                self.assertIn(REMOVAL_LABEL, flat)
+                self.assertIn("inside parentheses", flat)
+                self.assertIn("A plain mention of an issue or another pull request", flat)
+                self.assertNotIn("no pull request number, at most", flat)
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class PlainMentionCoverageTests(unittest.TestCase):
+    def test_plain_mentions_are_not_counted_by_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = ScratchRepository(Path(raw) / "repo")
+            _git(repo.root, "tag", "v0.1.0")
+            repo.write(
+                "changelog.d/regression.fixed.md",
+                "Fixed the regression reported in #7 and GH-8, see\nhttps://github.com/example/repo/pull/9.\n",
+            )
+            repo.commit("fix: regression (#10)")
+            merged = Path(raw) / "merged.json"
+            merged.write_text(json.dumps([7, 8, 9, 10]), encoding="utf-8")
+
+            result = coverage.evaluate(
+                repo.root, previous_tag="v0.1.0", section_header="## Unreleased", merged_prs_json=merged
+            )
+
+            self.assertEqual(result.covered, {10})
+            self.assertEqual(result.missing, {7, 8, 9})
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class BindingTests(unittest.TestCase):
+    """A fragment is bound from history only when history proves the number."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = ScratchRepository(Path(self._tmp.name) / "repo")
+
+    def _bind(self, root: Path | None = None) -> tuple[dict[str, int], dict[str, str]]:
+        module = _fragments()
+        fragments, problems = module.load_fragments(root or self.repo.root)
+        self.assertEqual(problems, [])
+        return module.bind_numbers(root or self.repo.root, fragments)
+
+    def test_shallow_repository_is_refused_by_preview_and_collect(self) -> None:
+        self.repo.write("changelog.d/first-entry.fixed.md", "Fixed first.\n")
+        self.repo.commit("fix: first (#12)")
+        self.repo.write("changelog.d/second-entry.added.md", "Added second.\n")
+        self.repo.commit("feat: second (#13)")
+        self.repo.write("other.txt", "unrelated\n")
+        self.repo.commit("docs: unrelated (#14)")
+        module = _fragments()
+        for depth, shallow in ((["--depth", "1"], True), ([], False)):
+            with self.subTest(shallow=shallow):
+                clone = Path(self._tmp.name) / ("shallow" if shallow else "full")
+                subprocess.run(
+                    ["git", "clone", "-q", "--no-hardlinks", *depth, self.repo.root.as_uri(), str(clone)],
+                    check=True,
+                    capture_output=True,
+                )
+                before = (clone / "CHANGELOG.md").read_text(encoding="utf-8")
+                code, output = _cli(module.main, "--repo", str(clone), "preview")
+                if shallow:
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("shallow", output)
+                    with self.assertRaises(module.CollectError) as raised:
+                        module.collect(clone, version="0.2.0", date="2026-02-01")
+                    self.assertIn("shallow", str(raised.exception))
+                    self.assertIn("fetch", str(raised.exception))
+                    self.assertEqual((clone / "CHANGELOG.md").read_text(encoding="utf-8"), before)
+                    self.assertTrue((clone / "changelog.d/first-entry.fixed.md").exists())
+                else:
+                    self.assertEqual(code, 0, output)
+                    result = module.collect(clone, version="0.2.0", date="2026-02-01")
+                    self.assertEqual(
+                        result.numbers,
+                        {"changelog.d/first-entry.fixed.md": 12, "changelog.d/second-entry.added.md": 13},
+                    )
+
+    def test_untracked_or_changed_working_tree_fragment_never_inherits_a_number(self) -> None:
+        self.repo.write("changelog.d/sample-entry.fixed.md", "Fixed the old sample.\n")
+        self.repo.commit("fix: old (#12)")
+        (self.repo.root / "changelog.d/sample-entry.fixed.md").unlink()
+        self.repo.commit("chore: removed (#13)")
+        self.repo.write("changelog.d/kept-entry.fixed.md", "Fixed the kept sample.\n")
+        self.repo.write("changelog.d/edited-entry.fixed.md", "Fixed the edited sample.\n")
+        self.repo.commit("fix: kept (#14)")
+        self.repo.write("changelog.d/sample-entry.fixed.md", "Fixed a new uncommitted sample.\n")
+        self.repo.write("changelog.d/edited-entry.fixed.md", "Fixed the edited sample, changed locally.\n")
+
+        numbers, unbound = self._bind()
+
+        self.assertEqual(numbers, {"changelog.d/kept-entry.fixed.md": 14})
+        self.assertIn("not committed", unbound["changelog.d/sample-entry.fixed.md"])
+        self.assertIn("differs", unbound["changelog.d/edited-entry.fixed.md"])
+        module = _fragments()
+        with self.assertRaises(module.CollectError) as raised:
+            module.collect(self.repo.root, version="0.2.0", date="2026-02-01")
+        self.assertIn("changelog.d/sample-entry.fixed.md", str(raised.exception))
+        self.assertIn("changelog.d/edited-entry.fixed.md", str(raised.exception))
+
+    def test_renamed_or_copied_fragment_is_not_bound_to_the_renaming_commit(self) -> None:
+        self.repo.write("changelog.d/sample-entry.fixed.md", "Fixed the first sample.\n")
+        self.repo.commit("fix: first (#12)")
+        _git(self.repo.root, "mv", "changelog.d/sample-entry.fixed.md", "changelog.d/renamed-entry.fixed.md")
+        self.repo.commit("docs: rename (#14)")
+        rename_sha = self.repo.head()
+        self.repo.write("changelog.d/copied-entry.fixed.md", "Fixed the first sample.\n")
+        self.repo.commit("docs: copy (#15)")
+
+        numbers, unbound = self._bind()
+
+        self.assertEqual(numbers, {})
+        self.assertIn(f"renamed in {rename_sha[:12]}", unbound["changelog.d/renamed-entry.fixed.md"])
+        self.assertIn("copied", unbound["changelog.d/copied-entry.fixed.md"])
+        module = _fragments()
+        with self.assertRaises(module.CollectError):
+            module.collect(self.repo.root, version="0.2.0", date="2026-02-01")
+
+    def test_squash_subject_number_rules(self) -> None:
+        # The number is the final '(#N)' of the subject; anything else is unbound.
+        module = _fragments()
+        for index, (subject, expected) in enumerate(
+            (
+                ("fix: path (#12)", 12),
+                ("fix: path (#12, #13)", None),
+                ('Revert "fix: previous (#12)" (#13)', 13),
+                ("fix: path (#12) more words", None),
+                ("fix: reference (#12) and actual merge (#13)", 13),
+                ("Merge pull request #13 from example/topic", None),
+            )
+        ):
+            with self.subTest(subject=subject):
+                repo = ScratchRepository(Path(self._tmp.name) / f"subject-{index}")
+                repo.write("changelog.d/sample-entry.fixed.md", "Fixed the sample.\n")
+                repo.commit(subject)
+                fragments, _problems = module.load_fragments(repo.root)
+                numbers, unbound = module.bind_numbers(repo.root, fragments)
+                self.assertEqual(numbers.get("changelog.d/sample-entry.fixed.md"), expected, unbound)
+
+    def test_readded_fragment_binds_to_the_commit_that_added_it_again(self) -> None:
+        self.repo.write("changelog.d/sample-entry.fixed.md", "Fixed the first sample.\n")
+        self.repo.commit("fix: first (#12)")
+        (self.repo.root / "changelog.d/sample-entry.fixed.md").unlink()
+        self.repo.commit("chore: remove (#13)")
+        self.repo.write("changelog.d/sample-entry.fixed.md", "Fixed the new sample.\n")
+        self.repo.commit("fix: readd (#14)")
+
+        numbers, _unbound = self._bind()
+
+        self.assertEqual(numbers, {"changelog.d/sample-entry.fixed.md": 14})
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class StagingBranchTests(unittest.TestCase):
+    """Fragments carried in through a squash-merged staging branch are never guessed."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = ScratchRepository(Path(self._tmp.name) / "repo")
+        _git(self.repo.root, "tag", "v0.1.0")
+
+    def _staging(self, *, carried: bool = False) -> None:
+        root = self.repo.root
+        if carried:
+            # An older bullet already names the inner pull request.
+            self.repo.write(
+                "CHANGELOG.md",
+                self.repo.read("CHANGELOG.md").replace("### Fixed\n\n", "### Fixed\n\n- Fixed a legacy part (#13).\n", 1),
+            )
+            self.repo.commit("docs: carried legacy entry")
+        _git(root, "checkout", "-q", "-b", "staging")
+        self.repo.write("changelog.d/inner-change.fixed.md", "Fixed the inner change.\n")
+        self.repo.write("changelog.d/inner-change.upgrade.md", "Set `INNER` before upgrading.\n")
+        self.repo.commit("fix: inner change (#13)")
+        inner = self.repo.head()
+        _git(root, "checkout", "-q", "main")
+        _git(root, "merge", "-q", "--squash", "staging")
+        self.repo.commit("feat: staging (#14)")
+        self.outer = self.repo.head()
+        self.repo.write("changelog.d/plain-change.fixed.md", "Fixed the plain change.\n")
+        self.repo.commit("fix: plain change (#15)")
+        plain = self.repo.head()
+        self.merged = Path(self._tmp.name) / "merged.json"
+        self.merged.write_text(
+            json.dumps(
+                [
+                    {
+                        "number": 13,
+                        "baseRefName": "staging",
+                        "headRefName": "inner",
+                        "isCrossRepository": False,
+                        "mergedAt": "2099-01-02T00:00:00Z",
+                        "mergeCommit": {"oid": inner},
+                        "labels": [],
+                    },
+                    {
+                        "number": 14,
+                        "baseRefName": "main",
+                        "headRefName": "staging",
+                        "isCrossRepository": False,
+                        "mergedAt": "2099-01-03T00:00:00Z",
+                        "mergeCommit": {"oid": self.outer},
+                        "labels": [{"name": "no-changelog"}],
+                    },
+                    {
+                        "number": 15,
+                        "baseRefName": "main",
+                        "headRefName": "plain",
+                        "isCrossRepository": False,
+                        "mergedAt": "2099-01-04T00:00:00Z",
+                        "mergeCommit": {"oid": plain},
+                        "labels": [],
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def _coverage(self, overrides: dict[str, int] | None = None) -> coverage.CoverageResult:
+        extra = {} if overrides is None else {"pr_overrides": overrides}
+        return coverage.evaluate(
+            self.repo.root,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=self.merged,
+            **extra,
+        )
+
+    def test_partial_override_of_a_commit_is_refused_listing_its_siblings(self) -> None:
+        self._staging()
+        module = _fragments()
+        before = self.repo.read("CHANGELOG.md")
+
+        with self.assertRaises(module.CollectError) as raised:
+            module.collect(
+                self.repo.root, version="0.2.0", date="2026-02-01", pr_overrides={"inner-change.fixed.md": 13}
+            )
+
+        self.assertIn("changelog.d/inner-change.upgrade.md", str(raised.exception))
+        self.assertEqual(self.repo.read("CHANGELOG.md"), before)
+        for main, extra in (
+            (module.main, ("--repo", str(self.repo.root), "preview", "--pr", "inner-change.fixed.md=13")),
+            (
+                coverage.main,
+                (
+                    "v0.1.0",
+                    "## Unreleased",
+                    "--repo",
+                    str(self.repo.root),
+                    "--merged-prs-json",
+                    str(self.merged),
+                    "--pr",
+                    "inner-change.fixed.md=13",
+                ),
+            ),
+        ):
+            with self.subTest(command=main.__module__):
+                code, output = _cli(main, *extra)
+                self.assertNotEqual(code, 0, output)
+                self.assertIn("changelog.d/inner-change.upgrade.md", output)
+
+        result = module.collect(
+            self.repo.root,
+            version="0.2.0",
+            date="2026-02-01",
+            pr_overrides={"inner-change.fixed.md": 13, "inner-change.upgrade.md": 13},
+        )
+        self.assertEqual(result.numbers["changelog.d/inner-change.upgrade.md"], 13)
+        self.assertEqual(result.numbers["changelog.d/plain-change.fixed.md"], 15)
+
+    def test_preview_lists_the_fragments_each_commit_added(self) -> None:
+        self._staging()
+
+        code, output = _cli(_fragments().main, "--repo", str(self.repo.root), "preview")
+
+        self.assertEqual(code, 0, output)
+        line = next((row for row in output.splitlines() if self.outer[:12] in row), "")
+        self.assertIn("(#14)", line)
+        self.assertIn("changelog.d/inner-change.fixed.md", line)
+        self.assertIn("changelog.d/inner-change.upgrade.md", line)
+
+    def test_fragment_bound_to_a_squashed_staging_branch_is_ambiguous(self) -> None:
+        self._staging(carried=True)
+
+        result = self._coverage()
+
+        self.assertFalse(result.ok, result.messages)
+        joined = "\n".join(result.messages)
+        self.assertIn("ambiguous", joined)
+        self.assertIn("changelog.d/inner-change.upgrade.md", joined)
+        self.assertIn("#14", joined)
+        self.assertIn("#13", joined)
+        flagged = [line for line in result.messages if "bound by Git to" in line]
+        self.assertEqual(len(flagged), 2, flagged)
+        self.assertFalse(any("plain-change" in line for line in flagged), flagged)
+
+        confirmed = self._coverage({"inner-change.fixed.md": 13, "inner-change.upgrade.md": 13})
+        self.assertTrue(confirmed.ok, confirmed.messages)
+        self.assertEqual(confirmed.covered, {13, 15})
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class CollectInputTests(unittest.TestCase):
+    """Collection writes and deletes only the fragment bytes it read."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _repo(self, name: str) -> ScratchRepository:
+        repo = ScratchRepository(Path(self._tmp.name) / name)
+        for number, path, text in (
+            (20, "changelog.d/gamma-path.fixed.md", "Fixed the gamma path.\n"),
+            (21, "changelog.d/alpha-path.fixed.md", "Fixed the alpha path.\n"),
+        ):
+            repo.write(path, text)
+            repo.commit(f"fix: change {number} (#{number})")
+        return repo
+
+    @staticmethod
+    def _mutate(repo: ScratchRepository, mode: str) -> None:
+        path = repo.root / "changelog.d/gamma-path.fixed.md"
+        if mode == "changed":
+            path.write_text("Fixed the gamma path, edited after the read.\n", encoding="utf-8")
+        elif mode == "replaced":
+            path.unlink()
+            path.write_text("Fixed a replacement never read.\n", encoding="utf-8")
+        elif mode == "removed":
+            path.unlink()
+        elif mode == "added":
+            repo.write("changelog.d/late-arrival.fixed.md", "Fixed a late arrival.\n")
+
+    def test_fragment_changed_before_the_write_stops_collection(self) -> None:
+        module = _fragments()
+        for mode in ("changed", "replaced", "removed"):
+            with self.subTest(mode=mode):
+                repo = self._repo(f"before-{mode}")
+                before = repo.read("CHANGELOG.md")
+                original = module.merge_into_unreleased
+
+                def merge_then_change(*args, **kwargs):
+                    merged = original(*args, **kwargs)
+                    self._mutate(repo, mode)
+                    return merged
+
+                with mock.patch.object(module, "merge_into_unreleased", side_effect=merge_then_change):
+                    with self.assertRaises(module.CollectError) as raised:
+                        module.collect(repo.root, version="0.2.0", date="2026-02-01")
+
+                self.assertIn("changelog.d/gamma-path.fixed.md", str(raised.exception))
+                self.assertEqual(repo.read("CHANGELOG.md"), before)
+                self.assertTrue((repo.root / "changelog.d/alpha-path.fixed.md").exists())
+
+    def test_cleanup_leaves_fragments_that_changed_after_the_write(self) -> None:
+        module = _fragments()
+        for mode in ("changed", "replaced", "removed"):
+            with self.subTest(mode=mode):
+                repo = self._repo(f"after-{mode}")
+                original = module._write_changelog
+
+                def write_then_change(path, text):
+                    original(path, text)
+                    self._mutate(repo, mode)
+
+                with mock.patch.object(module, "_write_changelog", side_effect=write_then_change):
+                    code, output = _cli(
+                        module.main, "--repo", str(repo.root), "collect", "--version", "0.2.0", "--date", "2026-02-01"
+                    )
+
+                self.assertEqual(code, 1, output)
+                self.assertNotIn("Traceback", output)
+                self.assertIn("changelog.d/gamma-path.fixed.md", output)
+                self.assertIn(RECOVERY_TEXT, output)
+                self.assertIn("## v0.2.0 - 2026-02-01", repo.read("CHANGELOG.md"))
+                self.assertFalse((repo.root / "changelog.d/alpha-path.fixed.md").exists())
+                gamma = repo.root / "changelog.d/gamma-path.fixed.md"
+                self.assertEqual(gamma.exists(), mode != "removed")
+                if mode != "removed":
+                    self.assertNotEqual(gamma.read_text(encoding="utf-8"), "Fixed the gamma path.\n")
+
+    def test_fragment_added_after_the_read_is_left_alone(self) -> None:
+        module = _fragments()
+        repo = self._repo("late")
+        original = module._write_changelog
+
+        def write_then_add(path, text):
+            original(path, text)
+            self._mutate(repo, "added")
+
+        with mock.patch.object(module, "_write_changelog", side_effect=write_then_add):
+            result = module.collect(repo.root, version="0.2.0", date="2026-02-01")
+
+        self.assertTrue((repo.root / "changelog.d/late-arrival.fixed.md").exists())
+        self.assertNotIn("changelog.d/late-arrival.fixed.md", result.consumed)
+        self.assertEqual(len(result.consumed), 2)
+        self.assertNotIn("late arrival", repo.read("CHANGELOG.md"))
+
+
+@unittest.skipIf(shutil.which("git") is None, "git executable is required")
+class OverrideMapTests(unittest.TestCase):
+    """preview, coverage and collect take the same --pr map, so the checklist order works."""
+
+    def test_preview_coverage_and_collect_accept_the_same_pr_map(self) -> None:
+        module = _fragments()
+        with tempfile.TemporaryDirectory() as raw:
+            repo = ScratchRepository(Path(raw) / "repo")
+            _git(repo.root, "tag", "v0.1.0")
+            repo.write("changelog.d/sample-entry.fixed.md", "Fixed the sample.\n")
+            repo.commit("fix: sample with an edited title")
+            merged = Path(raw) / "merged.json"
+            merged.write_text(json.dumps([12]), encoding="utf-8")
+            coverage_args = ("v0.1.0", "## Unreleased", "--repo", str(repo.root), "--merged-prs-json", str(merged))
+
+            code, output = _cli(module.main, "--repo", str(repo.root), "check")
+            self.assertEqual(code, 0, output)
+            code, output = _cli(coverage.main, *coverage_args)
+            self.assertEqual(code, 1, output)
+            self.assertIn("#12", output)
+
+            code, output = _cli(module.main, "--repo", str(repo.root), "preview", "--pr", "sample-entry.fixed.md=12")
+            self.assertEqual(code, 0, output)
+            self.assertIn("- Fixed the sample (#12).", output)
+            code, output = _cli(coverage.main, *coverage_args, "--pr", "sample-entry.fixed.md=12")
+            self.assertEqual(code, 0, output)
+
+            for bad, reason in (
+                ("sample-entry.fixed.md=abc", "use <file>=<number>"),
+                ("missing-entry.fixed.md=12", "not fragments in this checkout"),
+                ("sample-entry.fixed.md=0", "positive integer"),
+            ):
+                with self.subTest(value=bad):
+                    preview_code, preview_out = _cli(module.main, "--repo", str(repo.root), "preview", "--pr", bad)
+                    coverage_code, coverage_out = _cli(coverage.main, *coverage_args, "--pr", bad)
+                    self.assertNotEqual(preview_code, 0, preview_out)
+                    self.assertNotEqual(coverage_code, 0, coverage_out)
+                    self.assertIn(reason, preview_out)
+                    self.assertIn(reason, coverage_out)
+
+            code, output = _cli(
+                module.main,
+                "--repo",
+                str(repo.root),
+                "collect",
+                "--version",
+                "0.2.0",
+                "--date",
+                "2026-02-01",
+                "--pr",
+                "sample-entry.fixed.md=12",
+            )
+            self.assertEqual(code, 0, output)
+            code, output = _cli(
+                coverage.main, "v0.1.0", "## v0.2.0 - 2026-02-01", "--repo", str(repo.root), "--merged-prs-json", str(merged)
+            )
+            self.assertEqual(code, 0, output)
+
+    def test_checklist_shows_the_pr_map_in_order(self) -> None:
+        checklist = (REPOSITORY_ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+        steps = (
+            "python scripts/changelog_fragments.py check",
+            "python scripts/changelog_fragments.py preview [--pr <file>=<N> ...]",
+            '"## Unreleased" --merged-prs-json merged-prs.json [--pr <file>=<N> ...]',
+            "python scripts/changelog_fragments.py collect --version X.Y.Z --date YYYY-MM-DD [--pr <file>=<N> ...]",
+        )
+        positions = [checklist.find(step) for step in steps]
+        self.assertNotIn(-1, positions, list(zip(steps, positions)))
+        self.assertEqual(positions, sorted(positions))
+        flat = " ".join(checklist.split())
+        self.assertIn("prefer a merge commit over a squash", flat)
+        self.assertIn("bind every inner fragment with `--pr`", flat)
 
 
 if __name__ == "__main__":

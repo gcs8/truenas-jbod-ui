@@ -490,24 +490,41 @@ owner-approved `workflow_dispatch`.
   it because a pull request can enter the candidate through an intermediate
   same-repository branch:
   `gh pr list -R gcs8/truenas-jbod-ui --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository > merged-prs.json`
-- validate the fragments and run the coverage gate against the previous tag
-  and `## Unreleased` (the existing bullets plus every fragment in
-  `changelog.d/`, numbered from the commit that added it), then fix every
-  missing pull request number before proceeding:
+- work in a full clone (`git fetch --unshallow` if needed); `preview`,
+  `collect` and the coverage gate refuse a shallow clone because they cannot
+  prove which commit added a fragment
+- validate the fragments:
   `python scripts/changelog_fragments.py check`
-  `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json`
+- preview `## Unreleased` with the fragments merged in. It prints one note per
+  adding commit with the fragments it added and their numbers, and names every
+  fragment history does not bind (not committed, changed since its commit,
+  renamed or copied from another fragment, or a commit subject without a final
+  `(#N)`). Confirm the pull request of each unbound fragment and pass the same
+  map to this step and to the next two; give `--pr` for every fragment its
+  commit added, or for none of them:
+  `python scripts/changelog_fragments.py preview [--pr <file>=<N> ...]`
+- run the coverage gate against the previous tag and `## Unreleased` (the
+  existing bullets plus every fragment), then fix every missing pull request
+  number before proceeding. It also fails when a fragment is bound to a pull
+  request that merged a squashed intermediate branch, and names the outer and
+  inner numbers; bind each such fragment with `--pr`:
+  `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json [--pr <file>=<N> ...]`
+- staging branches: prefer a merge commit over a squash when merging a staging
+  branch into `main`, so each fragment keeps the commit of its own pull
+  request. After a squash, bind every inner fragment with `--pr`.
 - collect the fragments into the release section. This renames
   `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, adds each fragment as a bullet
   ending in its `(#N)` under its subsection, after the bullets already there,
-  and deletes exactly the fragments it consumed (it prints them):
-  `python scripts/changelog_fragments.py collect --version X.Y.Z --date YYYY-MM-DD`
-  A fragment whose adding commit has no `(#N)` subject stops the run with the
-  file name; confirm the pull request and pass `--pr <file>=<N>`. A second
-  run for the same version is refused; if a run stopped after writing
-  `CHANGELOG.md`, it lists the fragments still present and whether each is
-  already in the section. Review the diff; only `changelog.d/README.md` may
-  remain, and the release wrap validator refuses a release tree with any
-  other fragment
+  and deletes the fragments it consumed (it prints them):
+  `python scripts/changelog_fragments.py collect --version X.Y.Z --date YYYY-MM-DD [--pr <file>=<N> ...]`
+  It refuses, writing nothing, when a fragment changed between the read and
+  the write. After the write it deletes a fragment only while its bytes are
+  still the ones it read; any other one is left in place and listed, and the
+  run exits non-zero. A second run for the same version is refused; if a run
+  stopped after writing `CHANGELOG.md`, it lists the fragments still present
+  and whether each is already in the section. Review the diff; only
+  `changelog.d/README.md` may remain, and the release wrap validator refuses a
+  release tree with any other fragment
 - write three to five `### Highlights` bullets, review every
   `### Upgrade notes` bullet as an operator would, and rerun the coverage gate
   against the final header
