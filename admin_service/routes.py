@@ -28,6 +28,7 @@ from admin_service.route_support import (
     SERVICE_STARTED_AT,
     TemporaryFileResponse,
     _format_count,
+    admin_error_response,
     build_admin_state_payload,
     build_runtime_payload,
     compute_expires_at,
@@ -1573,7 +1574,8 @@ def build_router(admin_settings: Any) -> APIRouter:
         # own deadline. A result comes only from the scheduler's result; its
         # refusals before starting (400, 409) pass through. Anything else once
         # the connection was open, or no answer at all, gets the one fixed
-        # message. Only a connection that never opened stays "not available".
+        # message. Only a request that was never sent stays "not available",
+        # with a fixed state so the page can say the clean-up did not start.
         client = get_backup_scheduler_client()
         deadline = time.monotonic() + backup_scheduler_client.LIFECYCLE_APPLY_DEADLINE_SECONDS
         try:
@@ -1583,7 +1585,7 @@ def build_router(admin_settings: Any) -> APIRouter:
         except (SchedulerNoAnswerError, TimeoutError):
             response = None
         except SchedulerUnavailableError:
-            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
+            return admin_error_response(scheduler_unavailable_detail, 503, state="cleanup_not_sent")
         if response is not None:
             if response.status == 200 and is_cleanup_result(response.payload):
                 return JSONResponse(response.payload, status_code=200)

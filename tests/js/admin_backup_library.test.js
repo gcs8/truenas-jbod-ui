@@ -993,6 +993,71 @@ test("a lost connection or an undecided HTTP error after the apply went out is n
   assert.equal(banners.at(-1)[1], "error");
 });
 
+const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
+const NOT_SENT_BODY = {
+  ok: false,
+  state: "cleanup_not_sent",
+  detail: "The backup scheduler service is not available.",
+  request_id: "0123456789abcdef0123456789abcdef",
+};
+
+async function applyThroughTransport(answer) {
+  let lists = 0;
+  let applies = 0;
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async (url) => {
+      if (url.endsWith("/lifecycle/apply")) {
+        applies += 1;
+        return answer();
+      }
+      if (url.endsWith("/lifecycle/plan")) {
+        return jsonResponse(200, { plan_token: "plan-token-1", items: [
+          { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+      }
+      lists += 1;
+      return jsonResponse(200, syntheticLibrary());
+    },
+  });
+  const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+  await library.load();
+  await library.actions.openCleanup();
+  const before = lists;
+  await library.actions.applyCleanup();
+  return { elements, banners, extraReads: lists - before, applies };
+}
+
+test("a clean-up the admin service never sent says it did not start, and reads nothing more (#1188)", async () => {
+  const { elements, banners, extraReads, applies } = await applyThroughTransport(() => jsonResponse(503, NOT_SENT_BODY));
+  assert.equal(applies, 1);
+  assert.deepEqual(banners.at(-1), [CLEANUP_NOT_STARTED, "info"]);
+  assert.equal(resultNode(elements).textContent, CLEANUP_NOT_STARTED);
+  assert.doesNotMatch(resultNode(elements).className, /is-warning|is-bad/, "the busy refusal's plain tone");
+  assert.doesNotMatch(elements.dialog.textContent, /No answer came back|may have run|Clean up failed/);
+  assert.equal(extraReads, 0, "no list or status read after the refusal");
+});
+
+test("only the admin's not-sent 503 says did not start; a gateway's 5xx or a lost send stays not known (#1188)", async () => {
+  const answers = {
+    "plain HTTP 503": () => jsonResponse(503, { ok: false, detail: NOT_SENT_BODY.detail, request_id: NOT_SENT_BODY.request_id }),
+    "HTTP 503 with another state": () => jsonResponse(503, { ...NOT_SENT_BODY, state: "cleanup_state_unknown" }),
+    "HTTP 500 with the state": () => jsonResponse(500, NOT_SENT_BODY),
+    "HTTP 502 with the state": () => jsonResponse(502, NOT_SENT_BODY),
+    "HTTP 504 with the state": () => jsonResponse(504, NOT_SENT_BODY),
+    "send failed": () => Promise.reject(new TypeError("Failed to fetch")),
+    "202 with the state": () => jsonResponse(202, { state: "cleanup_not_sent", detail: NOT_SENT_BODY.detail }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements, banners, extraReads } = await applyThroughTransport(answer);
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /did not start|Clean up failed/, name);
+    assert.equal(extraReads, 0, `${name}: no read after the lost answer`);
+  }
+});
+
 test("the clean-up result sits directly under the plan's introduction, which no longer points below (#1188)", async () => {
   const outcomes = {
     success: () => ({ ok: true, deleted: ["cfg-old", "full-part"], already_missing: [], failed: null, not_attempted: [] }),

@@ -56,6 +56,8 @@
   // is a backup or a clean-up, so promise nothing about where its result shows.
   const CLEANUP_BUSY = "A backup or clean-up is already running on the backup service, so this clean-up did not start "
     + "and deleted nothing. Open Clean up again after it finishes.";
+  // The admin service never reached the scheduler, so nothing was sent.
+  const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
   const SENSITIVE_KEY = /path|file|dir|root|password|passphrase|secret|token|credential|key_id|access_key|private|username|user$|host|endpoint|url|share|bucket|export|mount/i;
 
   // ---------------------------------------------------------------- model --
@@ -1419,6 +1421,10 @@
           showResult(text, stopped || notes.length ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
+          if (error?.status === 503 && error?.cleanupState === "cleanup_not_sent") {
+            showResult(CLEANUP_NOT_STARTED, "info");
+            return;
+          }
           // The page's own timer ran out, or the request went out and the
           // transport could not tell what happened (no answer, a broken
           // connection, a 5xx or 408): no answer, never "failed".

@@ -507,10 +507,12 @@ minutes. The admin service waits up to 10 minutes in all for its answer, so it
 replies well before the page's own 15-minute limit.
 
 - If the backup service's result arrives, the dialog shows it.
-- If the admin service could not open a connection to the backup service at
-  all, nothing was sent and the API answers that the backup scheduler is not
-  available. The page cannot tell that answer from a gateway error, so it
-  shows the message below for it too.
+- If the backup scheduler cannot be reached (no socket, the connection is
+  refused or times out, or the wait ran out before the request was made),
+  nothing was sent. The API answers 503 with the fixed state
+  `cleanup_not_sent`, and the page says "Clean up did not start: The backup
+  scheduler service is not available." A 503 without that state, such as one
+  from a proxy in front of the admin service, gets the message below.
 - In every other case (the wait ran out, the connection broke while sending or
   receiving, or the answer was not a clean-up result or a refusal), and when
   the page itself stops waiting or gets an error that does not decide the

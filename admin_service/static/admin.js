@@ -6512,6 +6512,7 @@
               describeResponseFailure(describeRequestFailure(payload, response), outcome), outcome
             );
             error.status = response.status;
+            error.cleanupState = payload?.state; // a decided refusal's fixed state, if the route gave one
             throw error;
           }
           return payload;

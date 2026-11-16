@@ -148,8 +148,8 @@ class BackupSchedulerClient:
             # means only that no usable answer came back, not that the
             # scheduler did nothing.
             try:
-                if expired.is_set():  # the watchdog fired before it had the socket
-                    raise TimeoutError("The deadline passed before the request was sent.")
+                if expired.is_set():  # the watchdog fired before it had the socket; nothing was sent
+                    raise SchedulerUnavailableError("The deadline passed before the request was sent.")
                 connection.request(method, path, body=data, headers=headers)
                 response = connection.getresponse()
                 raw = response.read(MAX_JSON_BYTES + 1)

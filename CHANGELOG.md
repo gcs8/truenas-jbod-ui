@@ -56,8 +56,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   for those reads. If no usable answer comes back, the page says, in the
   warning colour, that no answer came back and the clean-up may have run, may
   still be running or may not have started, and asks for a reload in a few
-  minutes; nothing later changes that message. Reload admin pages that were
-  open before upgrading. History sidecar snapshots are replaced only by
+  minutes; nothing later changes that message. When the backup scheduler
+  cannot be reached, so the request was never sent, the page says the clean-up
+  did not start. Reload admin pages that were open before upgrading. History sidecar snapshots are replaced only by
   FULLs that pass the same fresh check, at most 14 local FULL content checks per
   backup run including the kept-copy check (#1195).
 - Re-saving a system in System Setup no longer resets settings the form does

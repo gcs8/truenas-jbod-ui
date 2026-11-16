@@ -9,6 +9,7 @@ remote target is the real filesystem transport over a temporary directory.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -422,6 +423,7 @@ CLEANUP_STATE_UNKNOWN = (
     "started. Reload this page in a few minutes and check Last clean-up before starting another."
 )
 NO_ANSWER = {"state": "cleanup_state_unknown", "detail": CLEANUP_STATE_UNKNOWN}
+NOT_AVAILABLE = "The backup scheduler service is not available."
 CLEANUP_RESULT_BODY = (
     b'{"ok": true, "deleted": [], "already_missing": [], "failed": null, "not_attempted": [], '
     b'"downgraded": [], "kept_after_replan": []}'
@@ -504,6 +506,63 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
 
         self.assertEqual(status, 503)
         self.assertEqual(json.loads(body)["detail"], "The backup scheduler service is not available.")
+
+    def assert_not_sent(self, status, body) -> None:
+        payload = json.loads(body)
+        self.assertEqual(status, 503, payload)
+        self.assertRegex(str(payload.get("request_id")), r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            payload, {"ok": False, "state": "cleanup_not_sent", "detail": NOT_AVAILABLE, "request_id": payload["request_id"]}
+        )
+
+    def test_a_clean_up_that_was_never_sent_says_so_in_a_fixed_state(self) -> None:
+        # No connection opened, so no byte left. The 503 carries a fixed state
+        # the page can tell apart from a gateway's 503, at each such stage.
+        import socket
+
+        bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(bound.close)
+        bound.bind(str(self.socket_path))  # a socket file nobody listens on
+        missing = self.client_module.BackupSchedulerClient(str(Path(self.temp.name) / "gone.sock"))
+        present = self.client_module.BackupSchedulerClient(str(self.socket_path))
+        never_connect = patch.object(self.client_module._UnixConnection, "connect", side_effect=AssertionError("connect"))
+        connect_times_out = patch.object(self.client_module._UnixConnection, "connect", side_effect=TimeoutError("timed out"))
+        stages = {
+            "socket file missing": (missing, never_connect),
+            "connect refused": (present, contextlib.nullcontext()),
+            "connect timed out": (present, connect_times_out),
+            "deadline passed before connect": (present, never_connect),
+        }
+        for name, (client, connect) in stages.items():
+            deadline = _apply_deadline(self.client_module, 0.0 if "deadline" in name else 5.0)
+            with self.subTest(name), connect, deadline, patch.object(
+                self.admin_routes, "get_backup_scheduler_client", return_value=client
+            ):
+                status, body = self.call("POST", "/api/admin/backups/lifecycle/apply", {"plan_token": "t"})
+                self.assert_not_sent(status, body)
+
+    def test_other_scheduler_routes_keep_their_not_available_answer_byte_for_byte(self) -> None:
+        from admin_service import route_support
+
+        client = self.client_module.BackupSchedulerClient(str(self.socket_path))  # no socket file
+        request_id = "0123456789abcdef0123456789abcdef"
+        expected = (
+            b'{"ok":false,"detail":"The backup scheduler service is not available.","request_id":"'
+            + request_id.encode()
+            + b'"}'
+        )
+        siblings = (
+            ("POST", "/api/admin/backups/run", {"backup_class": "full"}),
+            ("GET", "/api/admin/backups/lifecycle/plan", None),
+            ("POST", "/api/admin/backups/targets/t1/test", None),
+            ("POST", "/api/admin/backups/b1/verify", None),
+        )
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
+            route_support, "admin_request_id", return_value=request_id
+        ):
+            for method, path, body in siblings:
+                with self.subTest(path):
+                    self.assertEqual(self.call(method, path, body), (503, expected))
 
     def test_page_uses_the_same_words_as_the_route(self) -> None:
         import re
@@ -751,8 +810,7 @@ class AdminCleanupNoAnswerTests(SchedulerTestBase):
         self.assertFalse((self._paths.local_dir / older.name).exists())
 
     def test_accepted_clean_up_that_has_not_reserved_yet_is_not_known(self) -> None:
-        # The plan token is used, but the job is not reserved yet: the status
-        # read shows nothing running, and the clean-up still deletes later.
+        # The plan token is used, but the job is not reserved yet; the clean-up still deletes later.
         older, newest, scheduler = self.two_local_fulls()
         bridge = self.bridge(scheduler)
         token = self.plan_token(bridge)
@@ -784,11 +842,6 @@ class AdminCleanupNoAnswerTests(SchedulerTestBase):
     def route_with(self, apply_answer):
         """Drive the route with a client whose apply call gives ``apply_answer`` (raised if an exception)."""
 
-        from admin_service.services.backup_scheduler_client import SchedulerResponse
-
-        # Answered only if the route asks something after the apply; the tests check it does not.
-        follow_up = SchedulerResponse(status=200, payload={"available": True, "running": None})
-
         class Client:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, str]] = []
@@ -799,7 +852,7 @@ class AdminCleanupNoAnswerTests(SchedulerTestBase):
                     if isinstance(apply_answer, BaseException):
                         raise apply_answer
                     return apply_answer
-                return follow_up
+                raise AssertionError(f"unexpected scheduler request {method} {path}")
 
         client = Client()
         with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
@@ -914,7 +967,38 @@ class AdminCleanupNoAnswerTests(SchedulerTestBase):
         with patch.object(self.client_module._UnixConnection, "connect", side_effect=TimeoutError("timed out")):
             status, payload = self.apply(token)
         self.assertEqual(status, 503, payload)
-        self.assertEqual(payload["detail"], "The backup scheduler service is not available.")
+        self.assertEqual((payload.get("state"), payload.get("detail")), ("cleanup_not_sent", NOT_AVAILABLE))
+        self.assertEqual(bridge.seen, [])
+        self.assertIn(token, scheduler._plans)
+        self.assertTrue((self._paths.local_dir / older.name).exists())
+
+    def test_a_deadline_that_passes_after_connect_but_before_the_request_is_not_sent(self) -> None:
+        # The connection opens, but the deadline passes before the client holds
+        # the socket, so it never makes the request: nothing was sent.
+        import time
+
+        older, newest, scheduler = self.two_local_fulls()
+        bridge = self.bridge(scheduler)
+        token = self.plan_token(bridge)
+        real_connect = self.client_module._UnixConnection.connect
+        real_request = http.client.HTTPConnection.request
+        requests: list[tuple] = []
+
+        def slow_connect(connection):
+            real_connect(connection)
+            time.sleep(self.APPLY_WAIT + 0.3)
+
+        def counted(connection, *args, **kwargs):
+            requests.append(args[:2])
+            return real_request(connection, *args, **kwargs)
+
+        with patch.object(self.client_module._UnixConnection, "connect", slow_connect), patch.object(
+            http.client.HTTPConnection, "request", counted
+        ):
+            status, payload = self.apply(token)
+        self.assertEqual(requests, [])
+        self.assertEqual(status, 503, payload)
+        self.assertEqual((payload.get("state"), payload.get("detail")), ("cleanup_not_sent", NOT_AVAILABLE))
         self.assertEqual(bridge.seen, [])
         self.assertIn(token, scheduler._plans)
         self.assertTrue((self._paths.local_dir / older.name).exists())
