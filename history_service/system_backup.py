@@ -723,6 +723,70 @@ class _ImportRestoreDestination:
     expected_kind: Literal["file", "directory"]
 
 
+def _configuration_restore_destinations(settings: Settings) -> dict[str, _ImportRestoreDestination]:
+    """Every configuration restore target the import derives from ``settings``."""
+    config_path = Path(settings.config_file)
+    config_root = config_path.parent
+    layout_paths = _derive_runtime_layout_paths(config_path)
+    targets: tuple[tuple[str, Path, Literal["file", "directory"]], ...] = (
+        (CONFIG_FILE_KEY, config_path, "file"),
+        (RUNTIME_OVERRIDES_FILE_KEY, Path(settings.paths.runtime_overrides_file), "file"),
+        (PROFILE_FILE_KEY, Path(settings.paths.profile_file), "file"),
+        (MAPPING_FILE_KEY, Path(settings.paths.mapping_file), "file"),
+        (SAS_FABRIC_ALIAS_FILE_KEY, Path(settings.paths.sas_fabric_alias_file), "file"),
+        (SLOT_DETAIL_FILE_KEY, Path(settings.paths.slot_detail_cache_file), "file"),
+        (SSH_KEYS_KEY, config_root / "ssh", "directory"),
+        (TLS_TRUST_KEY, config_root / "tls", "directory"),
+        (KNOWN_HOSTS_KEY, Path(layout_paths["known_hosts_path"]), "file"),
+    )
+    return {key: _ImportRestoreDestination(key, path, kind) for key, path, kind in targets}
+
+
+def restore_configuration_folders(settings: Settings | None = None) -> tuple[Path, ...]:
+    """Folders where a restore that also restores configuration keeps its records.
+
+    Recovery lists these folders, and only these, for restore records that a
+    journal may no longer name (#1196). They come from the application's own
+    settings through the derivation the import uses, plus the other layouts an
+    imported configuration may select (its own folder's layout, the default
+    layout and the legacy container layout), never from the history volume.
+    Destinations outside these folders are not checked.
+    """
+    if settings is None:
+        try:
+            settings = load_settings(create_directories=False)
+        except Exception:
+            # Settings that do not load still name their layout folders below.
+            settings = None
+    config_path = Path(
+        settings.config_file
+        if settings is not None
+        else os.getenv("APP_CONFIG_PATH", Settings().config_file)
+    )
+    candidates: list[Path] = []
+    if settings is not None:
+        candidates.extend(
+            destination.target_path
+            for destination in _configuration_restore_destinations(settings).values()
+        )
+    for layout_config_path in (
+        config_path,
+        Path(Settings().config_file),
+        Path("/app/config/config.yaml"),
+    ):
+        candidates.extend(
+            Path(value)
+            for key, value in _derive_runtime_layout_paths(layout_config_path).items()
+            if key != "log_file"
+        )
+    folders: list[Path] = []
+    for candidate in candidates:
+        folder = Path(os.path.abspath(candidate.parent))
+        if folder not in folders:
+            folders.append(folder)
+    return tuple(folders)
+
+
 @dataclass(slots=True)
 class _PreparedSegmentedRestore:
     store: HistoryStore
@@ -3660,61 +3724,15 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
     ) -> dict[str, _ImportRestoreDestination]:
         trusted_settings = self._load_app_settings()
-        config_path = Path(trusted_settings.config_file)
-        config_root = config_path.parent
-        layout_paths = _derive_runtime_layout_paths(config_path)
-        destinations = {
-            CONFIG_FILE_KEY: _ImportRestoreDestination(
-                CONFIG_FILE_KEY,
-                config_path,
-                "file",
-            ),
-            RUNTIME_OVERRIDES_FILE_KEY: _ImportRestoreDestination(
-                RUNTIME_OVERRIDES_FILE_KEY,
-                Path(trusted_settings.paths.runtime_overrides_file),
-                "file",
-            ),
-            PROFILE_FILE_KEY: _ImportRestoreDestination(
-                PROFILE_FILE_KEY,
-                Path(trusted_settings.paths.profile_file),
-                "file",
-            ),
-            MAPPING_FILE_KEY: _ImportRestoreDestination(
-                MAPPING_FILE_KEY,
-                Path(trusted_settings.paths.mapping_file),
-                "file",
-            ),
-            SAS_FABRIC_ALIAS_FILE_KEY: _ImportRestoreDestination(
-                SAS_FABRIC_ALIAS_FILE_KEY,
-                Path(trusted_settings.paths.sas_fabric_alias_file),
-                "file",
-            ),
-            SLOT_DETAIL_FILE_KEY: _ImportRestoreDestination(
-                SLOT_DETAIL_FILE_KEY,
-                Path(trusted_settings.paths.slot_detail_cache_file),
-                "file",
-            ),
-            SSH_KEYS_KEY: _ImportRestoreDestination(
-                SSH_KEYS_KEY,
-                config_root / "ssh",
-                "directory",
-            ),
-            TLS_TRUST_KEY: _ImportRestoreDestination(
-                TLS_TRUST_KEY,
-                config_root / "tls",
-                "directory",
-            ),
-            KNOWN_HOSTS_KEY: _ImportRestoreDestination(
-                KNOWN_HOSTS_KEY,
-                Path(layout_paths["known_hosts_path"]),
-                "file",
-            ),
-            HISTORY_DB_KEY: _ImportRestoreDestination(
-                HISTORY_DB_KEY,
-                self.store.file_path,
-                "file",
-            ),
-        }
+        layout_paths = _derive_runtime_layout_paths(Path(trusted_settings.config_file))
+        # Recovery derives its configuration folders from the same targets
+        # (restore_configuration_folders), so the two cannot drift (#1196).
+        destinations = _configuration_restore_destinations(trusted_settings)
+        destinations[HISTORY_DB_KEY] = _ImportRestoreDestination(
+            HISTORY_DB_KEY,
+            self.store.file_path,
+            "file",
+        )
         self._validate_imported_restore_path_settings(
             manifest,
             group_entries,

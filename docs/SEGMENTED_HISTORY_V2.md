@@ -780,10 +780,25 @@ lists, and takes the decision from that record, never from the journal: `commit`
 finishes forward, and `pending` or `rollback` returns every target and the
 history to the prior generation. Parked prior and displaced configuration copies
 are retired by an authenticated rename before they are deleted, so a crash
-part-way through a delete never leaves a recorded path half removed. Recovery
-reports `prior-generation-restored` or `candidate-finalized` only after
-configuration and history agree, then removes the journal and the folder
-records. It refuses, changes nothing and keeps the journal with a named `reason`
+part-way through a delete never leaves a recorded path half removed. With the
+journal the restore wrote, recovery reports `prior-generation-restored` or
+`candidate-finalized` only after history and every target the folder records
+list agree, then removes the journal and the folder records. Before it changes
+anything, recovery also lists, by name only, the configuration folders that the
+application's own settings name: the folders of the files and folders above, for
+the configured layout, the default layout and the legacy container layout, never
+a folder named on the history volume. If one of them holds a restore record this
+recovery does not settle (the journal was removed, broken, rewritten as a
+history-only journal or replaced by one that does not name that record, the
+record belongs to another restore, or a crash came after the journal was removed
+and before the records were), recovery changes nothing and returns
+`configuration-recovery-incomplete` with the folders that hold such records; a
+folder that cannot be listed is reported the same way. The recovery command
+prints that receipt and exits with status 3; it exits 0 for every other receipt
+and 1 for a refusal. Each record lists the files the interrupted restore
+changed, with their prior and restored records: compare them, put back what is
+needed by hand, then remove the records and run recovery again. It refuses,
+changes nothing and keeps the journal with a named `reason`
 when the journal is malformed or overlaps history (`journal-invalid`), was
 written by another user (`journal-owner-mismatch`), a folder is missing or is
 not the one the restore used (`configuration-target-unavailable`), a folder
@@ -799,12 +814,21 @@ What this protects: recovery deletes, replaces or renames a configuration path
 only when the record in that path's own folder, written by the restore before
 the path changed, names it, and it moves the listed targets together to their
 recorded prior or candidate as the restore's recorded decision says. Editing
-the journal cannot change that. A writer of the history folder can still delete
-the journal or rewrite it as a history-only journal, so that recovery leaves
-configuration as the interrupted import left it, or make recovery refuse. Recovery
-judges history only from the history folder, so such a writer can always make
-history disagree with configuration. A writer of a configuration folder can
-change those files directly; recovery gives it no more than that.
+the journal cannot change that. A writer of the history folder can still delete,
+break or rewrite the journal so that recovery leaves configuration as the
+interrupted import left it; recovery then reports
+`configuration-recovery-incomplete` instead of success, as long as the records
+are in a folder the settings name and recovery runs where that folder is
+mounted. Such a writer can also make recovery refuse. Recovery judges history
+only from the history folder, so such a writer can always make history disagree
+with configuration. A writer of a configuration folder can change those files
+directly; recovery gives it no more than that.
+
+Limits: a configuration destination outside the folders the settings name is not
+checked, and a recovery run where the configuration folders are not mounted
+(the history container) cannot see their records, so there a success receipt
+says only that history converged. When an interrupted import may have restored
+configuration, run recovery through the admin service as described below.
 
 The history container does not mount the configuration volume, and in the base
 Compose file the admin service that ran the restore writes the journal as root.
@@ -816,7 +840,8 @@ arguments shown in the rotation section above through the admin service instead:
 enclosure-admin` with no `--user` override, since that service mounts
 configuration, data and history as the identity that ran the restore. Add
 `--apply` only after reviewing the reported state. A history-only restore keeps
-the version 1 journal and the history-container command unchanged.
+the version 1 journal and the history-container command unchanged; only a
+recovery run through the admin service also checks the configuration folders.
 
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2

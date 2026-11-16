@@ -14,6 +14,9 @@ PLATFORM_HINT = (
     "/app/scripts/rotate_segmented_history.py --source /history/history.db "
     "--segments-dir /history/segments --recover --apply"
 )
+# Recovery found a restore record it did not settle in a configuration folder
+# the application knows about, and changed nothing (#1196).
+INCOMPLETE_EXIT = 3
 
 
 def _load_rotation_api():
@@ -31,6 +34,11 @@ def _load_rotation_api():
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Append or recover one later segmented-history generation.",
+        epilog=(
+            f"Exit status: {INCOMPLETE_EXIT} when recovery reports "
+            "configuration-recovery-incomplete (it changed nothing), 0 for any other "
+            "printed receipt, 2 for a usage error, 1 for a refusal or any other error."
+        ),
     )
     parser.add_argument(
         "--source",
@@ -103,6 +111,13 @@ def main() -> int:
                 segments_directory=args.segments_dir,
                 apply=args.apply,
             )
+            from history_service.segmented_restore import CONFIGURATION_RECOVERY_INCOMPLETE
+
+            if receipt.get("recovery_state") == CONFIGURATION_RECOVERY_INCOMPLETE:
+                print(json.dumps(receipt, sort_keys=True))
+                # Raised inside the temporary-directory context, which then
+                # removes a directory it created, so this run changes nothing.
+                raise SystemExit(INCOMPLETE_EXIT)
         else:
             if any(
                 value is None

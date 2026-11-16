@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 
 from history_service.segment_catalog import path_entry_exists
 from history_service.segment_reader import SegmentedHistoryReader
@@ -20,6 +20,9 @@ ACTIVATION_JOURNAL_VERSION = 1
 WHOLE_IMPORT_JOURNAL_VERSION = 2
 WHOLE_IMPORT_DECISIONS = frozenset({"pending", "commit", "rollback"})
 IMPORT_SEAL_PURPOSE = "restore-import-seal"
+# Recovery returns this state, changing nothing, while a configuration folder
+# the application knows about holds a restore record it did not settle.
+CONFIGURATION_RECOVERY_INCOMPLETE = "configuration-recovery-incomplete"
 MAX_ACTIVATION_JOURNAL_BYTES = 1024 * 1024
 RESTORE_PHASES = frozenset(
     {
@@ -33,6 +36,7 @@ RESTORE_PHASES = frozenset(
 )
 _TRANSACTION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_IMPORT_SEAL_NAME = re.compile(r"\.truenas-jbod-ui-import-seal-[A-Za-z0-9_-]{1,64}\Z")
 
 
 class SegmentedRestoreRecoveryRefused(ValueError):
@@ -299,10 +303,22 @@ def tree_matches(path: Path, record: Any) -> bool:
 
 
 def _read_private_json(path: Path, *, invalid: str, changed: str) -> tuple[Any, dict[str, Any]]:
-    """Read a bounded private single-link JSON file and its exact record."""
+    """Read a bounded private single-link JSON file and its exact record.
+
+    A FIFO, device or folder put in its place is refused without waiting: the
+    entry type is checked before the open, the open never blocks, and the
+    opened file is checked again (#1196).
+    """
+    entry = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+        # A symlink still reaches the O_NOFOLLOW open below and fails there.
+        raise ValueError(invalid)
     descriptor = os.open(
         path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
     )
     try:
         before = os.fstat(descriptor)
@@ -428,6 +444,63 @@ def import_seal_path(folder: Path, transaction_id: str) -> Path:
     writer of that folder can make recovery act on it (#1196).
     """
     return folder / f".truenas-jbod-ui-import-seal-{transaction_id}"
+
+
+def find_import_seals(folders: Iterable[Path]) -> list[dict[str, Any]]:
+    """Name the restore folder records present in ``folders``, opening none.
+
+    ``folders`` must come from the application's own settings, never from the
+    history volume. Only those folders are listed, one level deep. A record
+    is matched by its exact name; a folder that exists but cannot be listed
+    is reported as unreadable, because its records are unknown (#1196).
+    """
+    found: list[dict[str, Any]] = []
+    for folder in folders:
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if _IMPORT_SEAL_NAME.fullmatch(entry.name) is None:
+                        continue
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    found.append(
+                        {
+                            "folder": str(folder),
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "unreadable": False,
+                        }
+                    )
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            found.append({"folder": str(folder), "device": None, "inode": None, "unreadable": True})
+    return found
+
+
+def configuration_recovery_incomplete(
+    unsettled: Sequence[dict[str, Any]],
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    """The receipt for records recovery found but did not settle; nothing changed."""
+    return {
+        "apply": apply,
+        "recovery_state": CONFIGURATION_RECOVERY_INCOMPLETE,
+        "folders": sorted({item["folder"] for item in unsettled}),
+        "unreadable_folders": sorted(
+            {item["folder"] for item in unsettled if item["unreadable"]}
+        ),
+        "message": (
+            "Configuration recovery is incomplete: the listed configuration folders "
+            "hold restore records that this recovery did not settle, so an "
+            "interrupted restore may have left configuration and history from "
+            "different generations. Recovery changed nothing. Review those folders "
+            "before removing the records."
+        ),
+    }
 
 
 def replace_restore_journal(
@@ -1066,7 +1139,17 @@ def recover_segmented_restore(
     journal: dict[str, Any],
     journal_record: dict[str, Any],
     apply: bool,
+    configuration_records: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
+    """Recover one segmented restore journal.
+
+    ``configuration_records`` are the restore records found, by name only,
+    in the configuration folders the application's own settings name (see
+    ``find_import_seals``). If any of them is not one this recovery settles,
+    recovery changes nothing and returns ``configuration-recovery-incomplete``:
+    the journal may have been edited, downgraded or replaced, and a whole
+    generation must not be reported while such a record remains (#1196).
+    """
     if journal.get("operation") != "segmented-restore":
         raise ValueError("Segmented restore journal is invalid.")
     source = source.absolute()
@@ -1082,6 +1165,18 @@ def recover_segmented_restore(
         source=source,
         segments_directory=segments_directory,
     )
+    settled = {
+        (folder_record["record"]["device"], folder_record["record"]["inode"])
+        for folder_record in folder_records
+    }
+    unsettled = [
+        item
+        for item in configuration_records
+        if item["unreadable"] or (item["device"], item["inode"]) not in settled
+    ]
+    if unsettled:
+        # The find authorizes nothing: it only stops a success report.
+        return configuration_recovery_incomplete(unsettled, apply=apply)
     prior_hot = paths["prior_hot"]
     candidate_hot = paths["candidate_hot"]
     prior_segments = paths["prior_segments"]

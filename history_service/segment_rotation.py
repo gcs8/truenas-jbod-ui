@@ -28,6 +28,8 @@ from history_service.segment_migration import (
 )
 from history_service.segment_reader import MAX_SEGMENTS_PER_QUERY, SegmentedHistoryReader
 from history_service.segmented_restore import (
+    configuration_recovery_incomplete,
+    find_import_seals,
     read_activation_journal,
     recover_segmented_restore,
 )
@@ -837,9 +839,23 @@ def _recover_pending_rotation_locked(
     source = source.absolute()
     segments_directory = segments_directory.absolute()
     journal_path = activation_pending_path(source)
+    # A restore that also restores configuration leaves a record in each
+    # configuration folder it changes. Those folders come from the
+    # application's own settings, never from the history volume, so a journal
+    # that was edited, removed or broken there cannot hide such a record. A
+    # record this recovery does not settle authorizes no change; it only
+    # stops a success report (#1196).
+    from history_service.system_backup import restore_configuration_folders
+
+    configuration_records = find_import_seals(restore_configuration_folders())
     journal_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
     if path_entry_exists(journal_path):
-        journal_pair = read_activation_journal(journal_path)
+        try:
+            journal_pair = read_activation_journal(journal_path)
+        except (OSError, ValueError):
+            if configuration_records:
+                return configuration_recovery_incomplete(configuration_records, apply=apply)
+            raise
         if journal_pair[0].get("operation") == "segmented-restore":
             return recover_segmented_restore(
                 source=source,
@@ -848,8 +864,11 @@ def _recover_pending_rotation_locked(
                 journal=journal_pair[0],
                 journal_record=journal_pair[1],
                 apply=apply,
+                configuration_records=configuration_records,
             )
         journal_pair = None
+    if configuration_records:
+        return configuration_recovery_incomplete(configuration_records, apply=apply)
     segments_directory = _require_output_directory(segments_directory)
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)

@@ -9,10 +9,16 @@ temporary directory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import select
 import shutil
+import signal
 import sqlite3
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -25,7 +31,12 @@ from history_service import segment_migration
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
-from history_service.segmented_restore import import_seal_path
+from history_service.segmented_restore import (
+    IMPORT_SEAL_PURPOSE,
+    import_seal_path,
+    read_activation_journal,
+    write_restore_journal,
+)
 from history_service.segmented_restore import record_file as record_restore_file
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
@@ -47,6 +58,26 @@ CRASH_EXIT = 23
 FINISHED_EXIT = 24
 UNEXPECTED_EXIT = 25
 _ORIGINAL_RMTREE = shutil.rmtree
+REPOSITORY = Path(__file__).resolve().parents[1]
+RECOVERY_COMMAND = REPOSITORY / "scripts" / "rotate_segmented_history.py"
+INCOMPLETE_STATE = "configuration-recovery-incomplete"
+INCOMPLETE_EXIT = 3
+BOUNDED_SECONDS = 15.0
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, str | None]]:
+    """Every entry under ``root`` with its type and, for files, its digest."""
+    snapshot: dict[str, tuple[str, str | None]] = {}
+    for path in sorted(root.rglob("*")):
+        metadata = os.lstat(path)
+        if stat.S_ISREG(metadata.st_mode):
+            entry = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+        elif stat.S_ISDIR(metadata.st_mode):
+            entry = ("directory", None)
+        else:
+            entry = ("other", None)
+        snapshot[str(path.relative_to(root))] = entry
+    return snapshot
 
 
 class _FixedSettingsBackupService(SystemBackupService):
@@ -304,12 +335,90 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                     leftovers.append(str(path.relative_to(target.root)))
         return sorted(leftovers)
 
+    @staticmethod
+    def _config_path(target: _Deployment) -> str:
+        return str(target.runtime.parent / "config.yaml")
+
     def _recover(self, target: _Deployment, *, apply: bool = True) -> dict[str, Any]:
-        return recover_pending_rotation(
-            source=target.hot,
-            segments_directory=target.segments,
-            apply=apply,
+        # Recovery finds the configuration folders from the application's own
+        # settings, as the admin service would, never from the history volume.
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": self._config_path(target)}):
+            return recover_pending_rotation(
+                source=target.hot,
+                segments_directory=target.segments,
+                apply=apply,
+            )
+
+    def _recover_with_command(
+        self,
+        target: _Deployment,
+        *,
+        apply: bool,
+    ) -> tuple[int, dict[str, Any] | None, str]:
+        """Run the documented recovery command; return exit code, receipt, stderr."""
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment.update(
+            PYTHONDONTWRITEBYTECODE="1",
+            APP_CONFIG_PATH=self._config_path(target),
         )
+        command = [
+            sys.executable,
+            str(RECOVERY_COMMAND),
+            "--source",
+            str(target.hot),
+            "--segments-dir",
+            str(target.segments),
+            "--recover",
+        ]
+        if apply:
+            command.append("--apply")
+        completed = subprocess.run(
+            command,
+            cwd=REPOSITORY,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        receipt = json.loads(completed.stdout) if completed.stdout.strip() else None
+        return completed.returncode, receipt, completed.stderr
+
+    def _run_in_bounded_child(self, action: Callable[[], Any]) -> dict[str, Any]:
+        """Run ``action`` in a forked child; fail if it does not return in time."""
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - runs only in the child
+            os.close(read_end)
+            try:
+                try:
+                    outcome: dict[str, Any] = {"result": action()}
+                except Exception as exc:
+                    outcome = {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "reason": getattr(exc, "reason", None),
+                        "cause": str(exc.__cause__) if exc.__cause__ else None,
+                    }
+                os.write(write_end, json.dumps(outcome, default=str).encode("utf-8"))
+            finally:
+                os._exit(FINISHED_EXIT)
+        os.close(write_end)
+        try:
+            ready, _, _ = select.select([read_end], [], [], BOUNDED_SECONDS)
+            if not ready:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail(f"recovery did not return within {BOUNDED_SECONDS:g} seconds")
+            chunks = []
+            while chunk := os.read(read_end, 65536):
+                chunks.append(chunk)
+        finally:
+            os.close(read_end)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), FINISHED_EXIT)
+        return json.loads(b"".join(chunks))
 
     def _assert_one_generation(
         self,
@@ -998,6 +1107,293 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                     self._assert_one_generation(target, result, label=label),
                     expected,
                 )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_folder_record_that_names_another_folder(self) -> None:
+        cases = ("folder field changed", "copied from a third folder")
+        for label in cases:
+            with self.subTest(record=label):
+                target = self._target(f"target-{cases.index(label)}")
+                marker = self._crash_before_history(target)
+                original_journal = marker.read_bytes()
+                journal = json.loads(original_journal)
+                transaction_id = journal["transaction_id"]
+                anchor_path = import_seal_path(target.runtime.parent, transaction_id)
+                record_path = import_seal_path(target.mapping.parent, transaction_id)
+                original_anchor = anchor_path.read_bytes()
+                original_record = record_path.read_bytes()
+                third = target.root / "third"
+                if label == "folder field changed":
+                    # Only the record's own-folder field is wrong.
+                    record = json.loads(original_record)
+                    record["folder"] = str(target.runtime.parent)
+                    record_path.write_bytes(json.dumps(record).encode("utf-8"))
+                else:
+                    # A third listed folder holds an empty record (legitimate
+                    # before anything there is staged). Copied over the data
+                    # folder's record, it shares the anchor and would make
+                    # recovery skip the data folder's restored files.
+                    third.mkdir()
+                    metadata = third.stat()
+                    anchor = json.loads(original_anchor)
+                    anchor["folders"].append(
+                        {"path": str(third), "device": metadata.st_dev, "inode": metadata.st_ino}
+                    )
+                    anchor_path.write_bytes(json.dumps(anchor).encode("utf-8"))
+                    write_restore_journal(
+                        import_seal_path(third, transaction_id),
+                        {
+                            "purpose": IMPORT_SEAL_PURPOSE,
+                            "transaction_id": transaction_id,
+                            "folder": str(third),
+                            "anchor": str(target.runtime.parent),
+                            "targets": [],
+                        },
+                    )
+                    record_path.write_bytes(import_seal_path(third, transaction_id).read_bytes())
+                    journal["targets"] = [
+                        item
+                        for item in journal["targets"]
+                        if Path(item["path"]).parent != target.mapping.parent
+                    ]
+                    marker.write_bytes(json.dumps(journal, sort_keys=True).encode("utf-8"))
+
+                self._assert_refused_and_unchanged(target, "configuration-target-unsealed")
+
+                # Control: the records and journal the restore wrote recover.
+                record_path.write_bytes(original_record)
+                anchor_path.write_bytes(original_anchor)
+                marker.write_bytes(original_journal)
+                if third.exists():
+                    import_seal_path(third, transaction_id).unlink()
+                    third.rmdir()
+                result = self._recover(target)
+                self.assertEqual(
+                    self._assert_one_generation(target, result, label=f"{label} control"),
+                    "prior",
+                )
+
+    # A FIFO, device or folder in place of a record must not stall recovery --
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_recovery_does_not_block_on_a_fifo_in_place_of_a_record_or_journal(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        transaction_id = json.loads(marker.read_bytes())["transaction_id"]
+        record_path = import_seal_path(target.mapping.parent, transaction_id)
+        original_record = record_path.read_bytes()
+        record_path.unlink()
+        os.mkfifo(record_path, 0o600)
+        before = _tree_snapshot(target.root)
+        for apply in (False, True):
+            with self.subTest(fifo="folder record", apply=apply):
+                outcome = self._run_in_bounded_child(
+                    lambda apply=apply: self._recover(target, apply=apply)
+                )
+                self.assertEqual(outcome.get("reason"), "configuration-target-unsealed", outcome)
+                self.assertEqual(outcome.get("cause"), "Restore folder record is invalid.")
+                self.assertEqual(_tree_snapshot(target.root), before)
+        record_path.unlink()
+        record_path.write_bytes(original_record)
+        record_path.chmod(0o600)
+
+        # The journal reader shares the same bounded open.
+        original_journal = marker.read_bytes()
+        marker.unlink()
+        os.mkfifo(marker, 0o600)
+        with self.subTest(fifo="journal"):
+            outcome = self._run_in_bounded_child(lambda: read_activation_journal(marker))
+            self.assertEqual(outcome.get("error"), "History activation journal is invalid.", outcome)
+        with self.subTest(fifo="journal", path="public recovery"):
+            before = _tree_snapshot(target.root)
+            outcome = self._run_in_bounded_child(lambda: self._recover(target, apply=True))
+            self.assertEqual(outcome.get("result", {}).get("recovery_state"), INCOMPLETE_STATE, outcome)
+            self.assertEqual(_tree_snapshot(target.root), before)
+        marker.unlink()
+        marker.write_bytes(original_journal)
+        marker.chmod(0o600)
+
+        # Control: the restored record and journal recover normally.
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="fifo control"),
+            "prior",
+        )
+
+    # Records the journal no longer names (journal edited, removed or broken) -
+
+    def _crash_mid_configuration(self, target: _Deployment) -> None:
+        original_activate = _ImportActivationTransaction._activate_journaled_file
+
+        def activate_one_then_exit(transaction: Any, *args: Any, **kwargs: Any) -> None:
+            original_activate(transaction, *args, **kwargs)
+            os._exit(CRASH_EXIT)
+
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(
+                    _ImportActivationTransaction,
+                    "_activate_journaled_file",
+                    activate_one_then_exit,
+                )
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        self.assertEqual(self._history_generation(target), "prior")
+        self.assertTrue(self._config_generation(target).startswith("mixed"))
+
+    def _crash_mid_rollback(self, target: _Deployment) -> None:
+        original_restore = _ImportActivationTransaction._restore_target
+
+        def fail_commit(_transaction: Any) -> None:
+            raise RuntimeError("synthetic failure after every target was activated")
+
+        def restore_one_then_exit(transaction: Any, entry: Any) -> None:
+            original_restore(transaction, entry)
+            os._exit(CRASH_EXIT)
+
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(_ImportActivationTransaction, "commit", fail_commit),
+                patch.object(_ImportActivationTransaction, "_restore_target", restore_one_then_exit),
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        self.assertEqual(self._history_generation(target), "candidate")
+        self.assertTrue(self._config_generation(target).startswith("mixed"))
+
+    @staticmethod
+    def _record_folders(target: _Deployment) -> list[str]:
+        return sorted(
+            {
+                str(path.parent)
+                for path in target.root.rglob(".truenas-jbod-ui-import-seal-*")
+                if ".next-" not in path.name
+            }
+        )
+
+    @staticmethod
+    def _edit_journal(target: _Deployment, edit: str, *, decision: str) -> None:
+        """Change only the history volume, as a writer of that volume could."""
+        marker = activation_pending_path(target.hot)
+        journal = json.loads(marker.read_bytes())
+        if edit == "version 1":
+            journal["journal_version"] = 1
+            journal.pop("targets")
+            journal.pop("anchor")
+        elif edit == "deleted":
+            marker.unlink()
+            return
+        elif edit == "corrupt":
+            marker.write_bytes(b"{broken")
+            return
+        elif edit == "empty version 2 anchor":
+            folder = target.hot.parent
+            metadata = folder.stat()
+            identity = {"path": str(folder), "device": metadata.st_dev, "inode": metadata.st_ino}
+            write_restore_journal(
+                import_seal_path(folder, journal["transaction_id"]),
+                {
+                    "purpose": IMPORT_SEAL_PURPOSE,
+                    "transaction_id": journal["transaction_id"],
+                    "folder": str(folder),
+                    "anchor": str(folder),
+                    "folders": [identity],
+                    "decision": decision,
+                    "targets": [],
+                },
+            )
+            journal["targets"] = []
+            journal["anchor"] = identity
+        else:
+            raise AssertionError(edit)
+        marker.write_bytes(json.dumps(journal, sort_keys=True).encode("utf-8"))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_command_reports_records_an_edited_journal_leaves_behind(self) -> None:
+        scenarios = (
+            ("mid-configuration", self._crash_mid_configuration, "pending"),
+            ("mid-rollback", self._crash_mid_rollback, "commit"),
+        )
+        edits = ("version 1", "deleted", "corrupt", "empty version 2 anchor")
+        for scenario, crash, decision in scenarios:
+            for edit in edits:
+                with self.subTest(scenario=scenario, edit=edit):
+                    target = self._target(f"target-{scenario}-{edit.replace(' ', '-')}")
+                    crash(target)
+                    record_folders = [
+                        folder
+                        for folder in self._record_folders(target)
+                        if folder != str(target.hot.parent)
+                    ]
+                    self.assertTrue(record_folders)
+                    self._edit_journal(target, edit, decision=decision)
+                    before = _tree_snapshot(target.root)
+                    for apply in (False, True):
+                        exit_code, receipt, stderr = self._recover_with_command(
+                            target,
+                            apply=apply,
+                        )
+                        self.assertEqual(
+                            (exit_code, (receipt or {}).get("recovery_state")),
+                            (INCOMPLETE_EXIT, INCOMPLETE_STATE),
+                            f"apply={apply}: {stderr[-400:]}",
+                        )
+                        assert receipt is not None
+                        self.assertEqual(receipt["folders"], record_folders)
+                        self.assertEqual(receipt["apply"], apply)
+                        self.assertEqual(_tree_snapshot(target.root), before)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_command_reports_success_when_no_record_is_left(self) -> None:
+        for scenario, crash in (
+            ("mid-configuration", self._crash_mid_configuration),
+            ("mid-rollback", self._crash_mid_rollback),
+        ):
+            with self.subTest(scenario=scenario):
+                target = self._target(f"target-{scenario}")
+                crash(target)
+                exit_code, receipt, stderr = self._recover_with_command(target, apply=False)
+                self.assertEqual(exit_code, 0, stderr[-400:])
+                assert receipt is not None
+                self.assertEqual(receipt["recovery_state"], "prior-generation-ready-to-restore")
+                exit_code, receipt, stderr = self._recover_with_command(target, apply=True)
+                self.assertEqual(exit_code, 0, stderr[-400:])
+                assert receipt is not None
+                self._assert_one_generation(target, receipt, label=scenario)
+                self.assertEqual(self._record_folders(target), [])
+                # Nothing is pending and no record is left: the usual refusal.
+                exit_code, receipt, stderr = self._recover_with_command(target, apply=True)
+                self.assertEqual((exit_code, receipt), (1, None))
+                self.assertIn("Segment rotation recovery is not pending.", stderr)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_reports_a_record_of_another_restore_and_changes_nothing(self) -> None:
+        target = self._target()
+        marker = self._crash_before_history(target)
+        transaction_id = json.loads(marker.read_bytes())["transaction_id"]
+        # A record that this recovery does not settle: another transaction's,
+        # left in a configuration folder the application knows about.
+        stale = import_seal_path(target.mapping.parent, "an-earlier-restore")
+        stale.write_bytes(import_seal_path(target.mapping.parent, transaction_id).read_bytes())
+        stale.chmod(0o600)
+        before = _tree_snapshot(target.root)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result = self._recover(target, apply=apply)
+                self.assertEqual(result["recovery_state"], INCOMPLETE_STATE)
+                self.assertEqual(result["folders"], [str(target.mapping.parent)])
+                self.assertEqual(_tree_snapshot(target.root), before)
+
+        stale.unlink()
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
 
 
 if __name__ == "__main__":
