@@ -86,6 +86,9 @@ Segmented history is an advanced opt-in. Ignore its tools unless you set
 
 ## Admin UI
 
+Reload any admin page that was open before the upgrade: an older page can show
+a clean-up whose answer did not arrive as "Deleted 0 copies."
+
 The published Compose files set `ADMIN_AUTO_STOP_SECONDS=3600`, so the admin UI
 stops itself an hour after it starts, and a plain `docker compose up -d` does
 not bring it back. Start it again with:

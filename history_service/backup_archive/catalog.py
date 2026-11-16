@@ -579,7 +579,12 @@ class ArtifactCatalog:
             if protect_newest_verified and _newest_verified_id(
                 connection, current.backup_class, current.location
             ) == current.artifact_id:
-                raise CatalogError("Artifact is the newest verified copy.")
+                # The flag is the last completed check, which can be a size or
+                # provider-checksum check at upload; say no more than that (#1202).
+                raise CatalogError(
+                    "Artifact is the newest copy of its class at this location that passed its last "
+                    "completed check (the upload check or a later Verify), so it is kept."
+                )
             connection.execute(
                 "UPDATE artifacts SET deletion_claimed_at = ?, deletion_claimed_by = ? "
                 "WHERE artifact_id = ?",

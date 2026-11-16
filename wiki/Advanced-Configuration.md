@@ -424,7 +424,8 @@ short-term set; the value must be at least `1`.
 
 When the optional backup scheduler is enabled, its daily FULL archives gradually
 replace this duplicate set only when they include `history_db`, remain present
-locally and are catalogued as verified. During cutover, usable local FULLs and
+locally, are catalogued as verified and still match their catalogued size and
+SHA-256 when the scheduler re-reads them. During cutover, usable local FULLs and
 retained history snapshots together provide at least the existing 14-copy floor;
 one first FULL therefore leaves 13 sidecar snapshots rather than collapsing the
 set to one copy. The scheduler removes only the oldest excess snapshot each time

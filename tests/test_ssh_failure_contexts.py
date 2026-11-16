@@ -154,6 +154,23 @@ class SSHCommandFailureContextTests(unittest.TestCase):
                     },
                 )
 
+    def test_unnumbered_mprutil_reads_name_the_unnumbered_controller(self) -> None:
+        for subcommand, _label in MPRUTIL_UNIT_LABELS:
+            with self.subTest(subcommand=subcommand):
+                self.assertEqual(
+                    InventoryService._ssh_command_failure_context(f"mprutil show {subcommand}"),
+                    {
+                        "context": "sas_fabric_mprutil",
+                        "context_label": "mprutil topology evidence",
+                        "controller": "mpr",
+                        "criticality": "topology",
+                    },
+                )
+        # Control: only those six reads name it; the shared table entry is not edited.
+        for command in ("mprutil show adapters", "mprutil show anything-else", "mprutil show adapter extra"):
+            with self.subTest(command=command):
+                self.assertNotIn("controller", InventoryService._ssh_command_failure_context(command))
+
     def test_an_unlisted_mprutil_subcommand_falls_back_to_its_own_name(self) -> None:
         self.assertEqual(
             InventoryService._ssh_command_failure_context("mprutil -u 0 show phys"),

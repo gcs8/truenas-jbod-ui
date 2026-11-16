@@ -514,11 +514,55 @@ def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
     return cdb_bytes, None
 
 
+# Kernel text reaches the decoder unvalidated, so a malformed message must be
+# rejected or decoded with bounded work (#1216). The decoder finds the literal
+# "CDB:" separator first and looks for the operation name only in a short window
+# before it; the match is then the decoder's own pattern, anchored at that
+# operation. A kernel operation name is a few dozen characters, and the longest
+# CDB (260 bytes, variable length) is 779 characters as spaced hex pairs. A
+# message whose operation, or whose run of CDB bytes, does not end inside its
+# window is not decoded. Text after the bytes is not limited.
+CDB_SEPARATOR = "CDB:"
+MAX_CDB_OPERATION_WINDOW_CHARS = 96
+MAX_CDB_TEXT_CHARS = 1024
+_CDB_MESSAGE_PATTERN = re.compile(
+    r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)"
+)
+_CDB_OPERATION_PATTERN = re.compile(r"[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?\.\s+\Z")
+# Every character an operation name, its period and the whitespace before
+# "CDB:" can hold.
+_CDB_OPERATION_SPAN = re.compile(r"[A-Z0-9 _/().\s-]+")
+# The run of two-digit byte tokens the tokenizer reads before it stops.
+_CDB_BYTE_RUN = re.compile(r"[0-9a-fA-F]{2}(?:\s+[0-9a-fA-F]{2})*(?!\S)")
+
+
+def _find_cdb_message(message: str) -> re.Match[str] | None:
+    """The decoder pattern's first match in `message`, found with linear work."""
+
+    separator = message.find(CDB_SEPARATOR)
+    while separator >= 0:
+        window_start = max(0, separator - MAX_CDB_OPERATION_WINDOW_CHARS)
+        if window_start > 0 and _CDB_OPERATION_SPAN.fullmatch(message, window_start - 1, separator):
+            # An operation that ends at this separator may start before the window.
+            return None
+        operation = _CDB_OPERATION_PATTERN.search(message, window_start, separator)
+        match = _CDB_MESSAGE_PATTERN.match(message, operation.start()) if operation else None
+        if match is not None:
+            text_end = separator + len(CDB_SEPARATOR) + MAX_CDB_TEXT_CHARS
+            if match.start("cdb") >= text_end:
+                # Separator whitespace fills the window: any bytes lie beyond it.
+                return None
+            byte_run = _CDB_BYTE_RUN.match(message, match.start("cdb"), match.end("cdb"))
+            if byte_run is not None and byte_run.end() > text_end:
+                # The CDB bytes do not end inside the window.
+                return None
+            return match
+        separator = message.find(CDB_SEPARATOR, separator + 1)
+    return None
+
+
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
-    match = re.search(
-        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)",
-        message,
-    )
+    match = _find_cdb_message(message)
     if not match:
         return {}
     cdb_bytes, malformed_raw = _split_cdb_tokens(match.group("cdb"))
