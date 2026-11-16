@@ -7,12 +7,14 @@ Valid payloads are the controls: they still produce the same readings.
 """
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from app.config import SystemConfig
+from app.config import Settings, SystemConfig
 from app.models.domain import SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
 from app.services.parsers import (
@@ -1113,6 +1115,184 @@ class NegativePowerOnTimeTests(unittest.TestCase):
         read = _summary({"power_on_time": {"hours": 100}})
         merged = InventoryService._merge_missing_smart_fields(refused, read)
         self.assertEqual((merged.power_on_hours, merged.power_on_days, merged.unread_fields), (100, 4, []))
+
+    def test_fallback_for_a_refused_power_on_time_says_it_was_not_read(self) -> None:
+        summary = self._quantastor(powerOnHours=-1)
+        self.assertFalse(summary.available)
+        self.assertEqual(
+            summary.message,
+            "QuantaStor reports this disk but no SMART counters. Its power-on time was reported but not read.",
+        )
+
+    def test_fallback_without_a_refusal_keeps_its_message(self) -> None:
+        for disk in ({}, {"smartHealthTest": None}):
+            with self.subTest(disk=disk):
+                summary = self._quantastor(**disk)
+                self.assertEqual(
+                    (summary.message, summary.unread_fields),
+                    ("QuantaStor reports this disk but no SMART counters.", []),
+                )
+
+
+class RefusedPowerOnStoreTests(unittest.TestCase):
+    """A refused power-on time survives the slot-detail store and every stored reader.
+
+    The refusal is written down as the lifetime names in ``unread_fields``; it
+    replaces the last-good lifetime the way a reading does, and a later real
+    reading clears it. Every reader that rebuilds a summary from the store,
+    including the one used while the layout cannot be resolved, refuses a
+    stored negative power-on time.
+    """
+
+    UNREAD = ["power_on_days", "power_on_hours"]
+    SERIAL = "SYNTHETIC-SERIAL"
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "slot-details.json"
+
+    def _slot(self, **disk: object) -> SlotView:
+        return SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="enc-1",
+                        present=True, serial=self.SERIAL, raw_status={"disk_raw": disk})
+
+    def _service(self) -> InventoryService:
+        # A fresh store object on the same file each time: nothing is shared in memory.
+        service = object.__new__(InventoryService)
+        service.system = SystemConfig(id="synthetic")
+        service.settings = Settings()
+        service.slot_detail_store = SlotDetailStore(str(self.path))
+        service._smart_cache = {}
+        service._smart_cache_until = {}
+        service._smart_negative_cache = {}
+        service._identity_unknown_slots = set()
+        service._observe_smart_summary_request = lambda _label: None
+        return service
+
+    def _write(self, **disk: object) -> SlotDetailCacheEntry:
+        service = self._service()
+        slot = self._slot(**disk)
+        summary = service._merge_smart_summary(slot, service._build_quantastor_smart_summary(slot))
+        entry = service._build_slot_detail_entry(slot, smart_summary=summary)
+        self.assertIsNotNone(entry)
+        service._persist_slot_detail_entries([entry])
+        return entry
+
+    def _store(self, smart_fields: dict) -> None:
+        SlotDetailStore(str(self.path)).save_entries([SlotDetailCacheEntry(
+            system_id="synthetic", enclosure_id="enc-1", slot=0, identifiers=[self.SERIAL],
+            slot_fields={"serial": self.SERIAL}, smart_fields=smart_fields,
+        )])
+
+    def _readers(self) -> dict[str, SmartSummaryView | None]:
+        return {
+            "rebuild": self._service()._build_persisted_smart_summary(self._slot()),
+            "no-layout": self._service().get_cached_slot_smart_summary_without_layout(0, "enc-1"),
+            "no-layout-batch": self._service().get_cached_slot_smart_summaries_without_layout(
+                [0, 1], "enc-1",
+            ).get(0),
+        }
+
+    def _lifetime(self, summary: SmartSummaryView | None) -> tuple:
+        self.assertIsNotNone(summary)
+        return summary.power_on_hours, summary.power_on_days, summary.unread_fields
+
+    def test_layout_unavailable_reader_refuses_a_stored_negative_power_on_time(self) -> None:
+        for fields, expected in (
+            ({"power_on_hours": -1, "power_on_days": -1}, (None, None, self.UNREAD)),
+            ({"power_on_hours": -1}, (None, None, ["power_on_hours"])),
+            ({"power_on_days": -1}, (None, None, ["power_on_days"])),
+        ):
+            self._store({"available": True, **fields})
+            for reader in ("no-layout", "no-layout-batch"):
+                with self.subTest(fields=fields, reader=reader):
+                    self.assertEqual(self._lifetime(self._readers()[reader]), expected)
+
+    def test_layout_unavailable_reader_keeps_real_and_zero_power_on_time(self) -> None:
+        for hours, days in ((0, 0), (48, 2), (321, 13)):
+            self._store({"available": True, "power_on_hours": hours, "power_on_days": days})
+            for reader in ("no-layout", "no-layout-batch"):
+                with self.subTest(hours=hours, reader=reader):
+                    self.assertEqual(self._lifetime(self._readers()[reader]), (hours, days, []))
+
+    def test_refused_power_on_time_beside_a_stable_field_is_written_and_read_back(self) -> None:
+        entry = self._write(smartHealthTest="PASSED", powerOnHours=-1, firmwareVersion="FW01")
+        self.assertEqual(entry.smart_fields,
+                         {"firmware_version": "FW01", "unread_fields": self.UNREAD, "available": True})
+        self.assertIsNotNone(entry.smart_updated_at)
+        self.assertFalse(entry.smart_stale)
+        for reader, summary in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(self._lifetime(summary), (None, None, self.UNREAD))
+                self.assertEqual(summary.firmware_version, "FW01")
+
+    def test_refused_power_on_time_alone_is_written_and_read_back(self) -> None:
+        entry = self._write(powerOnHours=-1)
+        self.assertEqual(entry.smart_fields, {"unread_fields": self.UNREAD, "available": False})
+        self.assertIsNotNone(entry.smart_updated_at)
+        for reader, summary in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(self._lifetime(summary), (None, None, self.UNREAD))
+
+    def test_a_real_reading_after_a_refusal_clears_the_stored_marker(self) -> None:
+        self._write(smartHealthTest="PASSED", powerOnHours=-1, firmwareVersion="FW01")
+        entry = self._write(smartHealthTest="PASSED", powerOnHours=100, firmwareVersion="FW01")
+        self.assertNotIn("unread_fields", entry.smart_fields)
+        for reader, summary in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(self._lifetime(summary), (100, 4, []))
+
+    def test_a_refusal_after_a_real_reading_replaces_the_stored_lifetime(self) -> None:
+        self._write(smartHealthTest="PASSED", powerOnHours=100, firmwareVersion="FW01")
+        entry = self._write(smartHealthTest="PASSED", powerOnHours=-1, firmwareVersion="FW01")
+        self.assertNotIn("power_on_hours", entry.smart_fields)
+        self.assertFalse(entry.smart_stale)
+        for reader, summary in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(self._lifetime(summary), (None, None, self.UNREAD))
+
+    def test_only_refused_lifetime_names_are_written(self) -> None:
+        slot = self._slot()
+        summary = SmartSummaryView(available=True, firmware_version="FW01", power_on_hours=48, power_on_days=2,
+                                   unread_fields=["power_on_hours", "temperature_c"])
+        entry = self._service()._build_slot_detail_entry(slot, smart_summary=summary)
+        self.assertNotIn("unread_fields", entry.smart_fields)
+        summary = SmartSummaryView(available=True, firmware_version="FW01",
+                                   unread_fields=["temperature_c", "power_on_hours"])
+        entry = self._service()._build_slot_detail_entry(slot, smart_summary=summary)
+        self.assertEqual(entry.smart_fields.get("unread_fields"), ["power_on_hours"])
+
+    def test_a_stored_name_with_a_real_value_beside_it_is_dropped(self) -> None:
+        self._store({"available": True, "power_on_hours": 48, "unread_fields": ["power_on_hours", "temperature_c"]})
+        # Only the layout-backed rebuild works out days from hours, as on main.
+        expected = {"rebuild": (48, 2, []), "no-layout": (48, None, []), "no-layout-batch": (48, None, [])}
+        for reader, summary in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(self._lifetime(summary), expected[reader])
+
+    def test_the_marker_survives_a_separate_process(self) -> None:
+        self._write(smartHealthTest="PASSED", powerOnHours=-1, firmwareVersion="FW01")
+        code = (
+            "import json, sys\n"
+            "from app.config import SystemConfig\n"
+            "from app.models.domain import SlotView\n"
+            "from app.services.inventory import InventoryService\n"
+            "from app.services.slot_detail_store import SlotDetailStore\n"
+            "service = object.__new__(InventoryService)\n"
+            "service.system = SystemConfig(id='synthetic')\n"
+            "service.slot_detail_store = SlotDetailStore(sys.argv[1])\n"
+            "slot = SlotView(slot=0, slot_label='00', row_index=0, column_index=0, enclosure_id='enc-1',"
+            " present=True, serial=sys.argv[2])\n"
+            "summary = service._build_persisted_smart_summary(slot)\n"
+            "print(json.dumps([summary.power_on_hours, summary.power_on_days, summary.unread_fields,"
+            " summary.firmware_version]))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(self.path), self.SERIAL],
+            cwd=str(Path(__file__).resolve().parents[1]), capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [None, None, self.UNREAD, "FW01"])
 
 
 if __name__ == "__main__":

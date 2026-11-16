@@ -149,8 +149,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   large integers in fields with no set range (hours, counters, sizes) are
   still published as reported. A reported but invalid logical block size no
   longer falls back to 512 bytes, and an invalid NVMe rotation rate is no
-  longer shown as SSD. A negative power-on time, from QuantaStor or from a
-  saved slot-detail entry, is not read either. Disk and storage-view details
+  longer shown as SSD. A power-on time that is a negative whole number after
+  the existing conversion, from QuantaStor or from a saved slot-detail entry,
+  is not read either; the saved slot-detail cache keeps that refusal, and a
+  QuantaStor disk that reports nothing else says its power-on time was not
+  read. Disk and storage-view details
   and the SMART tooltip (live and in the saved HTML copy), the live heat map
   tooltip and Storage
   Fabric show `not read` for such a field
@@ -162,7 +165,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   inputs not read" instead of 0 when none was read and nothing else scored.
   The history collector treats a temperature it cannot convert, or a value
   its database cannot store, as no sample instead of failing the pass. Stored
-  history, the saved slot-detail cache, the heat-map timeline and the per-row
+  history, the saved slot-detail cache (apart from a refused power-on time),
+  the heat-map timeline and the per-row
   SAS port and SATA PHY counters do not yet keep "not read" apart from absent
   (#1249).
 

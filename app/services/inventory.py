@@ -488,6 +488,7 @@ STABLE_SLOT_DETAIL_FIELDS = (
 # device_name is likewise a reusable alias.
 STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
 SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
+POWER_ON_FIELDS = ("power_on_days", "power_on_hours")
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -6311,7 +6312,7 @@ class InventoryService:
             return None
         return self._merge_smart_summary(
             slot_view,
-            self._refuse_negative_power_on(SmartSummaryView.model_validate(entry.smart_fields)),
+            self._stored_smart_summary(entry.smart_fields),
         )
 
     def _build_slot_detail_entry(
@@ -6367,6 +6368,11 @@ class InventoryService:
                 if self._slot_detail_field_missing(value):
                     continue
                 smart_fields[field_name] = value
+            # A refused lifetime is a read that happened: write its names down.
+            refused = [name for name in POWER_ON_FIELDS
+                       if name in smart_summary.unread_fields and getattr(smart_summary, name) is None]
+            if refused:
+                smart_fields["unread_fields"] = refused
             if smart_fields:
                 smart_fields["available"] = smart_summary.available
                 smart_updated_at = utcnow().isoformat()
@@ -7191,7 +7197,7 @@ class InventoryService:
             persisted = None
             if entry is not None and entry.smart_fields:
                 try:
-                    persisted = SmartSummaryView.model_validate(entry.smart_fields)
+                    persisted = self._stored_smart_summary(entry.smart_fields)
                 except (TypeError, ValueError):
                     pass
             if persisted is not None:
@@ -12601,7 +12607,8 @@ class InventoryService:
         ):
             fallback = self._fallback_smart_summary(
                 slot_view,
-                "QuantaStor reports this disk but no SMART counters.",
+                "QuantaStor reports this disk but no SMART counters."
+                + (" Its power-on time was reported but not read." if summary.unread_fields else ""),
             )
             fallback.unread_fields = summary.unread_fields
             return fallback
@@ -17870,9 +17877,17 @@ class InventoryService:
         return summary
 
     @staticmethod
+    def _stored_smart_summary(smart_fields: Mapping[str, Any]) -> SmartSummaryView:
+        """Rebuild a stored SMART half; only a refused lifetime is stored as not read."""
+        summary = SmartSummaryView.model_validate(smart_fields)
+        summary.unread_fields = [name for name in summary.unread_fields if name in POWER_ON_FIELDS]
+        InventoryService._prune_unread_smart_fields(summary)
+        return InventoryService._refuse_negative_power_on(summary)
+
+    @staticmethod
     def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:
         """A negative power-on time is not a reading: drop it and name it not read."""
-        for name in ("power_on_hours", "power_on_days"):
+        for name in POWER_ON_FIELDS:
             if (getattr(summary, name) or 0) < 0:
                 setattr(summary, name, None)
                 summary.unread_fields = sorted({*summary.unread_fields, name})
