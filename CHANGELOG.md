@@ -53,10 +53,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and UniFi GPIO lines, the SATA link-rate field, the `glabel status` label
   list and the `lsscsi -t` transport field rescan the same text. A
   `camcontrol devlist` row with many aliases, StorCLI output with many virtual
-  drives, an SSH command with many `sudo` options, and the enclosure sysfs map
-  read once for each SES device no longer cost the square of their size. The
-  work of each parser named here now grows linearly with its output, and
-  well-formed output parses as before. An operation name, CDB or sense line too
+  drives, an SSH command with many `sudo` options, the enclosure sysfs map
+  read once for each SES device, and the SES overlay that merged each SES
+  device into everything merged before it no longer cost the square of their
+  size. The work of each parser named here now grows linearly with its output,
+  and well-formed output parses as before. An operation name, CDB or sense line too
   long to be real, a CDB with no byte after `CDB:`, and a sense line with no
   sense key are not decoded; a StorCLI virtual drive without a decimal VD
   number is no longer given the physical drives of every VD; and a configured

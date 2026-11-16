@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import json
 import random
 import re
@@ -43,6 +44,8 @@ from app.services import parsers
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.parsers import (
     ParsedSSHData,
+    SESMapEnclosure,
+    SESMapSlot,
     canonicalize_ssh_command,
     normalize_device_name,
     normalize_text,
@@ -1309,6 +1312,404 @@ class SesOverlayHostSysfsTests(LinearGrowthAssertions):
         for bay, device in {0: "sda", 1: "sdb", 3: "sdd"}.items():
             self.assertEqual(overlay.ses_slot_candidates[bay].get("device_names"), [device])
         self.assertFalse(overlay.ses_slot_candidates[2].get("device_names"))
+
+
+# The SES enclosure merge and the host overlay loop as they were before the
+# overlay merged its devices once, kept as the reference for the tests below.
+def _reference_merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
+    for enclosure in enclosures:
+        parsers._tag_control_targets_with_reported_shelf(enclosure)
+    merged: dict[str, SESMapEnclosure] = {}
+    identity_enclosures: dict[str, SESMapEnclosure] = {}
+    slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
+    enclosure_ids: dict[str, str] = {}
+    ses_device_keys: dict[tuple[str | None, str], str] = {}
+
+    for enclosure in enclosures:
+        key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
+        if key is None and enclosure.ses_device:
+            key = ses_device_keys.get((enclosure.ssh_host, enclosure.ses_device))
+            if key is not None and (
+                enclosure.enclosure_id and merged[key].enclosure_id
+                and enclosure.enclosure_id != merged[key].enclosure_id
+            ):
+                key = None
+        if key is None and enclosure.ssh_host:
+            key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
+                        if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
+                                and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
+                        if parsers._ses_enclosures_share_identity(candidate, enclosure)), None)
+        if key is None:
+            key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
+            if key in merged:
+                key = f"{key}@{enclosure.ssh_host or 'local'}:{len(merged)}"
+            ses_devices = list(enclosure.ses_devices)
+            if enclosure.ses_device and enclosure.ses_device not in ses_devices:
+                ses_devices.append(enclosure.ses_device)
+            merged[key] = SESMapEnclosure(
+                ses_device=enclosure.ses_device,
+                ssh_host=enclosure.ssh_host,
+                ses_devices=ses_devices,
+                enclosure_id=enclosure.enclosure_id,
+                enclosure_name=enclosure.enclosure_name,
+                enclosure_label=enclosure.enclosure_label,
+                profile_id=enclosure.profile_id,
+                layout_rows=enclosure.layout_rows,
+                layout_columns=enclosure.layout_columns,
+                slot_layout=enclosure.slot_layout,
+                slots={},
+            )
+            slot_evidence[key] = []
+            identity_enclosures[key] = enclosure
+        target = merged[key]
+        target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
+        target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
+        target.ses_device = target.ses_device or enclosure.ses_device
+        for ses_device in [*enclosure.ses_devices, enclosure.ses_device]:
+            if ses_device and ses_device not in target.ses_devices:
+                target.ses_devices.append(ses_device)
+        for ses_device, count in enclosure.unplaced_sysfs_bindings_by_ses_device.items():
+            target.unplaced_sysfs_bindings_by_ses_device[ses_device] = (
+                target.unplaced_sysfs_bindings_by_ses_device.get(ses_device, 0) + count
+            )
+        target.enclosure_label = target.enclosure_label or enclosure.enclosure_label
+        target.profile_id = target.profile_id or enclosure.profile_id
+        target.layout_rows = target.layout_rows or enclosure.layout_rows
+        target.layout_columns = target.layout_columns or enclosure.layout_columns
+        target.slot_layout = target.slot_layout or enclosure.slot_layout
+        if target.enclosure_id:
+            enclosure_ids.setdefault(target.enclosure_id, key)
+        if enclosure.ses_device:
+            ses_device_keys.setdefault((enclosure.ssh_host, enclosure.ses_device), key)
+        slot_evidence[key].extend((slot, enclosure.ssh_host) for slot in enclosure.slots.values())
+
+        for slot in enclosure.unmapped_slots:
+            parsers._record_unmapped_ses_slot(target, slot)
+
+    for key, target in merged.items():
+        slots_by_element: list[SESMapSlot] = []
+        element_positions: dict[tuple[str | None, str, int], int] = {}
+        for slot, ssh_host in slot_evidence[key]:
+            ses_device = slot.ses_device or target.ses_device or ""
+            identity = (
+                (ssh_host, ses_device, slot.element_id)
+                if slot.element_id is not None
+                else None
+            )
+            if identity is None or identity not in element_positions:
+                if identity is not None:
+                    element_positions[identity] = len(slots_by_element)
+                slots_by_element.append(slot)
+                continue
+            parsers._merge_ses_slot_evidence(slots_by_element[element_positions[identity]], slot)
+
+        for slot in slots_by_element:
+            existing = target.slots.get(slot.slot_number)
+            if existing is None:
+                target.slots[slot.slot_number] = slot
+                continue
+            parsers._merge_ses_slot_evidence(existing, slot)
+
+    return list(merged.values())
+
+
+def _reference_host_overlay(slot_count: int, host: str, devices: list[str], results: list[SSHCommandResult]):  # noqa: ANN202
+    """The previous loop: each device's result merged into the overlay so far."""
+
+    by_command = {result.command: result for result in results}
+    sysfs = by_command.get(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
+    with mock.patch.object(parsers, "_merge_ses_enclosures", _reference_merge_ses_enclosures), mock.patch(
+        "app.services.inventory._merge_ses_enclosures", _reference_merge_ses_enclosures
+    ):
+        sysfs_slots = parsers.parse_enclosure_sysfs_map(sysfs.stdout) if sysfs and sysfs.ok and sysfs.stdout else {}
+        overlay, failures = ParsedSSHData(), []
+        for device in devices:
+            aes, ec, join = (
+                f"sudo -n /usr/bin/sg_ses -p aes {device}",
+                f"sudo -n /usr/bin/sg_ses -p ec {device}",
+                f"sudo -n /usr/bin/sg_ses --join --filter {device}",
+            )
+            aes_result = by_command.get(aes)
+            if aes_result is None or not aes_result.ok:
+                failures.append(device)
+                continue
+            outputs = {aes: aes_result.stdout}
+            outputs.update({command: by_command[command].stdout for command in (ec, join)
+                            if command in by_command and by_command[command].ok})
+            parsed = parse_ssh_outputs(outputs, slot_count, None, None, enclosure_sysfs_slots=sysfs_slots)
+            if not parsed.ses_enclosures:
+                continue
+            InventoryService._tag_ses_overlay(parsed, host)
+            overlay = InventoryService._merge_ses_overlay_data(overlay, parsed)
+    return overlay, failures
+
+
+_ENCLOSURE_ID_LINE = re.compile(r"(logical identifier \(hex\): )([0-9a-fA-F]+)")
+# Checked-in page sets: (file prefix, pages, sg name in the sysfs map, sysfs map).
+_SES_FIXTURE_SETS = (
+    ("scale_offset_1based", ("aes", "ec", "join"), "sg9", "scale_offset_1based_sysfs.txt"),
+    ("scale_offset_1based_invalid", ("aes",), "sg9", "scale_offset_1based_sysfs.txt"),
+    ("scale_md1280_sg1", ("aes", "ec", "join"), "sg1", "scale_md1280_sysfs.txt"),
+    ("scale_md1280_sg76", ("aes", "ec", "join"), "sg76", "scale_md1280_sysfs.txt"),
+    ("scale_sg26", ("aes", "ec"), "sg26", None),
+    ("scale_sg37", ("aes", "ec"), "sg37", None),
+    ("scale_shared_sata", ("aes",), "sg0", "scale_shared_sata_sysfs.txt"),
+)
+
+
+def _fixture_text(name: str) -> str:
+    return (_PARITY_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _generated_ses_host(rng: random.Random, size: int):  # noqa: ANN202
+    """SES devices on one host built from the checked-in page sets.
+
+    Each device reads one page set. Its enclosure identifier is the checked-in
+    one (the same set on two devices is one enclosure seen on two paths), one
+    shared by every device reading that set, one of its own, or absent. Some
+    devices return no AES page or an empty one.
+    """
+
+    devices, results, sysfs_lines = [], [], []
+    for index in range(size):
+        device = f"/dev/sg{100 + index}"
+        devices.append(device)
+        prefix, pages, sg_name, sysfs_name = rng.choice(_SES_FIXTURE_SETS)
+        identifier = rng.choice(("checked-in", "shared", "own", "absent"))
+        outcome = rng.choices(("pages", "aes failed", "aes empty"), weights=(8, 1, 1))[0]
+        for page in pages:
+            if page != "aes" and rng.random() < 0.3:
+                continue
+            text = _fixture_text(f"{prefix}_{page}.txt")
+            if identifier == "shared":
+                text = _ENCLOSURE_ID_LINE.sub(lambda match: match.group(1) + f"6{len(prefix):015x}", text)
+            elif identifier == "own":
+                text = _ENCLOSURE_ID_LINE.sub(lambda match: match.group(1) + f"7{index:015x}", text)
+            elif identifier == "absent":
+                text = _ENCLOSURE_ID_LINE.sub("", text)
+            ok = not (page == "aes" and outcome == "aes failed")
+            if page == "aes" and outcome == "aes empty":
+                text = ""
+            command = (
+                f"sudo -n /usr/bin/sg_ses --join --filter {device}"
+                if page == "join"
+                else f"sudo -n /usr/bin/sg_ses -p {page} {device}"
+            )
+            results.append(SSHCommandResult(
+                command=command, ok=ok, stdout=text if ok else "", stderr="" if ok else "failed", exit_code=0 if ok else 1
+            ))
+        if sysfs_name and rng.random() < 0.8:
+            for line in _fixture_text(sysfs_name).splitlines():
+                sysfs_lines.append(line.replace(f"|{sg_name} |", f"|sg{100 + index} |"))
+    results.append(SSHCommandResult(
+        command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout="".join(f"{line}\n" for line in sysfs_lines),
+        stderr="", exit_code=0,
+    ))
+    rng.shuffle(results)
+    return devices, results
+
+
+def _generated_enclosures(rng: random.Random) -> list[SESMapEnclosure]:
+    """Parsed-looking enclosures: shared, distinct and missing identifiers,
+    devices seen on two paths, and hosts with and without bay evidence."""
+
+    hosts = rng.choice((("host-a",), ("host-a", "host-b"), ("host-a", "host-b", "host-c"), ("host-a", None), (None,)))
+    identifiers = rng.choice(((None,), (None, "E1"), ("E1",), ("E1", "E2", None), tuple(f"E{i}" for i in range(5))))
+    devices = [f"/dev/sg{index}" for index in range(rng.randrange(1, 5))]
+    enclosures = []
+    for _ in range(rng.randrange(0, 9)):
+        device = rng.choice((*devices, None))
+        enclosure = SESMapEnclosure(
+            ses_device=device,
+            ses_devices=rng.choice(([], [device] if device else [], [rng.choice(devices)])),
+            enclosure_id=rng.choice(identifiers),
+            enclosure_name=rng.choice((None, "Front", "Rear")),
+            profile_id=rng.choice((None, "profile")),
+            layout_rows=rng.choice((None, 2)),
+            unplaced_sysfs_bindings_by_ses_device=rng.choice(({}, {device or "": 1})),
+            ssh_host=rng.choice(hosts),
+        )
+        for _ in range(rng.randrange(4)):
+            slot = SESMapSlot(
+                slot_number=rng.randrange(2),
+                element_id=rng.choice((None, 0, 1, 2, 3)),
+                ses_device=rng.choice((None, device)),
+                slot_number_source=rng.choice((None, "ses_element_id_fallback", "ses_device_slot_number")),
+                present=rng.choice((None, True, False)),
+                presence_source=rng.choice((None, "aes", "ec")),
+                device_names=rng.choice(([], ["sda"], ["sdb"])),
+                device_names_source=rng.choice((None, "enclosure_sysfs")),
+                sas_address=rng.choice((None, "0x10", "0x11", "0x11", "0x0")),
+                attached_sas_address=rng.choice((None, "0x20", "0x20", "0x21")),
+                serial=rng.choice((None, "S1", "S2")),
+                control_targets=[{"ses_device": device, "ses_element_id": rng.randrange(3)}] if device else [],
+            )
+            enclosure.slots.setdefault(slot.slot_number, slot)
+        for _ in range(rng.randrange(3)):
+            enclosure.unmapped_slots.append(
+                SESMapSlot(slot_number=-1, element_id=rng.randrange(6), ses_device=rng.choice((None, device)))
+            )
+        enclosures.append(enclosure)
+    return enclosures
+
+
+def _distinct_enclosures(size: int, *, one_device: bool = False) -> list[SESMapEnclosure]:
+    return [
+        SESMapEnclosure(
+            ses_device="/dev/sg0" if one_device else f"/dev/sg{index}",
+            enclosure_id=f"5{index:015x}",
+            ssh_host="host-a",
+        )
+        for index in range(size)
+    ]
+
+
+class SesOverlayMergeWorkTests(LinearGrowthAssertions):
+    def test_enclosure_merge_matches_the_previous_merge(self) -> None:
+        rng = random.Random(1216)
+        for case in range(3000):
+            enclosures = _generated_enclosures(rng)
+            expected = _reference_merge_ses_enclosures(copy.deepcopy(enclosures))
+            self.assertEqual(parsers._merge_ses_enclosures(copy.deepcopy(enclosures)), expected, case)
+
+    def test_a_record_joins_the_earliest_match_on_another_host(self) -> None:
+        def enclosure(host, device, *bays, enclosure_id=None):  # noqa: ANN001, ANN202
+            slots = {
+                slot: SESMapSlot(slot_number=slot, sas_address=address, attached_sas_address="0x20")
+                for slot, address in bays
+            }
+            return SESMapEnclosure(ses_device=device, enclosure_id=enclosure_id, ssh_host=host, slots=slots)
+
+        cases = {
+            # host-b is indexed first, but its match comes after host-c's.
+            "earliest across hosts": [
+                enclosure("host-b", "/dev/sg1", (0, "0x30")),
+                enclosure("host-c", "/dev/sg2", (0, "0x10")),
+                enclosure("host-b", "/dev/sg3", (1, "0x11")),
+                enclosure("host-a", "/dev/sg9", (0, "0x10"), (1, "0x11")),
+            ],
+            # The first match took another ID after it was indexed.
+            "identifier taken later": [
+                enclosure("host-b", "/dev/sg1", (0, "0x10")),
+                enclosure("host-b", "/dev/sg1", enclosure_id="E1"),
+                enclosure("host-c", "/dev/sg2", (1, "0x11")),
+                enclosure("host-a", "/dev/sg9", (0, "0x10"), (1, "0x11"), enclosure_id="E9"),
+            ],
+        }
+        for name, enclosures in cases.items():
+            with self.subTest(name):
+                merged = parsers._merge_ses_enclosures(copy.deepcopy(enclosures))
+                self.assertEqual(merged, _reference_merge_ses_enclosures(copy.deepcopy(enclosures)))
+                self.assertEqual(len(merged), 3 if name == "earliest across hosts" else 2)
+                self.assertEqual(next(item.ssh_host for item in merged if "/dev/sg9" in item.ses_devices), "host-c")
+
+    def test_slot_candidates_merged_in_place_match_merging_one_by_one(self) -> None:
+        rng = random.Random(926)
+
+        def candidate_map():  # noqa: ANN202
+            return {
+                rng.randrange(4): {
+                    "present": rng.choice((None, True, False)),
+                    "presence_source": rng.choice((None, "aes", "ec")),
+                    "device_names": rng.choice(([], ["sda"], ["sdb"])),
+                    "device_names_source": rng.choice((None, "enclosure_sysfs")),
+                    "identify_active": rng.choice((None, True, False)),
+                    "ses_targets": [
+                        {
+                            "ssh_host": "host-a",
+                            "ses_device": rng.choice(("/dev/sg0", "/dev/sg1")),
+                            "ses_element_id": rng.randrange(3),
+                            "ses_slot_number": rng.choice((None, 1)),
+                            **rng.choice(({}, {"enclosure_id": "E1"}, {"enclosure_id": "E2"})),
+                        }
+                        for _ in range(rng.randrange(4))
+                    ],
+                }
+                for _ in range(rng.randrange(4))
+            }
+
+        for case in range(1000):
+            maps = [candidate_map() for _ in range(rng.randrange(1, 7))]
+            expected: dict = {}
+            for item in copy.deepcopy(maps):
+                expected = parsers.merge_slot_candidate_maps(expected, item)
+            merged: dict = {}
+            index: dict = {}
+            for item in copy.deepcopy(maps):
+                parsers.merge_slot_candidate_maps(merged, item, index)
+            self.assertEqual(merged, expected, case)
+
+    def test_host_overlay_matches_the_previous_overlay(self) -> None:
+        rng = random.Random(1260)
+        for case in range(120):
+            devices, results = _generated_ses_host(rng, rng.randrange(1, 6))
+            slot_count = rng.choice((4, 60, 84))
+            expected, expected_failures = _reference_host_overlay(slot_count, "host-a", devices, copy.deepcopy(results))
+            overlay, failures = _fetch_overlay(_overlay_stub(slot_count), devices, copy.deepcopy(results))
+            self.assertEqual(overlay.ses_enclosures, expected.ses_enclosures, case)
+            self.assertEqual(overlay.ses_slot_candidates, expected.ses_slot_candidates, case)
+            self.assertEqual(overlay.ses_selected_meta, expected.ses_selected_meta, case)
+            self.assertEqual(len(failures), len(expected_failures), case)
+
+    def test_checked_in_pages_give_the_previous_overlay(self) -> None:
+        devices, results = [], []
+        sysfs = []
+        for index, (prefix, pages, sg_name, sysfs_name) in enumerate(_SES_FIXTURE_SETS * 2):
+            device = f"/dev/sg{200 + index}"
+            devices.append(device)
+            results.extend(_overlay_results([device], {page: _fixture_text(f"{prefix}_{page}.txt") for page in pages}, "")[:-1])
+            if sysfs_name:
+                sysfs.extend(line.replace(f"|{sg_name} |", f"|sg{200 + index} |")
+                             for line in _fixture_text(sysfs_name).splitlines())
+        results.append(SSHCommandResult(
+            command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout="\n".join(sysfs) + "\n", stderr="", exit_code=0
+        ))
+        expected, _ = _reference_host_overlay(84, "host-a", devices, copy.deepcopy(results))
+        overlay, failures = _fetch_overlay(_overlay_stub(84), devices, results)
+        self.assertEqual(failures, [])
+        # Each checked-in set is one enclosure read on two paths.
+        self.assertEqual(len(overlay.ses_enclosures), 6)
+        self.assertEqual(overlay.ses_enclosures, expected.ses_enclosures)
+        self.assertEqual(overlay.ses_slot_candidates, expected.ses_slot_candidates)
+        self.assertEqual(overlay.ses_selected_meta, expected.ses_selected_meta)
+
+    def test_many_ses_devices_have_linear_merge_work(self) -> None:
+        aes = _fixture_text("scale_offset_1based_aes.txt")
+        sysfs_line = _fixture_text("scale_offset_1based_sysfs.txt").splitlines()[0]
+
+        def build(size: int):  # noqa: ANN202
+            devices = [f"/dev/sg{index}" for index in range(size)]
+            pages = {
+                device: _ENCLOSURE_ID_LINE.sub(lambda match: match.group(1) + f"7{index:015x}", aes)
+                for index, device in enumerate(devices)
+            }
+            results = [
+                SSHCommandResult(command=f"sudo -n /usr/bin/sg_ses -p aes {device}", ok=True, stdout=text,
+                                 stderr="", exit_code=0)
+                for device, text in pages.items()
+            ]
+            sysfs = "".join(sysfs_line.replace("|sg9 |", f"|sg{index} |") + "\n" for index in range(size))
+            results.append(SSHCommandResult(command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout=sysfs,
+                                            stderr="", exit_code=0))
+            return devices, results
+
+        stub = _overlay_stub(4)
+        devices, results = build(8)
+        overlay, failures = _fetch_overlay(stub, devices, results)
+        self.assertEqual(failures, [])
+        self.assertEqual([enclosure.ses_device for enclosure in overlay.ses_enclosures], devices)
+        self.assert_linear_growth(lambda built: _fetch_overlay(stub, *built), build, size=256)
+
+    def test_many_distinct_enclosures_have_linear_merge_work(self) -> None:
+        for one_device in (False, True):
+            with self.subTest(one_device=one_device):
+                merged = parsers._merge_ses_enclosures(_distinct_enclosures(5, one_device=one_device))
+                self.assertEqual(len(merged), 5)
+                self.assert_linear_growth(
+                    parsers._merge_ses_enclosures,
+                    lambda size: _distinct_enclosures(size, one_device=one_device),
+                    size=1500,
+                )
 
 
 # --- Every pattern in the parser modules -------------------------------------

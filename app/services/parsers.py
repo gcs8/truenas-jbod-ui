@@ -2356,6 +2356,9 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
     slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
     enclosure_ids: dict[str, str] = {}
     ses_device_keys: dict[tuple[str | None, str], str] = {}
+    # Identity candidates by host, with their order (#1216).
+    host_candidate_keys: dict[str | None, list[str]] = {}
+    candidate_positions: dict[str, int] = {}
 
     for enclosure in enclosures:
         key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
@@ -2367,10 +2370,20 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             ):
                 key = None
         if key is None and enclosure.ssh_host:
-            key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
-                        if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
-                                and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
-                        if _ses_enclosures_share_identity(candidate, enclosure)), None)
+            # Only a candidate on another host can match: on this host it would
+            # share the ID or be the device's first record, both looked up above.
+            matches = [
+                match
+                for candidate_host, candidate_keys in host_candidate_keys.items()
+                if candidate_host != enclosure.ssh_host
+                for match in [next((candidate_key for candidate_key in candidate_keys
+                                    if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
+                                            and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
+                                    if _ses_enclosures_share_identity(identity_enclosures[candidate_key], enclosure)),
+                                   None)]
+                if match is not None
+            ]
+            key = min(matches, key=candidate_positions.__getitem__, default=None)
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
             if key in merged:
@@ -2393,6 +2406,8 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             )
             slot_evidence[key] = []
             identity_enclosures[key] = enclosure
+            candidate_positions[key] = len(candidate_positions)
+            host_candidate_keys.setdefault(enclosure.ssh_host, []).append(key)
         target = merged[key]
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
@@ -2691,10 +2706,18 @@ def _merge_control_targets(
     *,
     strict: bool = True,
 ) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    by_pair: dict[tuple[Any, ...], dict[str, Any]] = {}
+    return _add_control_targets([], {}, base + overlay, strict=strict)
+
+
+def _add_control_targets(
+    merged: list[dict[str, Any]],
+    by_pair: dict[tuple[Any, ...], dict[str, Any]],
+    items: list[dict[str, Any]],
+    *,
+    strict: bool = True,
+) -> list[dict[str, Any]]:
     conflicting: set[tuple[Any, ...]] = set()
-    for item in base + overlay:
+    for item in items:
         if not isinstance(item, dict):
             continue
         ssh_host = normalize_text(item.get("ssh_host"))
@@ -2839,8 +2862,11 @@ def _merge_candidate_sas_address(
 def merge_slot_candidate_maps(
     base: dict[int, dict[str, Any]],
     overlay: dict[int, dict[str, Any]],
+    target_index: dict[int, dict[tuple[Any, ...], dict[str, Any]]] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    merged = {slot: dict(payload) for slot, payload in base.items()}
+    # With `target_index` (empty with an empty base at first), base is merged
+    # in place and its targets stay indexed, so no merge redoes earlier ones.
+    merged = base if target_index is not None else {slot: dict(payload) for slot, payload in base.items()}
 
     for slot, payload in overlay.items():
         target = merged.setdefault(slot, {})
@@ -2863,7 +2889,11 @@ def merge_slot_candidate_maps(
             if key == "ses_targets":
                 existing = target.get(key, [])
                 if isinstance(existing, list) and isinstance(value, list):
-                    combined = _merge_control_targets(existing, value, strict=False)
+                    combined = (
+                        _add_control_targets(existing, target_index.setdefault(slot, {}), value, strict=False)
+                        if target_index is not None
+                        else _merge_control_targets(existing, value, strict=False)
+                    )
                     if combined:
                         target[key] = combined
                 continue

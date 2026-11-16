@@ -12865,6 +12865,8 @@ class InventoryService:
     ) -> tuple[ParsedSSHData, list[str]]:
         host_overlay = ParsedSSHData()
         host_failures: list[str] = []
+        host_enclosures: list[Any] = []
+        host_target_index: dict[int, dict[tuple[Any, ...], dict[str, Any]]] = {}
         device_commands: dict[str, tuple[str, str, str]] = {}
         commands: list[str] = []
         for device in devices:
@@ -12923,7 +12925,12 @@ class InventoryService:
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)
-            host_overlay = self._merge_ses_overlay_data(host_overlay, parsed)
+            # Add each device without redoing the earlier ones (#1216).
+            host_enclosures.extend(parsed.ses_enclosures)
+            merge_slot_candidate_maps(host_overlay.ses_slot_candidates, parsed.ses_slot_candidates, host_target_index)
+            host_overlay.ses_selected_meta = merge_enclosure_meta(host_overlay.ses_selected_meta, parsed.ses_selected_meta)
+            host_overlay.linux_scsi_devices.extend(parsed.linux_scsi_devices)
+        host_overlay.ses_enclosures = _merge_ses_enclosures(host_enclosures)
         return host_overlay, host_failures
 
     async def _fetch_sg_ses_overlay(
