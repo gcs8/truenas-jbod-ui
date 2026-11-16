@@ -79,10 +79,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed a lost bay-assignment change when two owners of one mapping file (a
   second app process, or a second store in one process) both reported a
   successful save. Saves, clears and imports now hold a writer lock
-  (`slot_mappings.json.lock` beside the file) from the read to the readback,
-  and refuse with `mapping_writer_lock_unavailable` when another writer holds
-  it too long, the filesystem cannot lock files, or the lock path is not a
-  regular file. The wait runs off the UI event loop. Reads take no lock and
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, the storage does not
+  support file locking, the lock file's name is taken by something that is
+  not a regular file, or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
   never wait for a writer, even one stalled while publishing: a read that
   finds the file was replaced between its check and its open reads again, and
   after three such rereads refuses with `mapping_read_busy` (503,

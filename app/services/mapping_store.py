@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import local as thread_local
 from types import MappingProxyType
 from typing import Any, BinaryIO, TypeAlias
 
@@ -166,24 +167,33 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
     """A mapping change was refused because the writer lock could not be held.
 
     ``reason`` is ``busy`` (another owner held it past the bounded wait),
-    ``unsupported`` (the filesystem cannot lock files) or ``not_regular`` (the
-    lock path is not a regular file). The mapping file is unchanged.
+    ``unsupported`` (the filesystem cannot lock files), ``not_regular`` (the
+    lock path is not a regular file) or ``unwritable`` (the existing lock file
+    cannot be opened for writing). The mapping file is unchanged.
     """
 
     error_code = "mapping_writer_lock_unavailable"
-    public_detail = (
-        "Could not save: another mapping change did not finish in time, "
-        "or the data folder cannot lock files. The mappings were not changed."
-    )
+    _SEE = " The mappings were not changed. See Troubleshooting: saving bay mappings."
+    # Fixed page text per reason: no path, no exception text (the log has those).
+    PUBLIC_DETAILS = {
+        "busy": "Could not save: another bay mapping save is in progress." + _SEE,
+        "unsupported": "Could not save: the storage holding the mapping file does not support file locking." + _SEE,
+        "not_regular": (
+            "Could not save: the mapping lock file's name is taken by something that is not a regular file." + _SEE
+        ),
+        "unwritable": "Could not save: the mapping lock file cannot be opened for writing." + _SEE,
+    }
     _REASONS = {
         "busy": "another writer held it past the bounded wait",
         "unsupported": "the filesystem does not support file locks, so concurrent writers cannot be kept apart",
-        "not_regular": "the lock path is not a regular file; remove it",
+        "not_regular": "the lock path is not a regular file; with every writer stopped, move it aside",
+        "unwritable": "this process cannot open it for writing; fix its owner or mode",
     }
 
     def __init__(self, lock_path: Path, reason: str) -> None:
         self.directory = lock_path.parent
         self.reason = reason
+        self.public_detail = self.PUBLIC_DETAILS[reason]
         self.operator_message = (
             f"Mapping change refused: could not hold the writer lock {lock_path} "
             f"because {self._REASONS[reason]}. The mapping file was not changed."
@@ -329,7 +339,7 @@ class MappingStore:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _shared_path_lock(self.file_path)
         # Set on the thread that holds this store's writer transaction.
-        self._writer_thread = threading.local()
+        self._writer_thread = thread_local()
 
     @property
     def writer_lock_path(self) -> Path:
@@ -379,6 +389,9 @@ class MappingStore:
         except OSError as exc:
             if exc.errno in _NOT_REGULAR_LOCK_ERRNOS:
                 raise MappingWriterLockUnavailable(lock_path, "not_regular") from exc
+            if existed and exc.errno in (errno.EACCES, errno.EPERM):
+                # The folder may be writable; this lock file is not.
+                raise MappingWriterLockUnavailable(lock_path, "unwritable") from exc
             capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
             if capacity_reason is not None:
                 raise StorageDirectoryCapacityExhausted(self.file_path.parent, capacity_reason) from exc

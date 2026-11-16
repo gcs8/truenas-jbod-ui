@@ -1150,9 +1150,219 @@ class MappingImportRouteRefusalTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 503)
                 body = json.loads(response.body)
                 self.assertEqual(body["error"], error_code)
-                self.assertEqual(body["detail"], type(error).public_detail)
+                self.assertEqual(body["detail"], error.public_detail)
                 self.assertNotIn("/app/data", response.body.decode("utf-8"))
                 service.get_snapshot.assert_not_awaited()
+
+
+SEE_TROUBLESHOOTING = "The mappings were not changed. See Troubleshooting: saving bay mappings."
+LOCK_REFUSAL_DETAILS = {
+    "busy": "Could not save: another bay mapping save is in progress. " + SEE_TROUBLESHOOTING,
+    "unsupported": (
+        "Could not save: the storage holding the mapping file does not support file locking. "
+        + SEE_TROUBLESHOOTING
+    ),
+    "not_regular": (
+        "Could not save: the mapping lock file's name is taken by something that is not a regular file. "
+        + SEE_TROUBLESHOOTING
+    ),
+    "unwritable": "Could not save: the mapping lock file cannot be opened for writing. " + SEE_TROUBLESHOOTING,
+}
+
+
+@unittest.skipIf(fcntl is None, "the cross-process writer lock needs POSIX flock")
+class SaveRefusedAtTheLockFileSaysWhyTests(unittest.TestCase):
+    """Each reason a save is refused at the lock file has its own fixed page message."""
+
+    def lock_path(self, path: Path) -> Path:
+        return path.with_name(path.name + ".lock")
+
+    def post_save(self, store: MappingStore, slot: int = 2):
+        """Run the real POST mapping route against a real store and service."""
+        from app.models.domain import InventorySnapshot, MappingRequest
+        from app.services.inventory import InventoryService
+
+        route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = bare_inventory_service(store)
+        service.peek_cached_snapshot = Mock(return_value=None)
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = MappingRequest(
+            expected_revision=mapping_store_module.bind_mapping_revision(
+                store.save_revision("a", "shelf", slot), InventoryService._slot_disk_binding(None),
+            ),
+            serial="SANITIZED",
+            notes="saved",
+            clear_identify_after_save=False,
+        )
+        snapshot = InventorySnapshot(
+            slots=[], layout_rows=[], layout_slot_count=0, layout_columns=1, refresh_interval_seconds=30,
+        )
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds", AsyncMock()),
+            patch.object(app_routes, "add_perf_metadata"),
+            patch.object(app_routes, "readback_after_write", AsyncMock(return_value=(snapshot, None))),
+        ):
+            return asyncio.run(route.endpoint(slot=slot, payload=payload, system_id="a", enclosure_id="shelf"))
+
+    def assert_refused(self, directory: str, path: Path, store: MappingStore, reason: str) -> None:
+        before = path.read_bytes()
+        with self.assertLogs("app.routes", level="ERROR") as logged:
+            response = self.post_save(store)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("Retry-After"), "5")
+        self.assertEqual(
+            json.loads(response.body),
+            {"ok": False, "error": WRITER_LOCK_UNAVAILABLE, "detail": LOCK_REFUSAL_DETAILS[reason]},
+        )
+        self.assertNotIn(directory, response.body.decode("utf-8"))
+        # The operator log keeps the detail: the lock file it could not hold.
+        self.assertIn(str(self.lock_path(path)), "\n".join(logged.output))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_a_healthy_save_through_the_route_still_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            response = self.post_save(store)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(json.loads(response.body)["mapping"]["notes"], "saved")
+            self.assertEqual(system_ids(path), ["a", "seed"])
+            self.assertTrue(self.lock_path(path).is_file())
+
+    def test_another_save_in_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.writer_lock_timeout_seconds = 0.1
+            holder = os.open(self.lock_path(path), os.O_RDWR | os.O_CREAT, 0o660)
+            try:
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                self.assert_refused(directory, path, store, "busy")
+            finally:
+                os.close(holder)
+
+    def test_storage_without_file_locking(self) -> None:
+        for number in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+            with self.subTest(errno=errno.errorcode[number]), tempfile.TemporaryDirectory() as directory:
+                path, store = seeded_store(directory)
+
+                def no_locks(descriptor, operation, number=number):
+                    raise OSError(number, os.strerror(number))
+
+                with patch.object(fcntl, "flock", no_locks):
+                    self.assert_refused(directory, path, store, "unsupported")
+
+    def test_lock_file_name_taken_by_something_that_is_not_a_regular_file(self) -> None:
+        for kind in ("directory", "symlink", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                path, store = seeded_store(directory)
+                lock = self.lock_path(path)
+                lock.unlink()
+                if kind == "directory":
+                    lock.mkdir()
+                elif kind == "symlink":
+                    target = Path(directory) / "target"
+                    target.write_bytes(b"")
+                    lock.symlink_to(target)
+                else:
+                    os.mkfifo(lock)
+                self.assert_refused(directory, path, store, "not_regular")
+
+    def test_lock_file_cannot_be_opened_for_writing(self) -> None:
+        with self.subTest(case="permission refused on open"), tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            real_open = os.open
+
+            def refuse_lock(target, flags, *args, **kwargs):
+                if os.fspath(target) == os.fspath(self.lock_path(path)):
+                    raise PermissionError(errno.EACCES, "Permission denied")
+                return real_open(target, flags, *args, **kwargs)
+
+            with patch.object(mapping_store_module.os, "open", refuse_lock):
+                self.assert_refused(directory, path, store, "unwritable")
+        if os.geteuid() != 0:
+            with self.subTest(case="read-only lock file"), tempfile.TemporaryDirectory() as directory:
+                path, store = seeded_store(directory)
+                self.lock_path(path).chmod(0o444)
+                self.assert_refused(directory, path, store, "unwritable")
+            with self.subTest(case="control: no lock file in a read-only folder"):
+                with tempfile.TemporaryDirectory() as directory:
+                    path, store = seeded_store(directory)
+                    self.lock_path(path).unlink()
+                    Path(directory).chmod(0o555)
+                    try:
+                        with self.assertLogs("app.routes", level="ERROR"):
+                            response = self.post_save(store)
+                    finally:
+                        Path(directory).chmod(0o755)
+                    self.assertEqual(json.loads(response.body)["error"], "data_directory_unwritable")
+
+    def test_the_four_messages_are_distinct_and_carry_no_path(self) -> None:
+        refusal = mapping_store_module.MappingWriterLockUnavailable
+        details = {}
+        for reason in LOCK_REFUSAL_DETAILS:
+            try:
+                details[reason] = refusal(Path("/app/data/slot_mappings.json.lock"), reason).public_detail
+            except KeyError:
+                self.fail(f"the writer-lock refusal has no reason {reason!r}")
+        self.assertEqual(details, LOCK_REFUSAL_DETAILS)
+        self.assertEqual(len(set(details.values())), 4)
+        for reason, detail in details.items():
+            with self.subTest(reason=reason):
+                self.assertTrue(detail.endswith("See Troubleshooting: saving bay mappings."))
+                self.assertNotIn("/", detail)
+                self.assertNotIn(".lock", detail)
+                self.assertNotIn(".json", detail)
+
+
+class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
+    """The section the four refusal messages point to exists and says what to do."""
+
+    def section(self) -> str:
+        text = (ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8")
+        heading = "\n## Saving bay mappings\n"
+        if heading not in text:
+            self.fail("Troubleshooting has no 'Saving bay mappings' section")
+        body = text.split(heading, 1)[1]
+        return body.split("\n## ", 1)[0]
+
+    def test_it_names_each_refusal_and_the_lock_file(self) -> None:
+        section = " ".join(self.section().split())
+        self.assertIn("slot_mappings.json.lock", section)
+        for phrase in (
+            "another bay mapping save is in progress",
+            "does not support file locking",
+            "is not a regular file",
+            "cannot be opened for writing",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, section)
+
+    def test_it_gives_the_recovery_steps(self) -> None:
+        section = " ".join(self.section().split())
+        for step in (
+            "docker compose down",
+            "Keep the mapping file",
+            "docker compose up -d",
+            "storage whose file locks work",
+        ):
+            with self.subTest(step=step):
+                self.assertIn(step, section)
+        # Services stop before anything at the lock file's name is touched.
+        self.assertLess(section.index("docker compose down"), section.index("mv "))
+
+    def test_it_never_offers_an_unguarded_save_or_deleting_a_live_lock_file(self) -> None:
+        section = " ".join(self.section().split()).lower()
+        self.assertIn("do not delete", section)
+        self.assertIn("while the services run", section)
+        for forbidden in ("unguarded mode", "disable the lock", "skip the lock", "rm -f"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, section)
 
 
 if __name__ == "__main__":

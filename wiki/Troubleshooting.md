@@ -240,6 +240,57 @@ load `known_hosts`, verify that `data/known_hosts` (or the file named by
 `ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
 configured app UID/GID and uses mode `0660`.
 
+## Saving bay mappings
+
+Saving, clearing or importing bay mappings holds a writer lock on a lock file
+beside the mapping file: `data/slot_mappings.json.lock` next to
+`data/slot_mappings.json` in the default layout. It keeps two writers from
+losing each other's changes. A save that cannot hold it is refused (HTTP 503),
+and the mappings are not changed. Reading mappings does not need the lock.
+There is no setting that saves without it. The app log line starting
+`Mapping change refused` names the lock file and the cause.
+
+| The page says | What it means |
+| --- | --- |
+| `another bay mapping save is in progress` | Another save, clear or import of the same mapping file, from this or another app process, held the lock past the 2 s wait. Save again when it finishes. If it never clears, look for a stuck process using the same data folder. |
+| `the storage holding the mapping file does not support file locking` | The data folder is on storage where file locks fail, for example an NFS mount without a lock manager. Move the mapping directory (below). |
+| `the mapping lock file's name is taken by something that is not a regular file` | A directory, link, FIFO or other non-file sits at the lock file's name. Repair it (below). |
+| `the mapping lock file cannot be opened for writing` | The lock file exists, but the app's user cannot open it for writing: wrong owner or mode. Repair it (below). |
+
+To repair the lock file's name or permissions:
+
+1. Stop every service that writes mappings: `docker compose down`, plus any
+   other deployment or host job that uses the same data folder. Keep them
+   stopped until step 4.
+2. Keep the mapping file. Copy `data/slot_mappings.json` somewhere safe first;
+   do not delete or edit it.
+3. Fix what sits at `data/slot_mappings.json.lock`:
+   - not a regular file: move it out of the way, for example
+     `mv data/slot_mappings.json.lock data/slot_mappings.json.lock.obstruction`,
+     then inspect it at leisure;
+   - a regular file the app cannot open: give it the app's owner and mode
+     `0660`, as in
+     [A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+4. Start again with `docker compose up -d` and save the mapping again. A missing
+   lock file is created by the next save.
+
+Do not delete an ordinary lock file while the services run: a running writer
+may hold it, and a new file would not keep the next writer out. With every
+writer stopped it is safe to remove; the next save recreates it.
+
+For storage without working file locks, move the mapping directory to storage
+whose file locks work, such as a local disk on the Docker host:
+
+1. Stop every service that writes mappings (`docker compose down`).
+2. Copy the data folder, with `slot_mappings.json`, to the new location.
+3. Point every `./data` bind mount in your Compose files at the new location.
+4. Start again with `docker compose up -d`.
+
+Some network shares accept a lock without enforcing it between clients (NFS
+mounted with local-only locks, older SMB). Saves then succeed, but two app
+hosts writing the same share are not kept apart. Run one writer per mapping
+file there.
+
 ## SCALE shows a generic runtime profile
 
 That usually means:
