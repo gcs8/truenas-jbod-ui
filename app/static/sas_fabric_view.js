@@ -958,14 +958,20 @@
     `;
   }
 
+  // A metric the producer lists in `not_read` was not read: say so, never omit it or show 0.
   function metricRows(metrics, labels = {}) {
+    const notRead = new Set(list(metrics?.not_read));
     return Object.entries(metrics || {})
-      .filter(([, value]) => value !== null && value !== undefined && value !== "" && !Array.isArray(value))
+      .filter(([key, value]) => notRead.has(key) || (value !== null && value !== undefined && value !== "" && !Array.isArray(value)))
       .slice(0, 10)
       .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), (
-        key === "kernel_diagnostics" ? diagnosticSummary(value) : value
+        notRead.has(key) ? "not read" : key === "kernel_diagnostics" ? diagnosticSummary(value) : value
       )))
       .join("");
+  }
+
+  function metricNotRead(node, key) {
+    return list(node?.metrics?.not_read).includes(key);
   }
 
   function evidenceChips(values) {
@@ -1707,7 +1713,8 @@
   }
 
   function fabricCountsIncomplete(fabric) {
-    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete");
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete")
+      || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
   }
 
   // "3", "at least 3" (some reads missing) or "not read". Never a bare 0
@@ -1751,10 +1758,10 @@
     `;
   }
 
-  function renderNodeGrid(nodes, limit = 12) {
+  function renderNodeGrid(nodes, limit = 12, emptyText = "No objects reported") {
     const visible = list(nodes).slice(0, limit);
     if (!visible.length) {
-      return '<span class="fabric-empty-note">No objects reported</span>';
+      return `<span class="fabric-empty-note">${escapeHtml(emptyText)}</span>`;
     }
     const overflow = nodes.length > limit ? `<span class="fabric-empty-note">+${nodes.length - limit} more</span>` : "";
     return `${visible.map((node) => renderNodeButton(node, { extra: "compact" })).join("")}${overflow}`;
@@ -1783,6 +1790,14 @@
     return `${chips}${overflow}`;
   }
 
+  // An empty lane list is "No objects reported" only when that list was read.
+  function laneListEmptyText(fabric, controllerName, listName) {
+    const read = fabric?.raw?.controller_read;
+    if (!read) return "No objects reported";
+    const state = read.lists?.[controllerName]?.[listName];
+    return state === "read" || state === "empty" ? "No objects reported" : "Not read";
+  }
+
   function renderLanesMode(fabric) {
     const copy = fabricViewCopy(fabric);
     const nodes = nodeMap(fabric);
@@ -1801,6 +1816,7 @@
         alias: node.alias,
         related_slots: node.related_slots,
       }));
+    const claimedSlots = new Set();
     const lanes = controllerRecords.map((controller) => {
       const controllerId = controller.id || `controller:${controller.name}`;
       const controllerNode = nodes.get(controllerId);
@@ -1815,6 +1831,7 @@
       expanders.forEach((node) => sortedSlots(node.related_slots).forEach((slot) => laneSlots.add(slot)));
       enclosures.forEach((node) => sortedSlots(node.related_slots).forEach((slot) => laneSlots.add(slot)));
       const slots = Array.from(laneSlots).sort((left, right) => left - right);
+      slots.forEach((slot) => claimedSlots.add(slot));
       const related = selectionTouchesNode(controllerId) || selectionTouchesSlots(slots);
       return `
         <section class="fabric-dedicated-lane${related ? " is-related" : ""}">
@@ -1831,11 +1848,11 @@
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.expanders)}</span>
-            <div class="fabric-node-grid">${renderNodeGrid(expanders, 8)}</div>
+            <div class="fabric-node-grid">${renderNodeGrid(expanders, 8, laneListEmptyText(fabric, controllerName, "expanders"))}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.enclosures)}</span>
-            <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
+            <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8, laneListEmptyText(fabric, controllerName, "enclosures"))}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(aggregateDiskNoun(slots) === "bay" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
@@ -1852,25 +1869,42 @@
           extra: "host",
         })}
       </div>
-      <div class="fabric-lane-board">${lanes || renderLanesWithoutController(fabric, copy)}</div>
+      <div class="fabric-lane-board">${lanes ? `${lanes}${renderUnattachedInventory(fabric, copy, claimedSlots)}` : renderLanesWithoutController(fabric, copy)}</div>
     `;
+  }
+
+  function inventoryBaySlots(fabric) {
+    return sortedSlots(list(fabric.nodes)
+      .filter((node) => node.kind === "bay")
+      .flatMap((node) => list(node.related_slots)));
   }
 
   // CORE without readable controller output still knows its bays: draw them
   // instead of an empty board; the status and warning list say why.
   function renderLanesWithoutController(fabric, copy) {
-    const slots = sortedSlots(list(fabric.nodes)
-      .filter((node) => node.kind === "bay")
-      .flatMap((node) => list(node.related_slots)));
+    const slots = inventoryBaySlots(fabric);
     if (fabric.platform !== "core" || !slots.length) {
       return '<div class="warning-item muted compact">No controller lanes are available yet.</div>';
     }
+    return renderInventoryBayGroup(copy, slots, (noun) => `Controller data could not be read. The ${noun} below come from the inventory.`);
+  }
+
+  // On a partial CORE read, bays no controller lane claims are still drawn,
+  // without guessing which controller or path they hang off.
+  function renderUnattachedInventory(fabric, copy, claimedSlots) {
+    if (fabric.platform !== "core" || !fabricCountsIncomplete(fabric)) return "";
+    const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
+    if (!slots.length) return "";
+    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. Some controller data was not read, so these ${noun} come from the inventory.`);
+  }
+
+  function renderInventoryBayGroup(copy, slots, notice) {
     // Same location-aware noun as the controller lanes: Bays only when every
     // drawn member has an affirmative physical location.
     const physical = aggregateDiskNoun(slots) === "bay";
     return `
       <section class="fabric-dedicated-lane">
-        <div class="warning-item muted compact">Controller data could not be read. The ${physical ? "bays" : "disks"} below come from the inventory.</div>
+        <div class="warning-item muted compact">${escapeHtml(notice(physical ? "bays" : "disks"))}</div>
         <div class="fabric-stage">
           <span class="fabric-stage-title">${escapeHtml(physical ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
           <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
@@ -2045,7 +2079,8 @@
 
   // Linked PHYs over reported PHYs. A null linked count was not read whole:
   // no fact rather than 0 (0 itself is a real, fully read count).
-  function phyFact(linked, total) {
+  function phyFact(linked, total, notRead = false) {
+    if (notRead) return "not read";
     if (!Number.isInteger(linked)) return null;
     return total !== null && total !== undefined && total !== "" ? `${linked}/${total}` : String(linked);
   }
@@ -3061,7 +3096,7 @@
           [linuxSes ? "SES devices" : storageFabric ? "Source" : "PCIe slot", linuxSes ? controllerNode?.metrics?.ses_device_count : storageFabric ? controllerNode?.raw?.source : controllerNode?.metrics?.pcie_slot || controllerNode?.raw?.pcie_slot],
           ["FW", linuxSes || storageFabric ? null : controllerNode?.metrics?.firmware || controllerNode?.raw?.firmware],
           ["Temp", linuxSes || storageFabric ? null : controllerNode?.metrics?.temperature],
-          ["PHY", linuxSes || storageFabric ? null : phyFact(controllerNode?.metrics?.linked_phy_count, controllerNode?.metrics?.phy_count)],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(controllerNode?.metrics?.linked_phy_count, controllerNode?.metrics?.phy_count, metricNotRead(controllerNode, "linked_phy_count"))],
           ["IOC", linuxSes || storageFabric ? null : iocFacts.iocstatus],
           ["Events", linuxSes || storageFabric ? null : diagnosticSummary(controllerDiagnostics)],
         ],
@@ -3139,9 +3174,9 @@
         ].filter(Boolean).join(" / "),
         facts: [
           [linuxSes ? "SG device" : storageFabric ? "Evidence" : "WWN", linuxSes ? enclosureNode?.raw_id || seed.pathState?.ses_device : storageFabric ? enclosureNode?.raw?.source : expanderNode?.raw_id || enclosureNode?.raw_id],
-          ["PHY", linuxSes || storageFabric ? null : phyFact(expanderNode?.metrics?.linked_phys, expanderNode?.metrics?.num_phys)],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(expanderNode?.metrics?.linked_phys, expanderNode?.metrics?.num_phys, metricNotRead(expanderNode, "linked_phys"))],
           ["Enclosure", linuxSes ? enclosureNode?.raw?.enclosure_label : mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
-          ["Devices", linuxSes || storageFabric ? null : formatCountMap(expanderNode?.raw?.device_counts)],
+          ["Devices", linuxSes || storageFabric ? null : metricNotRead(expanderNode, "linked_phys") ? "not read" : formatCountMap(expanderNode?.raw?.device_counts)],
           ["PHY errors", linuxSes || storageFabric ? null : expanderNode?.metrics?.phy_error_counters],
         ],
         hoverFacts: [

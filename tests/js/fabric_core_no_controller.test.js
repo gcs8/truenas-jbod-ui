@@ -26,6 +26,8 @@ const UNAVAILABLE_MAP = "No Storage Fabric map is available for this platform ye
 const BAYS_NOTICE = "Controller data could not be read. The bays below come from the inventory.";
 const DISKS_NOTICE = "Controller data could not be read. The disks below come from the inventory.";
 const NO_LANES = "No controller lanes are available yet.";
+const UNATTACHED_BAYS_NOTICE = "Not attached to a read controller. Some controller data was not read, so these bays come from the inventory.";
+const PHY_TABLE_NOTICE = "CORE PHY tables could not be read whole for 1 controller, so their linked PHY counts were not read.";
 const SUMMARY_IDS = {
   controllers: "fabric-summary-controllers",
   paths: "fabric-summary-paths",
@@ -245,4 +247,57 @@ test("main page topology summary uses the same not-read rule", () => {
   const { controller_read: _ignored, ...raw } = CASES.no_controller_bays.fabric.raw;
   assert.equal(noController({ ...CASES.no_controller_bays.fabric, raw }, false).meta, "No HBA controllers reported");
   assert.equal(noController(CASES.no_controller_bays.fabric, true).meta, "No storage sources reported");
+});
+
+test("list replies that were not read say not read in the summary and the lane, never no objects", () => {
+  const page = loadCase("unparsed_lists");
+  assert.equal(page.chip, "STORAGE PARTIAL");
+  assert.equal(page.summary.expanders, "not read");
+  assert.equal(page.summary.enclosures, "not read");
+  const lanes = textOf(page.map);
+  assert.equal((lanes.match(/Not read/g) || []).length, 2, lanes);
+  assert.doesNotMatch(lanes, /No objects reported/);
+  // Control: lists that were read and printed empty are measured zeroes.
+  const whole = textOf(loadCase("complete").map);
+  assert.equal((whole.match(/No objects reported/g) || []).length, 2, whole);
+  assert.doesNotMatch(whole, /Not read/);
+});
+
+test("a partial read still draws inventory bays no controller lane claims, with their pool and vdev", () => {
+  const page = loadCase("unreadable_second_unit");
+  assert.match(page.map, new RegExp(escapeRegExp(UNATTACHED_BAYS_NOTICE)));
+  assert.match(page.map, /data-fabric-trace="bay:0"[^>]*title="da0 \/ tank \/ mirror-0"/);
+  assert.match(page.map, /data-fabric-node="controller:mpr0"/);
+  // Control: a whole read keeps its lanes as before, with no extra group.
+  const whole = loadCase("complete");
+  assert.doesNotMatch(whole.map, /Not attached to a read controller/);
+  assert.doesNotMatch(whole.map, /data-fabric-trace="bay:0"/);
+});
+
+test("a rejected PHY table is not read, never absent or zero, and the view is partial", () => {
+  const page = loadCase("phy_table_rejected");
+  assert.equal(page.chip, "STORAGE PARTIAL");
+  assert.match(page.status, new RegExp(escapeRegExp(PHY_TABLE_NOTICE)));
+  const { metricRows, phyFact } = loadPage(FIXTURE, null);
+  const [controller] = CASES.phy_table_rejected.fabric.nodes.filter((node) => node.kind === "controller");
+  const rows = textOf(metricRows(controller.metrics));
+  assert.match(rows, /phy count not read/);
+  assert.match(rows, /linked phy count not read/);
+  assert.equal(phyFact(null, null, true), "not read");
+  assert.match(textOf(metricRows({ slots: "1", device_count: null, not_read: ["device_count"] })), /device count not read/);
+  // The status also stays partial from the read facts alone.
+  const quiet = loadPage({ ...CASES.phy_table_rejected.fabric, warnings: [] }, "lanes", CASES.phy_table_rejected.slots);
+  assert.equal(quiet.chip, "STORAGE PARTIAL");
+});
+
+test("main page inspector and lanes follow the same not-read facts", () => {
+  const sandbox = vm.createContext({ kvRow: (label, value) => `${label}: ${value};`, formatSasFabricValue: String });
+  vm.runInContext(`${["sasFabricList", "sasFabricMetricRows"].map(appFunctionSource).join("\n")}\nthis.rows = sasFabricMetricRows;`, sandbox);
+  assert.equal(sandbox.rows({ phy_count: null, not_read: ["phy_count"] }), "phy count: not read;");
+  assert.equal(sandbox.rows({ phy_count: null }), "");
+  vm.runInContext(`${appFunctionSource("sasFabricLaneListEmptyText")}\nthis.emptyText = sasFabricLaneListEmptyText;`, sandbox);
+  const { emptyText } = sandbox;
+  assert.equal(emptyText(CASES.unparsed_lists.fabric, "mpr0", "expanders"), "Not read");
+  assert.equal(emptyText(CASES.complete.fabric, "mpr0", "expanders"), "No objects reported");
+  assert.equal(emptyText({ raw: {} }, "mpr0", "expanders"), "No objects reported");
 });

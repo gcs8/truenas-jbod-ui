@@ -53,7 +53,23 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
             continue
         if re.match(r"^\d+\s+", stripped):
             parts = stripped.split()
-            if len(parts) >= 8:
+            unattached = _MPR_UNATTACHED_ADAPTER_PHY.match(stripped)
+            if unattached:
+                # mprutil leaves both handles and the speed blank for a PHY
+                # with nothing attached; the row is still part of the table.
+                detail["phy_rows"].append(
+                    {
+                        "phy": parts[0],
+                        "controller_handle": None,
+                        "device_handle": None,
+                        "disabled": parts[1],
+                        "speed": None,
+                        "min": parts[2],
+                        "max": parts[3],
+                        "device": " ".join(parts[4:]),
+                    }
+                )
+            elif len(parts) >= 8:
                 detail["phy_rows"].append(
                     {
                         "phy": parts[0],
@@ -75,11 +91,21 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     phy_numbers = [int(row["phy"]) for row in rows]
     if rows and not malformed_phy_rows and sorted(phy_numbers) == list(range(len(rows))):
         detail["phy_count"] = len(rows)
-        detail["linked_phy_count"] = sum(1 for row in rows if row.get("device") and row.get("device") != "No Device")
+        detail["linked_phy_count"] = sum(
+            1 for row in rows if row.get("device_handle") and row.get("device") and row.get("device") != "No Device"
+        )
+        detail["phy_table"] = "read"
     else:
         detail["phy_count"] = None
         detail["linked_phy_count"] = None
+        # No table at all is "absent" (as before); rows that were seen but
+        # did not form a whole table are "rejected": not read, not zero.
+        detail["phy_table"] = "rejected" if rows or malformed_phy_rows else "absent"
     return detail
+
+
+_MPR_PHY_SPEED = r"(?:[\d.]+|\?\?\?|Unk)"
+_MPR_UNATTACHED_ADAPTER_PHY = re.compile(rf"^\d+\s+[YN]\s+{_MPR_PHY_SPEED}\s+{_MPR_PHY_SPEED}\s+\S.*$")
 
 
 def parse_mpr_devices(text: str) -> list[dict[str, str]]:
@@ -211,7 +237,8 @@ def _mpr_expander_phy_candidate_lines(text: str, header_pattern: re.Pattern[str]
 def _mpr_expander_phy_table_complete(expander: dict[str, Any], candidate_lines: int) -> bool:
     rows = expander.get("phys") or []
     reported = str(expander.get("num_phys") or "")
-    if not rows or not reported.isdecimal() or len(rows) != int(reported) or candidate_lines != len(rows):
+    # Zero rows are whole only under a header that reports zero PHYs.
+    if not reported.isdecimal() or len(rows) != int(reported) or candidate_lines != len(rows):
         return False
     numbers = [str(row.get("phy") or "") for row in rows]
     if not all(number.isdecimal() and int(number) < int(reported) for number in numbers):
@@ -564,12 +591,26 @@ def _parse_mpr_sense_message(message: str) -> dict[str, str]:
     }
 
 
+def admit_mpr_unit_number(token: str | None) -> int | None:
+    """A controller unit number is 1 to 4 ASCII digits; anything else is rejected."""
+    return int(token) if token is not None and _MPR_UNIT_NUMBER.fullmatch(token) else None
+
+
+def rejected_mpr_summary_unit_tokens(text: str) -> set[str]:
+    """Unit tokens of adapter summary rows naming an mpr device whose unit number was not admitted."""
+    return {
+        row["device"].removeprefix("/dev/mpr")
+        for row in parse_mpr_adapter_summary(text)
+        if row["device"].startswith("/dev/mpr") and admit_mpr_unit_number(row.get("unit")) is None
+    }
+
+
 def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
     units: set[int] = set()
     for row in parse_mpr_adapter_summary(text):
-        unit = row.get("unit")
-        if unit is not None and str(unit).isdigit():
-            units.add(int(unit))
+        unit = admit_mpr_unit_number(row.get("unit"))
+        if unit is not None:
+            units.add(unit)
     return sorted(units)
 
 
@@ -610,5 +651,8 @@ def _freebsd_pci_location_to_address(location: str) -> str:
 def _mpr_unit_from_text(value: str | None) -> str | None:
     if not value:
         return None
-    match = re.search(r"\bmpr(?P<unit>\d+)\b", value)
+    match = re.search(r"\bmpr(?P<unit>[0-9]{1,4})\b", value)
     return match.group("unit") if match else None
+
+
+_MPR_UNIT_NUMBER = re.compile(r"[0-9]{1,4}")

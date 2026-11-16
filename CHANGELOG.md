@@ -49,18 +49,29 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   no `mprutil` output was returned; it says no controller or path data is
   available and still draws the bays, pools and vdevs the inventory knows.
   Output that cannot be read as controller data no longer creates a
-  controller, an adapter or expander PHY table that was not read whole
-  (missing, short, malformed or repeated rows) shows its PHY counts as
-  unknown instead of 0, and an empty numbered `mprutil -u N` result no
-  longer hides the unnumbered adapter details. A controller, path, expander
-  or enclosure count whose read did not happen or was incomplete
-  now reads "not read" or "at least N" in the summary, host line, disk view
-  and main-page topology summary instead of 0, a controller unit that could
-  not be read is named in a warning and keeps the view partial, and the
-  no-controller lanes say "disks" for unmapped inventory. When only the
-  unnumbered `mprutil show ...` commands answer, their board and firmware stay on one
-  controller, and every link and controller reference names a node that is
-  in the map (#1244, refs #1219).
+  controller. A count or list is shown as measured only when the reply that
+  carries it was read: a controller, path, expander or enclosure count whose
+  read did not happen, was incomplete or could not be parsed reads "not
+  read" or "at least N" in the summary, host line, disk view and main-page
+  topology summary instead of 0, and a lane whose expander or enclosure list
+  was not read says "Not read" instead of "No objects reported". A list
+  printed with its column heading and no rows is still a measured zero.
+  Every supported `mprutil -u N` command, `show all` included, counts its
+  unit as attempted; a unit that could not be read is named in a warning and
+  keeps the view partial, and a unit number that is not 1 to 4 digits is
+  rejected and counted, never shown. An adapter or expander PHY table that
+  was not read whole (missing, short, malformed or repeated rows) shows its
+  PHY counts as "not read", is counted in a warning and keeps the view
+  partial; a whole table keeps its counts, including rows for PHYs with
+  nothing attached and an expander that reports zero PHYs. An enclosure's
+  device count comes only from a device list that was read. On a partial
+  read, inventory bays that no controller lane claims are drawn in their own
+  group, and the no-controller lanes say "disks" for unmapped inventory. An
+  empty numbered `mprutil -u N` result no longer hides the unnumbered
+  adapter details. When only the unnumbered `mprutil show ...` commands
+  answer, their board and firmware stay on one controller, and every link
+  and controller reference names a node that is in the map (#1244, refs
+  #1219).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

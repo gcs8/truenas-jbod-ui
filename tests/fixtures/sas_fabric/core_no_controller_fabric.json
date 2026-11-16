@@ -257,12 +257,21 @@
             "expanders": "complete",
             "paths": "complete"
           },
+          "lists": {
+            "mpr0": {
+              "devices": "not_read",
+              "enclosures": "empty",
+              "expanders": "empty"
+            }
+          },
+          "rejected_units": 0,
           "units": [
             {
               "controller": "mpr0",
               "result": "read"
             }
-          ]
+          ],
+          "unread_phy_tables": 0
         },
         "mpr_kernel_events": {
           "controllers": [],
@@ -565,7 +574,10 @@
             "expanders": "not_read",
             "paths": "not_read"
           },
-          "units": []
+          "lists": {},
+          "rejected_units": 0,
+          "units": [],
+          "unread_phy_tables": 0
         },
         "mpr_kernel_events": {
           "controllers": [],
@@ -929,7 +941,10 @@
             "expanders": "not_read",
             "paths": "not_read"
           },
-          "units": []
+          "lists": {},
+          "rejected_units": 0,
+          "units": [],
+          "unread_phy_tables": 0
         },
         "mpr_kernel_events": {
           "controllers": [],
@@ -1296,7 +1311,10 @@
             "expanders": "not_read",
             "paths": "not_read"
           },
-          "units": []
+          "lists": {},
+          "rejected_units": 0,
+          "units": [],
+          "unread_phy_tables": 0
         },
         "mpr_kernel_events": {
           "controllers": [],
@@ -1400,6 +1418,822 @@
         "phy_identifier": null,
         "physical_block_size": null,
         "physical_location_known": false,
+        "pool_name": "tank",
+        "present": true,
+        "raw_status": {
+          "device_names": [
+            "da0"
+          ]
+        },
+        "row_index": 0,
+        "sas_address": null,
+        "scsi_hctl": null,
+        "search_text": "",
+        "serial": null,
+        "sg_device": null,
+        "size_bytes": null,
+        "size_human": null,
+        "slot": 0,
+        "slot_label": "00",
+        "smart_device_names": [],
+        "smart_device_type": null,
+        "ssh_ses_device": null,
+        "ssh_ses_element_id": null,
+        "ssh_ses_targets": [],
+        "state": "healthy",
+        "target_port_protocol": null,
+        "temperature_c": null,
+        "topology_label": null,
+        "transport_protocol": null,
+        "vdev_class": null,
+        "vdev_name": "mirror-0"
+      }
+    ]
+  },
+  "phy_table_rejected": {
+    "fabric": {
+      "aliases": [],
+      "available": true,
+      "controllers": [
+        {
+          "acpi_handle": null,
+          "board": "Synthetic HBA",
+          "chip": null,
+          "device": "/dev/mpr0",
+          "firmware": "1.2.3",
+          "id": "controller:mpr0",
+          "iocfacts": {},
+          "name": "mpr0",
+          "path_counts": {},
+          "pci": null,
+          "pci_address": null,
+          "pci_device": null,
+          "pci_location": null,
+          "pci_parent": null,
+          "pci_vendor": null,
+          "pcie_slot": null,
+          "pcie_slot_type": null,
+          "pcie_slot_usage": null,
+          "phy_rows": [],
+          "related_slots": [],
+          "temperature": null,
+          "unit": 0
+        }
+      ],
+      "enclosures": [],
+      "expanders": [],
+      "links": [
+        {
+          "evidence": [
+            "profile slot layout"
+          ],
+          "id": "backplane-bay:backplane:0->bay:0:0",
+          "kind": "backplane-bay",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "backplane:0",
+          "status": null,
+          "target": "bay:0"
+        },
+        {
+          "evidence": [],
+          "id": "bay-pool:bay:0->pool:tank:0",
+          "kind": "bay-pool",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "bay:0",
+          "status": null,
+          "target": "pool:tank"
+        },
+        {
+          "evidence": [],
+          "id": "host-controller:host->controller:mpr0",
+          "kind": "host-controller",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "host",
+          "status": null,
+          "target": "controller:mpr0"
+        },
+        {
+          "evidence": [],
+          "id": "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
+          "kind": "pool-vdev",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "pool:tank",
+          "status": null,
+          "target": "vdev:tank/mirror-0"
+        }
+      ],
+      "nodes": [
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "profile slot layout"
+          ],
+          "id": "backplane:0",
+          "kind": "backplane",
+          "label": "Backplane Zone 1",
+          "metrics": {
+            "slot_count": 1,
+            "slot_range": "Bays 00-00",
+            "zone": 1
+          },
+          "raw": {
+            "id": "backplane:0",
+            "index": 0,
+            "label": "Backplane Zone 1",
+            "range": "Bays 00-00",
+            "slots": [
+              0
+            ]
+          },
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "inventory snapshot"
+          ],
+          "id": "bay:0",
+          "kind": "bay",
+          "label": "Bay 00",
+          "metrics": {
+            "device_name": "da0",
+            "health": null,
+            "pool_name": "tank",
+            "present": true,
+            "vdev_name": "mirror-0"
+          },
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": 0,
+          "status": "healthy"
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "mprutil -u 0 show adapter"
+          ],
+          "id": "controller:mpr0",
+          "kind": "controller",
+          "label": "mpr0",
+          "metrics": {
+            "firmware": "1.2.3",
+            "kernel_diagnostics": {},
+            "linked_phy_count": null,
+            "not_read": [
+              "phy_count",
+              "linked_phy_count"
+            ],
+            "path_counts": {},
+            "pci_address": null,
+            "pcie_slot": null,
+            "phy_count": null,
+            "temperature": null
+          },
+          "raw": {
+            "acpi_handle": null,
+            "board": "Synthetic HBA",
+            "chip": null,
+            "device": "/dev/mpr0",
+            "firmware": "1.2.3",
+            "iocfacts": {},
+            "name": "mpr0",
+            "path_counts": {},
+            "pci": null,
+            "pci_address": null,
+            "pci_device": null,
+            "pci_location": null,
+            "pci_parent": null,
+            "pci_vendor": null,
+            "pcie_slot": null,
+            "pcie_slot_type": null,
+            "pcie_slot_usage": null,
+            "phy_rows": [],
+            "temperature": null,
+            "unit": 0
+          },
+          "raw_id": "/dev/mpr0",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "host",
+          "kind": "host",
+          "label": "Synthetic CORE",
+          "metrics": {
+            "slot_count": 1
+          },
+          "raw": {},
+          "raw_id": "synthetic-core",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "pool:tank",
+          "kind": "pool",
+          "label": "tank",
+          "metrics": {},
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "vdev:tank/mirror-0",
+          "kind": "vdev",
+          "label": "mirror-0",
+          "metrics": {},
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        }
+      ],
+      "paths": [],
+      "platform": "core",
+      "raw": {
+        "command_failures": [],
+        "commands": [
+          "mprutil -u 0 show adapter",
+          "mprutil -u 0 show enclosures",
+          "mprutil -u 0 show expanders"
+        ],
+        "controller_read": {
+          "counts": {
+            "controllers": "complete",
+            "enclosures": "complete",
+            "expanders": "complete",
+            "paths": "complete"
+          },
+          "lists": {
+            "mpr0": {
+              "devices": "not_read",
+              "enclosures": "empty",
+              "expanders": "empty"
+            }
+          },
+          "rejected_units": 0,
+          "units": [
+            {
+              "controller": "mpr0",
+              "result": "read"
+            }
+          ],
+          "unread_phy_tables": 1
+        },
+        "mpr_kernel_events": {
+          "controllers": [],
+          "devices": [],
+          "event_count": 0
+        },
+        "mpr_sysctl_locations": {},
+        "path_counts": {},
+        "path_slots": {},
+        "pci_controllers": [],
+        "pcie_slots": [],
+        "selected_bay_slots": [
+          0
+        ],
+        "selected_disk_slots": [
+          0
+        ],
+        "selected_enclosure_keys": []
+      },
+      "selected_enclosure_id": null,
+      "selected_enclosure_label": null,
+      "snapshot_cache_state": "miss",
+      "source_cache_state": "miss",
+      "sources": {},
+      "system_id": "synthetic-core",
+      "system_label": "Synthetic CORE",
+      "traces": [
+        {
+          "alias": null,
+          "display_label": null,
+          "evidence": [
+            "inventory snapshot",
+            "multipath members",
+            "selected enclosure scope"
+          ],
+          "id": "bay:0",
+          "kind": "bay",
+          "label": "Bay 00",
+          "link_ids": [
+            "backplane-bay:backplane:0->bay:0:0",
+            "bay-pool:bay:0->pool:tank:0",
+            "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
+          ],
+          "metrics": {
+            "device_name": "da0",
+            "mpr_devices": [],
+            "path_states": [],
+            "pool_name": "tank",
+            "selected_enclosure_scope": true,
+            "vdev_name": "mirror-0"
+          },
+          "node_ids": [
+            "host",
+            "bay:0",
+            "backplane:0",
+            "pool:tank",
+            "vdev:tank/mirror-0"
+          ],
+          "slots": [
+            0
+          ]
+        }
+      ],
+      "warnings": [
+        "CORE PHY tables could not be read whole for 1 controller, so their linked PHY counts were not read."
+      ]
+    },
+    "slots": [
+      {
+        "attached_sas_address": null,
+        "column_index": 0,
+        "device_name": "da0",
+        "enclosure_id": null,
+        "enclosure_identifier": null,
+        "enclosure_label": null,
+        "enclosure_name": null,
+        "gptid": null,
+        "health": null,
+        "identify_active": false,
+        "identity_state": "known",
+        "last_smart_test_lifetime_hours": null,
+        "last_smart_test_status": null,
+        "last_smart_test_type": null,
+        "led_backend": null,
+        "led_reason": null,
+        "led_supported": false,
+        "logical_block_size": null,
+        "logical_unit_id": null,
+        "mapping_clear_revision": null,
+        "mapping_reason": null,
+        "mapping_revision": null,
+        "mapping_source": "unknown",
+        "mapping_supported": true,
+        "model": null,
+        "multipath": null,
+        "notes": null,
+        "operator_context": {},
+        "persistent_id_label": null,
+        "phy_identifier": null,
+        "physical_block_size": null,
+        "physical_location_known": true,
+        "pool_name": "tank",
+        "present": true,
+        "raw_status": {
+          "device_names": [
+            "da0"
+          ]
+        },
+        "row_index": 0,
+        "sas_address": null,
+        "scsi_hctl": null,
+        "search_text": "",
+        "serial": null,
+        "sg_device": null,
+        "size_bytes": null,
+        "size_human": null,
+        "slot": 0,
+        "slot_label": "00",
+        "smart_device_names": [],
+        "smart_device_type": null,
+        "ssh_ses_device": null,
+        "ssh_ses_element_id": null,
+        "ssh_ses_targets": [],
+        "state": "healthy",
+        "target_port_protocol": null,
+        "temperature_c": null,
+        "topology_label": null,
+        "transport_protocol": null,
+        "vdev_class": null,
+        "vdev_name": "mirror-0"
+      }
+    ]
+  },
+  "unparsed_lists": {
+    "fabric": {
+      "aliases": [],
+      "available": true,
+      "controllers": [
+        {
+          "acpi_handle": null,
+          "board": "Synthetic HBA",
+          "chip": null,
+          "device": "/dev/mpr0",
+          "firmware": "1.2.3",
+          "id": "controller:mpr0",
+          "iocfacts": {},
+          "name": "mpr0",
+          "path_counts": {},
+          "pci": null,
+          "pci_address": null,
+          "pci_device": null,
+          "pci_location": null,
+          "pci_parent": null,
+          "pci_vendor": null,
+          "pcie_slot": null,
+          "pcie_slot_type": null,
+          "pcie_slot_usage": null,
+          "phy_rows": [],
+          "related_slots": [],
+          "temperature": null,
+          "unit": 0
+        }
+      ],
+      "enclosures": [],
+      "expanders": [],
+      "links": [
+        {
+          "evidence": [
+            "profile slot layout"
+          ],
+          "id": "backplane-bay:backplane:0->bay:0:0",
+          "kind": "backplane-bay",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "backplane:0",
+          "status": null,
+          "target": "bay:0"
+        },
+        {
+          "evidence": [],
+          "id": "bay-pool:bay:0->pool:tank:0",
+          "kind": "bay-pool",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "bay:0",
+          "status": null,
+          "target": "pool:tank"
+        },
+        {
+          "evidence": [],
+          "id": "host-controller:host->controller:mpr0",
+          "kind": "host-controller",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "host",
+          "status": null,
+          "target": "controller:mpr0"
+        },
+        {
+          "evidence": [],
+          "id": "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
+          "kind": "pool-vdev",
+          "related_slots": [
+            0
+          ],
+          "reported_lanes": null,
+          "slot": 0,
+          "source": "pool:tank",
+          "status": null,
+          "target": "vdev:tank/mirror-0"
+        }
+      ],
+      "nodes": [
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "profile slot layout"
+          ],
+          "id": "backplane:0",
+          "kind": "backplane",
+          "label": "Backplane Zone 1",
+          "metrics": {
+            "slot_count": 1,
+            "slot_range": "Bays 00-00",
+            "zone": 1
+          },
+          "raw": {
+            "id": "backplane:0",
+            "index": 0,
+            "label": "Backplane Zone 1",
+            "range": "Bays 00-00",
+            "slots": [
+              0
+            ]
+          },
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "inventory snapshot"
+          ],
+          "id": "bay:0",
+          "kind": "bay",
+          "label": "Bay 00",
+          "metrics": {
+            "device_name": "da0",
+            "health": null,
+            "pool_name": "tank",
+            "present": true,
+            "vdev_name": "mirror-0"
+          },
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": 0,
+          "status": "healthy"
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "mprutil -u 0 show adapter"
+          ],
+          "id": "controller:mpr0",
+          "kind": "controller",
+          "label": "mpr0",
+          "metrics": {
+            "firmware": "1.2.3",
+            "kernel_diagnostics": {},
+            "linked_phy_count": null,
+            "path_counts": {},
+            "pci_address": null,
+            "pcie_slot": null,
+            "phy_count": null,
+            "temperature": null
+          },
+          "raw": {
+            "acpi_handle": null,
+            "board": "Synthetic HBA",
+            "chip": null,
+            "device": "/dev/mpr0",
+            "firmware": "1.2.3",
+            "iocfacts": {},
+            "name": "mpr0",
+            "path_counts": {},
+            "pci": null,
+            "pci_address": null,
+            "pci_device": null,
+            "pci_location": null,
+            "pci_parent": null,
+            "pci_vendor": null,
+            "pcie_slot": null,
+            "pcie_slot_type": null,
+            "pcie_slot_usage": null,
+            "phy_rows": [],
+            "temperature": null,
+            "unit": 0
+          },
+          "raw_id": "/dev/mpr0",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "host",
+          "kind": "host",
+          "label": "Synthetic CORE",
+          "metrics": {
+            "slot_count": 1
+          },
+          "raw": {},
+          "raw_id": "synthetic-core",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "pool:tank",
+          "kind": "pool",
+          "label": "tank",
+          "metrics": {},
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [],
+          "id": "vdev:tank/mirror-0",
+          "kind": "vdev",
+          "label": "mirror-0",
+          "metrics": {},
+          "raw": {},
+          "raw_id": null,
+          "related_slots": [
+            0
+          ],
+          "slot": null,
+          "status": null
+        }
+      ],
+      "paths": [],
+      "platform": "core",
+      "raw": {
+        "command_failures": [],
+        "commands": [
+          "mprutil -u 0 show adapter",
+          "mprutil -u 0 show enclosures",
+          "mprutil -u 0 show expanders"
+        ],
+        "controller_read": {
+          "counts": {
+            "controllers": "complete",
+            "enclosures": "partial",
+            "expanders": "partial",
+            "paths": "complete"
+          },
+          "lists": {
+            "mpr0": {
+              "devices": "not_read",
+              "enclosures": "unreadable",
+              "expanders": "unreadable"
+            }
+          },
+          "rejected_units": 0,
+          "units": [
+            {
+              "controller": "mpr0",
+              "result": "read"
+            }
+          ],
+          "unread_phy_tables": 0
+        },
+        "mpr_kernel_events": {
+          "controllers": [],
+          "devices": [],
+          "event_count": 0
+        },
+        "mpr_sysctl_locations": {},
+        "path_counts": {},
+        "path_slots": {},
+        "pci_controllers": [],
+        "pcie_slots": [],
+        "selected_bay_slots": [
+          0
+        ],
+        "selected_disk_slots": [
+          0
+        ],
+        "selected_enclosure_keys": []
+      },
+      "selected_enclosure_id": null,
+      "selected_enclosure_label": null,
+      "snapshot_cache_state": "miss",
+      "source_cache_state": "miss",
+      "sources": {},
+      "system_id": "synthetic-core",
+      "system_label": "Synthetic CORE",
+      "traces": [
+        {
+          "alias": null,
+          "display_label": null,
+          "evidence": [
+            "inventory snapshot",
+            "multipath members",
+            "selected enclosure scope"
+          ],
+          "id": "bay:0",
+          "kind": "bay",
+          "label": "Bay 00",
+          "link_ids": [
+            "backplane-bay:backplane:0->bay:0:0",
+            "bay-pool:bay:0->pool:tank:0",
+            "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
+          ],
+          "metrics": {
+            "device_name": "da0",
+            "mpr_devices": [],
+            "path_states": [],
+            "pool_name": "tank",
+            "selected_enclosure_scope": true,
+            "vdev_name": "mirror-0"
+          },
+          "node_ids": [
+            "host",
+            "bay:0",
+            "backplane:0",
+            "pool:tank",
+            "vdev:tank/mirror-0"
+          ],
+          "slots": [
+            0
+          ]
+        }
+      ],
+      "warnings": [
+        "CORE controller mpr0 did not return a readable expander or enclosure list, so those counts may be incomplete."
+      ]
+    },
+    "slots": [
+      {
+        "attached_sas_address": null,
+        "column_index": 0,
+        "device_name": "da0",
+        "enclosure_id": null,
+        "enclosure_identifier": null,
+        "enclosure_label": null,
+        "enclosure_name": null,
+        "gptid": null,
+        "health": null,
+        "identify_active": false,
+        "identity_state": "known",
+        "last_smart_test_lifetime_hours": null,
+        "last_smart_test_status": null,
+        "last_smart_test_type": null,
+        "led_backend": null,
+        "led_reason": null,
+        "led_supported": false,
+        "logical_block_size": null,
+        "logical_unit_id": null,
+        "mapping_clear_revision": null,
+        "mapping_reason": null,
+        "mapping_revision": null,
+        "mapping_source": "unknown",
+        "mapping_supported": true,
+        "model": null,
+        "multipath": null,
+        "notes": null,
+        "operator_context": {},
+        "persistent_id_label": null,
+        "phy_identifier": null,
+        "physical_block_size": null,
+        "physical_location_known": true,
         "pool_name": "tank",
         "present": true,
         "raw_status": {
@@ -1691,6 +2525,14 @@
             "expanders": "partial",
             "paths": "complete"
           },
+          "lists": {
+            "mpr0": {
+              "devices": "not_read",
+              "enclosures": "empty",
+              "expanders": "empty"
+            }
+          },
+          "rejected_units": 0,
           "units": [
             {
               "controller": "mpr0",
@@ -1700,7 +2542,8 @@
               "controller": "mpr1",
               "result": "unreadable"
             }
-          ]
+          ],
+          "unread_phy_tables": 0
         },
         "mpr_kernel_events": {
           "controllers": [],

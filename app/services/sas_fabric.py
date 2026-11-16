@@ -52,8 +52,10 @@ from app.services.sas_fabric_parsers import (
     _pciconf_bus_address as _pciconf_bus_address,
     _split_mpr_dmesg_timestamp as _split_mpr_dmesg_timestamp,
     _strip_syslog_kernel_prefix as _strip_syslog_kernel_prefix,
+    admit_mpr_unit_number,
     build_core_mprutil_unit_commands as build_core_mprutil_unit_commands,
     discover_mpr_units_from_adapter_summary,
+    rejected_mpr_summary_unit_tokens,
     parse_dmidecode_slots,
     parse_mpr_adapter_detail,
     parse_mpr_adapter_summary,
@@ -530,6 +532,8 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                     "phy_count": detail.get("phy_count"),
                     "linked_phy_count": detail.get("linked_phy_count"),
                     "kernel_diagnostics": _diagnostic_metric_summary(controller_diagnostics),
+                    # A PHY table that was seen but not read whole: "not read", not absent.
+                    **({"not_read": ["phy_count", "linked_phy_count"]} if detail.get("phy_table") == "rejected" else {}),
                 },
                 evidence=_dedupe_strings(controller_evidence),
                 raw={key: value for key, value in controller.items() if key not in {"id", "related_slots"}},
@@ -767,7 +771,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         if node.kind in {"mpr-enclosure", "ses-enclosure"}
     ]
 
-    unit_reads = _mpr_unit_read_results(normalized_outputs, unit_data, command_failures)
+    unit_reads, rejected_units = _mpr_unit_read_results(normalized_outputs, unit_data, command_failures)
     unread_units = [item["controller"] for item in unit_reads if item["result"] != "read"]
     if not unit_data and any(item["result"] == "unreadable" for item in unit_reads):
         fabric_warnings.append(
@@ -790,22 +794,45 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         missing_lists = _dedupe_strings([
             name
             for subcommand in ("expanders", "enclosures")
-            for name in _mpr_units_missing_list(normalized_outputs, unit_data, subcommand)
+            for name in _mpr_units_missing_list(unit_data, subcommand)
         ])
         if missing_lists:
             fabric_warnings.append(
-                f"CORE controller {_bounded_name_list(missing_lists)} did not return an expander or "
+                f"CORE controller {_bounded_name_list(missing_lists)} did not return a readable expander or "
                 "enclosure list, so those counts may be incomplete."
             )
+    if rejected_units:
+        fabric_warnings.append(
+            f"CORE mprutil listed {rejected_units} controller "
+            + ("unit that is not a unit number, so it was" if rejected_units == 1 else "units that are not unit numbers, so they were")
+            + " not read."
+        )
+    unread_tables = Counter(
+        node.kind
+        for node in nodes.values()
+        if node.kind in {"controller", "expander"} and {"phy_count", "linked_phys"} & set(node.metrics.get("not_read") or [])
+    )
+    if unread_tables:
+        phrase = " and ".join(
+            f"{unread_tables[kind]} {kind}{'' if unread_tables[kind] == 1 else 's'}"
+            for kind in ("controller", "expander")
+            if unread_tables[kind]
+        )
+        fabric_warnings.append(f"CORE PHY tables could not be read whole for {phrase}, so their linked PHY counts were not read.")
     controller_read = {
         "units": unit_reads,
         "counts": _mpr_count_completeness(
-            normalized_outputs,
             unit_data,
             unit_reads,
+            rejected_units=rejected_units,
             controllers_seen=bool(controller_names),
             paths_seen=bool(paths),
         ),
+        # Per read unit: whether each list reply was read, printed empty (a
+        # measured zero), unreadable, or not kept at all.
+        "lists": {_mpr_controller_name_for_unit(unit): dict(payload["lists"]) for unit, payload in sorted(unit_data.items())},
+        "rejected_units": rejected_units,
+        "unread_phy_tables": sum(unread_tables.values()),
     }
     # Without controller data the bays, pools and vdevs the inventory already
     # knows are still drawn; the warning above says what could not be read.
@@ -1785,13 +1812,14 @@ def _mpr_controller_ids_by_unit(controllers: list[dict[str, Any]]) -> dict[int, 
 
 
 def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
-    units: set[int] = set(discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", "")))
-    for command in outputs:
-        match = re.match(r"mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$", command)
-        if match:
-            units.add(int(match.group("unit")))
-
     summary_units = set(discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", "")))
+    units: set[int] = set(summary_units)
+    for command in outputs:
+        match = _MPR_UNIT_COMMAND_PATTERN.match(command)
+        unit = admit_mpr_unit_number(match.group("unit")) if match and match.group("unit") is not None else None
+        if unit is not None:
+            units.add(unit)
+
     parsed: dict[int, dict[str, Any]] = {}
     for unit in sorted(units):
         payload = _parse_mpr_unit_payload(outputs, f"mprutil -u {unit} show")
@@ -1809,13 +1837,39 @@ def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
 
 
 def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "adapter_detail": parse_mpr_adapter_detail(outputs.get(f"{prefix} adapter", "")),
         "devices": parse_mpr_devices(outputs.get(f"{prefix} devices", "")),
         "enclosures": parse_mpr_enclosures(outputs.get(f"{prefix} enclosures", "")),
         "expanders": parse_mpr_expanders(outputs.get(f"{prefix} expanders", "")),
         "iocfacts": parse_mpr_iocfacts(outputs.get(f"{prefix} iocfacts", "")),
     }
+    payload["lists"] = {
+        subcommand: _mpr_list_state(outputs.get(f"{prefix} {subcommand}"), subcommand, payload[subcommand])
+        for subcommand in _MPR_LIST_HEADINGS
+    }
+    return payload
+
+
+# mprutil prints a column heading before each list, even an empty one.
+_MPR_LIST_HEADINGS = {
+    "expanders": re.compile(r"(?i)(?:num\s*phys|phy\s+remotephy)\b"),
+    "enclosures": re.compile(r"(?i)slots\s+logical\s+id\b"),
+    "devices": re.compile(r"(?i)b_+t\b"),
+}
+
+
+def _mpr_list_state(text: str | None, subcommand: str, rows: list[Any]) -> str:
+    """read, empty (a measured zero), unreadable, or not_read when no reply was kept."""
+    if text is None:
+        return "not_read"
+    if rows:
+        return "read"
+    heading = _MPR_LIST_HEADINGS[subcommand]
+    if all(not line.strip() or heading.match(line.strip()) for line in text.splitlines()):
+        return "empty"
+    # Text that parses to nothing is not an empty list.
+    return "unreadable"
 
 
 def _mpr_unit_payload_observed(payload: dict[str, Any]) -> bool:
@@ -1835,8 +1889,10 @@ def _mpr_unit_payload_observed(payload: dict[str, Any]) -> bool:
     )
 
 
+# Every supported unit command, `show all` included. The unit token is
+# admitted separately (1 to 4 ASCII digits); anything else is a rejected unit.
 _MPR_UNIT_COMMAND_PATTERN = re.compile(
-    r"mprutil (?:-u (?P<unit>\d+) )?show (?P<subcommand>adapter|devices|enclosures|expanders|iocfacts)$"
+    r"mprutil (?:-u (?P<unit>\S+) )?show (?P<subcommand>adapter|all|devices|enclosures|expanders|iocfacts)$"
 )
 _MPR_READ_NAME_LIMIT = 8
 
@@ -1851,23 +1907,29 @@ def _mpr_unit_read_results(
     outputs: dict[str, str],
     unit_data: dict[int, dict[str, Any]],
     command_failures: list[dict[str, Any]] | None,
-) -> list[dict[str, str]]:
-    """One result per attempted controller unit: read, unreadable, no_output or command_failed.
+) -> tuple[list[dict[str, str]], int]:
+    """One result per attempted controller unit (read, unreadable, no_output or
+    command_failed), and how many unit tokens were rejected.
 
     A unit was attempted when the adapter summary lists it or one of its unit
     commands answered or failed. The unnumbered fallback counts only when no
     numbered unit was read, because only then is it consulted.
     """
+    summary = outputs.get("mprutil show adapters", "")
     attempted: dict[int, dict[str, bool]] = {
-        unit: {"text": False, "failed": False}
-        for unit in discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", ""))
+        unit: {"text": False, "failed": False} for unit in discover_mpr_units_from_adapter_summary(summary)
     }
+    rejected = rejected_mpr_summary_unit_tokens(summary)
 
     def note(command: str, *, text: bool, failed: bool) -> None:
         match = _MPR_UNIT_COMMAND_PATTERN.match(command)
         if not match:
             return
-        unit = int(match.group("unit")) if match.group("unit") is not None else _LEGACY_MPR_UNIT_KEY
+        token = match.group("unit")
+        unit = _LEGACY_MPR_UNIT_KEY if token is None else admit_mpr_unit_number(token)
+        if unit is None:
+            rejected.add(token)
+            return
         entry = attempted.setdefault(unit, {"text": False, "failed": False})
         entry["text"] = entry["text"] or text
         entry["failed"] = entry["failed"] or failed
@@ -1893,31 +1955,30 @@ def _mpr_unit_read_results(
         else:
             result = "no_output"
         results.append({"controller": _mpr_controller_name_for_unit(unit), "result": result})
-    return results
+    return results, len(rejected)
 
 
-def _mpr_units_missing_list(outputs: dict[str, str], unit_data: dict[int, dict[str, Any]], subcommand: str) -> list[str]:
-    """Read units whose `show <subcommand>` did not answer (failed or never ran)."""
-    missing: list[str] = []
-    for unit in sorted(unit_data):
-        prefix = "mprutil show" if unit == _LEGACY_MPR_UNIT_KEY else f"mprutil -u {unit} show"
-        if f"{prefix} {subcommand}" not in outputs:
-            missing.append(_mpr_controller_name_for_unit(unit))
-    return missing
+def _mpr_units_missing_list(unit_data: dict[int, dict[str, Any]], subcommand: str) -> list[str]:
+    """Read units whose `show <subcommand>` reply was not read (failed, never ran or unreadable)."""
+    return [
+        _mpr_controller_name_for_unit(unit)
+        for unit, payload in sorted(unit_data.items())
+        if payload["lists"][subcommand] not in {"read", "empty"}
+    ]
 
 
 def _mpr_count_completeness(
-    outputs: dict[str, str],
     unit_data: dict[int, dict[str, Any]],
     unit_reads: list[dict[str, str]],
     *,
+    rejected_units: int,
     controllers_seen: bool,
     paths_seen: bool,
 ) -> dict[str, str]:
     """complete, partial (a lower bound) or not_read for each controller-side count."""
     if not unit_data:
         mpr_state = "not_read"
-    elif any(item["result"] != "read" for item in unit_reads):
+    elif rejected_units or any(item["result"] != "read" for item in unit_reads):
         mpr_state = "partial"
     else:
         mpr_state = "complete"
@@ -1926,7 +1987,7 @@ def _mpr_count_completeness(
         if mpr_state != "complete":
             return mpr_state
         # A read unit whose list command did not answer leaves the count short.
-        return "partial" if _mpr_units_missing_list(outputs, unit_data, subcommand) else "complete"
+        return "partial" if _mpr_units_missing_list(unit_data, subcommand) else "complete"
 
     return {
         "controllers": "partial" if mpr_state == "not_read" and controllers_seen else mpr_state,
@@ -3262,6 +3323,8 @@ def _add_mpr_infrastructure(
     for unit, payload in sorted(unit_data.items()):
         controller_id = controller_ids_by_unit.get(unit, f"controller:{_mpr_controller_name_for_unit(unit)}")
         enclosure_counts = Counter(str(device.get("enclosure_handle") or "") for device in payload.get("devices") or [])
+        # A device count is a measurement only from a device list that was read.
+        devices_read = (payload.get("lists") or {}).get("devices") in {"read", "empty"}
         selected_enc_handles = {
             str(enclosure.get("enc_handle") or "")
             for enclosure in payload.get("enclosures") or []
@@ -3302,6 +3365,8 @@ def _add_mpr_infrastructure(
                         "linked_phys": expander.get("linked_phys"),
                         "num_phys": expander.get("num_phys"),
                         "sas_level": expander.get("sas_level"),
+                        # The expander header was read, so a missing count is a PHY table not read whole.
+                        **({"not_read": ["linked_phys"]} if expander.get("linked_phys") is None else {}),
                     },
                     evidence=[f"mprutil -u {unit} show expanders"] if unit >= 0 else ["mprutil show expanders"],
                     raw=raw,
@@ -3334,7 +3399,7 @@ def _add_mpr_infrastructure(
                 "id": enclosure_id,
                 "controller_id": controller_id,
                 "unit": unit,
-                "device_count": int(enclosure_counts.get(enc_handle, 0)),
+                "device_count": int(enclosure_counts.get(enc_handle, 0)) if devices_read else None,
                 "selected_enclosure_candidate": selected_candidate,
                 "fabric_scope": "selected_enclosure" if selected_candidate else "unscoped",
                 **enclosure,
@@ -3347,7 +3412,11 @@ def _add_mpr_infrastructure(
                     label=str(enclosure.get("logical_id") or enc_handle or "MPR enclosure"),
                     raw_id=str(enclosure.get("logical_id") or enc_handle or ""),
                     controller_id=controller_id,
-                    metrics={"slots": enclosure.get("slots"), "device_count": raw["device_count"]},
+                    metrics={
+                        "slots": enclosure.get("slots"),
+                        "device_count": raw["device_count"],
+                        **({} if devices_read else {"not_read": ["device_count"]}),
+                    },
                     evidence=[f"mprutil -u {unit} show enclosures"] if unit >= 0 else ["mprutil show enclosures"],
                     raw=raw,
                 ),

@@ -2414,11 +2414,13 @@
     return String(value);
   }
 
+  // A metric the producer lists in `not_read` was not read: say so, never omit it or show 0.
   function sasFabricMetricRows(metrics, labels = {}) {
+    const notRead = new Set(sasFabricList(metrics?.not_read));
     return Object.entries(metrics || {})
-      .filter(([, value]) => value !== null && value !== undefined && value !== "" && !Array.isArray(value))
+      .filter(([key, value]) => notRead.has(key) || (value !== null && value !== undefined && value !== "" && !Array.isArray(value)))
       .slice(0, 8)
-      .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), formatSasFabricValue(value)))
+      .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), notRead.has(key) ? "not read" : formatSasFabricValue(value)))
       .join("");
   }
 
@@ -2541,16 +2543,24 @@
     `;
   }
 
-  function renderSasFabricCompactNodes(nodes, limit = 8, expandKey = null) {
+  function renderSasFabricCompactNodes(nodes, limit = 8, expandKey = null, emptyText = "No objects reported") {
     const all = sasFabricList(nodes);
     if (!all.length) {
-      return '<span class="sas-fabric-empty-note">No objects reported</span>';
+      return `<span class="sas-fabric-empty-note">${escapeHtml(emptyText)}</span>`;
     }
     // Without a key there is no toggle to reach the rest, so show every node.
     const capped = Boolean(expandKey) && all.length > limit;
     const visible = capped && !sasFabricListExpanded(expandKey) ? all.slice(0, limit) : all;
     const buttons = visible.map((node) => renderSasFabricNodeButton(node, { meta: sasFabricNodeMeta(node) || node.raw_id || formatSasFabricKind(node.kind), extra: "sas-fabric-compact-node" })).join("");
     return `${buttons}${capped ? renderSasFabricExpandToggle(expandKey, all.length - limit) : ""}`;
+  }
+
+  // An empty lane list is "No objects reported" only when that list was read.
+  function sasFabricLaneListEmptyText(fabric, controllerName, listName) {
+    const read = fabric?.raw?.controller_read;
+    if (!read) return "No objects reported";
+    const state = read.lists?.[controllerName]?.[listName];
+    return state === "read" || state === "empty" ? "No objects reported" : "Not read";
   }
 
   function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
@@ -2601,11 +2611,11 @@
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Transport Detail" : "Expanders"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6, `expanders:${controllerId}`)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6, `expanders:${controllerId}`, sasFabricLaneListEmptyText(fabric, controllerName, "expanders"))}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Enclosures / Views" : "SES / MPR Enclosures"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6, `enclosures:${controllerId}`)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6, `enclosures:${controllerId}`, sasFabricLaneListEmptyText(fabric, controllerName, "enclosures"))}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Mapped Bays" : "Impacted Bays"}</div>
