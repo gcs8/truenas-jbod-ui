@@ -45,6 +45,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
 - Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
   When days are not reported it shows the reported hours, and leaves the
   value out when neither is known; a reported zero still shows (#1234).

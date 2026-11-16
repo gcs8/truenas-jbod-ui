@@ -115,6 +115,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
     "tests.test_history_released_schema_upgrades",
+    "tests.test_ipmi_duplicate_bays",
     "tests.test_logging_config",
     "tests.test_nonroot_cli",
     "tests.test_parsers",
