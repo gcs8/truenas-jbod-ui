@@ -13,16 +13,19 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import AsyncMock
 
-from app.config import Settings, SystemConfig
-from app.models.domain import SlotView, SmartSummaryView
+from app.config import Settings, SystemConfig, TrueNASConfig
+from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
+from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     parse_nvme_id_ctrl_summary,
     parse_nvme_id_ns_summary,
     parse_nvme_smart_log_summary,
     parse_smartctl_summary,
 )
+from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.ssh_probe import SSHCommandResult
 
@@ -1137,11 +1140,12 @@ class NegativePowerOnTimeTests(unittest.TestCase):
 class RefusedPowerOnStoreTests(unittest.TestCase):
     """A refused power-on time survives the slot-detail store and every stored reader.
 
-    The refusal is written down as the lifetime names in ``unread_fields``; it
-    replaces the last-good lifetime the way a reading does, and a later real
-    reading clears it. Every reader that rebuilds a summary from the store,
-    including the one used while the layout cannot be resolved, refuses a
-    stored negative power-on time.
+    When the entry writer is given the refusal, it writes it down as the
+    lifetime names in ``unread_fields``; it replaces the last-good lifetime the
+    way a reading does, and a later real reading clears it. Every reader that
+    rebuilds a summary from the store, including the one used while the layout
+    cannot be resolved, refuses a stored negative power-on time. Whether the
+    live loader saves a summary at all is pinned in ``LiveRefusedPowerOnTests``.
     """
 
     UNREAD = ["power_on_days", "power_on_hours"]
@@ -1226,7 +1230,10 @@ class RefusedPowerOnStoreTests(unittest.TestCase):
                 self.assertEqual(self._lifetime(summary), (None, None, self.UNREAD))
                 self.assertEqual(summary.firmware_version, "FW01")
 
-    def test_refused_power_on_time_alone_is_written_and_read_back(self) -> None:
+    def test_the_writer_alone_records_a_refused_power_on_time_with_no_other_value(self) -> None:
+        # The entry writer on its own. The live loader never hands it this
+        # unavailable summary, so nothing is saved on that path (see
+        # LiveRefusedPowerOnTests).
         entry = self._write(powerOnHours=-1)
         self.assertEqual(entry.smart_fields, {"unread_fields": self.UNREAD, "available": False})
         self.assertIsNotNone(entry.smart_updated_at)
@@ -1293,6 +1300,129 @@ class RefusedPowerOnStoreTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [None, None, self.UNREAD, "FW01"])
+
+
+class LiveRefusedPowerOnTests(unittest.IsolatedAsyncioTestCase):
+    """The public SMART summary request on a QuantaStor system, with a real store.
+
+    An observation that yields no usable SMART value is unavailable: it is not
+    cached as a reading and it is not saved, so the slot-detail entry from an
+    earlier read stays. A reply whose only value is a refused power-on time is
+    such an observation, like a reply with no SMART values at all. A refused
+    power-on time beside another value is a reading and replaces the entry.
+    Every request and every reader below uses a new service and a new store
+    object on the same file, so nothing is shared in memory.
+    """
+
+    UNREAD = ["power_on_days", "power_on_hours"]
+    SERIAL = "SYNTHETIC-SERIAL"
+    REFUSED_ONLY = "QuantaStor reports this disk but no SMART counters. Its power-on time was reported but not read."
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.path = self.directory / "slot-details.json"
+
+    def _slot(self, **disk: object) -> SlotView:
+        return SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="enc-1",
+                        present=True, serial=self.SERIAL, raw_status={"disk_raw": disk})
+
+    def _service(self) -> InventoryService:
+        system = SystemConfig(id="synthetic", truenas=TrueNASConfig(platform="quantastor"))
+        settings = Settings()
+        return InventoryService(
+            settings, system, AsyncMock(), AsyncMock(), None,
+            MappingStore(str(self.directory / "slot-mappings.json")), ProfileRegistry(settings),
+            SlotDetailStore(str(self.path)),
+        )
+
+    async def _request(self, **disk: object) -> tuple[InventoryService, SmartSummaryView]:
+        service = self._service()
+        service.get_snapshot = AsyncMock(return_value=InventorySnapshot(
+            slots=[self._slot(**disk)], refresh_interval_seconds=30, selected_enclosure_id="enc-1",
+        ))
+        return service, await service.get_slot_smart_summary(0, selected_enclosure_id="enc-1")
+
+    def _stored(self) -> SlotDetailCacheEntry | None:
+        return SlotDetailStore(str(self.path)).get_entry("synthetic", "enc-1", 0)
+
+    def _readers(self) -> dict[str, tuple | None]:
+        summaries = {
+            "rebuild": self._service()._build_persisted_smart_summary(self._slot()),
+            "no-layout": self._service().get_cached_slot_smart_summary_without_layout(0, "enc-1"),
+            "no-layout-batch": self._service().get_cached_slot_smart_summaries_without_layout(
+                [0, 1], "enc-1",
+            ).get(0),
+        }
+        return {
+            reader: None if summary is None
+            else (summary.power_on_hours, summary.power_on_days, summary.unread_fields)
+            for reader, summary in summaries.items()
+        }
+
+    async def _store_100_hours(self) -> SlotDetailCacheEntry:
+        _service, first = await self._request(smartHealthTest="PASSED", powerOnHours=100)
+        self.assertEqual((first.available, first.power_on_hours, first.power_on_days), (True, 100, 4))
+        entry = self._stored()
+        self.assertEqual((entry.smart_fields.get("power_on_hours"), entry.smart_fields.get("power_on_days")),
+                         (100, 4))
+        return entry
+
+    def _assert_refused_only_answer(self, service: InventoryService, summary: SmartSummaryView) -> None:
+        self.assertFalse(summary.available)
+        self.assertEqual(summary.message, self.REFUSED_ONLY)
+        self.assertEqual((summary.power_on_hours, summary.power_on_days, summary.unread_fields),
+                         (None, None, self.UNREAD))
+        self.assertEqual(service._smart_cache, {})
+
+    async def test_a_refused_only_reply_leaves_the_earlier_saved_lifetime(self) -> None:
+        before = await self._store_100_hours()
+        service, live = await self._request(powerOnHours=-1)
+        self._assert_refused_only_answer(service, live)
+        after = self._stored()
+        self.assertEqual(after.smart_fields, before.smart_fields)
+        self.assertNotIn("unread_fields", after.smart_fields)
+        self.assertEqual((after.smart_updated_at, after.smart_stale), (before.smart_updated_at, False))
+        for reader, lifetime in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(lifetime, (100, 4, []))
+
+    async def test_a_refused_only_reply_with_no_earlier_entry_saves_no_smart_fields(self) -> None:
+        service, live = await self._request(powerOnHours=-1)
+        self._assert_refused_only_answer(service, live)
+        entry = self._stored()
+        self.assertEqual({} if entry is None else entry.smart_fields, {})
+        for reader, lifetime in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertIsNone(lifetime)
+
+    async def test_a_refused_power_on_time_beside_a_health_result_replaces_the_saved_lifetime(self) -> None:
+        await self._store_100_hours()
+        service, live = await self._request(smartHealthTest="PASSED", powerOnHours=-1)
+        self.assertEqual((live.available, live.smart_health_status), (True, "PASSED"))
+        self.assertEqual((live.power_on_hours, live.power_on_days, live.unread_fields), (None, None, self.UNREAD))
+        self.assertTrue(service._smart_cache)
+        after = self._stored()
+        self.assertEqual(after.smart_fields, {"unread_fields": self.UNREAD, "available": True})
+        self.assertFalse(after.smart_stale)
+        for reader, lifetime in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(lifetime, (None, None, self.UNREAD))
+
+    async def test_a_reply_with_no_smart_values_leaves_the_earlier_saved_entry(self) -> None:
+        before = await self._store_100_hours()
+        service, live = await self._request()
+        self.assertFalse(live.available)
+        self.assertEqual(live.message, "QuantaStor reports this disk but no SMART counters.")
+        self.assertEqual((live.power_on_hours, live.power_on_days), (None, None))
+        self.assertEqual(service._smart_cache, {})
+        after = self._stored()
+        self.assertEqual(after.smart_fields, before.smart_fields)
+        self.assertEqual((after.smart_updated_at, after.smart_stale), (before.smart_updated_at, False))
+        for reader, lifetime in self._readers().items():
+            with self.subTest(reader=reader):
+                self.assertEqual(lifetime, (100, 4, []))
 
 
 if __name__ == "__main__":

@@ -151,9 +151,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   longer falls back to 512 bytes, and an invalid NVMe rotation rate is no
   longer shown as SSD. A power-on time that is a negative whole number after
   the existing conversion, from QuantaStor or from a saved slot-detail entry,
-  is not read either; the saved slot-detail cache keeps that refusal, and a
-  QuantaStor disk that reports nothing else says its power-on time was not
-  read. Disk and storage-view details
+  is not read either; when the disk also reported another SMART value, the
+  saved slot-detail cache keeps that refusal, and a QuantaStor disk that
+  reports nothing else says its power-on time was not read. Disk and
+  storage-view details
   and the SMART tooltip (live and in the saved HTML copy), the live heat map
   tooltip and Storage
   Fabric show `not read` for such a field
