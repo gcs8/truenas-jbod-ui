@@ -123,9 +123,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `sudo` options, the enclosure sysfs map read once for each SES device, and
   the SES overlay that merged each SES device into everything merged before it
   no longer cost the square of their size. The work of each parser named here
-  now grows linearly with its output, and well-formed output parses as before,
-  including the SES shelves, bays and locate targets shown and the host chosen
-  when several hosts read the same shelves. With redundant paths to a shelf,
+  now grows linearly with its output, except the SES merge for one enclosure
+  reached over many paths, which costs what it did before and is tracked
+  separately. Well-formed output parses as before, including the SES shelves,
+  bays and locate targets shown and the host chosen when several hosts read
+  the same shelves. With redundant paths to a shelf,
   an empty bay and different element numbering on the paths, a bay can still
   be merged into its neighbour, as before; that is tracked separately. An
   operation name or a run of CDB bytes too long to be real is not decoded; a
