@@ -492,6 +492,7 @@ STABLE_SLOT_DETAIL_FIELDS = (
 # device_name is likewise a reusable alias.
 STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
 SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
+POWER_ON_FIELDS = ("power_on_days", "power_on_hours")
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -513,10 +514,13 @@ STABLE_SMART_DETAIL_FIELDS = (
 # smartctl exit metadata describes the read, not a SMART measurement, so it
 # must not make a summary count as available (#1171).
 SMART_SUMMARY_READ_METADATA_FIELDS = frozenset({"smartctl_exit_status", "smartctl_status_flags"})
+# Names of fields a source reported but could not read: evidence about the
+# read, never a reading, so it neither makes a summary available nor persists.
+SMART_SUMMARY_UNREAD_FIELD = "unread_fields"
 SMART_SUMMARY_VALUE_FIELDS = tuple(
     field_name
     for field_name in SmartSummaryView.model_fields
-    if field_name not in {"available", "message", *SMART_SUMMARY_READ_METADATA_FIELDS}
+    if field_name not in {"available", "message", SMART_SUMMARY_UNREAD_FIELD, *SMART_SUMMARY_READ_METADATA_FIELDS}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
@@ -6587,7 +6591,7 @@ class InventoryService:
             return None
         return self._merge_smart_summary(
             slot_view,
-            SmartSummaryView.model_validate(entry.smart_fields),
+            self._stored_smart_summary(entry.smart_fields),
         )
 
     def _build_slot_detail_entry(
@@ -6640,6 +6644,11 @@ class InventoryService:
                 if self._slot_detail_field_missing(value):
                     continue
                 smart_fields[field_name] = value
+            # A refused lifetime is a read that happened: write its names down.
+            refused = [name for name in POWER_ON_FIELDS
+                       if name in smart_summary.unread_fields and getattr(smart_summary, name) is None]
+            if refused:
+                smart_fields["unread_fields"] = refused
             if smart_fields:
                 smart_fields["available"] = smart_summary.available
                 smart_updated_at = utcnow().isoformat()
@@ -7487,7 +7496,7 @@ class InventoryService:
             persisted = None
             if entry is not None and entry.smart_fields:
                 try:
-                    persisted = SmartSummaryView.model_validate(entry.smart_fields)
+                    persisted = self._stored_smart_summary(entry.smart_fields)
                 except (TypeError, ValueError):
                     pass
             if persisted is not None:
@@ -8545,9 +8554,11 @@ class InventoryService:
                 # producer payload before any supplement can reach the cache.
                 try:
                     raw = json.loads(result.stdout)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
+                    # The parser below reports the same payload as unavailable.
                     raw = None
-                serial = normalize_text(raw.get("sn")) if isinstance(raw, dict) else None
+                sn = raw.get("sn") if isinstance(raw, dict) else None
+                serial = normalize_text(sn) if isinstance(sn, str) else None
                 expected_serial = normalize_text(slot_view.serial)
                 if expected_serial and serial and expected_serial.lower() != serial.lower():
                     raise _SmartIdentityConflict()
@@ -12958,6 +12969,7 @@ class InventoryService:
                 else "SMART data comes from QuantaStor."
             ),
         )
+        self._refuse_negative_power_on(summary)
         if not any(
             value is not None
             for value in (
@@ -12971,10 +12983,13 @@ class InventoryService:
                 summary.transport_protocol,
             )
         ):
-            return self._fallback_smart_summary(
+            fallback = self._fallback_smart_summary(
                 slot_view,
-                "QuantaStor reports this disk but no SMART counters.",
+                "QuantaStor reports this disk but no SMART counters."
+                + (" Its power-on time was reported but not read." if summary.unread_fields else ""),
             )
+            fallback.unread_fields = summary.unread_fields
+            return fallback
         return summary
 
     @staticmethod
@@ -18219,9 +18234,10 @@ class InventoryService:
         else:
             try:
                 raw = json.loads(payload)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                # The parser above reports the same payload as unavailable.
                 raw = None
-            if isinstance(raw, dict):
+            if isinstance(raw, dict) and isinstance(raw.get("serial_number"), str):
                 serial = normalize_text(raw.get("serial_number"))
         expected_serial = normalize_text(slot_view.serial)
         if (expected_serial and serial and expected_serial.lower() != serial.lower()) or (
@@ -18258,7 +18274,32 @@ class InventoryService:
         summary.available = summary.available or any(
             getattr(summary, field_name) is not None for field_name in SMART_SUMMARY_VALUE_FIELDS
         )
+        InventoryService._prune_unread_smart_fields(summary)
         return summary
+
+    @staticmethod
+    def _stored_smart_summary(smart_fields: Mapping[str, Any]) -> SmartSummaryView:
+        """Rebuild a stored SMART half; only a refused lifetime is stored as not read."""
+        summary = SmartSummaryView.model_validate(smart_fields)
+        summary.unread_fields = [name for name in summary.unread_fields if name in POWER_ON_FIELDS]
+        InventoryService._prune_unread_smart_fields(summary)
+        return InventoryService._refuse_negative_power_on(summary)
+
+    @staticmethod
+    def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:
+        """A negative power-on time is not a reading: drop it and name it not read."""
+        for name in POWER_ON_FIELDS:
+            if (getattr(summary, name) or 0) < 0:
+                setattr(summary, name, None)
+                summary.unread_fields = sorted({*summary.unread_fields, name})
+        return summary
+
+    @staticmethod
+    def _prune_unread_smart_fields(summary: SmartSummaryView) -> None:
+        """Keep only "not read" names whose field still has no reading."""
+        summary.unread_fields = sorted(
+            {name for name in summary.unread_fields if getattr(summary, name, None) is None}
+        )
 
     @staticmethod
     def _normalize_smart_transport_value(value: str | None) -> str | None:
@@ -18422,6 +18463,10 @@ class InventoryService:
         for field_name in (*SMART_SUMMARY_VALUE_FIELDS, *SMART_SUMMARY_READ_METADATA_FIELDS):
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
+        # A field either source could not read stays "not read" until one of
+        # them supplies a reading for it.
+        primary.unread_fields = [*primary.unread_fields, *supplement.unread_fields]
+        InventoryService._prune_unread_smart_fields(primary)
 
         primary.available = primary.available or supplement.available
         if not primary.message and supplement.message:
