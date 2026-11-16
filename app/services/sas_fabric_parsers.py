@@ -40,7 +40,7 @@ def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
 def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
     malformed_phy_rows = 0
-    discovering_phys = 0
+    discovering_phys: list[int] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -48,7 +48,7 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
         if stripped == "Discovery still in progress":
             # mprutil prints this in place of the row of a PHY still being
             # discovered and goes on; it holds that PHY's place, adds no row.
-            discovering_phys += 1
+            discovering_phys.append(len(detail["phy_rows"]) + len(discovering_phys))
             continue
         if stripped.endswith("Adapter:"):
             detail["name"] = stripped.removesuffix(" Adapter:")
@@ -94,9 +94,9 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     # Counts come only from a PHY table that was read whole. No table, a
     # malformed row, a repeated PHY number or a gap in the PHY numbers
     # (0 to n-1, as mprutil lists them) leaves both counts unknown. A PHY
-    # still in discovery fills its gap; the printed rows are what is counted.
-    phy_numbers = [int(row["phy"]) for row in rows]
-    table_size = len(rows) + discovering_phys
+    # still in discovery fills only its own position; printed rows are counted.
+    phy_numbers = [int(row["phy"]) for row in rows] + discovering_phys
+    table_size = len(phy_numbers)
     if (
         table_size
         and not malformed_phy_rows
@@ -164,10 +164,10 @@ def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:
             continue
         parts = stripped.split()
         # mprutil prints the SEP handle as blanks for an enclosure that is not
-        # an SES device, so such a row has one handle before its type.
+        # an SES device; only those printed columns make a one-handle row.
         sep_handle = parts[2] if len(parts) >= 5 and re.fullmatch(r"[0-9a-fA-F]{4}", parts[3]) else None
         handles = 2 if sep_handle else 1
-        if len(parts) < 3 + handles or not re.fullmatch(r"[0-9a-fA-F]{4}", parts[1 + handles]):
+        if not sep_handle and not _MPR_ENCLOSURE_BLANK_SEP.match(line):
             continue
         rows.append(
             {
@@ -179,6 +179,10 @@ def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:
             }
         )
     return rows
+
+
+# "  %.2d    %08x%08x    %s       %04x     %s" with a four-blank SEP column.
+_MPR_ENCLOSURE_BLANK_SEP = re.compile(r"^\s*\d+ {4}[0-9a-fA-F]{16} {15}[0-9a-fA-F]{4} {5}\S")
 
 
 def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:

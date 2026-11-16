@@ -860,6 +860,84 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
                 self.assertEqual(fabric.warnings, [warning])
 
 
+PHY_TABLE_WARNING = "CORE PHY tables could not be read whole for 1 controller, so their linked PHY counts were not read."
+UTILITY_ERROR = "mprutil: Error retrieving enclosure page: Input/output error\n"
+
+
+class CoreFabricShapeAdmissionTests(unittest.TestCase):
+    """A reply shape is admitted only by its own structure; anything else leaves that list or table not read."""
+
+    def partial(self, outputs: dict[str, str], warning: str):
+        fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        self.assertIn(warning, fabric.warnings)
+        return fabric
+
+    def test_enclosure_row_that_lost_its_type_is_not_read(self) -> None:
+        truncated = _printed_enclosure().replace("0010     External SES-2", "0010")
+        # A one-handle row is read only at mprutil's printed columns.
+        for text in (truncated, f"01 {SELECTED_ENCLOSURE} 0010 Unknown\n", _printed_enclosure(BLANK_HANDLE, "")):
+            with self.subTest(text):
+                self.assertEqual(parse_mpr_enclosures(text), [])
+        for name, outputs in {
+            "dedicated": {**_healthy_unit(), "mprutil -u 0 show enclosures": truncated},
+            "show all": {"mprutil -u 0 show all": _show_all().replace(_printed_enclosure(), truncated)},
+        }.items():
+            with self.subTest(name):
+                fabric = self.partial(outputs, LISTS_MISSING_WARNING)
+                read = fabric.raw["controller_read"]
+                self.assertEqual(read["lists"]["mpr0"]["enclosures"], "unreadable")
+                self.assertEqual(read["counts"]["enclosures"], "partial")
+                # No enclosure appears that the reply did not print.
+                self.assertEqual([node.id for node in fabric.nodes if node.kind == "mpr-enclosure"], [])
+        # Controls: every blank-SEP type mprutil prints still reads, with its own handle and type.
+        for kind in ("Unknown", "Direct Attached SGPIO", "Expander SGPIO", "Direct Attached GPIO"):
+            with self.subTest(kind):
+                [parsed] = parse_mpr_enclosures(_printed_enclosure(BLANK_HANDLE, kind))
+                self.assertEqual((parsed["sep_handle"], parsed["enc_handle"], parsed["type"]), (None, "0010", kind))
+
+    def test_utility_error_in_a_show_all_section_leaves_it_not_read(self) -> None:
+        with self.subTest("enclosures"):
+            enclosure_failed = _show_all().replace("Expanders:\n", UTILITY_ERROR + "Expanders:\n")
+            fabric = self.partial({"mprutil -u 0 show all": enclosure_failed}, LISTS_MISSING_WARNING)
+            read = fabric.raw["controller_read"]
+            self.assertEqual(read["lists"]["mpr0"]["enclosures"], "not_read")
+            self.assertEqual(read["counts"]["enclosures"], "partial")
+            self.assertEqual(read["lists"]["mpr0"]["expanders"], "read")
+        with self.subTest("adapter"):
+            # An error after the PHY rows leaves the adapter's PHY table not read.
+            adapter_failed = _show_all().replace("Devices:\n", "mprutil: Error retrieving SAS IO Unit page 0\nDevices:\n", 1)
+            fabric = self.partial({"mprutil -u 0 show all": adapter_failed}, PHY_TABLE_WARNING)
+            [controller] = [node.metrics for node in fabric.nodes if node.kind == "controller"]
+            self.assertEqual((controller["phy_count"], controller.get("not_read")), (None, ["phy_count", "linked_phy_count"]))
+        # Control: an unmodelled line in a section keeps its current treatment.
+        noted = _show_all().replace("Expanders:\n", "synthetic notice text\nExpanders:\n")
+        fabric = _core_fabric({"mprutil -u 0 show all": noted}, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+        self.assertEqual((fabric.warnings, fabric.raw["controller_read"]["lists"]["mpr0"]["enclosures"]), ([], "read"))
+
+    def test_any_column_zero_label_ends_the_previous_section(self) -> None:
+        other_device = f"00   11    5{4:015x} 000c    000a      SAS Target    12    0010 01    1\n"
+        for label in ("Other:", "Other1:", "Other_Section:", "other:", "Other Section:"):
+            with self.subTest(label):
+                text = _show_all().replace("Enclosures:\n", f"{label}\n{DEVICES_HEADING}{other_device}\nEnclosures:\n")
+                fabric = _core_fabric({"mprutil -u 0 show all": text}, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
+                # The unknown label's row is never counted.
+                self.assertEqual([n.metrics["device_count"] for n in fabric.nodes if n.kind == "mpr-enclosure"], [1])
+                self.assertEqual(fabric.warnings, [])
+
+    def test_discovery_line_stands_for_the_phy_at_its_own_position(self) -> None:
+        rows = _printed_adapter([]).replace("Device\n\n", "Device\n{rows}\n")
+        for name, table in {
+            "gap before a trailing line": _adapter_phy_row(0, attached=True) + _adapter_phy_row(2, attached=True)
+            + "Discovery still in progress\n",
+            "line before the PHY it displaced": "Discovery still in progress\n" + _adapter_phy_row(0, attached=True)
+            + _adapter_phy_row(1, attached=True),
+        }.items():
+            with self.subTest(name):
+                detail = parse_mpr_adapter_detail(rows.format(rows=table))
+                self.assertEqual((detail["phy_count"], detail["phy_table"]), (None, "rejected"))
+                self.partial({**_healthy_unit(), "mprutil -u 0 show adapter": rows.format(rows=table)}, PHY_TABLE_WARNING)
+
+
 if __name__ == "__main__":
     import sys
 

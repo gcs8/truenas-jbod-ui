@@ -1850,6 +1850,9 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
         "expanders": parse_mpr_expanders(replies["expanders"] or ""),
         "iocfacts": parse_mpr_iocfacts(replies["iocfacts"] or ""),
     }
+    if replies["adapter"] is None and "adapter" in sections:
+        # The utility reported an error in this section: its PHY table was not read.
+        payload["adapter_detail"]["phy_table"] = "rejected"
     payload["lists"] = {
         subcommand: _mpr_list_state(replies[subcommand], subcommand, payload[subcommand])
         for subcommand in _MPR_LIST_HEADINGS
@@ -1860,23 +1863,38 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
 # `mprutil show all` prints these labels, each alone on a line, before the
 # reply of the command it runs. Text under any other label is not read.
 _MPR_SHOW_ALL_SECTIONS = {"Adapter:": "adapter", "Devices:": "devices", "Enclosures:": "enclosures", "Expanders:": "expanders"}
-_MPR_SHOW_ALL_LABEL = re.compile(r"[A-Z][A-Za-z]*:")
+# Any column-0 line ending in a colon ends a section, except the adapter
+# reply's own "mpr0 Adapter:" name line.
+_MPR_SHOW_ALL_LABEL = re.compile(r"\S.*:")
+_MPR_ADAPTER_NAME_LINE = re.compile(r"\S+ Adapter:")
+# mprutil's warn() lines: "mprutil: Error retrieving enclosure page: ...".
+_MPR_UTILITY_ERROR = re.compile(r"mp[rs]util: ")
 
 
-def _split_mpr_show_all(text: str) -> dict[str, str]:
+def _split_mpr_show_all(text: str) -> dict[str, str | None]:
     sections: dict[str, list[str]] = {}
+    failed: set[str] = set()
     current: str | None = None
     for line in text.splitlines():
+        if current is not None and _MPR_UTILITY_ERROR.match(line.strip()):
+            failed.add(current)
+            continue
         # Labels start at column 0; indented `Key:` lines belong to a reply.
-        if _MPR_SHOW_ALL_LABEL.fullmatch(line.rstrip()):
-            current = _MPR_SHOW_ALL_SECTIONS.get(line.rstrip())
+        label = line.rstrip()
+        if _MPR_SHOW_ALL_LABEL.fullmatch(label) and not (current == "adapter" and _MPR_ADAPTER_NAME_LINE.fullmatch(label)):
+            current = _MPR_SHOW_ALL_SECTIONS.get(label)
             if current is not None:
                 sections.setdefault(current, [])
             continue
         if current is not None:
             sections[current].append(line)
-    # A label with nothing under it is a command that printed nothing: not read.
-    return {name: "\n".join(lines) + "\n" for name, lines in sections.items() if any(line.strip() for line in lines)}
+    # A label with nothing under it is a command that printed nothing, and a
+    # section the utility reported an error in was not read whole: not read.
+    return {
+        name: None if name in failed else "\n".join(lines) + "\n"
+        for name, lines in sections.items()
+        if name in failed or any(line.strip() for line in lines)
+    }
 
 
 # mprutil prints a column heading before each list, even an empty one.

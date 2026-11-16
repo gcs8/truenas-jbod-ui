@@ -91,7 +91,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   supported `mprutil -u N` command, `show all` included, counts its unit as
   attempted, and a `show all` reply is read through its `Adapter:`,
   `Devices:`, `Enclosures:` and `Expanders:` sections (a dedicated reply for
-  the same list wins); a unit that could not be read is named in a warning
+  the same list wins, and a section in which `mprutil` printed an error is
+  not read); a unit that could not be read is named in a warning
   and keeps the view partial, and a unit number that is not 1 to 4 digits is
   rejected and counted, never shown. An adapter or expander PHY table that
   was not read whole (missing, short, malformed or repeated rows) shows its
