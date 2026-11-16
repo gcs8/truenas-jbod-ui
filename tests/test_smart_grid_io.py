@@ -1090,20 +1090,28 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             # proof it fetched fresh data, so check the live read and the cached
             # value before any second request (#1209).
             #
-            # The scheduled refresh is the real task, but it waits at its first
-            # step until the request has answered and been checked. A request
-            # that waited for it would never answer, and the store trace around
-            # the request sees only the request's own file operations.
+            # The scheduled refresh starts at its real time, while the loader that
+            # served the stored answer is still registered, so it must start its
+            # own live read rather than take that answer. Only that live read
+            # waits, before its first store read, until the request has answered
+            # and been checked: a request that waited for it would never answer,
+            # and the store trace around the request sees only its own files.
             release = asyncio.Event()
-            parked = []
-            refresh = service._background_refresh_smart_summary
+            refreshes, live_loads = [], []
+            refresh, load = service._background_refresh_smart_summary, service._run_smart_loader
 
-            async def refresh_when_released(*args, **kwargs):
-                parked.append(args)
-                await release.wait()
+            async def counted_refresh(*args, **kwargs):
+                refreshes.append(args)
                 await refresh(*args, **kwargs)
 
-            with patch.object(service, "_background_refresh_smart_summary", refresh_when_released), \
+            async def live_load_when_released(*args, **kwargs):
+                if not kwargs["allow_stale_cache"]:
+                    live_loads.append(args)
+                    await release.wait()
+                return await load(*args, **kwargs)
+
+            with patch.object(service, "_background_refresh_smart_summary", counted_refresh), \
+                 patch.object(service, "_run_smart_loader", live_load_when_released), \
                  patch.object(service, "_schedule_background_smart_refresh",
                               wraps=service._schedule_background_smart_refresh) as scheduled:
                 try:
@@ -1121,8 +1129,8 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.wait_for(asyncio.gather(*tasks), 5)
                     except asyncio.TimeoutError:
                         self.fail("the scheduled refresh did not finish")
-                self.assertEqual(len(parked), 1, "expected one refresh, started through the step the test holds")
             self.assertGreater(api.calls, 0, "the scheduled refresh did not read the disk")
+            self.assertEqual((len(refreshes), len(live_loads)), (1, 1), "expected one refresh and one live read")
             refreshed = service._smart_cache[service._smart_cache_key(snapshot.slots[0])]
             self.assertEqual(refreshed.power_on_hours, 321)
             result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-default-after-stale")
