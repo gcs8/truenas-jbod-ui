@@ -7878,11 +7878,14 @@
     const safeValue = escapeHtml(hasValue ? String(value) : "n/a");
     const encodedValue = hasValue ? encodeURIComponent(String(value)) : "";
     const titleAttribute = title ? ` title="${escapeHtml(title)}"` : "";
+    // Text standing in for a value (an identifier that was not read, or one
+    // still loading) is shown, but there is nothing to copy.
+    const hasCopyValue = hasValue && value !== "not read" && value !== "Loading...";
     return `
       <div class="kv-row">
         <div class="kv-label">${escapeHtml(label)}</div>
         <div class="kv-value"${titleAttribute}>${safeValue}</div>
-        <div>${copyable && hasValue ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
+        <div>${copyable && hasCopyValue ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
       </div>
     `;
   }

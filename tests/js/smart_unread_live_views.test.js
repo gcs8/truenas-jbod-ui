@@ -237,3 +237,18 @@ test("the heat-map badge title uses the same reason", () => {
   const body = functionSource("applyHeatmapToTile");
   assert.match(body, /badge\.title = `\$\{metric\.label\}: \$\{record\?\.missingText \|\| "unknown"\}`/);
 });
+
+test("a copyable row offers Copy for an identifier, not for text standing in for one", () => {
+  const sandbox = vm.createContext({});
+  vm.runInContext(`${functionSource("escapeHtml")}\n${functionSource("kvRow")}\nthis.kvRow = kvRow;`, sandbox);
+  const offersCopy = (value) => sandbox.kvRow("Namespace NGUID", value, true).includes("copy-button");
+  assert.equal(offersCopy("synthetic-namespace-id"), true);
+  assert.equal(offersCopy("SYNTHETIC-0"), true);
+  // The row still shows the text; there is just nothing to copy.
+  for (const standIn of ["not read", "Loading..."]) {
+    assert.equal(offersCopy(standIn), false, standIn);
+    assert.match(sandbox.kvRow("Namespace NGUID", standIn, true), new RegExp(`<div class="kv-value">${standIn.replace(/\./g, "\\.")}</div>`));
+  }
+  assert.equal(offersCopy(""), false);
+  assert.equal(sandbox.kvRow("Serial", "SYNTHETIC-0", false).includes("copy-button"), false);
+});
