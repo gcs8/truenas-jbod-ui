@@ -2,6 +2,7 @@
 from dataclasses import replace
 from pathlib import Path
 import contextlib
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -9,6 +10,7 @@ from unittest import mock
 import yaml
 
 from scripts import update_immutable_deployment as deployment
+from tests import test_image_upgrade_smoke_safety as cleanup_fakes
 from tests import test_immutable_deployment as fixtures
 from tests.test_immutable_deployment import FakeRuntime, NEW_IMAGE_ID
 
@@ -18,9 +20,11 @@ def setUpModule() -> None:
     # or that others can write (#1100); report the system temporary directory
     # chain as root's, as test_immutable_deployment does.
     fixtures.SYSTEM_TEMP_AS_ROOT_CHAIN.start()
+    cleanup_fakes.setUpModule()
 
 
 def tearDownModule() -> None:
+    cleanup_fakes.tearDownModule()
     fixtures.SYSTEM_TEMP_AS_ROOT_CHAIN.stop()
 
 
@@ -503,7 +507,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         prep = source.split("HARDENED_OWNERSHIP_PREP = (", 1)[1].split("\n)\n", 1)[0]
         # A diagnostic may reject chown without executing an ownership repair.
         self.assertEqual(source.count("sudo chown "), prep.count("sudo chown "))
-        self.assertIn("HARDENED_OWNERSHIP_PREP", inspect.getsource(smoke.prepare_root))
+        # prepare_root runs it through hardened_ownership_commands(), one checked command at a time.
+        self.assertIn("hardened_ownership_commands()", inspect.getsource(smoke.prepare_root))
         calls = []
         deployment = smoke.Deployment(Path("/nonexistent"))
         deployment.compose = lambda *args, **kwargs: calls.append(args) or ""
@@ -854,7 +859,8 @@ class ReadOnlyStateScenarioTests(unittest.TestCase):
             deployment.exec_python.side_effect = read
             with (
                 mock.patch.object(smoke, "Deployment", return_value=deployment),
-                mock.patch.object(smoke, "prepare_root"),
+                # Stands in for prepare_root, including the record of the directory it created.
+                mock.patch.object(smoke, "prepare_root", side_effect=lambda path, *_: smoke._record_created_root(path)),
                 mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
                 mock.patch.object(smoke, "sha256", return_value="config"),
                 mock.patch.object(smoke, "wait_for_history_liveness"),
@@ -1009,26 +1015,42 @@ class ReadOnlyStateScenarioTests(unittest.TestCase):
         with mock.patch.object(smoke, "get_json", return_value=(200, {"status": "ok", "version": "2"})):
             smoke.wait_for_history_liveness("2")
 
-    def test_readonly_cli_cleans_up_on_both_success_and_qualification_failure(self):
+    def test_readonly_cli_cleanup_is_verified_on_success_and_qualification_failure(self):
         smoke = self.load_smoke()
         for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "docker-compose.yml").write_text("services: {}")
+                # The mocked scenario stands in for prepare_root, which records the directory it created.
+                smoke._record_created_root(root)
                 smoke.install_readonly_history_mount(smoke.Deployment(root))
                 argv = ["--scenario", "readonly-state", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
                         "--candidate-version", "2", "--candidate-revision", "revision"]
+                boundary = cleanup_fakes.CleanupBoundary(root)
                 with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
-                      mock.patch.object(smoke.subprocess, "run") as run,
+                      mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
                       mock.patch("sys.stdout"), mock.patch("sys.stderr")):
                     self.assertEqual(smoke.main(argv), 1 if failure else 0)
-                commands = [call.args[0] for call in run.call_args_list]
-                self.assertEqual(commands[-2:], [
-                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.readonly.yml",
-                     "down", "--volumes", "--remove-orphans"], ["sudo", "rm", "-rf", str(root)],
-                ])
+                expected = cleanup_fakes.expected_cleanup_commands(root, smoke.READONLY_FILES)
+                self.assertEqual(boundary.commands[-len(expected):], expected)
+                self.assertFalse(root.exists())
+            # Failed teardown: the run fails and the readback still happens, but the root is kept.
+            with self.subTest(failure=failure, teardown="failed"), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "docker-compose.yml").write_text("services: {}")
+                smoke._record_created_root(root)
+                smoke.install_readonly_history_mount(smoke.Deployment(root))
+                argv[argv.index("--root") + 1] = str(root)
+                boundary = cleanup_fakes.CleanupBoundary(root, down=1)
+                with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
+                      mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
+                      mock.patch("sys.stdout"), mock.patch("sys.stderr")):
+                    self.assertEqual(smoke.main(argv), 1)
+                self.assertFalse(boundary.removal_requested())
+                self.assertEqual(boundary.census_requested(), ["container", "network", "volume"])
+                self.assertTrue((root / "docker-compose.readonly.yml").is_file())
 
     def test_readonly_mount_is_the_only_fault_and_cleanup_uses_its_compose_chain(self):
         smoke = self.load_smoke()
@@ -1037,18 +1059,17 @@ class ReadOnlyStateScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docker-compose.yml").write_text("services: {}")
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             smoke.install_readonly_history_mount(smoke.Deployment(root))
             overlay = yaml.safe_load((root / "docker-compose.readonly.yml").read_text())
             self.assertEqual(overlay, {"services": {"enclosure-history": {
                 "volumes": ["./history:/app/history:ro"],
             }}})
-            with mock.patch.object(smoke.subprocess, "run") as run:
+            boundary = cleanup_fakes.CleanupBoundary(root)
+            with mock.patch.object(smoke.subprocess, "run", side_effect=boundary):
                 smoke.cleanup(root)
-            self.assertEqual(run.call_args_list[0].args[0], [
-                "docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.readonly.yml",
-                "down", "--volumes", "--remove-orphans",
-            ])
-            self.assertEqual(run.call_args_list[1].args[0], ["sudo", "rm", "-rf", str(root)])
+            self.assertEqual(boundary.commands,
+                             cleanup_fakes.expected_cleanup_commands(root, smoke.READONLY_FILES))
 
 
 class EnospcStateScenarioTests(unittest.TestCase):
@@ -1347,35 +1368,35 @@ class EnospcStateScenarioTests(unittest.TestCase):
                 execute(smoke.ENOSPC_WRITE_PROBE)
             self.assertEqual(set(root.iterdir()), {root / "history.db"})
 
-    def test_enospc_cli_cleans_up_on_both_success_and_qualification_failure(self):
+    def test_enospc_cli_cleanup_is_verified_on_success_and_qualification_failure(self):
         smoke = self.load_smoke()
         for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "docker-compose.yml").write_text("services: {}")
+                # The mocked scenario stands in for prepare_root, which records the directory it created.
+                smoke._record_created_root(root)
                 with mock.patch.object(smoke, "run"):
                     smoke.install_enospc_history_mount(smoke.Deployment(root))
                 argv = ["--scenario", "enospc-state", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
                         "--candidate-version", "2", "--candidate-revision", "revision"]
+                boundary = cleanup_fakes.CleanupBoundary(root)
                 with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
-                      mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                      mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
                       mock.patch.object(smoke.os.path, "ismount", return_value=True),
                       mock.patch("sys.stdout"), mock.patch("sys.stderr")):
                     self.assertEqual(smoke.main(argv), 1 if failure else 0)
-                commands = [call.args[0] for call in run.call_args_list]
-                self.assertEqual(commands[-3:], [
-                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.enospc.yml",
-                     "down", "--volumes", "--remove-orphans"],
-                    ["sudo", "umount", str(root / "history")], ["sudo", "rm", "-rf", str(root)],
-                ])
+                expected = cleanup_fakes.expected_cleanup_commands(root, smoke.ENOSPC_FILES, unmount=True)
+                self.assertEqual(boundary.commands[-len(expected):], expected)
 
     def test_enospc_fixture_is_bounded_and_cleanup_unmounts_before_removing_it(self):
         smoke = self.load_smoke()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docker-compose.yml").write_text("services: {}")
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             deployment = smoke.Deployment(root)
             with mock.patch.object(smoke, "run") as run:
                 smoke.install_enospc_history_mount(deployment)
@@ -1386,22 +1407,20 @@ class EnospcStateScenarioTests(unittest.TestCase):
             self.assertEqual(overlay, {"services": {"enclosure-history": {
                 "volumes": ["./history:/app/history:rw"],
             }}})
-            with (mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+            # A failed unmount must leave the root intact instead of traversing a live mount.
+            boundary = cleanup_fakes.CleanupBoundary(root, umount=1)
+            with (mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
+                  mock.patch.object(smoke.os.path, "ismount", return_value=True)):
+                with self.assertRaisesRegex(smoke.SmokeError, "unmount failed"):
+                    smoke.cleanup(root)
+            self.assertFalse(boundary.removal_requested())
+            self.assertTrue((root / "docker-compose.enospc.yml").is_file())
+            boundary = cleanup_fakes.CleanupBoundary(root)
+            with (mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
                   mock.patch.object(smoke.os.path, "ismount", return_value=True)):
                 smoke.cleanup(root)
-            commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(commands, [
-                ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.enospc.yml",
-                 "down", "--volumes", "--remove-orphans"],
-                ["sudo", "umount", str(root / "history")], ["sudo", "rm", "-rf", str(root)],
-            ])
-            # A failed unmount must leave the root intact instead of traversing a live mount.
-            with (mock.patch.object(smoke.subprocess, "run", side_effect=[
-                    mock.Mock(returncode=0), mock.Mock(returncode=1), mock.Mock(returncode=0)]) as run,
-                  mock.patch.object(smoke.os.path, "ismount", return_value=True)):
-                with self.assertRaises(smoke.SmokeError):
-                    smoke.cleanup(root)
-                self.assertEqual(run.call_count, 2)
+            self.assertEqual(boundary.commands,
+                             cleanup_fakes.expected_cleanup_commands(root, smoke.ENOSPC_FILES, unmount=True))
 
     def test_enospc_fill_requires_a_small_filesystem_and_restores_only_its_filler(self):
         import contextlib
@@ -2194,6 +2213,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docker-compose.yml").write_text("services: {}")
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             deployment = smoke.Deployment(root)
             with mock.patch.object(smoke, "run") as run:
                 smoke.install_backup_scheduler_with_target(deployment)
@@ -2253,26 +2273,26 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 ["sudo", "mv", str(root / "backup-targets" / "remote.held"),
                  str(root / "backup-targets" / "remote")],
             ])
-            with (mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+            boundary = cleanup_fakes.CleanupBoundary(root)
+            with (mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
                   mock.patch.object(smoke.os.path, "ismount", return_value=False)):
                 smoke.cleanup(root)
-            commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(commands, [
-                ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.unavailable-backup.yml",
-                 "down", "--volumes", "--remove-orphans"],
-                ["sudo", "rm", "-rf", str(root)],
-            ])
+            self.assertEqual(boundary.commands,
+                             cleanup_fakes.expected_cleanup_commands(root, smoke.UNAVAILABLE_BACKUP_FILES))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docker-compose.yml").write_text("services: {}")
             (root / "docker-compose.unavailable-backup.yml").write_text("services: {}")
-            with mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            smoke._record_created_root(root)
+            boundary = cleanup_fakes.CleanupBoundary(root)
+            with mock.patch.object(smoke.subprocess, "run", side_effect=boundary):
                 smoke.cleanup(root)
-            self.assertEqual(run.call_args_list[0].args[0][:6],
-                             ["docker", "compose", "-f", "docker-compose.yml",
+            self.assertEqual(boundary.commands[0][:8],
+                             ["docker", "compose", "--project-name", root.name.lower(), "-f", "docker-compose.yml",
                               "-f", "docker-compose.unavailable-backup.yml"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             with mock.patch.object(smoke, "run") as run:
                 smoke.install_backup_secrets(root)
             self.assertEqual([call.args[0] for call in run.call_args_list], [
@@ -2306,6 +2326,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             # umask 0 shows the requested mode itself: a world-readable request
             # would be visible here even though a later chmod could repair it.
             previous_umask = os.umask(0)
@@ -2341,27 +2362,27 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
         self.assertNotIn("UNAVAILABLE_BACKUP_FILES", inspect.getsource(smoke.install_backup_secrets))
         self.assertNotIn("backup-secrets", inspect.getsource(smoke.install_backup_scheduler_with_target))
 
-    def test_unavailable_backup_cli_cleans_up_on_both_success_and_qualification_failure(self):
+    def test_unavailable_backup_cli_cleanup_is_verified_on_success_and_qualification_failure(self):
         smoke = self.load_smoke()
         for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "docker-compose.yml").write_text("services: {}")
+                # The mocked scenario stands in for prepare_root, which records the directory it created.
+                smoke._record_created_root(root)
                 with mock.patch.object(smoke, "run"):
                     smoke.install_backup_scheduler_with_target(smoke.Deployment(root))
                 argv = ["--scenario", "unavailable-backup-storage", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
                         "--candidate-version", "2", "--candidate-revision", "revision"]
+                boundary = cleanup_fakes.CleanupBoundary(root)
                 with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
-                      mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                      mock.patch.object(smoke.subprocess, "run", side_effect=boundary),
                       mock.patch("sys.stdout"), mock.patch("sys.stderr")):
                     self.assertEqual(smoke.main(argv), 1 if failure else 0)
-                commands = [call.args[0] for call in run.call_args_list]
-                self.assertEqual(commands[-2:], [
-                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.unavailable-backup.yml",
-                     "down", "--volumes", "--remove-orphans"], ["sudo", "rm", "-rf", str(root)],
-                ])
+                expected = cleanup_fakes.expected_cleanup_commands(root, smoke.UNAVAILABLE_BACKUP_FILES)
+                self.assertEqual(boundary.commands[-len(expected):], expected)
 
 
 class AdminDuringUpgradeScenarioTests(unittest.TestCase):
@@ -2510,6 +2531,7 @@ class AdminDuringUpgradeScenarioTests(unittest.TestCase):
                                   return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})),
                 mock.patch.object(smoke, "remove_admin_service") as remove,
                 mock.patch.object(smoke, "print_admin_logs") as logs,
+                mock.patch.object(smoke, "cleanup") as phase_cleanup,
             ):
                 if fault is None:
                     result = smoke.admin_during_upgrade(self.args(root))
@@ -2530,7 +2552,9 @@ class AdminDuringUpgradeScenarioTests(unittest.TestCase):
         # Phase 1: a deployment that never enabled admin, literal update only.
         dormant.set_image.assert_called_once_with("candidate")
         dormant.pull_and_up.assert_called_once_with()
-        self.assertEqual(dormant.compose.call_args_list, [mock.call("down", "--volumes", "--remove-orphans")])
+        # Phase one leaves through the checked cleanup (teardown, readback, removal), not a bare `down`.
+        self.assertEqual(dormant.compose.call_args_list, [])
+        scope["phase_cleanup"].assert_called_once_with(scope["root"])
         self.assertEqual(scope["check_dormant"].call_args_list, [mock.call(dormant), mock.call(dormant)])
         self.assertEqual(dormant.runtime_environment, {})
         # Phase 2: admin started with the documented command, then the same profiles update.
@@ -2759,16 +2783,21 @@ class UpgradeScenarioContractTests(unittest.TestCase):
     def test_hardened_scenario_runs_every_compose_command_with_the_overlay(self):
         smoke = self.load_smoke()
         deployment = smoke.Deployment(Path("/nonexistent"), smoke.HARDENED_FILES)
+        # The project is pinned so startup and the cleanup readback name the same one.
         self.assertEqual(deployment.file_args(),
-                         ["-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
+                         ["--project-name", "nonexistent", "-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
         calls = []
-        with mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs: calls.append(command) or ""):
-            deployment.compose("pull")
-            deployment.compose("up", "-d")
-        self.assertEqual(calls[0][:6], ["docker", "compose", "-f", "docker-compose.yml",
-                                        "-f", "docker-compose.nonroot.yml"])
-        self.assertEqual(calls[1][6:], ["up", "-d"])
-        self.assertEqual(smoke.Deployment(Path("/nonexistent")).file_args(), [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            smoke._record_created_root(root)  # Compose runs only in a root this run created
+            deployment = smoke.Deployment(root, smoke.HARDENED_FILES)
+            with mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs: calls.append(command) or ""):
+                deployment.compose("pull")
+                deployment.compose("up", "-d")
+        self.assertEqual(calls[0][:8], ["docker", "compose", "--project-name", smoke.compose_project_name(root),
+                                        "-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
+        self.assertEqual(calls[1][8:], ["up", "-d"])
+        self.assertEqual(smoke.Deployment(Path("/nonexistent")).file_args(), ["--project-name", "nonexistent"])
 
     def test_kill_phases_are_the_history_startup_migration_steps_in_order(self):
         import inspect
@@ -2841,6 +2870,7 @@ class UpgradeScenarioContractTests(unittest.TestCase):
     def test_segmented_catalog_setting_survives_image_pin_changes(self):
         smoke = self.load_smoke()
         with tempfile.TemporaryDirectory() as directory:
+            smoke._record_created_root(Path(directory))  # as prepare_root records the directory it created
             deployment = smoke.Deployment(Path(directory))
             deployment.set_image("previous")
             deployment.set_runtime_environment(
@@ -2981,6 +3011,7 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         smoke = self.load_smoke()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            smoke._record_created_root(root)  # as prepare_root records the directory it created
             (root / "key-input").write_text("synthetic")
             deployment = smoke.Deployment(root)
             deployment.compose = mock.Mock(return_value="")
@@ -3088,7 +3119,8 @@ class UpgradeScenarioContractTests(unittest.TestCase):
                 def prepare(path, compose, config):
                     if path.name == "target":
                         self.assertNotEqual(config.read_bytes(), args.config_fixture.read_bytes())
-                    path.mkdir()
+                    path.mkdir(mode=0o700)  # private, as prepare_root creates it
+                    smoke._record_created_root(path)  # as prepare_root records the directory it created
                     (path / "docker-compose.yml").write_text("synthetic transport only")
                     (path / "must-not-survive").write_text("source" if path.name == "source" else "target")
 
@@ -3165,6 +3197,7 @@ class CleanHostRestoreDriverTests(unittest.TestCase):
         from types import SimpleNamespace
 
         calls = []
+        removed = self.removed = []
         identity = {"history_rows": {"slot_events": [3, "synthetic-digest"]}}
 
         class Transport(smoke.CleanHostDeployment):
@@ -3182,11 +3215,13 @@ class CleanHostRestoreDriverTests(unittest.TestCase):
                 return self.run_python(service, script)
 
         def prepare(path, compose, config):
-            path.mkdir()
+            path.mkdir(mode=0o700)  # private, as prepare_root creates it
+            smoke._record_created_root(path)  # as prepare_root records the directory it created
             (path / "docker-compose.yml").write_text("synthetic transport only")
 
         def run(command, **kwargs):
             if command[:3] == ["sudo", "rm", "-rf"]:
+                removed.append(command[-1])
                 shutil.rmtree(command[-1])
             return ""
 
@@ -3223,6 +3258,53 @@ class CleanHostRestoreDriverTests(unittest.TestCase):
             except smoke.SmokeError as exc:
                 outcome = exc
         return outcome, calls
+
+    def test_replaced_source_installation_is_not_removed(self):
+        # Removal authority is the directory this run created, not its pathname.
+        smoke = self.load_smoke()
+        real_down = smoke.clean_host_down
+
+        def down_then_replace(deployment, project, env):
+            real_down(deployment, project, env)
+            if deployment.root.name == "source" and not hasattr(self, "replaced"):
+                self.replaced = deployment.root.parent / "source-created-by-run"
+                deployment.root.rename(self.replaced)
+                deployment.root.mkdir()
+                (deployment.root / "operator-kept.txt").write_text("synthetic replacement data\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(os.path.realpath(directory)) / "jbod-clean-host-replaced"
+            with mock.patch.object(smoke, "clean_host_down", side_effect=down_then_replace):
+                outcome, _ = self.orchestrate(smoke, root)
+            self.assertIsInstance(outcome, smoke.SmokeError)
+            self.assertIn("no longer the directory this run created", str(outcome))
+            self.assertEqual(self.removed, [])
+            self.assertTrue((root / "source" / "operator-kept.txt").is_file())
+            self.assertTrue((root / "recovery" / "backup.7z").is_file())
+
+    def test_replaced_target_installation_stops_the_final_recursive_removal(self):
+        # The outer root is unchanged, but the target deployment it contains was
+        # replaced: the final removal checks every root this run created inside it.
+        smoke = self.load_smoke()
+        real_down = smoke.clean_host_down
+
+        def down_then_replace(deployment, project, env):
+            real_down(deployment, project, env)
+            if deployment.root.name == "target" and not hasattr(self, "replaced"):
+                self.replaced = deployment.root.parent.parent / "target-created-by-run"
+                deployment.root.rename(self.replaced)
+                deployment.root.mkdir()
+                (deployment.root / "operator-kept.txt").write_text("synthetic replacement data\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(os.path.realpath(directory)) / "jbod-clean-host-replaced-target"
+            with mock.patch.object(smoke, "clean_host_down", side_effect=down_then_replace):
+                outcome, _ = self.orchestrate(smoke, root)
+            self.assertIsInstance(outcome, smoke.SmokeError)
+            self.assertIn("no longer the directory this run created", str(outcome))
+            self.assertEqual(self.removed, [str(root / "source")])
+            self.assertTrue((root / "target" / "operator-kept.txt").is_file())
+            self.assertTrue((root / "recovery" / "backup.7z").is_file())
 
     @staticmethod
     def env_values(text):

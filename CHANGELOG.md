@@ -74,6 +74,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   activated, instead of replacing live history with a database the service
   then refuses to start on. The message names the found and supported
   versions, and live history is left unchanged (#1193).
+- Creating the demo builder system no longer deletes its new chassis profile
+  when the config file was already replaced and only the directory fsync
+  failed; the profile is kept and the request reports an uncertain save
+  (#1240).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
@@ -108,6 +112,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
+  stop other admin requests while slow storage writes or syncs the staged
+  file, and a cancelled upload keeps its file until the write has finished.
+  The timing settings save now refuses a `values` field that is not a
+  mapping with a 400 instead of reporting success or failing with a 500
+  (#1250).
 - CORE expander counter output that repeats a PHY marker, carries an invalid
   one such as `ff`, repeats its header, or carries anything after its end
   marker (such as a second answer) is now refused as a whole: those PHYs read
@@ -141,6 +151,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, a `--root` below a directory another user could rename
+  entries in, and missing fixtures before running any command. Every write,
+  move or removal inside the directory it created first checks, by device and
+  inode for the root and every parent, that it is still that directory, and a
+  recursive removal first checks every deployment directory it created inside
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
+  verified, also between the admin scenario's two phases, and keeps the root
+  and exits nonzero when cleanup fails or is unknown. Its header states what
+  this does not cover: a process running as the same user or as root that
+  swaps directories while it runs (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,
