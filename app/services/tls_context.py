@@ -87,6 +87,32 @@ def resolve_tls_server_name(config: TrueNASConfig) -> str | None:
     return parsed.hostname
 
 
+def tls_checks_hostname(config: TrueNASConfig) -> bool:
+    """Whether `build_tls_client_context(config)` checks the server's host name."""
+    return host_uses_tls(config.host) and bool(config.verify_ssl)
+
+
+def presented_tls_server_name(
+    request_url: str, server_hostname: str | None, *, check_hostname: bool,
+) -> str | None:
+    """The TLS server name `urlopen_with_tls_config` presents for `request_url`.
+
+    A server-name override that differs from the request host is sent only
+    while the context checks host names; otherwise the request host is sent,
+    as the standard HTTPS handler does. (A proxy tunnel is ambient deployment
+    configuration and is not modelled here.)
+    """
+    request_host = urlsplit(request_url).hostname
+    override = str(server_hostname or "").strip()
+    if (
+        not override
+        or not check_hostname
+        or (request_host is not None and override.lower() == request_host.lower())
+    ):
+        return request_host
+    return override
+
+
 class TlsTrustConfigurationError(RuntimeError):
     """The configured CA bundle cannot be used, so nothing can be verified.
 
@@ -132,7 +158,7 @@ def build_tls_client_context(config: TrueNASConfig) -> ssl.SSLContext | None:
 
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    if config.verify_ssl:
+    if tls_checks_hostname(config):
         if config.tls_ca_bundle_path:
             try:
                 context.load_verify_locations(cafile=config.tls_ca_bundle_path)
@@ -195,23 +221,19 @@ def urlopen_with_tls_config(
     server_hostname: str | None = None,
 ):
     request_host = urlsplit(request.full_url).hostname
-    normalized_server_hostname = str(server_hostname or "").strip()
+    presented = presented_tls_server_name(
+        request.full_url,
+        server_hostname,
+        check_hostname=bool(context is not None and context.check_hostname),
+    )
 
-    if (
-        context is None
-        or not normalized_server_hostname
-        or not context.check_hostname
-        or (
-            request_host is not None
-            and normalized_server_hostname.lower() == request_host.lower()
-        )
-    ):
+    if context is None or presented == request_host:
         https_handler: urllib.request.HTTPSHandler = urllib.request.HTTPSHandler(context=context)
     else:
         https_handler = _HostnameOverrideHTTPSHandler(
             context=context,
             check_hostname=context.check_hostname,
-            server_hostname=normalized_server_hostname,
+            server_hostname=presented,
         )
 
     # Credential-carrying requests follow same-origin redirects only (#737).

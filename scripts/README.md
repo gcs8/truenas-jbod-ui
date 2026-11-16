@@ -65,6 +65,7 @@ explicitly approved target; they are not part of ordinary offline source checks.
 | Script | Purpose and where to run |
 | --- | --- |
 | `dev_check.py` | Platform-aware source validation in a development checkout. `--safe` excludes the checked-in public-demo artifact check; `--full` includes it. Windows uses explicitly classified suites, not the full POSIX test set. |
+| `run_test_shard.py` | CI unittest shards in a development checkout: `run` one shard, `discover` every test identity, `verify` that the shards completed each discovered test exactly once, `compare` two inventories to list removed or added tests. Inventories and receipts are generated per run and never committed. |
 | `build_perf_baseline.py` | Check or refresh deterministic modeled performance budgets in a development checkout. |
 | `benchmark_snapshot_export_cache.py` | Modeled export-cache size and timing benchmark in a development checkout. |
 | `run_perf_harness.py` | Read-only API performance checks from a checkout against an explicitly selected running app. |
