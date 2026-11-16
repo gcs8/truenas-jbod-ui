@@ -71,6 +71,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   activated, instead of replacing live history with a database the service
   then refuses to start on. The message names the found and supported
   versions, and live history is left unchanged (#1193).
+- Creating the demo builder system no longer deletes its new chassis profile
+  when the config file was already replaced and only the directory fsync
+  failed; the profile is kept and the request reports an uncertain save
+  (#1240).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
