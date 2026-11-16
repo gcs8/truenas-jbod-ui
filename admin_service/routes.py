@@ -100,6 +100,7 @@ from app.models.domain import (
     TLSCertificateInspectRequest,
     TLSRemoteCertificateTrustRequest,
 )
+from app.secret_files import ReplacedDurabilityUncertainError
 from app.services.config_change_journal import record_config_change
 from app.services.credential_authority import (
     api_credential_authority,
@@ -1012,6 +1013,14 @@ def build_router(admin_settings: Any) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ReplacedDurabilityUncertainError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The demo system was written to the config file, but the save could not be confirmed "
+                    "as durable. Its profile was kept. Reload System Setup to check the saved state."
+                ),
+            ) from exc
 
         refreshed_settings = reload_app_settings()
         saved_system = result["system"]
