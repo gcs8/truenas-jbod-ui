@@ -18,6 +18,7 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from history_service.domain import MetricSample
 from history_service.segment_migration import migrate_segmented_history
@@ -340,21 +341,27 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
         # A guard, not a reproduction: the absolute-time predicate must keep
         # the batch on the timestamp index instead of sorting the table.
         cutoff = "2026-11-14T12:00:00+00:00"
-        cases = (
-            (HistoryStore._expired_rows_subquery("slot_events", "observed_at"), "idx_slot_events_observed_at"),
-            (HistoryStore._expired_rows_subquery("metric_samples", "observed_at"), "idx_metric_samples_observed_at"),
+        # (floor, index range): no floor on a pass's first batch, then one.
+        floors = (
+            (None, "(observed_at<?)"),
+            (("2026-11-14T08:00:00+00:00", 5), "(observed_at>? AND observed_at<?)"),
         )
         with closing(sqlite3.connect(self.path)) as connection:
             HistoryStore._register_retention_functions(connection)
-            for query, index_name in cases:
-                with self.subTest(index=index_name):
-                    parameters = (*HistoryStore._retention_parameters(cutoff, None), 10)
-                    plan = " ".join(
-                        str(row[3])
-                        for row in connection.execute(f"EXPLAIN QUERY PLAN {query}", parameters)
-                    )
-                    self.assertIn(f"INDEX {index_name} (observed_at>? AND observed_at<?)", plan)
-                    self.assertNotIn("USE TEMP B-TREE", plan)
+            for table in ("slot_events", "metric_samples"):
+                index_name = f"idx_{table}_observed_at"
+                for floor, index_range in floors:
+                    with self.subTest(index=index_name, floored=floor is not None):
+                        query = HistoryStore._expired_rows_subquery(
+                            table, "observed_at", floored=floor is not None
+                        )
+                        parameters = (*HistoryStore._retention_parameters(cutoff, floor), 10)
+                        plan = " ".join(
+                            str(row[3])
+                            for row in connection.execute(f"EXPLAIN QUERY PLAN {query}", parameters)
+                        )
+                        self.assertIn(f"INDEX {index_name} {index_range}", plan)
+                        self.assertNotIn("USE TEMP B-TREE", plan)
 
 
 NEWER_MICROSECOND = "2026-11-14T10:00:00.000200+00:00"
@@ -706,6 +713,234 @@ class RetentionScanFloorTests(unittest.TestCase):
         self.assertFalse(result["has_more"])
         self.assertEqual(remaining, [2] * 25)
         self.assertEqual(rolled, [(3600, 25, 25.0), (86400, 25, 25.0)])
+
+    def _late_raw_sample_case(self, *, stop_after_insert: bool) -> None:
+        # Expired samples between newer -05:00 samples move the floor past the
+        # start of the table. After the first batch, an expired sample with
+        # its own metric arrives behind the floor. It must stay unrolled until
+        # the next pass, and that pass must roll it exactly once per interval.
+        samples = []
+        for index in range(25):
+            moment = f"2026-11-14T08:00:{index:02d}"
+            samples.append(_sample(f"{moment}+00:00", 1))  # expired
+            samples.append(_sample(f"{moment}-05:00", 2))  # newer than the cutoff
+        self.store.insert_metric_samples(samples)
+        checks = [0]
+
+        def add_late_sample_after_first_batch() -> bool:
+            checks[0] += 1
+            if checks[0] == 2:
+                self.store.insert_metric_samples(
+                    [_sample("2026-11-14T07:00:00+00:00", 7, metric_name="late_metric")]
+                )
+            # The stopped variant runs one more floored batch, then stops.
+            return not (stop_after_insert and checks[0] == 3)
+
+        first = self.store.maintain_retention(
+            now=NOW,
+            raw_metric_retention_days=1,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=365,
+            batch_size=4,
+            max_batches=100,
+            should_continue=add_late_sample_after_first_batch,
+        )
+        self.assertEqual(first["interrupted"], stop_after_insert)
+        if stop_after_insert:
+            self.assertEqual(first["batches_completed"], 2)
+        self.assertEqual(self._late_rollups(), [])
+        self.assertEqual(self._late_samples(), [7])
+
+        for _ in range(2):
+            later = _retain(
+                self.store,
+                raw_metric_retention_days=1,
+                hourly_rollup_retention_days=365,
+                daily_rollup_retention_days=365,
+                batch_size=4,
+                max_batches=100,
+            )
+            self.assertFalse(later["has_more"])
+            self.assertEqual(self._late_samples(), [])
+            self.assertEqual(self._late_rollups(), [(3600, 1, 7.0), (86400, 1, 7.0)])
+        with closing(sqlite3.connect(self.path)) as connection:
+            rolled = connection.execute(
+                "SELECT bucket_seconds, SUM(sample_count), SUM(value_sum) FROM metric_rollups "
+                "WHERE metric_name = 'temperature_c' GROUP BY bucket_seconds ORDER BY bucket_seconds"
+            ).fetchall()
+            remaining = [row[0] for row in connection.execute("SELECT value_integer FROM metric_samples")]
+        self.assertEqual(rolled, [(3600, 25, 25.0), (86400, 25, 25.0)])
+        self.assertEqual(remaining, [2] * 25)
+
+    def _late_samples(self) -> list[int]:
+        with closing(sqlite3.connect(self.path)) as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    "SELECT value_integer FROM metric_samples WHERE metric_name = 'late_metric'"
+                )
+            ]
+
+    def _late_rollups(self) -> list[tuple]:
+        with closing(sqlite3.connect(self.path)) as connection:
+            return connection.execute(
+                "SELECT bucket_seconds, sample_count, value_sum FROM metric_rollups "
+                "WHERE metric_name = 'late_metric' ORDER BY bucket_seconds"
+            ).fetchall()
+
+    def test_a_raw_sample_added_behind_the_floor_is_rolled_up_once_on_the_next_pass(self) -> None:
+        self._late_raw_sample_case(stop_after_insert=False)
+
+    def test_a_raw_sample_added_behind_the_floor_of_a_stopped_pass_is_rolled_up_once(self) -> None:
+        self._late_raw_sample_case(stop_after_insert=True)
+
+
+# The smallest key SQLite stores, with empty timestamp text: a legal row that
+# no artificial "before everything" floor can precede.
+MINIMUM_KEY = -(2**63)
+
+
+class RetentionFirstBatchHasNoFloorTests(unittest.TestCase):
+    """Before a pass has a floor, no lower bound at all applies to a table."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-nofloor-")
+        self.addCleanup(self._temporary.cleanup)
+        self.path = Path(self._temporary.name) / "history.db"
+        self.store = HistoryStore(str(self.path))
+
+    def _assert_both_keys_expire(self, table: str) -> None:
+        first = _retain(
+            self.store,
+            event_retention_days=1,
+            hourly_rollup_retention_days=1,
+            daily_rollup_retention_days=1,
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            left = connection.execute(f"SELECT rowid FROM {table} ORDER BY rowid").fetchall()
+        self.assertEqual(left, [])
+        self.assertEqual(first["total_rows_removed"], 2)
+        self.assertFalse(first["has_more"])
+
+    def test_the_minimum_event_key_with_empty_time_text_expires(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.executemany(
+                "INSERT INTO slot_events (id, observed_at, system_id, enclosure_key, slot, "
+                "slot_label, event_type, details_json) "
+                "VALUES (?, '', 'synthetic-system', '', 0, '0', 'slot_state_changed', '{}')",
+                [(MINIMUM_KEY,), (MINIMUM_KEY + 1,)],
+            )
+            connection.commit()
+
+        self._assert_both_keys_expire("slot_events")
+
+    def test_the_minimum_rollup_key_with_empty_time_text_expires_in_both_intervals(self) -> None:
+        for bucket_seconds in (3600, 86400):
+            with self.subTest(bucket_seconds=bucket_seconds):
+                with closing(sqlite3.connect(self.path)) as connection:
+                    connection.execute("DELETE FROM metric_rollups")
+                    connection.executemany(
+                        "INSERT INTO metric_rollups (rowid, bucket_start, bucket_seconds, system_id, "
+                        "enclosure_key, slot, slot_label, metric_name, sample_count, value_sum, "
+                        "value_min, value_max, last_value, last_observed_at) "
+                        "VALUES (?, '', ?, 'synthetic-system', '', ?, '0', 'bytes_read', 1, 1, 1, 1, 1, '')",
+                        [(MINIMUM_KEY, bucket_seconds, 0), (MINIMUM_KEY + 1, bucket_seconds, 1)],
+                    )
+                    connection.commit()
+
+                self._assert_both_keys_expire("metric_rollups")
+
+
+REJECTED_WINDOW_TEXT = "2026-11-14T08:00:00-05:00"  # 13:00 UTC, newer than the cutoff
+OLD_TEXT = "2026-11-01T00:00:00+00:00"
+
+
+class RetentionCrossTableWorkTests(unittest.TestCase):
+    """A table with nothing left to delete is not read again while others run.
+
+    One table holds only window rows the exact-time test rejects; another
+    holds an old backlog that keeps the pass running for many batches. Four
+    times the rows may cost about four times the exact-time parses, not
+    sixteen: the rejected rows are not re-read in every batch the backlog
+    drives.
+    """
+
+    def _insert(self, path: Path, population: str, observed_at: str, count: int) -> None:
+        with closing(sqlite3.connect(path)) as connection:
+            if population == "events":
+                connection.executemany(
+                    "INSERT INTO slot_events (observed_at, system_id, enclosure_key, slot, "
+                    "slot_label, event_type, details_json) "
+                    "VALUES (?, 'synthetic-system', '', 0, '0', 'slot_state_changed', '{}')",
+                    ((observed_at,) for _ in range(count)),
+                )
+            elif population == "metrics":
+                connection.executemany(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, slot, "
+                    "slot_label, metric_name, value_integer) "
+                    "VALUES (?, 'synthetic-system', '', ?, '0', 'bytes_read', 1)",
+                    ((observed_at, index) for index in range(count)),
+                )
+            else:
+                connection.executemany(
+                    "INSERT INTO metric_rollups (bucket_start, bucket_seconds, system_id, "
+                    "enclosure_key, slot, slot_label, metric_name, sample_count, value_sum, "
+                    "value_min, value_max, last_value, last_observed_at) "
+                    "VALUES (?, ?, 'synthetic-system', '', ?, '0', 'bytes_read', 1, 1, 1, 1, 1, ?)",
+                    ((observed_at, int(population), index, observed_at) for index in range(count)),
+                )
+            connection.commit()
+
+    @staticmethod
+    def _count(path: Path, population: str) -> int:
+        with closing(sqlite3.connect(path)) as connection:
+            if population == "events":
+                return connection.execute("SELECT count(*) FROM slot_events").fetchone()[0]
+            if population == "metrics":
+                return connection.execute("SELECT count(*) FROM metric_samples").fetchone()[0]
+            return connection.execute(
+                "SELECT count(*) FROM metric_rollups WHERE bucket_seconds = ?", (int(population),)
+            ).fetchone()[0]
+
+    def test_rejected_window_rows_are_not_reread_while_another_table_has_a_backlog(self) -> None:
+        cases = (
+            # (rejected population, backlog population, retention days per kind)
+            ("events", "3600", {"event_retention_days": 1, "hourly_rollup_retention_days": 1}),
+            ("metrics", "events", {"raw_metric_retention_days": 1, "event_retention_days": 1}),
+            ("3600", "events", {"event_retention_days": 1, "hourly_rollup_retention_days": 1}),
+            ("86400", "events", {"event_retention_days": 1, "daily_rollup_retention_days": 1}),
+        )
+        from history_service import store as store_module
+
+        original = store_module._history_utc_instant
+        for rejected, backlog, days in cases:
+            with self.subTest(rejected=rejected, backlog=backlog):
+                calls: dict[int, int] = {}
+                for count in (200, 800):
+                    with tempfile.TemporaryDirectory(prefix="retention-cross-") as temporary:
+                        path = Path(temporary) / "history.db"
+                        store = HistoryStore(str(path))
+                        self._insert(path, rejected, REJECTED_WINDOW_TEXT, count)
+                        self._insert(path, backlog, OLD_TEXT, count)
+                        parsed = [0]
+
+                        def counting(value: object) -> str | None:
+                            if value == REJECTED_WINDOW_TEXT:
+                                parsed[0] += 1
+                            return original(value)
+
+                        with mock.patch.object(store_module, "_history_utc_instant", counting):
+                            result = _retain(store, batch_size=10, max_batches=1000, **days)
+                        calls[count] = parsed[0]
+                        # Once per pass; raw samples once for each rollup
+                        # interval and once for the delete.
+                        self.assertLessEqual(parsed[0], 3 * count, calls)
+                        self.assertFalse(result["has_more"])
+                        self.assertGreaterEqual(result["batches_completed"], count // 10)
+                        self.assertEqual(self._count(path, rejected), count)
+                        self.assertEqual(self._count(path, backlog), 0)
+                self.assertLessEqual(calls[800] / calls[200], 1.5 * 800 / 200, calls)
 
 
 class RetentionQueryPlanTests(unittest.TestCase):
