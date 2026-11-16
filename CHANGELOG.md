@@ -78,10 +78,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 - Storage Fabric event decoding no longer turns a CDB with a malformed byte
   token into a different valid command with an invented address and length;
-  it is marked malformed and keeps its raw text. A loginfo value wider than
-  32 bits is no longer labelled as the known fault of its low 32 bits and
-  stays unconfirmed; summaries count it as rejected instead of listing the
-  raw value (#1239).
+  it is marked malformed and keeps its raw text. An ASC/ASCQ value that is not
+  two one- or two-digit hex bytes is no longer labelled as the sense code it
+  resembles; it is marked malformed with no fault family. A loginfo value
+  wider than 32 bits is no longer labelled as the known fault of its low 32
+  bits and stays unconfirmed; summaries count it as rejected instead of
+  listing the raw value, and long kernel text is shortened before it becomes
+  a summary key (#1239).
 
 ### Performance
 
