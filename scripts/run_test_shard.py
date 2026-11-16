@@ -189,6 +189,8 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_ipmi_duplicate_bays",
         "test_mapping_routes",
         "test_nonroot_migration",
+        "test_persisted_smart_binding",
+        "test_persisted_smart_refresh",
         "test_public_demo_deterministic",
         "test_public_demo_fixture",
         "test_quantastor_api",
