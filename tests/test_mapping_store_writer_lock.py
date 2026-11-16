@@ -862,6 +862,129 @@ class ReadsNeverWaitForAPublishingWriterTests(unittest.TestCase):
                         original_fstat(descriptor)
 
 
+@unittest.skipIf(not hasattr(os, "mkfifo"), "swapping in a FIFO needs POSIX mkfifo")
+class ReadsRefuseANonRegularFileSwappedInAfterTheirCheckTests(unittest.TestCase):
+    """A path swapped to a FIFO, directory or link after the check never blocks or reads empty."""
+
+    def swap_after_check(self, path: Path, elsewhere: Path, kind: str):
+        original_open = os.open
+        swapped = threading.Event()
+
+        def swap_then_open(name, flags, *args, **kwargs):
+            if Path(name) == path and not flags & os.O_CREAT and not swapped.is_set():
+                path.unlink()
+                if kind == "fifo":
+                    os.mkfifo(path)
+                elif kind == "directory":
+                    path.mkdir()
+                else:
+                    path.symlink_to(elsewhere)
+                swapped.set()
+            return original_open(name, flags, *args, **kwargs)
+
+        return patch.object(mapping_store_module.os, "open", swap_then_open), swapped
+
+    def test_a_swap_after_the_check_is_refused_promptly_by_every_reader(self) -> None:
+        refusal_type = read_busy_refusal_type(self)
+        reads = {
+            "load_read_snapshot": lambda reader: reader.load_read_snapshot(),
+            "list_mappings": lambda reader: reader.list_mappings("a", "shelf"),
+            "scope_revision": lambda reader: reader.scope_revision("a", "shelf"),
+            "preview_replace_mappings": lambda reader: reader.preview_replace_mappings("a", "shelf", []),
+            "load_all": lambda reader: reader.load_all(),
+            "load_lookup_snapshot": lambda reader: reader.load_lookup_snapshot(),
+        }
+        for kind in ("fifo", "directory", "symlink"):
+            for name, read in reads.items():
+                with self.subTest(kind=kind, read=name), tempfile.TemporaryDirectory() as directory:
+                    path, _store = seeded_store(directory)
+                    reader = MappingStore(path)
+                    elsewhere = Path(directory) / "elsewhere.json"
+                    elsewhere.write_bytes(path.read_bytes())
+                    outcome: dict[str, object] = {}
+
+                    def run() -> None:
+                        try:
+                            outcome["returned"] = read(reader)
+                        except BaseException as exc:  # noqa: BLE001 - reported below
+                            outcome["raised"] = exc
+
+                    swap, swapped = self.swap_after_check(path, elsewhere, kind)
+                    with swap:
+                        thread = threading.Thread(target=run, daemon=True)
+                        thread.start()
+                        self.assertTrue(swapped.wait(timeout=5), "the read never reached its open")
+                        thread.join(timeout=2)
+                        blocked = thread.is_alive()
+                        if blocked:
+                            # Rescue the blocked open so the run cannot hang.
+                            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+                            thread.join(timeout=5)
+                    self.assertFalse(blocked, f"{name} blocked opening a {kind} swapped in after its check")
+                    raised = outcome.get("raised")
+                    self.assertIsInstance(
+                        raised, OSError, f"{name} returned {outcome.get('returned')!r} for a {kind}, not a refusal",
+                    )
+                    self.assertNotIsInstance(raised, refusal_type)
+                    self.assertIn("not a regular file", str(raised))
+
+    def test_a_regular_file_already_in_place_still_reads_as_before(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.save_mapping(mapping("a", 1, "kept"))
+            reader = MappingStore(path)
+            self.assertEqual([row.notes for row in reader.list_mappings("a", "shelf")], ["kept"])
+            self.assertEqual(len(reader.load_all()), 2)
+            self.assertEqual(len(reader.load_lookup_snapshot()), 2)
+            self.assertEqual(len(reader.load_read_snapshot()), 2)
+
+
+class MappingExportReadsOneVersionTests(unittest.TestCase):
+    """An export's rows and its revision come from the same published version."""
+
+    def test_a_save_published_during_an_export_does_not_mix_two_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.save_mapping(mapping("a", 1, "A"))
+            revision_a = store.scope_revision("a", "shelf")
+            reader = MappingStore(path)
+            service = bare_inventory_service(reader)
+            original_read = MappingStore._read_source_bytes_once
+            reads: list[int] = []
+
+            def read_then_publish(self_store):
+                content = original_read(self_store)
+                if self_store is reader:
+                    reads.append(1)
+                    if len(reads) == 1:
+                        store.save_mapping(mapping("a", 1, "B"))
+                return content
+
+            with patch.object(MappingStore, "_read_source_bytes_once", read_then_publish):
+                bundle = asyncio.run(service.export_mapping_bundle("shelf"))
+            revision_b = store.scope_revision("a", "shelf")
+            self.assertNotEqual(revision_a, revision_b)
+            self.assertEqual([row.notes for row in bundle.mappings], ["A"])
+            self.assertEqual(bundle.revision, revision_a, "the export paired version A's rows with another revision")
+            self.assertEqual(len(reads), 1, "the export read the mapping file more than once")
+
+    def test_an_export_with_no_concurrent_save_matches_the_current_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.save_mapping(mapping("a", 1, "A"))
+            store.save_mapping(mapping("a", 2, "A2"))
+            service = bare_inventory_service(MappingStore(path))
+            bundle = asyncio.run(service.export_mapping_bundle("shelf"))
+            self.assertEqual([(row.slot, row.notes) for row in bundle.mappings], [(1, "A"), (2, "A2")])
+            self.assertEqual(bundle.revision, store.scope_revision("a", "shelf"))
+            self.assertEqual(
+                bundle.revision,
+                store.preview_replace_mappings("a", "shelf", bundle.mappings)["revision"],
+            )
+            self.assertEqual(bundle.system_id, "a")
+            self.assertEqual(bundle.enclosure_id, "shelf")
+
+
 class MappingReadRefusalRouteTests(unittest.TestCase):
     """A read that refuses reaches the browser as a named, retryable 503."""
 

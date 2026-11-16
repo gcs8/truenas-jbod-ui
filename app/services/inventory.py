@@ -8295,17 +8295,14 @@ class InventoryService:
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
-        mappings = self.mapping_store.list_mappings(self.system.id, mapping_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            mappings,
-        )
+        # Rows and revision from one read, so a save in between cannot pair
+        # one version's rows with another's revision (#1228).
+        mappings, revision = self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
             enclosure_id=mapping_enclosure_id,
-            revision=preview["revision"],
+            revision=revision,
             mappings=mappings,
         )
 

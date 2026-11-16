@@ -219,6 +219,13 @@ class _SourceReplacedDuringRead(Exception):
         self.original = original
 
 
+class _SourceNotRegular(OSError):
+    """The mapping path is not a regular file: refused by every reader, never read as empty."""
+
+    def __init__(self) -> None:
+        super().__init__("Configured mapping source is not a regular file.")
+
+
 class MappingDurabilityError(RuntimeError):
     """A complete replacement is visible but its durability is indeterminate."""
 
@@ -546,6 +553,8 @@ class MappingStore:
         """Read once; authoritative callers fail closed, legacy display may degrade."""
         try:
             raw = self._read_source_bytes()
+        except _SourceNotRegular:
+            raise
         except OSError:
             if strict:
                 raise
@@ -611,6 +620,9 @@ class MappingStore:
         flags = os.O_RDONLY
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        # A FIFO swapped in after the lstat must not block the open; the fstat
+        # below then sees it is not the regular file that was checked.
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
             observed = os.lstat(self.file_path)
         except FileNotFoundError:
@@ -620,7 +632,7 @@ class MappingStore:
                 raise _SourceReplacedDuringRead(exc) from exc
             raise
         if not stat.S_ISREG(observed.st_mode):
-            raise OSError("Configured mapping source is not a regular file.")
+            raise _SourceNotRegular()
         try:
             descriptor = os.open(self.file_path, flags)
         except OSError as exc:
@@ -1064,15 +1076,9 @@ class MappingStore:
     ) -> list[ManualMapping]:
         enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         if system_id is not None:
-            state = self._load_state_for_scope(system_id, enclosure_id)
-            selected = self._scope_entries(state, system_id, enclosure_id)
-            return [
-                selected[identity]
-                for identity in sorted(
-                    selected,
-                    key=lambda item: (item[0] or "", item[1]),
-                )
-            ]
+            return self._sorted_scope_entries(
+                self._load_state_for_scope(system_id, enclosure_id), system_id, enclosure_id,
+            )
         state = self._load_state()
         mappings = [
             mapping
@@ -1087,6 +1093,20 @@ class MappingStore:
                 mapping.slot,
             ),
         )
+
+    def _sorted_scope_entries(
+        self, state: _ClassifiedStore, system_id: str, enclosure_id: str | None,
+    ) -> list[ManualMapping]:
+        selected = self._scope_entries(state, system_id, enclosure_id)
+        return [selected[identity] for identity in sorted(selected, key=lambda item: (item[0] or "", item[1]))]
+
+    def export_scope(self, system_id: str, enclosure_id: str | None) -> tuple[list[ManualMapping], str]:
+        """One scope's rows and their revision, both from one read of one version."""
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        state = self._load_state_for_scope(system_id, enclosure_id)
+        mappings = self._sorted_scope_entries(state, system_id, enclosure_id)
+        preview, _ = self._preview_from_state(state, system_id, enclosure_id, mappings)
+        return mappings, preview["revision"]
 
     def _normalize_incoming(
         self,
