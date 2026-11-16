@@ -254,7 +254,7 @@ There is no setting that saves without it. The app log line starting
 | --- | --- |
 | `another bay mapping save is in progress` | Another save, clear or import of the same mapping file, from this or another app process, held the lock past the 2 s wait. Save again when it finishes. If it never clears, look for a stuck process using the same data folder. |
 | `a file lock could not be taken on the storage holding the mapping file` | The lock call failed. The storage may not provide file locks, or the host may be short of lock resources; the message cannot tell which. See [When a file lock could not be taken](#when-a-file-lock-could-not-be-taken) below. |
-| `the mapping lock file's name is taken by something that is not a regular file` | A directory, link, FIFO or other non-file sits at the lock file's name. Repair it (below). |
+| `the mapping lock file could not be opened as a regular file` | Usually a directory, link, FIFO or other non-file sits at the lock file's name. A link loop higher in the path to the data folder gives the same message, so check the folder first. Check in the order below. |
 | `the mapping lock file cannot be opened for writing` | Something existed at the lock file's name and opening it for writing was refused. This message alone does not show the lock file is at fault: the data folder's permissions, or something that is not a regular file at that name, give the same refusal. Check in the order below. |
 
 To repair the lock file's name or permissions:

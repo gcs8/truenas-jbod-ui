@@ -1163,7 +1163,7 @@ LOCK_REFUSAL_DETAILS = {
         + SEE_TROUBLESHOOTING
     ),
     "not_regular": (
-        "Could not save: the mapping lock file's name is taken by something that is not a regular file. "
+        "Could not save: the mapping lock file could not be opened as a regular file. "
         + SEE_TROUBLESHOOTING
     ),
     "unwritable": "Could not save: the mapping lock file cannot be opened for writing. " + SEE_TROUBLESHOOTING,
@@ -1327,6 +1327,13 @@ class SaveRefusedAtTheLockFileSaysWhyTests(unittest.TestCase):
         self.assertNotIn("fix its owner or mode", logged)
         self.assertLess(logged.index("data folder"), logged.index("regular file"))
         self.assertLess(logged.index("regular file"), logged.index("owner and mode"))
+        # The same open error comes from a link loop higher in the path, so
+        # neither text says for certain what sits at the lock file's name.
+        self.assertNotIn("name is taken", details["not_regular"])
+        not_regular = refusal(Path("/app/data/slot_mappings.json.lock"), "not_regular").operator_message
+        self.assertNotIn("the lock path is not a regular file", not_regular)
+        self.assertIn("link loop", not_regular)
+        self.assertLess(not_regular.index("data folder"), not_regular.index("move"))
 
 
 class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
@@ -1346,7 +1353,7 @@ class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
         for phrase in (
             "another bay mapping save is in progress",
             "a file lock could not be taken",
-            "is not a regular file",
+            "could not be opened as a regular file",
             "cannot be opened for writing",
         ):
             with self.subTest(phrase=phrase):
@@ -1364,6 +1371,15 @@ class SavingBayMappingsTroubleshootingTests(unittest.TestCase):
                 self.assertIn(step, section)
         # Services stop before anything at the lock file's name is touched.
         self.assertLess(section.index("docker compose down"), section.index("mv "))
+
+    def test_the_regular_file_refusal_also_names_a_link_loop_in_the_path(self) -> None:
+        section = " ".join(self.section().split())
+        rows = [line for line in self.section().splitlines() if "could not be opened as a regular file" in line]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertNotIn("name is taken", section)
+        self.assertIn("link loop", row)
+        self.assertIn("data folder", row)
 
     def test_a_failed_lock_call_names_both_causes_before_any_move(self) -> None:
         section = " ".join(self.section().split())

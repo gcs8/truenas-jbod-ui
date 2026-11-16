@@ -55,7 +55,9 @@ _PATH_LOCKS_GUARD = threading.Lock()
 # The filesystem has no flock (for example NFS without a lock manager).
 _UNSUPPORTED_LOCK_ERRNOS = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS})
 # Opening the lock path found a directory (EISDIR), a socket or a device with
-# no reader (ENXIO), or a symlink (ELOOP with O_NOFOLLOW): not a regular file.
+# no reader (ENXIO), or a symlink (ELOOP with O_NOFOLLOW). A link loop higher
+# in the path also gives ELOOP, so these show only that the lock path could
+# not be opened as a regular file, not what sits at its name.
 _NOT_REGULAR_LOCK_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
 
 
@@ -169,7 +171,7 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
     ``reason`` is ``busy`` (another owner held it past the bounded wait),
     ``unsupported`` (the lock call failed: no file locks on that storage, or
     the host is short of lock records), ``not_regular`` (the
-    lock path is not a regular file) or ``unwritable`` (the existing lock file
+    lock path could not be opened as a regular file) or ``unwritable`` (the existing lock file
     cannot be opened for writing). The mapping file is unchanged.
     """
 
@@ -182,7 +184,7 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
             "Could not save: a file lock could not be taken on the storage holding the mapping file." + _SEE
         ),
         "not_regular": (
-            "Could not save: the mapping lock file's name is taken by something that is not a regular file." + _SEE
+            "Could not save: the mapping lock file could not be opened as a regular file." + _SEE
         ),
         "unwritable": "Could not save: the mapping lock file cannot be opened for writing." + _SEE,
     }
@@ -192,7 +194,11 @@ class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
             "the lock call failed (the storage may not provide file locks, or the host may be short of "
             "lock records), so concurrent writers cannot be kept apart"
         ),
-        "not_regular": "the lock path is not a regular file; with every writer stopped, move it aside",
+        "not_regular": (
+            "it could not be opened as a regular file (something that is not a regular file is at that "
+            "name, or a link loop is in the path to it); check the path to the data folder, then, with "
+            "every writer stopped, move anything at that name that is not a regular file aside"
+        ),
         "unwritable": (
             "this process cannot open it for writing; check the data folder's permissions, then that "
             "the lock path is a regular file, then its owner and mode"

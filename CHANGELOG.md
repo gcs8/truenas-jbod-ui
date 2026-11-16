@@ -84,8 +84,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the mapping file, and there is no unguarded fallback. A save that cannot
   hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
   four page messages: another save is in progress, a file lock could not be
-  taken on the storage, the lock file's name is taken by something that is
-  not a regular file, or the lock file cannot be opened for writing. Each
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
   points to the new Troubleshooting section "Saving bay mappings", which has
   the recovery steps. The wait runs off the UI event loop. Reads take no lock and
   never wait for a writer, even one stalled while publishing: a read that
