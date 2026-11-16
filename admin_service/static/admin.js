@@ -358,11 +358,13 @@
       return;
     }
     elements.banner.textContent = message;
-    elements.banner.classList.remove("is-error", "is-success");
+    elements.banner.classList.remove("is-error", "is-success", "is-warning");
     if (tone === "error") {
       elements.banner.classList.add("is-error");
     } else if (tone === "success") {
       elements.banner.classList.add("is-success");
+    } else if (tone === "warning") {
+      elements.banner.classList.add("is-warning");
     }
   }
 
@@ -6522,6 +6524,7 @@
               describeResponseFailure(describeRequestFailure(payload, response), outcome), outcome
             );
             error.status = response.status;
+            error.cleanupState = payload?.state; // a decided refusal's fixed state, if the route gave one
             throw error;
           }
           return payload;

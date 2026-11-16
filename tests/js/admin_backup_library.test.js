@@ -803,6 +803,437 @@ test("clean up reports a partial run and a stale plan plainly", async () => {
   assert.match(mounted.elements.dialog.textContent, /The list changed since this plan was made, so nothing was deleted/);
 });
 
+test("clean up that kept copies after a failed keeper check says so, not plain success (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: [], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["full-new"], kept_after_replan: ["cfg-old", "full-part"] }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  assert.match(elements.dialog.textContent, /These 2 copies will be deleted/);
+  await library.actions.applyCleanup();
+  const text = "Deleted 0 copies. 1 of the copies it kept failed the size and SHA-256 check and was marked unverified. "
+    + "2 planned deletions were not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copy marked unverified: if it passes, clean up again; if not, back up again to replace it.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.deepEqual(banners.at(-1), [text, "error"]);
+  // Once a result is shown, the plan's introduction no longer promises deletions.
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\./);
+  assert.doesNotMatch(elements.dialog.textContent, /The result is below/);
+  // The result carries the same problem tone as the banner, not the muted note colour.
+  const result = elements.dialog.querySelector(".backup-dialog-result");
+  assert.match(result.className, /(^|\s)is-bad(\s|$)/);
+  assert.match(STYLES, /\.backup-dialog-result\.is-bad[\s,{]/, "the problem tone has a style");
+});
+
+test("a plain clean-up result keeps the muted tone and the past-tense introduction (#1188)", async () => {
+  const { elements, library, banners } = mount();
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), ["Deleted 2 copies.", "success"]);
+  assert.doesNotMatch(elements.dialog.querySelector(".backup-dialog-result").className, /is-bad/);
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\./);
+  assert.doesNotMatch(elements.dialog.textContent, /The result is below/);
+});
+
+test("several kept copies that failed the check read in the plural, with no copy/copies shortcut (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: ["cfg-old"], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["k1", "k2", "k3"], kept_after_replan: ["full-part"] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "Deleted 1 copy. 3 of the copies it kept failed the size and SHA-256 check and were marked unverified. "
+    + "1 planned deletion was not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copies marked unverified: if they pass, clean up again; if not, back up again to replace them.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(LIBRARY_SOURCE, /copy\/copies|deletion\/deletions/);
+});
+
+// #1188: the one thing the page says when no usable answer to a clean-up came
+// back. It matches the route's detail.
+const CLEANUP_STATE_UNKNOWN = "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+  + "started. Reload this page in a few minutes and check Last clean-up before starting another.";
+
+function resultNode(elements) {
+  return elements.dialog.querySelector(".backup-dialog-result");
+}
+
+function listReads(api) {
+  return api.calls.filter(({ method, url }) => method === "GET" && url === "/api/admin/backups").length;
+}
+
+test("a clean-up with no answer says so in the warning tone, reads nothing more, and no later read changes it (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_state_unknown", detail: "ignored server text" }) });
+  // A clean-up shows as running at the first read, so the ordinary running poll is on.
+  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
+  const timers = [];
+  const { elements, library, banners } = mount({ api, deps: { setTimeout: (callback) => timers.push(callback), isVisible: () => true } });
+  await library.load();
+  assert.match(elements.status.textContent, /A clean-up is running\./);
+  assert.equal(timers.length, 1, "the ordinary running poll");
+  await library.actions.openCleanup();
+  const reads = listReads(api);
+  await library.actions.applyCleanup();
+  assert.ok(elements.dialog.textContent.includes(CLEANUP_STATE_UNKNOWN), elements.dialog.textContent);
+  assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
+  assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
+  assert.match(STYLES, /\.backup-dialog-result\.is-warning[\s,{]/, "the warning tone has a style");
+  assert.equal(listReads(api), reads, "no list or status read after the lost answer");
+  assert.equal(timers.length, 1, "no poll of its own");
+  // The ordinary poll and a manual refresh show the newer Last clean-up line, and leave the message alone.
+  const bannerCount = banners.length;
+  api.data.running = null;
+  api.data.grooming = { at: "2026-09-24T12:05:00Z", ok: true, deleted: 2, detail: null, failed_locations: {} };
+  timers.shift()();
+  await settle();
+  await settle();
+  await library.load();
+  assert.equal(banners.length, bannerCount, "no read replaces the message");
+  assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN);
+  assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
+  assert.match(elements.status.textContent, /Last clean-up: T\(2026-09-24T12:05:00Z\), 2 removed\./);
+  assert.doesNotMatch(elements.status.textContent, /A clean-up is running/);
+  assert.equal(timers.length, 0);
+});
+
+test("an apply answer with no result is not known, never a result (#1188)", async () => {
+  for (const answer of [{}, { state: "still_running", detail: "x" }, { state: "cleanup_running" }, { state: "cleanup_not_running" }, { state: "something-new" }, { ok: true }]) {
+    const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => answer });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.openCleanup();
+    await library.actions.applyCleanup();
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], JSON.stringify(answer));
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, JSON.stringify(answer));
+  }
+  assert.doesNotMatch(LIBRARY_SOURCE, /cleanup_running|no longer running|cleanupWatch|bannerRevision/);
+});
+
+test("when the page's own timer ends the apply wait, the clean-up is not known, not failed (#1188)", async () => {
+  const timers = new Map();
+  let timerId = 0;
+  let applied = 0;
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    setTimeout(callback, ms) { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: async (url) => {
+      if (url.endsWith("/lifecycle/apply")) {
+        applied += 1;
+        return new Promise(() => {}); // the answer never comes
+      }
+      if (url.endsWith("/lifecycle/plan")) {
+        return jsonResponse(200, { plan_token: "plan-token-1", items: [
+          { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+      }
+      return jsonResponse(200, syntheticLibrary());
+    },
+  });
+  const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+  await library.load();
+  await library.actions.openCleanup();
+  const applying = library.actions.applyCleanup();
+  await settle();
+  assert.equal(applied, 1);
+  const pageTimer = [...timers.values()].find(({ ms }) => ms === 15 * 60 * 1000);
+  assert.ok(pageTimer, "the apply has the page's 15-minute timer");
+  pageTimer.callback();
+  await applying;
+  assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
+  assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN);
+  assert.doesNotMatch(elements.dialog.textContent, /failed|not available|isn't running/);
+});
+
+test("a lost connection or an undecided HTTP error after the apply went out is not known, never failed (#1188)", async () => {
+  const answers = {
+    "lost connection": () => Promise.reject(new TypeError("Failed to fetch")),
+    "HTTP 500": () => jsonResponse(500, { detail: "Internal Server Error" }),
+    "HTTP 502": () => jsonResponse(502, { detail: "Bad Gateway" }),
+    "HTTP 503": () => jsonResponse(503, { detail: "The backup scheduler service is not available." }),
+    "HTTP 504": () => jsonResponse(504, { detail: "Gateway Timeout" }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    let lists = 0;
+    const transport = loadAdminFunctions(transportNames, {
+      navigator: { onLine: true },
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      fetch: async (url) => {
+        if (url.endsWith("/lifecycle/apply")) return answer();
+        if (url.endsWith("/lifecycle/plan")) {
+          return jsonResponse(200, { plan_token: "plan-token-1", items: [
+            { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+        }
+        lists += 1;
+        return jsonResponse(200, syntheticLibrary());
+      },
+    });
+    const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+    await library.load();
+    await library.actions.openCleanup();
+    const before = lists;
+    await library.actions.applyCleanup();
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|isn't running/, name);
+    assert.equal(lists, before, `${name}: no read after the lost answer`);
+  }
+  // A decided refusal from the admin service still says the clean-up failed.
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(new Error("Forbidden"), { status: 403, adminOutcome: "error" }) });
+  const { library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.match(banners.at(-1)[0], /^Clean up failed: Forbidden/);
+  assert.equal(banners.at(-1)[1], "error");
+});
+
+const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
+const NOT_SENT_BODY = {
+  ok: false,
+  state: "cleanup_not_sent",
+  detail: "The backup scheduler service is not available.",
+  request_id: "0123456789abcdef0123456789abcdef",
+};
+
+async function applyThroughTransport(answer) {
+  let lists = 0;
+  let applies = 0;
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async (url) => {
+      if (url.endsWith("/lifecycle/apply")) {
+        applies += 1;
+        return answer();
+      }
+      if (url.endsWith("/lifecycle/plan")) {
+        return jsonResponse(200, { plan_token: "plan-token-1", items: [
+          { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+      }
+      lists += 1;
+      return jsonResponse(200, syntheticLibrary());
+    },
+  });
+  const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+  await library.load();
+  await library.actions.openCleanup();
+  const before = lists;
+  await library.actions.applyCleanup();
+  return { elements, banners, extraReads: lists - before, applies };
+}
+
+const EMPTY_RESULT = { deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [], kept_after_replan: [] };
+
+test("a stopped or refused clean-up answered with ok: false shows its result through the page's own transport (#1188)", async () => {
+  // The scheduler answers a run that stopped, or that a keeper check refused,
+  // with HTTP 200 and ok: false. The admin transport treats ok: false as a
+  // failed request unless the caller accepts the result.
+  const reason = "Kept copy could not be checked (keeper-check-budget-exhausted).";
+  const cases = {
+    "keeper check refused after three damaged copies": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: reason }, not_attempted: [],
+        downgraded: ["full-a", "full-b", "full-c"], kept_after_replan: [] },
+      `Clean up stopped after 0 of 1: ${reason} `
+        + "3 of the copies it kept failed the size and SHA-256 check and were marked unverified. "
+        + "Run Verify on the copies marked unverified, or back up again to replace them.",
+    ],
+    "a deletion failed": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: "permission denied" }, not_attempted: [],
+        downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1: permission denied",
+    ],
+    "nothing attempted": [
+      { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: ["cfg-old"], downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1.",
+    ],
+  };
+  for (const [name, [answer, text]] of Object.entries(cases)) {
+    const { elements, banners, applies } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.equal(applies, 1, name);
+    assert.equal(resultNode(elements).textContent, text, name);
+    assert.deepEqual(banners.at(-1), [text, "error"], name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|Request failed with 200/, name);
+  }
+});
+
+test("an ok: false answer that is not a clean-up result is still a failed request (#1188)", async () => {
+  // Control: only the scheduler's own result shape is accepted.
+  const answers = {
+    "no result": { ok: false, detail: "synthetic refusal" },
+    "a result list that is not a list": { ok: false, deleted: "cfg-old" },
+    "a named state beside a result": { ok: false, state: "cleanup_state_unknown", deleted: [] },
+    // One list is not the result: every list must be there and well formed, and so must a failed entry when one is given.
+    "only the deleted list": { ok: false, deleted: [] },
+    "a deleted entry that is not an id": { ...EMPTY_RESULT, ok: false, deleted: [null] },
+    "a missing list": { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [] },
+    "a list entry that is not an id": { ...EMPTY_RESULT, ok: false, not_attempted: [{ id: "cfg-old" }] },
+    "a failed entry without its error": { ...EMPTY_RESULT, ok: false, failed: { id: "cfg-old" } },
+    "a failed entry that is text": { ...EMPTY_RESULT, ok: false, failed: "cfg-old" },
+    "a named state beside a whole result": { ...EMPTY_RESULT, ok: false, state: "cleanup_state_unknown" },
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.match(resultNode(elements).textContent, /^Clean up failed: /, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up stopped|Deleted \d/, name);
+    assert.equal(banners.at(-1)[1], "error", name);
+  }
+});
+
+test("a clean-up that reports itself incomplete never reads as a plain success (#1188)", async () => {
+  // The scheduler does not send this (incomplete means a failed or unattempted
+  // deletion), but the page must not turn "not complete" into "Deleted 0 copies."
+  const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: false }));
+  assert.equal(resultNode(elements).textContent, "Clean up stopped after 0 of 0.");
+  assert.deepEqual(banners.at(-1), ["Clean up stopped after 0 of 0.", "error"]);
+  // Control: the same lists with ok: true are a finished clean-up.
+  const done = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: true }));
+  assert.equal(resultNode(done.elements).textContent, "Deleted 0 copies.");
+  assert.deepEqual(done.banners.at(-1), ["Deleted 0 copies.", "success"]);
+});
+
+test("a clean-up the admin service never sent says it did not start, and reads nothing more (#1188)", async () => {
+  const { elements, banners, extraReads, applies } = await applyThroughTransport(() => jsonResponse(503, NOT_SENT_BODY));
+  assert.equal(applies, 1);
+  assert.deepEqual(banners.at(-1), [CLEANUP_NOT_STARTED, "info"]);
+  assert.equal(resultNode(elements).textContent, CLEANUP_NOT_STARTED);
+  assert.doesNotMatch(resultNode(elements).className, /is-warning|is-bad/, "the busy refusal's plain tone");
+  assert.doesNotMatch(elements.dialog.textContent, /No answer came back|may have run|Clean up failed/);
+  assert.equal(extraReads, 0, "no list or status read after the refusal");
+});
+
+test("only the admin's not-sent 503 says did not start; a gateway's 5xx or a lost send stays not known (#1188)", async () => {
+  const answers = {
+    "plain HTTP 503": () => jsonResponse(503, { ok: false, detail: NOT_SENT_BODY.detail, request_id: NOT_SENT_BODY.request_id }),
+    "HTTP 503 with another state": () => jsonResponse(503, { ...NOT_SENT_BODY, state: "cleanup_state_unknown" }),
+    "HTTP 500 with the state": () => jsonResponse(500, NOT_SENT_BODY),
+    "HTTP 502 with the state": () => jsonResponse(502, NOT_SENT_BODY),
+    "HTTP 504 with the state": () => jsonResponse(504, NOT_SENT_BODY),
+    "send failed": () => Promise.reject(new TypeError("Failed to fetch")),
+    "202 with the state": () => jsonResponse(202, { state: "cleanup_not_sent", detail: NOT_SENT_BODY.detail }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements, banners, extraReads } = await applyThroughTransport(answer);
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /did not start|Clean up failed/, name);
+    assert.equal(extraReads, 0, `${name}: no read after the lost answer`);
+  }
+});
+
+test("the clean-up result sits directly under the plan's introduction, which no longer points below (#1188)", async () => {
+  const outcomes = {
+    success: () => ({ ok: true, deleted: ["cfg-old", "full-part"], already_missing: [], failed: null, not_attempted: [] }),
+    "not known": () => ({ state: "cleanup_state_unknown" }),
+    busy: () => Object.assign(new Error("A backup or grooming run is already in progress."), { status: 409 }),
+    stale: () => Object.assign(new Error("gone"), { status: 409 }),
+  };
+  for (const [name, answer] of Object.entries(outcomes)) {
+    const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": answer });
+    const { elements, library } = mount({ api });
+    await library.load();
+    await library.actions.openCleanup();
+    await library.actions.applyCleanup();
+    const body = elements.dialog.querySelector(".backup-dialog-body");
+    const [first, second, third] = body.children;
+    assert.equal(first.className, "backup-cleanup-intro", name);
+    assert.equal(first.textContent, "These 2 copies were in the clean-up plan.", name);
+    assert.match(second.className, /backup-dialog-result/, name);
+    assert.match(third.className, /backup-cleanup-list/, name);
+    assert.equal(elements.dialog.querySelectorAll(".backup-dialog-result").length, 1, name);
+    assert.doesNotMatch(elements.dialog.textContent, /The result is below/, name);
+  }
+});
+
+test("a one-copy plan reads in the singular before and after Delete (#1188)", async () => {
+  const api = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t1", items: [
+    { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] }),
+  "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: ["cfg-old"], already_missing: [], failed: null, not_attempted: [] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  const intro = elements.dialog.querySelector(".backup-cleanup-intro");
+  assert.match(intro.textContent, /^This copy will be deleted\. /);
+  assert.doesNotMatch(elements.dialog.textContent, /These 1 cop/);
+  await library.actions.applyCleanup();
+  assert.equal(elements.dialog.querySelector(".backup-cleanup-intro").textContent, "This copy was in the clean-up plan.");
+});
+
+test("a long clean-up plan scrolls inside its list, so the introduction, result and buttons stay in view (#1188)", async () => {
+  const items = Array.from({ length: 14 }, (_, index) => ({ id: `copy-${index}`, location: "local", backup_class: "full", reason: "x", kind: "retention" }));
+  const api = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t14", items }),
+    "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: items.map(({ id }) => id), already_missing: [], failed: null, not_attempted: [] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  // The structure the styles rely on: the list is a direct child of the dialog
+  // body, after the introduction and the result; the buttons sit outside the body.
+  const dialogChildren = elements.dialog.children.map((node) => node.className);
+  const body = elements.dialog.querySelector(".backup-dialog-body");
+  assert.deepEqual(body.children.slice(0, 3).map((node) => node.className.split(" ").find((name) => name.startsWith("backup-"))),
+    ["backup-cleanup-intro", "backup-dialog-result", "backup-change-list"]);
+  assert.match(body.children[2].className, /(^|\s)backup-cleanup-list(\s|$)/);
+  assert.equal(body.children[2].children.length, 14);
+  assert.ok(dialogChildren.some((name) => /backup-dialog-actions/.test(name)), dialogChildren.join());
+  assert.equal(body.querySelector(".backup-dialog-actions"), null);
+  const rule = (selector) => {
+    const start = STYLES.indexOf(`${selector} {`);
+    assert.ok(start >= 0, `missing style ${selector}`);
+    return STYLES.slice(start, STYLES.indexOf("}", start));
+  };
+  assert.match(rule(".backup-dialog[open]:has(.backup-cleanup-list)"), /display:\s*flex;[\s\S]*flex-direction:\s*column;/);
+  assert.match(rule(".backup-dialog-body:has(> .backup-cleanup-list)"), /display:\s*flex;[\s\S]*min-height:\s*0;/);
+  assert.match(rule(".backup-cleanup-list"), /overflow-y:[ ]*auto;/);
+});
+
+test("a clean-up applied while another run holds the scheduler says why nothing happened (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(
+    new Error("A backup or grooming run is already in progress."), { status: 409 }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  // True whether the running job is a backup or a clean-up: no promise about which line shows its result.
+  const text = "A backup or clean-up is already running on the backup service, so this clean-up did not start "
+    + "and deleted nothing. Open Clean up again after it finishes.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(elements.dialog.textContent, /The list changed since this plan was made/);
+  assert.doesNotMatch(LIBRARY_SOURCE, /When the running one finishes, its result shows in the Last clean-up line/);
+  assert.deepEqual(banners.at(-1), [text, "info"]);
+});
+
+test("the admin banner has a warning tone (#1188)", () => {
+  const classes = new Set(["is-error", "is-success"]);
+  const banner = { textContent: "", classList: {
+    add: (...names) => names.forEach((name) => classes.add(name)),
+    remove: (...names) => names.forEach((name) => classes.delete(name)),
+  } };
+  const context = loadAdminFunctions(["setBanner"], { state: {}, elements: { banner } });
+  context.setBanner("Not known.", "warning");
+  assert.deepEqual([...classes], ["is-warning"]);
+  context.setBanner("Fine.", "success");
+  assert.deepEqual([...classes], ["is-success"]);
+  assert.match(STYLES, /\.status-banner\.is-warning\s*\{/);
+});
+
+test("the status line shows a clean-up that finished but marked copies unverified (#1188)", async () => {
+  const api = fakeApi();
+  api.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 0,
+    detail: "1 of the copies it kept failed the size and SHA-256 check and was marked unverified.", failed_locations: {} };
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-ok"), null);
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-bad").textContent,
+    "Last clean-up: T(2026-09-24T12:00:00Z), 0 removed. 1 of the copies it kept failed the size and SHA-256 check and was marked unverified.");
+});
+
 test("clean up with nothing to do, or without a token, never applies", async () => {
   const empty = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t", items: [] }) });
   let mounted = mount({ api: empty });
