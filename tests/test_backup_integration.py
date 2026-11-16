@@ -3196,10 +3196,14 @@ class AdminProxyTests(unittest.TestCase):
         calls: list[tuple[str, str, Any]] = []
 
         class FakeClient:
-            def request(self, method, path, *, body=None, actor=None, timeout=None):
+            def request(self, method, path, *, body=None, actor=None, timeout=None, deadline=None):
                 calls.append((method, path, body))
                 if path.endswith("/run"):
                     return SchedulerResponse(409, {"detail": "A backup or grooming run is already in progress."})
+                if path.endswith("/lifecycle/apply"):
+                    # #1188: only the scheduler's full result shape counts as a clean-up result.
+                    return SchedulerResponse(200, {"ok": True, "deleted": [], "already_missing": [], "failed": None,
+                                                   "not_attempted": [], "downgraded": [], "kept_after_replan": []})
                 return SchedulerResponse(200, {"ok": True})
 
         with patch.object(admin_routes, "get_backup_scheduler_client", return_value=FakeClient()):

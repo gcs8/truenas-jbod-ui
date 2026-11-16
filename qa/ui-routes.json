@@ -100,7 +100,7 @@
     {"service":"admin","method":"GET","path":"/api/admin/backups/policy","class":"read","why":"Backup policy view (secrets reported as present/missing only).","fingerprint":"cfada7f71825ae78c271a9c0"},
     {"service":"admin","method":"PUT","path":"/api/admin/backups/policy","class":"forbidden","why":"Saves the backup policy.","fingerprint":"4ffa15a7dd3bcf583fc5ec80"},
     {"service":"admin","method":"GET","path":"/api/admin/backups/lifecycle/plan","class":"forbidden","why":"First step of the backup cleanup flow.","fingerprint":"b4e66d46234949facaf75709"},
-    {"service":"admin","method":"POST","path":"/api/admin/backups/lifecycle/apply","class":"forbidden","why":"Deletes backups.","fingerprint":"65fc4e2b8c25f81a31a0cd74"},
+    {"service":"admin","method":"POST","path":"/api/admin/backups/lifecycle/apply","class":"forbidden","why":"Deletes backups.","fingerprint":"7c7fdba36fc1728ba8ef9832"},
     {"service":"admin","method":"POST","path":"/api/admin/backups/targets/{target_id}/test","class":"forbidden","why":"Contacts a backup target.","fingerprint":"1b87982dd8528dd7bd7eee73"},
     {"service":"admin","method":"GET","path":"/api/admin/backups/{artifact_id}","class":"read","why":"One backup's metadata.","fingerprint":"dba2326905e4dd27da64cfd8"},
     {"service":"admin","method":"POST","path":"/api/admin/backups/{artifact_id}/verify","class":"forbidden","why":"Verifies a backup (reads the target).","fingerprint":"3a07799830f878a8d902adb2"},

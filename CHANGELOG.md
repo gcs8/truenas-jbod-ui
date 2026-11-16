@@ -52,11 +52,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   at most three reads per class and location. A copy that cannot be read, a
   spent read budget or too little scratch space stops deletion at that
   location with a named reason, and a clean-up that marked copies unverified
-  says so on the backup page. A manual clean-up gets up to 10 minutes for
-  those reads. If its answer does not come back, the admin service asks the
-  backup service once whether a clean-up is running and the page says only
-  what it reported: running, not running, or not known (in the warning
-  colour), until a later status read shows none running. History sidecar
+  says so on the backup page. A manual clean-up gets up to 10 minutes in all
+  for those reads. If no usable answer comes back, the admin service asks the
+  backup service once whether a clean-up is running: the page says one is
+  running only when it reports so, and otherwise that the state is not known
+  (in the warning colour); it never says a clean-up is not running. Reload
+  admin pages that were open before upgrading. History sidecar
   snapshots are replaced only by
   FULLs that pass the same fresh check, at most 14 local FULL content checks per
   backup run including the kept-copy check (#1195).

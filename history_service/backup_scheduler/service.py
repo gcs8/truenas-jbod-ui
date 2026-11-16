@@ -892,11 +892,11 @@ class BackupScheduler:
                 if removed:
                     logger.info(
                         "Removed %d replaced history sidecar backup %s; "
-                        "%d digest-checked local FULL %s remain.",
+                        "%d digest-checked local FULL %s.",
                         removed,
                         "copy" if removed == 1 else "copies",
                         full_copy_count,
-                        "copy" if full_copy_count == 1 else "copies",
+                        "copy remains" if full_copy_count == 1 else "copies remain",
                     )
         return record
 
@@ -1535,6 +1535,9 @@ class BackupScheduler:
             class_runs = dict(self._status["classes"])
             target_runs = dict(self._status["targets"])
             grooming = self._status.get("grooming")
+            # #1188: read the job reservation with the stored clean-up result,
+            # so one answer never pairs an earlier result with a later idle state.
+            running = self.running
         pending = 0
         if self.coalescer is not None:
             try:
@@ -1549,7 +1552,7 @@ class BackupScheduler:
                 "Interrupted backup publications require recovery; pending sizes are recorded intent sizes."
                 if pending_publications else None
             ),
-            "running": self.running,
+            "running": running,
             "classes": {
                 "config": {
                     "enabled": config.enabled,

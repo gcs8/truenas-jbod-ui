@@ -13,6 +13,8 @@ import http.client
 import json
 import os
 import socket
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,10 +24,14 @@ DEFAULT_SOCKET = "/app/backup-api/scheduler.sock"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DOWNLOAD_TIMEOUT_SECONDS = 600.0
 # A clean-up apply reads kept copies back before it deletes (#1188); a remote
-# FULL can take minutes. Wait as long as a download may, which is still well
-# inside the page's 15-minute wait for this action, so the page always gets an
-# answer from the admin service rather than its own timeout.
-LIFECYCLE_APPLY_TIMEOUT_SECONDS = 600.0
+# FULL can take minutes. Both numbers are elapsed-time deadlines for the whole
+# exchange (connect, send, answer headers and body), not socket timeouts: the
+# apply ends by 10 minutes, and the one status read after a lost answer gets 30
+# seconds of its own. The admin service therefore answers at least four minutes
+# before the page's own 15-minute timer for this action (LONG_TIMEOUT_MS in
+# admin_backups.js) gives up.
+LIFECYCLE_APPLY_DEADLINE_SECONDS = 600.0
+CLEANUP_STATUS_READ_DEADLINE_SECONDS = 30.0
 MAX_JSON_BYTES = 16 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
@@ -93,7 +99,21 @@ class BackupSchedulerClient:
         body: dict[str, Any] | None = None,
         actor: str | None = None,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> SchedulerResponse:
+        """Send one request and read its JSON answer.
+
+        ``timeout`` bounds each blocking step on its own. ``deadline`` is a
+        ``time.monotonic()`` instant by which the whole exchange ends: when it
+        passes, the socket is shut down, so a slow or stalled answer cannot
+        stretch the wait step by step.
+        """
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SchedulerUnavailableError("The backup scheduler service was not asked in time.")
+            timeout = remaining if timeout is None else min(timeout, remaining)
         connection = self._connection(timeout)
         headers = {"Accept": "application/json"}
         data = None
@@ -102,10 +122,33 @@ class BackupSchedulerClient:
             headers["Content-Type"] = "application/json"
         if actor:
             headers["X-Backup-Actor"] = actor
+        expired = threading.Event()
+        opened: list[socket.socket] = []
+        watchdog = None
+        if deadline is not None:
+
+            def expire() -> None:
+                expired.set()
+                # The socket kept from connect: http.client lets go of
+                # connection.sock once a closing answer's headers are in.
+                for sock in opened:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+            watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+            watchdog.daemon = True
+            watchdog.start()
         try:
             try:
+                connection.connect()
+                opened.append(connection.sock)
+                if expired.is_set():
+                    raise TimeoutError("The deadline passed before the request was sent.")
                 connection.request(method, path, body=data, headers=headers)
             except OSError as exc:
+                # The send did not complete, so the request is not whole.
                 raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
             # The whole request was sent: from here on a failure means only that
             # no usable answer came back, not that the scheduler did nothing.
@@ -115,8 +158,12 @@ class BackupSchedulerClient:
             except TimeoutError as exc:
                 raise SchedulerTimeoutError("The backup scheduler did not answer in time.") from exc
             except (OSError, http.client.HTTPException) as exc:
+                if expired.is_set():
+                    raise SchedulerTimeoutError("The backup scheduler did not answer in time.") from exc
                 raise SchedulerNoAnswerError("The backup scheduler service did not answer.") from exc
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             connection.close()
         if len(raw) > MAX_JSON_BYTES:
             raise SchedulerNoAnswerError("The backup scheduler answer was too large.")

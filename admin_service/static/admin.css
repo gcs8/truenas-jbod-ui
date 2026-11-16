@@ -1980,6 +1980,30 @@ h3 {
   box-shadow: var(--shadow);
 }
 
+/* #1188: a long clean-up plan scrolls inside its list, so the introduction,
+   the result and the buttons stay in view. Without :has() the whole dialog
+   scrolls, as before. */
+.backup-dialog[open]:has(.backup-cleanup-list) {
+  display: flex;
+  flex-direction: column;
+}
+
+.backup-dialog-body:has(> .backup-cleanup-list) {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.backup-dialog-body:has(> .backup-cleanup-list) > * {
+  margin-block: 0;
+}
+
+.backup-cleanup-list {
+  min-height: 3em;
+  overflow-y: auto;
+}
+
 .backup-dialog::backdrop {
   background: rgba(3, 8, 14, 0.66);
 }
