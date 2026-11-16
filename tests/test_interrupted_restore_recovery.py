@@ -1006,6 +1006,154 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             "prior",
         )
 
+    def _parked_history(self, target: _Deployment, transaction_id: str) -> dict[str, Path]:
+        return {
+            "hot": target.hot.with_name(f".{target.hot.name}.previous-{transaction_id}"),
+            "segments": target.segments.with_name(
+                f".{target.segments.name}.previous-{transaction_id}"
+            ),
+        }
+
+    def _assert_history_refusal_changes_nothing(self, target: _Deployment) -> None:
+        """Dry run and apply refuse on the history records and change nothing."""
+        marker = activation_pending_path(target.hot)
+        before = _tree_snapshot(target.root)
+        # The dry run goes first, so a dry run that does not refuse stops the
+        # case before an apply could change anything.
+        for apply in (False, True):
+            with self.assertRaises(ValueError, msg=f"apply={apply}") as refused:
+                self._recover(target, apply=apply)
+            self.assertEqual(
+                getattr(refused.exception, "reason", None),
+                "history-target-unrecorded",
+            )
+            self.assertTrue(marker.exists())
+            self.assertEqual(self._config_generation(target), "candidate")
+            self.assertEqual(_tree_snapshot(target.root), before)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_journal_history_records_the_first_folder_does_not_hold(
+        self,
+    ) -> None:
+        target = self._target()
+        # Undecided: every target, history included, holds the candidate, so
+        # the restore's own records return to the prior generation.
+        exit_code = self._import_in_child(
+            target,
+            lambda: [patch.object(_ImportActivationTransaction, "commit", self._hard_exit)],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        marker = activation_pending_path(target.hot)
+        original = marker.read_bytes()
+        parked = self._parked_history(target, json.loads(original)["transaction_id"])
+        aside = Path(self._directory.name) / "aside"
+        aside.mkdir()
+        for parts in (("hot", "segments"), ("hot",), ("segments",)):
+            with self.subTest(edited=parts):
+                # A writer of the history folder calls the live candidate the
+                # prior copy and takes the parked prior copy away.
+                forged = json.loads(original)
+                for part in parts:
+                    forged[part]["prior"] = forged[part]["candidate"]
+                    os.replace(parked[part], aside / part)
+                marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+                try:
+                    self._assert_history_refusal_changes_nothing(target)
+                    self.assertEqual(self._history_generation(target), "candidate")
+                finally:
+                    for part in parts:
+                        os.replace(aside / part, parked[part])
+                    marker.write_bytes(original)
+
+        # Control: the journal the restore wrote returns both sides to prior.
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_committed_history_records_the_first_folder_does_not_hold(
+        self,
+    ) -> None:
+        target = self._target()
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(_ImportActivationTransaction, "_finalize_commit", self._hard_exit)
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        marker = activation_pending_path(target.hot)
+        original = marker.read_bytes()
+        parked = self._parked_history(target, json.loads(original)["transaction_id"])
+        live = {"hot": target.hot, "segments": target.segments}
+        aside = Path(self._directory.name) / "aside"
+        aside.mkdir()
+        # A writer of the history folder puts the parked prior history back in
+        # place and calls it the candidate of the committed restore.
+        forged = json.loads(original)
+        for part in ("hot", "segments"):
+            os.replace(live[part], aside / part)
+            os.replace(parked[part], live[part])
+            forged[part]["candidate"] = forged[part]["prior"]
+        forged["generation_id"] = self.prior_generation_id
+        marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+
+        self._assert_history_refusal_changes_nothing(target)
+        self.assertEqual(self._history_generation(target), "prior")
+
+        for part in ("hot", "segments"):
+            os.replace(live[part], parked[part])
+            os.replace(aside / part, live[part])
+        marker.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "candidate",
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_first_folder_record_without_matching_history(self) -> None:
+        target = self._target()
+        exit_code = self._import_in_child(
+            target,
+            lambda: [patch.object(_ImportActivationTransaction, "commit", self._hard_exit)],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        transaction_id = json.loads(activation_pending_path(target.hot).read_bytes())[
+            "transaction_id"
+        ]
+        record = import_seal_path(target.runtime.parent, transaction_id)
+        original = record.read_bytes()
+        honest = json.loads(original)
+        self.assertEqual(
+            [(item["path"], item["kind"]) for item in honest["history"]],
+            [(str(target.hot), "file"), (str(target.segments), "directory")],
+        )
+        moved = [dict(item) for item in honest["history"]]
+        moved[0]["path"] = str(target.hot.with_name("other.db"))
+        swapped = [dict(item) for item in honest["history"]]
+        swapped[1] = dict(swapped[1], prior=swapped[1]["candidate"])
+        for label, history in (
+            ("no history", []),
+            ("hot only", honest["history"][:1]),
+            ("another hot path", moved),
+            ("segments prior replaced", swapped),
+        ):
+            with self.subTest(record=label):
+                record.write_bytes(json.dumps({**honest, "history": history}).encode("utf-8"))
+                try:
+                    self._assert_history_refusal_changes_nothing(target)
+                finally:
+                    record.write_bytes(original)
+
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
     def test_recovery_refuses_a_truncated_or_replaced_folder_record(self) -> None:
         target = self._target()

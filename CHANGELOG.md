@@ -233,7 +233,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   configuration (#1196): recovery now returns configuration and history to the
   same generation, or refuses with a named reason and keeps its evidence,
   instead of reporting the prior generation restored while candidate
-  configuration stayed active. While a configuration folder that the
+  configuration stayed active. The history records recovery acts on must
+  match the restore's own record in the first configuration folder; a journal
+  whose history records differ is refused (`history-target-unrecorded`) and
+  nothing is changed. While a configuration folder that the
   application's settings name still holds a restore record that recovery did
   not settle, it reports `configuration-recovery-incomplete`, changes nothing
   and exits with status 3; a folder it lists past its scan bound gives

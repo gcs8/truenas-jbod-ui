@@ -1174,7 +1174,8 @@ class _ImportActivationTransaction:
 
         The first folder's record keeps it so that records left after the
         journal is gone can be checked against history, not only against
-        configuration (#1196). Recovery itself reads history from the journal.
+        configuration (#1196). Recovery refuses a journal whose history
+        records are not exactly these.
         """
         prepared = self._prepared_segmented_restore
         journal = self._activation_journal_payload

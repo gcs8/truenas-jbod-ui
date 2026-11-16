@@ -773,11 +773,12 @@ and prior names, and the exact prior and candidate records. The first folder's
 record also lists every folder before anything in that folder changes, and holds
 the decision: `pending`, then `commit` before commit cleanup or `rollback` before
 an in-process rollback. It also keeps the journal's prior and candidate records
-of the history database and the segments folder, for the read-only clean-up
-check below; recovery reads history from the journal. The journal lives in the
+of the history database and the segments folder, with their paths, written
+before anything is staged. The journal lives in the
 history folder, which lower-trust services can write, so it is only an index:
 it names the transaction
-and the first folder, and repeats each target for a cross-check. Recovery acts
+and the first folder, and repeats each target and the history records for a
+cross-check. Recovery acts
 only on targets the folder records list, converges every folder the first record
 lists, and takes the decision from that record, never from the journal: `commit`
 finishes forward, and `pending` or `rollback` returns every target and the
@@ -816,7 +817,10 @@ written by another user (`journal-owner-mismatch`), a folder is missing or is
 not the one the restore used (`configuration-target-unavailable`), a folder
 record is missing, malformed or does not belong to the first folder's record
 (`configuration-target-unsealed`), the journal names a target that its folder's
-record does not list exactly (`configuration-target-unrecorded`), a recorded
+record does not list exactly (`configuration-target-unrecorded`), the
+journal's history records or the history paths recovery was given are not
+exactly the ones the first folder's record holds, or that record holds none
+(`history-target-unrecorded`), a recorded
 file changed (`configuration-target-divergent`), the prior copy is gone
 (`prior-generation-unavailable`), or a committed import no longer holds the
 candidate (`committed-generation-incomplete`). Builds that only know version 1
@@ -831,9 +835,15 @@ break or rewrite the journal so that recovery leaves configuration as the
 interrupted import left it; recovery then reports
 `configuration-recovery-incomplete` instead of success, as long as the records
 are in a folder the settings name and recovery runs where that folder is
-mounted. Such a writer can also make recovery refuse. Recovery judges history
-only from the history folder, so such a writer can always make history disagree
-with configuration. A writer of a configuration folder can change those files
+mounted. Such a writer can also make recovery refuse. The history records
+recovery acts on are the ones the first folder's record holds, so editing them
+in the journal cannot choose which history recovery keeps: recovery refuses
+with `history-target-unrecorded` before it changes anything, on either volume.
+Recovery reports success only when the history database and the segments
+folder match, by content, the copy those records give for the recorded
+decision. Such a writer can still delete or change the history files
+themselves, so that recovery refuses and history cannot return to the side the
+decision selects, and can change history after recovery finishes. A writer of a configuration folder can change those files
 directly; recovery gives it no more than that.
 
 Limits: a configuration destination outside the folders the settings name is not

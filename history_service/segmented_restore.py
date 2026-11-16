@@ -944,8 +944,10 @@ def _configuration_targets(
     write, so it is only an index: it names the transaction and the first
     configuration folder. Each configuration folder holds the restore's own
     record of every target in it; the first folder's record also lists every
-    folder and holds the decision. Recovery acts only on targets those records
-    list, and refuses a journal target they do not list exactly (#1196).
+    folder and holds the decision and the history records. Recovery acts only
+    on targets those records list, and refuses a journal target they do not
+    list exactly (#1196); ``_require_recorded_history`` does the same for the
+    journal's history records.
     """
     if journal.get("journal_version") != WHOLE_IMPORT_JOURNAL_VERSION:
         return [], None, []
@@ -1067,6 +1069,38 @@ def _configuration_targets(
     return targets, anchor["decision"], ordered
 
 
+def _require_recorded_history(
+    anchor: dict[str, Any],
+    journal: dict[str, Any],
+    source: Path,
+    segments_directory: Path,
+) -> None:
+    """Refuse unless the journal's history records are the first folder's.
+
+    The journal's history records are only an index too: they must be the ones
+    the first configuration folder's record holds, or a writer of the history
+    folder could choose which history recovery keeps (#1196).
+    """
+    expected = [
+        {
+            "path": os.path.abspath(path),
+            "kind": kind,
+            "prior": journal[name]["prior"],
+            "candidate": journal[name]["candidate"],
+        }
+        for name, kind, path in (
+            ("hot", "file", source),
+            ("segments", "directory", segments_directory),
+        )
+    ]
+    if anchor["history"] != expected:
+        raise SegmentedRestoreRecoveryRefused(
+            "history-target-unrecorded",
+            "The restore journal's history records do not match the restore's own "
+            "record in the first configuration folder. Recovery changed nothing.",
+        )
+
+
 def _remove_journal_update(journal_path: Path, transaction_id: str) -> None:
     update_path = _journal_update_path(journal_path, transaction_id)
     if not path_entry_exists(update_path):
@@ -1149,6 +1183,11 @@ def recover_segmented_restore(
     if unsettled:
         # The find authorizes nothing: it only stops a success report.
         return configuration_recovery_incomplete(unsettled, apply=apply)
+    if decision is not None:
+        # folder_records[0] is the first folder's record.
+        _require_recorded_history(
+            folder_records[0]["payload"], journal, source, segments_directory
+        )
     prior_hot = paths["prior_hot"]
     candidate_hot = paths["candidate_hot"]
     prior_segments = paths["prior_segments"]
