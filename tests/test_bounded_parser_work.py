@@ -1564,6 +1564,123 @@ def _distinct_enclosures(size: int, *, one_device: bool = False) -> list[SESMapE
     ]
 
 
+def _synthetic_shelf_pages(
+    bays: int, *, identifier: str | None, elements: list[int] | None = None, empty: tuple[int, ...] = (),
+    invalid: tuple[int, ...] = (), pages: tuple[str, ...] = ("aes", "ec", "join"),
+) -> dict[str, str]:
+    """One SES path to a shelf: bay b (device slot number b + 1) is element
+    elements[b]. An empty bay has no SAS device; an invalid one has the normal
+    INVALID additional-element descriptor of an empty bay."""
+
+    elements = list(range(bays)) if elements is None else elements
+    title = "  SYNTH SHELF 0100\n" + (f"  Primary enclosure logical identifier (hex): {identifier}\n" if identifier else "")
+    out = {page: title for page in pages}
+    headers = {
+        "aes": "Additional element status diagnostic page:\n Element type: Array device slot, subenclosure id: 0 [ti=0]\n",
+        "ec": "Enclosure Status diagnostic page:\n Element type: Array device slot, subenclosure id: 0 [ti=0]\n",
+        "join": "[0,-1] Element type: Array device slot\n",
+    }
+    for page in pages:
+        out[page] += headers[page]
+    for bay, element in sorted(enumerate(elements), key=lambda item: item[1]):
+        present = bay not in empty
+        fields = (
+            f" number of phys: 1, not all phys: 0, device slot number: {bay + 1}\n SAS device type: "
+            + ("end device" if present else "no SAS device attached")
+            + f"\n attached SAS address: 0x5ddd\n SAS address: {f'0x{0x500000 + bay:x}' if present else '0x0'}\n"
+        )
+        aes = " flagged as invalid (no further information)\n" if bay in invalid else fields
+        status = "OK" if present else "Not installed"
+        if "aes" in out:
+            out["aes"] += f" Element index: {element} eiioe=0\n" + aes
+        if "ec" in out:
+            out["ec"] += f" Element {element} descriptor:\n status: {status}\n Ident=0\n"
+        if "join" in out:
+            out["join"] += (
+                f"Slot{bay + 1:02} [0,{element}] Element type: Array device slot\n Enclosure Status:\n"
+                f" status: {status}\n Additional Element Status:\n" + aes
+            )
+    return out
+
+
+def _reversed_element_pages(pages: dict[str, str]) -> dict[str, str]:
+    """The checked-in four-bay pages with the elements numbered the other way
+    round, each page's descriptors in element order as the tool prints them."""
+
+    patterns = {
+        "aes": r"(?m)^      Element index: (\d+).*$",
+        "ec": r"(?m)^      Element (\d+) descriptor:.*$",
+        "join": r"(?m)^Slot\d+ \[0,(\d+)\].*$",
+    }
+    out = {}
+    for page, text in pages.items():
+        matches = list(re.finditer(patterns[page], text))
+        blocks = []
+        for position, match in enumerate(matches):
+            block = text[match.start():matches[position + 1].start() if position + 1 < len(matches) else len(text)]
+            element = 3 - int(match.group(1))
+            start, end = match.start(1) - match.start(), match.end(1) - match.start()
+            blocks.append((element, block[:start] + str(element) + block[end:]))
+        out[page] = text[:matches[0].start()] + "".join(block for _, block in sorted(blocks))
+    return out
+
+
+def _host_results(device_pages: list[dict[str, str]]):  # noqa: ANN202
+    devices = [f"/dev/sg{100 + index}" for index in range(len(device_pages))]
+    results = [result for device, pages in zip(devices, device_pages) for result in _overlay_results([device], pages, "")]
+    results = [result for result in results if result.command != LINUX_ENCLOSURE_SYSFS_MAP_COMMAND]
+    results.append(SSHCommandResult(command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout="", stderr="",
+                                    exit_code=0))
+    return devices, results
+
+
+def _empty_bay_redundant_paths(*, later_shelf: bool, path_b_first: bool = False) -> list[dict[str, str]]:
+    """The checked-in four-bay shelf on two paths. Path A reads empty bay 3 as
+    the normal INVALID descriptor; path B numbers the elements the other way
+    round. A later device may read a second shelf."""
+
+    pages = {page: _fixture_text(f"scale_offset_1based_{page}.txt") for page in ("aes", "ec", "join")}
+    path_a = dict(
+        pages,
+        aes=_fixture_text("scale_offset_1based_invalid_aes.txt"),
+        join=re.sub(
+            r"(?ms)(^Slot03 .*?  Additional Element Status:\n).*?(?=^Slot04)",
+            lambda match: match.group(1) + "    flagged as invalid (no further information)\n",
+            pages["join"],
+        ),
+    )
+    paths = [_reversed_element_pages(pages), path_a] if path_b_first else [path_a, _reversed_element_pages(pages)]
+    if later_shelf:
+        paths.append({page: _ENCLOSURE_ID_LINE.sub(lambda match: match.group(1) + "5bbbb", text)
+                      for page, text in pages.items()})
+    return paths
+
+
+def _two_host_service(host_pages: dict[str, list[dict[str, str]]]) -> types.SimpleNamespace:
+    service = types.SimpleNamespace(
+        settings=types.SimpleNamespace(layout=types.SimpleNamespace(slot_count=4)),
+        _optional_ssh_transport_failure_detail=InventoryService._optional_ssh_transport_failure_detail,
+        _tag_ses_overlay=InventoryService._tag_ses_overlay,
+        _merge_ses_overlay_data=InventoryService._merge_ses_overlay_data,
+        _score_sg_ses_overlay=InventoryService._score_sg_ses_overlay,
+        _get_cached_sg_ses_devices=lambda host: [],
+        _remember_sg_ses_devices=lambda host, devices: None,
+        _sg_ses_device_cache={},
+        scores={},
+    )
+
+    async def discover(host, *, failure_prefix, report_empty_discovery=True):  # noqa: ANN001, ANN202
+        devices, results = _host_results(host_pages[host])
+        overlay, failures = await InventoryService._fetch_sg_ses_host_overlay(
+            service, host, devices, failure_prefix=failure_prefix, command_results=results
+        )
+        service.scores[host] = InventoryService._score_sg_ses_overlay(overlay)
+        return devices, overlay, failures
+
+    service._discover_and_fetch_sg_ses_host_overlay = discover
+    return service
+
+
 class SesOverlayMergeWorkTests(LinearGrowthAssertions):
     def test_enclosure_merge_matches_the_previous_merge(self) -> None:
         rng = random.Random(1216)
@@ -1710,6 +1827,142 @@ class SesOverlayMergeWorkTests(LinearGrowthAssertions):
                     lambda size: _distinct_enclosures(size, one_device=one_device),
                     size=1500,
                 )
+
+    def test_slot_candidates_keep_the_same_element_seen_from_two_hosts(self) -> None:
+        # Two HA nodes reach the same element through a device with the same
+        # name. Each node needs its own target, in the order they were merged.
+        def target(host: str, element: int) -> dict:
+            return {"ssh_host": host, "ses_device": "/dev/sg0", "ses_element_id": element, "ses_slot_number": 1}
+
+        maps = [{0: {"ses_targets": [target("host-a", 1)]}}, {0: {"ses_targets": [target("host-b", 1), target("host-a", 1)]}}]
+        expected = [target("host-a", 1), target("host-b", 1)]
+        merged: dict = {}
+        index: dict = {}
+        for item in copy.deepcopy(maps):
+            parsers.merge_slot_candidate_maps(merged, item, index)
+        self.assertEqual(merged[0]["ses_targets"], expected)
+        self.assertEqual(sorted(key[0] for key in index[0]), ["host-a", "host-b"])
+        one_by_one: dict = {}
+        for item in copy.deepcopy(maps):
+            one_by_one = parsers.merge_slot_candidate_maps(one_by_one, item)
+        self.assertEqual(one_by_one[0]["ses_targets"], expected)
+
+    def assert_previous_overlay(self, device_pages: list[dict[str, str]], slot_count: int, case: object = None):  # noqa: ANN201
+        devices, results = _host_results(device_pages)
+        expected, expected_failures = _reference_host_overlay(slot_count, "host-a", devices, copy.deepcopy(results))
+        overlay, failures = _fetch_overlay(_overlay_stub(slot_count), devices, results)
+        self.assertEqual(failures, expected_failures, case)
+        self.assertEqual(overlay.ses_enclosures, expected.ses_enclosures, case)
+        self.assertEqual([list(item.slots) for item in overlay.ses_enclosures],
+                         [list(item.slots) for item in expected.ses_enclosures], case)
+        self.assertEqual(overlay.ses_slot_candidates, expected.ses_slot_candidates, case)
+        self.assertEqual(overlay.ses_selected_meta, expected.ses_selected_meta, case)
+        return overlay
+
+    def test_redundant_paths_with_an_empty_bay_keep_the_previous_answer(self) -> None:
+        # The answer pinned here is inherited and kept on purpose: this change
+        # bounds the work, not the answer. Path B's stronger evidence for empty
+        # bay 3 brings its element number to a record that keeps path A's
+        # device, which names path A's bay 2. The earlier loop merged bay 3 into
+        # bay 2 when it merged the next device, so a later shelf decides
+        # whether bay 3 is shown. Tracked in the follow-up "SES merge: a bay
+        # keeps its own enclosure device and element together on every path".
+        for later_shelf, bays, score in ((True, [1, 2, 4], 7), (False, [1, 2, 4, 3], 4)):
+            with self.subTest(later_shelf=later_shelf):
+                overlay = self.assert_previous_overlay(_empty_bay_redundant_paths(later_shelf=later_shelf), 4)
+                shelf = overlay.ses_enclosures[0]
+                self.assertEqual(list(shelf.slots), bays)
+                self.assertEqual(InventoryService._score_sg_ses_overlay(overlay), score)
+                targets = [(item["ses_device"], item["ses_element_id"]) for item in shelf.slots[2].control_targets]
+                if later_shelf:
+                    # Bay 2 also carries bay 3's two targets, as before.
+                    self.assertEqual(targets, [("/dev/sg100", 1), ("/dev/sg101", 2), ("/dev/sg101", 1), ("/dev/sg100", 2)])
+                else:
+                    self.assertEqual(targets, [("/dev/sg100", 1), ("/dev/sg101", 2)])
+
+    def test_two_hosts_choose_the_host_the_previous_overlay_chose(self) -> None:
+        # Two hosts read the same shelves; one enumerates the paths the other
+        # way round, so only that host's overlay keeps bay 3. The host with more
+        # bays is chosen, as it was before.
+        for first_host_path_b_first in (False, True):
+            with self.subTest(first_host_path_b_first=first_host_path_b_first):
+                host_pages = {
+                    "node-a": _empty_bay_redundant_paths(later_shelf=True, path_b_first=first_host_path_b_first),
+                    "node-b": _empty_bay_redundant_paths(later_shelf=True, path_b_first=not first_host_path_b_first),
+                }
+                service = _two_host_service(host_pages)
+                overlay, failures, best_host = asyncio.run(
+                    InventoryService._fetch_sg_ses_overlay(service, ["node-a", "node-b"], failure_prefix="SES")
+                )
+                chosen = "node-a" if first_host_path_b_first else "node-b"
+                self.assertEqual(failures, [])
+                self.assertEqual(service.scores, {"node-a": 8 if first_host_path_b_first else 7,
+                                                  "node-b": 7 if first_host_path_b_first else 8})
+                self.assertEqual(best_host, chosen)
+                devices, results = _host_results(host_pages[chosen])
+                expected, _ = _reference_host_overlay(4, chosen, devices, results)
+                self.assertEqual(overlay.ses_enclosures, expected.ses_enclosures)
+                self.assertEqual(sorted(overlay.ses_enclosures[0].slots), [1, 2, 3, 4])
+
+    def test_redundant_paths_with_independent_numbering_give_the_previous_overlay(self) -> None:
+        # Shelves on two to four paths, each path numbering the elements its own
+        # way, an empty bay with the INVALID descriptor, other shelves between
+        # and after them, devices in any order.
+        rng = random.Random(7260)
+        for case in range(60):
+            bays = rng.choice((4, 12))
+            device_pages = []
+            for path in range(rng.choice((2, 2, 3, 4))):
+                elements = list(range(bays))
+                if path:
+                    rng.shuffle(elements)
+                device_pages.append(_synthetic_shelf_pages(
+                    bays, identifier="5abc", elements=elements, empty=(2,), invalid=(2,),
+                    pages=rng.choice((("aes",), ("aes", "ec"), ("aes", "ec", "join"))),
+                ))
+            for other in range(rng.randrange(4)):
+                elements = list(range(4))
+                rng.shuffle(elements)
+                device_pages.append(_synthetic_shelf_pages(
+                    4, identifier=f"5d{other:02x}", elements=elements, empty=(1,), invalid=(1,) if rng.random() < 0.5 else ()
+                ))
+            rng.shuffle(device_pages)
+            self.assert_previous_overlay(device_pages, bays, case)
+
+    def test_redundant_paths_with_an_empty_bay_have_linear_merge_work(self) -> None:
+        # Every shelf is re-merged after its second path, as the earlier loop
+        # did, but the shelves merged before it are not merged again.
+        def build(size: int) -> list[dict[str, str]]:
+            device_pages = []
+            for index in range(size):
+                identifier = f"5{index:04x}"
+                device_pages.append(_synthetic_shelf_pages(4, identifier=identifier, empty=(2,), invalid=(2,)))
+                device_pages.append(_synthetic_shelf_pages(4, identifier=identifier, elements=[3, 2, 1, 0], empty=(2,)))
+            return device_pages
+
+        real = parsers._merge_ses_enclosures
+
+        def merged_slots(device_pages: list[dict[str, str]]) -> int:
+            handed = []
+
+            def counting(enclosures):  # noqa: ANN001, ANN202
+                handed.append(sum(len(item.slots) for item in enclosures))
+                return real(enclosures)
+
+            with mock.patch("app.services.inventory._merge_ses_enclosures", counting):
+                overlay, failures = _fetch_overlay(_overlay_stub(4), *_host_results(device_pages))
+            self.assertEqual(failures, [])
+            self.assertEqual(len(overlay.ses_enclosures), len(device_pages) // 2)
+            return sum(handed)
+
+        # Bays handed to the merge, per shelf: its two paths, then the shelf
+        # again once or twice until a merge leaves it unchanged. Merging every
+        # earlier shelf again for each device would grow with the square.
+        for size in (16, 64):
+            self.assertLessEqual(merged_slots(build(size)), size * 4 * 5, size)
+        stub = _overlay_stub(4)
+        self.assert_linear_growth(lambda built: _fetch_overlay(stub, *built), lambda size: _host_results(build(size)),
+                                  size=64)
 
 
 # --- Every pattern in the parser modules -------------------------------------

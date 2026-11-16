@@ -57,7 +57,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read once for each SES device, and the SES overlay that merged each SES
   device into everything merged before it no longer cost the square of their
   size. The work of each parser named here now grows linearly with its output,
-  and well-formed output parses as before. An operation name, CDB or sense line too
+  and well-formed output parses as before, including the SES shelves, bays and
+  locate targets shown and the host chosen when several hosts read the same
+  shelves. With redundant paths to a shelf, an empty bay and different element
+  numbering on the paths, a bay can still be merged into its neighbour, as
+  before; that is tracked separately. An operation name, CDB or sense line too
   long to be real, a CDB with no byte after `CDB:`, and a sense line with no
   sense key are not decoded; a StorCLI virtual drive without a decimal VD
   number is no longer given the physical drives of every VD; and a configured

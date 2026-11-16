@@ -12866,6 +12866,8 @@ class InventoryService:
         host_overlay = ParsedSSHData()
         host_failures: list[str] = []
         host_enclosures: list[Any] = []
+        shelf_by_id: dict[str, int] = {}
+        unsettled: set[int] = set()
         host_target_index: dict[int, dict[tuple[Any, ...], dict[str, Any]]] = {}
         device_commands: dict[str, tuple[str, str, str]] = {}
         commands: list[str] = []
@@ -12925,12 +12927,30 @@ class InventoryService:
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)
-            # Add each device without redoing the earlier ones (#1216).
-            host_enclosures.extend(parsed.ses_enclosures)
+            # Merge each device as the earlier loop did, but only into the shelves
+            # it can join and the shelves the last merge changed: that loop also
+            # merged every other shelf again, which changed nothing (#1216). A
+            # device is read once, so only its enclosure ID can join an earlier shelf.
+            picks = sorted(unsettled | {
+                shelf_by_id[enclosure.enclosure_id]
+                for enclosure in parsed.ses_enclosures
+                if enclosure.enclosure_id in shelf_by_id
+            })
+            before = [copy.deepcopy(host_enclosures[index]) for index in picks]
+            merged = _merge_ses_enclosures([*(host_enclosures[index] for index in picks), *parsed.ses_enclosures])
+            first_new = len(host_enclosures)
+            host_enclosures.extend(merged[len(picks):])
+            for index, enclosure in zip(picks, merged):
+                host_enclosures[index] = enclosure
+            unsettled = {index for index, old in zip(picks, before) if old != host_enclosures[index]}
+            unsettled.update(range(first_new, len(host_enclosures)))
+            for index in [*picks, *range(first_new, len(host_enclosures))]:
+                if host_enclosures[index].enclosure_id:
+                    shelf_by_id.setdefault(host_enclosures[index].enclosure_id, index)
             merge_slot_candidate_maps(host_overlay.ses_slot_candidates, parsed.ses_slot_candidates, host_target_index)
             host_overlay.ses_selected_meta = merge_enclosure_meta(host_overlay.ses_selected_meta, parsed.ses_selected_meta)
             host_overlay.linux_scsi_devices.extend(parsed.linux_scsi_devices)
-        host_overlay.ses_enclosures = _merge_ses_enclosures(host_enclosures)
+        host_overlay.ses_enclosures = host_enclosures
         return host_overlay, host_failures
 
     async def _fetch_sg_ses_overlay(
