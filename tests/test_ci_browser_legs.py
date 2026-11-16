@@ -319,7 +319,8 @@ class RequiredAggregateTests(unittest.TestCase):
         self.assertEqual(job_needs(jobs["javascript-source"]), ["route"])
 
     @unittest.skipIf(os.name == "nt", "runs the step's shell command with bash")
-    def test_the_result_check_fails_unless_the_legs_and_both_source_gates_succeeded(self) -> None:
+    def test_the_result_check_fails_unless_the_legs_succeeded(self) -> None:
+        # The legs and both source gates: all three results must be success.
         script = aggregate_check_step(self.aggregate)["run"]
         for results in itertools.product(JOB_RESULTS, repeat=len(AGGREGATE_RESULT_ENV)):
             env = dict(zip(AGGREGATE_RESULT_ENV, results))
