@@ -998,7 +998,14 @@ def build_router(admin_settings: Any) -> APIRouter:
             before=settings,
             after=refreshed_settings,
             lead="Saved.",
-            note=fixed_device_sg_ses_note(len(skipped_sg_ses_reads)) if skipped_sg_ses_reads else None,
+            note=" ".join(
+                note
+                for note in (
+                    fixed_device_sg_ses_note(len(skipped_sg_ses_reads)) if skipped_sg_ses_reads else None,
+                    setup_service.last_save_note,
+                )
+                if note
+            ) or None,
         )
 
     @router.post("/api/admin/system-setup/demo")
