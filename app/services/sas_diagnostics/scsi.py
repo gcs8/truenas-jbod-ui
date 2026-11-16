@@ -464,14 +464,64 @@ SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0004", "name": "PHY reset problem count"},
 ]
 
+# One byte printed as hexadecimal text: ASCII hex digits only, one or two of
+# them (the kernel prints CDB bytes as "%02x" and ASC/ASCQ as "%x"). A sign,
+# an underscore, a prefix, spaces, non-ASCII digits or a wider token (even
+# one with leading zeros) is not a byte and is never converted.
+HEX_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{1,2}")
+CDB_DECIMAL_TOKEN = re.compile(r"[0-9]+")
+# The only text the kernel prints after the CDB bytes is its transfer-length
+# trailer, "length <decimal>" (followed by "SMID <n>" and free text).
+CDB_TRAILER_WORD = "length"
+MAX_CDB_RAW_EVIDENCE_LENGTH = 128
+MAX_MALFORMED_ASC_EVIDENCE_LENGTH = 32
+
+
+def read_hex_byte_token(token: str, *, two_digits: bool = False) -> int | None:
+    """Return the byte a whole hex token names, or None when it is not one."""
+    if not isinstance(token, str) or not HEX_BYTE_TOKEN.fullmatch(token):
+        return None
+    if two_digits and len(token) != 2:
+        return None
+    return int(token, 16)
+
+
+def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
+    """Return the CDB bytes and, when the byte run is malformed, its raw text.
+
+    A CDB is a run of two-digit hexadecimal byte tokens. The run ends cleanly
+    only at the end of the text or at the kernel trailer ``length <decimal>``
+    (for example ``length 16 SMID 7``). Any other token that ends the run (a
+    short, wrong-width or non-hex token, or any other word) makes the CDB
+    malformed, as does an empty run. A malformed run is never compacted: the
+    bytes before the bad token keep their positions and nothing after it is
+    converted.
+    """
+    tokens = text.split()
+    cdb_bytes: list[int] = []
+    for index, token in enumerate(tokens):
+        value = read_hex_byte_token(token, two_digits=True)
+        if value is not None:
+            cdb_bytes.append(value)
+            continue
+        trailer_value = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if cdb_bytes and token == CDB_TRAILER_WORD and CDB_DECIMAL_TOKEN.fullmatch(trailer_value):
+            break
+        raw = " ".join(tokens)
+        if len(raw) > MAX_CDB_RAW_EVIDENCE_LENGTH:
+            raw = f"{raw[: MAX_CDB_RAW_EVIDENCE_LENGTH - 3]}..."
+        return cdb_bytes, raw
+    return cdb_bytes, None
+
+
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     match = re.search(
-        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",
+        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)",
         message,
     )
     if not match:
         return {}
-    cdb_bytes = [int(token, 16) for token in match.group("cdb").split() if re.fullmatch(r"[0-9a-fA-F]{2}", token)]
+    cdb_bytes, malformed_raw = _split_cdb_tokens(match.group("cdb"))
     reported_operation = match.group("operation").strip()
     opcode = cdb_bytes[0] if cdb_bytes else None
     operation_from_table = opcode in SCSI_CDB_OPCODE_NAMES if opcode is not None else False
@@ -488,7 +538,15 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     family = _cdb_fault_family(operation)
     confidence = "standard" if operation_from_table else "observed"
     decoder_note = None
-    if opcode in SCSI_SERVICE_ACTION_OPCODES and service_action is not None and not service_action_known:
+    if malformed_raw is not None:
+        # Opcode recognition is kept apart from whole-CDB validity: a known
+        # opcode stays named, but no field is decoded from a malformed run.
+        confidence = "standard-partial" if operation_from_table else "unconfirmed"
+        decoder_note = (
+            "CDB contains a malformed byte token; address and length fields are not decoded "
+            "and the raw CDB text is kept as evidence."
+        )
+    elif opcode in SCSI_SERVICE_ACTION_OPCODES and service_action is not None and not service_action_known:
         confidence = "standard-partial"
         decoder_note = "Opcode is standard, but this service action is not in the current local lookup table."
     elif not operation_from_table:
@@ -499,8 +557,6 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
         "operation": operation,
         "reported_operation": reported_operation,
         "direction": _cdb_direction(operation),
-        "cdb_hex": " ".join(f"{value:02x}" for value in cdb_bytes),
-        "byte_count": len(cdb_bytes),
         "likely_layer": fault_family_likely_layer(family),
         "description": f"{operation} was active when the path error was reported.",
         "decode_confidence": confidence,
@@ -515,6 +571,12 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
         decoded["service_action"] = f"0x{service_action:02x}"
         if service_action_known:
             decoded["service_action_label"] = operation
+    if malformed_raw is not None:
+        decoded["cdb_malformed"] = True
+        decoded["cdb_raw"] = malformed_raw
+        return decoded
+    decoded["cdb_hex"] = " ".join(f"{value:02x}" for value in cdb_bytes)
+    decoded["byte_count"] = len(cdb_bytes)
 
     address = _decode_cdb_address(cdb_bytes)
     if address:
@@ -532,6 +594,10 @@ def decode_scsi_sense_event(event: dict[str, Any]) -> dict[str, Any]:
     sense_key = str(event.get("sense_key") or event.get("sense") or "").upper()
     asc = str(event.get("asc") or "").lower()
     asc_tuple = parse_asc_ascq(asc)
+    # A present field ("" included: the line had an empty "asc:") that the
+    # reader rejects is malformed; only a missing field is absent.
+    if event.get("asc") is not None and asc_tuple is None:
+        return _malformed_asc_sense_event(asc, sense_key)
     asc_label = SCSI_ASC_ASCQ_LABELS.get(asc_tuple) if asc_tuple else None
     family = _sense_fault_family(reason, sense_key, asc_tuple)
     sense_label = SCSI_SENSE_KEY_LABELS.get(sense_key)
@@ -560,14 +626,39 @@ def decode_scsi_sense_event(event: dict[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+def _malformed_asc_sense_event(asc: str, sense_key: str) -> dict[str, Any]:
+    # A rejected ASC/ASCQ is not a code: no T10 label, fault family or layer is
+    # derived from it, and the event keeps the kernel's own reason as its title.
+    if len(asc) > MAX_MALFORMED_ASC_EVIDENCE_LENGTH:
+        asc = f"{asc[: MAX_MALFORMED_ASC_EVIDENCE_LENGTH - 3]}..."
+    return {
+        "sense_key": sense_key,
+        "sense_label": SCSI_SENSE_KEY_LABELS.get(sense_key),
+        "asc": asc,
+        "asc_malformed": True,
+        "description": "The target returned SCSI sense data, but its ASC/ASCQ value could not be decoded.",
+        "decode_confidence": "unconfirmed",
+        "decode_source": "kernel_message",
+        "source_attribution": dict(KERNEL_MESSAGE_SOURCE),
+        "decoder_note": (
+            "ASC/ASCQ value is malformed (each part must be one or two hex digits); it was not "
+            "decoded against the T10 table and the raw text is kept as evidence."
+        ),
+    }
+
+
 def parse_asc_ascq(value: str) -> tuple[int, int] | None:
-    parts = [part.strip() for part in str(value or "").split(",", 1)]
+    """Return ASC and ASCQ as the kernel prints them (``%x,%x``), or None.
+
+    Each part must be a whole byte token; the text is not trimmed or repaired.
+    """
+    parts = str(value or "").split(",")
     if len(parts) != 2:
         return None
-    try:
-        return int(parts[0], 16), int(parts[1], 16)
-    except ValueError:
+    asc, ascq = (read_hex_byte_token(part) for part in parts)
+    if asc is None or ascq is None:
         return None
+    return asc, ascq
 
 
 def decode_scsi_status_value(value: str) -> dict[str, Any]:
