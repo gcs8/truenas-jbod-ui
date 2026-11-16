@@ -146,6 +146,7 @@ def admin_error_response(
     headers: dict[str, str] | None = None,
     log_level: int = logging.WARNING,
     exc_info: Any = None,
+    state: str | None = None,
 ) -> JSONResponse:
     """One admin error surface: the correlation id in the body, header and log.
 
@@ -164,8 +165,11 @@ def admin_error_response(
     response_headers = {REQUEST_ID_HEADER: request_id}
     if headers:
         response_headers.update(headers)
+    body = {"ok": False, "detail": detail, "request_id": request_id}
+    if state:
+        body["state"] = state
     return JSONResponse(
-        {"ok": False, "detail": detail, "request_id": request_id},
+        body,
         status_code=status_code,
         headers=response_headers,
     )

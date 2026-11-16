@@ -28,6 +28,7 @@ from admin_service.route_support import (
     SERVICE_STARTED_AT,
     TemporaryFileResponse,
     _format_count,
+    admin_error_response,
     build_admin_state_payload,
     build_runtime_payload,
     compute_expires_at,
@@ -63,7 +64,8 @@ from admin_service.services.account_bootstrap import (
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
-from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+from admin_service.services import backup_scheduler_client
+from admin_service.services.backup_scheduler_client import SchedulerNoAnswerError, SchedulerUnavailableError
 from admin_service.services.esxi_host_prep import (
     MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
 )
@@ -998,7 +1000,14 @@ def build_router(admin_settings: Any) -> APIRouter:
             before=settings,
             after=refreshed_settings,
             lead="Saved.",
-            note=fixed_device_sg_ses_note(len(skipped_sg_ses_reads)) if skipped_sg_ses_reads else None,
+            note=" ".join(
+                note
+                for note in (
+                    fixed_device_sg_ses_note(len(skipped_sg_ses_reads)) if skipped_sg_ses_reads else None,
+                    setup_service.last_save_note,
+                )
+                if note
+            ) or None,
         )
 
     @router.post("/api/admin/system-setup/demo")
@@ -1475,6 +1484,36 @@ def build_router(admin_settings: Any) -> APIRouter:
         return artifact_id
 
     scheduler_unavailable_detail = "The backup scheduler service is not available."
+    # #1188: the one thing the apply route says when no usable answer to a
+    # clean-up came back, whatever the reason. It asks the scheduler nothing
+    # more: no later read can tell what this request did. The page uses the
+    # same words.
+    cleanup_no_answer_detail = (
+        "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+        "started. Reload this page in a few minutes and check Last clean-up before starting another."
+    )
+
+    def is_cleanup_result(payload: Any) -> bool:
+        """The shape the scheduler's apply route returns for a finished clean-up."""
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+            return False
+        for key in ("deleted", "already_missing", "not_attempted", "downgraded", "kept_after_replan"):
+            items = payload.get(key)
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                return False
+        failed = payload.get("failed")
+        return failed is None or (
+            isinstance(failed, dict) and isinstance(failed.get("id"), str) and isinstance(failed.get("error"), str)
+        )
+
+    async def scheduler_request_by(deadline: float, client: Any, method: str, path: str, **kwargs: Any) -> Any:
+        """One scheduler request that ends by ``deadline``, including any wait for a worker thread."""
+
+        remaining = max(0.0, deadline - time.monotonic())
+        return await asyncio.wait_for(
+            asyncio.to_thread(client.request, method, path, deadline=deadline, **kwargs), timeout=remaining + 1.0
+        )
 
     async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
         client = get_backup_scheduler_client()
@@ -1554,7 +1593,29 @@ def build_router(admin_settings: Any) -> APIRouter:
         token = payload.get("plan_token") if isinstance(payload, dict) else None
         if not isinstance(token, str) or not token or len(token) > 128:
             raise HTTPException(status_code=400, detail="plan_token is required.")
-        return await scheduler_call("POST", "/internal/backups/lifecycle/apply", {"plan_token": token})
+        # #1188: apply reads kept copies back before deleting, so it gets its
+        # own deadline. A result comes only from the scheduler's result; its
+        # refusals before starting (400, 409) pass through. Anything else once
+        # the connection was open, or no answer at all, gets the one fixed
+        # message. Only a request that was never sent stays "not available",
+        # with a fixed state so the page can say the clean-up did not start.
+        client = get_backup_scheduler_client()
+        deadline = time.monotonic() + backup_scheduler_client.LIFECYCLE_APPLY_DEADLINE_SECONDS
+        try:
+            response = await scheduler_request_by(
+                deadline, client, "POST", "/internal/backups/lifecycle/apply", body={"plan_token": token}, actor="admin"
+            )
+        except (SchedulerNoAnswerError, TimeoutError):
+            response = None
+        except SchedulerUnavailableError:
+            return admin_error_response(scheduler_unavailable_detail, 503, state="cleanup_not_sent")
+        if response is not None:
+            if response.status == 200 and is_cleanup_result(response.payload):
+                return JSONResponse(response.payload, status_code=200)
+            detail = response.payload.get("detail") if isinstance(response.payload, dict) else None
+            if response.status in (400, 409) and isinstance(detail, str) and detail:
+                raise HTTPException(status_code=response.status, detail=detail)
+        return JSONResponse({"state": "cleanup_state_unknown", "detail": cleanup_no_answer_detail}, status_code=202)
 
     @router.post("/api/admin/backups/targets/{target_id}/test")
     async def test_backup_target(target_id: str) -> JSONResponse:

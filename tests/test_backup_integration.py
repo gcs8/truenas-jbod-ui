@@ -2429,6 +2429,147 @@ class SchedulerTests(SchedulerTestBase):
         problems = backup_archive_problems(self._paths.status_file)
         self.assertTrue(any(p.startswith("Backup grooming stopped: ConnectionRefusedError") for p in problems))
 
+    def test_grooming_keeps_the_older_full_when_the_newest_local_copy_is_missing(self) -> None:
+        # #1188: keep=1 with two local copies; the newest file vanished after
+        # it was verified, while its catalog row still says verified.
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2}})
+        older = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        newest = scheduler.run_now("full")
+        (self._paths.local_dir / newest.name).unlink()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 1}})
+        token, _expires, plan = scheduler.plan()
+        # The preview is catalog-only; the payload check happens before deletion.
+        self.assertEqual([item.record.artifact_id for item in plan.items], [older.artifact_id])
+
+        result = scheduler.apply(token)
+
+        self.assertTrue((self._paths.local_dir / older.name).exists(), "the last good copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertEqual(grooming["deleted"], 0)
+        self.assertIn("marked unverified", grooming["detail"])
+        self.assertEqual(scheduler.plan()[2].items, ())
+
+    def test_remote_grooming_reads_back_kept_copies_before_deleting(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        remote_dir = self.remote_root / "nas"
+        # Same-size corruption of the newest remote copy after its upload readback.
+        (remote_dir / newest.name).write_bytes(b"X" * newest.size)
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+
+        result = scheduler.apply(scheduler.plan()[0])
+
+        self.assertTrue((remote_dir / older.name).exists(), "the last good remote copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        # The readback scratch file never outlives the check.
+        self.assertEqual(
+            [path.name for path in self._paths.state_dir.iterdir() if path.name.startswith("keeper-check-")], []
+        )
+
+    def test_missing_remote_keeper_is_downgraded_without_listing_the_target(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        remote_dir = self.remote_root / "nas"
+        (remote_dir / newest.name).unlink()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+        token = scheduler.plan()[0]
+
+        real_get = LocalDirectoryTarget.get
+        with patch.object(LocalDirectoryTarget, "get", autospec=True, side_effect=real_get) as get, \
+                patch.object(LocalDirectoryTarget, "list", autospec=True, side_effect=AssertionError("listed")) as listed:
+            result = scheduler.apply(token)
+
+        self.assertTrue((remote_dir / older.name).exists(), "the last good remote copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(result.failed_locations, {})
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        # Only the newest kept copy is read, capped at its recorded size. Once
+        # it is downgraded nothing is left to delete, so the check stops there.
+        # The target is never listed.
+        self.assertEqual(
+            [(call.args[1], call.kwargs["limit"]) for call in get.call_args_list],
+            [(newest.name, newest.size)],
+        )
+        self.assertEqual(listed.call_count, 0)
+
+    def test_remote_grooming_deletes_after_an_intact_keeper_readback(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+
+        result = scheduler.apply(scheduler.plan()[0])
+
+        self.assertTrue(result.complete)
+        self.assertEqual([item.record.artifact_id for item in result.deleted], [older.artifact_id])
+        self.assertFalse((self.remote_root / "nas" / older.name).exists())
+        self.assertTrue(scheduler.catalog.get(newest.artifact_id).verified)
+
+    def test_remote_keeper_readback_failure_refuses_the_deletion(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+        token = scheduler.plan()[0]
+
+        with patch.object(LocalDirectoryTarget, "get", side_effect=PermissionError("synthetic denied")):
+            result = scheduler.apply(token)
+
+        self.assertTrue((self.remote_root / "nas" / older.name).exists())
+        self.assertEqual(result.deleted, ())
+        self.assertIn("keeper-readback-failed", result.failed_locations["nas"])
+        self.assertTrue(scheduler.catalog.get(newest.artifact_id).verified, "an unchecked keeper is not downgraded")
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertFalse(grooming["ok"])
+        self.assertIn("keeper-readback-failed", grooming["failed_locations"]["nas"])
+        self.assertNotIn("synthetic denied", json.dumps(grooming))
+
+    def test_same_size_corrupt_fulls_earn_no_sidecar_replacement_credit(self) -> None:
+        # #1188: FULL files corrupted without a size change must not stand in
+        # for the last good history sidecar snapshot.
+        scheduler = self.make({"full": {"enabled": True}})
+        earlier = []
+        for _ in range(13):
+            earlier.append(scheduler.run_now("full"))
+            self.now += timedelta(days=1)
+        sidecar = self._paths.history_backup_dir / "history-20260922T030000Z.sqlite3"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_bytes(b"last good sidecar snapshot")
+        stamp = (self.now - timedelta(days=1)).timestamp()
+        os.utime(sidecar, (stamp, stamp))
+        for record in earlier:
+            path = self._paths.local_dir / record.name
+            path.write_bytes(b"X" * record.size)
+
+        scheduler.run_now("full")
+
+        self.assertTrue(sidecar.exists(), "corrupt FULLs earned sidecar replacement credit")
+        self.assertEqual(scheduler._verified_local_full_count(), 1)
+        for record in earlier:
+            self.assertFalse(scheduler.catalog.get(record.artifact_id).verified)
+
     def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
         import dataclasses
 
@@ -2908,7 +3049,10 @@ class SchedulerApiTests(SchedulerTestBase):
         self.assertEqual(set(plan), {"plan_token", "expires_at", "items", "guarded"})
         status, body = asgi_call(app, "POST", "/internal/backups/lifecycle/apply", {"plan_token": plan["plan_token"]})
         self.assertEqual(status, 200)
-        self.assertEqual(set(json.loads(body)), {"ok", "deleted", "already_missing", "failed", "not_attempted"})
+        self.assertEqual(
+            set(json.loads(body)),
+            {"ok", "deleted", "already_missing", "failed", "not_attempted", "downgraded", "kept_after_replan"},
+        )
         self.assertEqual(asgi_call(app, "POST", "/internal/backups/lifecycle/apply", {"plan_token": plan["plan_token"]})[0], 409)
         status, body = asgi_call(app, "POST", "/internal/backups/targets/nas/test")
         self.assertEqual(status, 200)
@@ -3053,10 +3197,14 @@ class AdminProxyTests(unittest.TestCase):
         calls: list[tuple[str, str, Any]] = []
 
         class FakeClient:
-            def request(self, method, path, *, body=None, actor=None):
+            def request(self, method, path, *, body=None, actor=None, timeout=None, deadline=None):
                 calls.append((method, path, body))
                 if path.endswith("/run"):
                     return SchedulerResponse(409, {"detail": "A backup or grooming run is already in progress."})
+                if path.endswith("/lifecycle/apply"):
+                    # #1188: only the scheduler's full result shape counts as a clean-up result.
+                    return SchedulerResponse(200, {"ok": True, "deleted": [], "already_missing": [], "failed": None,
+                                                   "not_attempted": [], "downgraded": [], "kept_after_replan": []})
                 return SchedulerResponse(200, {"ok": True})
 
         with patch.object(admin_routes, "get_backup_scheduler_client", return_value=FakeClient()):

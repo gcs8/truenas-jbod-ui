@@ -19,7 +19,7 @@ import os
 import threading
 import unittest
 
-from history_service.backup_archive.catalog import new_artifact_id
+from history_service.backup_archive.catalog import CatalogError, new_artifact_id
 from history_service.backup_archive.transport import FtpTarget, LocalDirectoryTarget
 
 import tests.test_backup_archive_transport as archive_transport_fixtures
@@ -573,15 +573,24 @@ class CleanupRefusalWordingTests(backup_fixtures.SchedulerTestBase):
         # Through the admin route, which hands the page the scheduler's answer.
         status, result = _admin_call(app, "/api/admin/backups/lifecycle/apply", None, {"plan_token": plan["plan_token"]})
         self.assertEqual(status, 200)
-        self.assertEqual(set(result), {"ok", "deleted", "already_missing", "failed", "not_attempted"})
-        self.assertIs(result["ok"], False)
-        self.assertEqual(result["deleted"], [])
-        self.assertEqual(result["failed"]["id"], older.artifact_id)
-        self.assertEqual(result["failed"]["error"], f"CatalogError: {GUARD_REFUSAL}")
-        self.assertNotIn("verified", result["failed"]["error"])
+        self.assertEqual(
+            set(result),
+            {"ok", "deleted", "already_missing", "failed", "not_attempted", "downgraded", "kept_after_replan"},
+        )
+        # No copy that passed a check would stay, so the clean-up keeps the
+        # planned copy before the guard is asked (#1188).
+        self.assertIs(result["ok"], True)
+        self.assertEqual((result["deleted"], result["failed"]), ([], None))
+        self.assertEqual(result["kept_after_replan"], [older.artifact_id])
         self.assertEqual((self.ftp.files, self.ftp.retr_calls), (files, reads))  # nothing deleted, nothing read
         row = scheduler.serialize(scheduler.get(older.artifact_id))
         self.assertEqual((row["upload_check"], row["last_verify"], row["verified"]), ("size", None, True))
+        # The guard itself, asked about the same size-only copy, says what it checked.
+        with self.assertRaises(CatalogError) as refused:
+            scheduler.catalog.claim_deletion(scheduler.catalog.get(older.artifact_id), actor="op")
+        self.assertEqual(str(refused.exception), GUARD_REFUSAL)
+        self.assertNotIn("verified", str(refused.exception))
+        self.assertEqual(self.ftp.files, files)
 
 
 GUARD_REFUSAL = (

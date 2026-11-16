@@ -95,9 +95,87 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   when the config file was already replaced and only the directory fsync
   failed; the profile is kept and the request reports an uncertain save
   (#1240).
+- The CORE Storage Fabric view no longer invents an `mpr-1` controller when
+  no `mprutil` output was returned; it says no controller or path data is
+  available and still draws the bays, pools and vdevs the inventory knows.
+  Output that cannot be read as controller data no longer creates a
+  controller. A count or list is shown as measured only when the reply that
+  carries it was read: a controller, path, expander or enclosure count whose
+  read did not happen, was incomplete or could not be parsed reads "not
+  read" or "at least N" in the summary, host line, disk view and main-page
+  topology summary instead of 0, and a lane whose expander or enclosure list
+  was not read says "Not read" instead of "No objects reported". A list
+  printed with its column heading and no rows is still a measured zero, and
+  rows `mprutil` prints with blank columns (an expander's zero parent or
+  enclosure handle, a non-SES enclosure's SEP handle) are read. Every
+  supported `mprutil -u N` command, `show all` included, counts its unit as
+  attempted, and a `show all` reply is read through its `Adapter:`,
+  `Devices:`, `Enclosures:` and `Expanders:` sections (a dedicated reply for
+  the same list wins, and a section in which `mprutil` printed an error is
+  not read); a unit that could not be read is named in a warning
+  and keeps the view partial, and a unit number that is not 1 to 4 digits is
+  rejected and counted, never shown. An adapter or expander PHY table that
+  was not read whole (missing, short, malformed or repeated rows) shows its
+  PHY counts as "not read", is counted in a warning and keeps the view
+  partial; a whole table keeps its counts, including rows for PHYs with
+  nothing attached and an expander that reports zero PHYs, and a
+  "Discovery still in progress" line in place of a PHY row adds no warning.
+  Of these reads, an unread or rejected controller unit, an unread expander
+  or enclosure list and a PHY table not read whole make the status partial.
+  An enclosure's device count comes only from a device list that was read;
+  an unread device list shows that count as "not read" and, as before,
+  leaves the status alone. On a partial
+  read, inventory bays that no controller lane claims are drawn in their own
+  group, and the no-controller lanes say "disks" for unmapped inventory. An
+  empty numbered `mprutil -u N` result no longer hides the unnumbered
+  adapter details. When only the unnumbered `mprutil show ...` commands
+  answer, their board and firmware stay on one controller, and every link
+  and controller reference names a node that is in the map (#1244, refs
+  #1219).
+- System Setup no longer replaces a system configured only in the top-level
+  `truenas` and `ssh` settings (in `config.yaml` or `.env`, including one that
+  sets only a credential and uses the default host) when a system is added,
+  under any id, `default` included. The add is refused before anything is
+  written. The message says to save `default` in System Setup or move it into
+  a `systems` entry in `config.yaml`, and that its API key and passwords are
+  then stored in `config.yaml`; the Advanced Configuration wiki page has the
+  steps. Saving `default` from System Setup now keeps the settings the form
+  does not show and the exact user names in effect, and copies each key or
+  password it keeps into `config.yaml` with the value in effect, including one
+  from a `TRUENAS_*` or `SSH_*` variable or its `_FILE` file, without showing
+  it; when group or other accounts can read `config.yaml`, that save logs a
+  warning and the result says so. Demo creation applies the same check. Each
+  config save stages under its own private name; one that fails or is
+  interrupted before the new file is published leaves the previous file intact
+  and removes its own staging copy, best effort, and no other file. Saves
+  still rewrite `config.yaml` without its comments (#1253).
+- Backup retention no longer deletes the last good copy on the strength of a
+  kept copy it has not checked. Before deleting, grooming reads back the
+  newest kept copy and compares size and SHA-256; a missing or corrupt one is
+  marked unverified, the plan is worked out again and the next copy is tried,
+  at most three reads per class and location. A copy that cannot be read, a
+  spent read budget or too little scratch space stops deletion at that
+  location with a named reason, and a clean-up that marked copies unverified
+  says so on the backup page. A manual clean-up gets up to 10 minutes in all
+  for those reads. If no usable answer comes back, the page says, in the
+  warning colour, that no answer came back and the clean-up may have run, may
+  still be running or may not have started, and asks for a reload in a few
+  minutes; nothing later changes that message. When the backup scheduler
+  cannot be reached, so the request was never sent, the page says the clean-up
+  did not start. Reload admin pages that were open before upgrading. History sidecar snapshots are replaced only by
+  FULLs that pass the same fresh check, at most 14 local FULL content checks per
+  backup run including the kept-copy check (#1195).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
+- QuantaStor: two overlapping storage views on one node no longer both show
+  the same disk, and another node's pool-device row at the same local path
+  (such as `/dev/sda`) no longer moves a disk to that node's bay, gives it
+  that node's pool, or lists the disk as visible on that node. A pool-device
+  row's device path now matches only a disk on the row's own node, and a row
+  with no known node matches no disk by path when the grid has several nodes;
+  stable identifiers (physical disk ID, serial, SCSI ID) still match across
+  nodes, and single-node systems are unchanged (#1264).
 - The backup list's Verified column now says what the backup details say: a
   copy uploaded to an FTP-style target, which checks only the remote size,
   reads "Size only at upload" in both places until an explicit Verify reads
@@ -212,6 +290,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file was replaced between its check and its open reads again, and
+  after three such rereads refuses with `mapping_read_busy` (503,
+  `Retry-After`) instead of waiting. A read that already opened the file
+  returns that complete version. A mapping path that is not a regular file,
+  including one swapped in during a read, is refused without blocking and is
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
+  revision from the same read. A refused import now gets the named 503
+  instead of a generic error (#1256).
 
 ### Performance
 

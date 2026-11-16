@@ -324,9 +324,13 @@ test.describe("admin sidecar smoke", () => {
 
   test("demo creation preserves a loaded existing synthetic system", async ({ page }) => {
     test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1", "Requires the isolated synthetic admin runner.");
+    // The clean-room config has a top-level truenas host and no systems list,
+    // so its implicit legacy system must be saved as "default" (an edit of
+    // that system, so replace_existing) before any system can be added (#1227).
     const created = await page.request.post("/api/admin/system-setup", {data: {
-      system_id: "qa-safety-existing", label: "Synthetic existing system", platform: "linux",
+      system_id: "default", label: "Synthetic existing system", platform: "linux",
       truenas_host: "https://synthetic.example.invalid", ssh_enabled: false, make_default: true,
+      replace_existing: true,
     }});
     expect(created.ok()).toBeTruthy();
     await gotoAdmin(page);
