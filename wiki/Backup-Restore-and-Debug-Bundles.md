@@ -451,7 +451,7 @@ journal. Restart the scheduler to apply a save:
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. With `trust_on_first_use`, a new host key is saved in the scheduler's own state folder and `known_hosts_path` is only read. Use SFTP for "SCP" |
 | `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted. Uploads check the remote size only; the target test and the backup's details say so until **Verify** downloads it and matches size and SHA-256 |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
-| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
+| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url`. When the store's checksum (ETag) matches the bytes sent, nothing is read back and the backup's details say "Checked by the provider's checksum at upload"; otherwise the upload is read back and hashed. Earlier versions recorded both cases the same way, so an S3 copy recorded as read back says "by the provider's checksum or by read-back". Each says so until **Verify** downloads it and matches size and SHA-256 |
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
 
@@ -480,17 +480,21 @@ Some copies are never deleted:
 
 - A preserved (pinned) backup is never deleted and does not count toward keep-N.
   Preserve one before an upgrade or migration and give a reason.
-- The newest verified copy of each class at each location is always kept.
+- The newest copy of each class at each location that passed its last
+  completed check is always kept. For an FTP copy that check can be the
+  upload's size check, and for an S3 copy the store's checksum; its Verified
+  column says so until **Verify** re-reads it.
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
 
 Before grooming deletes a copy of a class at a location, it makes sure at
-least one copy it is keeping is still good. It reads back the newest verified
-copy that stays and checks its size and SHA-256 against the catalog. If that
-copy matches, the check ends and the deletions go ahead. If it is missing or no
-longer matches, it is marked unverified, the plan is worked out again (which
-can only remove deletions, never add one), and the next newest verified copy is
-read. The check stops as soon as nothing is left to delete. The clean-up result
+least one copy it is keeping is still good. Of the copies that stay, it reads
+back the newest one that passed its last completed check, and checks its size
+and SHA-256 against the catalog. If that copy matches, the check ends and the
+deletions go ahead. If it is missing or no longer matches, it is marked
+unverified, the plan is worked out again (which can only remove deletions,
+never add one), and the next newest such copy is read. The check stops as soon
+as nothing is left to delete. The clean-up result
 and the backup page's "Last clean-up" status line both say how many copies were
 marked unverified, even when the clean-up otherwise finished, in the same words
 ("3 of the copies it kept failed the size and SHA-256 check and were marked
@@ -639,6 +643,14 @@ preview and apply grooming with a one-time plan token, and test a target.
 Artifact and library routes use opaque backup ids; they do not accept or return
 an artifact file path. Policy routes accept target paths and secret-file paths,
 but secret-file paths and credential contents are never returned.
+
+A Verify answer and the backup's details carry an `outcome`: `matched` (the
+copy was read back and matched its size and SHA-256), `mismatch` (it was read
+and did not match, or a local copy is gone; it stops counting as verified), or
+`not_read` (the copy could not be opened or read, so nothing was checked and
+its verified status, restore and clean-up treatment are unchanged). The page
+words the last case as "could not read the copy, nothing checked". Results
+saved by earlier versions have no outcome.
 
 ## Create a debug bundle
 

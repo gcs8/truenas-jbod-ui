@@ -215,6 +215,43 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   with no known node matches no disk by path when the grid has several nodes;
   stable identifiers (physical disk ID, serial, SCSI ID) still match across
   nodes, and single-node systems are unchanged (#1264).
+- The backup list's Verified column now says what the backup details say: a
+  copy uploaded to an FTP-style target, which checks only the remote size,
+  reads "Size only at upload" in both places until an explicit Verify reads
+  it back and matches its SHA-256. A remote copy whose upload check was never
+  recorded now says so instead of "Yes". A Verify of the local copy no longer
+  carries over to a remote copy made from it, and one malformed stored upload
+  check no longer stops the whole list from loading. A Verify result now names
+  the copy it read. A remote copy's result saved before this change is no
+  longer counted, because it may have been copied from the local copy: after
+  upgrading, such a copy reads as its upload check (size only, or not
+  recorded) until it is verified again. Listing reads nothing from the target
+  and rewrites no catalogue file. The Verify banner follows the Verify's own
+  result, so one that could not reach
+  the target no longer says "Backup verified.", and "Last check" says Worked
+  only for a passed check. The clean-up dialog no longer calls the copy it
+  keeps in each place the newest verified copy: it is the newest copy that
+  passed its last completed check, which can be a size check, and the
+  clean-up refusal for that copy says the same instead of "the newest verified
+  copy". An S3 upload whose ETag matched is no longer recorded or shown as read
+  back: it says it was checked by the provider's checksum. A copy recorded as
+  read back, which earlier versions also recorded for a matching S3 ETag, says
+  provider's checksum or read-back when its target is S3 or no longer
+  configured. Both hold until the copy's own Verify passes. A Verify or
+  clean-up that stopped now shows its own result on the page instead of a
+  generic request failure. A Verify now reports whether the copy was read and
+  matched, read and did not match, or could not be read; one that could not
+  read the copy says nothing was checked and its earlier status is unchanged,
+  instead of reading as a failed check. Once the size or content check has
+  rejected a copy, a later failure (closing the connection, or removing the
+  partial download or the fetched temporary copy) no longer replaces that
+  result: the copy is still reported and marked as not matching, and a
+  download of it is refused as a mismatch, as is now a download larger than
+  catalogued. A rejection the caller was already handling when the Verify or
+  download began is not counted against this copy. An operating-system error
+  while removing the fetched temporary copy after a match no longer hides the
+  match and is logged. Interruption and cancellation still stop the Verify
+  (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

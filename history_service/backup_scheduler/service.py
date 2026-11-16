@@ -30,6 +30,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -1176,7 +1177,11 @@ class BackupScheduler:
     ) -> None:
         self.catalog.add(remote_record)
         with self._state_lock:
-            meta = self._metadata_snapshot(source.artifact_id)
+            # Copy only what describes the archive itself. Verify results and
+            # publication intents belong to the source copy: a Verify of the local
+            # file must never make this remote copy look read back (#1202).
+            source_meta = self._metadata_snapshot(source.artifact_id)
+            meta = {key: source_meta[key] for key in _ARCHIVE_DESCRIPTION_KEYS if key in source_meta}
             # #722: remember how the upload was checked, so the detail view can
             # say "size only" until an explicit verify re-reads and hashes it.
             meta["upload_check"] = upload_check
@@ -1471,7 +1476,27 @@ class BackupScheduler:
             "preserved_by": record.preserved_by or None,
             "change_count": len(record.change_ids),
             "app_version": meta.get("app_version"),
+            # #1202: the list says what the details say. None for local copies
+            # and copies catalogued before #722.
+            "upload_check": self._presented_upload_check(record, meta),
+            "last_verify": _list_last_verify(record, meta),
         }
+
+    def _presented_upload_check(self, record: ArtifactRecord, meta: Mapping[str, Any]) -> str | None:
+        """How this copy was checked at upload, claiming no more than the record shows.
+
+        Earlier releases stored "readback" for an S3 upload whose ETag matched,
+        which read nothing back, and the stored record cannot tell that apart
+        from a real readback (#1202). Such a record, and one whose target is no
+        longer configured, is presented as either until its own Verify passes.
+        """
+
+        value = _upload_check(meta)
+        if value == "readback" and record.location != LOCAL_LOCATION:
+            target = self.policy.target(record.location)
+            if target is None or target.settings.provider == "s3":
+                return "provider_checksum_or_readback"
+        return value
 
     def detail(self, artifact_id: str) -> dict[str, Any]:
         record = self.get(artifact_id)
@@ -1504,9 +1529,7 @@ class BackupScheduler:
             if meta
             else None
         )
-        payload["last_verify"] = meta.get("last_verify")
-        # None for local copies and copies catalogued before #722.
-        payload["upload_check"] = meta.get("upload_check") if meta.get("upload_check") in {"readback", "size"} else None
+        payload["last_verify"] = _detail_last_verify(record, meta)
         return payload
 
     def library(self) -> dict[str, Any]:
@@ -1630,41 +1653,61 @@ class BackupScheduler:
             _require_match(record, size, digest)
             yield record, local
         finally:
-            for child in workspace.iterdir():
-                child.unlink(missing_ok=True)
-            workspace.rmdir()
+            try:
+                for child in workspace.iterdir():
+                    child.unlink(missing_ok=True)
+                workspace.rmdir()
+            except OSError as exc:
+                # Never let clean-up replace the result of the read and comparison (#1202).
+                logger.error("Backup fetch workspace could not be removed (%s).", type(exc).__name__)
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
         ok = False
+        # Which of three things happened (#1202), decided by where the attempt
+        # stopped and never by an error's text: "matched", "mismatch" (the
+        # comparison ran and failed, or the local copy is gone), or "not_read"
+        # (opening or reading the copy failed, so nothing was checked).
+        outcome: str | None = "not_read"
         record = self.get(artifact_id)
+        ambient = sys.exc_info()[1]  # what the caller is already handling is not about this copy
         try:
             with self.materialize(artifact_id):
-                pass  # materialize re-hashes and compares with the catalogue
+                outcome = None  # read and matched; a later failure claims no outcome
             self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
             ok = True
+            outcome = "matched"
             detail = "Readback matched the catalogued size and SHA-256."
         except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
             # A copy that no longer matches must stop counting as verified, so it is
             # neither offered for restore nor protected as the newest verified copy.
             self.catalog.mark_unverified(artifact_id)
+            outcome = "mismatch"
             detail = str(exc)
         except ArtifactNotFoundError as exc:
             if record.location != LOCAL_LOCATION:
                 raise
             self.catalog.mark_unverified(artifact_id)
+            outcome = "mismatch"
             detail = str(exc)
         except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
+            rejection = rejected_copy_error(exc, ambient)
+            if rejection is not None:  # a later failure (e.g. clean-up) must not hide the rejection
+                self.catalog.mark_unverified(artifact_id)
+                outcome, detail = "mismatch", str(rejection)
         with self._state_lock:
             meta = self._meta.setdefault(artifact_id, {})
-            meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
+            # The result names the copy it read, so it never counts for another (#1202).
+            meta["last_verify"] = {"at": at, "ok": ok, "detail": detail, "artifact_id": artifact_id}
+            if outcome is not None:
+                meta["last_verify"]["outcome"] = outcome
             self._save_meta()
         # Re-publish (or clear) verified_full from the catalog's current flag so
         # the history sidecar never suppresses its own copy after a failed
         # readback of the replacement artifact.
         self._write_status()
-        return {"ok": ok, "artifact": self.serialize(self.get(artifact_id)), "detail": detail}
+        return {"ok": ok, "outcome": outcome, "artifact": self.serialize(self.get(artifact_id)), "detail": detail}
 
     def test_target(self, target_id: str) -> dict[str, Any]:
         target = self.policy.target(target_id)
@@ -1690,6 +1733,67 @@ def _target_run(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     return {"at": value.get("at"), "ok": bool(value.get("ok")), "detail": value.get("detail")}
+
+
+def _upload_check(meta: Mapping[str, Any]) -> str | None:
+    value = meta.get("upload_check")
+    # A malformed stored value is unknown for that copy; it must not break the list.
+    return value if isinstance(value, str) and value in {"readback", "provider_checksum", "size"} else None
+
+
+def _own_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The last explicit Verify result of this copy, or None.
+
+    A result counts only when it names this copy. Earlier releases wrote no
+    name and copied the local copy's result into each remote copy's metadata,
+    so an unnamed result on a remote copy says nothing about that copy's bytes:
+    the copy reads as its upload check until its own Verify reads it back. A
+    local copy's metadata is written only by its own run and its own Verify,
+    so its unnamed result is its own (#1202).
+    """
+
+    value = meta.get("last_verify")
+    if not isinstance(value, Mapping):
+        return None
+    if "artifact_id" in value:
+        return value if value["artifact_id"] == record.artifact_id else None
+    return value if record.location == LOCAL_LOCATION else None
+
+
+def _list_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """When this copy's last explicit Verify ran and whether it passed, without its text.
+
+    Only a boolean ``True`` counts as passed, so a malformed record never
+    upgrades a size-only copy. The details add the result's text.
+    """
+
+    value = _own_last_verify(record, meta)
+    if value is None:
+        return None
+    at = value.get("at")
+    return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
+
+
+def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The list summary of this copy's last Verify plus its text, by the same rules."""
+
+    value = _own_last_verify(record, meta)
+    if value is None:
+        return None
+    detail = value.get("detail")
+    summary = _list_last_verify(record, meta)
+    # Absent in results from earlier releases; shown only when it agrees with ``ok``.
+    outcome = value.get("outcome")
+    if not (isinstance(outcome, str) and (outcome == "matched") is summary["ok"] and outcome in _VERIFY_OUTCOMES):
+        outcome = None
+    return {**summary, "outcome": outcome, "detail": detail if isinstance(detail, str) else None}
+
+
+_VERIFY_OUTCOMES = frozenset({"matched", "mismatch", "not_read"})
+
+
+# Metadata that describes the archive content and so holds for every copy of it.
+_ARCHIVE_DESCRIPTION_KEYS = ("app_version", "schema_version", "packaging", "groups", "history_replacement")
 
 
 def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, Any]:
@@ -1743,6 +1847,29 @@ def _reports_absent(exc: BaseException) -> bool:
 def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:
     if size != record.size or digest != record.sha256:
         raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+
+
+def rejected_copy_error(exc: BaseException, ambient: BaseException | None = None) -> BaseException | None:
+    """The size or content check's rejection behind ``exc``, by type, or None (#1202).
+
+    ``ambient`` is the exception the caller was handling when the attempt began.
+    That one object is skipped, and so is anything reached only through it, so a
+    rejection the caller was already handling is not taken for this copy. Nothing
+    else ties an exception to an attempt: an exception object kept from earlier
+    and chained in later is examined like any other.
+    """
+
+    pending, seen = [exc], set()
+    while pending and len(seen) < 32:  # bounded; ``seen`` also stops a cycle
+        current = pending.pop()
+        if current is ambient:
+            continue
+        if isinstance(current, (ArchiveIntegrityError, ArchiveDownloadTooLargeError)):
+            return current
+        if id(current) not in seen:
+            seen.add(id(current))
+            pending += [link for link in (current.__cause__, current.__context__) if link is not None]
+    return None
 
 
 def _hash_file(path: Path) -> tuple[int, str]:

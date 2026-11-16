@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +26,7 @@ from history_service.backup_scheduler.service import (
     BackupScheduler,
     SchedulerBusyError,
     describe_error,
+    rejected_copy_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,7 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
     @app.get("/internal/backups/{artifact_id}/download")
     async def download(artifact_id: str) -> FileResponse:
         stack = contextlib.ExitStack()
+        ambient = sys.exc_info()[1]  # as in Verify: not about this copy
         try:
             record, path = await asyncio.to_thread(stack.enter_context, scheduler.materialize(artifact_id))
         except ArtifactNotFoundError:
@@ -168,6 +171,8 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
             raise HTTPException(status_code=409, detail=f"{exc} Verify it, or use another copy.") from exc
         except Exception as exc:  # noqa: BLE001 - remote fetch failures are operator-facing
             stack.close()
+            if (rejection := rejected_copy_error(exc, ambient)) is not None:  # as Verify decides
+                raise HTTPException(status_code=409, detail=f"{rejection} Verify it, or use another copy.") from exc
             raise HTTPException(status_code=502, detail=f"Could not read the backup: {describe_error(exc)}") from exc
         filename = record.name.rsplit("/", 1)[-1]
         return FileResponse(
