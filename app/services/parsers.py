@@ -4926,17 +4926,19 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
     return details
 
 
-def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[Any]:
+    # Every entry, objects or not: the parser skips the others, and the census
+    # check refuses a reply that has any (#1218).
     rows = response_data.get("Drive Information") or response_data.get("PD LIST") or []
     if isinstance(rows, list) and rows:
-        return [row for row in rows if isinstance(row, dict)]
+        return list(rows)
 
-    fallback_rows: list[dict[str, Any]] = []
+    fallback_rows: list[Any] = []
     for key, value in response_data.items():
         if not isinstance(key, str) or not re.match(r"^Drive\s+/c\d+/e\d+/s\d+$", key, re.IGNORECASE):
             continue
         if isinstance(value, list):
-            fallback_rows.extend(item for item in value if isinstance(item, dict))
+            fallback_rows.extend(value)
         elif isinstance(value, dict):
             fallback_rows.append(value)
     return fallback_rows
@@ -5066,10 +5068,12 @@ def parse_storcli_physical_drives(
 def storcli_physical_drive_list_complete(output: str) -> bool:
     """True when a `/eall/sall show all J` reply is a whole drive census (#1218).
 
-    Every controller block answered `Success` and every row of its drive list
-    names an enclosure and slot, so a slot it lists no drive in is empty. A
-    failed, unparsed or partial reply, or one with no drive list, proves no
-    absence.
+    Every controller block answered `Success`, the drive parser read at least
+    one drive record (from the `Drive Information`/`PD LIST` table or from
+    `Drive /cN/eM/sK` entries), every record names an enclosure and slot, and
+    no `Drive /cN/eM/sK` entry names a drive the records do not; a slot it
+    lists no drive in is then empty. A failed, unparsed, partial or
+    self-contradicting reply, or one with no drive record, proves no absence.
     """
     try:
         payload = json.loads(output)
@@ -5083,11 +5087,18 @@ def storcli_physical_drive_list_complete(output: str) -> bool:
         response = controller.get("Response Data") if isinstance(controller, dict) else None
         if not isinstance(status, dict) or str(status.get("Status") or "").strip().casefold() != "success":
             return False
-        rows = (response.get("Drive Information") or response.get("PD LIST")) if isinstance(response, dict) else None
-        if not isinstance(rows, list) or not rows or not all(
-            isinstance(row, dict) and _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2]
-            for row in rows
-        ):
+        if not isinstance(response, dict):
+            return False
+        # The records the drive parser reads, in either form it accepts.
+        listed = [
+            _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2] if isinstance(row, dict) else None
+            for row in _collect_storcli_physical_drive_rows(response)
+        ]
+        named = {
+            _storcli_slot_key(detail.get("enclosure_id"), detail.get("slot"))
+            for detail in _collect_storcli_drive_details(response).values()
+        }
+        if not listed or None in listed or not named <= set(listed):
             return False
     return True
 

@@ -842,5 +842,232 @@ class StorcliOnlyEnumerationTests(unittest.TestCase):
                     self.assertEqual(domain_models.slot_occupancy(slot), "unknown", slot.slot)
 
 
+def _storcli_drive(slot: int, controller: int = 0, slot_text: str | None = None) -> dict[str, Any]:
+    return {"Ctl": f"c{controller}", "EID:Slt": slot_text or f"13:{slot}", "DID": slot, "State": "Onln", "DG": "0",
+            "Size": "1 TB", "Intf": "NVMe", "Med": "SSD", "SeSz": "512B", "Model": "Synthetic",
+            "SN": f"SANITIZED-C{controller}-S{slot}"}
+
+
+def _storcli_block(drives: list[Any], *, controller: int = 0, form: str = "table",
+                   status: str = "Success") -> dict[str, Any]:
+    """One controller block of an `/eall/sall show all J` reply, in either form the drive parser reads."""
+    if form == "table":
+        response: dict[str, Any] = {"Drive Information": drives}
+    else:
+        # The per-drive form: one `Drive /cN/eM/sK` entry per drive, beside its detailed entry.
+        response = {}
+        for drive in drives:
+            path = f"Drive /c{controller}/e13/s{drive['DID']}"
+            response[path] = [drive]
+            response[f"{path} - Detailed Information"] = {
+                f"{path} Device attributes": {"SN": drive["SN"]},
+                f"{path} Port Information": {"Connector Name": f"C{drive['DID']} x4"},
+            }
+    return {"Command Status": {"Controller": controller, "Status": status, "Description": "None"},
+            "Response Data": response}
+
+
+def _storcli_drives_reply(*blocks: dict[str, Any]) -> str:
+    return json.dumps({"Controllers": list(blocks)})
+
+
+class StorcliPerDriveCensusTests(unittest.TestCase):
+    """A successful reply in the per-drive form is a whole census, as the table form is.
+
+    Through the real SSH parser, the ESXi correlation, the SES storage-view
+    runtime and the Storage Fabric builder.
+    """
+
+    def read(self, outputs: dict[str, str], *, controllers: tuple[int, ...] = (0,)) -> dict[str, Any]:
+        from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
+        from app.services.mapping_store import MappingStore
+        from app.services.parsers import parse_ssh_outputs
+        from app.services.profile_registry import ESXI_AOC_SLG4_2H8M2_PROFILE_ID, ProfileRegistry
+        from app.services.slot_detail_store import SlotDetailStore
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = Settings()
+        system = SystemConfig(
+            id="synthetic-esxi", truenas=TrueNASConfig(platform="esxi"),
+            default_profile_id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+            ssh=SSHConfig(enabled=False, commands=[STORCLI_LIST.format(controller=c) for c in controllers]),
+        )
+        service = inventory_module.InventoryService(
+            settings, system, AsyncMock(), AsyncMock(), None, MappingStore(str(Path(directory.name) / "m.json")),
+            ProfileRegistry(settings), SlotDetailStore(str(Path(directory.name) / "d.json")),
+        )
+        parsed = parse_ssh_outputs(outputs, 2, None)
+        slots, _enclosures, meta, rows, count, columns = service._correlate(None, parsed, [])
+        snapshot = InventorySnapshot(
+            slots=slots, selected_system_id=system.id, selected_enclosure_id=meta.get("id"),
+            selected_profile=service.profile_registry.get(ESXI_AOC_SLG4_2H8M2_PROFILE_ID),
+            layout_rows=rows, layout_slot_count=count, layout_columns=columns, refresh_interval_seconds=60,
+        )
+        runtime = service._build_ses_storage_view_runtime(
+            StorageViewConfig(id="physical", label="Physical", kind="ses_enclosure", template_id="ses-auto"), snapshot,
+        )
+        fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={})
+        by_slot = {slot.slot: slot for slot in slots}
+        return {
+            "census": dict(parsed.esxi_storcli_drive_lists),
+            "bays": [(slot, domain_models.slot_occupancy(by_slot[slot]), by_slot[slot].serial) for slot in (0, 1)],
+            "runtime": sorted((item.slot_index, item.occupied, item.presence_known) for item in runtime.slots),
+            "fabric": [node.metrics["present"] for node in sorted(
+                (node for node in fabric.nodes if node.kind == "bay"), key=lambda node: node.slot)],
+        }
+
+    def test_a_per_drive_reply_with_one_drive_leaves_the_other_bay_empty(self) -> None:
+        listing = STORCLI_LIST.format(controller=0)
+        result = self.read({listing: _storcli_drives_reply(_storcli_block([_storcli_drive(0)], form="per-drive"))})
+        self.assertEqual(result["census"], {"storcli /c0/eall/sall show all J": True})
+        self.assertEqual(result["bays"], [(0, "present", "SANITIZED-C0-S0"), (1, "empty", None)])
+        # The storage view shows the bay as read and empty (`Empty`), not unknown.
+        self.assertEqual(result["runtime"], [(0, True, True), (1, False, True)])
+        self.assertEqual(result["fabric"], [True, False])
+
+    def test_a_per_drive_reply_with_two_drives_keeps_both(self) -> None:
+        listing = STORCLI_LIST.format(controller=0)
+        result = self.read({listing: _storcli_drives_reply(
+            _storcli_block([_storcli_drive(0), _storcli_drive(1)], form="per-drive"),
+        )})
+        self.assertEqual(result["census"], {"storcli /c0/eall/sall show all J": True})
+        self.assertEqual(result["bays"], [(0, "present", "SANITIZED-C0-S0"), (1, "present", "SANITIZED-C0-S1")])
+        self.assertEqual(result["fabric"], [True, True])
+
+    def test_the_table_form_is_unchanged(self) -> None:
+        listing = STORCLI_LIST.format(controller=0)
+        result = self.read({listing: _storcli_drives_reply(_storcli_block([_storcli_drive(0)]))})
+        self.assertEqual(result["census"], {"storcli /c0/eall/sall show all J": True})
+        self.assertEqual(result["bays"], [(0, "present", "SANITIZED-C0-S0"), (1, "empty", None)])
+        self.assertEqual(result["runtime"], [(0, True, True), (1, False, True)])
+        self.assertEqual(result["fabric"], [True, False])
+
+    def test_two_controllers_one_answering_in_each_form_are_both_a_census(self) -> None:
+        first, second = STORCLI_LIST.format(controller=0), STORCLI_LIST.format(controller=1)
+        result = self.read({
+            first: _storcli_drives_reply(_storcli_block([_storcli_drive(0)])),
+            second: _storcli_drives_reply(_storcli_block([_storcli_drive(1, controller=1)], controller=1, form="per-drive")),
+        }, controllers=(0, 1))
+        self.assertEqual(result["census"], {"storcli /c0/eall/sall show all J": True,
+                                            "storcli /c1/eall/sall show all J": True})
+        self.assertEqual(result["bays"], [(0, "present", "SANITIZED-C0-S0"), (1, "present", "SANITIZED-C1-S1")])
+        self.assertEqual(result["fabric"], [True, True])
+        # The same two forms in one `/call` reply.
+        listing = "/opt/lsi/storcli64/storcli64 /call/eall/sall show all J"
+        result = self.read({listing: _storcli_drives_reply(
+            _storcli_block([_storcli_drive(0)]),
+            _storcli_block([_storcli_drive(1, controller=1)], controller=1, form="per-drive"),
+        )}, controllers=())
+        self.assertEqual(result["census"], {"storcli /call/eall/sall show all J": True})
+        self.assertEqual(result["bays"], [(0, "present", "SANITIZED-C0-S0"), (1, "present", "SANITIZED-C1-S1")])
+
+    def test_a_failed_partial_or_contradicting_reply_leaves_the_unlisted_bay_unknown(self) -> None:
+        listing = STORCLI_LIST.format(controller=0)
+        one = [_storcli_drive(0)]
+        # A table that names bay 0 and a per-drive entry for bay 1 in the same reply.
+        contradicting = _storcli_block(one)
+        contradicting["Response Data"].update(_storcli_block([_storcli_drive(1)], form="per-drive")["Response Data"])
+        # A per-drive entry whose row names another slot than its entry.
+        mislabelled = _storcli_block(one, form="per-drive")
+        mislabelled["Response Data"]["Drive /c0/e13/s1"] = mislabelled["Response Data"].pop("Drive /c0/e13/s0")
+        cases = {
+            "failed status": ({listing: _storcli_drives_reply(_storcli_block(one, form="per-drive", status="Failure"))},
+                              (0,)),
+            "a second controller block failed": ({listing: _storcli_drives_reply(
+                _storcli_block(one, form="per-drive"), _storcli_block([], controller=1, status="Failure"),
+            )}, (0,)),
+            "a configured listing did not answer": ({listing: _storcli_drives_reply(
+                _storcli_block(one, form="per-drive"))}, (0, 1)),
+            "an unparseable slot": ({listing: _storcli_drives_reply(_storcli_block(
+                [_storcli_drive(0), _storcli_drive(1, slot_text="13:x")], form="per-drive",
+            ))}, (0,)),
+            "a table row that is not an object": ({listing: _storcli_drives_reply(
+                _storcli_block([_storcli_drive(0), "13:1 garbled"]))}, (0,)),
+            "a table and a per-drive entry name different drives": (
+                {listing: _storcli_drives_reply(contradicting)}, (0,)),
+            "a per-drive entry names another slot than its row": (
+                {listing: _storcli_drives_reply(mislabelled)}, (0,)),
+        }
+        for name, (outputs, controllers) in cases.items():
+            with self.subTest(name):
+                result = self.read(outputs, controllers=controllers)
+                self.assertEqual(result["bays"][0], (0, "present", "SANITIZED-C0-S0"))
+                self.assertEqual(result["bays"][1][1], "unknown")
+                self.assertEqual(result["runtime"][1], (1, False, False))
+                self.assertEqual(result["fabric"][1], "unknown")
+                # Either a listing was not a census, or a configured one did not answer.
+                self.assertTrue(False in result["census"].values() or len(result["census"]) < len(controllers))
+        # A `Success` reply that lists no drive at all is not a census either.
+        no_entries = _storcli_block([])
+        no_entries["Response Data"] = {}
+        for name, block in {"an empty table": _storcli_block([]), "no drive entries": no_entries}.items():
+            with self.subTest(name):
+                result = self.read({listing: _storcli_drives_reply(block)})
+                self.assertEqual(result["census"], {"storcli /c0/eall/sall show all J": False})
+                self.assertEqual([bay[1] for bay in result["bays"]], ["unknown", "unknown"])
+                self.assertEqual(result["fabric"], ["unknown", "unknown"])
+        # Control: the same per-drive reply alone is a census (above), and a
+        # table that names the same drives as its per-drive entries is too.
+        agreeing = _storcli_block(one)
+        agreeing["Response Data"].update(_storcli_block(one, form="per-drive")["Response Data"])
+        result = self.read({listing: _storcli_drives_reply(agreeing)})
+        self.assertEqual(result["bays"][1][1], "empty")
+        self.assertEqual(result["fabric"], [True, False])
+
+
+class RestoreConfirmationAfterAReadChangeTests(unittest.TestCase):
+    """A restore previewed on an empty bay and confirmed on an unread one (or the reverse) is refused."""
+
+    BAYS_CHANGED = "Bays changed since the preview. Preview the import again."
+
+    def restore(self, at_preview: SlotView, at_confirmation: SlotView) -> tuple[Any, Any]:
+        from app.models.domain import MappingBundle
+
+        case = presence_cases.CoreSesutilShowPresenceTests()
+        self.addCleanup(case.doCleanups)
+        service = case.service()
+        reads = iter((at_preview, at_confirmation))
+        service._get_pre_write_snapshot = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda *_args, **_kwargs: InventorySnapshot(
+                slots=[next(reads).model_copy(update={"enclosure_id": "enc-a"})], refresh_interval_seconds=60,
+            ),
+        )
+        bundle = MappingBundle(mappings=[ManualMapping(
+            system_id=service.system.id, enclosure_id="enc-a", slot=0, serial="SANITIZED-RESTORED",
+        )])
+        preview = asyncio.run(service.preview_mapping_bundle(bundle, "enc-a"))
+        try:
+            asyncio.run(service.import_mapping_bundle(
+                bundle, "enc-a", expected_revision=preview["revision"], import_digest=preview["import_digest"],
+                invalidate_snapshot=False,
+            ))
+            error = None
+        except Exception as exc:  # noqa: BLE001 - the assertions name the refusal.
+            error = exc
+        stored = service.mapping_store.get_mapping(service.system.id, "enc-a", 0)
+        return error, stored.serial if stored else None
+
+    def test_empty_then_unread_and_unread_then_empty_are_refused(self) -> None:
+        unread = UNREAD["core-show-unknown"]
+        for name, (at_preview, at_confirmation) in {
+            "empty at preview, unread at confirmation": (KNOWN_EMPTY, unread),
+            "unread at preview, empty at confirmation": (unread, KNOWN_EMPTY),
+        }.items():
+            with self.subTest(name):
+                error, stored = self.restore(at_preview(), at_confirmation())
+                self.assertEqual(
+                    (getattr(error, "error_code", None), getattr(error, "public_detail", None)),
+                    ("mapping_import_bays_changed", self.BAYS_CHANGED),
+                )
+                self.assertIsNone(stored)
+
+    def test_an_unchanged_read_restores(self) -> None:
+        unread = UNREAD["core-show-unknown"]
+        for name, read in {"empty both times": KNOWN_EMPTY, "unread both times": unread}.items():
+            with self.subTest(name):
+                self.assertEqual(self.restore(read(), read()), (None, "SANITIZED-RESTORED"))
+
+
 if __name__ == "__main__":
     unittest.main()
