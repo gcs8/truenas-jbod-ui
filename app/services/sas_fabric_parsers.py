@@ -185,12 +185,114 @@ def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:
 _MPR_ENCLOSURE_BLANK_SEP = re.compile(r"^\s*\d+ {4}[0-9a-fA-F]{16} {15}[0-9a-fA-F]{4} {5}\S")
 
 
+def _skip_whitespace(line: str, index: int) -> int:
+    while index < len(line) and line[index].isspace():
+        index += 1
+    return index
+
+
+def _skip_rate_characters(line: str, index: int) -> int:
+    while index < len(line) and (line[index] == "." or line[index].isdecimal()):
+        index += 1
+    return index
+
+
+def _mpr_phy_rate_end(line: str, index: int) -> int | None:
+    """End of a `[\\d.]+` or `???` field at `index` that whitespace follows."""
+
+    end = _skip_rate_characters(line, index)
+    if end == index and line.startswith("???", index):
+        end = index + 3
+    return end if index < end < len(line) and line[end].isspace() else None
+
+
+def _mpr_phy_max_and_device(line: str, index: int) -> tuple[str, str] | None:
+    """`<max> <device>` from `index`; the device is the rest of the line."""
+
+    max_end = _mpr_phy_rate_end(line, index)
+    # At least one separator and one more character, which may be whitespace.
+    if max_end is None or len(line) - max_end < 2:
+        return None
+    return line[index:max_end], line[max_end:].strip()
+
+
+def _mpr_phy_min_max_and_device(line: str, index: int) -> tuple[str, str, str] | None:
+    min_end = _mpr_phy_rate_end(line, index)
+    if min_end is None:
+        return None
+    rest = _mpr_phy_max_and_device(line, _skip_whitespace(line, min_end))
+    return None if rest is None else (line[index:min_end], *rest)
+
+
+def _match_mpr_expander_phy_line(line: str) -> dict[str, str | None] | None:
+    """Read one `mprutil show expanders` PHY row with work linear in the line.
+
+    Same result as the pattern
+    `^\\s*(\\d+)\\s+(?:(\\d+)\\s+([0-9a-fA-F]{4})\\s+([\\d.]+)|)\\s*([\\d.]+|\\?\\?\\?)\\s+([\\d.]+|\\?\\?\\?)\\s+(.+?)\\s*$`
+    with the device stripped (#1216). That pattern retried overlapping
+    whitespace and digit runs from every position. Each field here is scanned
+    once: the full row (PHY, remote PHY, handle, speed, min, max, device) is
+    tried first, then the short row (PHY, min, max, device).
+    """
+
+    phy_start = _skip_whitespace(line, 0)
+    phy_end = _skip_rate_characters(line, phy_start)
+    if phy_end == phy_start or "." in line[phy_start:phy_end] or phy_end == len(line) or not line[phy_end].isspace():
+        return None
+    fields_start = _skip_whitespace(line, phy_end)
+    row: dict[str, str | None] = {
+        "phy": line[phy_start:phy_end],
+        "remote_phy": None,
+        "dev_handle": None,
+        "speed": None,
+        "min": None,
+        "max": None,
+        "device": None,
+    }
+
+    remote_end = _skip_rate_characters(line, fields_start)
+    handle_start = _skip_whitespace(line, remote_end)
+    handle_end = handle_start + 4
+    speed_start = _skip_whitespace(line, handle_end)
+    speed_end = _skip_rate_characters(line, speed_start)
+    if (
+        remote_end > fields_start
+        and "." not in line[fields_start:remote_end]
+        and handle_start > remote_end
+        and handle_end < len(line)
+        and not line[handle_start:handle_end].strip(_HEX_DIGITS)
+        and len(line[handle_start:handle_end]) == 4
+        and speed_start > handle_end
+        and speed_end > speed_start
+    ):
+        rates_start = _skip_whitespace(line, speed_end)
+        full = _mpr_phy_min_max_and_device(line, rates_start)
+        speed = line[speed_start:speed_end]
+        if full is None and speed_end - speed_start >= 2 and rates_start > speed_end:
+            # The pattern's backtracking: the last speed character becomes min.
+            rest = _mpr_phy_max_and_device(line, rates_start)
+            if rest is not None:
+                full = (speed[-1], *rest)
+                speed = speed[:-1]
+        if full is not None:
+            row.update(
+                remote_phy=line[fields_start:remote_end],
+                dev_handle=line[handle_start:handle_end],
+                speed=speed,
+            )
+            row["min"], row["max"], row["device"] = full
+            return row
+
+    short = _mpr_phy_min_max_and_device(line, fields_start)
+    if short is None:
+        return None
+    row["min"], row["max"], row["device"] = short
+    return row
+
+
 def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     expanders: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
-    phy_pattern = re.compile(
-        r"^\s*(\d+)\s+(?:(\d+)\s+([0-9a-fA-F]{4})\s+([\d.]+)|)\s*([\d.]+|\?\?\?)\s+([\d.]+|\?\?\?)\s+(.+?)\s*$"
-    )
     for line in text.splitlines():
         header = _match_mpr_expander_header(line)
         if header:
@@ -207,23 +309,12 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
             continue
         if current is None:
             continue
-        phy = phy_pattern.match(line)
+        phy = _match_mpr_expander_phy_line(line)
         if not phy:
             continue
-        device = phy.group(7).strip()
-        if device.lower().startswith("phy "):
+        if str(phy["device"]).lower().startswith("phy "):
             continue
-        current["phys"].append(
-            {
-                "phy": phy.group(1),
-                "remote_phy": phy.group(2),
-                "dev_handle": phy.group(3),
-                "speed": phy.group(4),
-                "min": phy.group(5),
-                "max": phy.group(6),
-                "device": device,
-            }
-        )
+        current["phys"].append(phy)
     candidate_lines = _mpr_expander_phy_candidate_lines(text)
     for expander, candidates in zip(expanders, candidate_lines):
         # Counts come only from a PHY table read whole: one row per reported
@@ -291,6 +382,14 @@ def parse_mpr_iocfacts(text: str) -> dict[str, str]:
     return facts
 
 
+# `key=value` attributes. A match can only start where a key run starts: the
+# same matches as without the guard, because a run that fails at its start
+# fails at every later position too, but a long run without "=" is read once
+# instead of once per character (#1216).
+_PCICONF_ATTRIBUTE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]+)=([^\s]+)")
+_SYSCTL_LOCATION_ATTRIBUTE_PATTERN = re.compile(r"(?<![a-zA-Z_])([a-zA-Z_]+)=([^\s]+)")
+
+
 def parse_pciconf_sas_controllers(text: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     current: dict[str, str] | None = None
@@ -319,7 +418,7 @@ def parse_pciconf_sas_controllers(text: str) -> list[dict[str, str]]:
                     header.group("function"),
                 ),
             }
-            for key, value in re.findall(r"([A-Za-z0-9_]+)=([^\s]+)", header.group("attrs")):
+            for key, value in _PCICONF_ATTRIBUTE_PATTERN.findall(header.group("attrs")):
                 normalized_key = key.lower()
                 if normalized_key == "class":
                     current["class_code"] = value
@@ -421,7 +520,7 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
         if location_match:
             controller = f"mpr{location_match.group('unit')}"
             row = controllers.setdefault(controller, {"controller": controller, "unit": location_match.group("unit")})
-            for key, value in re.findall(r"([a-zA-Z_]+)=([^\s]+)", location_match.group("value")):
+            for key, value in _SYSCTL_LOCATION_ATTRIBUTE_PATTERN.findall(location_match.group("value")):
                 normalized_key = key.lower()
                 if normalized_key == "dbsf":
                     row["pci_location"] = value
@@ -438,6 +537,9 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
             row = controllers.setdefault(controller, {"controller": controller, "unit": parent_match.group("unit")})
             row["pci_parent"] = parent_match.group("value").strip()
     return controllers
+
+
+_HEX_DIGITS = "0123456789abcdefABCDEF"
 
 
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
