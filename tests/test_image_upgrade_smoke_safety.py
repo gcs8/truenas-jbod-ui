@@ -21,6 +21,21 @@ NONROOT_FIXTURE = REPOSITORY / "tests/fixtures/compose/v0.22.2.nonroot.yml"
 CONFIG_FIXTURE = REPOSITORY / "tests/fixtures/ci-smoke-config.yaml"
 
 
+_PREVIOUS_UMASK: list[int] = []
+
+
+def setUpModule() -> None:
+    # The smoke refuses a root that another user could rename entries in,
+    # group-writable included; build the synthetic trees with the usual umask
+    # whatever the runner's is (the script itself creates its roots 0755/0700).
+    _PREVIOUS_UMASK.append(os.umask(0o022))
+
+
+def tearDownModule() -> None:
+    if _PREVIOUS_UMASK:
+        os.umask(_PREVIOUS_UMASK.pop())
+
+
 def load_smoke():
     spec = importlib.util.spec_from_file_location(
         "run_image_upgrade_smoke_safety", REPOSITORY / "scripts" / "run_image_upgrade_smoke.py")
@@ -802,17 +817,415 @@ class ScenarioLocalDeadlineTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 0)
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(os.path.realpath(directory.name))
+        smoke._record_created_root(root)  # Compose runs only in a root this run created
         with mock.patch.object(smoke.subprocess, "Popen", Process), \
              mock.patch.object(smoke.subprocess, "run", side_effect=boundary), \
              mock.patch("sys.stderr"):
             try:
-                smoke.kill_during_startup(smoke.Deployment(Path("synthetic-root")), phase, "synthetic-kill")
+                smoke.kill_during_startup(smoke.Deployment(root), phase, "synthetic-kill")
                 escaped = None
             except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
                 escaped = type(exc).__name__
         self.assertIsNone(escaped)
         self.assertEqual(len(removals), 1)
         self.assertGreater(removals[0].get("timeout") or 0, 0)
+
+
+def tree_snapshot(path: Path) -> dict[str, bytes | None]:
+    """Every entry under path with its bytes (None for a directory)."""
+    return {str(entry.relative_to(path)): (entry.read_bytes() if entry.is_file() else None)
+            for entry in sorted(path.rglob("*"))}
+
+
+class TreeHost(ComposeHostFake):
+    """ComposeHostFake that also plays ``sudo mv`` and single-file ``sudo rm`` on the temporary tree."""
+
+    def __call__(self, command, **kwargs):
+        listed = list(command)
+        if listed[:2] == ["sudo", "mv"]:
+            self.commands.append(listed)
+            self.kwargs.append(kwargs)
+            Path(listed[2]).rename(listed[3])
+            return subprocess.CompletedProcess(listed, 0, "" if kwargs.get("text") else b"", "")
+        if listed[:2] == ["sudo", "rm"] and listed[2] != "-rf":
+            self.commands.append(listed)
+            self.kwargs.append(kwargs)
+            Path(listed[-1]).unlink()
+            return subprocess.CompletedProcess(listed, 0, "" if kwargs.get("text") else b"", "")
+        return super().__call__(command, **kwargs)
+
+
+class SwapHost(TreeHost):
+    """TreeHost that moves the created root aside and puts a foreign tree at its path after command N."""
+
+    def __init__(self, root: Path, foreign: Path, *, swap_after: int | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.root = root
+        self.foreign = foreign
+        self.swap_after = swap_after
+        self.swapped = False
+
+    def swap(self) -> None:
+        self.root.rename(self.root.parent / "created-by-this-run")
+        self.foreign.rename(self.root)
+        self.swapped = True
+
+    def __call__(self, command, **kwargs):
+        result = super().__call__(command, **kwargs)
+        if not self.swapped and self.swap_after is not None and len(self.commands) == self.swap_after:
+            self.swap()
+        return result
+
+
+def stage_backup_target(root: Path, *, available: bool) -> None:
+    """The backup-target state each target helper starts from: a target directory, or the held one plus a file."""
+    targets = root / "backup-targets"
+    targets.mkdir(exist_ok=True)
+    if available:
+        (targets / "remote").mkdir()
+    else:
+        (targets / "remote.held").mkdir()
+        (targets / "remote").write_bytes(b"")
+
+
+class RoundThreeCase(RoundTwoCase):
+    def case(self, tag: str) -> tuple[Path, Path]:
+        """A fresh holder with an absent root path and a synthetic operator tree beside it."""
+        holder = self.parent / tag
+        holder.mkdir(mode=0o755)
+        foreign = holder / "operator-install"
+        for name in ("config", "history", "backup-targets/remote"):
+            (foreign / name).mkdir(parents=True)
+        (foreign / ".env").write_text("OPERATOR ENV\n", encoding="utf-8")
+        (foreign / "docker-compose.yml").write_text("OPERATOR COMPOSE\n", encoding="utf-8")
+        (foreign / "config" / "config.yaml").write_text("operator config\n", encoding="utf-8")
+        return holder / "smoke-root", foreign
+
+    def attempt(self, action, host) -> tuple[str, mock.Mock]:
+        """``completed``, ``refused: <reason>`` or ``unhandled <type>``, and the Popen recorder."""
+        popen = mock.Mock(side_effect=AssertionError("a process was launched"))
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=host), \
+             mock.patch.object(self.smoke.subprocess, "Popen", popen), \
+             mock.patch.object(self.smoke.os.path, "ismount", return_value=True), \
+             mock.patch("sys.stderr"):
+            try:
+                action()
+            except self.smoke.SmokeError as exc:
+                return f"refused: {exc}", popen
+            except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                return f"unhandled {type(exc).__name__}", popen
+        return "completed", popen
+
+
+class OwnershipCheckedWriteTests(RoundThreeCase):
+    """Every write, move or removal inside a root passes the ownership check immediately before it."""
+
+    def consumers(self, root: Path) -> dict:
+        smoke = self.smoke
+
+        def deployment(image: str | None = None):
+            created = smoke.Deployment(root)
+            created.image = image
+            return created
+
+        return {
+            "Deployment.set_image": lambda: deployment().set_image("synthetic-image"),
+            "Deployment.set_runtime_environment":
+                lambda: deployment("synthetic-image").set_runtime_environment("SYNTHETIC", "value"),
+            "Deployment.compose": lambda: deployment().compose("up", "-d"),
+            "Deployment.exec_python": lambda: deployment().exec_python("enclosure-ui", "print(1)"),
+            "Deployment.run_python": lambda: deployment().run_python("enclosure-history", "print(1)"),
+            "kill_during_startup": lambda: smoke.kill_during_startup(deployment(), smoke.KILL_PHASES[0], "synthetic"),
+            "install_enospc_history_mount": lambda: smoke.install_enospc_history_mount(deployment()),
+            "install_readonly_history_mount": lambda: smoke.install_readonly_history_mount(deployment()),
+            "install_backup_secrets": lambda: smoke.install_backup_secrets(root),
+            "install_backup_scheduler_with_target": lambda: smoke.install_backup_scheduler_with_target(deployment()),
+            "make_backup_target_unavailable": lambda: smoke.make_backup_target_unavailable(root),
+            "make_backup_target_available": lambda: smoke.make_backup_target_available(root),
+            "cleanup": lambda: smoke.cleanup(root),
+        }
+
+    def test_every_write_move_and_removal_refuses_a_replaced_root(self):
+        names = list(self.consumers(self.parent / "unused"))
+        for index, name in enumerate(names):
+            with self.subTest(consumer=name):
+                root, foreign = self.case(f"case-{index}")
+                self.prepare(root, TreeHost())
+                before = tree_snapshot(foreign)
+                root.rename(root.parent / "created-by-this-run")
+                foreign.rename(root)
+                host = TreeHost()
+                outcome, popen = self.attempt(self.consumers(root)[name], host)
+                self.assertEqual(host.commands, [], "a command reached the replacement")
+                popen.assert_not_called()
+                self.assertRegex(outcome, "^refused: .*no longer the directory this run created")
+                self.assertEqual(tree_snapshot(root), before, "the replacement tree was written to")
+
+    def test_unchanged_root_control_reaches_every_consumer(self):
+        # Passing control: on the directory this run created nothing is refused.
+        for index, name in enumerate(self.consumers(self.parent / "unused")):
+            if name in ("kill_during_startup", "Deployment.exec_python", "Deployment.run_python", "cleanup"):
+                continue  # they need a running synthetic container or end the root; covered elsewhere
+            with self.subTest(consumer=name):
+                root, _ = self.case(f"control-{index}")
+                self.prepare(root, TreeHost())
+                stage_backup_target(root, available=name != "make_backup_target_available")
+                outcome, _ = self.attempt(self.consumers(root)[name], TreeHost())
+                self.assertEqual(outcome, "completed")
+
+    def test_each_command_is_checked_immediately_before_it(self):
+        # The root is replaced after the k-th command of a multi-step helper:
+        # the next command or file write must not reach the replacement.
+        smoke = self.smoke
+
+        def registered(root: Path, *, available: bool = True) -> None:
+            self.prepare(root, TreeHost())
+            stage_backup_target(root, available=available)
+
+        cases = {
+            "prepare_root": (None, 8, lambda root: smoke.prepare_root(
+                root, COMPOSE_FIXTURE, CONFIG_FIXTURE, NONROOT_FIXTURE)),
+            "install_backup_scheduler_with_target": (registered, 7, lambda root: (
+                smoke.install_backup_scheduler_with_target(smoke.Deployment(root)))),
+            "install_backup_secrets": (registered, 2, lambda root: smoke.install_backup_secrets(root)),
+            "make_backup_target_unavailable": (registered, 2, lambda root: smoke.make_backup_target_unavailable(root)),
+            "make_backup_target_available": (lambda root: registered(root, available=False), 2,
+                                             lambda root: smoke.make_backup_target_available(root)),
+        }
+        for name, (setup, total, action) in cases.items():
+            for swap_after in range(1, total):
+                with self.subTest(helper=name, swap_after=swap_after):
+                    root, foreign = self.case(f"{name}-{swap_after}")
+                    if setup is not None:
+                        setup(root)
+                    before = tree_snapshot(foreign)
+                    host = SwapHost(root, foreign, swap_after=swap_after)
+                    outcome, _ = self.attempt(lambda: action(root), host)
+                    self.assertTrue(host.swapped)
+                    self.assertEqual(len(host.commands), swap_after,
+                                     f"commands reached the replacement: {host.commands[swap_after:]}")
+                    self.assertRegex(outcome, "^refused: .*no longer the directory this run created")
+                    self.assertEqual(tree_snapshot(root), before, "the replacement tree was written to")
+
+    def test_cleanup_does_not_unmount_inside_a_root_replaced_during_teardown(self):
+        root, foreign = self.case("enospc")
+        self.prepare(root, TreeHost())
+        (root / self.smoke.ENOSPC_FILES[-1]).write_text("services: {}\n", encoding="utf-8")
+        (foreign / self.smoke.ENOSPC_FILES[-1]).write_text("services: {}\n", encoding="utf-8")
+        before = tree_snapshot(foreign)
+        host = SwapHost(root, foreign, swap_after=1)
+        outcome, _ = self.attempt(lambda: self.smoke.cleanup(root), host)
+        self.assertEqual(len(host.commands), 1, host.commands)
+        self.assertRegex(outcome, "^refused: .*no longer the directory this run created")
+        self.assertFalse(any(command[:2] == ["sudo", "umount"] for command in host.commands))
+        self.assertEqual(tree_snapshot(root), before)
+
+    def test_interrupted_migration_reference_copy_refuses_a_root_replaced_by_a_step(self):
+        smoke = self.smoke
+        root, foreign = self.case("interrupted")
+        before = tree_snapshot(foreign)
+        args = smoke.build_parser().parse_args(cli_argv(root, scenario="interrupted-migration"))
+        # prepare_root issues seven commands, then the scenario stops history and
+        # pulls the candidate; the root is replaced right after that pull.
+        host = SwapHost(root, foreign, swap_after=9)
+        with mock.patch.object(smoke, "seed_previous_release", return_value=({}, {}, {})):
+            outcome, _ = self.attempt(lambda: smoke.interrupted_migration(args), host)
+        self.assertTrue(host.swapped)
+        self.assertEqual(host.commands[8][-1:], ["pull"])
+        self.assertEqual(len(host.commands), 9, f"commands reached the replacement: {host.commands[9:]}")
+        self.assertRegex(outcome, "^refused: .*no longer the directory this run created")
+        self.assertEqual(tree_snapshot(root), before)
+
+
+class SharedAncestorTests(RoundThreeCase):
+    """A root is refused when another unprivileged user could rename entries above or in it."""
+
+    REASON = "could let another user rename or replace"
+
+    def holder(self, name: str, mode: int, parent: Path | None = None) -> Path:
+        holder = (parent or self.parent) / name
+        holder.mkdir()
+        os.chmod(holder, mode)
+        self.addCleanup(os.chmod, holder, 0o755)
+        return holder
+
+    def test_root_below_a_directory_others_can_rename_entries_in_is_refused(self):
+        for mode in (0o777, 0o775, 0o757, 0o770):
+            with self.subTest(mode=oct(mode)):
+                holder = self.holder(f"shared-{mode:o}", mode)
+                host = TreeHost()
+                outcome, _ = self.attempt(
+                    lambda: self.smoke.prepare_root(holder / "smoke-root", COMPOSE_FIXTURE, CONFIG_FIXTURE), host)
+                self.assertRegex(outcome, f"^refused: .*{self.REASON}")
+                self.assertEqual(host.commands, [])
+                self.assertFalse((holder / "smoke-root").exists())
+
+    def test_shared_grandparent_is_refused_too(self):
+        grand = self.holder("shared-grandparent", 0o777)
+        holder = self.holder("private", 0o755, grand)
+        host = TreeHost()
+        outcome, _ = self.attempt(
+            lambda: self.smoke.prepare_root(holder / "smoke-root", COMPOSE_FIXTURE, CONFIG_FIXTURE), host)
+        self.assertRegex(outcome, f"^refused: .*{self.REASON}")
+        self.assertEqual(host.commands, [])
+        self.assertFalse((holder / "smoke-root").exists())
+
+    def test_parent_owned_by_another_user_is_refused(self):
+        holder = self.holder("foreign-owner", 0o755)
+        real_lstat = os.lstat
+        stranger = os.geteuid() + 4242
+
+        def lstat(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if Path(path) == holder:
+                fields = list(info[:10])
+                fields[4] = stranger  # st_uid
+                return os.stat_result(fields)
+            return info
+
+        host = TreeHost()
+        with mock.patch.object(self.smoke.os, "lstat", side_effect=lstat):
+            outcome, _ = self.attempt(
+                lambda: self.smoke.prepare_root(holder / "smoke-root", COMPOSE_FIXTURE, CONFIG_FIXTURE), host)
+        self.assertRegex(outcome, f"^refused: .*{self.REASON}")
+        self.assertEqual(host.commands, [])
+        self.assertFalse((holder / "smoke-root").exists())
+
+    def test_sticky_and_private_parents_are_admitted(self):
+        # Passing control: in a sticky directory another user cannot rename this run's entry.
+        for mode in (0o1777, 0o1775, 0o755, 0o700):
+            with self.subTest(mode=oct(mode)):
+                holder = self.holder(f"ok-{mode:o}", mode)
+                outcome, _ = self.attempt(
+                    lambda: self.smoke.prepare_root(holder / "smoke-root", COMPOSE_FIXTURE, CONFIG_FIXTURE),
+                    TreeHost())
+                self.assertEqual(outcome, "completed")
+                self.assertTrue(self.smoke.owns_root(holder / "smoke-root"))
+
+    def test_a_parent_opened_to_other_users_after_creation_stops_every_write_and_removal(self):
+        holder = self.holder("later-shared", 0o755)
+        root = holder / "smoke-root"
+        self.prepare(root, TreeHost())
+        os.chmod(holder, 0o777)
+        for name, action in (("set_image", lambda: self.smoke.Deployment(root).set_image("synthetic")),
+                             ("cleanup", lambda: self.smoke.cleanup(root))):
+            with self.subTest(action=name):
+                host = TreeHost()
+                outcome, _ = self.attempt(action, host)
+                self.assertRegex(outcome, f"^refused: .*{self.REASON}")
+                self.assertEqual(host.commands, [])
+                self.assertFalse((root / ".env").exists())
+                self.assertTrue((root / "config" / "config.yaml").is_file())
+
+    def test_clean_host_root_below_a_shared_directory_is_refused(self):
+        holder = self.holder("shared-clean-host", 0o777)
+        root = holder / "jbod-clean-host-shared"
+        with self.assertRaisesRegex(self.smoke.SmokeError, self.REASON):
+            self.smoke.admit_clean_host_root(root, consent=True)
+        self.assertFalse(root.exists())
+
+
+class CreationAcquisitionTests(RoundThreeCase):
+    def test_a_populated_directory_found_at_creation_is_not_recorded(self):
+        root, foreign = self.case("acquire")
+        before = tree_snapshot(foreign)
+        real_mkdir = os.mkdir
+
+        def mkdir_then_swap(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, mode, *args, **kwargs)
+            if Path(path) == root:
+                root.rename(root.parent / "created-by-this-run")
+                foreign.rename(root)
+
+        host = TreeHost()
+        with mock.patch.object(self.smoke.os, "mkdir", side_effect=mkdir_then_swap):
+            outcome, _ = self.attempt(lambda: self.smoke.prepare_root(root, COMPOSE_FIXTURE, CONFIG_FIXTURE), host)
+        self.assertRegex(outcome, "^refused: .*not the empty directory this run just created")
+        self.assertEqual(host.commands, [])
+        self.assertEqual(tree_snapshot(root), before)
+        self.assertFalse(self.smoke.owns_root(root))
+
+
+class NestedRootRemovalTests(RoundThreeCase):
+    """Nothing is removed recursively until every root this run created beneath it passes its own check."""
+
+    def nested(self, tag: str) -> tuple[Path, Path, Path]:
+        outer, foreign = self.case(tag)
+        self.prepare(outer, TreeHost())
+        child = outer / "child-root"
+        self.prepare(child, TreeHost())
+        return outer, child, foreign
+
+    def test_replaced_child_root_stops_the_recursive_removal_of_its_parent(self):
+        outer, child, foreign = self.nested("replaced-child")
+        child.rename(outer / "child-created-by-run")
+        foreign.rename(child)
+        before = tree_snapshot(child)
+        host = TreeHost()
+        outcome, _ = self.attempt(lambda: self.smoke.cleanup(outer), host)
+        self.assertRegex(outcome, "^refused: .*no longer the directory this run created")
+        self.assertFalse(host.removal_requested())
+        self.assertEqual(tree_snapshot(child), before)
+
+    def test_unchanged_child_roots_are_removed_and_forgotten_with_their_parent(self):
+        # Passing control.
+        outer, child, _ = self.nested("unchanged-child")
+        host = TreeHost()
+        outcome, _ = self.attempt(lambda: self.smoke.cleanup(outer), host)
+        self.assertEqual(outcome, "completed")
+        self.assertFalse(outer.exists())
+        self.assertNotIn(child, self.smoke._OWNED_ROOTS)
+        self.assertNotIn(outer, self.smoke._OWNED_ROOTS)
+
+
+class ThreatModelTests(unittest.TestCase):
+    SCRIPT = REPOSITORY / "scripts" / "run_image_upgrade_smoke.py"
+    # Privileged commands that only read; every other one is a write, move or removal.
+    READ_VERBS = {"cat", "stat", "find"}
+    # The only functions allowed to write in-process or to issue a privileged
+    # write: each performs the ownership check itself, immediately before it.
+    CHECKED_WRITERS = {"owned_run", "owned_write", "owned_unlink", "owned_mkdir",
+                       "_create_owned_directory", "remove_owned_tree"}
+    WRITE_METHODS = {"write_text", "write_bytes", "chmod", "unlink", "mkdir", "rename", "touch", "symlink_to",
+                     "rmdir"}
+    WRITE_FUNCTIONS = {("shutil", "copyfile"), ("shutil", "copy"), ("shutil", "move"), ("shutil", "rmtree"),
+                       ("os", "open"), ("os", "mkdir"), ("os", "rename"), ("os", "replace"), ("os", "remove"),
+                       ("os", "unlink"), ("os", "chmod"), ("os", "rmdir")}
+
+    def test_script_header_states_its_threat_model(self):
+        doc = " ".join((load_smoke().__doc__ or "").split())
+        self.assertIn("other unprivileged users", doc)
+        self.assertIn("does not claim protection against a process running as the same user or as root", doc)
+
+    def test_no_write_move_or_removal_bypasses_the_ownership_check(self):
+        import ast
+        tree = ast.parse(self.SCRIPT.read_text(encoding="utf-8"))
+        offenders = []
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef) or function.name in self.CHECKED_WRITERS:
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = node.func
+                if isinstance(callee, ast.Name) and callee.id in ("run", "run_bytes") and node.args \
+                        and isinstance(node.args[0], ast.List) and node.args[0].elts:
+                    words = [element.value for element in node.args[0].elts[:2] if isinstance(element, ast.Constant)]
+                    privileged_write = words[:1] == ["sudo"] and words[1:2] and words[1] not in self.READ_VERBS
+                    if words[:1] == ["bash"] or privileged_write:
+                        offenders.append(f"{function.name}: {' '.join(map(str, words))}")
+                elif isinstance(callee, ast.Attribute) and (
+                        callee.attr in self.WRITE_METHODS
+                        # Path.replace(target) moves a file; str.replace(old, new) takes two arguments.
+                        or (callee.attr == "replace" and len(node.args) == 1)):
+                    offenders.append(f"{function.name}: .{callee.attr}()")
+                elif isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) \
+                        and (callee.value.id, callee.attr) in self.WRITE_FUNCTIONS:
+                    offenders.append(f"{function.name}: {callee.value.id}.{callee.attr}()")
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
