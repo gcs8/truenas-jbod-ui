@@ -74,7 +74,9 @@ def _http_wire():
 
     def putrequest(conn, method, url, *args, **kwargs):
         tls = isinstance(conn, http.client.HTTPSConnection)
-        seen["request"] = ("https" if tls else "http", conn.host.lower(), conn.port, url.split("?", 1)[0])
+        # The whole request target, query included: a query-routing gateway
+        # can pick the machine by it.
+        seen["request"] = ("https" if tls else "http", conn.host.lower(), conn.port, url)
         return original_putrequest(conn, method, url, *args, **kwargs)
 
     def connect(conn):
@@ -878,6 +880,71 @@ class TransportDestinationTests(_SmartRouteCase):
         self.assertEqual(_bmc_wire(self._service(same).bmc_service), old_wire)
         self._assert_kept_through_both_routes(before, same)
 
+    def _bmc(self, host: str, label: str | None = None) -> SystemConfig:
+        return self._api(self.API, platform="core", label=label).model_copy(
+            update={"bmc": BMCConfig(enabled=True, host=host, username="synthetic")},
+        )
+
+    def test_bmc_query_moves_the_request_and_the_binding(self) -> None:
+        # The BMC service keeps a query in its base URL and appends the
+        # request path to it as text, so a query-routing gateway in front of
+        # several BMCs is told which one by the query.
+        gateway = "https://bmc.example.test/gateway?appliance={}&path="
+        before, after = self._bmc(gateway.format("a")), self._bmc(gateway.format("b"))
+        old_wire, new_wire = (_bmc_wire(self._service(system).bmc_service) for system in (before, after))
+        self.assertEqual(old_wire["request"][-1], "/gateway?appliance=a&path=/redfish/v1/Systems")
+        self.assertEqual(new_wire["request"][-1], "/gateway?appliance=b&path=/redfish/v1/Systems")
+        self._assert_moved_through_both_routes(before, after)
+        # Control: the same query, a reload that renames only, keeps the row.
+        same = self._bmc(gateway.format("a"), label="Renamed")
+        self.assertEqual(_bmc_wire(self._service(same).bmc_service), old_wire)
+        self._assert_kept_through_both_routes(before, same)
+
+    def test_bmc_fragment_is_bound_only_by_what_it_does_to_the_request(self) -> None:
+        # urllib drops the fragment before sending. A fragment in the base
+        # URL also swallows the request path appended after it, so only the
+        # base path goes out.
+        def wire(host: str):
+            return _bmc_wire(self._service(self._bmc(host)).bmc_service)["request"]
+
+        def binding(host: str) -> str:
+            return slot_detail_collection_binding(self._bmc(host))
+
+        self.assertEqual(wire("bmc.example.test/gw#a")[-1], "/gw")
+        self.assertEqual(wire("bmc.example.test/gw#a"), wire("bmc.example.test/gw#b"))
+        self.assertEqual(binding("bmc.example.test/gw#a"), binding("bmc.example.test/gw#b"))
+        self.assertNotEqual(wire("bmc.example.test/gw"), wire("bmc.example.test/gw#a"))
+        self.assertNotEqual(binding("bmc.example.test/gw"), binding("bmc.example.test/gw#a"))
+
+    def test_api_query_the_url_builder_drops_keeps_rows(self) -> None:
+        # The API clients build their request base without the configured
+        # URL's query, so a query-only edit sends the same request.
+        for platform in ("core", "quantastor"):
+            with self.subTest(platform=platform):
+                before = self._api("https://api.example.test/appliance-a?route=a", platform=platform)
+                after = self._api("https://api.example.test/appliance-a?route=b", platform=platform)
+                old_wire = _api_wire(self._service(before))
+                self.assertNotIn("route=", old_wire["request"][-1])
+                self.assertEqual(old_wire, _api_wire(self._service(after)))
+                self._assert_kept_through_both_routes(before, after)
+
+    def test_bmc_binding_without_a_query_is_unchanged_by_query_support(self) -> None:
+        # Rows saved with the earlier form of the binding stay valid for a
+        # BMC URL without a query: these digests were taken before the query
+        # was bound, and a query-less base is still (scheme, host, path).
+        expected = {
+            "bmc.example.test/bmc-a": (("https", "bmc.example.test", "/bmc-a"), "sha256:bf75553e80e0a2138d45f370bc4ef27f"),
+            "https://bmc.example.test:8443": (("https", "bmc.example.test:8443", ""), "sha256:46951f8569ea41f202049fd5293e5742"),
+        }
+        for host, (resource, digest) in expected.items():
+            with self.subTest(host=host):
+                system = SystemConfig.model_validate({
+                    "id": SYSTEM_ID, "truenas": {"platform": "core", "host": self.API}, "ssh": {"enabled": False},
+                    "bmc": {"enabled": True, "host": host, "username": "synthetic"},
+                })
+                self.assertEqual(inventory_module.collection_destination_plan(system).bmc_resource, resource)
+                self.assertEqual(slot_detail_collection_binding(system), digest)
+
     def test_jsonrpc_version_moves_the_binding_only_where_it_is_in_the_url(self) -> None:
         def scale(dialect: str, version: str) -> SystemConfig:
             return self._api(self.API, platform="scale", api_dialect=dialect, api_version=version)
@@ -1014,6 +1081,12 @@ def _baselines() -> dict[str, SystemConfig]:
             "esxi", ssh=ssh, bmc={"enabled": True, "host": "bmc.example.test/bmc-a", "username": "synthetic"},
         ),
         "ipmi-bmc": make("ipmi", bmc={"enabled": True, "host": "https://bmc.example.test:8443"}),
+        # A query-routing BMC gateway (the BMC service sends the query), and
+        # an API URL whose query the API client drops.
+        "core-bmc-query": make(
+            "core", host="https://api.example.test/appliance-a?route=a", ssh={**ssh, "enabled": False},
+            bmc={"enabled": True, "host": "https://bmc.example.test/gateway?appliance=a&path=", "username": "synthetic"},
+        ),
         "quantastor-standalone": make(
             "quantastor", ssh={**ssh, "host": "api.example.test", "ha_nodes": [], "ha_enabled": False},
         ),

@@ -55,7 +55,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   system ID (its appliance address including any path prefix, the API
   dialect or version where it is part of that address, the platform, the TLS
   server name the connection presents, SSH hosts, their order or port, the
-  QuantaStor HA mode or controller hosts, or an enabled BMC's address) no
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address,
+  query included) no
   longer serves the previous destination's saved SMART values or bay details:
   each saved row records the configured destinations it was read under, and
   only rows for the current configuration are read. This follows configured

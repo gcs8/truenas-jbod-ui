@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
+from urllib.request import Request as UrllibRequest
 
 from app import __version__
 from app.config import (
@@ -187,7 +188,7 @@ from app.services.ssh_probe import (
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
-from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
+from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService, bmc_request_url
 from app.services.supermicro_bmc import _normalize_bmc_host as normalize_bmc_host
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
@@ -1639,7 +1640,8 @@ class CollectionDestinationPlan:
     quantastor_standalone_hosts: QuantastorHostOrder | None = None
     quantastor_clustered_hosts: QuantastorHostOrder | None = None
     quantastor_node_hosts: tuple[tuple[str, str], ...] = ()
-    # The BMC's base URL as its service sends it, only while the BMC is read.
+    # Where the BMC's requests go (its base URL as its service sends it, the
+    # query included), only while the BMC is read.
     bmc_resource: tuple[str, ...] | None = None
 
     def quantastor_hosts(self, *, clustered: bool) -> QuantastorHostOrder | None:
@@ -1661,6 +1663,32 @@ def _request_resource(url: str) -> tuple[str, ...]:
         # Not a URL any client can connect to; still a distinct destination.
         return "unparsed", url.strip()
     return parts.scheme, parts.netloc.rpartition("@")[2].lower(), parts.path
+
+
+_BMC_PROBE_PATHS = ("/a", "/b")
+
+
+def _bmc_request_resource(base_url: str) -> tuple[str, ...]:
+    """(scheme, host and port, request target ahead of the request path) of the BMC's requests.
+
+    The BMC service builds each request URL with `bmc_request_url`, and
+    urllib sends the target it parses from that URL: a query is kept, a
+    fragment is not. Two request paths are parsed the same way here. When a
+    fragment in the base swallows the appended path, every request sends the
+    same target, which is marked so it differs from a base that sends the
+    path. Without a query or fragment this is the base URL's own scheme, host
+    and path, as before the query was bound.
+    """
+    try:
+        requests = [UrllibRequest(bmc_request_url(base_url, path)) for path in _BMC_PROBE_PATHS]
+    except ValueError:
+        # Not a URL any client can connect to; still a distinct destination.
+        return "unparsed", base_url.strip()
+    first, second = (request.selector for request in requests)
+    scheme, host = requests[0].type, (requests[0].host or "").rpartition("@")[2].lower()
+    if first == second:
+        return scheme, host, first, "request path not sent"
+    return scheme, host, first[: -len(_BMC_PROBE_PATHS[0])]
 
 
 def _quantastor_host_order(system: SystemConfig, *, skip_api_host: bool) -> QuantastorHostOrder:
@@ -1708,7 +1736,7 @@ def collection_destination_plan(system: SystemConfig) -> CollectionDestinationPl
         platform=platform,
         api_resource=api_resource,
         api_tls_server_name=server_name.lower() if server_name else None,
-        bmc_resource=_request_resource(bmc_url) if system.bmc.enabled and bmc_url else None,
+        bmc_resource=_bmc_request_resource(bmc_url) if system.bmc.enabled and bmc_url else None,
     )
     ssh = system.ssh
     if not ssh.enabled:
