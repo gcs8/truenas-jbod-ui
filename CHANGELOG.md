@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- Last-good SMART values saved by earlier versions are not shown after the
+  upgrade, because they do not record which appliance they came from. Each
+  bay shows SMART again after its next successful SMART read (#1261).
+
 ### Changed
 
 - The image now installs every Python package, direct and transitive, from
@@ -42,9 +48,56 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
   world-readable when the host refuses the mode change (#1180).
+- Certificate imports now keep asynchronous file reads and responses bound to
+  the editor and TLS target that started them, so later editor state cannot
+  receive an earlier import's trust result (#1252).
 
 ### Fixed
 
+- Changing where a system's reads are configured to go while keeping its
+  system ID (its appliance address including any path prefix, the API
+  dialect or version where it is part of that address, the platform, the TLS
+  server name the connection presents, SSH hosts, their order or port, the
+  QuantaStor HA mode or controller hosts, or an enabled BMC's address,
+  query included) no
+  longer serves the previous destination's saved SMART values or bay details:
+  each saved row records the configured destinations it was read under, and
+  only rows for the current configuration are read. This follows configured
+  routing only; it does not record which node of a system answered. An edit
+  that moves no read, such as a rename, a new key, or an extra SSH host on a
+  platform that reads only the primary host, keeps the saved values. The first SMART read served from saved values
+  after a restart now refreshes from the disk in the background on its own,
+  instead of waiting for a second request (#1261).
+- A history pass where every SMART metric read failed no longer counts as a
+  success: it fails, keeps both metric cadences, and the next pass reads the
+  metrics again. When only some scopes fail, the healthy ones keep their
+  samples and the failed ones are retried on the next pass while the
+  collector reports partial collection (#1241).
+- In the admin setup form, turning off One-Time Bootstrap or switching the
+  platform to VMware ESXi or a BMC-only system while a permission preview is
+  still loading now keeps the guidance for the form as it is; the older
+  preview's result or error no longer replaces it (#1236).
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
+- Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
+  When days are not reported it shows the reported hours, and leaves the
+  value out when neither is known; a reported zero still shows (#1234).
+- Restore now refuses a history database whose schema version is outside the
+  range this release supports, in both backup formats and before anything is
+  activated, instead of replacing live history with a database the service
+  then refuses to start on. The message names the found and supported
+  versions, and live history is left unchanged (#1193).
+- Creating the demo builder system no longer deletes its new chassis profile
+  when the config file was already replaced and only the directory fsync
+  failed; the profile is kept and the request reports an uncertain save
+  (#1240).
+- Re-saving a system in System Setup no longer resets settings the form does
+  not show, such as the middleware call limit `max_concurrent_calls`, to their
+  defaults; the save now changes only the fields the form owns (#1194).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
@@ -76,6 +129,38 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
+  stop other admin requests while slow storage writes or syncs the staged
+  file, and a cancelled upload keeps its file until the write has finished.
+  The timing settings save now refuses a `values` field that is not a
+  mapping with a 400 instead of reporting success or failing with a 500
+  (#1250).
+- CORE expander counter output that repeats a PHY marker, carries an invalid
+  one such as `ff`, repeats its header, or carries anything after its end
+  marker (such as a second answer) is now refused as a whole: those PHYs read
+  unknown (`rejected_output`) instead of keeping whichever frame came first
+  as a measured zero or error count (#1238).
+- The history service no longer fails to start when an interrupted segmented
+  rotation or restore left its activation marker. It now stays up with
+  history stopped, and `/healthz` reports down with the recovery command,
+  leaving the marker and database untouched (#1243).
+- Fixed three admin Backups page bugs: adding or removing a target in Backup
+  settings discarded unsaved class settings, a reply from a closed settings
+  dialog could replace the open dialog's targets so Save dropped one, and a
+  copy could stay Kept after Stop keeping because the reload after a change
+  reused a read that started before it (#1254).
+- With zero-based API slot numbering, a disk whose nested enclosure slot is
+  the integer 0 now stays bound to bay 0 instead of losing its bay, matching
+  the string "0"; a boolean slot value is no longer read as a bay (#1235).
+- On ESXi hosts where two RAID controllers report the same local slot (such
+  as `13:0`), a placed disk no longer takes the other controller's pool,
+  topology and fault state; a slot key shared by several disks is no longer
+  used for topology lookup (#1237, refs #1213).
+- When a refresh returns incomplete topology and the last trusted inventory
+  view is kept, the answer now says so: it keeps the trusted bays and their
+  read time, but shows the latest refresh's source status and warnings under
+  a warning that the view is retained, and the snapshot export reports the
+  same warning instead of the earlier successful status (#1242).
 - Fixed a lost bay-assignment change when two owners of one mapping file (a
   second app process, or a second store in one process) both reported a
   successful save. Saves, clears and imports now hold a writer lock
@@ -110,6 +195,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, a `--root` below a directory another user could rename
+  entries in, and missing fixtures before running any command. Every write,
+  move or removal inside the directory it created first checks, by device and
+  inode for the root and every parent, that it is still that directory, and a
+  recursive removal first checks every deployment directory it created inside
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
+  verified, also between the admin scenario's two phases, and keeps the root
+  and exits nonzero when cleanup fails or is unknown. Its header states what
+  this does not cover: a process running as the same user or as root that
+  swaps directories while it runs (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,
@@ -120,6 +220,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   build cannot replace the image a deployment follows; manual inputs are split
   without filename expansion, and branch, sha and custom tags are unchanged
   (#1179).
+- The release-wrap validator now fails a checklist table that repeats a gate,
+  so a later Pass row can no longer hide an earlier Blocked one. It also
+  reports malformed rows, including a row missing an outer pipe, instead of
+  skipping them or ending the table there, and rejects "Not enough time" as an
+  N/A reason (#1233).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
