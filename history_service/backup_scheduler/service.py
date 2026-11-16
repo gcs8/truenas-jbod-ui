@@ -29,6 +29,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -1527,6 +1528,7 @@ class BackupScheduler:
         # (opening or reading the copy failed, so nothing was checked).
         outcome: str | None = "not_read"
         record = self.get(artifact_id)
+        ambient = sys.exc_info()[1]  # what the caller is already handling is not about this copy
         try:
             with self.materialize(artifact_id):
                 outcome = None  # read and matched; a later failure claims no outcome
@@ -1548,7 +1550,7 @@ class BackupScheduler:
             detail = str(exc)
         except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
-            rejection = rejected_copy_error(exc)
+            rejection = rejected_copy_error(exc, ambient)
             if rejection is not None:  # a later failure (e.g. clean-up) must not hide the rejection
                 self.catalog.mark_unverified(artifact_id)
                 outcome, detail = "mismatch", str(rejection)
@@ -1666,12 +1668,18 @@ def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:
         raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
 
 
-def rejected_copy_error(exc: BaseException) -> BaseException | None:
-    """The size or content check's rejection behind ``exc``, by type, or None (#1202)."""
+def rejected_copy_error(exc: BaseException, ambient: BaseException | None = None) -> BaseException | None:
+    """The size or content check's rejection behind ``exc``, by type, or None (#1202).
+
+    ``ambient`` is the exception the caller was handling before the attempt began;
+    the walk stops there, because it and everything behind it concern something else.
+    """
 
     pending, seen = [exc], set()
     while pending and len(seen) < 32:  # bounded; ``seen`` also stops a cycle
         current = pending.pop()
+        if current is ambient:
+            continue
         if isinstance(current, (ArchiveIntegrityError, ArchiveDownloadTooLargeError)):
             return current
         if id(current) not in seen:

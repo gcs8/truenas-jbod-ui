@@ -856,6 +856,31 @@ class VerifyOutcomeTests(backup_fixtures.SchedulerTestBase):
                 self.assertIn("outcome", last_verify, "the details carry no Verify outcome")
                 self.assertEqual(last_verify["outcome"], presented)
 
+    def test_a_rejection_the_caller_is_already_handling_says_nothing_about_another_copy(self) -> None:
+        from history_service.backup_scheduler.service import ArchiveIntegrityError
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        copies = self._copies(scheduler)
+        local, remote = copies["local"], copies["nas"]
+        path = scheduler._local_path(local)
+        path.write_bytes(b"X" * len(path.read_bytes()))
+        self.broken_targets = {"nas"}
+        try:
+            with scheduler.materialize(local.artifact_id):
+                self.fail("the altered local copy passed its check")
+        except ArchiveIntegrityError:
+            # The remote copy cannot be opened, so none of it is read; the
+            # rejection being handled here is the local copy's.
+            result = scheduler.verify(remote.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertEqual(result["detail"], "ConnectionRefusedError")
+        self.assertIs(result["artifact"]["verified"], True)
+        self.assertIs(result["artifact"]["restorable"], True)
+        self.assertTrue(scheduler.get(remote.artifact_id).verified)
+        last = self._detail(scheduler, remote.artifact_id)["last_verify"]
+        self.assertEqual((last["ok"], last["outcome"]), (False, "not_read"))
+
 
 @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
 class VerifyCleanupFailureTests(backup_fixtures.SchedulerTestBase):
@@ -1172,6 +1197,65 @@ class RejectedCopyStaysRejectedTests(backup_fixtures.SchedulerTestBase):
                     self.site = None
                     self.doCleanups()
                     self.setUp()
+
+    def test_only_a_rejection_raised_during_this_verify_counts(self) -> None:
+        import errno
+
+        from history_service.backup_scheduler.service import ArchiveIntegrityError
+
+        for stored_suffix, expected in ((b"OVERSIZED", "mismatch"), (b"", "not_read")):
+            with self.subTest(expected=expected):
+                scheduler, remote, stored = self._scheduler()
+                self.stored, self.site = stored + stored_suffix, "sftp_session_close"
+                self.failure = OSError(errno.EIO, "Input/output error")
+                try:
+                    raise ArchiveIntegrityError("Readback of another copy does not match.")
+                except ArchiveIntegrityError:
+                    result = scheduler.verify(remote.artifact_id)
+                    status, _body = self._download(scheduler, remote.artifact_id)
+                self.assertEqual((result["ok"], result["outcome"]), (False, expected))
+                self.assertEqual(status, 409 if expected == "mismatch" else 502)
+                if expected == "mismatch":
+                    # This copy's own rejection, hidden by the failing close, still counts.
+                    self.assertEqual(result["detail"], self.SIZE_REJECTED)
+                    self.assertFalse(scheduler.get(remote.artifact_id).verified)
+                else:
+                    # Intact copy, failing close: the caller's rejection is not about it.
+                    self.assertEqual(result["detail"], "OSError: Input/output error")
+                    self.assertTrue(scheduler.get(remote.artifact_id).verified)
+                self.site = None
+                self.doCleanups()
+                self.setUp()
+
+    def test_the_chain_walk_stops_at_what_the_caller_was_handling(self) -> None:
+        from history_service.backup_archive.transport import ArchiveDownloadTooLargeError
+        from history_service.backup_scheduler.service import ArchiveIntegrityError, rejected_copy_error
+
+        def walk(exc, ambient):
+            try:
+                return rejected_copy_error(exc, ambient)
+            except TypeError:
+                self.fail("the walk cannot be told what the caller was already handling")
+
+        ambient = ArchiveIntegrityError("Readback of another copy does not match.")
+        own = ArchiveDownloadTooLargeError(self.SIZE_REJECTED)
+        behind = ArchiveIntegrityError("older still")
+        ambient.__context__ = behind
+        close_failed = OSError("close")
+        close_failed.__context__ = ambient
+        self.assertIsNone(walk(close_failed, ambient))
+        self.assertIsNone(walk(ambient, ambient))
+        # This attempt's own rejection is found, in front of the caller's.
+        own.__context__ = ambient
+        close_failed.__context__ = own
+        self.assertIs(walk(close_failed, ambient), own)
+        # Stopping at the caller's exception does not end the walk elsewhere.
+        wrapped = RuntimeError("wrapped")
+        wrapped.__cause__, wrapped.__context__ = own, ambient
+        self.assertIs(walk(wrapped, ambient), own)
+        # Without a caller exception the walk is as before.
+        self.assertIs(walk(close_failed, None), own)
+        self.assertIs(rejected_copy_error(close_failed), own)
 
     def test_the_chain_walk_is_bounded_and_survives_a_cycle(self) -> None:
         from history_service.backup_archive.transport import ArchiveDownloadTooLargeError
