@@ -21,6 +21,7 @@ from app.services.truenas_ws import (
     LocalServiceError,
     TrueNASAPIError,
     classify_remote_failure,
+    error_body_read_category,
     is_local_failure_message,
     log_failure,
 )
@@ -430,7 +431,7 @@ class SupermicroBMCService:
         )
         try:
             with self._build_https_opener().open(request, timeout=self.config.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8", "replace"))
+                payload = json.loads(response.read().decode("utf-8", "replace"))
         except HTTPError as exc:
             try:
                 with exc:
@@ -439,7 +440,7 @@ class SupermicroBMCService:
                 raise TrueNASAPIError(
                     f"Redfish request failed with HTTP {exc.code}; error response could not be read.",
                     code=exc.code,
-                    category="remote_error",
+                    category=error_body_read_category(read_exc),
                     method=path,
                 ) from read_exc
             category = "authentication_failed" if exc.code in {401, 403} else "remote_error"
@@ -464,6 +465,14 @@ class SupermicroBMCService:
                 method=path,
                 reason=str(exc),
             ) from exc
+        # Every Redfish resource is a JSON object; any other root is unusable.
+        if not isinstance(payload, dict):
+            raise TrueNASAPIError(
+                "Redfish returned an unusable response.",
+                category="response_invalid",
+                method=path,
+            )
+        return payload
 
     def _open_web_session(self):
         if not self.base_url:

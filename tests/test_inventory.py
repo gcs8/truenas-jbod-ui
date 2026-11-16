@@ -20692,7 +20692,9 @@ ses0:
         message = str(refused.exception)
         self.assertNotIn("was switched through", message)
         self.assertIn("was not switched", message)
-        self.assertIn("synthetic failure", message)
+        # The other path's command output is the action reason, not the message.
+        self.assertNotIn("synthetic failure", message)
+        self.assertIn("synthetic failure", refused.exception.reason or "")
         self.assertFalse(any("--set=ident" in command for host, command in sent if host == "node-b.example.test"))
 
     async def test_locate_without_a_recorded_shelf_rereads_the_snapshot_first(self) -> None:

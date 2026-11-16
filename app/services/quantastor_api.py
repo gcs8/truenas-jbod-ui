@@ -21,6 +21,7 @@ from app.services.truenas_ws import (
     TrueNASAPIError,
     TrueNASRawData,
     classify_remote_failure,
+    error_body_read_category,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ class QuantastorRESTClient:
                 raise TrueNASAPIError(
                     f"Quantastor endpoint {endpoint} failed ({exc.code}); error response could not be read.",
                     code=exc.code,
-                    category="remote_error",
+                    category=error_body_read_category(read_exc),
                     method=endpoint,
                 ) from read_exc
             category = "authentication_failed" if exc.code in {401, 403} else "remote_error"

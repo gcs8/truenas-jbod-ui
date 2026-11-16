@@ -40,23 +40,30 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Inventory source status and `/healthz`, SMART responses, BMC warnings,
   locator status, storage-view history and mapping-preview errors and snapshot
-  exports now show a fixed category for a failure the platform API, SSH, the
-  BMC or the network reports (authentication failed, timed out, could not be
-  reached, TLS connection failed, certificate verification failed with a named
-  certificate problem, a reported error with its code), keep this service's
-  own messages such as the SSH-off note, sudo guidance and missing slot or view
-  as before, and name an unexpected local error as one. Log lines carry the
-  operation, category, method or endpoint, error name, code, errno or exit
-  status instead of exception text; background refresh and layout log lines
-  name a fixed operation, and an enclosure id appears in a log line only when
-  it is a plain identifier. Collector failures stay at ERROR, and an
-  unexpected local error, also when an adapter wrapped it, is reported as an
-  internal error and logs at ERROR with file base names, functions and line
-  numbers (at most 20 frames) but without its message. Locate-light and
-  system-locator action errors add the reason the appliance or BMC reported
-  after the fixed message, bounded and without control characters; a local
-  fault during those actions answers "<action> stopped on an internal error;
-  see the service log." (#1263).
+  exports now show a fixed category for a failure the platform API, the BMC or
+  the network reports (authentication failed, timed out, could not be reached,
+  TLS connection failed, certificate verification failed with a named
+  certificate problem, an unusable response, a reported error with its code),
+  keep this service's own messages such as the SSH-off note, sudo guidance and
+  missing slot or view as before, and name an unexpected local error as one.
+  A reply that is not a JSON object where one is required counts as an
+  unusable response. Log lines carry the operation, category, method or
+  endpoint, error name, code, errno or exit status instead of exception text;
+  background refresh, layout, SMART batch and mapping-save failure lines name
+  a fixed operation, the locate-light refusal line keeps this service's own
+  message and adds those fields but never the reported reason, and an
+  enclosure id, view id or device appears in a log line only when it is a
+  plain identifier. Collector failures stay at
+  ERROR, and an unexpected local error, also when an adapter wrapped it or it
+  happened while an error response was being read, is reported as an internal
+  error and logs at ERROR with file base names, functions and line numbers (at
+  most 20 frames) but without its message. Locate-light and system-locator
+  action errors, including locate-light commands run over SSH, add the reason
+  the appliance, BMC or command reported after the fixed message, at most 300
+  characters and without control characters; a local fault during those
+  actions answers "<action> stopped on an internal error; see the service
+  log." The SMART-over-SSH fallback and the SSH transport log records are not
+  covered by this change (#1263).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay

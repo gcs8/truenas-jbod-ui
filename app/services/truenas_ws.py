@@ -19,7 +19,8 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Any, Awaitable, Callable, Iterator
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree
@@ -200,7 +201,9 @@ def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
     """Return a fixed category and a bounded numeric code for a failure.
 
     The decision uses the exception type, its errno and the structured fields
-    the adapters set, never the message text. Only adapter wrappers
+    the adapters set, never the message text. (Where the older API dialect has
+    no structured field, its adapter sets the category from a known reply
+    marker: ``DDP_REPLY_MARKERS``.) Only adapter wrappers
     (`TrueNASAPIError`, `URLError`) are looked through to their cause; any other
     exception type an adapter does not raise is ``internal_error``.
     """
@@ -275,6 +278,18 @@ def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
         if not adapter_error:
             return INTERNAL_FAILURE_CATEGORY, None
     return "remote_error", fallback_code
+
+
+def error_body_read_category(exc: BaseException) -> str:
+    """The category for a fault while reading an HTTP error response body.
+
+    The error status already arrived, so the call stays the error the remote
+    side reported; a local fault (decided by structure) stays internal.
+    """
+
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        return INTERNAL_FAILURE_CATEGORY
+    return "remote_error"
 
 
 def is_local_failure_message(exc: BaseException) -> bool:
@@ -377,19 +392,26 @@ def log_failure(
     exc: BaseException,
     *,
     level: int = logging.WARNING,
+    identifiers: Mapping[str, Any] | None = None,
 ) -> None:
     """Log a failure by its structured facts only.
 
-    ``operation`` is a fixed name; identifiers go through ``log_identifier``.
+    ``operation`` is a fixed name. ``identifiers`` maps a fixed field name to
+    a value that is written only through ``log_identifier``.
     An ``internal_error`` (a bug or local fault) is always ERROR and carries the
     stack frames so it can be found, but not the exception message.
     """
 
     fields = failure_log_fields(exc)
-    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+    internal = classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY
+    if internal:
         origin = _failure_origin(exc)
         if origin is not exc:
             fields = f"{fields}, cause={type(origin).__name__}"
+    for name, value in (identifiers or {}).items():
+        if value is not None:
+            fields = f"{fields}, {name}={log_identifier(value)}"
+    if internal:
         # ``exception`` with ``exc_info=False``: the ERROR call the catch-all
         # sites always made, with the frames written as text instead of the
         # traceback, which would carry the exception message.
@@ -406,9 +428,23 @@ def log_failure(
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
 
-# The DDP endpoint reports a full call queue as ETOOMANYREFS (59 on CORE's
-# FreeBSD, 109 on SCALE's Linux) with this reason text.
-_DDP_BUSY_REASON = "maximum number of concurrent calls"
+# Origin is decided by structure, and remote text is never shown or logged.
+# Sorting a remote failure into one of the fixed categories is different: the
+# older (DDP) dialect gives no structured field for these two conditions, so
+# each is recognised by a known marker in the appliance's own reply (``busy``:
+# a substring of the reason, compared in lower case; ``method_unavailable``:
+# the whole reason, or the error name). This gives the appliance no new power,
+# since it can already select any category by sending the matching code, and
+# the busy marker drives the back-off that keeps this service from
+# overloading the appliance. The reply words select a category only.
+DDP_REPLY_MARKERS: Mapping[str, str] = MappingProxyType(
+    {
+        "busy": "maximum number of concurrent calls",
+        "method_unavailable": "ENOMETHOD",
+    }
+)
+# A full call queue without a reason is ETOOMANYREFS (59 on CORE's FreeBSD,
+# 109 on SCALE's Linux).
 _DDP_BUSY_ERRNOS = frozenset({59, 109})
 
 
@@ -437,16 +473,17 @@ def build_ddp_error(method: str, error: Any) -> TrueNASAPIError:
         reason = str(raw_reason or "").lower()
         code = bounded_remote_error_code(error.get("error"))
         errname = error_name_token(error.get("errname"))
-        busy = _DDP_BUSY_REASON in reason or (not reason and code in _DDP_BUSY_ERRNOS)
+        busy = DDP_REPLY_MARKERS["busy"] in reason or (not reason and code in _DDP_BUSY_ERRNOS)
     error_class = TrueNASAPIBusyError if busy else TrueNASAPIError
+    missing_method = DDP_REPLY_MARKERS["method_unavailable"]
     method_unavailable = isinstance(error, dict) and (
-        errname == "ENOMETHOD" or str(raw_reason or "").strip().upper() == "ENOMETHOD"
+        errname == missing_method or str(raw_reason or "").strip().upper() == missing_method
     )
     if busy:
         category = "busy"
     elif method_unavailable:
         category = "method_unavailable"
-        errname = "ENOMETHOD"
+        errname = missing_method
     else:
         category = "remote_error"
     return error_class(
@@ -673,6 +710,27 @@ class MiddlewareCallLimitCollector:
 REGISTRY.register(MiddlewareCallLimitCollector())
 
 
+def is_method_unavailable(exc: BaseException) -> bool:
+    """True when the platform reported that the called method does not exist.
+
+    Read from the typed error name both dialects set, never from the message.
+    """
+
+    return isinstance(exc, TrueNASAPIError) and exc.errname == "ENOMETHOD"
+
+
+def ddp_reply_object(message: Any, method: str | None = None) -> dict[str, Any]:
+    """A decoded DDP message, which must be an object; anything else is unusable."""
+
+    if isinstance(message, dict):
+        return message
+    raise TrueNASAPIError(
+        f"{method} returned an unusable reply." if method else "The websocket returned an unusable reply.",
+        category="response_invalid",
+        method=method,
+    )
+
+
 def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
     """Map a JSON-RPC error object onto the app's typed API error."""
 
@@ -829,7 +887,8 @@ class _MiddlewareCallDispatcher:
             # cancellation that initiated shutdown.
             pass
 
-    async def _handle_message(self, message: dict[str, Any]) -> None:
+    async def _handle_message(self, message: Any) -> None:
+        message = ddp_reply_object(message)
         if message.get("msg") == "ping":
             # DDP heartbeats are JSON messages, not WebSocket control frames.
             pong = {"msg": "pong"}
@@ -1151,7 +1210,7 @@ class TrueNASWebsocketClient:
             try:
                 result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
             except TrueNASAPIError as exc:
-                if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                if self.config.platform == "scale" and is_method_unavailable(exc):
                     raise LocalServiceError(
                         "Detailed SMART JSON is not available through the SCALE websocket API on this system.",
                         category="method_unavailable",
@@ -1263,7 +1322,7 @@ class TrueNASWebsocketClient:
                             timeout=lambda: min(self.config.timeout_seconds, max(phase_deadline - loop.time(), 0.001)),
                         )
                 except TrueNASAPIError as exc:
-                    if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                    if self.config.platform == "scale" and is_method_unavailable(exc):
                         # Not about this disk: the method is absent, so nothing
                         # in this batch can succeed. Fail the whole batch.
                         raise LocalServiceError(
@@ -1369,7 +1428,7 @@ class TrueNASWebsocketClient:
     async def _perform_handshake(self, ws: ClientConnection, login: _PendingLogin) -> None:
         if not self._uses_jsonrpc:
             await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
-            response = json.loads(await ws.recv())
+            response = ddp_reply_object(json.loads(await ws.recv()))
             if response.get("msg") != "connected":
                 raise TrueNASAPIError(
                     "Unexpected websocket handshake response.",
@@ -1521,7 +1580,7 @@ class TrueNASWebsocketClient:
         try:
             results = await call_method("smart.test.results", [])
         except TrueNASAPIError as exc:
-            if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+            if self.config.platform == "scale" and is_method_unavailable(exc):
                 logger.info("smart.test.results is unavailable on this SCALE system; continuing without SMART history.")
             else:
                 logger.warning("smart.test.results failed; continuing without SMART test overview.")
@@ -1668,7 +1727,7 @@ class TrueNASWebsocketClient:
     ) -> Any:
         while True:
             raw_message = await ws.recv()
-            message = json.loads(raw_message)
+            message = ddp_reply_object(json.loads(raw_message), method)
             msg_type = message.get("msg")
 
             if msg_type == "ping":

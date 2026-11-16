@@ -197,6 +197,7 @@ from app.services.truenas_ws import (
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
+    bounded_remote_reason,
     classify_remote_failure,
     is_local_failure_message,
     log_failure,
@@ -6837,7 +6838,7 @@ class InventoryService:
             "exit_status=%s duration_seconds=%.3f",
             self.system.id,
             slot_view.slot_label,
-            device,
+            log_identifier(device),
             element,
             action.value,
             exit_status,
@@ -16819,9 +16820,8 @@ class InventoryService:
             # only if the device still reports the shelf it was found on.
             preflight = results[0]
             if not preflight.ok:
-                raise TrueNASAPIError(
-                    "Could not confirm which shelf this bay's enclosure device belongs to: "
-                    + self._led_command_failure_detail(preflight)
+                raise self._led_command_failure(
+                    "Could not confirm which shelf this bay's enclosure device belongs to.", preflight
                 )
             reported = parse_sesutil_map_enclosure_ids(preflight.stdout)
             # The device must still be listed and report the shelf it was found
@@ -16846,9 +16846,7 @@ class InventoryService:
             duration_seconds=action_duration,
         )
         if not action_result.ok:
-            raise TrueNASAPIError(
-                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
-            )
+            raise self._led_command_failure("SSH LED action failed.", action_result)
 
         readback_result = results[1]
         parsed = parse_sesutil_map(readback_result[0].stdout) if readback_result[0].ok else []
@@ -16954,9 +16952,8 @@ class InventoryService:
             ) -> list[str]:
                 for target, preflight in zip(host_targets, results, strict=True):
                     if not preflight.ok:
-                        raise TrueNASAPIError(
-                            "Could not confirm which shelf this bay's enclosure device belongs to: "
-                            + self._led_command_failure_detail(preflight)
+                        raise self._led_command_failure(
+                            "Could not confirm which shelf this bay's enclosure device belongs to.", preflight
                         )
                     if parse_sg_ses_enclosure_logical_id(preflight.stdout) != normalize_text(target.get("enclosure_id")):
                         raise self._led_target_moved(slot_view)
@@ -16975,7 +16972,7 @@ class InventoryService:
                 if failures:
                     # No path was switched: keep the earlier paths' failures visible.
                     raise LedTargetMovedError(
-                        f"{exc} The other enclosure path also failed: " + "; ".join(failures)
+                        f"{exc} The other enclosure path also failed.", reason="; ".join(failures)
                     ) from exc
                 raise
             except LedSessionBusyError:
@@ -16983,7 +16980,7 @@ class InventoryService:
             except TrueNASAPIError as exc:
                 # An ordinary preflight failure leaves this host untouched,
                 # but must not discard a confirmed action on another host.
-                failures.append(str(exc))
+                failures.append(self._led_failure_text(exc))
                 continue
             results = results[len(preflight_commands):]
             # Only a successful locate command counts as switching this bay.
@@ -17007,7 +17004,10 @@ class InventoryService:
                 )
                 if not action_result.ok:
                     failures.append(
-                        f"{target_device}:{target_element}: {self._led_command_failure_detail(action_result)}"
+                        bounded_remote_reason(
+                            f"{target_device}:{target_element}: {self._led_command_failure_detail(action_result)}"
+                        )
+                        or f"{target_element}: exit {action_result.exit_code}"
                     )
                     continue
                 observed = None
@@ -17039,7 +17039,7 @@ class InventoryService:
             # A successful command alone is not partial success: at least one
             # successful path must actually read back the requested state.
             if not any(path["identify_active"] is requested_active for path in paths):
-                raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+                raise TrueNASAPIError("SSH LED action failed.", reason=" | ".join(failures))
             result.update(partial=True, failures=[failure[:240] for failure in failures[:8]])
         return result
 
@@ -17214,9 +17214,7 @@ class InventoryService:
             duration_seconds=duration,
         )
         if not action_result.ok:
-            raise TrueNASAPIError(
-                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
-            )
+            raise self._led_command_failure("SSH LED action failed.", action_result)
         readback_result = results[1][0]
         states = parse_unifi_gpio_debug(readback_result.stdout) if readback_result.ok else {}
         observed = states.get(vendor_slot_number)
@@ -17237,6 +17235,19 @@ class InventoryService:
             or _bounded_middleware_text(result.stdout)
             or f"exit {result.exit_code}"
         )
+
+    @classmethod
+    def _led_command_failure(cls, message: str, result: SSHCommandResult) -> TrueNASAPIError:
+        """A fixed message; the command's output is only the action reason."""
+
+        return TrueNASAPIError(message, reason=cls._led_command_failure_detail(result))
+
+    @staticmethod
+    def _led_failure_text(exc: TrueNASAPIError) -> str:
+        """One path's failure for the action response: the message and its reason."""
+
+        reason = bounded_remote_reason(exc.reason)
+        return f"{str(exc).rstrip('.')}: {reason}" if reason else str(exc)
 
     async def _run_ssh_command(
         self, command: str, host: str | None = None, *, timeout_seconds: float | None = None

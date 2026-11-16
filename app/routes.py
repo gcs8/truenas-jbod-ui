@@ -119,9 +119,9 @@ from app.services.truenas_ws import (
     TrueNASAPIError,
     bounded_remote_reason,
     classify_remote_failure,
+    failure_log_fields,
     is_local_failure_message,
     log_failure,
-    log_identifier,
 )
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
@@ -705,12 +705,15 @@ def build_router() -> APIRouter:
             )
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "2"}) from exc
         except TrueNASAPIError as exc:
+            # The message is this service's own sentence; the remote reason,
+            # kept apart on the error, is not logged.
             logger.info(
-                "Locate light refusal system=%s bay %s action=%s reason=%s",
+                "Locate light refusal system=%s bay %s action=%s reason=%s (%s)",
                 service.system.id,
                 slot,
                 payload.action.value,
                 exc,
+                failure_log_fields(exc),
             )
             raise HTTPException(
                 status_code=400,
@@ -836,7 +839,7 @@ def build_router() -> APIRouter:
                         "another path failed and may still be lit."
                     )
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
-                logger.warning("Failed to clear identify LED after saving slot %s mapping: %s", slot, exc)
+                log_failure(logger, "Mapping identify-light clear", exc, identifiers={"bay": str(slot)})
                 led_warning = "Saved mapping, but failed to clear the identify LED; see application logs."
 
         service.invalidate_physical_enclosure_snapshot_cache(
@@ -1154,11 +1157,12 @@ def build_router() -> APIRouter:
             # Classified before the broad OSError branch below, which
             # would otherwise report a missing CA bundle's ENOENT as a
             # slot-detail-cache write failure and name the wrong path.
-            logger.error(
-                "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
-                log_identifier(enclosure_id),
+            log_failure(
+                logger,
+                "SMART batch TLS CA bundle load",
                 exc,
-                exc_info=exc,
+                level=logging.ERROR,
+                identifiers={"enclosure": enclosure_id},
             )
             raise HTTPException(
                 status_code=500,
@@ -1175,12 +1179,12 @@ def build_router() -> APIRouter:
             # log line an operator needs to find it, rather than as a shelf
             # outage they are invited to wait out.
             if not _is_smart_batch_transport_failure(exc):
-                logger.error(
-                    "SMART batch could not write the slot-detail cache for "
-                    "enclosure %s; the data directory is not usable: %s",
-                    log_identifier(enclosure_id),
+                log_failure(
+                    logger,
+                    "SMART batch slot-detail cache write",
                     exc,
-                    exc_info=exc,
+                    level=logging.ERROR,
+                    identifiers={"enclosure": enclosure_id},
                 )
                 raise HTTPException(
                     status_code=500,
@@ -1223,21 +1227,22 @@ def build_router() -> APIRouter:
         except TrueNASAPIError as exc:
             raise _smart_remote_http_exception(exc) from exc
         except TlsTrustConfigurationError as exc:
-            logger.error(
-                "Storage-view SMART batch could not load the TLS CA bundle for view %s: %s",
-                view_id,
+            log_failure(
+                logger,
+                "Storage-view SMART batch TLS CA bundle load",
                 exc,
-                exc_info=exc,
+                level=logging.ERROR,
+                identifiers={"view": view_id},
             )
             raise HTTPException(status_code=500, detail=SMART_BATCH_TLS_TRUST_DETAIL) from exc
         except (OSError, ConnectionClosed) as exc:
             if not _is_smart_batch_transport_failure(exc):
-                logger.error(
-                    "Storage-view SMART batch could not write the slot-detail cache for "
-                    "view %s; the data directory is not usable: %s",
-                    view_id,
+                log_failure(
+                    logger,
+                    "Storage-view SMART batch slot-detail cache write",
                     exc,
-                    exc_info=exc,
+                    level=logging.ERROR,
+                    identifiers={"view": view_id},
                 )
                 raise HTTPException(status_code=500, detail=SMART_BATCH_LOCAL_STORAGE_DETAIL) from exc
             raise HTTPException(
