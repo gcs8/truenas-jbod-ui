@@ -162,6 +162,7 @@ from app.services.parsers import (
     normalize_hex_identifier,
     normalize_lookup_keys,
     normalize_text,
+    parse_enclosure_sysfs_map,
     parse_esxcli_smart_get,
     parse_pool_query_topology,
     parse_nvme_id_ctrl_summary,
@@ -12884,6 +12885,14 @@ class InventoryService:
         transport_detail = self._optional_ssh_transport_failure_detail(results_by_command.values())
         if transport_detail is not None:
             return host_overlay, [f"{failure_prefix} page probes failed on {host}: {transport_detail}."]
+        # The enclosure sysfs map covers the whole host: parse it once and give
+        # every device's parse the same slot hints (#1216).
+        sysfs_result = results_by_command.get(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
+        sysfs_slots = (
+            parse_enclosure_sysfs_map(sysfs_result.stdout)
+            if sysfs_result is not None and sysfs_result.ok and sysfs_result.stdout
+            else {}
+        )
         for device, (aes_command, ec_command, join_command) in device_commands.items():
             aes_result = results_by_command.get(
                 aes_command,
@@ -12903,11 +12912,14 @@ class InventoryService:
             join_result = results_by_command.get(join_command)
             if join_result is not None and join_result.ok:
                 outputs[join_command] = join_result.stdout
-            sysfs_result = results_by_command.get(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
-            if sysfs_result is not None and sysfs_result.ok:
-                outputs[LINUX_ENCLOSURE_SYSFS_MAP_COMMAND] = sysfs_result.stdout
 
-            parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
+            parsed = parse_ssh_outputs(
+                outputs,
+                self.settings.layout.slot_count,
+                None,
+                None,
+                enclosure_sysfs_slots=sysfs_slots,
+            )
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)

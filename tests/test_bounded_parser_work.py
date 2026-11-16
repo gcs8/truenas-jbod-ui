@@ -21,6 +21,8 @@ comments below).
 from __future__ import annotations
 
 import ast
+import asyncio
+import json
 import random
 import re
 import sys
@@ -33,11 +35,22 @@ from re import _constants as _sre  # the parsed-pattern opcodes, for the pattern
 from re import _parser as _sre_parse
 from unittest import mock
 
+from pydantic import ValidationError
+
+from app.config import SSHConfig
+from app.services.ssh_probe import SSHCommandResult
 from app.services import parsers
+from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.parsers import (
+    ParsedSSHData,
+    canonicalize_ssh_command,
+    normalize_device_name,
     normalize_text,
     parse_camcontrol_devlist,
     parse_glabel_status,
+    parse_lsscsi_devices,
+    parse_ssh_outputs,
+    parse_storcli_virtual_drives,
     parse_sesutil_map,
     parse_sesutil_show_enclosures,
     parse_sg_ses_aes,
@@ -987,6 +1000,315 @@ class SgSesJoinFirstHeaderTests(unittest.TestCase):
                 "sg_ses join /dev/sg7",
             )
         )
+
+
+# --- Parsers whose work grew with a second dimension of the input -------------
+#
+# Each test below pairs a growth case (the shared n-against-4n helper) with a
+# control that ordinary output still parses to the same result.
+
+_REFERENCE_LSSCSI_TRANSPORT_PATTERN = re.compile(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)")
+
+
+def _lsscsi_transport(text: str):  # noqa: ANN202
+    devices = parse_lsscsi_devices(text, transport=True)
+    return devices[0].transport, devices[0].transport_address
+
+
+class LsscsiTransportWorkTests(LinearGrowthAssertions):
+    def test_transport_text_without_a_colon_has_linear_work(self) -> None:
+        head = "[0:0:0:0]    disk    "
+        shapes = {
+            # Word and punctuation characters alternate, so every word starts
+            # at a new boundary inside one run of transport characters.
+            "word and dash": (lambda size: head + "a-" * (size // 2) + "!", (None, None)),
+            "mixed word and punctuation": (lambda size: head + "ab+_-9-" * (size // 7) + " /dev/sda", (None, None)),
+            "dash then word": (lambda size: head + "-a" * (size // 2), (None, None)),
+            "run then a colon and no address": (lambda size: head + "a-" * (size // 2) + ":", (None, None)),
+            "run then a transport": (
+                lambda size: head + "a-" * (size // 2) + "! sas:0x12ab /dev/sda /dev/sg0",
+                ("sas", "0x12ab"),
+            ),
+        }
+        for name, (build, expected) in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(_lsscsi_transport(build(40)), expected)
+                self.assert_linear_growth(_lsscsi_transport, build)
+
+    def test_transport_matches_the_previous_pattern(self) -> None:
+        rng = random.Random(1216)
+        tokens = ("a", "Z", "9", "_", "-", "+", "-a", "a-", ":", "::", "sas:", "0x5", "é", "é-", "٣", "!", ",", ";", "/", ".")
+        cases = [
+            "sas:0x12ab",
+            "fc:0x12ab,0x34cd",
+            "sata:",
+            "iqn.2001-04.com.example:storage,t,0x1",
+            "-sas:x",
+            "+-:x",
+            "é-sas:x",
+            "a-b-c:d",
+            "x sas:  y:z",
+        ] + [_random_text(rng, tokens, (" ", "  ", "\t", "\xa0", ""), 10) for _ in range(6000)]
+        for detail in cases:
+            reference = _REFERENCE_LSSCSI_TRANSPORT_PATTERN.search(detail)
+            match = parsers._search_lsscsi_transport(detail)
+            with self.subTest(detail=detail):
+                self.assertEqual(
+                    match and (match.span(), match.groupdict()),
+                    reference and (reference.span(), reference.groupdict()),
+                )
+        # Through the parser, with a device path and a sg path on the line.
+        self.assertEqual(
+            _lsscsi_transport("[1:0:2:0]  disk  sas:0x12ab,  /dev/sdb  /dev/sg1"),
+            ("sas", "0x12ab"),
+        )
+
+
+def _reference_camcontrol_peers(output: str) -> dict[str, list[str]]:
+    """The alias expansion `parse_camcontrol_devlist` did before this change."""
+
+    peers: dict[str, list[str]] = {}
+    for line in output.splitlines():
+        match = _REFERENCE_CAMCONTROL_PATTERN.search(line)
+        if not match:
+            continue
+        devices = [
+            normalized
+            for device in match.group("devices").split(",")
+            if parsers.DEVICE_REGEX.search(device.strip()) and (normalized := normalize_device_name(device))
+        ]
+        deduped = list(dict.fromkeys(devices))
+        if len(deduped) < 2:
+            continue
+        for device in deduped:
+            others = [peer for peer in deduped if peer.lower() != device.lower()]
+            if others:
+                peers[device.lower()] = others
+    return peers
+
+
+class CamcontrolAliasGroupTests(LinearGrowthAssertions):
+    def test_many_aliases_on_one_row_have_linear_work(self) -> None:
+        def build(size: int) -> str:
+            aliases = ",".join(f"da{index}" for index in range(size // 6))
+            return f"<SYNTH DISK 0001>  at scbus0 target 0 lun 0 ({aliases})"
+
+        info = parse_camcontrol_devlist(build(60))
+        self.assertEqual(list(info.peer_devices["da0"]), [f"da{index}" for index in range(1, 10)])
+        self.assertEqual(list(info.peer_devices["da9"]), [f"da{index}" for index in range(9)])
+        self.assert_linear_growth(parse_camcontrol_devlist, build, size=6000)
+
+    def test_peer_devices_match_the_previous_expansion(self) -> None:
+        rng = random.Random(1216)
+        aliases = ("da0", "DA0", "da1", "ada0", "ada1", "pass0", "nvd0", "da0p1", "sd0", "x", "", " da1 ")
+        lines = [
+            "scbus0 on mpr0 bus 0:",
+            "<SYNTH DISK 0001>  at scbus0 target 0 lun 0 (pass0,da0)",
+            "<SYNTH DISK 0002>  at scbus0 target 1 lun 0 (da1,ada1,pass1)",
+            "<SYNTH DISK 0003>  at scbus0 target 2 lun 0 (da0,DA0)",
+            "<SYNTH DISK 0004>  at scbus0 target 3 lun 0 (da2)",
+        ]
+        for _ in range(3000):
+            row = ",".join(rng.choice(aliases) for _ in range(rng.randrange(1, 6)))
+            lines.append(f"<SYNTH DISK {rng.randrange(9)}>  at scbus0 target {rng.randrange(4)} lun 0 ({row})")
+        for start in range(0, len(lines), 10):
+            output = "\n".join(lines[start : start + 10])
+            peers = parse_camcontrol_devlist(output).peer_devices
+            with self.subTest(output=output):
+                self.assertEqual({key: list(value) for key, value in peers.items()}, _reference_camcontrol_peers(output))
+                # The values still compare equal to the lists they replace.
+                self.assertEqual(peers, _reference_camcontrol_peers(output))
+
+
+def _storcli_virtual_drives(response: dict) -> list[dict]:
+    return parse_storcli_virtual_drives(json.dumps({"Controllers": [{"Response Data": response}]}))
+
+
+def _reference_storcli_pd_slots(response: dict, vd_id: str) -> list[str]:
+    """The PD rows the parser associated with one VD before this change."""
+
+    rows = []
+    for key, value in response.items():
+        if re.search(rf"\bPDs\s+for\s+VD\s+{re.escape(vd_id)}\b", key, re.IGNORECASE) and isinstance(value, list):
+            rows.extend(item["EID:Slt"] for item in value if isinstance(item, dict))
+    return rows
+
+
+class StorcliVirtualDriveWorkTests(LinearGrowthAssertions):
+    def test_many_virtual_drives_and_sections_have_linear_work(self) -> None:
+        def build(size: int) -> dict:
+            count = size // 16
+            response = {"VD LIST": [{"DG/VD": f"0/{index}", "Name": "x"} for index in range(count)]}
+            response.update({f"PDs for VD {index}": [{"EID:Slt": f"252:{index}"}] for index in range(count)})
+            return response
+
+        drives = _storcli_virtual_drives(build(160))
+        self.assertEqual([drive["vd_id"] for drive in drives], [str(index) for index in range(10)])
+        self.assertEqual([[pd["slot_key"] for pd in drive["physical_drives"]] for drive in drives][3], ["252:3"])
+        self.assert_linear_growth(lambda response: _storcli_virtual_drives(response), build)
+
+    def test_physical_drive_sections_match_the_previous_association(self) -> None:
+        rng = random.Random(1216)
+        headings = (
+            "PDs for VD {}", "pds  for\tvd {}", "PDS FOR VD  {}", "PDs for VD {}x", "PDs for VD {}_1", "PDs for VD {}-a",
+            "PDs for VD {}/1", "xPDs for VD {}", "PDs for VD 0{}", "PDs for VD {} PDs for VD 1", "PDs forVD {}",
+            "VD{} Properties", "PDs for VD {}\u00e9", "PDs for VD {}\u0663", "/c0/v{}",
+        )
+        vd_ids = ("0", "1", "2", "10", "01", "00")
+        for trial in range(400):
+            response: dict = {
+                "VD LIST": [{"DG/VD": f"0/{vd_id}", "Name": "x"} for vd_id in rng.sample(vd_ids, rng.randrange(1, 4))]
+            }
+            for index in range(rng.randrange(1, 6)):
+                key = rng.choice(headings).format(rng.choice(vd_ids))
+                response.setdefault(key, []).append({"EID:Slt": f"252:{trial % 50 + index}"})
+            with self.subTest(response=response):
+                for drive in _storcli_virtual_drives(response):
+                    self.assertEqual(
+                        [pd["slot_key"] for pd in drive["physical_drives"]],
+                        _reference_storcli_pd_slots(response, drive["vd_id"]),
+                    )
+
+    def test_a_row_without_a_virtual_drive_number_is_not_given_every_section(self) -> None:
+        # Behaviour choice: a row whose VD number is missing or not decimal is
+        # not associated with any "PDs for VD" section (it used to collect all
+        # of them, which is a guess).
+        response = {
+            "VD LIST": [{"Name": "no number"}, {"DG/VD": "0/x", "Name": "word"}, {"DG/VD": "0/0", "Name": "control"}],
+            "PDs for VD 0": [{"EID:Slt": "252:0"}],
+            "PDs for VD 1": [{"EID:Slt": "252:1"}],
+        }
+        drives = _storcli_virtual_drives(response)
+        self.assertEqual([[pd["slot_key"] for pd in drive["physical_drives"]] for drive in drives], [[], [], ["252:0"]])
+
+
+class SshCommandNormalizationWorkTests(LinearGrowthAssertions):
+    def test_many_sudo_options_have_linear_work(self) -> None:
+        shapes = {
+            "repeated option": lambda size: "sudo " + "-n " * (size // 3) + "glabel status",
+            "repeated sudo": lambda size: "sudo -n " * (size // 8) + "glabel status",
+        }
+        for name, build in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(canonicalize_ssh_command(build(300)), "glabel status")
+                # shlex's own linear cost hides the prefix loop at sizes a test
+                # can afford, so the words come from `str.split` here; quoting
+                # plays no part in these inputs.
+                with mock.patch.object(parsers.shlex, "split", str.split):
+                    self.assertEqual(canonicalize_ssh_command(build(300)), "glabel status")
+                    self.assert_linear_growth(canonicalize_ssh_command, build, size=30000)
+        for command, key in (
+            ("sudo -n glabel status", "glabel status"),
+            ("sudo -n /sbin/camcontrol devlist -v", "camcontrol devlist -v"),
+            ("sudo", "sudo"),
+            ("sudo -n", "sudo -n"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(canonicalize_ssh_command(command), key)
+
+    def test_configured_commands_are_bounded_at_load(self) -> None:
+        self.assertEqual(len(SSHConfig().commands), 6)
+        SSHConfig(commands=["x" * 4096, " ".join(["x"] * 256), "sudo -n /usr/bin/sg_ses -p aes /dev/sg3"])
+        for command, message in (
+            ("x" * 4097, "An SSH command is longer than 4096 characters."),
+            (" ".join(["secret"] * 257), "An SSH command has more than 256 words."),
+        ):
+            with self.subTest(length=len(command)):
+                with self.assertRaises(ValidationError) as caught:
+                    SSHConfig(commands=["glabel status", command])
+                self.assertIn(message, str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertNotIn("xxxx", str(caught.exception))
+
+
+_PARITY_FIXTURES = Path(__file__).parent / "fixtures" / "platform_parity"
+
+
+def _overlay_stub(slot_count: int, *, merge: bool = True) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        settings=types.SimpleNamespace(layout=types.SimpleNamespace(slot_count=slot_count)),
+        _optional_ssh_transport_failure_detail=InventoryService._optional_ssh_transport_failure_detail,
+        _tag_ses_overlay=InventoryService._tag_ses_overlay if merge else (lambda parsed, host: None),
+        _merge_ses_overlay_data=InventoryService._merge_ses_overlay_data if merge else (lambda base, overlay: base),
+    )
+
+
+def _overlay_results(devices: list[str], pages: dict[str, str], sysfs: str) -> list[SSHCommandResult]:
+    results = []
+    for device in devices:
+        for page, text in pages.items():
+            command = (
+                f"sudo -n /usr/bin/sg_ses --join --filter {device}"
+                if page == "join"
+                else f"sudo -n /usr/bin/sg_ses -p {page} {device}"
+            )
+            results.append(SSHCommandResult(command=command, ok=True, stdout=text, stderr="", exit_code=0))
+    results.append(
+        SSHCommandResult(command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout=sysfs, stderr="", exit_code=0)
+    )
+    return results
+
+
+def _fetch_overlay(stub, devices: list[str], results: list[SSHCommandResult]):  # noqa: ANN001, ANN202
+    return asyncio.run(
+        InventoryService._fetch_sg_ses_host_overlay(
+            stub, "host-a", devices, failure_prefix="SES", command_results=results
+        )
+    )
+
+
+class SesOverlayHostSysfsTests(LinearGrowthAssertions):
+    def test_host_sysfs_map_is_parsed_once_for_all_devices(self) -> None:
+        aes = (_PARITY_FIXTURES / "scale_offset_1based_aes.txt").read_text(encoding="utf-8")
+        sysfs_line = (_PARITY_FIXTURES / "scale_offset_1based_sysfs.txt").read_text(encoding="utf-8")
+
+        def build(size: int):  # noqa: ANN202
+            devices = [f"/dev/sg{index}" for index in range(size)]
+            sysfs = "".join(sysfs_line.replace("sg9 ", f"sg{index} ") for index in range(size))
+            return devices, _overlay_results(devices, {"aes": aes}, sysfs)
+
+        stub = _overlay_stub(4, merge=False)
+        devices, results = build(32)
+        consumed = []
+        real = parsers.parse_enclosure_sysfs_map
+        with mock.patch.object(parsers, "parse_enclosure_sysfs_map", lambda text: consumed.append(len(text)) or real(text)):
+            with mock.patch("app.services.inventory.parse_enclosure_sysfs_map", parsers.parse_enclosure_sysfs_map):
+                _fetch_overlay(_overlay_stub(4), devices, results)
+        sysfs_length = len(results[-1].stdout)
+        self.assertEqual(sum(consumed), sysfs_length)
+        self.assert_linear_growth(lambda built: _fetch_overlay(stub, *built), build, size=32)
+
+    def test_overlay_is_unchanged_for_ordinary_output(self) -> None:
+        pages = {
+            page: (_PARITY_FIXTURES / f"scale_offset_1based_{page}.txt").read_text(encoding="utf-8")
+            for page in ("aes", "ec", "join")
+        }
+        sysfs = (_PARITY_FIXTURES / "scale_offset_1based_sysfs.txt").read_text(encoding="utf-8")
+        devices = ["/dev/sg9", "/dev/sg10"]
+        results = _overlay_results(devices, pages, sysfs)
+        overlay, failures = _fetch_overlay(_overlay_stub(4), devices, results)
+
+        # The same overlay built the way the caller did before this change:
+        # each device's pages parsed together with the whole host map.
+        expected = ParsedSSHData()
+        by_command = {result.command: result.stdout for result in results}
+        for device in devices:
+            outputs = {command: text for command, text in by_command.items() if command.endswith(f" {device}")}
+            outputs[LINUX_ENCLOSURE_SYSFS_MAP_COMMAND] = sysfs
+            parsed = parse_ssh_outputs(outputs, 4, None, None)
+            if parsed.ses_enclosures:
+                InventoryService._tag_ses_overlay(parsed, "host-a")
+                expected = InventoryService._merge_ses_overlay_data(expected, parsed)
+
+        self.assertEqual(failures, [])
+        self.assertTrue(overlay.ses_enclosures)
+        self.assertEqual(overlay.ses_enclosures, expected.ses_enclosures)
+        self.assertEqual(overlay.ses_slot_candidates, expected.ses_slot_candidates)
+        self.assertEqual(overlay.ses_slot_to_device, expected.ses_slot_to_device)
+        # The host map still names the disks in the bays its device reads.
+        for bay, device in {0: "sda", 1: "sdb", 3: "sdd"}.items():
+            self.assertEqual(overlay.ses_slot_candidates[bay].get("device_names"), [device])
+        self.assertFalse(overlay.ses_slot_candidates[2].get("device_names"))
 
 
 # --- Every pattern in the parser modules -------------------------------------

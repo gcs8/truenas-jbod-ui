@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -99,7 +99,7 @@ class ParsedSSHData:
     ses_slot_to_device: dict[int, str] = field(default_factory=dict)
     camcontrol_models: dict[str, str] = field(default_factory=dict)
     camcontrol_controllers: dict[str, str] = field(default_factory=dict)
-    camcontrol_peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    camcontrol_peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
     ses_enclosures: list["SESMapEnclosure"] = field(default_factory=list)
@@ -228,11 +228,45 @@ class MultipathInfo:
     consumers: list[MultipathConsumer] = field(default_factory=list)
 
 
+class CamcontrolPeers(Sequence[str]):
+    """The other aliases a CAM row lists for one device, read from the row.
+
+    Every alias on a row shares one group record instead of holding its own
+    list of the others, so a row with N aliases costs N, not N squared (#1216).
+    It reads and compares like the list it replaces.
+    """
+
+    __slots__ = ("_group", "_key")
+
+    def __init__(self, group: tuple[tuple[str, str], ...], key: str) -> None:
+        self._group = group  # (alias, lower-case alias) in row order
+        self._key = key
+
+    def __iter__(self) -> Iterator[str]:
+        return (alias for alias, lowered in self._group if lowered != self._key)
+
+    def __len__(self) -> int:
+        return sum(1 for _alias, lowered in self._group if lowered != self._key)
+
+    def __getitem__(self, index):  # noqa: ANN001, ANN204
+        return list(self)[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (CamcontrolPeers, list, tuple)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return repr(list(self))
+
+
 @dataclass(slots=True)
 class CamcontrolInfo:
     models: dict[str, str] = field(default_factory=dict)
     controllers: dict[str, str] = field(default_factory=dict)
-    peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     # CAM target per device, recorded only under a known controller line. The
     # number is controller-local: the same target on another HBA is another
     # device.
@@ -670,13 +704,12 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     # Only aliases explicitly listed on one CAM row describe the same device.
     # Model/target/LUN repeats across HBAs do not establish disk identity.
     for devices in device_rows:
-        deduped = list(dict.fromkeys(devices))
-        if len(deduped) < 2:
+        group = tuple((device, device.lower()) for device in dict.fromkeys(devices))
+        # A device has peers when the row names at least one other device.
+        if len({lowered for _device, lowered in group}) < 2:
             continue
-        for device in deduped:
-            peers = [peer for peer in deduped if peer.lower() != device.lower()]
-            if peers:
-                info.peer_devices[device.lower()] = peers
+        for _device, lowered in group:
+            info.peer_devices[lowered] = CamcontrolPeers(group, lowered)
     return info
 
 
@@ -4503,10 +4536,14 @@ def canonicalize_ssh_command(command: str) -> str:
     if not tokens:
         return command.strip()
 
-    while tokens and tokens[0] == "sudo":
-        tokens.pop(0)
-        while tokens and tokens[0].startswith("-"):
-            tokens.pop(0)
+    # Step over `sudo` and its options with an index and slice once: popping
+    # the front of the list moved every later word each time (#1216).
+    start = 0
+    while start < len(tokens) and tokens[start] == "sudo":
+        start += 1
+        while start < len(tokens) and tokens[start].startswith("-"):
+            start += 1
+    tokens = tokens[start:]
 
     if not tokens:
         return command.strip()
@@ -4625,6 +4662,33 @@ def parse_lsblk_json(output: str) -> list[dict[str, Any]]:
     return [item for item in blockdevices if isinstance(item, dict)]
 
 
+_LSSCSI_TRANSPORT_PATTERN = re.compile(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)")
+_LSSCSI_TRANSPORT_RUN_PATTERN = re.compile(r"[A-Za-z0-9_+-]+")
+_WORD_BOUNDARY_PATTERN = re.compile(r"\b")
+
+
+def _search_lsscsi_transport(detail: str) -> re.Match[str] | None:
+    """`_LSSCSI_TRANSPORT_PATTERN.search(detail)` with work linear in the text.
+
+    The unanchored search started again at every word boundary inside a run of
+    transport characters with no colon after it (`a-a-a-...`), and each start
+    read the rest of the run (#1216). Every start inside one run ends at the
+    same run end, so it succeeds or fails with the first start the word
+    boundary allows. One match there per run finds the same match.
+    """
+
+    for run in _LSSCSI_TRANSPORT_RUN_PATTERN.finditer(detail):
+        if detail[run.end() : run.end() + 1] != ":":
+            continue
+        boundary = _WORD_BOUNDARY_PATTERN.search(detail, run.start(), run.end())
+        if boundary is None or boundary.start() >= run.end():
+            continue
+        match = _LSSCSI_TRANSPORT_PATTERN.match(detail, boundary.start())
+        if match:
+            return match
+    return None
+
+
 def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxScsiDevice]:
     devices: list[LinuxScsiDevice] = []
     line_pattern = re.compile(r"^\[(?P<hctl>[^\]]+)\]\s+(?P<type>\S+)\s+(?P<body>.*)$")
@@ -4656,7 +4720,7 @@ def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxS
         )
 
         if transport:
-            transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
+            transport_match = _search_lsscsi_transport(detail)
             if transport_match:
                 parsed.transport = normalize_text(transport_match.group("transport").lower())
                 parsed.transport_address = normalize_text(transport_match.group("address").rstrip(",;"))
@@ -5191,6 +5255,34 @@ def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[d
     return fallback_rows
 
 
+_STORCLI_PD_SECTION_HEADING_PATTERN = re.compile(r"\bPDs\s+for\s+VD\s+", re.IGNORECASE)
+_STORCLI_PD_SECTION_VD_PATTERN = re.compile(r"\w*")
+
+
+def _collect_storcli_pd_sections(response_data: dict[str, Any]) -> dict[str, list[list[Any]]]:
+    """Each "PDs for VD <n>" section value, indexed once by its VD number.
+
+    The VD loop used to search every response key again for each VD (#1216).
+    A decimal VD number names a section exactly when the word that follows the
+    heading is that number, so one pass over the keys answers every VD, in
+    key order, with the same sections as the per-VD search.
+    """
+
+    sections: dict[str, list[list[Any]]] = {}
+    for key, value in response_data.items():
+        if not isinstance(key, str):
+            continue
+        named: set[str] = set()
+        for heading in _STORCLI_PD_SECTION_HEADING_PATTERN.finditer(key):
+            vd_id = _STORCLI_PD_SECTION_VD_PATTERN.match(key, heading.end()).group(0)
+            if vd_id in named or not (vd_id.isascii() and vd_id.isdigit()):
+                continue
+            named.add(vd_id)
+            if isinstance(value, list):
+                sections.setdefault(vd_id, []).append(value)
+    return sections
+
+
 def _parse_storcli_virtual_drive_response(
     response_data: dict[str, Any],
     *,
@@ -5199,6 +5291,7 @@ def _parse_storcli_virtual_drive_response(
 ) -> list[dict[str, Any]]:
     rows = _collect_storcli_virtual_drive_rows(response_data)
     details_by_vd = _collect_storcli_virtual_drive_details(response_data)
+    pd_sections_by_vd = _collect_storcli_pd_sections(response_data)
     virtual_drives: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -5210,11 +5303,11 @@ def _parse_storcli_virtual_drive_response(
         if vd_id is None:
             vd_id = normalize_text(str(row.get("VD") if row.get("VD") is not None else ""))
         detail = details_by_vd.get(vd_id or "", {})
-        pd_rows = []
-        for key, value in response_data.items():
-            if isinstance(key, str) and re.search(rf"\bPDs\s+for\s+VD\s+{re.escape(vd_id or '')}\b", key, re.IGNORECASE):
-                if isinstance(value, list):
-                    pd_rows.extend(item for item in value if isinstance(item, dict))
+        # Only a decimal VD number names its sections. A row without one is
+        # given no section rather than every section in the response.
+        pd_rows = [
+            item for section in pd_sections_by_vd.get(vd_id or "", ()) for item in section if isinstance(item, dict)
+        ]
         physical_drives = []
         for pd_row in pd_rows:
             enclosure_id, slot, slot_key = _parse_storcli_eid_slot(pd_row.get("EID:Slt") or pd_row.get("EID:Slt "))
@@ -5354,7 +5447,15 @@ def parse_ssh_outputs(
     slot_count: int,
     enclosure_filter: str | None,
     selected_enclosure_id: str | None = None,
+    *,
+    enclosure_sysfs_slots: dict[str, dict[int, list[str]]] | None = None,
 ) -> ParsedSSHData:
+    """Parse one set of SSH command outputs.
+
+    `enclosure_sysfs_slots` is the already parsed host enclosure sysfs map, for
+    a caller that applies one host map to several devices' outputs; it is used
+    instead of any `enclosure sysfs map` output in `outputs`.
+    """
     parsed = ParsedSSHData()
     normalized_outputs: dict[str, str] = {}
 
@@ -5448,11 +5549,12 @@ def parse_ssh_outputs(
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
         # Kernel enclosure-driver hints are keyed by device slot number, so
         # they join the merged bays, not the per-page pre-merge records.
-        enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
-        if enclosure_sysfs_output:
-            enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
-            if enclosure_sysfs_slots:
-                _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
+        if enclosure_sysfs_slots is None:
+            enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
+            if enclosure_sysfs_output:
+                enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
+        if enclosure_sysfs_slots:
+            _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
         for enclosure in parsed.ses_enclosures:
             _flag_degraded_ses_sas_addresses(enclosure)
     if parsed.ses_enclosures or ses_map_output or ses_show_output:
