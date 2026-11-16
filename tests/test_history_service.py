@@ -47,6 +47,7 @@ from history_service.migration_lock import history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import (
+    CURRENT_SCHEMA_VERSION,
     DISK_IDENTITY_BACKFILL_USER_VERSION,
     RETENTION_WAIT_STATE_NAME,
     HistoryStore,
@@ -2454,12 +2455,16 @@ class HistoryStoreTests(unittest.TestCase):
             def __init__(self, name: str) -> None:
                 self.name = name
 
-            def execute(self, _statement: str, *_parameters: object) -> "FakeConnection":
+            def execute(self, statement: str, *_parameters: object) -> "FakeConnection":
                 events.append(f"{self.name}:execute")
+                self.last_statement = statement
                 return self
 
-            def fetchone(self) -> None:
-                # The restore's counter recount (#1093) finds no counter table.
+            def fetchone(self) -> tuple[int] | None:
+                # The restore's schema-version gate (#1189) reads a supported
+                # version; the counter recount (#1093) finds no counter table.
+                if getattr(self, "last_statement", "") == "PRAGMA user_version":
+                    return (CURRENT_SCHEMA_VERSION,)
                 return None
 
             def backup(self, _target: object) -> None:
