@@ -1684,6 +1684,45 @@ def replace_settings(settings: Settings) -> None:
 get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 
 
+def apply_env_overrides(
+    merged: dict[str, Any],
+    *,
+    sections: frozenset[str] | None = None,
+    applied: set[tuple[str, ...]] | None = None,
+) -> None:
+    """Apply the .env overrides to ``merged`` in place, as ``load_settings`` does.
+
+    ``sections`` limits the overrides to those whose target starts with one of
+    these top-level keys; the parsing and blank rules are the same either way.
+    ``applied`` receives the target path of every override that set a value.
+    """
+    for env_name, target_path in ENV_OVERRIDES.items():
+        if sections is not None and target_path[0] not in sections:
+            continue
+        raw_value = (
+            load_secret_environment_value(env_name)
+            if env_name in FILE_SECRET_ENV_OVERRIDES
+            else os.getenv(env_name)
+        )
+        if raw_value is None:
+            continue
+        if env_name in EXACT_STRING_ENV_OVERRIDES:
+            # A blank ``KEY=`` line copied from .env.example is unset, like
+            # every other key; a ``<KEY>_FILE`` secret is still used exactly.
+            if not raw_value.strip() and os.getenv(f"{env_name}_FILE") is None:
+                continue
+            parsed_value = raw_value
+        elif not raw_value.strip():
+            continue
+        elif _override_is_text(target_path):
+            parsed_value = raw_value.strip()
+        else:
+            parsed_value = _parse_scalar(raw_value)
+        _set_path_value(merged, target_path, parsed_value)
+        if applied is not None:
+            applied.add(target_path)
+
+
 def load_settings(
     *,
     running_restart_only: Settings | None = None,
@@ -1748,27 +1787,7 @@ def load_settings(
     _warn_unknown_config_keys_once(config_path, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
-    for env_name, target_path in ENV_OVERRIDES.items():
-        raw_value = (
-            load_secret_environment_value(env_name)
-            if env_name in FILE_SECRET_ENV_OVERRIDES
-            else os.getenv(env_name)
-        )
-        if raw_value is None:
-            continue
-        if env_name in EXACT_STRING_ENV_OVERRIDES:
-            # A blank ``KEY=`` line copied from .env.example is unset, like
-            # every other key; a ``<KEY>_FILE`` secret is still used exactly.
-            if not raw_value.strip() and os.getenv(f"{env_name}_FILE") is None:
-                continue
-            parsed_value = raw_value
-        elif not raw_value.strip():
-            continue
-        elif _override_is_text(target_path):
-            parsed_value = raw_value.strip()
-        else:
-            parsed_value = _parse_scalar(raw_value)
-        _set_path_value(merged, target_path, parsed_value)
+    apply_env_overrides(merged)
     _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
     merged = _apply_config_path_relative_defaults(

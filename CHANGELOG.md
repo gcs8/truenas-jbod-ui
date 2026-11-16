@@ -95,6 +95,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   when the config file was already replaced and only the directory fsync
   failed; the profile is kept and the request reports an uncertain save
   (#1240).
+- System Setup no longer replaces a system configured only in the top-level
+  `truenas` and `ssh` settings (in `config.yaml` or `.env`, including one that
+  sets only a credential and uses the default host) when a system is added,
+  under any id, `default` included. The add is refused before anything is
+  written. The message says to save `default` in System Setup or move it into
+  a `systems` entry in `config.yaml`, and that its API key and passwords are
+  then stored in `config.yaml`; the Advanced Configuration wiki page has the
+  steps. Saving `default` from System Setup now keeps the settings the form
+  does not show and the exact user names in effect, and copies each key or
+  password it keeps into `config.yaml` with the value in effect, including one
+  from a `TRUENAS_*` or `SSH_*` variable or its `_FILE` file, without showing
+  it; when group or other accounts can read `config.yaml`, that save logs a
+  warning and the result says so. Demo creation applies the same check. Each
+  config save stages under its own private name; one that fails or is
+  interrupted before the new file is published leaves the previous file intact
+  and removes its own staging copy, best effort, and no other file. Saves
+  still rewrite `config.yaml` without its comments (#1253).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
