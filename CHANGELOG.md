@@ -132,6 +132,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   answer, their board and firmware stay on one controller, and every link
   and controller reference names a node that is in the map (#1244, refs
   #1219).
+- System Setup no longer replaces a system configured only in the top-level
+  `truenas` and `ssh` settings (in `config.yaml` or `.env`, including one that
+  sets only a credential and uses the default host) when a system is added,
+  under any id, `default` included. The add is refused before anything is
+  written. The message says to save `default` in System Setup or move it into
+  a `systems` entry in `config.yaml`, and that its API key and passwords are
+  then stored in `config.yaml`; the Advanced Configuration wiki page has the
+  steps. Saving `default` from System Setup now keeps the settings the form
+  does not show and the exact user names in effect, and copies each key or
+  password it keeps into `config.yaml` with the value in effect, including one
+  from a `TRUENAS_*` or `SSH_*` variable or its `_FILE` file, without showing
+  it; when group or other accounts can read `config.yaml`, that save logs a
+  warning and the result says so. Demo creation applies the same check. Each
+  config save stages under its own private name; one that fails or is
+  interrupted before the new file is published leaves the previous file intact
+  and removes its own staging copy, best effort, and no other file. Saves
+  still rewrite `config.yaml` without its comments (#1253).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
@@ -212,6 +229,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback.
+  Upgrade effect: saving bay mappings now needs a working lock file beside
+  the mapping file, and there is no unguarded fallback. A save that cannot
+  hold it is refused with `mapping_writer_lock_unavailable` (503) and one of
+  four page messages: another save is in progress, a file lock could not be
+  taken on the storage, the lock file could not be opened as a regular file,
+  or the lock file cannot be opened for writing. Each
+  points to the new Troubleshooting section "Saving bay mappings", which has
+  the recovery steps. The wait runs off the UI event loop. Reads take no lock and
+  never wait for a writer, even one stalled while publishing: a read that
+  finds the file was replaced between its check and its open reads again, and
+  after three such rereads refuses with `mapping_read_busy` (503,
+  `Retry-After`) instead of waiting. A read that already opened the file
+  returns that complete version. A mapping path that is not a regular file,
+  including one swapped in during a read, is refused without blocking and is
+  never read as "no mappings"; the save's own readback uses the same check
+  and reports it as unconfirmed durability. A mapping export takes its rows and its
+  revision from the same read. A refused import now gets the named 503
+  instead of a generic error (#1256).
 
 ### Performance
 
