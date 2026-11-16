@@ -377,6 +377,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   read time, but shows the latest refresh's source status and warnings under
   a warning that the view is retained, and the snapshot export reports the
   same warning instead of the earlier successful status (#1242).
+- Fixed recovery of a crashed segmented restore that also restored
+  configuration (#1196): recovery now returns configuration and history to the
+  same generation, or refuses with a named reason and keeps its evidence,
+  instead of reporting the prior generation restored while candidate
+  configuration stayed active. The history records recovery acts on must
+  match the restore's own record in the first configuration folder; a journal
+  whose history records differ is refused (`history-target-unrecorded`) and
+  nothing is changed. While a configuration folder that the
+  application's settings name still holds a restore record that recovery did
+  not settle, it reports `configuration-recovery-incomplete`, changes nothing
+  and exits with status 3; a folder it lists past its scan bound gives
+  `recovery-scan-limit-reached` the same way. Run such a recovery through the
+  admin service, which mounts the configuration volume; a receipt printed
+  without `APP_SERVICE_ROLE=admin` (the history container, or an older Compose
+  file with no roles) says the configuration folders were not checked there and
+  gives the admin command, which sets that role. The guide's check for records
+  left after the journal calls them stale only when configuration and history
+  both hold the generation the restore's recorded decision selects (#1265).
 - Fixed a lost bay-assignment change when two owners of one mapping file (a
   second app process, or a second store in one process) both reported a
   successful save. Saves, clears and imports now hold a writer lock
