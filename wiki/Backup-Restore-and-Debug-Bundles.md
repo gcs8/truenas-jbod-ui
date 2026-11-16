@@ -503,30 +503,25 @@ colour, directly under the plan's introduction, which changes to say the
 copies were in the plan rather than that they will be deleted.
 
 Because a clean-up reads kept copies back first, a manual clean-up can take
-minutes. The admin service waits up to 10 minutes in all for its answer, then
-up to 30 seconds for one status question, so it replies well before the
-page's own 15-minute limit. The page states only what the backup service
-reported:
+minutes. The admin service waits up to 10 minutes in all for its answer, so it
+replies well before the page's own 15-minute limit.
 
 - If the backup service's result arrives, the dialog shows it.
-- If the request never reached the backup service, nothing started and the
-  dialog says the backup scheduler is not available.
-- If the request was sent but no usable answer came back (the wait ran out,
-  the answer broke off, or it was not a clean-up result), the admin service
-  asks the backup service once whether a clean-up is running. Only if it says
-  one is does the dialog say a clean-up is running and can still delete the
-  copies in its plan. The page then keeps re-reading the backup list, and once
-  a read made after that message shows no clean-up running, the dialog (if
-  still open) and the banner (if nothing else has replaced it) say that the
-  clean-up is no longer running and that the "Last clean-up" line shows the
-  most recent finished clean-up and its time.
-- In every other case, including when the backup service says nothing is
-  running and when the page itself stops waiting, the dialog says, in the
-  warning colour, that no answer arrived and the state is not known: the
-  clean-up may not have started yet, may be running or may have finished, and
-  copies in its plan may still be deleted. Reload the list later and read the
-  "Last clean-up" line and its time. This message stays until you close the
-  dialog or start something else.
+- If the admin service could not open a connection to the backup service at
+  all, nothing was sent and the API answers that the backup scheduler is not
+  available. The page cannot tell that answer from a gateway error, so it
+  shows the message below for it too.
+- In every other case (the wait ran out, the connection broke while sending or
+  receiving, or the answer was not a clean-up result or a refusal), and when
+  the page itself stops waiting or gets an error that does not decide the
+  outcome, the dialog and banner say, in the warning colour: "No answer came
+  back for this clean-up. It may have run, may still be running, or may not
+  have started. Reload this page in a few minutes and check Last clean-up
+  before starting another." The page asks nothing more for that clean-up, and
+  no later list refresh changes this message; it stays until you close the
+  dialog or start something else. The "Last clean-up" line shows the most
+  recent clean-up the backup service recorded, which is not necessarily this
+  one.
 - While a clean-up runs, the status line says "A clean-up is running."
 
 A clean-up started while a backup or another clean-up is running does not

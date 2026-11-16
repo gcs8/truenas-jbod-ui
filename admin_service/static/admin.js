@@ -9184,7 +9184,6 @@
     formatBytes,
     formatLocalTimestamp,
     setBanner,
-    bannerRevision: () => state.bannerRevision,
     confirm: (message) => window.confirm(message),
     encodeUtf8Base64,
     describeBackupRestoreConfirmation,

@@ -1460,22 +1460,14 @@ def build_router(admin_settings: Any) -> APIRouter:
         return artifact_id
 
     scheduler_unavailable_detail = "The backup scheduler service is not available."
-    # #1188: what the apply route says when the clean-up's own answer did not
-    # arrive. Only a status read that shows a clean-up running is said as
-    # such; everything else is not known. Neither says a clean-up is not
-    # running, did not start or has a result. The page uses the same words.
-    cleanup_no_answer_details = {
-        "cleanup_running": (
-            "A clean-up is running on the backup service and can still delete the copies in its plan. "
-            "The answer to this request did not reach the admin service. This page checks again by itself "
-            "and says so here once that clean-up is no longer running."
-        ),
-        "cleanup_state_unknown": (
-            "No answer to this clean-up reached the admin service, so its state is not known. It may not have "
-            "started yet, may be running or may have finished, and copies in its plan may still be deleted. "
-            "Reload the list later and read the Last clean-up line and its time."
-        ),
-    }
+    # #1188: the one thing the apply route says when no usable answer to a
+    # clean-up came back, whatever the reason. It asks the scheduler nothing
+    # more: no later read can tell what this request did. The page uses the
+    # same words.
+    cleanup_no_answer_detail = (
+        "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+        "started. Reload this page in a few minutes and check Last clean-up before starting another."
+    )
 
     def is_cleanup_result(payload: Any) -> bool:
         """The shape the scheduler's apply route returns for a finished clean-up."""
@@ -1498,29 +1490,6 @@ def build_router(admin_settings: Any) -> APIRouter:
         return await asyncio.wait_for(
             asyncio.to_thread(client.request, method, path, deadline=deadline, **kwargs), timeout=remaining + 1.0
         )
-
-    async def cleanup_state_after_lost_answer(client: Any) -> str:
-        """Ask the scheduler once whether a clean-up is running; anything else is not known.
-
-        No reservation is not proof that nothing will run: an accepted request
-        can still be on its way to the job reservation.
-        """
-
-        deadline = time.monotonic() + backup_scheduler_client.CLEANUP_STATUS_READ_DEADLINE_SECONDS
-        try:
-            response = await scheduler_request_by(deadline, client, "GET", "/internal/backups")
-        except (SchedulerUnavailableError, TimeoutError):
-            return "cleanup_state_unknown"
-        payload = response.payload if isinstance(response.payload, dict) else {}
-        running = payload.get("running")
-        if (
-            response.status == 200
-            and payload.get("available") is True
-            and isinstance(running, dict)
-            and running.get("backup_class") == "lifecycle"  # a manual clean-up's reservation
-        ):
-            return "cleanup_running"
-        return "cleanup_state_unknown"
 
     async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
         client = get_backup_scheduler_client()
@@ -1602,10 +1571,9 @@ def build_router(admin_settings: Any) -> APIRouter:
             raise HTTPException(status_code=400, detail="plan_token is required.")
         # #1188: apply reads kept copies back before deleting, so it gets its
         # own deadline. A result comes only from the scheduler's result; its
-        # refusals before starting (400, 409) pass through. Any other answer
-        # after the request went out whole, or none, is no usable answer: ask
-        # the scheduler once and say only what that shows. A request that was
-        # never sent in full started nothing and stays "not available".
+        # refusals before starting (400, 409) pass through. Anything else once
+        # the connection was open, or no answer at all, gets the one fixed
+        # message. Only a connection that never opened stays "not available".
         client = get_backup_scheduler_client()
         deadline = time.monotonic() + backup_scheduler_client.LIFECYCLE_APPLY_DEADLINE_SECONDS
         try:
@@ -1622,8 +1590,7 @@ def build_router(admin_settings: Any) -> APIRouter:
             detail = response.payload.get("detail") if isinstance(response.payload, dict) else None
             if response.status in (400, 409) and isinstance(detail, str) and detail:
                 raise HTTPException(status_code=response.status, detail=detail)
-        state = await cleanup_state_after_lost_answer(client)
-        return JSONResponse({"state": state, "detail": cleanup_no_answer_details[state]}, status_code=202)
+        return JSONResponse({"state": "cleanup_state_unknown", "detail": cleanup_no_answer_detail}, status_code=202)
 
     @router.post("/api/admin/backups/targets/{target_id}/test")
     async def test_backup_target(target_id: str) -> JSONResponse:

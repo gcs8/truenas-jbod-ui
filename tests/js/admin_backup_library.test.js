@@ -854,144 +854,64 @@ test("several kept copies that failed the check read in the plural, with no copy
   assert.doesNotMatch(LIBRARY_SOURCE, /copy\/copies|deletion\/deletions/);
 });
 
-// #1188: what the page says when the clean-up's own answer did not reach the
-// admin service. Each matches the route's detail for that state.
-const CLEANUP_RUNNING = "A clean-up is running on the backup service and can still delete the copies in its plan. "
-  + "The answer to this request did not reach the admin service. This page checks again by itself "
-  + "and says so here once that clean-up is no longer running.";
-const CLEANUP_STATE_UNKNOWN = "No answer to this clean-up reached the admin service, so its state is not known. It may not have "
-  + "started yet, may be running or may have finished, and copies in its plan may still be deleted. "
-  + "Reload the list later and read the Last clean-up line and its time.";
-const CLEANUP_NO_LONGER_RUNNING = "The clean-up that was running is no longer running. "
-  + "The Last clean-up line shows the most recent finished clean-up and its time.";
-
-// A library with a timer hook and a banner revision, as admin.js mounts it.
-function watchingLibrary(api) {
-  const timers = [];
-  const banners = [];
-  let revision = 0;
-  const mounted = mount({ api, deps: {
-    setTimeout: (callback) => timers.push(callback),
-    isVisible: () => true,
-    setBanner: (message, tone) => { revision += 1; banners.push([message, tone]); },
-    bannerRevision: () => revision,
-  } });
-  return { ...mounted, timers, banners, otherBanner: (message) => { revision += 1; banners.push([message, "info"]); } };
-}
-
-async function tick(timers) {
-  timers.shift()();
-  await settle();
-  await settle();
-}
+// #1188: the one thing the page says when no usable answer to a clean-up came
+// back. It matches the route's detail.
+const CLEANUP_STATE_UNKNOWN = "No answer came back for this clean-up. It may have run, may still be running, or may not have "
+  + "started. Reload this page in a few minutes and check Last clean-up before starting another.";
 
 function resultNode(elements) {
   return elements.dialog.querySelector(".backup-dialog-result");
 }
 
-test("a clean-up the scheduler reports running is said to be running, then replaced once nothing runs (#1188)", async () => {
-  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_running", detail: "ignored server text" }) });
+function listReads(api) {
+  return api.calls.filter(({ method, url }) => method === "GET" && url === "/api/admin/backups").length;
+}
+
+test("a clean-up with no answer says so in the warning tone, reads nothing more, and no later read changes it (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_state_unknown", detail: "ignored server text" }) });
+  // A clean-up shows as running at the first read, so the ordinary running poll is on.
   api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-  const { elements, library, banners, timers } = watchingLibrary(api);
+  const timers = [];
+  const { elements, library, banners } = mount({ api, deps: { setTimeout: (callback) => timers.push(callback), isVisible: () => true } });
   await library.load();
   assert.match(elements.status.textContent, /A clean-up is running\./);
+  assert.equal(timers.length, 1, "the ordinary running poll");
   await library.actions.openCleanup();
-  await library.actions.applyCleanup();
-  assert.ok(elements.dialog.textContent.includes(CLEANUP_RUNNING), elements.dialog.textContent);
-  assert.doesNotMatch(elements.dialog.textContent, /Deleted 0 copies/);
-  assert.deepEqual(banners.at(-1), [CLEANUP_RUNNING, "info"]);
-  assert.doesNotMatch(resultNode(elements).className, /is-bad|is-warning/);
-  // Still running at the next status read: nothing changes, the page keeps checking.
-  assert.equal(timers.length, 1);
-  await tick(timers);
-  assert.deepEqual(banners.at(-1), [CLEANUP_RUNNING, "info"]);
-  assert.equal(timers.length, 1);
-  // The scheduler finished and stored its result: the running message goes.
-  api.data.running = null;
-  api.data.grooming = { at: "2026-09-24T12:05:00Z", ok: true, deleted: 2, detail: null, failed_locations: {} };
-  await tick(timers);
-  assert.deepEqual(banners.at(-1), [CLEANUP_NO_LONGER_RUNNING, "info"]);
-  assert.equal(resultNode(elements).textContent, CLEANUP_NO_LONGER_RUNNING);
-  assert.doesNotMatch(elements.dialog.textContent, /A clean-up is running/);
-  assert.equal(elements.status.querySelector("span.backup-run-status.is-ok").textContent, "Last clean-up: T(2026-09-24T12:05:00Z), 2 removed.");
-  assert.doesNotMatch(elements.status.textContent, /A clean-up is running/);
-  assert.equal(timers.length, 0, "checking stops once nothing runs");
-});
-
-test("a list read that started before the running answer arrived never settles it (#1188)", async () => {
-  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_running" }) });
-  let reads = 0;
-  let releaseOldRead;
-  const original = api.fetchJson;
-  api.fetchJson = async (url, options = {}) => {
-    if (url === "/api/admin/backups" && ++reads === 2) {
-      const before = structuredClone(api.data); // nothing running when this read was answered
-      return new Promise((resolve) => { releaseOldRead = () => resolve(before); });
-    }
-    return original(url, options);
-  };
-  const { elements, library, banners, timers } = watchingLibrary(api);
-  await library.load();
-  await library.actions.openCleanup();
-  const oldRead = library.load({ quiet: true });
-  const applying = library.actions.applyCleanup();
-  await settle();
-  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-  assert.deepEqual(banners.at(-1), [CLEANUP_RUNNING, "info"]);
-  releaseOldRead();
-  await oldRead;
-  await applying;
-  // The older read shows nothing running, but it was asked before the running answer: no change.
-  assert.deepEqual(banners.at(-1), [CLEANUP_RUNNING, "info"]);
-  assert.equal(resultNode(elements).textContent, CLEANUP_RUNNING);
-  assert.equal(timers.length, 1, "the page keeps checking");
-  // A read made after the answer, which still shows the clean-up running, changes nothing either.
-  await tick(timers);
-  assert.deepEqual(banners.at(-1), [CLEANUP_RUNNING, "info"]);
-  assert.equal(timers.length, 1);
-  // A later read that shows nothing running settles it.
-  api.data.running = null;
-  await tick(timers);
-  assert.deepEqual(banners.at(-1), [CLEANUP_NO_LONGER_RUNNING, "info"]);
-  assert.equal(timers.length, 0);
-});
-
-test("a clean-up whose state is not known says so in the warning tone, and no poll changes that (#1188)", async () => {
-  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_state_unknown", detail: "ignored server text" }) });
-  // Another clean-up shows as running at the first read after the answer, then finishes.
-  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-  const { elements, library, banners, timers } = watchingLibrary(api);
-  await library.load();
-  await library.actions.openCleanup();
+  const reads = listReads(api);
   await library.actions.applyCleanup();
   assert.ok(elements.dialog.textContent.includes(CLEANUP_STATE_UNKNOWN), elements.dialog.textContent);
   assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
   assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
   assert.match(STYLES, /\.backup-dialog-result\.is-warning[\s,{]/, "the warning tone has a style");
+  assert.equal(listReads(api), reads, "no list or status read after the lost answer");
+  assert.equal(timers.length, 1, "no poll of its own");
+  // The ordinary poll and a manual refresh show the newer Last clean-up line, and leave the message alone.
   const bannerCount = banners.length;
-  assert.equal(timers.length, 1, "the status line still follows the running clean-up");
   api.data.running = null;
   api.data.grooming = { at: "2026-09-24T12:05:00Z", ok: true, deleted: 2, detail: null, failed_locations: {} };
-  await tick(timers);
-  assert.equal(banners.length, bannerCount, "no poll replaces the not-known message");
+  timers.shift()();
+  await settle();
+  await settle();
+  await library.load();
+  assert.equal(banners.length, bannerCount, "no read replaces the message");
   assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN);
   assert.match(resultNode(elements).className, /(^|\s)is-warning(\s|$)/);
   assert.match(elements.status.textContent, /Last clean-up: T\(2026-09-24T12:05:00Z\), 2 removed\./);
+  assert.doesNotMatch(elements.status.textContent, /A clean-up is running/);
   assert.equal(timers.length, 0);
 });
 
-test("an apply answer with no result and no known state is not known, never a result (#1188)", async () => {
-  for (const answer of [{}, { state: "still_running", detail: "x" }, { state: "cleanup_not_running" }, { state: "something-new" }, { ok: true }]) {
+test("an apply answer with no result is not known, never a result (#1188)", async () => {
+  for (const answer of [{}, { state: "still_running", detail: "x" }, { state: "cleanup_running" }, { state: "cleanup_not_running" }, { state: "something-new" }, { ok: true }]) {
     const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => answer });
-    // A clean-up shows as running at the next read, so the message is not yet replaced.
-    api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-    const { elements, library, banners } = watchingLibrary(api);
+    const { elements, library, banners } = mount({ api });
     await library.load();
     await library.actions.openCleanup();
     await library.actions.applyCleanup();
     assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], JSON.stringify(answer));
-    assert.doesNotMatch(elements.dialog.textContent, /Deleted 0 copies|is still running on the backup service|no clean-up is running/);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, JSON.stringify(answer));
   }
+  assert.doesNotMatch(LIBRARY_SOURCE, /cleanup_running|no longer running|cleanupWatch|bannerRevision/);
 });
 
 test("when the page's own timer ends the apply wait, the clean-up is not known, not failed (#1188)", async () => {
@@ -1029,63 +949,54 @@ test("when the page's own timer ends the apply wait, the clean-up is not known, 
   assert.doesNotMatch(elements.dialog.textContent, /failed|not available|isn't running/);
 });
 
-test("a lost connection after the apply went out is not known; a 503 still says the scheduler is not running (#1188)", async () => {
-  const lost = Object.assign(new Error("Admin could not be reached after the request was sent."), { adminOutcome: "unknown" });
-  let mounted = mount({ api: fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => lost }) });
-  await mounted.library.load();
-  await mounted.library.actions.openCleanup();
-  await mounted.library.actions.applyCleanup();
-  assert.deepEqual(mounted.banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"]);
-
-  const unavailable = Object.assign(new Error("The backup scheduler service is not available."), { status: 503, adminOutcome: "unknown" });
-  mounted = mount({ api: fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => unavailable }) });
-  await mounted.library.load();
-  await mounted.library.actions.openCleanup();
-  await mounted.library.actions.applyCleanup();
-  assert.match(mounted.banners.at(-1)[0], /^Clean up failed: The backup scheduler isn't running on this server\./);
-  assert.equal(mounted.banners.at(-1)[1], "error");
-});
-
-test("settling a running message leaves a dialog the operator opened since alone (#1188)", async () => {
-  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_running" }) });
-  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-  const { elements, library, banners, timers } = watchingLibrary(api);
+test("a lost connection or an undecided HTTP error after the apply went out is not known, never failed (#1188)", async () => {
+  const answers = {
+    "lost connection": () => Promise.reject(new TypeError("Failed to fetch")),
+    "HTTP 500": () => jsonResponse(500, { detail: "Internal Server Error" }),
+    "HTTP 502": () => jsonResponse(502, { detail: "Bad Gateway" }),
+    "HTTP 503": () => jsonResponse(503, { detail: "The backup scheduler service is not available." }),
+    "HTTP 504": () => jsonResponse(504, { detail: "Gateway Timeout" }),
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    let lists = 0;
+    const transport = loadAdminFunctions(transportNames, {
+      navigator: { onLine: true },
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      fetch: async (url) => {
+        if (url.endsWith("/lifecycle/apply")) return answer();
+        if (url.endsWith("/lifecycle/plan")) {
+          return jsonResponse(200, { plan_token: "plan-token-1", items: [
+            { id: "cfg-old", location: "local", backup_class: "config", reason: "x", kind: "retention" }] });
+        }
+        lists += 1;
+        return jsonResponse(200, syntheticLibrary());
+      },
+    });
+    const { elements, library, banners } = mount({ deps: { fetchJson: transport.fetchJson } });
+    await library.load();
+    await library.actions.openCleanup();
+    const before = lists;
+    await library.actions.applyCleanup();
+    assert.deepEqual(banners.at(-1), [CLEANUP_STATE_UNKNOWN, "warning"], name);
+    assert.equal(resultNode(elements).textContent, CLEANUP_STATE_UNKNOWN, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|isn't running/, name);
+    assert.equal(lists, before, `${name}: no read after the lost answer`);
+  }
+  // A decided refusal from the admin service still says the clean-up failed.
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(new Error("Forbidden"), { status: 403, adminOutcome: "error" }) });
+  const { library, banners } = mount({ api });
   await library.load();
   await library.actions.openCleanup();
   await library.actions.applyCleanup();
-  library.actions.closeDialog();
-  await library.actions.showDetails("cfg-new");
-  const details = elements.dialog.textContent;
-  assert.doesNotMatch(details, /clean-up/i);
-  api.data.running = null;
-  await tick(timers);
-  // The watch was settled (the banner says so) but the details dialog is untouched.
-  assert.deepEqual(banners.at(-1), [CLEANUP_NO_LONGER_RUNNING, "info"]);
-  assert.equal(elements.dialog.textContent, details);
-  assert.doesNotMatch(elements.dialog.textContent, /no longer running/);
-});
-
-test("replacing a running message leaves a newer banner from another action alone (#1188)", async () => {
-  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "cleanup_running" }) });
-  api.data.running = { backup_class: "lifecycle", started_at: "2026-09-24T12:00:00Z" };
-  const { elements, library, banners, timers, otherBanner } = watchingLibrary(api);
-  await library.load();
-  await library.actions.openCleanup();
-  await library.actions.applyCleanup();
-  library.actions.closeDialog();
-  otherBanner("Backup settings saved. Restart the backup scheduler to apply them.");
-  api.data.running = null;
-  assert.equal(timers.length, 1, "the page keeps checking while a clean-up runs");
-  await tick(timers);
-  assert.deepEqual(banners.at(-1), ["Backup settings saved. Restart the backup scheduler to apply them.", "info"]);
-  assert.equal(timers.length, 0);
-  assert.doesNotMatch(elements.dialog.textContent, /A clean-up is running/);
+  assert.match(banners.at(-1)[0], /^Clean up failed: Forbidden/);
+  assert.equal(banners.at(-1)[1], "error");
 });
 
 test("the clean-up result sits directly under the plan's introduction, which no longer points below (#1188)", async () => {
   const outcomes = {
     success: () => ({ ok: true, deleted: ["cfg-old", "full-part"], already_missing: [], failed: null, not_attempted: [] }),
-    running: () => ({ state: "cleanup_running" }),
+    "not known": () => ({ state: "cleanup_state_unknown" }),
     busy: () => Object.assign(new Error("A backup or grooming run is already in progress."), { status: 409 }),
     stale: () => Object.assign(new Error("gone"), { status: 409 }),
   };

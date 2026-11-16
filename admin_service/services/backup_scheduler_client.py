@@ -24,14 +24,11 @@ DEFAULT_SOCKET = "/app/backup-api/scheduler.sock"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DOWNLOAD_TIMEOUT_SECONDS = 600.0
 # A clean-up apply reads kept copies back before it deletes (#1188); a remote
-# FULL can take minutes. Both numbers are elapsed-time deadlines for the whole
-# exchange (connect, send, answer headers and body), not socket timeouts: the
-# apply ends by 10 minutes, and the one status read after a lost answer gets 30
-# seconds of its own. The admin service therefore answers at least four minutes
-# before the page's own 15-minute timer for this action (LONG_TIMEOUT_MS in
-# admin_backups.js) gives up.
+# FULL can take minutes. This is an elapsed-time deadline for the whole
+# exchange (connect, send, answer headers and body), not a socket timeout, so
+# the admin service answers at least four minutes before the page's own
+# 15-minute timer for this action (LONG_TIMEOUT_MS in admin_backups.js) gives up.
 LIFECYCLE_APPLY_DEADLINE_SECONDS = 600.0
-CLEANUP_STATUS_READ_DEADLINE_SECONDS = 30.0
 MAX_JSON_BYTES = 16 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
@@ -41,7 +38,7 @@ class SchedulerUnavailableError(RuntimeError):
 
 
 class SchedulerNoAnswerError(SchedulerUnavailableError):
-    """The whole request was sent, but no usable answer came back.
+    """The connection was open, but no usable answer came back.
 
     This says nothing about what the scheduler did with the request: it may
     have finished, failed or still be working on it. Callers that do not
@@ -50,7 +47,7 @@ class SchedulerNoAnswerError(SchedulerUnavailableError):
 
 
 class SchedulerTimeoutError(SchedulerNoAnswerError):
-    """The whole request was sent, but its answer did not arrive in time."""
+    """The connection was open, but no answer arrived in time."""
 
 
 @dataclass
@@ -143,16 +140,17 @@ class BackupSchedulerClient:
         try:
             try:
                 connection.connect()
-                opened.append(connection.sock)
-                if expired.is_set():
+            except OSError as exc:
+                # No connection, so no byte of the request left.
+                raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
+            opened.append(connection.sock)
+            # From here on bytes may have left: a failure, even while sending,
+            # means only that no usable answer came back, not that the
+            # scheduler did nothing.
+            try:
+                if expired.is_set():  # the watchdog fired before it had the socket
                     raise TimeoutError("The deadline passed before the request was sent.")
                 connection.request(method, path, body=data, headers=headers)
-            except OSError as exc:
-                # The send did not complete, so the request is not whole.
-                raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
-            # The whole request was sent: from here on a failure means only that
-            # no usable answer came back, not that the scheduler did nothing.
-            try:
                 response = connection.getresponse()
                 raw = response.read(MAX_JSON_BYTES + 1)
             except TimeoutError as exc:
