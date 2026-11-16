@@ -149,8 +149,8 @@ class ShardRunTests(unittest.TestCase):
             second = json.loads(run_test_shard.result_path(results_dir, "2").read_text(encoding="utf-8"))
 
         self.assertEqual(first["modules"], ["test_outcome_pass"])
-        self.assertEqual(first["test_counts"], {"test_outcome_pass": 1})
-        self.assertEqual(second["test_counts"], {"test_outcome_fail": 1})
+        self.assertEqual(first["completed_ids"], ["test_outcome_pass.Passing.test_ok"])
+        self.assertEqual(second["completed_ids"], ["test_outcome_fail.Failing.test_fails"])
         self.assertEqual((first["tests_run"], first["was_successful"]), (1, True))
         self.assertEqual((second["tests_run"], second["failures"], second["was_successful"]), (1, 1, False))
         self.assertEqual(first["python_version"], run_test_shard.python_version_label())
@@ -168,7 +168,7 @@ class ShardRunTests(unittest.TestCase):
             for attempt in (1, 2):
                 payload = json.loads((results / f"shard-1-attempt-{attempt}.json").read_text())
                 self.assertEqual(payload["run_attempt"], attempt)
-            with mock.patch.object(run_test_shard, "build_suite_and_counts") as build:
+            with mock.patch.object(run_test_shard, "build_suite_and_ids") as build:
                 self.assertEqual(run_test_shard.run_shard(
                     "1", shards=shards, tests_dir=synthetic.path, results_dir=results,
                     stream=io.StringIO(), run_attempt=2,
@@ -177,7 +177,7 @@ class ShardRunTests(unittest.TestCase):
 
     def test_run_rejects_invalid_attempt_before_execution(self) -> None:
         for attempt in (True, 0, -1, "2"):
-            with self.subTest(attempt=attempt), mock.patch.object(run_test_shard, "build_suite_and_counts") as build:
+            with self.subTest(attempt=attempt), mock.patch.object(run_test_shard, "build_suite_and_ids") as build:
                 self.assertEqual(run_test_shard.run_shard("1", run_attempt=attempt), 2)
                 build.assert_not_called()
 
@@ -196,19 +196,50 @@ class ShardRunTests(unittest.TestCase):
         self.assertEqual(ids, ["test_form_probe.Passing.test_ok"])
 
 
+def _ids(module: str) -> list[str]:
+    return [f"{module}.Synthetic.test_{index}" for index in range(3)]
+
+
+def _binding(shards: dict[str, tuple[str, ...]], python_version: str = "3.14") -> dict[str, str]:
+    return {
+        "python_version": python_version,
+        "source_commit": "a" * 40,
+        "run_id": "42",
+        "partition_fingerprint": run_test_shard.partition_fingerprint(shards),
+    }
+
+
+def _inventory(shards: dict[str, tuple[str, ...]], python_version: str = "3.14") -> dict:
+    modules = {module: _ids(module) for module in sorted(m for ms in shards.values() for m in ms)}
+    return {
+        "schema": 2,
+        "kind": "inventory",
+        "profile": "linux-full",
+        **_binding(shards, python_version),
+        "modules": modules,
+        "ids": sorted(test_id for ids in modules.values() for test_id in ids),
+    }
+
+
 class ShardVerifyTests(unittest.TestCase):
     def _results(self, results_dir: Path, shards: dict[str, tuple[str, ...]], **overrides) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)
         for shard_id, modules in shards.items():
+            ids = [test_id for module in modules for test_id in _ids(module)]
             payload = {
+                "schema": 2,
+                "kind": "shard",
+                **_binding(self._table),
                 "shard": shard_id,
-                "python_version": "3.14",
                 "modules": list(modules),
-                "test_counts": {module: 3 for module in modules},
-                "tests_run": 3,
+                "collected_ids": ids,
+                "started_ids": ids,
+                "completed_ids": ids,
+                "tests_run": len(ids),
                 "failures": 0,
                 "errors": 0,
                 "skipped": 0,
+                "expected_failures": 0,
                 "unexpected_successes": 0,
                 "was_successful": True,
             }
@@ -217,6 +248,7 @@ class ShardVerifyTests(unittest.TestCase):
 
     def test_verify_passes_only_with_one_green_result_per_shard(self) -> None:
         shards = {"1": ("test_a",), "2": ("test_b",)}
+        self._table = shards
         with tempfile.TemporaryDirectory() as raw_dir:
             tests_dir = Path(raw_dir)
             for name in ("test_a", "test_b"):
@@ -224,14 +256,14 @@ class ShardVerifyTests(unittest.TestCase):
             results_dir = tests_dir / "results"
 
             self._results(results_dir, shards)
-            expected_counts = {"test_a": 3, "test_b": 3}
+            inventory = _inventory(shards)
             self.assertEqual(
                 run_test_shard.verify_results(
                     results_dir,
                     "3.14",
+                    inventory,
                     shards=shards,
                     tests_dir=tests_dir,
-                    expected_counts=expected_counts,
                 ),
                 [],
             )
@@ -242,7 +274,7 @@ class ShardVerifyTests(unittest.TestCase):
                 "empty": (shards, {"1": {"tests_run": 0}}, "shard 1: ran no tests"),
                 "wrong-python": (shards, {"1": {"python_version": "3.12"}}, "expected '3.14'"),
                 "drifted-modules": (shards, {"2": {"modules": ["test_a"]}}, "module list differs"),
-                "missing-counts": (shards, {"1": {"test_counts": None}}, "test_counts is not an object"),
+                "missing-ids": (shards, {"1": {"completed_ids": None}}, "must be lists of identities"),
             }
             for label, (present, overrides, expected) in cases.items():
                 with self.subTest(case=label):
@@ -252,9 +284,9 @@ class ShardVerifyTests(unittest.TestCase):
                     problems = run_test_shard.verify_results(
                         results_dir,
                         "3.14",
+                        inventory,
                         shards=shards,
                         tests_dir=tests_dir,
-                        expected_counts=expected_counts,
                     )
                     self.assertTrue(any(expected in problem for problem in problems), problems)
 
@@ -263,13 +295,14 @@ class ShardVerifyTests(unittest.TestCase):
                 run_test_shard.verify_results(
                     tests_dir / "absent",
                     "3.14",
+                    inventory,
                     shards=shards,
                     tests_dir=tests_dir,
-                    expected_counts=expected_counts,
                 )[0],
             )
 
     def _attempt(self, results_dir, shards, shard_id, attempt, **overrides):
+        self._table = shards
         self._results(results_dir, {shard_id: shards[shard_id]})
         source = run_test_shard.result_path(results_dir, shard_id)
         payload = json.loads(source.read_text(encoding="utf-8"))
@@ -281,8 +314,7 @@ class ShardVerifyTests(unittest.TestCase):
 
     def _verify_attempts(self, tests_dir, shards):
         return run_test_shard.verify_results(
-            tests_dir / "results", "3.14", shards=shards, tests_dir=tests_dir,
-            expected_counts={module: 3 for modules in shards.values() for module in modules},
+            tests_dir / "results", "3.14", _inventory(shards), shards=shards, tests_dir=tests_dir,
         )
 
     def test_latest_attempt_replaces_failure_and_keeps_unaffected_shards(self) -> None:
@@ -291,7 +323,7 @@ class ShardVerifyTests(unittest.TestCase):
                       "2": (synthetic.write("test_b", PASSING_MODULE),)}
             results = synthetic.path / "results"
             self._attempt(results, shards, "1", 2, was_successful=False, failures=1,
-                          test_counts={"test_a": 2})
+                          completed_ids=_ids("test_a")[:2])
             self._attempt(results, shards, "2", 2)
             self._attempt(results, shards, "1", 10)
             paths = list(results.glob("*.json"))
@@ -342,6 +374,7 @@ class ShardVerifyTests(unittest.TestCase):
     def test_legacy_receipt_is_attempt_one_and_cannot_tie_explicit_attempt_one(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            self._table = shards
             results = synthetic.path / "results"
             self._attempt(results, shards, "1", 2)
             self._results(results, shards, **{"1": {"was_successful": False, "failures": 1}})
@@ -396,10 +429,13 @@ class SkippedCases(unittest.TestCase):
                 module = synthetic.write("test_skipped_cases", body)
                 shards = {"1": (module,)}
                 results = synthetic.path / "results"
+                binding = _binding(shards, run_test_shard.python_version_label())
+                inventory = run_test_shard.build_inventory(synthetic.path, binding=binding)
                 self.assertEqual(
                     run_test_shard.run_shard(
                         "1", shards=shards, tests_dir=synthetic.path,
                         results_dir=results, stream=io.StringIO(), run_attempt=attempt,
+                        binding=binding,
                     ),
                     0,
                 )
@@ -407,12 +443,13 @@ class SkippedCases(unittest.TestCase):
                     run_test_shard.result_path(results, "1", attempt).read_text(encoding="utf-8")
                 )
                 self.assertEqual(receipt["tests_run"], 1)
+                self.assertEqual(receipt["completed_ids"], ["test_skipped_cases.SkippedCases.test_cases"])
                 self.assertEqual(receipt["skipped"], 3)
                 self.assertIs(receipt["was_successful"], True)
                 self.assertEqual(
                     run_test_shard.verify_results(
-                        results, run_test_shard.python_version_label(), shards=shards,
-                        tests_dir=synthetic.path, expected_counts={module: 1},
+                        results, run_test_shard.python_version_label(), inventory, shards=shards,
+                        tests_dir=synthetic.path,
                     ),
                     [],
                 )
@@ -430,8 +467,14 @@ class SkippedCases(unittest.TestCase):
     def test_verify_rejects_a_removed_test_method_while_the_module_remains(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             results_dir = synthetic.path / "results"
-            synthetic.write("test_mutation", PASSING_MODULE)
+            synthetic.write("test_mutation", TWO_PASSING_TESTS_MODULE)
             shards = {"1": ("test_mutation",)}
+            binding = _binding(shards, run_test_shard.python_version_label())
+            inventory = run_test_shard.build_inventory(synthetic.path, binding=binding)
+            sys.modules.pop("test_mutation", None)
+            synthetic.write("test_mutation", PASSING_MODULE)
+            for cached in synthetic.path.glob("__pycache__/test_mutation.*"):
+                cached.unlink()
             self.assertEqual(
                 run_test_shard.run_shard(
                     "1",
@@ -439,6 +482,7 @@ class SkippedCases(unittest.TestCase):
                     tests_dir=synthetic.path,
                     results_dir=results_dir,
                     stream=io.StringIO(),
+                    binding=binding,
                 ),
                 0,
             )
@@ -446,21 +490,27 @@ class SkippedCases(unittest.TestCase):
             problems = run_test_shard.verify_results(
                 results_dir,
                 run_test_shard.python_version_label(),
+                inventory,
                 shards=shards,
                 tests_dir=synthetic.path,
-                expected_counts={"test_mutation": 2},
             )
 
-        self.assertEqual(
+        self.assertIn(
+            "test identities that no shard completed (2): "
+            "test_mutation.Passing.test_one, test_mutation.Passing.test_two",
             problems,
-            ["test-count manifest: test_mutation lost 1 test (expected 2, found 1)"],
+        )
+        self.assertIn(
+            "test identities completed but not discovered (1): test_mutation.Passing.test_ok", problems
         )
 
-    def test_verify_requires_additions_to_update_the_manifest(self) -> None:
+    def test_verify_admits_added_tests_without_any_committed_baseline(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             results_dir = synthetic.path / "results"
             synthetic.write("test_addition", TWO_PASSING_TESTS_MODULE)
             shards = {"1": ("test_addition",)}
+            binding = _binding(shards, run_test_shard.python_version_label())
+            inventory = run_test_shard.build_inventory(synthetic.path, binding=binding)
             self.assertEqual(
                 run_test_shard.run_shard(
                     "1",
@@ -468,6 +518,7 @@ class SkippedCases(unittest.TestCase):
                     tests_dir=synthetic.path,
                     results_dir=results_dir,
                     stream=io.StringIO(),
+                    binding=binding,
                 ),
                 0,
             )
@@ -475,78 +526,59 @@ class SkippedCases(unittest.TestCase):
             problems = run_test_shard.verify_results(
                 results_dir,
                 run_test_shard.python_version_label(),
+                inventory,
                 shards=shards,
                 tests_dir=synthetic.path,
-                expected_counts={"test_addition": 1},
             )
 
-        self.assertEqual(
-            problems,
-            ["test-count manifest: test_addition gained 1 test (expected 1, found 2); update the manifest"],
-        )
+        self.assertEqual(problems, [])
+        self.assertFalse((ROOT / "tests" / "unittest_test_counts.json").exists())
 
 
-class TestCountManifestTests(unittest.TestCase):
-    def test_generator_writes_stable_sorted_module_counts(self) -> None:
+class DiscoveryInventoryTests(unittest.TestCase):
+    def test_inventory_is_stable_and_sorted(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             synthetic.write("test_z", PASSING_MODULE)
             synthetic.write("test_a", TWO_PASSING_TESTS_MODULE)
-            manifest_path = synthetic.path / "counts.json"
+            binding = _binding({"1": ("test_a", "test_z")})
 
-            counts = run_test_shard.write_test_count_manifest(
-                manifest_path,
-                modules=("test_z", "test_a"),
-                tests_dir=synthetic.path,
-            )
+            first = run_test_shard.build_inventory(synthetic.path, binding=binding)
+            second = run_test_shard.build_inventory(synthetic.path, binding=binding)
 
-            self.assertEqual(counts, {"test_a": 2, "test_z": 1})
-            self.assertEqual(
-                json.loads(manifest_path.read_text(encoding="utf-8")),
-                {"schema": 1, "modules": {"test_a": 2, "test_z": 1}},
-            )
-            self.assertTrue(manifest_path.read_text(encoding="utf-8").endswith("\n"))
+        self.assertEqual(first, second)
+        self.assertEqual(list(first["modules"]), ["test_a", "test_z"])
+        self.assertEqual(
+            first["ids"],
+            ["test_a.Passing.test_one", "test_a.Passing.test_two", "test_z.Passing.test_ok"],
+        )
 
-    def test_generator_refuses_import_failures_instead_of_recording_failed_tests(self) -> None:
+    def test_discovery_refuses_import_failures_instead_of_recording_failed_tests(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             synthetic.write("test_broken", "import dependency_that_does_not_exist\n")
-            manifest_path = synthetic.path / "counts.json"
 
-            with self.assertRaisesRegex(ValueError, "test_broken failed discovery"):
-                run_test_shard.write_test_count_manifest(
-                    manifest_path,
-                    modules=("test_broken",),
-                    tests_dir=synthetic.path,
-                )
+            with self.assertRaisesRegex(run_test_shard.DiscoveryError, "test_broken failed discovery"):
+                run_test_shard.collect_inventory_ids(synthetic.path)
 
-            self.assertFalse(manifest_path.exists())
-
-    def test_update_counts_refuses_a_module_level_skip(self) -> None:
+    def test_discovery_refuses_a_module_level_skip(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             synthetic.write(
                 "test_skipped",
                 "import unittest\nraise unittest.SkipTest('platform')\n"
                 "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n",
             )
-            manifest_path = synthetic.path / "counts.json"
 
-            with self.assertRaisesRegex(ValueError, "test_skipped skipped itself at import"):
-                run_test_shard.write_test_count_manifest(
-                    manifest_path,
-                    modules=("test_skipped",),
-                    tests_dir=synthetic.path,
-                )
-
-            self.assertFalse(manifest_path.exists())
+            with self.assertRaisesRegex(run_test_shard.DiscoveryError, "test_skipped skipped itself at import"):
+                run_test_shard.collect_inventory_ids(synthetic.path)
 
     @unittest.skipIf(
         sys.platform == "win32",
         "full discovery imports POSIX-only modules excluded from the Windows portable suite",
     )
-    def test_checked_in_manifest_matches_full_discovery(self) -> None:
-        expected = run_test_shard.load_test_count_manifest()
-        actual = run_test_shard.discovered_test_counts(run_test_shard.discovered_modules())
+    def test_full_discovery_of_this_checkout_is_clean(self) -> None:
+        inventory = run_test_shard.collect_inventory_ids()
 
-        self.assertEqual(run_test_shard.test_count_problems(expected, actual), [])
+        self.assertEqual(tuple(inventory), run_test_shard.discovered_modules())
+        self.assertTrue(all(inventory.values()))
 
 
 class CIShardContractTests(unittest.TestCase):
@@ -585,7 +617,65 @@ class CIShardContractTests(unittest.TestCase):
         self.assertIn("${{ matrix.python-version }}", download["with"]["pattern"])
         verify = next(step for step in gate["steps"] if "run_test_shard.py verify" in str(step.get("run") or ""))
         self.assertIn('--python-version "${{ matrix.python-version }}"', verify["run"])
+        self.assertIn('--inventory "$RUNNER_TEMP/test-identities/candidate.json"', verify["run"])
         self.assertNotIn("if", verify, "the verify step must run unconditionally in the gate")
+
+    def test_gate_discovers_the_expected_identities_itself_before_verifying(self) -> None:
+        gate = self.workflow["jobs"]["python-source"]
+        runs = [str(step.get("run") or "") for step in gate["steps"]]
+        discover = next(i for i, run in enumerate(runs) if "run_test_shard.py discover --output" in run)
+        verify = next(i for i, run in enumerate(runs) if "run_test_shard.py verify" in run)
+        install = next(i for i, run in enumerate(runs) if "pip install" in run)
+
+        self.assertLess(install, discover)
+        self.assertLess(discover, verify)
+        self.assertIn('"$RUNNER_TEMP/test-identities/candidate.json"', runs[discover])
+        self.assertNotIn("if", gate["steps"][discover])
+        # Discovery imports every test module, so the gate installs what the shards install.
+        self.assertIn("-r requirements.txt", runs[install])
+        self.assertIn("-r requirements-dev.txt", runs[install])
+        self.assertNotIn("unittest_test_counts", CI_WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_removed_tests_fail_pull_requests_unless_labelled_and_only_report_on_main(self) -> None:
+        gate = self.workflow["jobs"]["python-source"]
+        self.assertEqual(gate["permissions"], {"contents": "read", "pull-requests": "read"})
+        approval = next(s for s in gate["steps"] if s.get("id") == "removal-approval")
+        compare = next(s for s in gate["steps"] if "run_test_shard.py compare" in str(s.get("run") or ""))
+        steps = gate["steps"]
+
+        # The token is used before any pull-request code (checkout, installs,
+        # test imports) has run on the runner, so test code cannot shim `gh`.
+        # A pull request can still edit this workflow; the check guards
+        # against unnoticed removal, not against an edit that disables it.
+        self.assertIs(steps[0], approval)
+        self.assertLess(steps.index(approval), steps.index(compare))
+        self.assertEqual(approval["if"], "github.event_name == 'pull_request'")
+        self.assertIn('index("tests-removed-ok")', approval["run"])
+        self.assertIn('test "$approved" = true || test "$approved" = false', approval["run"])
+        self.assertEqual(
+            compare["if"],
+            "github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')",
+        )
+        self.assertEqual(compare["continue-on-error"], "${{ github.event_name != 'pull_request' }}")
+        self.assertIn("github.event.pull_request.base.sha", compare["env"]["BASE_SHA"])
+        self.assertEqual(
+            compare["env"]["REMOVALS_APPROVED"], "${{ steps.removal-approval.outputs.approved == 'true' }}"
+        )
+        # The token is confined to the label read; the steps that import test code never see it.
+        for step in steps:
+            if step is not approval:
+                self.assertNotIn("GH_TOKEN", step.get("env", {}), step.get("name"))
+        script = compare["run"]
+        self.assertIn('git worktree add --detach "$base_dir" "$BASE_SHA"', script)
+        self.assertIn('-I "$GITHUB_WORKSPACE/scripts/run_test_shard.py" discover', script)
+        self.assertIn('--root "$base_dir"', script)
+        self.assertIn("approval=(--removals-approved)", script)
+        self.assertIn('--candidate "$RUNNER_TEMP/test-identities/candidate.json"', script)
+        upload = next(s for s in steps if s.get("name") == "Upload test identities")
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn("${{ github.run_attempt }}", upload["with"]["name"])
+        self.assertFalse(upload["with"]["name"].startswith("python-unittest-"),
+                         "the shard-result download pattern must not pick up inventories")
 
     def test_artifact_and_coverage_paths_are_attempt_scoped(self) -> None:
         shard_job = self.workflow["jobs"]["python-unittest"]

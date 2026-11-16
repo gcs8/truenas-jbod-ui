@@ -135,6 +135,9 @@ class HistoryCollectionPaused(RuntimeError):
 
 
 COLLECTION_PAUSED_REASON = "The history database is damaged; collection is paused to protect it."
+# A metric pass that read no SMART data is not a successful collection (#1205).
+SMART_METRICS_UNAVAILABLE_REASON = "No history SMART metrics could be collected; every SMART request failed."
+SMART_METRICS_PARTIAL_REASON = "Some history SMART metric requests failed; metric collection was partial."
 # Deferred chronological index builds (#910). Scheduled collection never
 # writes a pass to a database that has just refused an index build. The first
 # INDEX_BUILD_QUICK_RETRIES retries are INDEX_BUILD_RETRY_SECONDS apart, for a
@@ -330,6 +333,11 @@ class HistoryCollector:
         self.last_smart_evidence_at: str | None = None
         self._scope_enumeration_complete = True
         self._scope_collection_degraded_reason: str | None = None
+        # Scopes whose SMART metric read failed, with the metric kinds ("fast",
+        # "slow") still owed. They are retried on the next pass even when the
+        # shared cadence is not due, and keep the collector degraded (#1205).
+        self._pending_smart_metric_scopes: dict[tuple[str, str | None], frozenset[str]] = {}
+        self._smart_metric_degraded_reason: str | None = None
         # Scopes the last scan read but did not record, with why (#927). None
         # until a scan has looked; a root-only scan updates only its own scope.
         self.last_skipped_scopes: list[dict[str, Any]] | None = None
@@ -481,6 +489,8 @@ class HistoryCollector:
         smart_temperatures: dict[str, float] = {}
         trusted_smart_scope_observed = False
         smart_scope_unavailable = False
+        smart_scopes_succeeded = 0
+        smart_scopes_failed = 0
         force_inventory = self._should_force_inventory_for_collection(
             collect_fast=collect_fast,
             collect_slow=collect_slow,
@@ -573,11 +583,19 @@ class HistoryCollector:
                 slot_count=len(slot_records),
             )
 
-            if not collect_fast and not collect_slow:
+            scope_key = (scope.system_id, scope.enclosure_id)
+            pending_kinds = self._pending_smart_metric_scopes.get(scope_key, frozenset())
+            # Only a scheduled pass pays a retry debt. A manual refresh reads
+            # just what it asked for, so a Quick refresh never turns into a
+            # fresh SMART read; an unpaid debt waits for the next scheduled pass.
+            scope_collect_fast = collect_fast or (include_due_intervals and "fast" in pending_kinds)
+            scope_collect_slow = collect_slow or (include_due_intervals and "slow" in pending_kinds)
+            if not scope_collect_fast and not scope_collect_slow:
                 continue
 
             present_slots = [record.slot for record in slot_records if record.present]
             if not present_slots:
+                self._pending_smart_metric_scopes.pop(scope_key, None)
                 continue
             records_by_slot = {record.slot: record for record in slot_records if record.present}
             for record in records_by_slot.values():
@@ -586,7 +604,7 @@ class HistoryCollector:
             smart_started = time.perf_counter()
             self._enter_failure_stage("smart_read", scope.system_id)
             try:
-                summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
+                summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=scope_collect_slow)
             except HistoryCollectionStopping:
                 raise
             except Exception as exc:  # noqa: BLE001 - one slow scope should not fail the whole fleet pass.
@@ -604,14 +622,21 @@ class HistoryCollector:
                     enclosure_label=scope.enclosure_label,
                     scope_index=scope_index,
                     slot_count=len(present_slots),
-                    force_fresh=collect_slow,
+                    force_fresh=scope_collect_slow,
                     error=str(exc),
                 )
+                smart_scopes_failed += 1
+                owed_kinds = set(pending_kinds)
+                if scope_collect_fast:
+                    owed_kinds.add("fast")
+                if scope_collect_slow:
+                    owed_kinds.add("slow")
+                self._pending_smart_metric_scopes[scope_key] = frozenset(owed_kinds)
                 continue
             self._raise_if_stopping()
             self._enter_failure_stage("metric_write", scope.system_id)
             self._record_collection_stage(
-                "smart.fresh" if collect_slow else "smart.cached",
+                "smart.fresh" if scope_collect_slow else "smart.cached",
                 time.perf_counter() - smart_started,
                 system_id=scope.system_id,
                 system_label=scope.system_label,
@@ -620,7 +645,7 @@ class HistoryCollector:
                 scope_index=scope_index,
                 slot_count=len(present_slots),
                 summary_count=len(summaries),
-                force_fresh=collect_slow,
+                force_fresh=scope_collect_slow,
             )
             metric_samples: list[MetricSample] = []
             for record in slot_records:
@@ -638,11 +663,11 @@ class HistoryCollector:
                     previous_temperature = smart_temperatures.get(evidence_key)
                     if previous_temperature is None or temperature > previous_temperature:
                         smart_temperatures[evidence_key] = temperature
-                if collect_fast:
+                if scope_collect_fast:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, FAST_METRIC_FIELDS)
                     )
-                if collect_slow:
+                if scope_collect_slow:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, SLOW_METRIC_FIELDS)
                     )
@@ -660,6 +685,35 @@ class HistoryCollector:
                     scope_index=scope_index,
                     sample_count=len(metric_samples),
                 )
+            smart_scopes_succeeded += 1
+            collected_kinds = {
+                kind
+                for kind, collected in (("fast", scope_collect_fast), ("slow", scope_collect_slow))
+                if collected
+            }
+            remaining_kinds = pending_kinds - collected_kinds
+            if remaining_kinds:
+                self._pending_smart_metric_scopes[scope_key] = frozenset(remaining_kinds)
+            else:
+                self._pending_smart_metric_scopes.pop(scope_key, None)
+
+        if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
+            # A complete census is authoritative: a scope that left it owes nothing.
+            census_keys = {(scope.system_id, scope.enclosure_id) for scope in scopes}
+            for pending_key in list(self._pending_smart_metric_scopes):
+                if pending_key not in census_keys:
+                    del self._pending_smart_metric_scopes[pending_key]
+        if smart_scopes_failed and not smart_scopes_succeeded:
+            # Every SMART read this pass attempted failed, whether a due cadence
+            # or only a retry debt asked for it: nothing was collected, so the
+            # cadences stay where they were and the pass fails instead of succeeding.
+            self._enter_failure_stage("smart_read")
+            self._smart_metric_degraded_reason = SMART_METRICS_UNAVAILABLE_REASON
+            raise HistorySourceError.error_reply(SMART_METRICS_UNAVAILABLE_REASON)
+        if not self._pending_smart_metric_scopes:
+            self._smart_metric_degraded_reason = None
+        elif smart_scopes_succeeded or collect_fast or collect_slow:
+            self._smart_metric_degraded_reason = SMART_METRICS_PARTIAL_REASON
 
         if (
             (collect_fast or collect_slow)
@@ -787,10 +841,12 @@ class HistoryCollector:
         """Why /healthz reports ``degraded``, or None when the service is healthy.
 
         Degraded means one of: the last background collection pass failed, an
-        inventory sweep had unavailable scopes, the history database is read-only,
-        or cleanup failed twice in a row. Other manual refresh failures alone do
-        not count; they are shown in "Last error" and cleared by the next
-        successful pass. Inventory degradation clears after a complete sweep.
+        inventory sweep had unavailable scopes, SMART metrics could not be read
+        for some or all scopes, the history database is read-only, or cleanup
+        failed twice in a row. Other manual refresh failures alone do not count;
+        they are shown in "Last error" and cleared by the next successful pass.
+        Inventory degradation clears after a complete sweep; SMART degradation
+        clears once every failed scope has been read again or left the census.
         """
 
         if self.collection_pause()[0]:
@@ -807,7 +863,7 @@ class HistoryCollector:
             return INDEX_BUILD_PAUSED_REASON
         if self._index_build_failures > 0:
             return INDEX_BUILD_DEGRADED_REASON
-        return self._scope_collection_degraded_reason
+        return self._scope_collection_degraded_reason or self._smart_metric_degraded_reason
 
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
