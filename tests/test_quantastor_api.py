@@ -479,6 +479,8 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
                 api_password="secret",
                 platform="quantastor",
                 tls_server_name="TrueNAS.gcs8.io",
+                # The override is presented only while host names are verified.
+                verify_ssl=True,
             )
         )
 
@@ -496,6 +498,12 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, [])
         self.assertEqual(urlopen_with_tls_config_mock.call_args.kwargs["server_hostname"], "TrueNAS.gcs8.io")
+
+        # Without verification the transport presents the URL host instead.
+        client.config = client.config.model_copy(update={"verify_ssl": False})
+        client._request_json("storageSystemEnum", {"flags": 0})
+        url_host = client.config.host.split("://", 1)[1]
+        self.assertEqual(urlopen_with_tls_config_mock.call_args.kwargs["server_hostname"], url_host)
 
 
 if __name__ == "__main__":
