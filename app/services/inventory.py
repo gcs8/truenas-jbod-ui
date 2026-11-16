@@ -901,34 +901,6 @@ class _QuantastorCliDiskHints:
     identities: list[dict[str, set[str]]] = field(default_factory=list)
 
 
-@dataclass(slots=True)
-class _QuantastorPoolDeviceIndex:
-    # Pool-device rows for per-disk admission (#1211). Stable IDs are grid-wide; paths are filed
-    # under the row's node (none if unknown on a multi-node grid) and match only a disk there.
-    # A key two different disks carry on one node (a placeholder serial) is `shared`: it names none.
-    rows: list[dict[str, Any]] = field(default_factory=list)
-    stable: dict[str, list[int]] = field(default_factory=dict)
-    paths: dict[tuple[str | None, str], list[int]] = field(default_factory=dict)
-    shared: set[Any] = field(default_factory=set)
-    owners: dict[tuple[Any, str | None], str] = field(default_factory=dict)
-    # (node, serial, SCSI ID) -> ids of the REST records of that one disk.
-    records: dict[tuple[str | None, str, str], set[str]] = field(default_factory=dict)
-    sole_system_id: str | None = None
-
-    def scope_of(self, row: dict[str, Any]) -> str | None:
-        return normalize_value_text(row.get("storageSystemId")) or self.sole_system_id
-
-    def note(self, key: Any, scope: str | None, owner: str) -> None:
-        if self.owners.setdefault((key, scope), owner) != owner:
-            self.shared.add(key)
-
-    def post(self, table: dict[Any, list[int]], key: Any, position: int, scope: str | None, owner: str) -> None:
-        postings = table.setdefault(key, [])
-        if not postings or postings[-1] != position:
-            postings.append(position)
-        self.note(key, scope, owner)
-
-
 @dataclass(frozen=True, slots=True)
 class DiskResolution:
     disk: DiskRecord | None
@@ -10396,14 +10368,6 @@ class InventoryService:
             selected_system_id,
             selected_hw_enclosure_id,
         )
-        # Say once that memberships were withheld, so a missing member status is not read as healthy (#1211).
-        if conflicted := sum(1 for disk in disk_records if disk.raw.get("quantastor_pool_device_conflict")):
-            many = conflicted != 1
-            warnings.append(
-                f"QuantaStor gave conflicting pool-device or identity data for {conflicted} disk{'s' if many else ''}, "
-                f"so {'their' if many else 'its'} pool-device membership and member status are withheld; any pool "
-                f"and health reported for {'each disk' if many else 'the disk'} itself are still shown."
-            )
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
@@ -10420,15 +10384,7 @@ class InventoryService:
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
-        # Node-local device paths are not grid-wide keys (#1211): a bay without
-        # a disk record sees only the selected node's pool-device rows.
-        pool_device_index = self._build_quantastor_pool_device_index(raw_data)
-        topology_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]] = {}
-        self._build_quantastor_topology_members(raw_data, members_by_row=topology_by_row)
-        node_topology_members = self._build_quantastor_topology_members(
-            raw_data,
-            rows=[row for row in pool_device_index.rows if pool_device_index.scope_of(row) == selected_system_id],
-        )
+        api_topology_members = self._build_quantastor_topology_members(raw_data, selected_system_id)
         selected_meta = frame.selected_meta
         selected_meta["storage_system_id"] = selected_system_id
         empty_ssh = ParsedSSHData()
@@ -10509,9 +10465,7 @@ class InventoryService:
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
-                api_topology_members=self._quantastor_bay_topology_members(
-                    disk, node_topology_members, topology_by_row,
-                ),
+                api_topology_members=api_topology_members,
                 api_enclosure_ids=set(),
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "Quantastor disk")
@@ -10739,7 +10693,7 @@ class InventoryService:
         cli_disk_hints = self._resolve_quantastor_cli_disk_hints(
             raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         )
-        pool_device_index = self._build_quantastor_pool_device_index(raw_data)
+        pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
@@ -10826,11 +10780,9 @@ class InventoryService:
             )
             if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
-            # Pool-device row by the disk's own keys, then the hardware row's (#1211).
-            disk_scope = owner_id or selected_system_id or pool_device_index.sole_system_id
-            pool_device, pool_device_conflict = self._admit_quantastor_pool_device(
-                pool_device_index, disk, disk_scope, lookup_keys, selected_system_id,
-            )
+            # A disk looks a pool-device path up under its own node (#1211).
+            disk_node = owner_id or selected_system_id
+            pool_hint = self._quantastor_pool_slot_hint(pool_slot_hints, lookup_keys, disk_node)
             merged_raw = dict(disk)
             if hint and isinstance(hint.get("hw_raw"), dict):
                 merged_raw = self._merge_quantastor_payloads(hint["hw_raw"], merged_raw)
@@ -10860,18 +10812,11 @@ class InventoryService:
                 cli_hint = ({key: cli_hint[key] for key in (
                     "devicePath", "altDevicePath", "deviceName", "device", "name"
                 ) if key in cli_hint} if same_owner else None)
-            if pool_device is None and not pool_device_conflict:
-                pool_device, pool_device_conflict = self._admit_quantastor_pool_device(
-                    pool_device_index, disk, disk_scope, lookup_keys, selected_system_id,
-                )
-            if pool_device is not None:
-                merged_raw["quantastor_pool_device"] = pool_device
-            elif pool_device_conflict:
-                merged_raw["quantastor_pool_device_conflict"] = True
-            pool_slot = self._extract_quantastor_slot(pool_device) if pool_device is not None else None
-            # SMART paths still come only from a row that places the disk.
-            pool_hint = {"pool_device_raw": pool_device} if pool_slot is not None else None
-            slot = pool_slot if pool_slot is not None else hint.get("slot") if hint else None
+            if not pool_hint:
+                pool_hint = self._quantastor_pool_slot_hint(pool_slot_hints, lookup_keys, disk_node)
+            if pool_hint and isinstance(pool_hint.get("pool_device_raw"), dict):
+                merged_raw["quantastor_pool_device"] = pool_hint["pool_device_raw"]
+            slot = pool_hint.get("slot") if pool_hint else hint.get("slot") if hint else None
             if not isinstance(slot, int):
                 slot = self._extract_quantastor_slot(disk)
             smart_devices = self._build_quantastor_smart_devices(disk, merged_raw, cli_hint, hint, pool_hint)
@@ -11345,134 +11290,62 @@ class InventoryService:
             return [None] * len(disks)
         return output
 
-    @staticmethod
-    def _build_quantastor_pool_device_index(raw_data: TrueNASRawData) -> _QuantastorPoolDeviceIndex:
-        system_ids = {
-            system_id for row in raw_data.systems if (system_id := normalize_value_text(row.get("id")))
-        }
-        index = _QuantastorPoolDeviceIndex(
-            sole_system_id=next(iter(system_ids)) if len(system_ids) == 1 else None,
-        )
-        for number, disk in enumerate(raw_data.disks):
-            if not isinstance(disk, dict):
-                continue
-            scope = normalize_value_text(
-                disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId")
-            ) or index.sole_system_id
-            # One disk's records (raw, multipath, crypt) share serial and SCSI ID; distinct disks do not.
-            serial = normalize_value_text(disk.get("serialNumber") or disk.get("serial"))
-            scsi_id = normalize_value_text(disk.get("scsiId"))
-            fallback = normalize_value_text(disk.get("id")) or f"#{number}"
-            if serial and scsi_id:
-                index.records.setdefault((scope, serial, scsi_id), set()).add(fallback)
-            for value, owner in ((disk.get("serialNumber"), scsi_id), (disk.get("serial"), scsi_id), (scsi_id, serial)):
-                for key in normalize_lookup_keys(normalize_value_text(value)):
-                    index.note(key, ("disk", scope), owner or fallback)
-        for row in raw_data.pool_devices:
-            if not isinstance(row, dict):
-                continue
-            position = len(index.rows)
-            index.rows.append(row)
-            physical_disk = row.get("physicalDiskObj") if isinstance(row.get("physicalDiskObj"), dict) else {}
-            scope = index.scope_of(row)
-            # Which disk the row names: its physical disk ID, else its path, else the row itself.
-            owner = next((text for value in (
-                row.get("physicalDiskId"), physical_disk.get("id"), row.get("devicePath"), row.get("id"),
-            ) if (text := normalize_value_text(value))), f"#{position}")
-            for value in (
-                row.get("physicalDiskId"),
-                row.get("physicalDiskSerialNumber"),
-                row.get("physicalDiskScsiId"),
-                row.get("id"),
-                physical_disk.get("id"),
-                physical_disk.get("serialNumber"),
-                physical_disk.get("scsiId"),
-            ):
-                for key in normalize_lookup_keys(normalize_value_text(value)):
-                    index.post(index.stable, key, position, scope, owner)
-            if scope is None and len(system_ids) > 1:
-                continue
-            for value in (row.get("devicePath"), physical_disk.get("devicePath"), physical_disk.get("altDevicePath")):
-                for key in normalize_lookup_keys(normalize_value_text(value)):
-                    index.post(index.paths, (scope, key), position, scope, owner)
-        return index
-
-    @staticmethod
-    def _quantastor_pool_device_contradicts(
-        row: dict[str, Any],
-        disk: dict[str, Any],
-        shared: set[Any],
-        *,
-        same_node: bool,
-        record_ids: set[str] = frozenset(),
-    ) -> bool:
-        """A serial outside the disk row's serial aliases, another SCSI ID, or on the
-        same node a physical disk ID of no record of this disk (#1211). Shared values are ignored."""
-        physical_disk = row.get("physicalDiskObj") if isinstance(row.get("physicalDiskObj"), dict) else {}
-
-        def texts(*values: Any) -> set[str]:
-            return {
-                text for value in values
-                if (text := normalize_value_text(value)) and shared.isdisjoint(normalize_lookup_keys(text))
-            }
-
-        pairs = [
-            (texts(row.get("physicalDiskSerialNumber"), physical_disk.get("serialNumber")),
-             texts(disk.get("serialNumber"), disk.get("serial"))),
-            (texts(row.get("physicalDiskScsiId"), physical_disk.get("scsiId")), texts(disk.get("scsiId"))),
-        ]
-        if same_node:
-            # Physical disk IDs are per node: an HA peer names a shared disk by its own ID.
-            pairs.append((texts(row.get("physicalDiskId"), physical_disk.get("id")), texts(disk.get("id"), *record_ids)))
-        return any((extra := row_values - disk_values) and (disk_values or len(extra) > 1)
-                   for row_values, disk_values in pairs)
-
-    def _admit_quantastor_pool_device(
+    def _build_quantastor_pool_slot_hints(
         self,
-        index: _QuantastorPoolDeviceIndex,
-        disk: dict[str, Any],
-        disk_scope: str | None,
-        lookup_keys: set[str],
+        raw_data: TrueNASRawData,
         selected_system_id: str | None,
-    ) -> tuple[dict[str, Any] | None, bool]:
-        """(row, conflict) for this disk (#1211). Ranking (slot, selected node, spare) orders admitted
-        rows only. Only shared keys, or top rows differing in bay, pool, vdev, class or status, are a
-        conflict. Agreeing rows give one row chosen by content, never by input order."""
-        positions: set[int] = set()
-        shared_hit = False
-        for key in lookup_keys:
-            for table, lookup in ((index.stable, key), (index.paths, (disk_scope, key))):
-                if postings := table.get(lookup):
-                    if lookup in index.shared:
-                        shared_hit = True
-                    else:
-                        positions.update(postings)
-        record_ids = index.records.get((disk_scope, normalize_value_text(disk.get("serialNumber") or disk.get("serial")),
-                                        normalize_value_text(disk.get("scsiId"))), set())
-        ranked: list[tuple[tuple[bool, int], int]] = []
-        for position in positions:
-            row = index.rows[position]
-            if self._quantastor_pool_device_contradicts(
-                row, disk, index.shared, same_node=index.scope_of(row) == disk_scope, record_ids=record_ids,
-            ):
+    ) -> dict[Any, tuple[int, int, dict[str, Any]]]:
+        # Values are (score, position, hint): the best score wins, then the earlier row.
+        hints: dict[Any, tuple[int, int, dict[str, Any]]] = {}
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
+        for position, row in enumerate(raw_data.pool_devices):
+            slot = self._extract_quantastor_slot(row)
+            if slot is None:
                 continue
-            owner_id = normalize_value_text(row.get("storageSystemId"))
-            score = (8 if selected_system_id and owner_id == selected_system_id else 0) + (
-                4 if self._quantastor_bool(row.get("isSpare")) else 0
+            owner_id = normalize_text(
+                str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
             )
-            ranked.append(((self._extract_quantastor_slot(row) is not None, score), position))
-        if not ranked:
-            return None, shared_hit
-        best = max(rank for rank, _position in ranked)
-        top = [index.rows[position] for rank, position in ranked if rank == best]
-        memberships = {
-            (self._extract_quantastor_slot(row), normalize_value_text(row.get("storagePoolId") or row.get("poolId")),
-             *self._quantastor_pool_device_vdev(row), normalize_value_text(row.get("status")))
-            for row in top
-        }
-        if len(memberships) > 1:
-            return None, True
-        return min(top, key=lambda row: sorted(map(repr, row.items()))), False
+            score = 0
+            if selected_system_id and owner_id == selected_system_id:
+                score += 8
+            if self._quantastor_bool(row.get("isSpare")):
+                score += 4
+            hint = {
+                "slot": slot,
+                "storage_system_id": owner_id,
+                "pool_device_raw": row,
+            }
+            for field_name in ("physicalDiskId", "physicalDiskSerialNumber", "physicalDiskScsiId", "devicePath", "id"):
+                value = row.get(field_name)
+                for key in normalize_lookup_keys(str(value) if value is not None else None):
+                    # A device path is node-local (#1211): on a grid of several nodes it is
+                    # filed under the row's node, and a row with no known node files none.
+                    if field_name == "devicePath" and several_nodes:
+                        if not owner_id:
+                            continue
+                        key = (owner_id, key)
+                    current = hints.get(key)
+                    if current is None or score > current[0]:
+                        hints[key] = (score, position, hint)
+        return hints
+
+    @staticmethod
+    def _quantastor_pool_slot_hint(
+        hints: dict[Any, tuple[int, int, dict[str, Any]]],
+        lookup_keys: set[str],
+        node: str | None,
+    ) -> dict[str, Any] | None:
+        for key in lookup_keys:
+            found = [entry for entry in (hints.get(key), hints.get((node, key))) if entry is not None]
+            if found:
+                return max(found, key=lambda entry: (entry[0], -entry[1]))[2]
+        return None
+
+    @staticmethod
+    def _quantastor_has_several_nodes(raw_data: TrueNASRawData) -> bool:
+        return len({
+            system_id for system_row in raw_data.systems if (system_id := normalize_value_text(system_row.get("id")))
+        }) > 1
 
     @staticmethod
     def _select_quantastor_canonical_slot(rows: list[dict[str, Any]]) -> int | None:
@@ -11488,44 +11361,10 @@ class InventoryService:
             return None
         return max(slot_counter, key=lambda slot: (slot_counter[slot], raw_widths.get(slot, 0), slot))
 
-    @staticmethod
-    def _quantastor_bay_topology_members(
-        disk: DiskRecord | None,
-        node_members: dict[str, ZpoolMember],
-        members_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]],
-    ) -> dict[str, ZpoolMember]:
-        """Pool topology for one bay (#1211): a disk's bay only from the row that disk
-        admitted (none: unknown); a bay without a disk only from the selected node's rows."""
-        if disk is None:
-            return node_members
-        pool_device = disk.raw.get("quantastor_pool_device")
-        entry = members_by_row.get(id(pool_device)) if isinstance(pool_device, dict) else None
-        if entry is None:
-            return {}
-        member, row_keys = entry
-        return {key: member for key in (*disk.lookup_keys, *row_keys)}
-
-    @classmethod
-    def _quantastor_pool_device_vdev(cls, device: dict[str, Any]) -> tuple[str, str]:
-        # Shared with admission, so a tie is judged on the vdev name and class the bay shows.
-        member_number = device.get("number")
-        vdev_name = normalize_value_text(device.get("raidGroupId") or device.get("name") or device.get("deviceName")) or (
-            f"member-{member_number}" if isinstance(member_number, int) else "member"
-        )
-        vdev_class = cls._quantastor_text(
-            device.get("class"),
-            device.get("usageType"),
-            device.get("role"),
-            "spare" if device.get("isSpare") or normalize_value_text(device.get("raidGroupId")) == "spares" else None,
-        ) or "data"
-        return vdev_name, vdev_class
-
     def _build_quantastor_topology_members(
         self,
         raw_data: TrueNASRawData,
-        rows: list[dict[str, Any]] | None = None,
-        *,
-        members_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]] | None = None,
+        selected_system_id: str | None = None,
     ) -> dict[str, ZpoolMember]:
         pool_index = {
             normalize_value_text(pool.get("id")): pool
@@ -11543,7 +11382,14 @@ class InventoryService:
         }
 
         members: dict[str, ZpoolMember] = {}
-        for device in raw_data.pool_devices if rows is None else rows:
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
+        for device in raw_data.pool_devices:
+            # Bays here are the selected node's: another node's device path, or one
+            # of no known node on a grid of several nodes, names none of them (#1211).
+            owner_id = normalize_text(
+                str(device.get("storageSystemId")) if device.get("storageSystemId") is not None else None
+            )
+            foreign_paths = several_nodes and (owner_id is None or owner_id != selected_system_id)
             pool_id = normalize_text(
                 str(device.get("storagePoolId") or device.get("poolId"))
                 if (device.get("storagePoolId") or device.get("poolId")) is not None
@@ -11558,7 +11404,16 @@ class InventoryService:
                 if (pool.get("name") or pool.get("description") or pool_id) is not None
                 else None
             ) or "Pool"
-            vdev_name, vdev_class = self._quantastor_pool_device_vdev(device)
+            member_number = device.get("number")
+            vdev_name = normalize_value_text(device.get("raidGroupId") or device.get("name") or device.get("deviceName")) or (
+                f"member-{member_number}" if isinstance(member_number, int) else "member"
+            )
+            vdev_class = self._quantastor_text(
+                device.get("class"),
+                device.get("usageType"),
+                device.get("role"),
+                "spare" if device.get("isSpare") or normalize_value_text(device.get("raidGroupId")) == "spares" else None,
+            ) or "data"
             owner_label = self._quantastor_pool_owner_label(pool, system_index)
             topology_label = f"{pool_name} > {vdev_name} > {vdev_class}"
             if owner_label:
@@ -11573,25 +11428,19 @@ class InventoryService:
                 raw_name=normalize_value_text(device.get("name") or device.get("devicePath")),
                 raw_path=normalize_value_text(device.get("devicePath")),
             )
-            row_keys: set[str] = set()
             for field_name in ("physicalDiskId", "devicePath", "physicalDiskSerialNumber", "physicalDiskScsiId"):
+                if foreign_paths and field_name == "devicePath":
+                    continue
                 for key in normalize_lookup_keys(normalize_value_text(device.get(field_name))):
                     members[key] = member
-                    row_keys.add(key)
             physical_disk_obj = device.get("physicalDiskObj")
             if isinstance(physical_disk_obj, dict):
-                for value in (
-                    physical_disk_obj.get("id"),
-                    physical_disk_obj.get("serialNumber"),
-                    physical_disk_obj.get("scsiId"),
-                    physical_disk_obj.get("devicePath"),
-                    physical_disk_obj.get("altDevicePath"),
-                ):
+                for field_name in ("id", "serialNumber", "scsiId", "devicePath", "altDevicePath"):
+                    if foreign_paths and field_name in ("devicePath", "altDevicePath"):
+                        continue
+                    value = physical_disk_obj.get(field_name)
                     for key in normalize_lookup_keys(str(value) if value is not None else None):
                         members[key] = member
-                        row_keys.add(key)
-            if members_by_row is not None:
-                members_by_row[id(device)] = (member, frozenset(row_keys))
 
         return members
 
@@ -11799,8 +11648,10 @@ class InventoryService:
         self,
         raw_data: TrueNASRawData,
         allowed_system_ids: set[str] | None = None,
-    ) -> dict[str, set[str]]:
-        hints: dict[str, set[str]] = {}
+        selected_system_id: str | None = None,
+    ) -> dict[Any, set[str]]:
+        hints: dict[Any, set[str]] = {}
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
         rows = [*raw_data.disks, *raw_data.cli_disks, *self._quantastor_hw_disk_rows(raw_data)]
         for row in rows:
             owner_id = normalize_text(
@@ -11812,16 +11663,22 @@ class InventoryService:
                 continue
             if allowed_system_ids is not None and owner_id not in allowed_system_ids:
                 continue
-            # A device path is node-local: another node's /dev/sda is another
-            # disk, so it cannot show this one as visible there (#1211).
-            path_keys = {
-                key
-                for field_name in ("devicePath", "altDevicePath", "name")
-                for key in normalize_lookup_keys(normalize_value_text(row.get(field_name)))
-            }
-            for key in self._collect_quantastor_lookup_keys(row) - path_keys:
+            # Another node's disk at the same local path is another disk (#1211).
+            scoped = several_nodes and owner_id != selected_system_id
+            for key in self._quantastor_node_lookup_keys(row, scoped, owner_id):
                 hints.setdefault(key, set()).add(owner_id)
         return hints
+
+    @classmethod
+    def _quantastor_node_lookup_keys(cls, payload: dict[str, Any] | None, scoped: bool, node: str | None) -> set[Any]:
+        """Lookup keys; if `scoped`, device paths are filed under `node`, or not at all if it is unknown (#1211)."""
+        if not scoped or not isinstance(payload, dict):
+            return cls._collect_quantastor_lookup_keys(payload)
+        keys: set[Any] = cls._collect_quantastor_lookup_keys({**payload, "devicePath": None, "altDevicePath": None})
+        for field_name in ("devicePath", "altDevicePath") if node else ():
+            value = payload.get(field_name)
+            keys.update((node, key) for key in normalize_lookup_keys(str(value) if value is not None else None))
+        return keys
 
     @staticmethod
     def _collect_quantastor_lookup_keys(payload: dict[str, Any] | None) -> set[str]:
@@ -11879,7 +11736,9 @@ class InventoryService:
         presence_hints = self._build_quantastor_presence_hints(
             raw_data,
             allowed_presence_system_ids or None,
+            selected_system_id,
         )
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
         pool_index = {
             normalize_value_text(pool.get("id")): pool
             for pool in raw_data.pools
@@ -11899,8 +11758,14 @@ class InventoryService:
                 physical_disk_obj = pool_device.get("physicalDiskObj")
 
             lookup_keys.update(self._collect_quantastor_lookup_keys(hw_disk))
-            lookup_keys.update(self._collect_quantastor_lookup_keys(pool_device))
-            lookup_keys.update(self._collect_quantastor_lookup_keys(physical_disk_obj))
+            # The row's device paths are its own node's (#1211).
+            row_node = normalize_text(
+                str(pool_device.get("storageSystemId")) if pool_device and pool_device.get("storageSystemId") is not None
+                else None
+            )
+            row_scoped = several_nodes and (row_node is None or row_node != selected_system_id)
+            lookup_keys.update(self._quantastor_node_lookup_keys(pool_device, row_scoped, row_node))
+            lookup_keys.update(self._quantastor_node_lookup_keys(physical_disk_obj, row_scoped, row_node))
 
             visible_on_ids = sorted({system_id for key in lookup_keys for system_id in presence_hints.get(key, set())})
             visible_on_labels = [system_labels.get(system_id) or system_id for system_id in visible_on_ids if system_id]
