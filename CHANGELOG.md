@@ -131,6 +131,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   drive the BMC listed last with that drive's identify target. ESXi hosts,
   which already refused to choose, now show such a bay as unknown with the
   same warning instead of empty (#1248).
+- The streamed backup import check of the slot mapping, SAS alias and slot
+  detail files no longer builds fields it ignores, so one entry with a large
+  unused value cannot exhaust memory. An entry whose used fields exceed 65,536
+  values or 1 MiB of text is refused as invalid (#1245).
 - Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
   When days are not reported it shows the reported hours, and leaves the
   value out when neither is known; a reported zero still shows (#1234).
