@@ -87,14 +87,15 @@ OUTCOME_COUNTERS = ("failures", "errors", "skipped", "expected_failures", "unexp
 REMOVAL_APPROVAL_LABEL = "tests-removed-ok"
 LISTED_IDS = 25
 
-# Balanced from a per-test timing run on ubuntu-latest (2026-09-24, Python 3.12
-# and 3.14 averaged, with the slow-test fixes of #569 applied). The backup and
+# Balanced from per-module times in the shard job logs of six green runs on
+# ubuntu-latest (2026-11-16, median per Python version; #1191). The backup and
 # rotation suites, the two heaviest, sit on different shards. Keep each tuple
 # sorted; the guard test rejects a module listed twice or not at all.
 SHARDS: dict[str, tuple[str, ...]] = {
     "1": (
         "test_account_bootstrap",
         "test_admin_config",
+        "test_bounded_parser_work",
         "test_changelog_entry_gate",
         "test_dev_check",
         "test_disk_retention_accounting",
@@ -123,6 +124,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_demo_provenance",
         "test_public_screenshots",
         "test_segment_sealer",
+        "test_segmented_history_reader",
         "test_snapshot_export",
         "test_ssh_connection_keep",
         "test_ssh_failure_contexts",
@@ -142,7 +144,6 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_background_refresh_busy_routes",
         "test_background_refresh_deadlines",
         "test_backup_integration",
-        "test_bounded_parser_work",
         "test_ci_browser_legs",
         "test_ci_contract",
         "test_combined_shelf_upgrade",
@@ -174,7 +175,6 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_segment_census",
         "test_segment_rotation",
         "test_segmented_history",
-        "test_segmented_history_reader",
         "test_segmented_restore_recovery",
         "test_ses_unknown_occupancy_consumers",
         "test_ses_unknown_presence",
