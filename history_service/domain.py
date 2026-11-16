@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from app.models.domain import slot_occupancy
 
 
 FIELD_LABELS = {
@@ -229,6 +231,9 @@ class SlotStateRecord:
     multipath_active_controllers: str | None = None
     multipath_passive_controllers: str | None = None
     multipath_failed_controllers: str | None = None
+    # Not a stored column: False when the inventory read no occupancy for the
+    # bay (#1218). The collector then keeps the bay's last recorded row.
+    presence_known: bool = field(default=True, compare=False)
 
     def __post_init__(self) -> None:
         if self.disk_identity_key is None:
@@ -287,7 +292,8 @@ class SlotStateRecord:
             enclosure_label=enclosure_label,
             slot=slot_number,
             slot_label=normalize_text(slot_payload.get("slot_label")) or f"{slot_number:02d}",
-            present=as_bool(slot_payload.get("present")),
+            present=slot_occupancy(slot_payload) == "present",
+            presence_known=slot_occupancy(slot_payload) != "unknown",
             state=normalize_text(slot_payload.get("state")),
             identify_active=as_bool(slot_payload.get("identify_active")),
             device_name=normalize_text(slot_payload.get("device_name")),

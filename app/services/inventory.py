@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import shlex
+import ssl
 import time
 import threading
 import weakref
@@ -55,6 +56,7 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
     SystemLocatorStatusView,
+    slot_occupancy,
 )
 from app.metrics import (
     observe_inventory_background_snapshot_refresh,
@@ -83,6 +85,8 @@ from app.services.mapping_store import (
     MappingRevisionConflict,
     MappingSlotDiskChanged,
     MappingSlotDiskChangedBeforeClear,
+    MappingSlotDiskUnverifiable,
+    MappingSlotDiskUnverifiableBeforeClear,
     MappingStore,
     bind_mapping_revision,
     resolve_physical_mapping_scope,
@@ -197,10 +201,17 @@ from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService, bmc_
 from app.services.supermicro_bmc import _normalize_bmc_host as normalize_bmc_host
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
+    LocalServiceError,
     TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
+    bounded_remote_reason,
+    classify_remote_failure,
+    is_local_failure_message,
+    log_failure,
+    log_identifier,
     normalize_disk_inventory_rows,
     truenas_session_destination,
 )
@@ -1133,8 +1144,10 @@ class _ManualOnlyStorageViewSlots:
             "slot_size": slot_size,
         }
         if mapping is None:
+            # No saved assignment and no live bay behind it: nothing says
+            # whether this bay holds a disk (#1218).
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state="unknown", source="placeholder",
+                **common, occupied=False, presence_known=False, state="unknown", source="placeholder",
                 placement_key="assigned by hand only",
             )
         live = next(
@@ -1148,7 +1161,8 @@ class _ManualOnlyStorageViewSlots:
         )
         if live is None:
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state=SlotState.unmapped.value, source="manual_mapping",
+                **common, occupied=False, presence_known=False, state=SlotState.unmapped.value,
+                source="manual_mapping",
                 match_reasons=["saved bay assignment"], placement_key="saved bay assignment",
                 device_name=mapping.device_name, serial=mapping.serial, gptid=mapping.gptid,
                 description=mapping.notes,
@@ -1725,6 +1739,139 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
     "criticality": "inventory",
 }
 SSH_COMMAND_FAILURE_REASON = "ssh_command_failed"
+
+_CERTIFICATE_VERIFY_CODE_LABELS: dict[int, str] = {
+    2: "issuer certificate not available",
+    9: "certificate not yet valid",
+    10: "certificate expired",
+    18: "self-signed certificate",
+    19: "self-signed certificate chain",
+    20: "certificate issuer not trusted",
+    21: "certificate chain incomplete",
+    62: "certificate name mismatch",
+}
+
+
+def _certificate_verify_code_label(exc: BaseException) -> str | None:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            code = getattr(current, "verify_code", None)
+            if isinstance(code, int) and not isinstance(code, bool):
+                return _CERTIFICATE_VERIFY_CODE_LABELS.get(code)
+            return None
+        for linked in (getattr(current, "reason", None), current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return None
+
+
+def _public_source_failure_message(label: str, exc: BaseException) -> str:
+    """Source status text: this service's own sentence, else a fixed category."""
+
+    if is_local_failure_message(exc):
+        return str(exc)
+    category, code = classify_remote_failure(exc)
+    if category == INTERNAL_FAILURE_CATEGORY:
+        return f"{label} collection stopped on an internal error; see the service log."
+    if category == "authentication_failed":
+        return f"{label} authentication failed."
+    if category == "timeout":
+        return f"{label} collection timed out."
+    if category == "unreachable":
+        return f"{label} could not be reached."
+    if category == "tls_failed":
+        return f"{label} TLS connection failed."
+    if category == "method_unavailable":
+        return f"{label} does not support a required API method."
+    if category == "response_invalid":
+        return f"{label} returned an unusable response."
+    if category == "remote_error":
+        code_context = f" (code {code})" if code is not None else ""
+        return f"{label} reported a collection error{code_context}."
+    return f"{label} collection failed."
+
+
+def public_smart_failure_message(exc: BaseException) -> str:
+    """SMART fallback text: this service's own sentence, else a fixed category."""
+
+    if is_local_failure_message(exc):
+        return str(exc)
+    category, _code = classify_remote_failure(exc)
+    if category == "certificate_verification":
+        certificate_label = _certificate_verify_code_label(exc)
+        detail = f" ({certificate_label})" if certificate_label else ""
+        return f"SMART data certificate verification failed{detail}."
+    return {
+        "authentication_failed": "SMART data authentication failed.",
+        "busy": "The SMART data source is busy; try again shortly.",
+        INTERNAL_FAILURE_CATEGORY: "SMART data collection stopped on an internal error; see the service log.",
+        "method_unavailable": "SMART data is unavailable through this API.",
+        "response_invalid": "The SMART data source returned an unusable response.",
+        "timeout": "SMART data collection timed out.",
+        "tls_failed": "The SMART data source TLS connection failed.",
+        "unreachable": "The SMART data source could not be reached.",
+    }.get(category, "SMART data collection failed.")
+
+
+# A device path shown in this service's own SMART sentences. Names come from
+# the platform inventory, so anything outside this shape is not repeated.
+_PUBLIC_DEVICE_PATH = re.compile(r"(?:/dev/)?[A-Za-z0-9._/-]{1,128}")
+SMART_SSH_REMOTE_FAILURE_MESSAGE = "SMART data collection over SSH failed."
+
+
+def _public_device_path(device_path: str) -> str:
+    return device_path if _PUBLIC_DEVICE_PATH.fullmatch(device_path) else "this disk"
+
+
+class SmartSshFailure(str):
+    """A SMART-over-SSH failure, with its origin recorded where it is produced.
+
+    The string value is the full diagnostic and may hold remote command output;
+    it is never published or logged. ``public_message`` is set only when the
+    producer wrote the sentence itself (SSH turned off, sudo guidance, a parse
+    failure); otherwise read responses use a fixed category. ``kind`` and
+    ``exit_status`` are the value-safe facts for the service log.
+    """
+
+    kind: str
+    public_message: str | None
+    exit_status: int | None
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        kind: str,
+        public_message: str | None = None,
+        exit_status: int | None = None,
+    ) -> "SmartSshFailure":
+        failure = super().__new__(cls, text)
+        failure.kind = kind
+        failure.public_message = public_message
+        failure.exit_status = exit_status if isinstance(exit_status, int) and not isinstance(exit_status, bool) else None
+        return failure
+
+
+def _smart_ssh_failure_public_message(error: str) -> str:
+    if isinstance(error, SmartSshFailure) and error.public_message:
+        return error.public_message
+    return SMART_SSH_REMOTE_FAILURE_MESSAGE
+
+
+def _log_smart_ssh_failure(error: str) -> None:
+    kind = error.kind if isinstance(error, SmartSshFailure) else "unclassified"
+    exit_status = error.exit_status if isinstance(error, SmartSshFailure) else None
+    logger.warning(
+        "SMART SSH collection failed (kind=%s, exit_status=%s)",
+        kind,
+        "none" if exit_status is None else exit_status,
+    )
 
 
 def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
@@ -2681,7 +2828,7 @@ class InventoryService:
                         self._observe_inventory_snapshot_request("trusted-fallback")
                         logger.warning(
                             "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
-                            cache_key,
+                            log_identifier(cache_key),
                         )
                         # Keep the trusted facts, but answer with a copy that
                         # says this refresh failed (#1208); the cache keeps
@@ -2974,8 +3121,7 @@ class InventoryService:
         # older candidate over the newer canonical topology.
         self._touch_snapshot_key(cache_key)
         logger.debug(
-            "Snapshot refresh for %s was superseded by canonical options sequence %s.",
-            cache_key,
+            "Snapshot refresh was superseded by canonical options sequence %s.",
             self._canonical_options_request_sequence,
         )
         return current
@@ -3734,7 +3880,9 @@ class InventoryService:
                             known_snapshots[option.id] = snapshot
                         if not inputs_are_current():
                             return fallback_order("current correlation inputs are unavailable")
-                        enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+                        enclosure_counts.append(
+                            (option.id, sum(1 for slot in snapshot.slots if slot_occupancy(slot) == "present"))
+                        )
 
                     order = effective_main_view_order(
                         enclosure_counts=enclosure_counts,
@@ -4068,7 +4216,7 @@ class InventoryService:
             if not in_pair(view_node):
                 continue
             for runtime_slot in view.slots:
-                if runtime_slot.occupied:
+                if slot_occupancy(runtime_slot) == "present":
                     rendered.setdefault(
                         (f"storage-view:{view.id}", runtime_slot.slot_index), (runtime_slot, view_node),
                     )
@@ -4133,10 +4281,10 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
-            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+            raise LocalServiceError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
         smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
         if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, smart_enclosure_id}:
@@ -4181,7 +4329,7 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slots = {slot.slot_index: slot for slot in runtime_view.slots}
 
         ordered: list[int] = []
@@ -4238,7 +4386,11 @@ class InventoryService:
                             bypass_negative_cache=bypass_negative_cache,
                         )
                     except TrueNASAPIError as exc:
-                        summary = self._fallback_smart_summary(slot_view, str(exc))
+                        log_failure(logger, "Storage-view SMART collection", exc)
+                        summary = self._fallback_smart_summary(
+                            slot_view,
+                            public_smart_failure_message(exc),
+                        )
                 return slot_index, summary
 
             for slot_index, summary in await asyncio.gather(*(load(slot_index) for slot_index in synthetic)):
@@ -4263,10 +4415,10 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+            raise LocalServiceError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
-            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+            raise LocalServiceError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
         history_enclosure_id = (
             runtime_view.backing_enclosure_id
@@ -4284,8 +4436,9 @@ class InventoryService:
     def _storage_view_runtime_slot_state(
         cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
     ) -> SlotState:
-        if not runtime_slot.occupied:
-            return SlotState.empty
+        occupancy = slot_occupancy(runtime_slot)
+        if occupancy != "present":
+            return SlotState.empty if occupancy == "empty" else SlotState.unknown
         if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
@@ -4321,7 +4474,8 @@ class InventoryService:
             enclosure_id=f"storage-view:{runtime_view.id}",
             enclosure_label=runtime_view.label,
             enclosure_name=runtime_view.label,
-            present=runtime_slot.occupied,
+            present=slot_occupancy(runtime_slot) == "present",
+            presence_known=slot_occupancy(runtime_slot) != "unknown",
             state=self._storage_view_runtime_slot_state(runtime_slot),
             non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
@@ -4423,7 +4577,9 @@ class InventoryService:
                 mappings[slot_value] = mapping
         live_slots_by_key: dict[str, SlotView] = {}
         for live_slot in snapshot.slots:
-            if live_slot.identity_state == "unknown":
+            # Only a bay read as holding a disk can stand for a saved identity:
+            # an unread or empty row naming it is no live disk (#1218).
+            if live_slot.identity_state == "unknown" or slot_occupancy(live_slot) != "present":
                 continue
             for value in (live_slot.serial, live_slot.gptid, live_slot.device_name):
                 for key in normalize_lookup_keys(value):
@@ -4460,12 +4616,20 @@ class InventoryService:
                 if slot
                 else storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
             )
+            # A layout bay the backing snapshot has no row for was not read: the
+            # snapshot lists the live layout's bays, so this one is unknown, not
+            # empty (#1218).
+            occupancy = slot_occupancy(slot)
             runtime_slots.append(
                 StorageViewRuntimeSlot(
                     slot_index=slot_value,
                     slot_label=label,
-                    occupied=bool(slot and slot.present),
-                    state=(slot.state.value if slot and isinstance(slot.state, SlotState) else str(slot.state) if slot else "empty"),
+                    occupied=occupancy == "present",
+                    presence_known=occupancy != "unknown",
+                    state=(
+                        slot.state.value if slot and isinstance(slot.state, SlotState)
+                        else str(slot.state) if slot else SlotState.unknown.value
+                    ),
                     source="snapshot_slot",
                     match_reasons=["selected enclosure snapshot"],
                     placement_key="live enclosure slot",
@@ -4541,7 +4705,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=visible_slot_count,
             slots=runtime_slots,
         )
@@ -4622,7 +4786,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=len(visible_slots),
             slots=runtime_slots,
         )
@@ -5150,7 +5314,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background inventory source refresh failed: %s", exc)
+                log_failure(logger, "Background inventory source refresh", exc)
 
         task.add_done_callback(_cleanup)
         return task
@@ -5216,15 +5380,15 @@ class InventoryService:
                 force_refresh=True,
                 invalidate_sg_ses_device_cache=False,
             )
-        except SnapshotStateBusyError:
+        except SnapshotStateBusyError as exc:
             if not _background_refresh_abandoned():
-                logger.exception("Background inventory source refresh failed")
+                logger.exception("Background inventory source refresh failed (reason=%s).", exc.reason, exc_info=False)
             else:
                 # Already reported when it was abandoned (#1125).
                 logger.info("Discarded the late result of an abandoned inventory source refresh.")
             return None
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background inventory source refresh failed")
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background inventory source refresh", exc, level=logging.ERROR)
             return None
 
     def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
@@ -6172,7 +6336,7 @@ class InventoryService:
 
         async def load_bmc_inventory() -> BMCInventory:
             if self.bmc_service is None:
-                raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
+                raise LocalServiceError("BMC / IPMI access is not configured for this system.")
             with perf_stage("inventory.bmc.fetch"):
                 # Retain the executor Future: cancelling an asyncio wrapper
                 # cannot stop this synchronous collector.
@@ -6209,24 +6373,45 @@ class InventoryService:
             try:
                 api_result = await api_task
             except Exception as exc:
-                logger.exception("Failed to fetch platform API data")
+                log_failure(logger, "Platform API collection", exc, level=logging.ERROR)
                 certificate_failure = certificate_verification_failure_reason(exc)
                 if certificate_failure is not None:
-                    # #954: name a failed certificate check instead of "unreachable".
-                    certificate_message = f"{api_label} certificate check failed: {certificate_failure}."
+                    # #954: keep the failure actionable without publishing the
+                    # verifier's free-form text. Reviewed verify codes recover
+                    # stable categories such as expiry and name mismatch.
+                    certificate_label = _certificate_verify_code_label(exc)
+                    certificate_detail = f" ({certificate_label})" if certificate_label else ""
+                    certificate_message = f"{api_label} certificate verification failed{certificate_detail}."
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=certificate_message)
-                    warnings.append(certificate_message)
+                    warnings.append(
+                        f"{certificate_message} "
+                        "Slot details may be partial or unavailable."
+                    )
                 elif isinstance(exc, TrueNASAPIBusyError):
                     # #1072: the appliance answered but is out of capacity, or
                     # the app is backing off after it was. Not "unreachable".
-                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=f"{api_label} is busy; collection will retry.",
+                    )
                     warnings.append(
                         f"{api_label} is busy; the app is backing off before asking again. "
                         "Slot details may be partial until it answers."
                     )
                 else:
-                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                    warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
+                    # The status shows this service's own sentence or a fixed
+                    # category; the log line above carries the structured facts.
+                    public_message = _public_source_failure_message(api_label, exc)
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=public_message,
+                    )
+                    warnings.append(
+                        f"{public_message} "
+                        "Slot details may be partial or unavailable."
+                    )
             else:
                 if api_result is not None:
                     raw_data = api_result
@@ -6246,8 +6431,13 @@ class InventoryService:
             try:
                 ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
             except Exception as exc:
-                logger.exception("Failed to collect SSH diagnostics")
-                sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc), required_ok=False)
+                log_failure(logger, "SSH diagnostics collection", exc, level=logging.ERROR)
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message=_public_source_failure_message("SSH diagnostics", exc),
+                    required_ok=False,
+                )
                 warnings.append("SSH is turned on but no command output came back.")
             else:
                 sources["ssh"] = ssh_status
@@ -6259,8 +6449,12 @@ class InventoryService:
             try:
                 bmc_inventory = await bmc_task
             except Exception as exc:
-                logger.exception("Failed to collect BMC / IPMI diagnostics")
-                sources["bmc"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                log_failure(logger, "BMC diagnostics collection", exc, level=logging.ERROR)
+                sources["bmc"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message=_public_source_failure_message("BMC / IPMI diagnostics", exc),
+                )
                 warnings.append("BMC/IPMI is turned on but the BMC could not be read.")
             else:
                 sources["bmc"] = SourceStatus(enabled=True, ok=True, message="BMC / IPMI inventory reachable.")
@@ -6270,8 +6464,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.scale.fetch_ses_overlay"):
                     scale_ses_data, scale_ses_failures = await self._fetch_scale_ses_overlay()
-            except Exception:
-                logger.exception("Failed to collect SCALE SES diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the API data still stands.
+                log_failure(logger, "SCALE SES diagnostics collection", exc, level=logging.ERROR)
                 scale_ses_failures.append(
                     "TrueNAS SCALE SSH SES rediscovery failed unexpectedly. API disk and pool data is still being used."
                 )
@@ -6300,8 +6494,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.quantastor.fetch_cli_overlay"):
                     quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay(raw_data)
-            except Exception:
-                logger.exception("Failed to collect Quantastor CLI diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the REST data still stands.
+                log_failure(logger, "Quantastor CLI diagnostics collection", exc, level=logging.ERROR)
                 quantastor_cli_failures.append(
                     "Quantastor SSH CLI enrichment failed unexpectedly. REST data is still being used."
                 )
@@ -6323,8 +6517,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.quantastor.fetch_ses_overlay"):
                     quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay(raw_data)
-            except Exception:
-                logger.exception("Failed to collect Quantastor SES diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the REST and CLI data still stand.
+                log_failure(logger, "Quantastor SES diagnostics collection", exc, level=logging.ERROR)
                 quantastor_ses_failures.append(
                     "Quantastor SSH SES enrichment failed unexpectedly. Available REST and CLI data is still being used."
                 )
@@ -6387,7 +6581,8 @@ class InventoryService:
                 self._snapshot_refresh_tasks.pop(key, None)
 
         task = self._start_background_refresh(
-            f"snapshot {cache_key}",
+            # The label reaches the abandonment warning: the key only through the strict formatter.
+            f"snapshot {log_identifier(cache_key)}",
             self._background_snapshot_refresh(cache_key, default_selection=default_selection),
             unregister=_unregister,
         )
@@ -6402,7 +6597,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background snapshot refresh failed for %s: %s", key, exc)
+                log_failure(logger, "Background snapshot refresh", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -6431,7 +6626,7 @@ class InventoryService:
                 and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
                 and self._snapshot_meets_source_requirement(cache_key, minimum_source_publication)
             ):
-                logger.debug("Background snapshot refresh reused newer publication for %s.", cache_key)
+                logger.debug("Background snapshot refresh reused a newer publication.")
                 self._observe_background_snapshot_refresh("reused", "newer-publication")
                 return
             result = await self._get_snapshot_result(
@@ -6447,18 +6642,19 @@ class InventoryService:
             # stand in. No work is lost: the stale value stays public and the
             # next request schedules another refresh from the newer sources.
             # Not an error (#928, #1169).
-            logger.debug("Background snapshot refresh for %s was superseded (reason=%s).", cache_key, exc.reason)
+            logger.debug("Background snapshot refresh was superseded (reason=%s).", exc.reason)
             self._observe_background_snapshot_refresh("superseded", exc.reason)
         except SnapshotStateBusyError as exc:
             if not _background_refresh_abandoned():
-                logger.exception("Background snapshot refresh failed for %s (reason=%s)", cache_key, exc.reason)
+                # ``reason`` is a fixed token the raising branch set.
+                logger.exception("Background snapshot refresh failed (reason=%s).", exc.reason, exc_info=False)
                 self._observe_background_snapshot_refresh("busy", exc.reason)
             else:
                 # Already reported when it was abandoned (#1125).
-                logger.info("Discarded the late result of an abandoned snapshot refresh for %s.", cache_key)
+                logger.info("Discarded the late result of an abandoned snapshot refresh.")
                 self._observe_background_snapshot_refresh("abandoned", exc.reason)
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background snapshot refresh failed for %s", cache_key)
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background snapshot refresh", exc, level=logging.ERROR)
             self._observe_background_snapshot_refresh("failed", "unexpected")
         finally:
             _snapshot_background_refresh.reset(background_token)
@@ -6499,7 +6695,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                logger.warning("Background SMART refresh failed for %s: %s", key, exc)
+                log_failure(logger, "Background SMART refresh", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -6516,8 +6712,8 @@ class InventoryService:
                 allow_stale_cache=False,
                 expected_generation=generation_token,
             )
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background SMART refresh failed for %s", cache_key)
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background SMART refresh", exc, level=logging.ERROR)
         finally:
             _smart_detail_batch.reset(token)
 
@@ -7112,7 +7308,7 @@ class InventoryService:
             "exit_status=%s duration_seconds=%.3f",
             self.system.id,
             slot_view.slot_label,
-            device,
+            log_identifier(device),
             element,
             action.value,
             exit_status,
@@ -7340,12 +7536,19 @@ class InventoryService:
 
         try:
             active = await asyncio.to_thread(self.bmc_service.get_uid_status)
-        except Exception as exc:  # noqa: BLE001 - surface operational failure in-band.
+        except Exception as exc:  # noqa: BLE001 - normalize operational failure in-band.
+            log_failure(logger, "BMC locator status read", exc)
+            if is_local_failure_message(exc):
+                reason = str(exc)
+            elif classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+                reason = "BMC locator status read stopped on an internal error; see the service log."
+            else:
+                reason = "BMC locator status unavailable."
             return SystemLocatorStatusView(
                 supported=True,
                 active=False,
                 backend="supermicro_bmc",
-                reason=str(exc),
+                reason=reason,
             )
 
         return SystemLocatorStatusView(
@@ -7357,12 +7560,20 @@ class InventoryService:
 
     async def set_system_locator(self, active: bool) -> SystemLocatorStatusView:
         if not self.system.bmc.enabled or self.bmc_service is None:
-            raise TrueNASAPIError("System locator control requires configured BMC / IPMI access.")
+            raise LocalServiceError("System locator control requires configured BMC / IPMI access.")
 
         try:
             resolved_active = await asyncio.to_thread(self.bmc_service.set_uid_active, bool(active))
+        except TrueNASAPIError:
+            # Keep the BMC error's structured fields for the authorized route.
+            raise
         except Exception as exc:  # noqa: BLE001 - normalize backend failures.
-            raise TrueNASAPIError(str(exc)) from exc
+            # The BMC adapter types every BMC answer; anything else is a local fault.
+            raise TrueNASAPIError(
+                "System locator action failed.",
+                category=INTERNAL_FAILURE_CATEGORY,
+                method="set_uid_active",
+            ) from exc
 
         self.invalidate_snapshot_cache(
             reason="set_system_locator",
@@ -7384,11 +7595,15 @@ class InventoryService:
         logical unit id, then persistent id), the same set that decides whether
         an occupied bay's disk is known. An empty or missing bay binds as empty;
         an occupied bay without a strong identifier binds as unknown, so a swap
-        between two such disks cannot be told apart. The reusable device name
-        and the bay's SAS address are not part of it.
+        between two such disks cannot be told apart. A bay whose occupancy was
+        not read binds as unread, never as empty (#1218). The reusable device
+        name and the bay's SAS address are not part of it.
         """
-        if slot_view is None or not slot_view.present or slot_view.state == SlotState.empty:
-            identity: list[str | None] = ["empty"]
+        occupancy = "empty" if slot_view is None else slot_occupancy(slot_view)
+        if occupancy == "unknown":
+            identity: list[str | None] = ["unread"]
+        elif occupancy == "empty" or slot_view.state == SlotState.empty:
+            identity = ["empty"]
         else:
             identity = ["occupied", None, None]
             for field_name in STRONG_SLOT_IDENTITY_FIELDS:
@@ -7422,6 +7637,19 @@ class InventoryService:
             and expected_revision[split:] != binding
         ):
             raise changed(conflict.current_revision) from conflict
+
+    @staticmethod
+    def _refuse_if_slot_unread(
+        slot_view: SlotView | None, revision: Callable[[], str], binding: str,
+        refusal: type[MappingSlotDiskUnverifiable],
+    ) -> None:
+        """Refuse any write to a bay whose occupancy the pre-write read did not read (#1218).
+
+        Nothing can be checked against such a bay, so no editor revision lets
+        the write through, and the refusal does not claim the disk changed.
+        """
+        if slot_view is not None and slot_occupancy(slot_view) == "unknown":
+            raise refusal(bind_mapping_revision(revision(), binding))
 
     async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
         """Read the current view a bay-assignment write is checked against.
@@ -7465,6 +7693,10 @@ class InventoryService:
         # as the pre-write read found it is bound here, so a write prepared
         # against another disk is refused before anything is stored (#1141).
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.save_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiable,
+        )
 
         def invalidate_after_save(_saved: ManualMapping) -> None:
             self.invalidate_physical_enclosure_snapshot_cache(
@@ -7508,6 +7740,10 @@ class InventoryService:
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.clear_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiableBeforeClear,
+        )
 
         def invalidate_after_clear(cleared: bool) -> None:
             if cleared:
@@ -7692,7 +7928,7 @@ class InventoryService:
             )
             slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
             if not slot_view:
-                raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+                raise LocalServiceError(f"Slot {slot:02d} is not present in the current snapshot.")
             return await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
                 allow_stale_cache=allow_stale_cache,
@@ -8157,10 +8393,13 @@ class InventoryService:
                 self._observe_smart_summary_request("ssh-live")
                 return summary
 
+            if error_message:
+                _log_smart_ssh_failure(error_message)
             fallback = self._fallback_smart_summary(
                 slot_view,
-                error_message
-                or (
+                _smart_ssh_failure_public_message(error_message)
+                if error_message
+                else (
                     "TrueNAS did not return SMART data; turn on SSH for full SMART details."
                     if self.system.truenas.platform == "scale"
                     else "No SMART data is available for this bay."
@@ -8181,7 +8420,8 @@ class InventoryService:
                     else:
                         payload = await self._fetch_disk_smartctl_bounded(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
-                last_error = str(exc)
+                log_failure(logger, "SMART API collection", exc)
+                last_error = public_smart_failure_message(exc)
                 continue
 
             api_summary = self._merge_smart_summary(
@@ -8201,7 +8441,8 @@ class InventoryService:
                         else:
                             enrichment_payload = await self._fetch_disk_smartctl_bounded(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
-                    last_error = str(exc)
+                    # The JSON summary stands; only its enrichment is missing.
+                    log_failure(logger, "SMART API enrichment", exc)
                 else:
                     api_summary = self._merge_missing_smart_fields(
                         api_summary,
@@ -8251,7 +8492,8 @@ class InventoryService:
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
             if ssh_error:
-                last_error = ssh_error
+                _log_smart_ssh_failure(ssh_error)
+                last_error = _smart_ssh_failure_public_message(ssh_error)
 
         fallback = self._fallback_smart_summary(
             slot_view,
@@ -8282,8 +8524,11 @@ class InventoryService:
             async with asyncio.timeout(timeout):
                 return await self.truenas_client.fetch_disk_smartctl(candidate, args)
         except TimeoutError as exc:
-            raise TrueNASAPIError(
-                f"SMART lookup for {candidate} timed out after {timeout:g}s; the disk did not answer."
+            raise LocalServiceError(
+                f"SMART lookup for {_public_device_path(candidate)} timed out after {timeout:g}s; "
+                "the disk did not answer.",
+                category="timeout",
+                method="disk.smartctl",
             ) from exc
 
     async def _prime_core_grid(
@@ -8427,7 +8672,11 @@ class InventoryService:
                                 "admitted": admissions[slot]} if core_cohort is not None else {}),
                         )
                     except TrueNASAPIError as exc:
-                        summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
+                        log_failure(logger, "SMART batch collection", exc)
+                        summary = self._fallback_smart_summary(
+                            slot_lookup.get(slot),
+                            public_smart_failure_message(exc),
+                        )
                     return SmartBatchItem(slot=slot, summary=summary)
 
             async def complete_batch() -> list[SmartBatchItem]:
@@ -8472,7 +8721,8 @@ class InventoryService:
         slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
-            return None, "SMART detail needs SSH on this system, and SSH is turned off."
+            ssh_disabled = "SMART detail needs SSH on this system, and SSH is turned off."
+            return None, SmartSshFailure(ssh_disabled, kind="ssh_disabled", public_message=ssh_disabled)
 
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
@@ -8604,16 +8854,24 @@ class InventoryService:
                             None if result.exit_code is None else smartctl_exit_flags(result.exit_code)
                         )
                     if summary is None:
-                        detail = (
-                            result.stderr.strip()
-                            or result.stdout.strip()
-                            or "Unknown SSH smartctl error."
-                        )
+                        remote_detail = result.stderr.strip() or result.stdout.strip()
+                        detail = remote_detail or "Unknown SSH smartctl error."
                         detail = self._describe_smartctl_ssh_failure(detail, device_path)
-                        last_error = (
-                            f"{target_host}:{device_path}: {detail}"
-                            if target_host
-                            else f"{device_path}: {detail}"
+                        kind, guidance = self._smartctl_ssh_failure_guidance(
+                            remote_detail,
+                            _public_device_path(device_path),
+                        )
+                        last_error = SmartSshFailure(
+                            (
+                                f"{target_host}:{device_path}: {detail}"
+                                if target_host
+                                else f"{device_path}: {detail}"
+                            ),
+                            kind=kind,
+                            public_message=(
+                                f"{_public_device_path(device_path)}: {guidance}" if guidance else None
+                            ),
+                            exit_status=result.exit_code,
                         )
                         if "command not found" not in detail.lower():
                             skipped_candidate = candidate
@@ -8644,29 +8902,48 @@ class InventoryService:
                         if self.system.truenas.platform == "quantastor" and target_host:
                             self._quantastor_preferred_ses_host = target_host
                         return summary, None
-                    last_error = (
-                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                        if target_host
-                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                    last_error = SmartSshFailure(
+                        (
+                            f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                            if target_host
+                            else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        ),
+                        kind="parse_failed",
+                        # Reached only when the parser reported its own fixed
+                        # "SMART JSON parsing failed." sentence.
+                        public_message=f"{_public_device_path(device_path)}: SMART JSON parsing failed.",
+                        exit_status=result.exit_code,
                     )
                     skipped_candidate = candidate
 
         return None, last_error
 
     def _describe_smartctl_ssh_failure(self, detail: str, device_path: str) -> str:
+        _kind, guidance = self._smartctl_ssh_failure_guidance(detail, device_path)
+        return guidance or detail
+
+    def _smartctl_ssh_failure_guidance(self, detail: str, device_path: str) -> tuple[str, str | None]:
+        """The failure kind and, for the known sudo refusals, this service's guidance.
+
+        The guidance is written here; the remote output only selects which
+        fixed sentence applies and is never part of it.
+        """
+
         lowered = detail.lower()
         if "not allowed to execute" in lowered and "smartctl" in lowered:
             service_user = normalize_text(self.system.ssh.user) or "the SSH service account"
-            return (
+            return "sudo_denied", (
                 f"The SSH user {service_user} is not allowed to run smartctl on {device_path}. "
                 "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
         if "a password is required" in lowered or "password is required" in lowered:
-            return (
+            return "sudo_password", (
                 "smartctl needs a sudo password on this host. "
                 "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
-        return detail
+        if not detail:
+            return "no_output", "Unknown SSH smartctl error."
+        return "command_failed", None
 
     def _smartctl_binary_candidates(self) -> tuple[str, ...]:
         if self.system.truenas.platform == "core":
@@ -8797,7 +9074,7 @@ class InventoryService:
             (normalize_text(enclosure_id) or "").startswith("virtual-system:")
             for enclosure_id in enclosure_ids
         ):
-            raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
+            raise LocalServiceError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
 
     @staticmethod
     def _mapping_import_written_bays(preview: dict[str, Any]) -> list[tuple[str | None, int]]:
@@ -8874,13 +9151,17 @@ class InventoryService:
             return None
         if slot_view is None:
             return None
-        if not slot_view.present or slot_view.state == SlotState.empty:
+        # An unread bay's current disk cannot be compared; say that, never
+        # that the bay is empty (#1218).
+        occupancy = slot_occupancy(slot_view)
+        if occupancy != "present" or slot_view.state == SlotState.empty:
             current = None
         else:
             current = normalize_text(getattr(slot_view, field_name))
             if not current or current.casefold() == backup.casefold():
                 return None
-        return {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        warning = {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        return {**warning, "occupancy": "unknown"} if occupancy == "unknown" else warning
 
     async def preview_mapping_bundle(
         self,
@@ -10410,6 +10691,21 @@ class InventoryService:
         if len(disks_by_bmc_slot) < len({disk.slot for disk in disk_records if disk.slot is not None}):
             warnings.append("ESXi controller/enclosure coordinates overlap; ambiguous disks remain unplaced.")
 
+        # The RAID card's drive list is taken as its census only when every
+        # listing configured and run passed the parser's census check; a card
+        # bay it lists no drive in is then empty, as before #1218. A listing
+        # that failed that check or did not answer, or another layout, proves
+        # no absence.
+        drive_lists = ssh_data.esxi_storcli_drive_lists
+        configured_lists = {
+            command for command in map(canonicalize_ssh_command, self.system.ssh.commands)
+            if re.fullmatch(r"storcli /(?:c\d+|call)/eall/sall show all J", command)
+        }
+        storcli_census_complete = (
+            selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+            and bool(drive_lists) and all(drive_lists.values()) and configured_lists <= drive_lists.keys()
+        )
+        listed_slots = {disk.slot for disk in disk_records if disk.slot is not None}
         esxi_topology_members = self._build_esxi_topology_members(disk_records)
         slot_hints = selected_profile.slot_hints or {}
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
@@ -10554,6 +10850,8 @@ class InventoryService:
                     }
             raw_slot_status["mapping_resolution_source"] = resolution.source
             raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
+            if storcli_census_complete and disk is None and slot not in listed_slots and raw_slot_status["present"] is None:
+                raw_slot_status["present"] = False
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -10913,8 +11211,10 @@ class InventoryService:
                 loaded_entries=loaded_mappings,
             )
             ses_candidate = quantastor_ses_candidates.get(slot, {})
+            # Occupancy is unknown until the SES candidate decides it; a
+            # default False here was read as live empty evidence (#1214).
             slot_hints = {
-                "present": False,
+                "present": None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
@@ -10934,9 +11234,18 @@ class InventoryService:
             disk = resolution.disk
             slot_hints["mapping_resolution_source"] = resolution.source
             slot_hints["stale_manual_mapping"] = resolution.stale_manual_mapping
+            # A failed disk match is not an empty report when SES reached this
+            # bay and left occupancy undecided: the final status keeps it
+            # unknown. Without SES, the appliance disk list decides (#1218).
+            occupancy_undecided = (
+                disk is None
+                and bool(ses_candidate)
+                and not isinstance(ses_candidate.get("present"), bool)
+                and not self._slot_has_live_empty_evidence(slot_hints)
+            )
             raw_slot_status = {
-                "present": disk is not None,
-                "status": disk.health if disk else "Empty",
+                "present": None if occupancy_undecided else disk is not None,
+                "status": disk.health if disk else (None if occupancy_undecided else "Empty"),
                 "device_hint": disk.path_device_name if disk else None,
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,
@@ -14193,6 +14502,9 @@ class InventoryService:
                 target[field_name] = ses_candidate[field_name]
         if ses_candidate.get("sas_address_hint"):
             target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
+            target["sas_address_source"] = ses_candidate.get("sas_address_source")
+        if ses_candidate.get("sas_address_conflict") is True:
+            target["sas_address_conflict"] = True
         if ses_candidate.get("sas_device_type"):
             target["sas_device_type"] = ses_candidate.get("sas_device_type")
         if ses_candidate.get("attached_sas_address"):
@@ -14217,7 +14529,12 @@ class InventoryService:
         if isinstance(ses_candidate.get("identify_active"), bool):
             target["identify_active"] = bool(target.get("identify_active")) or ses_candidate.get("identify_active")
         if isinstance(ses_candidate.get("present"), bool):
+            # Occupancy moves as one decision: the value, its source and any
+            # equal-strength conflict. Without the source and conflict a weaker
+            # zero SAS hint is re-read as live empty evidence (#1214).
             target["present"] = ses_candidate.get("present")
+            target["presence_source"] = ses_candidate.get("presence_source")
+            target["presence_conflict"] = ses_candidate.get("presence_conflict") is True
 
     @staticmethod
     def _build_sg_ses_discovery_command() -> str:
@@ -16993,20 +17310,41 @@ class InventoryService:
         # Critical onto every empty slot), and used to fabricate a present
         # drive out of them.
         ses_says_empty_without_disk = raw_present is False and disk is None
+        # SES evidence that leaves occupancy undecided (a truncated AES
+        # descriptor, a condition-only Enclosure Status record) and no resolved
+        # disk: neither occupancy nor a drive is known. A condition code alone
+        # is not a drive fault either, so the bay stays unknown (#1218).
+        ses_presence_unknown_without_disk = (
+            raw_present is None
+            and disk is None
+            and not empty
+            and bool(
+                normalize_text(raw_slot_status.get("ses_device"))
+                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
+            )
+        )
         # `_status_contains` is a substring scan, so the positive presence
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
         # its state was already empty.
-        status_says_populated = self._haystack_contains(
-            status_haystack, "ok", "installed", "ready", "present"
-        ) and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        # A status keyword is no occupancy evidence where SES reached the bay
+        # and its parser left occupancy undecided: `sesutil show` prints `OK`
+        # for a row with no device name.
+        status_says_populated = (
+            not ses_presence_unknown_without_disk
+            and self._haystack_contains(status_haystack, "ok", "installed", "ready", "present")
+            and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        )
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
             or (not ses_says_empty_without_disk and status_says_populated)
         )
+        # Occupancy is known when evidence said occupied or said empty. A
+        # False `present` without empty evidence only means nothing was read.
+        presence_known = present or empty
 
-        if faulty and not ses_says_empty_without_disk:
+        if faulty and not ses_says_empty_without_disk and not ses_presence_unknown_without_disk:
             non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
             non_identify_state = SlotState.empty
@@ -17243,6 +17581,7 @@ class InventoryService:
             enclosure_label=enclosure_meta.get("label") or normalize_text(raw_slot_status.get("enclosure_label")),
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
+            presence_known=presence_known,
             state=state,
             non_identify_state=non_identify_state.value,
             identify_active=identify_active,
@@ -17441,9 +17780,8 @@ class InventoryService:
             # only if the device still reports the shelf it was found on.
             preflight = results[0]
             if not preflight.ok:
-                raise TrueNASAPIError(
-                    "Could not confirm which shelf this bay's enclosure device belongs to: "
-                    + self._led_command_failure_detail(preflight)
+                raise self._led_command_failure(
+                    "Could not confirm which shelf this bay's enclosure device belongs to.", preflight
                 )
             reported = parse_sesutil_map_enclosure_ids(preflight.stdout)
             # The device must still be listed and report the shelf it was found
@@ -17468,9 +17806,7 @@ class InventoryService:
             duration_seconds=action_duration,
         )
         if not action_result.ok:
-            raise TrueNASAPIError(
-                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
-            )
+            raise self._led_command_failure("SSH LED action failed.", action_result)
 
         readback_result = results[1]
         parsed = parse_sesutil_map(readback_result[0].stdout) if readback_result[0].ok else []
@@ -17576,9 +17912,8 @@ class InventoryService:
             ) -> list[str]:
                 for target, preflight in zip(host_targets, results, strict=True):
                     if not preflight.ok:
-                        raise TrueNASAPIError(
-                            "Could not confirm which shelf this bay's enclosure device belongs to: "
-                            + self._led_command_failure_detail(preflight)
+                        raise self._led_command_failure(
+                            "Could not confirm which shelf this bay's enclosure device belongs to.", preflight
                         )
                     if parse_sg_ses_enclosure_logical_id(preflight.stdout) != normalize_text(target.get("enclosure_id")):
                         raise self._led_target_moved(slot_view)
@@ -17597,7 +17932,7 @@ class InventoryService:
                 if failures:
                     # No path was switched: keep the earlier paths' failures visible.
                     raise LedTargetMovedError(
-                        f"{exc} The other enclosure path also failed: " + "; ".join(failures)
+                        f"{exc} The other enclosure path also failed.", reason="; ".join(failures)
                     ) from exc
                 raise
             except LedSessionBusyError:
@@ -17605,7 +17940,7 @@ class InventoryService:
             except TrueNASAPIError as exc:
                 # An ordinary preflight failure leaves this host untouched,
                 # but must not discard a confirmed action on another host.
-                failures.append(str(exc))
+                failures.append(self._led_failure_text(exc))
                 continue
             results = results[len(preflight_commands):]
             # Only a successful locate command counts as switching this bay.
@@ -17629,7 +17964,10 @@ class InventoryService:
                 )
                 if not action_result.ok:
                     failures.append(
-                        f"{target_device}:{target_element}: {self._led_command_failure_detail(action_result)}"
+                        bounded_remote_reason(
+                            f"{target_device}:{target_element}: {self._led_command_failure_detail(action_result)}"
+                        )
+                        or f"{target_element}: exit {action_result.exit_code}"
                     )
                     continue
                 observed = None
@@ -17661,7 +17999,7 @@ class InventoryService:
             # A successful command alone is not partial success: at least one
             # successful path must actually read back the requested state.
             if not any(path["identify_active"] is requested_active for path in paths):
-                raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+                raise TrueNASAPIError("SSH LED action failed.", reason=" | ".join(failures))
             result.update(partial=True, failures=[failure[:240] for failure in failures[:8]])
         return result
 
@@ -17836,9 +18174,7 @@ class InventoryService:
             duration_seconds=duration,
         )
         if not action_result.ok:
-            raise TrueNASAPIError(
-                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
-            )
+            raise self._led_command_failure("SSH LED action failed.", action_result)
         readback_result = results[1][0]
         states = parse_unifi_gpio_debug(readback_result.stdout) if readback_result.ok else {}
         observed = states.get(vendor_slot_number)
@@ -17859,6 +18195,19 @@ class InventoryService:
             or _bounded_middleware_text(result.stdout)
             or f"exit {result.exit_code}"
         )
+
+    @classmethod
+    def _led_command_failure(cls, message: str, result: SSHCommandResult) -> TrueNASAPIError:
+        """A fixed message; the command's output is only the action reason."""
+
+        return TrueNASAPIError(message, reason=cls._led_command_failure_detail(result))
+
+    @staticmethod
+    def _led_failure_text(exc: TrueNASAPIError) -> str:
+        """One path's failure for the action response: the message and its reason."""
+
+        reason = bounded_remote_reason(exc.reason)
+        return f"{str(exc).rstrip('.')}: {reason}" if reason else str(exc)
 
     async def _run_ssh_command(
         self, command: str, host: str | None = None, *, timeout_seconds: float | None = None

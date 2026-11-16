@@ -47,7 +47,7 @@ function loadFunctions(names, context = {}) {
 
 test("a storage-view tooltip names the vdev and the pool member state", () => {
   const { buildStorageViewTooltipLines } = loadFunctions(
-    ["formatSlotHealth", "buildStorageViewTooltipLines"],
+    ["formatSlotHealth", "slotOccupancy", "buildStorageViewTooltipLines"],
     {
       currentPlatform: () => "core",
       persistentIdLabel: () => "GPTID",
