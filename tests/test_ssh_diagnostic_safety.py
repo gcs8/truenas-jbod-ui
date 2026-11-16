@@ -1501,6 +1501,23 @@ def _quantastor_snapshot_service(directory: str, node_a_row: dict[str, Any]) -> 
     return service, contacted
 
 
+def _answer_network_port_list(service: InventoryService, contacted: list[str], ports: list[dict[str, Any]]) -> None:
+    """The node's CLI answers the network port list; every other SSH read is refused."""
+
+    async def answer(commands, host, *, stdin_data=None):
+        del stdin_data
+        contacted.append(host)
+        results = _refused_probe_results(commands)
+        return [
+            SSHCommandResult(command=command, ok=True, stdout=json.dumps(ports), exit_code=0)
+            if "network-port-list" in command
+            else result
+            for command, result in zip(commands, results)
+        ]
+
+    service._run_ssh_commands = AsyncMock(side_effect=answer)
+
+
 def _documentation_addresses(count: int) -> list[str]:
     pool = [f"198.51.100.{index}" for index in range(1, 201)] + [f"203.0.113.{index}" for index in range(1, 201)]
     return pool[:count]
@@ -1721,7 +1738,7 @@ class DiscoveryScaleAndReportedHostTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
         self.assertIn(
             "QuantaStor node address read is incomplete: 256 addresses used, 1 left out at the limit of "
-            "256 per node. The addresses left out were not tried over SSH.",
+            "256 per reported address list. The addresses left out were not tried over SSH.",
             snapshot.warnings,
         )
         self.assertIn("203.0.113.56", contacted)
@@ -1734,6 +1751,69 @@ class DiscoveryScaleAndReportedHostTests(unittest.IsolatedAsyncioTestCase):
                 snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
                 self.assertFalse([w for w in snapshot.warnings if "node address" in w], snapshot.warnings)
                 self.assertLessEqual(set(addresses), set(contacted))
+
+    async def test_address_limit_applies_per_reported_address_list(self) -> None:
+        service, contacted = _quantastor_snapshot_service(
+            self.directory, {"ipAddresses": _documentation_addresses(257)}
+        )
+        _answer_network_port_list(
+            service,
+            contacted,
+            [
+                {"storageSystemId": "node-a", "ipAddress": f"2001:db8::{index:x}", "gateway": "2001:db8::fffe"}
+                for index in range(1, 258)
+            ],
+        )
+        snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+        encoded = json.loads(json.dumps(snapshot.model_dump(mode="json")))
+        self.assertEqual(
+            [warning for warning in encoded["warnings"] if "node address read is incomplete" in warning],
+            [
+                "QuantaStor node address read is incomplete: 512 addresses used, 2 left out at the limit of "
+                "256 per reported address list. The addresses left out were not tried over SSH."
+            ],
+        )
+
+    async def test_reported_address_is_validated_as_reported_at_both_ends(self) -> None:
+        controls = [chr(code) for code in range(0x20)] + ["\x7f"]
+        sources = {"system_row": "node-a.example.test", "gateway_port": "192.0.2.70"}
+
+        async def read(source: str, value: str) -> tuple[list[str], list[str]]:
+            row = {"hostname": value} if source == "system_row" else {}
+            service, contacted = _quantastor_snapshot_service(self.directory, row)
+            if source == "gateway_port":
+                _answer_network_port_list(
+                    service, contacted, [{"storageSystemId": "node-a", "ipAddress": value, "gateway": "192.0.2.1"}]
+                )
+            snapshot = await service.get_sas_fabric_snapshot(force_refresh=True)
+            return json.loads(json.dumps(snapshot.model_dump(mode="json")))["warnings"], contacted
+
+        for source, host in sources.items():
+            for value in (host, f"  {host}", f"{host}  ", f" {host} "):
+                with self.subTest(source=source, control=repr(value)):
+                    warnings, contacted = await read(source, value)
+                    self.assertIn(host, contacted)
+                    self.assertNotIn(REPORTED_ADDRESS_NOT_USABLE_ONE, warnings)
+            for character in controls:
+                for value in (character + host, host + character, f" {character}{host}", f"{host}{character} "):
+                    with self.subTest(source=source, value=repr(value)):
+                        warnings, contacted = await read(source, value)
+                        self.assertIn(REPORTED_ADDRESS_NOT_USABLE_ONE, warnings)
+                        self.assertNotIn(host, contacted)
+
+    def test_host_identity_is_none_for_values_that_are_not_text(self) -> None:
+        identity = InventoryService._normalize_host_identity
+        self.assertEqual(identity("Node-A.Example.Test"), "node-a.example.test")
+        self.assertIsNone(identity(None))
+        for value in (b"node-a.example.test", bytearray(b"node-a.example.test"), memoryview(b"node-a.example.test"), 7):
+            with self.subTest(value_type=type(value).__name__):
+                try:
+                    result = identity(value)
+                    matched = InventoryService._quantastor_hosts_match(value, "node-a.example.test")
+                except Exception as exc:  # noqa: BLE001 - host identity must be total
+                    self.fail(f"host identity raised {type(exc).__name__}")
+                self.assertIsNone(result)
+                self.assertFalse(matched)
 
     def test_gateway_port_hosts_are_read_far_above_real_port_counts(self) -> None:
         ports = [
@@ -1754,7 +1834,7 @@ class DiscoveryScaleAndReportedHostTests(unittest.IsolatedAsyncioTestCase):
             [
                 REPORTED_ADDRESS_NOT_USABLE_ONE,
                 "QuantaStor node address read is incomplete: 256 addresses used, 1 left out at the limit of "
-                "256 per node. The addresses left out were not tried over SSH.",
+                "256 per reported address list. The addresses left out were not tried over SSH.",
             ],
         )
         healthy = TrueNASRawData(

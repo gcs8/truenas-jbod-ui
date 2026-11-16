@@ -48,9 +48,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reported as one even beside successful reads, and its log record lists frames
   by file name, function and line only. An SG device path found by discovery
   is used only in the `/dev/sgN` form, and a QuantaStor-reported node address
-  only when it reads as an IP address or a host name; other values are dropped
-  and counted, never shown. Discovery keeps up to 16,384 SG devices per host
-  (lowest numbers first) and 256 addresses per node; reaching either limit, or
+  only when it reads, as reported, as an IP address or a host name (plain
+  spaces at either end are trimmed; any other whitespace or control character
+  makes it unusable); other values are dropped and counted, never shown.
+  Discovery keeps up to 16,384 SG devices per host (lowest numbers first) and
+  256 addresses per reported address list; reaching either limit, or
   dropping a reported address, is shown in Storage Fabric warnings with the
   counts (#1259).
 - A generated SSH private key is now created with its final `0640` mode

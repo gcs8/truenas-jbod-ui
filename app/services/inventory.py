@@ -636,10 +636,12 @@ def _parse_reported_host(value: str | None) -> str | None:
     """A reported host as an IP address or a host name, lower-cased, else None.
 
     Total: it never raises, never URL-parses and never turns the value into a
-    different host. IPv6 may be bracketed; an IPv6 zone index is refused.
+    different host. IPv6 may be bracketed; an IPv6 zone index is refused. Only
+    plain spaces at either end are trimmed; any other whitespace or control
+    character anywhere makes the value unusable.
     """
 
-    text = normalize_text(value) if isinstance(value, str) else None
+    text = value.strip(" ") if isinstance(value, str) else None
     if not text or len(text) > 255 or not text.isascii() or not text.isprintable():
         return None
     bracketed = text.startswith("[") and text.endswith("]")
@@ -13537,8 +13539,9 @@ class InventoryService:
             return None, 0
         unusable = 0
         for key in ("ipAddress", "ipAddr", "ip", "address", "hostAddress"):
-            text = normalize_value_text(row.get(key))
-            if not text:
+            value = row.get(key)
+            text = "" if value is None else str(value)
+            if not text.strip(" "):
                 continue
             host = _parse_reported_host(text)
             if host is None:
@@ -13642,8 +13645,8 @@ class InventoryService:
                 for item in value:
                     add_host(item)
                 return
-            text = normalize_text(str(value))
-            if not text:
+            text = str(value)
+            if not text.strip(" "):
                 return
             normalized = _parse_reported_host(text)
             if normalized is None:
@@ -13695,7 +13698,8 @@ class InventoryService:
             warnings.append(
                 f"QuantaStor node address read is incomplete: {used_at_limit} "
                 f"{'address' if used_at_limit == 1 else 'addresses'} used, {left_out} left out at the limit "
-                f"of {QUANTASTOR_MAX_REPORTED_HOSTS} per node. The addresses left out were not tried over SSH."
+                f"of {QUANTASTOR_MAX_REPORTED_HOSTS} per reported address list. The addresses left out were not "
+                "tried over SSH."
             )
         return warnings
 
@@ -13707,7 +13711,7 @@ class InventoryService:
         if summary is not None:
             logger.warning(
                 "QuantaStor node host discovery ignored %d values that are not an IP address or DNS name "
-                "and %d beyond the limit of %d per system (operation=quantastor_node_hosts)%s",
+                "and %d beyond the limit of %d per reported address list (operation=quantastor_node_hosts)%s",
                 rejected,
                 beyond_limit,
                 QUANTASTOR_MAX_REPORTED_HOSTS,
@@ -13733,7 +13737,7 @@ class InventoryService:
 
     @staticmethod
     def _normalize_host_identity(value: str | None) -> str | None:
-        host = normalize_text(value)
+        host = normalize_text(value) if isinstance(value, str) else None
         if not host:
             return None
         # A bare address or host name is read directly; only a configured
