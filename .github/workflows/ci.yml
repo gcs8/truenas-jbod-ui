@@ -981,17 +981,59 @@ jobs:
             exit 1
           fi
 
-  public-demo-artifact:
-    name: Checked-in public demo artifact
+  # The fixture-only browser specs run as four parallel legs (#1191). Each leg
+  # runs an explicit spec list with one Playwright worker; the lists are
+  # balanced from measured per-spec times on ubuntu-latest (about 9.5 minutes
+  # of serial browser work each). Every fixture spec under qa/ sits on exactly
+  # one leg: tests/test_ci_browser_legs.py fails on a spec that is on no leg,
+  # on two legs, or on a leg it does not belong to. The required check is the
+  # `public-demo-artifact` job below, which fails unless every leg succeeded.
+  fixture-browser:
+    name: Fixture browser specs (leg ${{ matrix.leg }})
     if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # The UI coverage crawl (qa/ui-coverage.spec.js) adds about 10 minutes to
-    # the fixture-only browser specs; keep headroom over the ~20 minute total.
-    timeout-minutes: 35
+    # The longest leg carries the primary UI coverage crawl
+    # (qa/ui-coverage-primary-crawl.spec.js, about 9 minutes, with its own
+    # 16-minute test timeout); keep headroom over that.
+    timeout-minutes: 25
     needs:
       - route
       - javascript-source
       - python-source
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          # Leg 1 also runs the once-only checks: the checked-in demo
+          # integrity, the public docs and screenshots, and the current-source
+          # demo smoke with the artifact-aware JavaScript unit suite.
+          - leg: "1"
+            smoke: true
+            specs: >-
+              qa/ui-coverage-primary-crawl.spec.js
+              qa/saved-view-selection.spec.js
+          - leg: "2"
+            smoke: false
+            specs: >-
+              qa/ui-coverage.spec.js
+              qa/header-and-disk-path-layout.spec.js
+              qa/connections-clear-selection.spec.js
+              qa/chassis-row-overflow.spec.js
+              qa/upgrade-notice.spec.js
+          - leg: "3"
+            smoke: false
+            specs: >-
+              qa/heatmap-temperature-bands.spec.js
+              qa/ui-a11y-narrow-layout.spec.js
+              qa/ui-scope-safety.spec.js
+          - leg: "4"
+            smoke: false
+            specs: >-
+              qa/admin-draft-target-ownership.spec.js
+              qa/release-contract.spec.js
+              qa/offline-snapshot.spec.js
+              qa/connections-overflow.spec.js
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -1012,9 +1054,11 @@ jobs:
           python -m pip check
 
       - name: Verify checked-in public demo is publishable
+        if: matrix.smoke
         run: python scripts/check_public_demo_artifact.py public-demo
 
       - name: Verify current README, Wiki, and screenshots
+        if: matrix.smoke
         run: |
           python scripts/check_public_docs.py
           python scripts/check_public_screenshots.py
@@ -1035,6 +1079,7 @@ jobs:
       # browser QA runs against a throwaway build of this commit's source. The
       # checked-in bytes are covered by the integrity check above.
       - name: Smoke test current-source public demo and browser fixture
+        if: matrix.smoke
         env:
           PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html
           SLOT_FOCUS_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/index.html
@@ -1071,30 +1116,49 @@ jobs:
       # offline snapshot, or a local app server on a temporary data dir) and
       # need no appliance, so they run on every pull request. The live
       # appliance specs (ui-switching, esxi-smoke) and the private restore spec
-      # stay manual (#445).
+      # stay manual (#445). The spec list comes from this leg's matrix entry.
       - name: Run fixture-only browser specs
         env:
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
           PYTHON: python
+          LEG_SPECS: ${{ matrix.specs }}
         run: |
           set -euo pipefail
-          npx playwright test \
-            qa/admin-draft-target-ownership.spec.js \
-            qa/chassis-row-overflow.spec.js \
-            qa/connections-clear-selection.spec.js \
-            qa/connections-overflow.spec.js \
-            qa/header-and-disk-path-layout.spec.js \
-            qa/heatmap-temperature-bands.spec.js \
-            qa/offline-snapshot.spec.js \
-            qa/release-contract.spec.js \
-            qa/saved-view-selection.spec.js \
-            qa/ui-a11y-narrow-layout.spec.js \
-            qa/ui-coverage.spec.js \
-            qa/ui-scope-safety.spec.js \
-            qa/upgrade-notice.spec.js \
-            --retries=0
+          read -r -a specs <<< "$LEG_SPECS"
+          test "${#specs[@]}" -gt 0
+          for spec in "${specs[@]}"; do
+            test -f "$spec"
+          done
+          npx playwright test "${specs[@]}" --workers=1 --retries=0
           status="$(git status --short)"
           if [ -n "$status" ]; then
             printf '%s\n' "$status"
             exit 1
           fi
+
+      - name: Upload browser report on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fixture-browser-leg-${{ matrix.leg }}-attempt-${{ github.run_attempt }}
+          path: playwright-report/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  public-demo-artifact:
+    name: Checked-in public demo artifact
+    # Runs after the legs whether they passed or failed (not when the run was
+    # cancelled), so this required check turns red when any leg failed, was
+    # cancelled, or was skipped because a job it needs failed. A routed-off
+    # duplicate run still skips it, as before.
+    if: "${{ !cancelled() && needs.route.outputs.run == 'true' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - route
+      - fixture-browser
+    steps:
+      - name: Require every fixture browser leg to succeed
+        env:
+          LEG_RESULT: ${{ needs.fixture-browser.result }}
+        run: test "$LEG_RESULT" = success

@@ -97,6 +97,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_storage_view_smart_batch",
         "test_system_backup",
         "test_system_setup_api_dialect",
+        "test_system_setup_field_ownership",
         "test_truenas_ws",
     ),
     "2": (
@@ -105,6 +106,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_background_refresh_busy_routes",
         "test_background_refresh_deadlines",
         "test_backup_integration",
+        "test_ci_browser_legs",
         "test_ci_contract",
         "test_combined_shelf_upgrade",
         "test_compose_runtime_matrix",
@@ -186,6 +188,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_doc_privacy",
         "test_public_docs_contract",
         "test_release_changelog_coverage",
+        "test_restore_history_schema_gate",
         "test_route_contracts",
         "test_settings_reload",
         "test_slot_detail_store",
