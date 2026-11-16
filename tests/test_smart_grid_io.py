@@ -909,10 +909,13 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
         with trace.capture():
             result = await service.get_slot_smart_summaries(slots, **kwargs)
         trace.report(phase, len(result))
+        self.assert_paired(trace)
+        return result, trace
+
+    def assert_paired(self, trace):
         self.assertEqual(trace.operations["read"], trace.operations["json_load"])
         self.assertEqual(trace.operations["write"], trace.operations["json_dump"])
         self.assertEqual(trace.operations["write"], trace.operations["replace"])
-        return result, trace
 
     def assert_other(self, store, other):
         self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
@@ -1098,24 +1101,30 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             #
             # The scheduled refresh runs beside the request. Its live read is
             # held until the request has answered, so the request provably did
-            # not wait for it, and the refresh cannot be part-way through a
-            # store write while the request's own store I/O is checked.
+            # not wait for it. The store trace stays open until the refresh is
+            # parked at that held read: by then the refresh has finished the
+            # store read it does first and has not begun a write, so no store
+            # operation is part-way through when the pairs are checked.
             api.hold = asyncio.Event()
+            trace = StoreTrace(service.slot_detail_store)
             with patch.object(service, "_schedule_background_smart_refresh",
                               wraps=service._schedule_background_smart_refresh) as scheduled:
-                try:
-                    result, _ = await asyncio.wait_for(
-                        self.grid(service, [snapshot.slots[0].slot], "history-stale", allow_stale_cache=True), 5)
-                except asyncio.TimeoutError:
-                    self.fail("the stale-allowed request waited for the live read")
+                with trace.capture():
+                    try:
+                        result = await asyncio.wait_for(service.get_slot_smart_summaries(
+                            [snapshot.slots[0].slot], allow_stale_cache=True), 5)
+                    except asyncio.TimeoutError:
+                        self.fail("the stale-allowed request waited for the live read")
+                    self.assertEqual(api.calls, 0)
+                    try:
+                        await asyncio.wait_for(api.held.wait(), 5)
+                    except asyncio.TimeoutError:
+                        self.fail("the scheduled refresh did not start a live read")
+                trace.report("history-stale", len(result))
+                self.assert_paired(trace)
                 self.assertEqual(result[0].summary.power_on_hours, 17)
                 self.assertEqual(api.calls, 0)
                 scheduled.assert_called_once()
-                try:
-                    await asyncio.wait_for(api.held.wait(), 5)
-                except asyncio.TimeoutError:
-                    self.fail("the scheduled refresh did not start a live read")
-                self.assertEqual(api.calls, 0)
                 api.hold.set()
                 tasks = list(service._smart_refresh_tasks.values())
                 if tasks:
