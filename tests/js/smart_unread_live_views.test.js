@@ -247,7 +247,7 @@ test("a copyable row offers Copy for an identifier, not for text standing in for
   // The row still shows the text; there is just nothing to copy.
   for (const standIn of ["not read", "Loading..."]) {
     assert.equal(offersCopy(standIn), false, standIn);
-    assert.match(sandbox.kvRow("Namespace NGUID", standIn, true), new RegExp(`<div class="kv-value">${standIn.replace(/\./g, "\\.")}</div>`));
+    assert.ok(sandbox.kvRow("Namespace NGUID", standIn, true).includes(`<div class="kv-value">${standIn}</div>`), standIn);
   }
   assert.equal(offersCopy(""), false);
   assert.equal(sandbox.kvRow("Serial", "SYNTHETIC-0", false).includes("copy-button"), false);
