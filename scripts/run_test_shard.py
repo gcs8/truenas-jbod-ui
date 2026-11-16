@@ -154,6 +154,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_image_upgrade_contract",
         "test_image_upgrade_smoke_safety",
         "test_immutable_deployment",
+        "test_incomplete_refresh_status",
         "test_log_noise",
         "test_logging_config",
         "test_parsers",

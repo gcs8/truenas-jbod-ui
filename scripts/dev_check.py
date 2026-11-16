@@ -197,6 +197,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_schema_version_gate",
             "tests.test_history_service",
             "tests.test_history_smart_metric_failure",
+            "tests.test_incomplete_refresh_status",
             "tests.test_inventory",
             "tests.test_inventory_nested_slot_zero",
             "tests.test_inventory_registry_routes",
