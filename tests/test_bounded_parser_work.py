@@ -9,9 +9,10 @@ count, and no regex may be handed a region that grows with the input.
 
 A few whole-line patterns in the MPR event parser are linear by construction
 (anchored, each quantifier followed by a character outside its class, ending in
-`.+$`, which cannot fail on a single line). The tests name those patterns
-explicitly and charge them by region instead of region squared. Any other
-pattern, including a new one, is still charged as quadratic.
+`.+$` or `.*`, which cannot fail on a single line), and a few are literal
+markers. The tests name those patterns explicitly and charge them by region
+instead of region squared. Any other pattern, including a new one, is still
+charged as quadratic.
 
 The later tests measure the real regex engine as a growth ratio between two
 input sizes, and sweep every pattern in the parser modules (see the section
@@ -65,8 +66,8 @@ from app.services.parsers import (
 from app.services import sas_fabric_parsers
 from app.services.sas_diagnostics import scsi
 from app.services.sas_diagnostics.scsi import MAX_CDB_TEXT_CHARS, decode_scsi_cdb_message
+from app.services.sas_diagnostics.decoder import MAX_DIAGNOSTIC_TEXT_LENGTH
 from app.services.sas_fabric_parsers import (
-    _parse_mpr_sense_message,
     parse_mpr_dmesg_events,
     parse_mpr_expanders,
     parse_mpr_sysctl_locations,
@@ -88,6 +89,13 @@ LINEAR_MPR_LINE_PATTERNS = frozenset(
         r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.+)$",
         r"^(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<rest>.+)$",
         r"error\s+\d+\s*,",
+        # The controller line, its tgt/SMID/loginfo tail (read with fullmatch)
+        # and the literal markers of the sense line.
+        r"^(?P<controller>mpr\d+):\s+(?P<body>.+)$",
+        r"tgt\s+(?P<target>[0-9]+)\s+SMID\s+(?P<smid>[0-9]+)\s+loginfo(?:\s+(?P<loginfo>.*))?",
+        r"SCSI sense:",
+        r"asc:",
+        r"\s\(",
     }
 )
 
@@ -227,7 +235,8 @@ class BoundedWorkAssertions(unittest.TestCase):
         for size in SIZES:
             text = build(size)
             result, meter = measure(module, lambda: parse(text), linear_patterns)
-            self.assertEqual(result, rejected, f"{size}-character input was not rejected")
+            expected = rejected(size) if callable(rejected) else rejected
+            self.assertEqual(result, expected, f"{size}-character input was not rejected")
             if previous_work is not None:
                 self.assertLessEqual(
                     meter.work,
@@ -308,16 +317,19 @@ class MprCdbDecodeWorkTests(BoundedWorkAssertions):
                 "READ(16)",
                 "88 00 00 00 00 00 00 00 00 10 00 00 00 08 00 00",
             ),
+            # The words after the bytes make the first CDB malformed; the
+            # later "CDB:" is not read in its place.
             "TEST UNIT READY. CDB: 00 00 00 00 00 00 and READ(10). CDB: 28": (
                 "TEST UNIT READY",
-                "00 00 00 00 00 00",
+                None,
             ),
         }
         for message, (reported_operation, cdb_hex) in cases.items():
             with self.subTest(message=message):
                 decoded = decode_scsi_cdb_message(message)
                 self.assertEqual(decoded["reported_operation"], reported_operation)
-                self.assertEqual(decoded["cdb_hex"], cdb_hex)
+                self.assertEqual(decoded.get("cdb_hex"), cdb_hex)
+                self.assertEqual(decoded.get("cdb_malformed"), True if cdb_hex is None else None)
 
         for message in ("READ(10) CDB: 28 00", "read(10). CDB: 28 00", "READ(10). CDB:28 00", "(10). CDB: 28"):
             with self.subTest(message=message):
@@ -364,14 +376,87 @@ class MprCdbDecodeWorkTests(BoundedWorkAssertions):
         self.assertEqual(decode_scsi_cdb_message(later), {})
         self.assertEqual(pipeline(later), (1, {}))
 
-    def test_cdb_text_without_a_byte_token_is_not_decoded(self) -> None:
+    def test_cdb_text_without_a_byte_token_is_kept_as_malformed(self) -> None:
         self.assertEqual(decode_scsi_cdb_message("WRITE(10). CDB: 2a 00")["byte_count"], 2)
-        for message in ("WRITE(10). CDB:  ", "WRITE(10). CDB:  \tzz", "WRITE(10). CDB:   ,2a"):
+        self.assertEqual(decode_scsi_cdb_message("WRITE(10). CDB:  "), {})
+        for message, raw in (("WRITE(10). CDB:  \tzz", "zz"), ("WRITE(10). CDB:   ,2a", ",2a")):
             with self.subTest(message=message):
-                self.assertEqual(decode_scsi_cdb_message(message), {})
+                decoded = decode_scsi_cdb_message(message)
+                self.assertEqual(decoded["operation"], "WRITE(10)")
+                self.assertIs(decoded["cdb_malformed"], True)
+                self.assertEqual(decoded["cdb_raw"], raw)
+                self.assertNotIn("cdb_hex", decoded)
         parsed = parse_mpr_dmesg_events("(da0:mpr0:0:1:0): WRITE(10). CDB:  \tzz")
         self.assertEqual(parsed["event_count"], 1)
-        self.assertEqual(dict(parsed["by_controller"]["mpr0"]["operation_counts"]), {})
+        self.assertEqual(dict(parsed["by_controller"]["mpr0"]["operation_counts"]), {"WRITE(10)": 1})
+
+    def test_a_later_cdb_is_not_read_in_place_of_one_outside_the_window(self) -> None:
+        cdb = "28 00 00 00 00 10 00 00 01 00"
+        # Control: a run shorter than the window that ends no operation lets
+        # the search go on to the next "CDB:".
+        control = decode_scsi_cdb_message("A" * 90 + " CDB: 00 then READ(10). CDB: " + cdb)
+        self.assertEqual(control["reported_operation"], "READ(10)")
+        self.assertEqual(control["cdb_hex"], cdb)
+        # A run longer than the window may end an operation that starts before
+        # it, so nothing is decoded, and the later "CDB:" is not read instead.
+        self.assertEqual(decode_scsi_cdb_message("A" * 200 + " CDB: 00 then READ(10). CDB: " + cdb), {})
+        # Separator whitespace that fills the window before a token that is not
+        # a byte is refused too; one character less, the token is inside the
+        # window and the CDB is kept as malformed.
+        self.assertEqual(decode_scsi_cdb_message("WRITE(10). CDB:" + " " * (MAX_CDB_TEXT_CHARS - 1) + "\tzz"), {})
+        inside = decode_scsi_cdb_message("WRITE(10). CDB:" + " " * (MAX_CDB_TEXT_CHARS - 2) + "\tzz")
+        self.assertIs(inside["cdb_malformed"], True)
+        self.assertEqual(inside["cdb_raw"], "zz")
+
+    def test_a_wrong_width_token_at_the_window_edge_keeps_the_cdb_as_malformed(self) -> None:
+        # The byte run ends one character before the window does; the next
+        # token, three digits wide, crosses the edge and is not a byte.
+        edge = decode_scsi_cdb_message("WRITE(10). CDB:   " + "00 " * 340 + "000 00")
+        self.assertIs(edge.get("cdb_malformed"), True)
+        self.assertNotIn("cdb_hex", edge)
+        # A byte in its place carries the run past the window.
+        self.assertEqual(decode_scsi_cdb_message("WRITE(10). CDB:   " + "00 " * 341 + "00"), {})
+
+    def test_operation_before_an_unparsable_separator_keeps_linear_work(self) -> None:
+        # The first "CDB:" has an operation but no byte after it. The decoder's
+        # pattern is matched only at that operation, never searched through
+        # the rest, so the search goes on at the next separator. Measured on
+        # the real regex engine (see "Linear work, measured" below).
+        def build(size: int) -> str:
+            return "(da0:mpr0:0:1:0): READ(10). CDB:x " + "A" * size + " CDB: 00"
+
+        self.assertEqual(decode_scsi_cdb_message(build(8000)), {})
+        growth = _superlinear_growth(decode_scsi_cdb_message, build, 2000)
+        self.assertIsNone(growth, growth)
+
+    def test_the_decoder_reads_the_unbounded_pattern_inside_the_windows(self) -> None:
+        reference = re.compile(
+            r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)"
+        )
+        pieces = (
+            "READ(10)", "WRITE(16)", "TEST UNIT READY", "x", "12", " ", "  ", "\t", ".", ". ", "CDB:", "cdb:",
+            "28", "00", "2a", "zz", "000", "length", "16", "(", ")", "(10)", "\n", "\r", "A", "_", "-", "/",
+        )
+        rng = random.Random(1260)
+        messages = [
+            "(da0:mpr0:0:1:0): READ(10). CDB: 28 00 00 00 00 10 00 00 01 00 length 512 SMID 7 x",
+            "x READ(10). CDB: 28 00 then WRITE(16). CDB: 8a",
+            "READ(10).\tCDB:\t28\r00",
+        ]
+        while len(messages) < 3000:
+            message = ""
+            while len(message) < rng.randint(1, 90):
+                message += rng.choice(pieces)
+            messages.append(message)
+        for message in messages:
+            with self.subTest(message=message):
+                expected = reference.search(message)
+                found = scsi._find_cdb_message(message)
+                if expected is None:
+                    self.assertIsNone(found)
+                else:
+                    assert found is not None
+                    self.assertEqual(found.group("operation", "cdb"), expected.group("operation", "cdb"))
 
     def test_cdb_text_reaching_the_window_end_is_not_decoded(self) -> None:
         cdb = "28 00 00 00 00 10 00 00 01 00"
@@ -383,48 +468,20 @@ class MprCdbDecodeWorkTests(BoundedWorkAssertions):
         self.assertEqual(decode_scsi_cdb_message("WRITE(10). CDB: " + cdb + " " * padding + "\t00 00"), {})
 
 
-# The patterns these parsers used before #1216, kept as the reference for the
-# differential tests below.
-_REFERENCE_CONTROLLER_PATTERN = re.compile(
-    r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-    r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
-)
-_REFERENCE_SENSE_PATTERN = re.compile(
-    r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)"
-)
-_DIFFERENTIAL_TOKENS = (
-    "mpr0:", "mpr1", ":", " ", " ", "  ", "\t", "x", "Y", "tgt", "SMID", "loginfo", "7", "12", "3a",
-    "ab", "g", "SCSI sense:", "asc:", "4b,4", "11,0", ",", "(", ")", "NAK", "MEDIUM ERROR",
-)
-
-
-_DIFFERENTIAL_SPACES = ("", " ", " ", "  ", "\t", " \t ")
-_CONTROLLER_SHAPE = ("mpr0:", " ", "Controller", " ", "x", " ", "tgt", " ", "7", " ", "SMID", " ", "12", " ", "loginfo", " ", "3a")
-_SENSE_SHAPE = ("SCSI sense:", " ", "MEDIUM", " ", "ERROR", " ", "asc:", "11", ",", "0", " ", "(", "x", " ", "y", ")")
-
-
-def _random_line(rng: random.Random, shape: tuple[str, ...]) -> str:
-    """A line of the given shape with pieces randomly dropped, swapped or repeated."""
-
-    pieces: list[str] = []
-    for piece in shape:
-        roll = rng.random()
-        if roll < 0.1:
-            continue
-        if roll < 0.25:
-            piece = rng.choice(_DIFFERENTIAL_SPACES if piece == " " else _DIFFERENTIAL_TOKENS)
-        pieces.append(piece)
-        if rng.random() < 0.05:
-            pieces.append(rng.choice(_DIFFERENTIAL_TOKENS))
-    return "".join(pieces)
-
-
 def _controller_event(text: str):  # noqa: ANN202
     parsed = parse_mpr_dmesg_events(text)
     if not parsed["event_count"]:
         return None
     event = parsed["recent_events"][0]
     return event["source"], event["target"], event["smid"], event["loginfo"]
+
+
+def _reported_text(value: str) -> str:
+    """A text field as the event parser reports it: bounded, marked when cut."""
+
+    if len(value) <= MAX_DIAGNOSTIC_TEXT_LENGTH:
+        return value
+    return f"{value[: MAX_DIAGNOSTIC_TEXT_LENGTH - 3]}..."
 
 
 def _sense_event(text: str):  # noqa: ANN202
@@ -456,95 +513,20 @@ class MprEventLineWorkTests(BoundedWorkAssertions):
 
     def test_sense_message_with_long_interior_whitespace_has_bounded_work(self) -> None:
         shapes = {
-            "no asc": lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " " * size + "Y",
-            "far asc": lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " " * size + "Y asc:11,0 (Z)",
-            "repeated asc": lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " asc:1," * (size // 7),
+            "no asc": (lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " " * size + "Y", (None, None, None)),
+            "far asc": (
+                lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " " * size + "Y asc:11,0 (Z)",
+                lambda size: (_reported_text("X" + " " * size + "Y"), "11,0", "Z"),
+            ),
+            # The first asc: field is read whole; there is no reason.
+            "repeated asc": (
+                lambda size: "(da0:mpr0:0:1:0): SCSI sense: X" + " asc:1," * (size // 7),
+                lambda size: ("X", _reported_text(" asc:".join(["1,"] * (size // 7))), None),
+            ),
         }
-        for name, build in shapes.items():
+        for name, (build, expected) in shapes.items():
             with self.subTest(shape=name):
-                self.assert_fabric_bounded(build, _sense_event, (None, None, None))
-
-    def test_controller_line_matches_the_previous_pattern(self) -> None:
-        rng = random.Random(1216)
-        cases = [
-            "mpr0: Controller reported scsi ioc terminated tgt 180 SMID 142 loginfo 31120302",
-            "mpr0: x  tgt 1 SMID 2 loginfo 3",
-            "mpr0: tgt 1 SMID 2 loginfo 3",
-            "mpr0: x\ttgt\t1\tSMID\t2\tloginfo\tab",
-            "mpr0: x tgt 1 SMID 2 loginfo 3 tgt",
-            "mpr0: x tgt 1 SMID 2 loginfo 3g",
-            "mpr0: xtgt 1 SMID 2 loginfo 3",
-            "mpr0:x",
-            "mpr12: y",
-            "mpr0: x tgt 1 SMID 2 loginfo 3 ",
-            "mpr0:  ",
-            "mpr0: ",
-        ] + [_random_line(rng, _CONTROLLER_SHAPE) for _ in range(4000)]
-        for line in cases:
-            reference = _REFERENCE_CONTROLLER_PATTERN.match(line)
-            with self.subTest(line=line):
-                fields = sas_fabric_parsers._match_mpr_controller_line(line)
-                if reference is None:
-                    self.assertIsNone(fields)
-                else:
-                    assert fields is not None
-                    self.assertEqual(fields["message"].strip(), reference.group("message").strip())
-                    for name in ("controller", "target", "smid", "loginfo"):
-                        self.assertEqual(fields[name], reference.group(name), name)
-
-                # Through the event parser, which strips each line first.
-                stripped = line.strip()
-                reference = _REFERENCE_CONTROLLER_PATTERN.match(stripped)
-                event = _controller_event(stripped) if stripped else None
-                if reference is None:
-                    self.assertIsNone(event)
-                    continue
-                self.assertEqual(
-                    event,
-                    ("controller", reference.group("target"), reference.group("smid"), reference.group("loginfo")),
-                )
-                self.assertEqual(
-                    parse_mpr_dmesg_events(stripped)["recent_events"][0]["message"],
-                    reference.group("message").strip(),
-                )
-
-    def test_sense_message_matches_the_previous_pattern(self) -> None:
-        rng = random.Random(1216)
-        cases = [
-            "SCSI sense: ABORTED COMMAND asc:4b,4 (NAK received)",
-            "SCSI sense: MEDIUM ERROR asc:11,0 (Unrecovered read error) (retry)",
-            "SCSI sense: x asc:1,2 () asc:3,4 (y)",
-            "SCSI sense: x asc:zz asc:3,4 (y)",
-            "SCSI sense: x asc:1,2 ()",
-            "SCSI sense: x asc:1,2 (",
-            "SCSI sense:x  asc:1,2 (y)",
-            "noise SCSI sense: x asc:1,2 (y) SCSI sense: z asc:3,4 (w)",
-        ] + [_random_line(rng, _SENSE_SHAPE) for _ in range(4000)]
-        for message in cases:
-            reference = _REFERENCE_SENSE_PATTERN.search(message)
-            with self.subTest(message=message):
-                parsed = _parse_mpr_sense_message(message)
-                if reference is None or not reference.group("sense").strip():
-                    # An empty sense key is not a well-formed sense message.
-                    self.assertEqual(parsed, {})
-                    continue
-                self.assertEqual(
-                    parsed,
-                    {
-                        "sense": reference.group("sense").strip(),
-                        "sense_key": reference.group("sense").strip().upper(),
-                        "asc": reference.group("asc").lower(),
-                        "reason": reference.group("reason").strip(),
-                    },
-                )
-
-    def test_overlong_sense_message_is_not_decoded(self) -> None:
-        control = _parse_mpr_sense_message("SCSI sense: ABORTED COMMAND asc:4b,4 (NAK received)")
-        self.assertEqual(control["sense_key"], "ABORTED COMMAND")
-        self.assertEqual(_parse_mpr_sense_message("SCSI sense:  asc:4b,4 (NAK received)"), {})
-        self.assertEqual(
-            _parse_mpr_sense_message("SCSI sense: " + "ABORTED COMMAND " * 30 + "asc:4b,4 (NAK received)"), {}
-        )
+                self.assert_fabric_bounded(build, _sense_event, expected)
 
 
 SES_PARSERS = {
@@ -1989,18 +1971,13 @@ _PATTERNS_FROM_CALLERS = {"_ses_input_exceeds_bounds": (1, re.IGNORECASE, "match
 # callers bound them. Each one is pumped through that caller instead of the
 # bare pattern, and each has its own named tests above.
 _CALL_SITE_BOUNDED = {
-    r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)": (
+    r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)": (
         decode_scsi_cdb_message,
-        "matched only inside the windows found around CDB:",
+        "matched only at an operation found in the window before CDB:",
     ),
     r"[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?\.\s+\Z": (
         decode_scsi_cdb_message,
         "searched only in the window before CDB:",
-    ),
-    r"CDB:\s+[0-9a-fA-F][0-9a-fA-F ]*": (decode_scsi_cdb_message, "matched only in the window after CDB:"),
-    r"SCSI sense:\s*(?P<sense>\S.*?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\(": (
-        _parse_mpr_sense_message,
-        "matched only in the window after SCSI sense:",
     ),
     r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)": (
         parse_camcontrol_devlist,
@@ -2088,6 +2065,16 @@ def _regex_sites(module: types.ModuleType) -> list[_RegexSite]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             assigned[id(node.value)] = node.targets[0].id
+    # A pattern compiled from each string of a literal tuple in a comprehension.
+    looped: dict[int, tuple[str | None, ...]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and len(node.generators) == 1:
+            loop = node.generators[0]
+            if isinstance(loop.target, ast.Name) and isinstance(loop.iter, ast.Tuple):
+                for child in ast.walk(node.elt):
+                    first = child.args[0] if _re_call(child) and child.args else None
+                    if isinstance(first, ast.Name) and first.id == loop.target.id:
+                        looped[id(child)] = tuple(_literal_pattern(item) for item in loop.iter.elts)
 
     sites = []
     for node in ast.walk(tree):
@@ -2101,7 +2088,8 @@ def _regex_sites(module: types.ModuleType) -> list[_RegexSite]:
         if function is None:
             continue
         pattern = _literal_pattern(node.args[0])
-        if pattern is None:
+        literals = (pattern,) if pattern is not None else looped.get(id(node), (None,))
+        if None in literals:
             owner = owners.get(id(node))
             if owner is not None and owner.name in _PATTERNS_FROM_CALLERS:
                 continue  # swept at each caller above
@@ -2119,7 +2107,7 @@ def _regex_sites(module: types.ModuleType) -> list[_RegexSite]:
                 methods |= {"search"}
         else:
             methods = frozenset({function})
-        sites.append(_RegexSite(name, node.lineno, pattern, flags, methods))
+        sites.extend(_RegexSite(name, node.lineno, literal, flags, methods) for literal in literals)
     return sites
 
 
