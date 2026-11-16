@@ -14,9 +14,19 @@ candidate, oldest first. The guarantees, in order:
   ``keep_count``; once older than the grace period they become candidates of
   kind ``"unverified"``, listed separately from retention deletions.
 * A (class, location) pair without a rule is left alone entirely.
+* A retention deletion never relies on a kept copy that was not just checked
+  (#1188). Before the first retention deletion of a (class, location) pair,
+  ``apply`` reads back the newest verified kept copy and compares size and
+  SHA-256 with the catalog. One matching copy is enough. A missing or
+  mismatching one is marked unverified, the pair is replanned (only planned
+  items that are still due stay) and the next newest verified copy is tried,
+  at most ``KEEPER_READS_PER_GROUP`` reads per pair, stopping as soon as no
+  deletion remains. A keeper that cannot be checked, or a read budget spent
+  without a match, refuses the location with a named reason.
 
-``LifecycleManager.plan(now)`` is a dry run. ``apply(plan, resolver)`` deletes
-exactly the planned items, tombstoning each in the catalog. A location whose
+``LifecycleManager.plan(now)`` is a dry run that reads only the catalog.
+``apply(plan, resolver)`` deletes at most the planned items, tombstoning each
+in the catalog. A location whose
 target cannot be opened, or whose deletion reports a connection/timeout
 failure, is skipped (recorded in ``ApplyResult.failed_locations``) while the
 other locations are still groomed; any other unexpected error stops the run
@@ -25,6 +35,7 @@ with the partial progress in the result.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from collections.abc import Callable, Iterable, Mapping
@@ -47,8 +58,30 @@ from .errors import describe_error
 
 DEFAULT_UNVERIFIED_GRACE = timedelta(hours=24)
 DEFAULT_ACTOR = "lifecycle"
+_DIGEST_CHUNK = 1024 * 1024
+# Keeper read attempts per (class, location) pair in one apply. Spending them
+# all without a matching keeper refuses the location; it never permits a delete.
+KEEPER_READS_PER_GROUP = 3
+KEEPER_BUDGET_EXHAUSTED = "keeper-check-budget-exhausted"
 
 PlanKind = Literal["retention", "unverified"]
+
+
+class KeeperCheckUnavailable(RuntimeError):
+    """A kept copy's payload could not be checked, so no deletion may rely on it.
+
+    ``reason`` is a fixed code shown in grooming status (never provider text):
+    ``keeper-unverifiable`` (the target offers no way to read the bytes back),
+    ``keeper-unreadable`` (a local copy exists but cannot be read),
+    ``keeper-readback-failed`` (a remote readback did not complete),
+    ``keeper-scratch-capacity`` (no room to stage a remote readback) or
+    ``keeper-check-budget-exhausted`` (the read budget ran out before a kept
+    copy matched).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Kept copy could not be checked ({reason}).")
+        self.reason = reason
 
 
 class GroomableTarget(Protocol):
@@ -67,6 +100,10 @@ class GroomableTarget(Protocol):
 
 
 TargetResolver = Callable[[str], GroomableTarget]
+# Reads a kept copy back and returns its (size, sha256). Raises
+# FileNotFoundError when the copy is gone and KeeperCheckUnavailable when it
+# cannot be checked; reading stops once more than the recorded size arrived.
+PayloadDigest = Callable[[ArtifactRecord, GroomableTarget], tuple[int, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +156,10 @@ class ApplyResult:
     error: str | None = None
     not_attempted: tuple[PlanItem, ...] = ()
     failed_locations: Mapping[str, str] = field(default_factory=dict)
+    # Keepers whose payload was missing or did not match, now marked unverified.
+    downgraded: tuple[ArtifactRecord, ...] = ()
+    # Planned items left in place because the replan after a downgrade keeps them.
+    kept_after_replan: tuple[PlanItem, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -163,6 +204,9 @@ class LifecycleManager:
     catalog: ArtifactCatalog
     rules: Iterable[RetentionRule] = ()
     unverified_grace: timedelta = DEFAULT_UNVERIFIED_GRACE
+    # How apply() reads a kept copy back; None means local_payload_digest,
+    # which checks the local backup directory and refuses every other target.
+    payload_digest: PayloadDigest | None = None
     _rules: dict[tuple[str, str], RetentionRule] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -242,6 +286,77 @@ class LifecycleManager:
             generated_at=now, items=tuple(sorted(items, key=order)), guarded=tuple(sorted(guarded, key=order))
         )
 
+    # -- keeper checks -------------------------------------------------------
+
+    def _newest_keeper(self, records: list[ArtifactRecord], pending: set[str]) -> ArtifactRecord | None:
+        """The newest verified copy that stays after ``pending`` is deleted."""
+
+        return max(
+            (
+                record
+                for record in records
+                if record.verified
+                and record.artifact_id not in pending
+                and not self.catalog.is_deletion_claimed(record.artifact_id)
+            ),
+            key=lambda record: (record.created_at, record.artifact_id),
+            default=None,
+        )
+
+    def _keeper_intact(self, record: ArtifactRecord, target: GroomableTarget) -> bool:
+        digest = self.payload_digest or local_payload_digest
+        try:
+            size, sha256 = digest(record, target)
+        except FileNotFoundError:
+            return False
+        return size == record.size and sha256 == record.sha256
+
+    def _confirm_keepers(
+        self,
+        backup_class: str,
+        location: str,
+        pending: set[str],
+        target: GroomableTarget,
+        planned_at: datetime,
+        downgraded: list[ArtifactRecord],
+    ) -> set[str]:
+        """Find one kept copy that matches; return the planned ids still safe to delete.
+
+        The newest verified copy that stays is read first. If it matches, the
+        check ends and ``pending`` may be deleted. If it is missing or does not
+        match, it is marked unverified (and appended to ``downgraded``), the
+        pair is replanned (which can only shrink ``pending``) and the next
+        newest is tried. The check stops as soon as nothing is left to delete,
+        and after ``KEEPER_READS_PER_GROUP`` reads without a match it raises
+        ``KeeperCheckUnavailable`` so the location is refused.
+        ``KeeperCheckUnavailable`` and connection errors from a read propagate
+        the same way.
+        """
+
+        rule = self._rules.get((backup_class, location))
+        for _attempt in range(KEEPER_READS_PER_GROUP):
+            if not pending:
+                return pending
+            keeper = self._newest_keeper(
+                self.catalog.list(backup_class=backup_class, location=location), pending
+            )
+            if keeper is None:
+                # Nothing checked stays, so nothing may be deleted.
+                return set()
+            if self._keeper_intact(keeper, target):
+                return pending
+            downgraded.append(self.catalog.mark_unverified(keeper.artifact_id))
+            if rule is None:
+                return set()
+            replanned, _guarded = self._plan_group(
+                rule, self.catalog.list(backup_class=backup_class, location=location), planned_at
+            )
+            # Never add a deletion the reviewed plan did not contain.
+            pending = pending & {item.record.artifact_id for item in replanned if item.kind == "retention"}
+        if not pending:
+            return pending
+        raise KeeperCheckUnavailable(KEEPER_BUDGET_EXHAUSTED)
+
     # -- applying ------------------------------------------------------------
 
     def apply(
@@ -262,6 +377,12 @@ class LifecycleManager:
         resolved, or deletion reports a connection/timeout failure, that
         location's items are skipped and the others continue. Any other failure
         releases the claim and stops the run.
+
+        Before the first retention deletion of each (class, location) pair the
+        pair's keepers are read back (see ``_confirm_keepers``). A downgraded
+        keeper can only shrink the set of deletions; a keeper that cannot be
+        checked refuses the whole location with a ``KeeperCheckUnavailable``
+        reason in ``failed_locations``.
         """
 
         clock = now or (lambda: datetime.now(timezone.utc))
@@ -271,6 +392,9 @@ class LifecycleManager:
         failed_locations: dict[str, str] = {}
         first_failure: tuple[PlanItem, str] | None = None
         skipped: list[PlanItem] = []
+        downgraded: list[ArtifactRecord] = []
+        kept: list[PlanItem] = []
+        confirmed: dict[tuple[str, str], set[str]] = {}
         items = list(plan.items)
         for index, item in enumerate(items):
             record = item.record
@@ -283,6 +407,8 @@ class LifecycleManager:
                     error=message,
                     not_attempted=tuple(skipped + items[index + 1 :]),
                     failed_locations=failed_locations,
+                    downgraded=tuple(downgraded),
+                    kept_after_replan=tuple(kept),
                 )
 
             if record.location in failed_locations:
@@ -297,6 +423,35 @@ class LifecycleManager:
                     skipped.append(item)
                     continue
             target = targets[record.location]
+            if item.kind == "retention":
+                group = (record.backup_class, record.location)
+                if group not in confirmed:
+                    pending = {
+                        entry.record.artifact_id
+                        for entry in items
+                        if entry.kind == "retention"
+                        and (entry.record.backup_class, entry.record.location) == group
+                    }
+                    try:
+                        confirmed[group] = self._confirm_keepers(
+                            *group, pending, target, plan.generated_at, downgraded
+                        )
+                    except KeeperCheckUnavailable as exc:
+                        message = str(exc)
+                    except (ConnectionError, TimeoutError) as exc:
+                        message = describe_error(exc)
+                    except Exception as exc:  # noqa: BLE001 - refuse the location, never delete unchecked
+                        message = f"{KeeperCheckUnavailable('keeper-check-failed')} {describe_error(exc)}"
+                    else:
+                        message = None
+                    if message is not None:
+                        failed_locations[record.location] = message
+                        first_failure = first_failure or (item, message)
+                        skipped.append(item)
+                        continue
+                if record.artifact_id not in confirmed[group]:
+                    kept.append(item)
+                    continue
             try:
                 self.catalog.claim_deletion(record, actor=actor, now=clock())
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
@@ -334,6 +489,8 @@ class LifecycleManager:
             error=error,
             not_attempted=tuple(entry for entry in skipped if entry is not failed),
             failed_locations=failed_locations,
+            downgraded=tuple(downgraded),
+            kept_after_replan=tuple(kept),
         )
 
 
@@ -406,6 +563,38 @@ class LocalBackupDirectory:
             raise ValueError("Artifact path is not a regular file.")
         os.unlink(path)
 
+    def digest(self, name: str, *, limit: int) -> tuple[int, str]:
+        """(size, sha256) of a regular file, read in chunks; stops once ``limit`` is exceeded.
+
+        Raises ``FileNotFoundError`` when the file is gone, ``ValueError`` for
+        a path that escapes the root or is not a regular file, and ``OSError``
+        when it cannot be opened or read (a symlink is refused, not followed).
+        """
+
+        path = self._path(name)
+        # O_NONBLOCK: a FIFO planted under a keeper's name must not block the
+        # open before the regular-file check refuses it.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("Artifact path is not a regular file.")
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := os.read(descriptor, _DIGEST_CHUNK):
+                size += len(chunk)
+                if size > limit:
+                    break
+                digest.update(chunk)
+            return size, digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
     def list(self, prefix: str = "") -> list[LocalObject]:
         objects: list[LocalObject] = []
         for directory, dirnames, filenames in os.walk(self.root, followlinks=False):
@@ -426,6 +615,23 @@ class LocalBackupDirectory:
                     )
                 )
         return objects
+
+
+def local_payload_digest(record: ArtifactRecord, target: GroomableTarget) -> tuple[int, str]:
+    """Default ``PayloadDigest``: hash a copy in the local backup directory.
+
+    Any other target cannot be content-verified here and is refused, so a
+    caller that grooms remote locations must supply its own bounded readback.
+    """
+
+    if not isinstance(target, LocalBackupDirectory):
+        raise KeeperCheckUnavailable("keeper-unverifiable")
+    try:
+        return target.digest(record.name, limit=record.size)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise KeeperCheckUnavailable("keeper-unreadable") from exc
 
 
 def local_target_resolver(

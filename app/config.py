@@ -318,6 +318,10 @@ class HANodeConfig(BaseModel):
         return normalized or None
 
 
+MAX_SSH_COMMAND_CHARS = 4096
+MAX_SSH_COMMAND_WORDS = 256
+
+
 class SSHConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -344,6 +348,20 @@ class SSHConfig(BaseModel):
             "sesutil show",
         ]
     )
+
+    @field_validator("commands", mode="after")
+    @classmethod
+    def _bound_commands(cls, value: list[str]) -> list[str]:
+        # Each configured command is split into words and normalized whenever
+        # its output is parsed, so its size is bounded where it is loaded
+        # (#1216). Splitting on whitespace never yields fewer words than the
+        # shell-style split does.
+        for command in value:
+            if len(command) > MAX_SSH_COMMAND_CHARS:
+                raise ValueError(f"An SSH command is longer than {MAX_SSH_COMMAND_CHARS} characters.")
+            if len(command.split()) > MAX_SSH_COMMAND_WORDS:
+                raise ValueError(f"An SSH command has more than {MAX_SSH_COMMAND_WORDS} words.")
+        return value
 
     @field_validator("ha_nodes", mode="after")
     @classmethod

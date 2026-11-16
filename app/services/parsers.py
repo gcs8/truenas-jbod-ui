@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -99,7 +99,7 @@ class ParsedSSHData:
     ses_slot_to_device: dict[int, str] = field(default_factory=dict)
     camcontrol_models: dict[str, str] = field(default_factory=dict)
     camcontrol_controllers: dict[str, str] = field(default_factory=dict)
-    camcontrol_peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    camcontrol_peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
     ses_enclosures: list["SESMapEnclosure"] = field(default_factory=list)
@@ -228,11 +228,45 @@ class MultipathInfo:
     consumers: list[MultipathConsumer] = field(default_factory=list)
 
 
+class CamcontrolPeers(Sequence[str]):
+    """The other aliases a CAM row lists for one device, read from the row.
+
+    Every alias on a row shares one group record instead of holding its own
+    list of the others, so a row with N aliases costs N, not N squared (#1216).
+    It reads and compares like the list it replaces.
+    """
+
+    __slots__ = ("_group", "_key")
+
+    def __init__(self, group: tuple[tuple[str, str], ...], key: str) -> None:
+        self._group = group  # (alias, lower-case alias) in row order
+        self._key = key
+
+    def __iter__(self) -> Iterator[str]:
+        return (alias for alias, lowered in self._group if lowered != self._key)
+
+    def __len__(self) -> int:
+        return sum(1 for _alias, lowered in self._group if lowered != self._key)
+
+    def __getitem__(self, index):  # noqa: ANN001, ANN204
+        return list(self)[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (CamcontrolPeers, list, tuple)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return repr(list(self))
+
+
 @dataclass(slots=True)
 class CamcontrolInfo:
     models: dict[str, str] = field(default_factory=dict)
     controllers: dict[str, str] = field(default_factory=dict)
-    peer_devices: dict[str, list[str]] = field(default_factory=dict)
+    peer_devices: dict[str, Sequence[str]] = field(default_factory=dict)
     # CAM target per device, recorded only under a known controller line. The
     # number is controller-local: the same target on another HBA is another
     # device.
@@ -585,15 +619,47 @@ def parse_glabel_status(output: str) -> GlabelInfo:
         partitions_by_label.setdefault(label.lower(), set()).add(component.lower())
 
     info = GlabelInfo()
+    # A set beside each list, so a provider with many labels is not rescanned
+    # for every row (#1216).
+    listed_labels: dict[str, set[str]] = {}
     for gptid, _component, device in rows:
         if len(partitions_by_label[gptid.lower()]) > 1:
             continue
         info.gptid_to_device[gptid.lower()] = device
         info.device_to_gptid[device.lower()] = gptid
         labels = info.device_to_gptids.setdefault(device.lower(), [])
-        if gptid not in labels:
+        listed = listed_labels.setdefault(device.lower(), set())
+        if gptid not in listed:
+            listed.add(gptid)
             labels.append(gptid)
     return info
+
+
+_CAMCONTROL_DEVICE_LINE_PATTERN = re.compile(
+    r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)"
+)
+
+
+def _match_camcontrol_device_line(line: str) -> re.Match[str] | None:
+    """`_CAMCONTROL_DEVICE_LINE_PATTERN.search(line)` with work linear in the line.
+
+    An unanchored search retried the lazy scan for "target" from every "<", and
+    the device list from every "(" with no ")" after it (#1216). Only the first
+    "<" that has a model before its ">" can start the leftmost match: a later
+    one closes at the same or a later ">", so its search sees a subset of the
+    same text. The match must also end at or before the last ")". So one match
+    at that "<", confined to that end, finds the same match.
+    """
+
+    start = line.find("<")
+    while start >= 0:
+        model_end = line.find(">", start + 1)
+        if model_end < 0:
+            return None
+        if model_end > start + 1:
+            return _CAMCONTROL_DEVICE_LINE_PATTERN.match(line, start, line.rfind(")") + 1)
+        start = line.find("<", model_end + 1)
+    return None
 
 
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
@@ -608,10 +674,7 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             current_controller = normalize_text(bus_match.group("controller"))
             continue
 
-        match = re.search(
-            r"<(?P<model>[^>]+)>.*?target\s+(?P<target>\S+)\s+lun\s+(?P<lun>\S+)\s+\((?P<devices>[^)]+)\)",
-            line,
-        )
+        match = _match_camcontrol_device_line(line)
         if not match:
             continue
 
@@ -641,13 +704,12 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     # Only aliases explicitly listed on one CAM row describe the same device.
     # Model/target/LUN repeats across HBAs do not establish disk identity.
     for devices in device_rows:
-        deduped = list(dict.fromkeys(devices))
-        if len(deduped) < 2:
+        group = tuple((device, device.lower()) for device in dict.fromkeys(devices))
+        # A device has peers when the row names at least one other device.
+        if len({lowered for _device, lowered in group}) < 2:
             continue
-        for device in deduped:
-            peers = [peer for peer in deduped if peer.lower() != device.lower()]
-            if peers:
-                info.peer_devices[device.lower()] = peers
+        for _device, lowered in group:
+            info.peer_devices[lowered] = CamcontrolPeers(group, lowered)
     return info
 
 
@@ -793,11 +855,28 @@ def _add_ses_device_name(slot: SESMapSlot, name: str) -> None:
     slot.device_names.sort(key=_device_name_sort_key)
 
 
-def _ses_input_exceeds_bounds(output: str, element_pattern: str) -> bool:
+def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], bool]) -> bool:
+    """Count element headers line by line, the way the parsers read them.
+
+    A pattern is matched against each stripped line, never the whole output: a
+    `^\\s*` that can cross line breaks rescans every run of blank lines, which
+    made this pre-count quadratic on small malformed output (#1216).
+    """
+
     if len(output) > MAX_SES_OUTPUT_CHARS:
         return True
+    if isinstance(element_line, str):
+        element_line_pattern = re.compile(element_line, re.IGNORECASE)
+
+        def is_element_line(line: str) -> bool:
+            return element_line_pattern.match(line) is not None
+    else:
+        is_element_line = element_line
     element_count = 0
-    for _match in re.finditer(element_pattern, output, re.MULTILINE | re.IGNORECASE):
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or not is_element_line(stripped):
+            continue
         element_count += 1
         if element_count > MAX_SES_ELEMENTS:
             return True
@@ -1827,6 +1906,82 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     return enclosure
 
 
+SG_SES_JOIN_ELEMENT_TYPE_LABEL = "element type:"
+
+
+def _skip_sg_ses_whitespace(line: str, index: int) -> int:
+    while index < len(line) and line[index].isspace():
+        index += 1
+    return index
+
+
+def _scan_sg_ses_signed_decimal(line: str, index: int) -> int | None:
+    if index < len(line) and line[index] == "-":
+        index += 1
+    digits_start = index
+    while index < len(line) and line[index].isdecimal():
+        index += 1
+    return index if index > digits_start else None
+
+
+def _match_sg_ses_join_element_header(
+    line: str,
+    *,
+    require_type: bool = True,
+) -> tuple[str | None, str, str, str] | None:
+    """Recognize `<descriptor> [<subenclosure>,<element>] Element type: <type>`.
+
+    `line` is already stripped. The regex this replaces paired a lazy
+    descriptor with a whitespace run, so a long run of spaces was rescanned
+    from every position (#1216). This scan reads each character a bounded
+    number of times and keeps the same rules: the first bracket that starts the
+    line or follows whitespace and completes a header wins, and the descriptor
+    is everything before it. Returns (descriptor, subenclosure, element, type),
+    or None. With `require_type=False` the type may be missing.
+    """
+
+    bracket = line.find("[")
+    while bracket >= 0:
+        if bracket == 0 or line[bracket - 1].isspace():
+            subenclosure_end = _scan_sg_ses_signed_decimal(line, bracket + 1)
+            element_end = None
+            if subenclosure_end is not None and line.startswith(",", subenclosure_end):
+                element_end = _scan_sg_ses_signed_decimal(line, subenclosure_end + 1)
+            if element_end is not None and line.startswith("]", element_end):
+                label_start = _skip_sg_ses_whitespace(line, element_end + 1)
+                label_end = label_start + len(SG_SES_JOIN_ELEMENT_TYPE_LABEL)
+                if (
+                    label_start > element_end + 1
+                    and line[label_start:label_end].lower() == SG_SES_JOIN_ELEMENT_TYPE_LABEL
+                ):
+                    type_start = _skip_sg_ses_whitespace(line, label_end)
+                    if not require_type or (label_end < type_start < len(line)):
+                        return (
+                            line[:bracket].rstrip() if bracket else None,
+                            line[bracket + 1 : subenclosure_end],
+                            line[subenclosure_end + 1 : element_end],
+                            line[type_start:].rstrip(),
+                        )
+        bracket = line.find("[", bracket + 1)
+    return None
+
+
+def _is_sg_ses_join_element_header(line: str) -> bool:
+    return _match_sg_ses_join_element_header(line) is not None
+
+
+def _starts_with_sg_ses_slot_bracket(lowered: str) -> bool:
+    """`slot<digits><whitespace>[` at the start of a lowercased line, scanned once."""
+
+    if not lowered.startswith("slot"):
+        return False
+    digits_end = 4
+    while digits_end < len(lowered) and lowered[digits_end].isdecimal():
+        digits_end += 1
+    bracket = _skip_sg_ses_whitespace(lowered, digits_end)
+    return digits_end > 4 and bracket > digits_end and lowered.startswith("[", bracket)
+
+
 def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | None:
     """
     Parse `sg_ses --join --filter /dev/sgN` output into slot metadata.
@@ -1837,10 +1992,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     through the same SESMapEnclosure model so AES/EC-only hosts keep working.
     """
 
-    if _ses_input_exceeds_bounds(
-        output,
-        r"^\s*(?:.*?)?\[-?\d+,-?\d+\]\s+Element type:",
-    ):
+    if _ses_input_exceeds_bounds(output, _is_sg_ses_join_element_header):
         return None
 
     ses_device = _extract_sg_ses_device(command)
@@ -1863,13 +2015,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             enclosure.enclosure_id = common_field[1]
             continue
 
-        element_header_match = re.match(
-            r"^(?:(?P<descriptor>.*?)\s+)?"
-            r"\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+"
-            r"Element type:\s+(?P<element_type>.+?)\s*$",
-            stripped,
-            re.IGNORECASE,
-        )
+        element_header_match = _match_sg_ses_join_element_header(stripped)
         if element_header_match:
             _apply_resolved_ses_descriptor_presence(
                 current_slot,
@@ -1886,13 +2032,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             current_slot = None
             descriptor_slot_number = None
             descriptor_presence_evidence = []
-            element_type = normalize_text(element_header_match.group("element_type")) or ""
+            header_descriptor, _subenclosure, header_element, header_type = element_header_match
+            element_type = normalize_text(header_type) or ""
             if not _is_ses_device_slot_type(element_type):
                 continue
-            element_id = int(element_header_match.group("element"))
+            element_id = int(header_element)
             if element_id < 0:
                 continue
-            descriptor = normalize_text(element_header_match.group("descriptor"))
+            descriptor = normalize_text(header_descriptor)
             descriptor_match = re.search(r"\bSlot(?P<slot>\d+)\b", descriptor or "", re.IGNORECASE)
             if descriptor_match:
                 descriptor_slot_number = int(descriptor_match.group("slot"))
@@ -2027,8 +2174,8 @@ def _extract_sg_ses_enclosure_name(output: str) -> str | None:
         if (
             lowered.startswith(stop_prefixes)
             or lowered.startswith(("element type:", "element index:", "overall descriptor:"))
-            or re.match(r"slot\d+\s+\[", lowered)
-            or re.match(r"(?:.*?\s+)?\[-?\d+,-?\d+\]\s+element type:", lowered)
+            or _starts_with_sg_ses_slot_bracket(lowered)
+            or _match_sg_ses_join_element_header(stripped, require_type=False) is not None
         ):
             break
         if lowered.startswith(ignored_prefixes):
@@ -2209,6 +2356,9 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
     slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
     enclosure_ids: dict[str, str] = {}
     ses_device_keys: dict[tuple[str | None, str], str] = {}
+    # Identity candidates by host, with their order (#1216).
+    host_candidate_keys: dict[str | None, list[str]] = {}
+    candidate_positions: dict[str, int] = {}
 
     for enclosure in enclosures:
         key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
@@ -2220,10 +2370,20 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             ):
                 key = None
         if key is None and enclosure.ssh_host:
-            key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
-                        if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
-                                and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
-                        if _ses_enclosures_share_identity(candidate, enclosure)), None)
+            # Only a candidate on another host can match: on this host it would
+            # share the ID or be the device's first record, both looked up above.
+            matches = [
+                match
+                for candidate_host, candidate_keys in host_candidate_keys.items()
+                if candidate_host != enclosure.ssh_host
+                for match in [next((candidate_key for candidate_key in candidate_keys
+                                    if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
+                                            and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
+                                    if _ses_enclosures_share_identity(identity_enclosures[candidate_key], enclosure)),
+                                   None)]
+                if match is not None
+            ]
+            key = min(matches, key=candidate_positions.__getitem__, default=None)
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
             if key in merged:
@@ -2246,6 +2406,8 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             )
             slot_evidence[key] = []
             identity_enclosures[key] = enclosure
+            candidate_positions[key] = len(candidate_positions)
+            host_candidate_keys.setdefault(enclosure.ssh_host, []).append(key)
         target = merged[key]
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
@@ -2544,10 +2706,18 @@ def _merge_control_targets(
     *,
     strict: bool = True,
 ) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    by_pair: dict[tuple[Any, ...], dict[str, Any]] = {}
+    return _add_control_targets([], {}, base + overlay, strict=strict)
+
+
+def _add_control_targets(
+    merged: list[dict[str, Any]],
+    by_pair: dict[tuple[Any, ...], dict[str, Any]],
+    items: list[dict[str, Any]],
+    *,
+    strict: bool = True,
+) -> list[dict[str, Any]]:
     conflicting: set[tuple[Any, ...]] = set()
-    for item in base + overlay:
+    for item in items:
         if not isinstance(item, dict):
             continue
         ssh_host = normalize_text(item.get("ssh_host"))
@@ -2692,8 +2862,11 @@ def _merge_candidate_sas_address(
 def merge_slot_candidate_maps(
     base: dict[int, dict[str, Any]],
     overlay: dict[int, dict[str, Any]],
+    target_index: dict[int, dict[tuple[Any, ...], dict[str, Any]]] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    merged = {slot: dict(payload) for slot, payload in base.items()}
+    # With `target_index` (empty with an empty base at first), base is merged
+    # in place and its targets stay indexed, so no merge redoes earlier ones.
+    merged = base if target_index is not None else {slot: dict(payload) for slot, payload in base.items()}
 
     for slot, payload in overlay.items():
         target = merged.setdefault(slot, {})
@@ -2716,7 +2889,11 @@ def merge_slot_candidate_maps(
             if key == "ses_targets":
                 existing = target.get(key, [])
                 if isinstance(existing, list) and isinstance(value, list):
-                    combined = _merge_control_targets(existing, value, strict=False)
+                    combined = (
+                        _add_control_targets(existing, target_index.setdefault(slot, {}), value, strict=False)
+                        if target_index is not None
+                        else _merge_control_targets(existing, value, strict=False)
+                    )
                     if combined:
                         target[key] = combined
                 continue
@@ -4095,6 +4272,9 @@ def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
     )
 
 
+_SATA_CURRENT_LINK_RATE_PATTERN = re.compile(r"\(current:\s*([^)]+)\)", re.IGNORECASE)
+
+
 def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
@@ -4134,7 +4314,10 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         elif line.startswith("SATA Version is:"):
             value = normalize_text(line.split(":", 1)[1])
             if value:
-                current_match = re.search(r"\(current:\s*([^)]+)\)", value, re.IGNORECASE)
+                # The match ends at a ")", so the search stops at the last
+                # one: with no ")" after it, a whitespace run after "current:"
+                # was retried from every position (#1216).
+                current_match = _SATA_CURRENT_LINK_RATE_PATTERN.search(value, 0, value.rfind(")") + 1)
                 if current_match:
                     negotiated_link_rate = normalize_text(current_match.group(1))
                     value = normalize_text(value[: current_match.start()].rstrip(" ,")) or value
@@ -4383,10 +4566,14 @@ def canonicalize_ssh_command(command: str) -> str:
     if not tokens:
         return command.strip()
 
-    while tokens and tokens[0] == "sudo":
-        tokens.pop(0)
-        while tokens and tokens[0].startswith("-"):
-            tokens.pop(0)
+    # Step over `sudo` and its options with an index and slice once: popping
+    # the front of the list moved every later word each time (#1216).
+    start = 0
+    while start < len(tokens) and tokens[start] == "sudo":
+        start += 1
+        while start < len(tokens) and tokens[start].startswith("-"):
+            start += 1
+    tokens = tokens[start:]
 
     if not tokens:
         return command.strip()
@@ -4505,6 +4692,33 @@ def parse_lsblk_json(output: str) -> list[dict[str, Any]]:
     return [item for item in blockdevices if isinstance(item, dict)]
 
 
+_LSSCSI_TRANSPORT_PATTERN = re.compile(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)")
+_LSSCSI_TRANSPORT_RUN_PATTERN = re.compile(r"[A-Za-z0-9_+-]+")
+_WORD_BOUNDARY_PATTERN = re.compile(r"\b")
+
+
+def _search_lsscsi_transport(detail: str) -> re.Match[str] | None:
+    """`_LSSCSI_TRANSPORT_PATTERN.search(detail)` with work linear in the text.
+
+    The unanchored search started again at every word boundary inside a run of
+    transport characters with no colon after it (`a-a-a-...`), and each start
+    read the rest of the run (#1216). Every start inside one run ends at the
+    same run end, so it succeeds or fails with the first start the word
+    boundary allows. One match there per run finds the same match.
+    """
+
+    for run in _LSSCSI_TRANSPORT_RUN_PATTERN.finditer(detail):
+        if detail[run.end() : run.end() + 1] != ":":
+            continue
+        boundary = _WORD_BOUNDARY_PATTERN.search(detail, run.start(), run.end())
+        if boundary is None or boundary.start() >= run.end():
+            continue
+        match = _LSSCSI_TRANSPORT_PATTERN.match(detail, boundary.start())
+        if match:
+            return match
+    return None
+
+
 def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxScsiDevice]:
     devices: list[LinuxScsiDevice] = []
     line_pattern = re.compile(r"^\[(?P<hctl>[^\]]+)\]\s+(?P<type>\S+)\s+(?P<body>.*)$")
@@ -4536,7 +4750,7 @@ def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxS
         )
 
         if transport:
-            transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
+            transport_match = _search_lsscsi_transport(detail)
             if transport_match:
                 parsed.transport = normalize_text(transport_match.group("transport").lower())
                 parsed.transport_address = normalize_text(transport_match.group("address").rstrip(",;"))
@@ -4608,14 +4822,22 @@ def parse_ubntstorage_json(output: str) -> list[dict[str, Any]]:
     return []
 
 
+_UNIFI_GPIO_LINE_HEAD_PATTERN = re.compile(r"gpio-\d+\s+\(", re.IGNORECASE)
+_UNIFI_GPIO_LINE_PATTERN = re.compile(
+    r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
+    re.IGNORECASE,
+)
+
+
 def parse_unifi_gpio_debug(output: str) -> dict[int, bool]:
     slot_states: dict[int, bool] = {}
-    line_pattern = re.compile(
-        r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
-        re.IGNORECASE,
-    )
     for raw_line in output.splitlines():
-        match = line_pattern.search(raw_line)
+        # Only the first `gpio-N (` can start the leftmost match: a later one
+        # opens after it, so its greedy scan for "|hdd@" sees a subset of the
+        # same text. One match there, instead of a search that rescanned the
+        # rest of the line from every `gpio-N (` (#1216).
+        head = _UNIFI_GPIO_LINE_HEAD_PATTERN.search(raw_line)
+        match = _UNIFI_GPIO_LINE_PATTERN.match(raw_line, head.start()) if head else None
         if not match:
             continue
         if match.group("direction").lower() != "out":
@@ -5063,6 +5285,34 @@ def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[d
     return fallback_rows
 
 
+_STORCLI_PD_SECTION_HEADING_PATTERN = re.compile(r"\bPDs\s+for\s+VD\s+", re.IGNORECASE)
+_STORCLI_PD_SECTION_VD_PATTERN = re.compile(r"\w*")
+
+
+def _collect_storcli_pd_sections(response_data: dict[str, Any]) -> dict[str, list[list[Any]]]:
+    """Each "PDs for VD <n>" section value, indexed once by its VD number.
+
+    The VD loop used to search every response key again for each VD (#1216).
+    A decimal VD number names a section exactly when the word that follows the
+    heading is that number, so one pass over the keys answers every VD, in
+    key order, with the same sections as the per-VD search.
+    """
+
+    sections: dict[str, list[list[Any]]] = {}
+    for key, value in response_data.items():
+        if not isinstance(key, str):
+            continue
+        named: set[str] = set()
+        for heading in _STORCLI_PD_SECTION_HEADING_PATTERN.finditer(key):
+            vd_id = _STORCLI_PD_SECTION_VD_PATTERN.match(key, heading.end()).group(0)
+            if vd_id in named or not (vd_id.isascii() and vd_id.isdigit()):
+                continue
+            named.add(vd_id)
+            if isinstance(value, list):
+                sections.setdefault(vd_id, []).append(value)
+    return sections
+
+
 def _parse_storcli_virtual_drive_response(
     response_data: dict[str, Any],
     *,
@@ -5071,6 +5321,7 @@ def _parse_storcli_virtual_drive_response(
 ) -> list[dict[str, Any]]:
     rows = _collect_storcli_virtual_drive_rows(response_data)
     details_by_vd = _collect_storcli_virtual_drive_details(response_data)
+    pd_sections_by_vd = _collect_storcli_pd_sections(response_data)
     virtual_drives: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -5082,11 +5333,11 @@ def _parse_storcli_virtual_drive_response(
         if vd_id is None:
             vd_id = normalize_text(str(row.get("VD") if row.get("VD") is not None else ""))
         detail = details_by_vd.get(vd_id or "", {})
-        pd_rows = []
-        for key, value in response_data.items():
-            if isinstance(key, str) and re.search(rf"\bPDs\s+for\s+VD\s+{re.escape(vd_id or '')}\b", key, re.IGNORECASE):
-                if isinstance(value, list):
-                    pd_rows.extend(item for item in value if isinstance(item, dict))
+        # Only a decimal VD number names its sections. A row without one is
+        # given no section rather than every section in the response.
+        pd_rows = [
+            item for section in pd_sections_by_vd.get(vd_id or "", ()) for item in section if isinstance(item, dict)
+        ]
         physical_drives = []
         for pd_row in pd_rows:
             enclosure_id, slot, slot_key = _parse_storcli_eid_slot(pd_row.get("EID:Slt") or pd_row.get("EID:Slt "))
@@ -5226,7 +5477,15 @@ def parse_ssh_outputs(
     slot_count: int,
     enclosure_filter: str | None,
     selected_enclosure_id: str | None = None,
+    *,
+    enclosure_sysfs_slots: dict[str, dict[int, list[str]]] | None = None,
 ) -> ParsedSSHData:
+    """Parse one set of SSH command outputs.
+
+    `enclosure_sysfs_slots` is the already parsed host enclosure sysfs map, for
+    a caller that applies one host map to several devices' outputs; it is used
+    instead of any `enclosure sysfs map` output in `outputs`.
+    """
     parsed = ParsedSSHData()
     normalized_outputs: dict[str, str] = {}
 
@@ -5320,11 +5579,12 @@ def parse_ssh_outputs(
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
         # Kernel enclosure-driver hints are keyed by device slot number, so
         # they join the merged bays, not the per-page pre-merge records.
-        enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
-        if enclosure_sysfs_output:
-            enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
-            if enclosure_sysfs_slots:
-                _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
+        if enclosure_sysfs_slots is None:
+            enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
+            if enclosure_sysfs_output:
+                enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
+        if enclosure_sysfs_slots:
+            _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
         for enclosure in parsed.ses_enclosures:
             _flag_degraded_ses_sas_addresses(enclosure)
     if parsed.ses_enclosures or ses_map_output or ses_show_output:
