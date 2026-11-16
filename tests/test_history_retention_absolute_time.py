@@ -1463,14 +1463,17 @@ class RetentionUndecodableTimestampTests(unittest.TestCase):
         self.assertFalse(result["has_more"])
 
     def test_a_rollup_merge_treats_an_undecodable_last_time_like_unreadable_text(self) -> None:
-        # The bucket is kept (rollup retention off); a newer raw sample merges
-        # into it. An existing last time that is not a time keeps its value,
-        # exactly as for the decodable unreadable time.
+        # The bucket is kept (rollup retention off); a raw sample merges into
+        # it. An existing last time that is not a time is older than the
+        # sample's, although its text sorts later, so the sample gives the
+        # last value, exactly as for the decodable unreadable time.
+        merged = "2026-11-03T00:10:00+00:00"
         outcomes = []
         for name, last_observed_at in (("unreadable", UNREADABLE_WINDOW), ("undecodable", UNDECODABLE_WINDOW)):
             with self.subTest(last_observed_at=name):
                 path = self.root / f"merge-{name}.db"
                 store = HistoryStore(str(path))
+                stored = last_observed_at.encode() if isinstance(last_observed_at, str) else last_observed_at
                 with closing(sqlite3.connect(path)) as connection:
                     connection.execute(
                         "INSERT INTO metric_rollups (bucket_start, bucket_seconds, system_id, "
@@ -1478,10 +1481,11 @@ class RetentionUndecodableTimestampTests(unittest.TestCase):
                         "value_min, value_max, last_value, last_observed_at, disk_identity_key) "
                         "VALUES ('2026-11-03T00:00:00+00:00', 3600, ?, 'enc-a', 5, '05', "
                         "'temperature_c', 1, 7, 7, 7, 7, CAST(? AS TEXT), '')",
-                        (SYSTEM_ID, last_observed_at.encode() if isinstance(last_observed_at, str) else last_observed_at),
+                        (SYSTEM_ID, stored),
                     )
                     connection.commit()
-                store.insert_metric_samples([_sample("2026-11-03T00:10:00+00:00", 40)])
+                self.assertGreater(stored, merged.encode())
+                store.insert_metric_samples([_sample(merged, 40)])
 
                 result = self._retain_without_error(store, raw_metric_retention_days=1)
 
@@ -1495,10 +1499,10 @@ class RetentionUndecodableTimestampTests(unittest.TestCase):
                 self.assertEqual(samples, 0)
                 self.assertEqual(result["metric_samples_removed"], 1)
                 self.assertFalse(result["has_more"])
-                self.assertEqual(rows[0][:3], (3600, 2, 7.0))
+                self.assertEqual(rows[0][:3], (3600, 2, 40.0))
                 self.assertEqual(rows[1][:3], (86400, 1, 40.0))
                 outcomes.append(rows[0][3])
-        self.assertEqual(outcomes, [UNREADABLE_WINDOW.encode(), UNDECODABLE_WINDOW])
+        self.assertEqual(outcomes, [merged.encode(), merged.encode()])
 
     def test_an_undecodable_raw_sample_with_a_value_still_fails_its_rollup_as_before(self) -> None:
         # No hourly bucket can be named for it, so its rollup insert fails and
@@ -2168,6 +2172,69 @@ class RetentionSqliteReadableTimeTests(unittest.TestCase):
                             "last_value, last_observed_at FROM metric_rollups ORDER BY bucket_start, bucket_seconds"
                         ).fetchall()
                     self.assertEqual(rollups, [(*row, valued) for row in valued_bucket])
+
+    def test_a_sample_with_only_a_real_value_is_rolled_up(self) -> None:
+        text = "2026-11-03T00:30:00+00:00"
+        path, store = self._store("real-only")
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, slot, "
+                "slot_label, metric_name, value_real) "
+                "VALUES (?, 'synthetic-system', '', 5, '05', 'bytes_read', 3.5)",
+                (text,),
+            )
+            connection.commit()
+
+        self._retain_counters(store, 100)
+
+        self.assertEqual(_rollups(path), [(3600, 1, 3.5, text), (86400, 1, 3.5, text)])
+
+    def test_a_kept_bucket_whose_last_time_sqlite_cannot_read_gives_one_last_value_for_any_batching(self) -> None:
+        # A kept or restored hourly bucket can hold a last time SQLite does
+        # not read. Such a time counts as older than every time SQLite reads,
+        # in the merge as in the rank, so the readable samples decide in time
+        # order however they arrive. The unreadable text sorts after both
+        # samples, between them, or before both.
+        earlier, later = ("2026-11-03T01:29:00+01:00", 1), ("2026-11-02T19:30:00-05:00", 2)
+        self.assertGreater(earlier[0], later[0])
+        arrivals = {
+            "together, batch size 100": ([[earlier, later]], 100),
+            "together, batch size 2": ([[earlier, later]], 2),
+            "together, batch size 1": ([[earlier, later]], 1),
+            "together in the other order, batch size 1": ([[later, earlier]], 1),
+            "earlier then later": ([[earlier], [later]], 100),
+            "later then earlier": ([[later], [earlier]], 100),
+        }
+        forms = {
+            "last": "2026-11-03T01:30:xx+00:00",
+            "between": "2026-11-03T00:30:xx+00:00",
+            "first": "2026-11-02T00:30:xx+00:00",
+        }
+        for form, unreadable in forms.items():
+            with closing(sqlite3.connect(":memory:")) as connection:
+                self.assertIsNone(connection.execute("SELECT julianday(?)", (unreadable,)).fetchone()[0])
+            self.assertEqual(
+                sorted([later[0], earlier[0], unreadable]).index(unreadable),
+                {"first": 0, "between": 1, "last": 2}[form],
+            )
+            for index, (label, (batches, batch_size)) in enumerate(arrivals.items()):
+                with self.subTest(unreadable_text_sorts=form, arrival=label):
+                    path, store = self._store(f"kept-unreadable-{form}-{index}")
+                    with closing(sqlite3.connect(path)) as connection:
+                        connection.execute(
+                            "INSERT INTO metric_rollups (bucket_start, bucket_seconds, system_id, "
+                            "enclosure_key, slot, slot_label, metric_name, sample_count, value_sum, "
+                            "value_min, value_max, last_value, last_observed_at, disk_identity_key) "
+                            "VALUES ('2026-11-03T00:00:00+00:00', 3600, 'synthetic-system', '', 5, '05', "
+                            "'bytes_read', 1, 3, 3, 3, 3, ?, '')",
+                            (unreadable,),
+                        )
+                        connection.commit()
+                    for batch in batches:
+                        self._insert(path, list(batch))
+                        self._retain_counters(store, batch_size)
+
+                    self.assertEqual(_rollups(path), [(3600, 3, 2.0, later[0]), (86400, 2, 2.0, later[0])])
 
 
 class SqliteMillisecondRoundingTests(unittest.TestCase):

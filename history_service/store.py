@@ -3499,12 +3499,21 @@ class HistoryStore:
         can give the last value when its text sorts last. The service writes
         one timestamp format, whose text sorts in time order, and never
         samples one counter twice in a millisecond: only restored or imported
-        text can meet this. A NULL reading on either side falls through to
-        the text.
+        text can meet this.
+
+        Text SQLite does not read (a NULL reading) is older than any text it
+        reads, as NULL sorts in the rank; two such texts compare as text. A
+        raw sample with one has no bucket, so only the last time of a kept
+        or restored bucket can be one, and the first readable sample merged
+        into that bucket replaces it.
         """
 
         day_new, day_old = f"julianday({new})", f"julianday({old})"
-        return f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 ELSE {new} >= {old} END"
+        return (
+            f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 "
+            f"WHEN ({day_new} IS NULL) <> ({day_old} IS NULL) THEN {day_old} IS NULL "
+            f"ELSE {new} >= {old} END"
+        )
 
     @staticmethod
     def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:

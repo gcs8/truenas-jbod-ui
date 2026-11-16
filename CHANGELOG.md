@@ -101,8 +101,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   a non-UTC offset while it is still newer than the retention cutoff, and
   rollups keep the latest counter value across offsets to SQLite's
   millisecond, whatever the batch size. Inside one millisecond the stored
-  text decides, as before. Retention also no longer fails, keeping every
-  row, when a rollup bucket holds a sample without a value (#1247).
+  text decides, as before; a kept bucket whose last time cannot be read
+  takes the first readable sample merged into it. Retention also no longer
+  fails, keeping every row, when a rollup bucket holds a sample without a
+  value (#1247).
 - Changing where a system's reads are configured to go while keeping its
   system ID (its appliance address including any path prefix, the API
   dialect or version where it is part of that address, the platform, the TLS
