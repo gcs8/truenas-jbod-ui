@@ -6311,7 +6311,7 @@ class InventoryService:
             return None
         return self._merge_smart_summary(
             slot_view,
-            SmartSummaryView.model_validate(entry.smart_fields),
+            self._refuse_negative_power_on(SmartSummaryView.model_validate(entry.smart_fields)),
         )
 
     def _build_slot_detail_entry(
@@ -12585,6 +12585,7 @@ class InventoryService:
                 else "SMART data comes from QuantaStor."
             ),
         )
+        self._refuse_negative_power_on(summary)
         if not any(
             value is not None
             for value in (
@@ -12598,10 +12599,12 @@ class InventoryService:
                 summary.transport_protocol,
             )
         ):
-            return self._fallback_smart_summary(
+            fallback = self._fallback_smart_summary(
                 slot_view,
                 "QuantaStor reports this disk but no SMART counters.",
             )
+            fallback.unread_fields = summary.unread_fields
+            return fallback
         return summary
 
     @staticmethod
@@ -17864,6 +17867,15 @@ class InventoryService:
             getattr(summary, field_name) is not None for field_name in SMART_SUMMARY_VALUE_FIELDS
         )
         InventoryService._prune_unread_smart_fields(summary)
+        return summary
+
+    @staticmethod
+    def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:
+        """A negative power-on time is not a reading: drop it and name it not read."""
+        for name in ("power_on_hours", "power_on_days"):
+            if (getattr(summary, name) or 0) < 0:
+                setattr(summary, name, None)
+                summary.unread_fields = sorted({*summary.unread_fields, name})
         return summary
 
     @staticmethod

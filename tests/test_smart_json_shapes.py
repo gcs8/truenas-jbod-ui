@@ -7,9 +7,12 @@ Valid payloads are the controls: they still produce the same readings.
 """
 
 import json
+import tempfile
 import unittest
 from decimal import Decimal
+from pathlib import Path
 
+from app.config import SystemConfig
 from app.models.domain import SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
 from app.services.parsers import (
@@ -18,6 +21,7 @@ from app.services.parsers import (
     parse_nvme_smart_log_summary,
     parse_smartctl_summary,
 )
+from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.ssh_probe import SSHCommandResult
 
 SMART_PARSE_FAILED = "SMART JSON parsing failed."
@@ -1032,6 +1036,83 @@ class RefusedEvidenceTests(unittest.TestCase):
         self.assertIn("transport_protocol", summary.unread_fields)
         summary = self._read({"device": {"protocol": "NVMe"}})
         self.assertEqual((summary.transport_protocol, summary.unread_fields), ("NVMe", []))
+
+
+class NegativePowerOnTimeTests(unittest.TestCase):
+    """A negative power-on time is not a reading, from QuantaStor or from a stored summary.
+
+    The summary carries no power-on hours or days and names the field not read,
+    so the page says it was reported but not read. Zero and real values stay.
+    """
+
+    UNREAD = ["power_on_days", "power_on_hours"]
+
+    def _quantastor(self, **disk: object) -> SmartSummaryView:
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, raw_status={"disk_raw": disk})
+        return InventoryService._build_quantastor_smart_summary(object.__new__(InventoryService), slot)
+
+    def _rebuilt(self, smart_fields: dict) -> SmartSummaryView | None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = object.__new__(InventoryService)
+            service.system = SystemConfig(id="synthetic")
+            service.slot_detail_store = SlotDetailStore(str(Path(directory) / "slot-details.json"))
+            service.slot_detail_store.save_entries([SlotDetailCacheEntry(
+                system_id="synthetic", enclosure_id="enc-1", slot=0, identifiers=["SYNTHETIC-SERIAL"],
+                slot_fields={"serial": "SYNTHETIC-SERIAL"}, smart_fields=smart_fields,
+            )])
+            slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="enc-1",
+                            present=True, serial="SYNTHETIC-SERIAL")
+            return service._build_persisted_smart_summary(slot)
+
+    def test_quantastor_negative_power_on_hours_is_not_read(self) -> None:
+        for value in (-1, "-1", -24.0, "-48 hours"):
+            with self.subTest(value=value):
+                summary = self._quantastor(smartHealthTest="PASSED", powerOnHours=value, bytesWritten=8760)
+                self.assertEqual((summary.power_on_hours, summary.power_on_days), (None, None))
+                self.assertEqual(summary.unread_fields, self.UNREAD)
+                self.assertIsNone(summary.annualized_bytes_written)
+                self.assertEqual((summary.available, summary.smart_health_status), (True, "PASSED"))
+
+    def test_quantastor_negative_power_on_alone_still_names_the_field(self) -> None:
+        summary = self._quantastor(powerOnHours=-1)
+        self.assertEqual((summary.power_on_hours, summary.power_on_days), (None, None))
+        self.assertEqual(summary.unread_fields, self.UNREAD)
+
+    def test_quantastor_zero_and_real_power_on_hours_are_readings(self) -> None:
+        for value, days in ((0, 0), (240, 10), ("48", 2)):
+            with self.subTest(value=value):
+                summary = self._quantastor(smartHealthTest="PASSED", powerOnHours=value)
+                self.assertEqual((summary.power_on_hours, summary.power_on_days), (int(value), days))
+                self.assertEqual(summary.unread_fields, [])
+
+    def test_quantastor_negative_temperature_is_still_a_reading(self) -> None:
+        summary = self._quantastor(smartHealthTest="PASSED", temperature=-5, powerOnHours=10)
+        self.assertEqual((summary.temperature_c, summary.power_on_hours, summary.unread_fields), (-5, 10, []))
+
+    def test_stored_negative_power_on_comes_back_not_read(self) -> None:
+        for fields in ({"power_on_hours": -1, "power_on_days": -1}, {"power_on_hours": -1}):
+            with self.subTest(fields=fields):
+                summary = self._rebuilt({"available": True, **fields})
+                self.assertEqual((summary.power_on_hours, summary.power_on_days), (None, None))
+                self.assertTrue(set(summary.unread_fields) & set(self.UNREAD))
+                self.assertTrue(set(summary.unread_fields) <= set(self.UNREAD))
+
+    def test_stored_negative_days_beside_real_hours_keeps_the_hours(self) -> None:
+        summary = self._rebuilt({"available": True, "power_on_hours": 48, "power_on_days": -1})
+        self.assertEqual((summary.power_on_hours, summary.power_on_days, summary.unread_fields), (48, 2, []))
+
+    def test_stored_zero_and_real_power_on_are_readings(self) -> None:
+        for hours, days in ((0, 0), (321, 13)):
+            with self.subTest(hours=hours):
+                summary = self._rebuilt({"available": True, "power_on_hours": hours, "power_on_days": days})
+                self.assertEqual((summary.power_on_hours, summary.power_on_days, summary.unread_fields),
+                                 (hours, days, []))
+
+    def test_a_later_real_reading_clears_the_marker(self) -> None:
+        refused = self._quantastor(smartHealthTest="PASSED", powerOnHours=-1)
+        read = _summary({"power_on_time": {"hours": 100}})
+        merged = InventoryService._merge_missing_smart_fields(refused, read)
+        self.assertEqual((merged.power_on_hours, merged.power_on_days, merged.unread_fields), (100, 4, []))
 
 
 if __name__ == "__main__":

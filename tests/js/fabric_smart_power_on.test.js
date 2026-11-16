@@ -216,3 +216,21 @@ test("control: reported days are still preferred over hours", () => {
   assert.equal(result.line, `PASSED / ${(1234).toLocaleString()} d`);
   assert.match(result.card, /<em>Power on<\/em>/);
 });
+
+// A negative power-on time is not a reading. The server sends no hours or days
+// and names both not read (the Python tests in test_smart_json_shapes.py check
+// the QuantaStor summary and the stored-summary rebuild send exactly this).
+test("a negative power-on time sent as not read shows not read and no number", () => {
+  const refused = render({ power_on_days: null, power_on_hours: null, unread_fields: ["power_on_days", "power_on_hours"] });
+  assert.equal(refused.power, "");
+  assert.equal(refused.line, "PASSED / power on not read");
+  assert.match(refused.card, /<em>Power on<\/em>not read/);
+  assert.doesNotMatch(`${refused.line} ${refused.card}`, /-\d/);
+  // A raw negative value is still never printed as a lifetime.
+  const raw = render({ power_on_days: -1, power_on_hours: -1 });
+  assert.equal(raw.power, "");
+  assert.doesNotMatch(`${raw.line} ${raw.card}`, /-1 [dh]/);
+  // Controls: zero and a real value stay readings.
+  assert.match(render({ power_on_days: 0, power_on_hours: 0 }).card, /<em>Power on<\/em>0 d/);
+  assert.equal(render({ power_on_days: 10, power_on_hours: 240 }).line, "PASSED / 10 d");
+});

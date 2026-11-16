@@ -149,8 +149,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   large integers in fields with no set range (hours, counters, sizes) are
   still published as reported. A reported but invalid logical block size no
   longer falls back to 512 bytes, and an invalid NVMe rotation rate is no
-  longer shown as SSD. Disk and storage-view details and the SMART tooltip
-  (live and in the saved HTML copy), the live heat map tooltip and Storage
+  longer shown as SSD. A negative power-on time, from QuantaStor or from a
+  saved slot-detail entry, is not read either. Disk and storage-view details
+  and the SMART tooltip (live and in the saved HTML copy), the live heat map
+  tooltip and Storage
   Fabric show `not read` for such a field
   instead of hiding it, showing `n/a` or `0 d`, or filling it from the slot;
   an absent field keeps its existing text, and a summary whose every field
