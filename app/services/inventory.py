@@ -200,6 +200,7 @@ from app.services.truenas_ws import (
     classify_remote_failure,
     is_local_failure_message,
     log_failure,
+    log_identifier,
     normalize_disk_inventory_rows,
 )
 from websockets.exceptions import ConnectionClosed
@@ -2439,7 +2440,7 @@ class InventoryService:
                         self._observe_inventory_snapshot_request("trusted-fallback")
                         logger.warning(
                             "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
-                            cache_key,
+                            log_identifier(cache_key),
                         )
                         return CacheResult(cached, "trusted-fallback")
                     self._observe_inventory_snapshot_request(refresh_trigger)
@@ -2729,8 +2730,7 @@ class InventoryService:
         # older candidate over the newer canonical topology.
         self._touch_snapshot_key(cache_key)
         logger.debug(
-            "Snapshot refresh for %s was superseded by canonical options sequence %s.",
-            cache_key,
+            "Snapshot refresh was superseded by canonical options sequence %s.",
             self._canonical_options_request_sequence,
         )
         return current
@@ -4978,15 +4978,15 @@ class InventoryService:
                 force_refresh=True,
                 invalidate_sg_ses_device_cache=False,
             )
-        except SnapshotStateBusyError:
+        except SnapshotStateBusyError as exc:
             if not _background_refresh_abandoned():
-                logger.exception("Background inventory source refresh failed")
+                logger.exception("Background inventory source refresh failed (reason=%s).", exc.reason, exc_info=False)
             else:
                 # Already reported when it was abandoned (#1125).
                 logger.info("Discarded the late result of an abandoned inventory source refresh.")
             return None
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background inventory source refresh failed")
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background inventory source refresh", exc, level=logging.ERROR)
             return None
 
     def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
@@ -6013,8 +6013,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.scale.fetch_ses_overlay"):
                     scale_ses_data, scale_ses_failures = await self._fetch_scale_ses_overlay()
-            except Exception:
-                logger.exception("Failed to collect SCALE SES diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the API data still stands.
+                log_failure(logger, "SCALE SES diagnostics collection", exc, level=logging.ERROR)
                 scale_ses_failures.append(
                     "TrueNAS SCALE SSH SES rediscovery failed unexpectedly. API disk and pool data is still being used."
                 )
@@ -6043,8 +6043,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.quantastor.fetch_cli_overlay"):
                     quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay(raw_data)
-            except Exception:
-                logger.exception("Failed to collect Quantastor CLI diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the REST data still stands.
+                log_failure(logger, "Quantastor CLI diagnostics collection", exc, level=logging.ERROR)
                 quantastor_cli_failures.append(
                     "Quantastor SSH CLI enrichment failed unexpectedly. REST data is still being used."
                 )
@@ -6066,8 +6066,8 @@ class InventoryService:
             try:
                 with perf_stage("inventory.quantastor.fetch_ses_overlay"):
                     quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay(raw_data)
-            except Exception:
-                logger.exception("Failed to collect Quantastor SES diagnostics")
+            except Exception as exc:  # noqa: BLE001 - the REST and CLI data still stand.
+                log_failure(logger, "Quantastor SES diagnostics collection", exc, level=logging.ERROR)
                 quantastor_ses_failures.append(
                     "Quantastor SSH SES enrichment failed unexpectedly. Available REST and CLI data is still being used."
                 )
@@ -6128,7 +6128,8 @@ class InventoryService:
                 self._snapshot_refresh_tasks.pop(key, None)
 
         task = self._start_background_refresh(
-            f"snapshot {cache_key}",
+            # The label reaches the abandonment warning: the key only through the strict formatter.
+            f"snapshot {log_identifier(cache_key)}",
             self._background_snapshot_refresh(cache_key, default_selection=default_selection),
             unregister=_unregister,
         )
@@ -6143,7 +6144,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                log_failure(logger, f"Background snapshot refresh for {key}", exc)
+                log_failure(logger, "Background snapshot refresh", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -6172,7 +6173,7 @@ class InventoryService:
                 and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
                 and self._snapshot_meets_source_requirement(cache_key, minimum_source_publication)
             ):
-                logger.debug("Background snapshot refresh reused newer publication for %s.", cache_key)
+                logger.debug("Background snapshot refresh reused a newer publication.")
                 self._observe_background_snapshot_refresh("reused", "newer-publication")
                 return
             result = await self._get_snapshot_result(
@@ -6188,18 +6189,19 @@ class InventoryService:
             # stand in. No work is lost: the stale value stays public and the
             # next request schedules another refresh from the newer sources.
             # Not an error (#928, #1169).
-            logger.debug("Background snapshot refresh for %s was superseded (reason=%s).", cache_key, exc.reason)
+            logger.debug("Background snapshot refresh was superseded (reason=%s).", exc.reason)
             self._observe_background_snapshot_refresh("superseded", exc.reason)
         except SnapshotStateBusyError as exc:
             if not _background_refresh_abandoned():
-                logger.exception("Background snapshot refresh failed for %s (reason=%s)", cache_key, exc.reason)
+                # ``reason`` is a fixed token the raising branch set.
+                logger.exception("Background snapshot refresh failed (reason=%s).", exc.reason, exc_info=False)
                 self._observe_background_snapshot_refresh("busy", exc.reason)
             else:
                 # Already reported when it was abandoned (#1125).
-                logger.info("Discarded the late result of an abandoned snapshot refresh for %s.", cache_key)
+                logger.info("Discarded the late result of an abandoned snapshot refresh.")
                 self._observe_background_snapshot_refresh("abandoned", exc.reason)
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background snapshot refresh failed for %s", cache_key)
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background snapshot refresh", exc, level=logging.ERROR)
             self._observe_background_snapshot_refresh("failed", "unexpected")
         finally:
             _snapshot_background_refresh.reset(background_token)
@@ -6240,7 +6242,7 @@ class InventoryService:
                 return
             exc = completed.exception()
             if exc is not None:
-                log_failure(logger, f"Background SMART refresh for {key}", exc)
+                log_failure(logger, "Background SMART refresh", exc)
 
         task.add_done_callback(_cleanup)
 
@@ -6257,8 +6259,8 @@ class InventoryService:
                 allow_stale_cache=False,
                 expected_generation=generation_token,
             )
-        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
-            logger.exception("Background SMART refresh failed for %s", cache_key)
+        except Exception as exc:  # noqa: BLE001 - background refreshes should stay best-effort.
+            log_failure(logger, "Background SMART refresh", exc, level=logging.ERROR)
         finally:
             _smart_detail_batch.reset(token)
 
@@ -7095,7 +7097,12 @@ class InventoryService:
             # Keep the BMC error's structured fields for the authorized route.
             raise
         except Exception as exc:  # noqa: BLE001 - normalize backend failures.
-            raise TrueNASAPIError(str(exc)) from exc
+            # The BMC adapter types every BMC answer; anything else is a local fault.
+            raise TrueNASAPIError(
+                "System locator action failed.",
+                category=INTERNAL_FAILURE_CATEGORY,
+                method="set_uid_active",
+            ) from exc
 
         self.invalidate_snapshot_cache(
             reason="set_system_locator",

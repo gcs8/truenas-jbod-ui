@@ -115,10 +115,13 @@ from app.services.snapshot_export import (
 from app.services.storage_writability import StorageDirectoryUnwritable
 from app.services.tls_context import TlsTrustConfigurationError
 from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
     TrueNASAPIError,
     bounded_remote_reason,
+    classify_remote_failure,
     is_local_failure_message,
     log_failure,
+    log_identifier,
 )
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
@@ -257,14 +260,18 @@ def _smart_remote_http_exception(exc: TrueNASAPIError) -> HTTPException:
     )
 
 
-def _authorized_action_failure_detail(exc: TrueNASAPIError) -> str:
+def _authorized_action_failure_detail(exc: TrueNASAPIError, *, operation: str) -> str:
     """Failure text for a route behind ``require_read_ui_mutation_authorization``.
 
     It adds the remote reason the error keeps apart from its message (bounded,
     without control characters). Only those routes may call this; read routes,
     exports, source status and log lines use the message or a fixed category.
+    A local fault, wrapped or not, gets fixed text and an ERROR record instead.
     """
 
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        log_failure(_routes_logger, operation, exc)
+        return f"{operation} stopped on an internal error; see the service log."
     message = str(exc)
     reason = bounded_remote_reason(getattr(exc, "reason", None))
     if not reason or is_local_failure_message(exc):
@@ -705,7 +712,10 @@ def build_router() -> APIRouter:
                 payload.action.value,
                 exc,
             )
-            raise HTTPException(status_code=400, detail=_authorized_action_failure_detail(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_authorized_action_failure_detail(exc, operation="Locate light action"),
+            ) from exc
         service.schedule_led_snapshot_refresh(enclosure_id=enclosure_id)
         return JSONResponse(
             {
@@ -765,7 +775,10 @@ def build_router() -> APIRouter:
         try:
             return await service.set_system_locator(payload.active)
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=_authorized_action_failure_detail(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_authorized_action_failure_detail(exc, operation="System locator action"),
+            ) from exc
 
     @router.post(
         "/api/slots/{slot}/mapping",
@@ -1143,7 +1156,7 @@ def build_router() -> APIRouter:
             # slot-detail-cache write failure and name the wrong path.
             logger.error(
                 "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
-                enclosure_id,
+                log_identifier(enclosure_id),
                 exc,
                 exc_info=exc,
             )
@@ -1165,7 +1178,7 @@ def build_router() -> APIRouter:
                 logger.error(
                     "SMART batch could not write the slot-detail cache for "
                     "enclosure %s; the data directory is not usable: %s",
-                    enclosure_id,
+                    log_identifier(enclosure_id),
                     exc,
                     exc_info=exc,
                 )

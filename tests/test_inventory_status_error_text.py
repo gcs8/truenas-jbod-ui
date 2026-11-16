@@ -8,9 +8,11 @@ import inspect
 import io
 import json
 import logging
+import re
 import ssl
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,11 +24,13 @@ from websockets.datastructures import Headers
 from websockets.exceptions import InvalidStatus
 from websockets.http11 import Response
 
+from app import logging_config
 from app import main as app_main
 from app import route_support
 from app import routes as app_routes
 from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
+    EnclosureOption,
     InventorySnapshot,
     LedAction,
     LedRequest,
@@ -38,15 +42,22 @@ from app.models.domain import (
     StorageViewRuntimePayload,
     SystemLocatorRequest,
 )
-from app.services.inventory import InventoryService
+from app.services.inventory import (
+    InventoryService,
+    InventorySourceBundle,
+    SnapshotStateBusyError,
+    SupersededSnapshotRefreshError,
+)
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.snapshot_export import SnapshotExportService
+from app.services.parsers import ParsedSSHData
 from app.services.ssh_probe import SSHCommandResult
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import TlsTrustConfigurationError
+from app.services import truenas_ws as truenas_ws_module
 from app.services.truenas_ws import (
     TrueNASAPIError,
     TrueNASRawData,
@@ -54,6 +65,7 @@ from app.services.truenas_ws import (
     build_ddp_error,
     build_jsonrpc_error,
     classify_remote_failure,
+    log_failure,
     normalize_disk_inventory_rows,
 )
 from tests.test_snapshot_export import FakeHistoryBackend, build_request
@@ -656,7 +668,7 @@ class FailureOriginTests(_InventoryFixture):
                 self.assertIn(f"exception={type_name}", record.getMessage())
                 # Stack frames, so the bug can be found; no exception message.
                 self.assertIn("inventory.py", record.getMessage())
-                self.assertIsNone(record.exc_info)
+                self.assertFalse(record.exc_info)
                 self.assertNotIn(PRIVATE_MARKER, logs.text())
                 self.assertNotIn(PRIVATE_MARKER, serialized)
 
@@ -1324,6 +1336,511 @@ class AdapterMessageTests(unittest.IsolatedAsyncioTestCase):
                 refusal = _raised_by(bmc._open_web_session)
         self.assertEqual(str(refusal), "Supermicro BMC rejected the configured username or password.")
         self.assertEqual(classify_remote_failure(refusal)[0], "authentication_failed")
+
+
+# Appliance-chosen identifiers in a cache key: a marker plus terminal controls.
+HOSTILE_IDENTIFIER = PRIVATE_MARKER + "\x1b[31m\n"
+INTERNAL_RECORD_HEADER = "; stack frames, exception message omitted:\n"
+_FRAME_LINE = re.compile(r"  [A-Za-z0-9_.<>-]+:\d+ in [A-Za-z_<>][A-Za-z0-9_<>]*")
+
+
+def _formatted(record: logging.LogRecord) -> str:
+    """The record as both maintained service formatters write it."""
+
+    return "\n".join(
+        (
+            logging_config.JsonFormatter(service_name="synthetic").format(record),
+            logging_config.SafeTextFormatter(service_name="synthetic").format(record),
+        )
+    )
+
+
+def _deep_local_fault(depth: int) -> None:
+    if depth:
+        _deep_local_fault(depth - 1)
+        return
+    raise RuntimeError(PRIVATE_MARKER)
+
+
+class LogOriginTests(_InventoryFixture):
+    """Log lines name fixed operations and structured facts, never remote values."""
+
+    def assert_value_free(self, logs: _RecordedLogs) -> None:
+        for record in logs.records:
+            rendered = record.getMessage() + "\n" + _formatted(record)
+            self.assertNotIn(PRIVATE_MARKER, rendered, rendered)
+            self.assertNotIn("\x1b", rendered, rendered)
+
+    def assert_internal_record(self, record: logging.LogRecord, operation: str, fields: str) -> list[str]:
+        message = record.getMessage()
+        header, _, frames = message.partition(INTERNAL_RECORD_HEADER)
+        self.assertEqual(header, f"{operation} failed (category=internal_error, {fields})")
+        self.assertEqual(record.levelno, logging.ERROR)
+        self.assertFalse(record.exc_info)
+        lines = frames.splitlines()
+        self.assertTrue(lines, message)
+        for line in lines:
+            self.assertRegex(line, _FRAME_LINE)
+        return lines
+
+    async def test_background_callbacks_log_a_fixed_operation_only(self) -> None:
+        service = self._service()
+        smart_key = ("synthetic-status", "core", HOSTILE_IDENTIFIER, 1, (HOSTILE_IDENTIFIER,), ("serial", PRIVATE_MARKER))
+        remote = TrueNASAPIError("pool.query failed (remote error).", category="unreachable", reason=PRIVATE_MARKER)
+
+        def failing(error: BaseException):
+            async def fail(*_args, **_kwargs):
+                raise error
+
+            return fail
+
+        async def run_source(error: BaseException) -> None:
+            with patch.object(service, "_background_source_bundle_refresh", new=failing(error)):
+                task = service._schedule_background_source_bundle_refresh()
+                await asyncio.gather(task, return_exceptions=True)
+                await asyncio.sleep(0)
+
+        labels: list[str] = []
+        start_background_refresh = service._start_background_refresh
+
+        def record_start(label, work, **kwargs):
+            labels.append(label)
+            return start_background_refresh(label, work, **kwargs)
+
+        async def run_snapshot(error: BaseException) -> None:
+            with (
+                patch.object(service, "_background_snapshot_refresh", new=failing(error)),
+                patch.object(service, "_start_background_refresh", new=record_start),
+            ):
+                service._schedule_background_snapshot_refresh(HOSTILE_IDENTIFIER)
+                await asyncio.gather(service._snapshot_refresh_tasks[HOSTILE_IDENTIFIER], return_exceptions=True)
+                await asyncio.sleep(0)
+
+        async def run_smart(error: BaseException) -> None:
+            with patch.object(service, "_background_refresh_smart_summary", new=failing(error)):
+                service._schedule_background_smart_refresh(smart_key, self._smart_slot())
+                await asyncio.gather(service._smart_refresh_tasks[smart_key], return_exceptions=True)
+                await asyncio.sleep(0)
+
+        cases = (
+            ("Background inventory source refresh", run_source),
+            ("Background snapshot refresh", run_snapshot),
+            ("Background SMART refresh", run_smart),
+        )
+        for operation, run in cases:
+            with self.subTest(operation=operation, origin="internal"):
+                with _RecordedLogs() as logs:
+                    await run(RuntimeError(PRIVATE_MARKER))
+                records = logs.matching(f"{operation} failed")
+                self.assertEqual(len(records), 1, logs.text())
+                self.assert_internal_record(records[0], operation, "exception=RuntimeError")
+                self.assert_value_free(logs)
+            with self.subTest(operation=operation, origin="remote"):
+                with _RecordedLogs() as logs:
+                    await run(remote)
+                records = logs.matching(f"{operation} failed")
+                self.assertEqual(len(records), 1, logs.text())
+                self.assertEqual(
+                    records[0].getMessage(),
+                    f"{operation} failed (category=unreachable, exception=TrueNASAPIError)",
+                )
+                self.assert_value_free(logs)
+        # The refresh label, which the abandonment warning prints, holds no raw key.
+        self.assertEqual(labels, ["snapshot (unlisted)", "snapshot (unlisted)"])
+
+    async def test_background_refresh_catch_alls_log_fixed_operations(self) -> None:
+        service = self._service()
+        smart_key = ("synthetic-status", "core", HOSTILE_IDENTIFIER, 1, (HOSTILE_IDENTIFIER,), ("serial", PRIVATE_MARKER))
+        with _RecordedLogs() as logs:
+            with patch.object(
+                service,
+                "_schedule_background_source_bundle_refresh",
+                side_effect=RuntimeError(PRIVATE_MARKER),
+            ):
+                await service._background_snapshot_refresh(HOSTILE_IDENTIFIER)
+            with patch.object(
+                service,
+                "_get_slot_smart_summary_for_slot_view",
+                new=AsyncMock(side_effect=RuntimeError(PRIVATE_MARKER)),
+            ):
+                await service._background_refresh_smart_summary(smart_key, self._smart_slot(), (0, 0, 0))
+            with patch.object(
+                service,
+                "_get_inventory_source_bundle",
+                new=AsyncMock(side_effect=RuntimeError(PRIVATE_MARKER)),
+            ):
+                self.assertIsNone(await service._background_source_bundle_refresh())
+        for operation in (
+            "Background snapshot refresh",
+            "Background SMART refresh",
+            "Background inventory source refresh",
+        ):
+            records = logs.matching(f"{operation} failed")
+            self.assertEqual(len(records), 1, logs.text())
+            self.assert_internal_record(records[0], operation, "exception=RuntimeError")
+        self.assert_value_free(logs)
+
+        # Expected local outcomes keep their own reason token and no key.
+        with _RecordedLogs() as logs:
+            for error in (SnapshotStateBusyError(reason="invalidated"), SupersededSnapshotRefreshError()):
+                with patch.object(service, "_schedule_background_source_bundle_refresh", side_effect=error):
+                    await service._background_snapshot_refresh(HOSTILE_IDENTIFIER)
+            with patch.object(
+                service,
+                "_get_inventory_source_bundle",
+                new=AsyncMock(side_effect=SnapshotStateBusyError(reason="invalidated")),
+            ):
+                await service._background_source_bundle_refresh()
+        messages = [record.getMessage() for record in logs.records]
+        self.assertIn("Background snapshot refresh failed (reason=invalidated).", messages)
+        self.assertIn("Background snapshot refresh was superseded (reason=newer-topology).", messages)
+        self.assertIn("Background inventory source refresh failed (reason=invalidated).", messages)
+        self.assertTrue(all(not record.exc_info for record in logs.records), messages)
+        self.assert_value_free(logs)
+
+    async def test_overlay_catch_alls_log_internal_errors_without_their_message(self) -> None:
+        cases = (
+            ("scale", ("_fetch_scale_ses_overlay",), ("SCALE SES diagnostics collection",)),
+            (
+                "quantastor",
+                ("_fetch_quantastor_cli_overlay", "_fetch_quantastor_ses_overlay"),
+                ("Quantastor CLI diagnostics collection", "Quantastor SES diagnostics collection"),
+            ),
+        )
+        for platform, overlays, operations in cases:
+            with self.subTest(platform=platform):
+                service = self._service(platform=platform)
+                service.system = service.system.model_copy(
+                    update={"ssh": SSHConfig(enabled=True, host="source.example.test", user="svcuser")}
+                )
+                service.ssh_probe.run_planned_commands = AsyncMock(return_value=[])
+                with _RecordedLogs() as logs:
+                    with (
+                        patch.object(service, overlays[0], new=AsyncMock(side_effect=RuntimeError(PRIVATE_MARKER))),
+                        patch.object(
+                            service,
+                            overlays[-1],
+                            new=AsyncMock(side_effect=RuntimeError(PRIVATE_MARKER)),
+                        ),
+                    ):
+                        await service._collect_inventory_source_bundle()
+                for operation in operations:
+                    records = logs.matching(f"{operation} failed")
+                    self.assertEqual(len(records), 1, logs.text())
+                    self.assert_internal_record(records[0], operation, "exception=RuntimeError")
+                self.assert_value_free(logs)
+
+    async def test_layout_guard_logs_an_internal_error_without_its_message(self) -> None:
+        cases = (
+            (RuntimeError(HOSTILE_IDENTIFIER), "internal"),
+            (TrueNASAPIError("pool.query failed (remote error).", category="unreachable", reason=PRIVATE_MARKER), "remote"),
+        )
+        for error, origin in cases:
+            with self.subTest(origin=origin):
+                service = AsyncMock()
+                service.get_snapshot.side_effect = error
+                with _RecordedLogs() as logs, self.assertRaises(HTTPException) as raised:
+                    await route_support.resolve_layout_slots(service, "synthetic-enclosure")
+                self.assertEqual(raised.exception.status_code, 503)
+                self.assertEqual(raised.exception.detail, route_support.ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
+                records = logs.matching("Slot bounds layout read failed")
+                self.assertEqual(len(records), 1, logs.text())
+                if origin == "internal":
+                    self.assert_internal_record(records[0], "Slot bounds layout read", "exception=RuntimeError")
+                else:
+                    self.assertEqual(records[0].levelno, logging.DEBUG)
+                    self.assertEqual(
+                        records[0].getMessage(),
+                        "Slot bounds layout read failed (category=unreachable, exception=TrueNASAPIError)",
+                    )
+                self.assert_value_free(logs)
+
+    async def test_trusted_fallback_warning_names_only_a_well_formed_enclosure_id(self) -> None:
+        for enclosure_id, shown in (("node-a", "node-a"), (HOSTILE_IDENTIFIER, "(unlisted)")):
+            with self.subTest(shown=shown):
+                service = self._service(platform="quantastor")
+                trusted = InventorySnapshot(
+                    slots=[self._smart_slot()],
+                    refresh_interval_seconds=30,
+                    selected_system_id=service.system.id,
+                    selected_system_platform="quantastor",
+                    selected_enclosure_id=enclosure_id,
+                    enclosures=[EnclosureOption(id=enclosure_id, label="Node A")],
+                    platform_context={"topology_complete": True},
+                )
+                incomplete = InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id=service.system.id,
+                    selected_system_platform="quantastor",
+                    selected_enclosure_id=enclosure_id,
+                    platform_context={"topology_complete": False},
+                )
+                service._cache[enclosure_id] = trusted
+                service._cache_until[enclosure_id] = datetime.now(timezone.utc) - timedelta(seconds=1)
+                service._source_bundle = InventorySourceBundle(
+                    raw_data=TrueNASRawData(enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[]),
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+                service._source_bundle_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+                service._build_snapshot = AsyncMock(return_value=incomplete)
+                with _RecordedLogs() as logs:
+                    result = await service._get_snapshot_result(force_refresh=True, selected_enclosure_id=enclosure_id)
+                self.assertEqual(result.cache_state, "trusted-fallback")
+                self.assertIn(
+                    f"Preserving previously trusted snapshot for {shown} because the refreshed topology is incomplete.",
+                    [record.getMessage() for record in logs.records],
+                )
+                self.assert_value_free(logs)
+
+    async def test_smart_batch_storage_error_names_only_a_well_formed_enclosure_id(self) -> None:
+        route = self._route("/api/slots/smart-batch", "POST")
+        for enclosure_id, shown in (("shelf-a", "shelf-a"), (HOSTILE_IDENTIFIER, "(unlisted)")):
+            with self.subTest(shown=shown):
+                service = MagicMock()
+                service.system = SystemConfig(id="synthetic-route", truenas=TrueNASConfig(platform="core"))
+                service.get_slot_smart_summaries = AsyncMock(side_effect=PermissionError(errno.EACCES, "Permission denied"))
+                registry = MagicMock()
+                registry.get_service.return_value = service
+                with (
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "resolve_read_layout_slots", new=AsyncMock(return_value=(None, "verified"))),
+                    patch.object(app_routes, "add_perf_metadata"),
+                    _RecordedLogs() as logs,
+                    self.assertRaises(HTTPException) as raised,
+                ):
+                    await route(payload=SmartBatchRequest(slots=[0]), system_id=None, enclosure_id=enclosure_id, fresh=False)
+                self.assertEqual(raised.exception.status_code, 500)
+                records = logs.matching("SMART batch could not write the slot-detail cache")
+                self.assertEqual(len(records), 1, logs.text())
+                self.assertIn(f"for enclosure {shown}; the data directory", records[0].getMessage())
+                self.assert_value_free(logs)
+
+    def test_log_identifier_admits_only_bounded_plain_identifiers(self) -> None:
+        log_identifier = getattr(truenas_ws_module, "log_identifier", None)
+        self.assertIsNotNone(log_identifier, "the one strict identifier formatter")
+        for value in ("shelf-a", "__service_no_enclosure__", "5003048001c1043f", "/dev/ses0", "a" * 96):
+            with self.subTest(value=value[:12]):
+                self.assertEqual(log_identifier(value), value)
+        for value in ("a" * 97, "", " shelf", "shelf a", "shelf\n", "shelf\x1b[31m", "sh\u00e9lf", "-shelf", None, 5):
+            with self.subTest(value=repr(value)[:12]):
+                self.assertEqual(log_identifier(value), "(unlisted)")
+
+    def test_internal_error_frames_are_bounded_base_names(self) -> None:
+        error = _raised_by(lambda: _deep_local_fault(40))
+        target = logging.getLogger("tests.synthetic_internal")
+        with _RecordedLogs() as logs:
+            log_failure(target, "Synthetic read", error)
+        self.assertEqual(len(logs.records), 1)
+        lines = self.assert_internal_record(logs.records[0], "Synthetic read", "exception=RuntimeError")
+        self.assertEqual(len(lines), 20)
+        # The innermost frames are kept: the raise site comes last.
+        self.assertTrue(lines[-1].endswith(" in _deep_local_fault"), lines[-1])
+        rendered = logs.text() + _formatted(logs.records[0])
+        self.assertNotIn("/", rendered.split(INTERNAL_RECORD_HEADER, 1)[1])
+        self.assertNotIn("raise RuntimeError", rendered)
+        self.assert_value_free(logs)
+
+        # A local fault wrapped by an adapter is listed by its own frames.
+        wrapped = self._error_with_cause(PermissionError(errno.EACCES, PRIVATE_MARKER))
+        wrapped.category = "internal_error"
+        with _RecordedLogs() as logs:
+            log_failure(target, "Synthetic read", wrapped, level=logging.DEBUG)
+        self.assertEqual(len(logs.records), 1)
+        lines = self.assert_internal_record(
+            logs.records[0],
+            "Synthetic read",
+            "errno=13, exception=TrueNASAPIError, cause=PermissionError",
+        )
+        self.assertTrue(any(line.endswith(" in _error_with_cause") for line in lines), lines)
+        self.assert_value_free(logs)
+
+    def test_failure_log_fields_ignore_linked_exception_text(self) -> None:
+        cause = ValueError(PRIVATE_MARKER)
+        cause.__context__ = KeyError(PRIVATE_MARKER)
+        error = TrueNASAPIError(
+            "pool.query failed (remote error).",
+            category="remote_error",
+            reason=PRIVATE_MARKER,
+            method="pool.query",
+            errname="EINVAL",
+        )
+        error.__cause__ = cause
+        target = logging.getLogger("tests.synthetic_remote")
+        with _RecordedLogs() as logs:
+            log_failure(target, "Synthetic read", error)
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            ["Synthetic read failed (category=remote_error, method=pool.query, errname=EINVAL, exception=TrueNASAPIError)"],
+        )
+        self.assert_value_free(logs)
+
+
+class WrappedLocalFaultTests(_InventoryFixture):
+    """A category local code sets survives wrapping, in read and action paths."""
+
+    INTERNAL_ACTION_DETAIL = "System locator action stopped on an internal error; see the service log."
+
+    def _bmc(self) -> SupermicroBMCService:
+        return SupermicroBMCService(
+            BMCConfig(enabled=True, host="bmc.example.test", username="synthetic-user", password="***")
+        )
+
+    def _bmc_calls(self, service: SupermicroBMCService, opener: _FakeOpener):
+        return (
+            ("redfish", lambda: service._redfish_get_json("/redfish/v1/Systems/1")),
+            ("web", lambda: service._fetch_web_text(opener, "https://bmc.example.test/cgi/url_redirect.cgi")),
+            (
+                "post",
+                lambda: service._post_web_text(
+                    opener, "/cgi/op.cgi", {"op": "misc_uid"}, csrf="synthetic", referer="https://bmc.example.test/"
+                ),
+            ),
+        )
+
+    def test_bmc_adapter_keeps_a_local_os_error_internal(self) -> None:
+        for errno_value, expected in ((errno.EACCES, "internal_error"), (errno.ECONNREFUSED, "unreachable")):
+            local = OSError(errno_value, PRIVATE_MARKER)
+            service = self._bmc()
+            opener = _FakeOpener(error=local)
+            with patch.object(service, "_build_https_opener", return_value=opener):
+                for name, call in self._bmc_calls(service, opener):
+                    with self.subTest(call=name, expected=expected):
+                        error = _raised_by(call)
+                        self.assertIsInstance(error, TrueNASAPIError)
+                        self.assertEqual(classify_remote_failure(error)[0], expected)
+                        self.assertNotIn(PRIVATE_MARKER, str(error))
+                        if expected == "internal_error":
+                            # A local fault has no remote reason to show anyone.
+                            self.assertIsNone(error.reason)
+                            with _RecordedLogs() as logs:
+                                log_failure(logging.getLogger("tests.synthetic_bmc"), "BMC read", error)
+                            self.assertEqual(len(logs.records), 1)
+                            self.assertEqual(logs.records[0].levelno, logging.ERROR)
+                            self.assertIn("errno=13", logs.records[0].getMessage())
+                            self.assertIn(INTERNAL_RECORD_HEADER, logs.records[0].getMessage())
+                            self.assertNotIn(PRIVATE_MARKER, logs.text())
+                        else:
+                            # Control: a transport failure keeps its bounded reason.
+                            self.assertTrue(error.reason)
+
+    def test_bmc_inventory_reports_a_local_fault_as_internal(self) -> None:
+        service = self._bmc()
+        opener = _FakeOpener(error=PermissionError(errno.EACCES, PRIVATE_MARKER))
+        with (
+            patch.object(service, "_build_https_opener", return_value=opener),
+            patch.object(service, "_populate_redfish_simple_storage_fallback"),
+            _RecordedLogs() as logs,
+        ):
+            inventory = service.fetch_inventory()
+        self.assertEqual(
+            inventory.warnings,
+            [
+                "BMC Redfish inventory stopped on an internal error; see the service log.",
+                "BMC web inventory stopped on an internal error; see the service log.",
+            ],
+        )
+        for operation in ("BMC Redfish inventory", "BMC web inventory"):
+            records = logs.matching(f"{operation} failed (category=internal_error")
+            self.assertEqual(len(records), 1, logs.text())
+            self.assertEqual(records[0].levelno, logging.ERROR)
+            self.assertIn(INTERNAL_RECORD_HEADER, records[0].getMessage())
+        self.assertNotIn(PRIVATE_MARKER, logs.text() + json.dumps(inventory.warnings))
+
+    async def test_quantastor_source_reports_a_local_fault_as_internal(self) -> None:
+        client = QuantastorRESTClient(
+            TrueNASConfig(
+                host="http://source.example.test",
+                platform="quantastor",
+                api_user="synthetic-user",
+                api_password="synthetic-password",
+            )
+        )
+        for cause, expected in (
+            (PermissionError(errno.EACCES, PRIVATE_MARKER), "collection stopped on an internal error; see the service log."),
+            (ConnectionRefusedError(errno.ECONNREFUSED, PRIVATE_MARKER), "could not be reached."),
+        ):
+            with self.subTest(cause=type(cause).__name__):
+                with patch("app.services.quantastor_api.urlopen_with_tls_config", side_effect=cause):
+                    wrapped = _raised_by(lambda: client._request_json("storageSystemEnum"))
+                service = self._service(platform="quantastor", api_error=wrapped)
+                with _RecordedLogs() as logs:
+                    bundle = await service._collect_inventory_source_bundle()
+                message = bundle.sources["api"].message
+                self.assertTrue(message.endswith(expected), message)
+                records = logs.matching("Platform API collection failed")
+                self.assertEqual(len(records), 1, logs.text())
+                self.assertEqual(records[0].levelno, logging.ERROR)
+                self.assertEqual(INTERNAL_RECORD_HEADER in records[0].getMessage(), isinstance(cause, PermissionError))
+                self.assertNotIn(PRIVATE_MARKER, logs.text() + message)
+
+    async def _locator_post(self, error: BaseException) -> tuple[HTTPException, _RecordedLogs]:
+        service = self._service(bmc_error=TrueNASAPIError("synthetic"))
+        assert service.bmc_service is not None
+        service.bmc_service.set_uid_active.side_effect = error
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        route = self._route("/api/system-locator", "POST")
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
+            _RecordedLogs() as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await route(payload=SystemLocatorRequest(active=True), system_id=None)
+        return raised.exception, logs
+
+    async def test_locator_action_shows_typed_reasons_and_hides_local_faults(self) -> None:
+        bmc = self._bmc()
+        refusal = HTTPError(
+            "https://bmc.example.test/cgi/op.cgi",
+            500,
+            "synthetic BMC refusal",
+            Message(),
+            io.BytesIO(b""),
+        )
+        post = lambda opener: bmc._post_web_text(  # noqa: E731 - one call shape, two openers.
+            opener, "/cgi/op.cgi", {"op": "misc_uid"}, csrf="synthetic", referer="https://bmc.example.test/"
+        )
+
+        # Control: a typed BMC failure still carries its bounded reason.
+        response, logs = await self._locator_post(_raised_by(lambda: post(_FakeOpener(error=refusal))))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.detail, "Supermicro BMC request failed: HTTP Error 500: synthetic BMC refusal")
+        self.assertFalse(logs.matching("category=internal_error"), logs.text())
+
+        local_faults = (
+            (
+                "unexpected exception",
+                RuntimeError(HOSTILE_IDENTIFIER + "x" * 700),
+                "method=set_uid_active, exception=TrueNASAPIError, cause=RuntimeError",
+                "mock.py:",
+            ),
+            (
+                "wrapped local OSError",
+                _raised_by(lambda: post(_FakeOpener(error=PermissionError(errno.EACCES, PRIVATE_MARKER)))),
+                "method=/cgi/op.cgi, errno=13, exception=TrueNASAPIError, cause=PermissionError",
+                "test_inventory_status_error_text.py:",
+            ),
+        )
+        for name, error, fields, origin_frame in local_faults:
+            with self.subTest(case=name):
+                response, logs = await self._locator_post(error)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.detail, self.INTERNAL_ACTION_DETAIL)
+                records = logs.matching("System locator action failed (category=internal_error")
+                self.assertEqual(len(records), 1, logs.text())
+                lines = LogOriginTests.assert_internal_record(self, records[0], "System locator action", fields)
+                # The frames are those of the fault itself, not of the wrapper.
+                self.assertTrue(lines[-1].startswith(f"  {origin_frame}"), lines)
+                rendered = logs.text() + "".join(_formatted(record) for record in logs.records)
+                self.assertNotIn(PRIVATE_MARKER, rendered + response.detail)
+                self.assertNotIn("\x1b", rendered + response.detail)
 
 
 if __name__ == "__main__":

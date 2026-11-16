@@ -59,7 +59,7 @@
     "test_immutable_deployment": 92,
     "test_inventory": 610,
     "test_inventory_registry_routes": 15,
-    "test_inventory_status_error_text": 40,
+    "test_inventory_status_error_text": 53,
     "test_jbod_runner_trial": 15,
     "test_log_noise": 29,
     "test_logging_config": 17,

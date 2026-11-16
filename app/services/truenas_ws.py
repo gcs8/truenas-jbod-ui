@@ -6,6 +6,7 @@ import http.client
 import itertools
 import json
 import logging
+import os
 import random
 import re
 import socket
@@ -115,7 +116,8 @@ class TrueNASAPIError(RuntimeError):
     ) -> None:
         super().__init__(*args)
         self.errname = errname
-        self.reason = bounded_remote_reason(reason)
+        # A local fault the adapter wrapped has no remote reason to carry.
+        self.reason = None if category == INTERNAL_FAILURE_CATEGORY else bounded_remote_reason(reason)
         self.code = code
         self.category = category
         self.method = method
@@ -204,6 +206,8 @@ def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
     """
 
     if isinstance(exc, LocalServiceError):
+        if exc.category == INTERNAL_FAILURE_CATEGORY:
+            return INTERNAL_FAILURE_CATEGORY, None
         if exc.category in REMOTE_FAILURE_CATEGORIES:
             return exc.category, bounded_remote_error_code(exc.code)
         return LOCAL_FAILURE_CATEGORY, None
@@ -225,6 +229,9 @@ def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
         if isinstance(current, TrueNASAPIBusyError):
             return "busy", bounded_remote_error_code(current.code)
         if isinstance(current, TrueNASAPIError):
+            # A category the local code set survives wrapping.
+            if current.category == INTERNAL_FAILURE_CATEGORY:
+                return INTERNAL_FAILURE_CATEGORY, None
             adapter_error = True
             code = bounded_remote_error_code(current.code)
             fallback_code = code if code is not None else fallback_code
@@ -319,6 +326,51 @@ def failure_log_fields(exc: BaseException) -> str:
     return ", ".join(fields)
 
 
+MAX_LOGGED_FRAMES = 20
+_LOG_IDENTIFIER = re.compile(r"[A-Za-z0-9_/][A-Za-z0-9_.:/-]{0,95}")
+UNLISTED_LOG_IDENTIFIER = "(unlisted)"
+
+
+def log_identifier(value: Any) -> str:
+    """The one way an identifier (enclosure id, device, key) enters a log line.
+
+    Appliance identifiers are remote data: a value is written only when all of
+    it is printable ASCII from a short set, at most 96 characters; anything
+    else is written as a fixed placeholder.
+    """
+
+    if isinstance(value, str) and _LOG_IDENTIFIER.fullmatch(value):
+        return value
+    return UNLISTED_LOG_IDENTIFIER
+
+
+def _failure_origin(exc: BaseException) -> BaseException:
+    """The exception that started the chain: explicit cause first, else context."""
+
+    origin = exc
+    seen = {id(origin)}
+    while True:
+        linked = origin.__cause__ or (None if origin.__suppress_context__ else origin.__context__)
+        if linked is None or id(linked) in seen or len(seen) >= 16:
+            return origin
+        seen.add(id(linked))
+        origin = linked
+
+
+def failure_frames(exc: BaseException) -> str:
+    """Where a local fault happened, without paths, source text or message.
+
+    Lists the innermost ``MAX_LOGGED_FRAMES`` frames of the exception that
+    started the chain as ``  <file base name>:<line> in <function>``.
+    """
+
+    origin = _failure_origin(exc)
+    frames = traceback.extract_tb(origin.__traceback__ or exc.__traceback__)[-MAX_LOGGED_FRAMES:]
+    return "\n".join(
+        f"  {os.path.basename(frame.filename)}:{frame.lineno} in {frame.name}" for frame in frames
+    )
+
+
 def log_failure(
     target_logger: logging.Logger,
     operation: str,
@@ -328,18 +380,25 @@ def log_failure(
 ) -> None:
     """Log a failure by its structured facts only.
 
+    ``operation`` is a fixed name; identifiers go through ``log_identifier``.
     An ``internal_error`` (a bug or local fault) is always ERROR and carries the
     stack frames so it can be found, but not the exception message.
     """
 
     fields = failure_log_fields(exc)
     if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
-        frames = "".join(traceback.format_list(traceback.extract_tb(exc.__traceback__))).rstrip()
-        target_logger.error(
+        origin = _failure_origin(exc)
+        if origin is not exc:
+            fields = f"{fields}, cause={type(origin).__name__}"
+        # ``exception`` with ``exc_info=False``: the ERROR call the catch-all
+        # sites always made, with the frames written as text instead of the
+        # traceback, which would carry the exception message.
+        target_logger.exception(
             "%s failed (%s); stack frames, exception message omitted:\n%s",
             operation,
             fields,
-            frames or "  (no frames recorded)",
+            failure_frames(exc) or "  (no frames recorded)",
+            exc_info=False,
         )
         return
     target_logger.log(level, "%s failed (%s)", operation, fields)

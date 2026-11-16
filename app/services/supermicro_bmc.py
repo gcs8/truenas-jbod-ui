@@ -17,6 +17,7 @@ from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_ope
 from app.config import BMCConfig, normalize_text, normalize_value_text
 from app.services.tls_context import SameOriginRedirectHandler
 from app.services.truenas_ws import (
+    INTERNAL_FAILURE_CATEGORY,
     LocalServiceError,
     TrueNASAPIError,
     classify_remote_failure,
@@ -138,10 +139,14 @@ def _redfish_error_message(body: bytes) -> str | None:
     return normalize_text(error_block.get("message"))
 
 
-def _bmc_warning(exc: TrueNASAPIError, fixed_text: str) -> str:
+def _bmc_warning(exc: TrueNASAPIError, operation: str, fixed_text: str) -> str:
     """This service's own sentence as it is; anything from the BMC as fixed text."""
 
-    return str(exc) if is_local_failure_message(exc) else fixed_text
+    if is_local_failure_message(exc):
+        return str(exc)
+    if classify_remote_failure(exc)[0] == INTERNAL_FAILURE_CATEGORY:
+        return f"{operation} stopped on an internal error; see the service log."
+    return fixed_text
 
 
 class SupermicroBMCService:
@@ -162,14 +167,14 @@ class SupermicroBMCService:
             self._populate_redfish_inventory(inventory)
         except TrueNASAPIError as exc:
             _log_bmc_failure("BMC Redfish inventory", exc)
-            inventory.warnings.append(_bmc_warning(exc, "BMC Redfish inventory unavailable."))
+            inventory.warnings.append(_bmc_warning(exc, "BMC Redfish inventory", "BMC Redfish inventory unavailable."))
             inventory.source_details["redfish_ok"] = False
 
         try:
             self._populate_web_inventory(inventory)
         except TrueNASAPIError as exc:
             _log_bmc_failure("BMC web inventory", exc)
-            inventory.warnings.append(_bmc_warning(exc, "BMC web inventory unavailable."))
+            inventory.warnings.append(_bmc_warning(exc, "BMC web inventory", "BMC web inventory unavailable."))
             inventory.source_details["web_xml_ok"] = False
             if not inventory.drives:
                 self._populate_redfish_simple_storage_fallback(inventory)
@@ -235,6 +240,7 @@ class SupermicroBMCService:
             inventory.source_details["redfish_storage_ok"] = False
             inventory.source_details["redfish_storage_error"] = _bmc_warning(
                 exc,
+                "BMC Redfish storage inventory",
                 "BMC Redfish storage inventory unavailable.",
             )
         else:

@@ -804,7 +804,8 @@ async def resolve_layout_slots(
     except (UnknownEnclosureError, SnapshotStateBusyError) as exc:
         raise http_exception_for(exc) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
-        logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
+        # DEBUG for a remote failure as before; an internal error is ERROR with frames.
+        log_failure(logger, "Slot bounds layout read", exc, level=logging.DEBUG)
         raise HTTPException(
             status_code=503,
             detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL,
