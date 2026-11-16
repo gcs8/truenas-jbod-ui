@@ -12,7 +12,12 @@ from app.services.sas_diagnostics.common import (
     fault_family_severity,
     severity_rank,
 )
-from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo
+from app.services.sas_diagnostics.lsi_loginfo import (
+    decode_lsi_loginfo,
+    loginfo_is_rejected,
+    malformed_controller_tail_result,
+    malformed_loginfo_result,
+)
 from app.services.sas_diagnostics.scsi import (
     decode_scsi_cdb_message,
     decode_scsi_sense_event,
@@ -57,6 +62,7 @@ def new_mpr_event_summary() -> dict[str, Any]:
         "devices": set(),
         "targets": set(),
         "loginfo_counts": Counter(),
+        "loginfo_rejected_count": 0,
         "sense_counts": Counter(),
         "cam_status_counts": Counter(),
         "fault_family_counts": Counter(),
@@ -88,10 +94,17 @@ def decode_mpr_dmesg_event(event: dict[str, Any]) -> dict[str, Any]:
             "description": "The OS is retrying a command after transport or sense data indicated failure.",
         }
     if event_type == "ioc_terminated":
+        if event.get("controller_tail_malformed"):
+            # The first tail is not in the kernel's form: no field of it, or
+            # of any later tail, is decoded.
+            return malformed_controller_tail_result(str(event.get("controller_tail_raw") or ""))
         loginfo = str(event.get("loginfo") or "").lower()
         decoded_loginfo = decode_lsi_loginfo(loginfo)
         if decoded_loginfo:
             return decoded_loginfo
+        if event.get("loginfo") is not None:
+            # The field was printed but is not a number: say so, never absent.
+            return malformed_loginfo_result(loginfo)
         return {
             "label": "Controller terminated SCSI IO",
             "family": "controller_terminated_io",
@@ -118,7 +131,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "raw_line": event.get("line"),
         "decoded": decoded,
     }
-    for key in ("bus", "lun", "smid", "loginfo", "asc", "reason", "timestamp_raw"):
+    for key in ("bus", "lun", "smid", "loginfo", "asc", "reason", "timestamp_raw", "controller_tail_malformed"):
         if event.get(key) is not None:
             record[key] = event.get(key)
     for key in (
@@ -132,6 +145,10 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "service_action",
         "cdb_hex",
         "byte_count",
+        "cdb_malformed",
+        "cdb_raw",
+        "controller_tail_malformed",
+        "controller_tail_raw",
         "lba",
         "transfer_blocks",
         "allocation_length",
@@ -139,6 +156,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "sense_key",
         "sense_label",
         "asc_label",
+        "asc_malformed",
         "log_page_code",
         "log_page",
         "log_page_control",
@@ -221,19 +239,27 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
     if event_type == "scsi_sense":
         summary["sense_count"] += 1
         if event.get("reason"):
-            summary["sense_counts"][event["reason"]] += 1
+            # Kernel free text is bounded like row text before it becomes a key.
+            summary["sense_counts"][bound_diagnostic_value(str(event["reason"]))] += 1
     if event_type == "ioc_terminated":
         summary["ioc_terminated_count"] += 1
     if event_type == "cam_status":
         cam_status = str(event.get("message") or "").split(":", 1)[-1].strip()
         if cam_status:
-            summary["cam_status_counts"][cam_status] += 1
+            summary["cam_status_counts"][bound_diagnostic_value(cam_status)] += 1
     if event.get("device"):
         summary["devices"].add(event["device"])
     if event.get("target"):
         summary["targets"].add(event["target"])
-    if event.get("loginfo"):
-        summary["loginfo_counts"][event["loginfo"]] += 1
+    if event.get("controller_tail_malformed"):
+        summary["loginfo_rejected_count"] += 1
+    elif event.get("loginfo") is not None:
+        # A loginfo that is not a 32-bit hex number is never decoded, so it is
+        # counted as rejected instead of becoming a summary key.
+        if loginfo_is_rejected(event["loginfo"]):
+            summary["loginfo_rejected_count"] += 1
+        else:
+            summary["loginfo_counts"][event["loginfo"]] += 1
     family = str(record.get("family") or "")
     if family:
         summary["fault_family_counts"][family] += 1
@@ -280,6 +306,7 @@ def finalize_mpr_event_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "devices": sorted(summary["devices"]),
         "targets": sorted(summary["targets"], key=_mpr_target_sort_key),
         "loginfo_counts": dict(summary["loginfo_counts"]),
+        "loginfo_rejected_count": summary["loginfo_rejected_count"],
         "sense_counts": dict(summary["sense_counts"]),
         "cam_status_counts": dict(summary["cam_status_counts"]),
         "fault_family_counts": fault_family_counts,
@@ -364,7 +391,8 @@ def _decode_scsi_status_event(message: str) -> dict[str, Any]:
 
 
 def _decode_cam_error_event(message: str) -> dict[str, Any]:
-    match = re.search(r"Error\s+(?P<code>\d+)\s*,\s*(?P<state>.+)$", message, re.IGNORECASE)
+    # ASCII digits only: int() would also convert other scripts' digits.
+    match = re.search(r"Error\s+(?P<code>[0-9]+)\s*,\s*(?P<state>.+)$", message, re.IGNORECASE)
     if not match:
         return {
             "label": f"CAM error: {message.strip()}" if message.strip() else "CAM error",
