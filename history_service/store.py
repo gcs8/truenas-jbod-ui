@@ -3311,12 +3311,15 @@ class HistoryStore:
         # - a finished set: a table whose batch deleted nothing has nothing
         #   eligible from its floor, so it is not read again in this pass while
         #   other tables keep the pass running.
-        # Both only narrow the scan. A row that arrives behind the floor, or in
-        # a finished table (rollups this pass creates included), waits for the
-        # next pass: a deletion can be delayed, never advanced. Rollups still
-        # cover exactly the raw rows deleted, because one subquery selects both.
-        # Each table's rejected window rows are therefore read a bounded number
-        # of times per pass, whatever the other tables hold.
+        # Both only narrow the scan. A row another writer adds behind the
+        # floor, or in a finished table, waits for the next pass: a deletion
+        # can be delayed, never advanced. A rollup this batch writes is known
+        # to the pass, so when its bucket is already past that table's cutoff
+        # the same batch deletes it by key, wherever it lies; has_more=false
+        # therefore never leaves a row the pass wrote and could delete. Rollups
+        # still cover exactly the raw rows deleted, because one subquery
+        # selects both. Each table's rejected window rows are therefore read a
+        # bounded number of times per pass, whatever the other tables hold.
         cls._register_retention_functions(connection)
         floors = dict(scan_floors or {})
         finished = set(finished_tables)
@@ -3330,14 +3333,16 @@ class HistoryStore:
             return removed
 
         metric_samples_removed = 0
+        written_expired: dict[int, list[int]] = {3600: [], 86400: []}
         if active("metric_samples", cutoffs["metric"]):
-            for bucket_seconds in (3600, 86400):
-                cls._roll_up_metric_rows(
+            for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
+                written_expired[bucket_seconds] = cls._roll_up_metric_rows(
                     connection,
                     cutoff=cutoffs["metric"],
                     batch_size=batch_size,
                     bucket_seconds=bucket_seconds,
                     floor=floors.get("metric_samples"),
+                    rollup_cutoff=cutoffs[kind],
                 )
             metric_samples_removed = record("metric_samples", cls._delete_expired_rows(
                 connection,
@@ -3361,35 +3366,45 @@ class HistoryStore:
         rollups_removed = {}
         for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
             name = f"rollups_{bucket_seconds}"
-            rollups_removed[bucket_seconds] = 0
-            if active(name, cutoffs[kind]):
-                rollups_removed[bucket_seconds] = record(name, cls._delete_rollup_batch(
+            # At most one written rollup per raw row this batch selected, so
+            # these never exceed the batch size; they count against it.
+            removed = connection.executemany(
+                "DELETE FROM metric_rollups WHERE rowid = ? AND bucket_seconds = ?",
+                [(rowid, bucket_seconds) for rowid in written_expired[bucket_seconds]],
+            ).rowcount if written_expired[bucket_seconds] else 0
+            if active(name, cutoffs[kind]) and removed < batch_size:
+                removed += record(name, cls._delete_rollup_batch(
                     connection,
                     bucket_seconds=bucket_seconds,
                     cutoff=cutoffs[kind],
-                    batch_size=batch_size,
+                    batch_size=batch_size - removed,
                     floors=floors,
                 ))
+            rollups_removed[bucket_seconds] = removed
         # A table that just deleted nothing has nothing eligible left in this
-        # transaction, so it is skipped here too.
-        has_more = any(
-            (
-                active("metric_samples", cutoffs["metric"]) and cls._retention_rows_exist(
-                    connection, "metric_samples", "observed_at", cutoffs["metric"],
-                    floor=floors.get("metric_samples"),
-                ),
-                active("slot_events", cutoffs["event"]) and cls._retention_rows_exist(
-                    connection, "slot_events", "observed_at", cutoffs["event"],
-                    floor=floors.get("slot_events"),
-                ),
-                active("rollups_3600", cutoffs["hourly"]) and cls._rollups_exist(
-                    connection, 3600, cutoffs["hourly"], floor=floors.get("rollups_3600"),
-                ),
-                active("rollups_86400", cutoffs["daily"]) and cls._rollups_exist(
-                    connection, 86400, cutoffs["daily"], floor=floors.get("rollups_86400"),
-                ),
-            )
+        # transaction, so it is skipped here too; a table whose check finds
+        # nothing is finished as well.
+        remaining_checks = (
+            ("metric_samples", cutoffs["metric"], lambda floor: cls._retention_rows_exist(
+                connection, "metric_samples", "observed_at", cutoffs["metric"], floor=floor,
+            )),
+            ("slot_events", cutoffs["event"], lambda floor: cls._retention_rows_exist(
+                connection, "slot_events", "observed_at", cutoffs["event"], floor=floor,
+            )),
+            ("rollups_3600", cutoffs["hourly"], lambda floor: cls._rollups_exist(
+                connection, 3600, cutoffs["hourly"], floor=floor,
+            )),
+            ("rollups_86400", cutoffs["daily"], lambda floor: cls._rollups_exist(
+                connection, 86400, cutoffs["daily"], floor=floor,
+            )),
         )
+        has_more = False
+        for name, cutoff, exists in remaining_checks:
+            if active(name, cutoff):
+                if exists(floors.get(name)):
+                    has_more = True
+                else:
+                    finished.add(name)
         return {
             "metric_samples_removed": metric_samples_removed,
             "events_removed": events_removed,
@@ -3510,7 +3525,22 @@ class HistoryStore:
         batch_size: int,
         bucket_seconds: int,
         floor: tuple[str, int] | None,
-    ) -> None:
+        rollup_cutoff: str | None = None,
+    ) -> list[int]:
+        """Roll the selected raw rows up; return the written rollups already expired.
+
+        Expiry is the rollup table's own predicate, evaluated on each row the
+        statement inserted or updated.
+        """
+
+        if rollup_cutoff is None:
+            returning, returning_parameters = "RETURNING rowid, 0", ()
+        else:
+            returning = (
+                "RETURNING rowid, "
+                + cls._expired_timestamp_predicate("bucket_start", "rowid", floored=False)
+            )
+            returning_parameters = cls._retention_bounds(rollup_cutoff)
         if bucket_seconds == 3600:
             bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', observed_at)"
         elif bucket_seconds == 86400:
@@ -3518,7 +3548,7 @@ class HistoryStore:
         else:
             raise ValueError("Unsupported history rollup interval.")
         expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
-        connection.execute(
+        written = connection.execute(
             f"""
             INSERT INTO metric_rollups (
                 bucket_start, bucket_seconds, system_id, system_label,
@@ -3595,9 +3625,16 @@ class HistoryStore:
                 ),
                 logical_unit_id = COALESCE(excluded.logical_unit_id, metric_rollups.logical_unit_id),
                 sas_address = COALESCE(excluded.sas_address, metric_rollups.sas_address)
-            """,
-            (bucket_seconds, *cls._retention_parameters(cutoff, floor), batch_size),
-        )
+            """
+            + returning,
+            (
+                bucket_seconds,
+                *cls._retention_parameters(cutoff, floor),
+                batch_size,
+                *returning_parameters,
+            ),
+        ).fetchall()
+        return [int(row[0]) for row in written if row[1]]
 
     @classmethod
     def _delete_rollup_batch(

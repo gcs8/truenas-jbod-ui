@@ -943,6 +943,232 @@ class RetentionCrossTableWorkTests(unittest.TestCase):
                 self.assertLessEqual(calls[800] / calls[200], 1.5 * 800 / 200, calls)
 
 
+HOURLY_CUTOFF_TWO_DAYS = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)
+# Raw text order is not bucket order: the first sample (13:00 UTC) rolls into
+# an hourly bucket newer than a two-day hourly cutoff, the second (09:00 UTC)
+# into one already older than it.
+PASS_WRITTEN_SAMPLES = (("2026-11-13T08:00:00-05:00", 13), ("2026-11-13T09:00:00+00:00", 9))
+
+
+def _expired_by_absolute_time(path: Path, bucket_seconds: int, cutoff: datetime) -> list[str]:
+    """Rollup buckets older than the cutoff, read in Python, not by the store."""
+
+    with closing(sqlite3.connect(path)) as connection:
+        rows = connection.execute(
+            "SELECT bucket_start FROM metric_rollups WHERE bucket_seconds = ?", (bucket_seconds,)
+        ).fetchall()
+    return sorted(
+        text for (text,) in rows if datetime.fromisoformat(text).astimezone(timezone.utc) < cutoff
+    )
+
+
+class RetentionPassWrittenRollupTests(unittest.TestCase):
+    """has_more=false means no row this pass knows about is still eligible.
+
+    A rollup the pass itself writes is known to it. When its bucket is already
+    past that rollup table's cutoff, the same pass removes it, whether the
+    table had nothing left to delete (finished) or the bucket lies behind the
+    table's scan floor. If the batch budget ends first, has_more is true. The
+    collector's next-due answer, the segmented backup authorization and the
+    dashboard line all follow from that one flag.
+    """
+
+    RETENTION = {"raw_metric_retention_days": 1, "hourly_rollup_retention_days": 2}
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-written-")
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        self.path = self.root / "history.db"
+        self.store = HistoryStore(str(self.path))
+
+    def _insert_samples(self, samples=PASS_WRITTEN_SAMPLES) -> None:
+        self.store.insert_metric_samples([_sample(text, value) for text, value in samples])
+
+    def _expired_hourly(self) -> list[str]:
+        return _expired_by_absolute_time(self.path, 3600, HOURLY_CUTOFF_TWO_DAYS)
+
+    def test_an_expired_rollup_written_into_a_finished_table_is_removed_in_the_same_pass(self) -> None:
+        self._insert_samples()
+        result = _retain(self.store, batch_size=1, max_batches=100, **self.RETENTION)
+        self.assertEqual(self._expired_hourly(), [])
+        self.assertEqual(result["metric_samples_removed"], 2)
+        self.assertEqual(result["hourly_rollups_removed"], 1)
+        self.assertEqual(result["total_rows_removed"], 3)
+        self.assertFalse(result["has_more"])
+        self.assertFalse(result["interrupted"])
+        with closing(sqlite3.connect(self.path)) as connection:
+            kept = connection.execute(
+                "SELECT bucket_start, sample_count, value_sum FROM metric_rollups "
+                "WHERE bucket_seconds = 3600"
+            ).fetchall()
+        # The newer bucket stays, rolled up exactly once.
+        self.assertEqual(kept, [("2026-11-13T13:00:00+00:00", 1, 13.0)])
+
+    def test_an_expired_rollup_written_behind_the_scan_floor_is_removed_in_the_same_pass(self) -> None:
+        # Batch 1 deletes an old hourly bucket, which sets the hourly floor.
+        # Batch 2 writes an expired bucket (19:00 UTC) whose text sorts before
+        # that floor, so a scan that starts after the floor cannot see it.
+        # Control: the written bucket has the floor's own text and a newer key.
+        cases = {
+            "behind the floor": ("2026-11-12T20:00:00+00:00", "2026-11-13T09:00:00+14:00"),
+            "floor text, newer key (control)": (
+                "2026-11-12T19:00:00+00:00", "2026-11-13T09:00:00+14:00",
+            ),
+        }
+        helper = RetentionCrossTableWorkTests()
+        for label, (old_bucket, late_sample) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="retention-floor-") as temporary:
+                path = Path(temporary) / "history.db"
+                store = HistoryStore(str(path))
+                helper._insert(path, "3600", old_bucket, 1)
+                store.insert_metric_samples(
+                    [_sample("2026-11-13T08:00:00-05:00", 13), _sample(late_sample, 9)]
+                )
+                result = _retain(store, batch_size=1, max_batches=100, **self.RETENTION)
+                self.assertEqual(_expired_by_absolute_time(path, 3600, HOURLY_CUTOFF_TWO_DAYS), [])
+                self.assertEqual(result["metric_samples_removed"], 2)
+                self.assertEqual(result["hourly_rollups_removed"], 2)
+                self.assertFalse(result["has_more"])
+
+    def test_a_budget_too_small_to_finish_reports_more_work(self) -> None:
+        # Old hourly buckets beyond the budget, plus the pass-written expired one.
+        RetentionCrossTableWorkTests()._insert(self.path, "3600", OLD_TEXT, 3)
+        self._insert_samples()
+        first = _retain(self.store, batch_size=1, max_batches=2, **self.RETENTION)
+        self.assertTrue(first["has_more"])
+        self.assertTrue(self._expired_hourly())
+        second = _retain(self.store, batch_size=1, max_batches=100, **self.RETENTION)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(self._expired_hourly(), [])
+        self.assertEqual(first["hourly_rollups_removed"] + second["hourly_rollups_removed"], 4)
+
+    def _collector(self, *, segmented: bool, max_batches: int):
+        from history_service.collector import HistoryCollector
+        from history_service.config import HistorySettings
+
+        settings = HistorySettings(
+            sqlite_path=str(self.path),
+            segment_catalog_path=str(self.root / "segments" / "catalog.json") if segmented else None,
+            raw_metric_retention_days=1,
+            event_retention_days=0,
+            hourly_rollup_retention_days=2,
+            daily_rollup_retention_days=0,
+            retention_batch_size=1,
+            retention_max_batches_per_run=max_batches,
+            retention_interval_seconds=3600,
+        )
+        return HistoryCollector(settings, self.store)
+
+    def _authorization_state(self) -> str | None:
+        from history_service.store import SEGMENTED_RETENTION_STATE_NAME
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute(
+                "SELECT state FROM history_maintenance_state WHERE name = ?",
+                (SEGMENTED_RETENTION_STATE_NAME,),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    @staticmethod
+    def _rendered_pending(collector) -> str:
+        from unittest.mock import MagicMock
+
+        from history_service import main as history_main
+
+        context = history_main.build_dashboard_context(
+            request=MagicMock(),
+            status=history_main.public_collector_status(collector.status()),
+            counts={},
+            scopes=[],
+            app_version="test",
+        )
+        html = history_main.templates.get_template("dashboard.html").render(context)
+        marker = 'id="status-last-retention-has-more">'
+        start = html.index(marker) + len(marker)
+        return html[start:html.index("</dd>", start)]
+
+    def test_the_collector_dashboard_and_backup_authorization_follow_the_remaining_work(self) -> None:
+        from datetime import timedelta
+
+        for segmented in (False, True):
+            for max_batches in (100, 1):
+                with self.subTest(segmented=segmented, max_batches=max_batches):
+                    self.setUp()
+                    self._insert_samples()
+                    collector = self._collector(segmented=segmented, max_batches=max_batches)
+                    backup_at = NOW - timedelta(minutes=5)
+                    collector._run_retention_if_due(NOW, backup_succeeded=True, backup_at=backup_at)
+
+                    remaining = bool(self._expired_hourly()) or self.store.counts()["metric_sample_count"] > 0
+                    status = collector.status()
+                    # The public flag, the dashboard line and the next-due
+                    # answer say exactly whether eligible rows remain.
+                    self.assertIs(status["last_retention_has_more"], remaining)
+                    self.assertEqual(self._rendered_pending(collector), "yes" if remaining else "no")
+                    self.assertIs(collector._retention_due(NOW + timedelta(seconds=60)), remaining)
+                    if segmented:
+                        # The backup claim is kept for another pass while work remains.
+                        self.assertEqual(self._authorization_state(), "ready" if remaining else "consumed")
+                    # A sufficient budget finishes in one pass; one batch does not.
+                    self.assertEqual(remaining, max_batches == 1)
+                    if remaining:
+                        collector._run_retention_if_due(
+                            NOW + timedelta(seconds=60), backup_succeeded=True, backup_at=backup_at
+                        )
+                        if max_batches == 1:
+                            # One raw row per pass: the second pass finishes it.
+                            self.assertEqual(self.store.counts()["metric_sample_count"], 0)
+                        self.assertEqual(self._expired_hourly(), [])
+                        self.assertFalse(collector.status()["last_retention_has_more"])
+                        if segmented:
+                            self.assertEqual(self._authorization_state(), "consumed")
+
+    def test_reopening_for_written_rollups_does_not_reread_rejected_rows(self) -> None:
+        # The hourly table holds only window rows the exact-time test rejects,
+        # so it is finished after the first batch. Every later batch of the
+        # old raw backlog writes expired hourly rollups into it. Work stays
+        # proportional to rows deleted plus rollups written: the rejected rows
+        # are not read again for each batch that writes into the table.
+        from history_service import store as store_module
+
+        helper = RetentionCrossTableWorkTests()
+        original = store_module._history_utc_instant
+        parses: dict[int, int] = {}
+        steps: dict[int, int] = {}
+        for count in (200, 800):
+            with tempfile.TemporaryDirectory(prefix="retention-reopen-") as temporary:
+                path = Path(temporary) / "history.db"
+                store = HistoryStore(str(path))
+                helper._insert(path, "3600", REJECTED_WINDOW_TEXT, count)
+                helper._insert(path, "metrics", OLD_TEXT, count)
+                parsed = [0]
+
+                def counting(value: object) -> str | None:
+                    if value == REJECTED_WINDOW_TEXT:
+                        parsed[0] += 1
+                    return original(value)
+
+                work = _count_store_work(store)
+                with mock.patch.object(store_module, "_history_utc_instant", counting):
+                    result = _retain(
+                        store,
+                        raw_metric_retention_days=1,
+                        hourly_rollup_retention_days=1,
+                        batch_size=10,
+                        max_batches=1000,
+                    )
+                parses[count], steps[count] = parsed[0], work[0]
+                self.assertFalse(result["has_more"])
+                self.assertEqual(result["metric_samples_removed"], count)
+                self.assertEqual(result["hourly_rollups_removed"], count)
+                self.assertEqual(helper._count(path, "metrics"), 0)
+                self.assertEqual(helper._count(path, "3600"), count)
+                self.assertLessEqual(parsed[0], 2 * count, parses)
+        self.assertLessEqual(parses[800] / parses[200], 1.5 * 800 / 200, parses)
+        self.assertLessEqual(steps[800] / steps[200], 1.5 * 800 / 200, steps)
+
+
 class RetentionQueryPlanTests(unittest.TestCase):
     """Every retention statement reads the tables through the timestamp index."""
 
