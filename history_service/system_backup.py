@@ -301,6 +301,14 @@ MAX_STRUCTURED_YAML_MEMBER_BYTES = 2 * 1024 * 1024
 JSON_STREAM_CHUNK_CHARS = 64 * 1024
 MAX_JSON_KEY_CHARS = 64 * 1024
 JSON_DUPLICATE_CACHE_KIB = 512
+# Retained-size limits for ONE mapping entry of a file-backed JSON member. The
+# member-size limit does not bound what one entry builds in memory, so the
+# fields a model reads are counted while they are built: every value is one
+# node, and key, string and number text counts toward the character limit.
+# Fields the model ignores are checked and skipped without being built.
+MAX_JSON_ENTRY_NODES = 65_536
+MAX_JSON_ENTRY_CHARS = 1024 * 1024
+JSON_ENTRY_LIMIT_MESSAGE = "JSON mapping entry exceeds its validation limit."
 
 ExtractedMember = bytes | Path
 
@@ -459,6 +467,24 @@ class _StreamingJSONReader:
         self.position = 0
         self.eof = False
         self.duplicate_keys: _DiskBackedDuplicateKeyTracker | None = None
+        # Per-entry budget, active only while one mapping entry is being built.
+        self.entry_nodes_left: int | None = None
+        self.entry_chars_left = 0
+
+    def _charge_entry(self, chars: int) -> None:
+        if self.entry_nodes_left is None:
+            return
+        self.entry_nodes_left -= 1
+        self.entry_chars_left -= chars
+        if self.entry_nodes_left < 0 or self.entry_chars_left < 0:
+            raise ValueError(JSON_ENTRY_LIMIT_MESSAGE)
+
+    def _charge_entry_key(self, key: str) -> None:
+        if self.entry_nodes_left is None:
+            return
+        self.entry_chars_left -= len(key)
+        if self.entry_chars_left < 0:
+            raise ValueError(JSON_ENTRY_LIMIT_MESSAGE)
 
     def _new_object_scope(self) -> int:
         if self.duplicate_keys is None:
@@ -542,10 +568,15 @@ class _StreamingJSONReader:
         self.whitespace()
         token = self.peek()
         if token == '"':
-            return self.string(materialize=materialize)
+            text = self.string(materialize=materialize)
+            if text is not None:
+                self._charge_entry(len(text))
+            return text
         if token == "{":
             self.take()
             result: dict[str, Any] | None = {} if materialize else None
+            if materialize:
+                self._charge_entry(0)
             scope = self._new_object_scope()
             self.whitespace()
             if self.peek() == "}":
@@ -555,6 +586,8 @@ class _StreamingJSONReader:
                 key = self.string()
                 assert isinstance(key, str)
                 self._record_object_key(scope, key)
+                if result is not None:
+                    self._charge_entry_key(key)
                 self.expect(":")
                 item = self.value(materialize=materialize, depth=depth + 1)
                 if result is not None:
@@ -568,6 +601,8 @@ class _StreamingJSONReader:
         if token == "[":
             self.take()
             result_list: list[Any] | None = [] if materialize else None
+            if materialize:
+                self._charge_entry(0)
             self.whitespace()
             if self.peek() == "]":
                 self.take()
@@ -590,7 +625,10 @@ class _StreamingJSONReader:
         if not scalar:
             raise ValueError("JSON payload is malformed.")
         decoded = json.loads(scalar)
-        return decoded if materialize else None
+        if not materialize:
+            return None
+        self._charge_entry(len(scalar))
+        return decoded
 
     def validate_mapping_entries(self, target_key: str, model: Any) -> int:
         result = 0
@@ -637,6 +675,7 @@ class _StreamingJSONReader:
         self.expect("{")
         scope = self._new_object_scope()
         count = 0
+        field_names = _model_entry_field_names(model)
         self.whitespace()
         if self.peek() == "}":
             self.take()
@@ -646,7 +685,13 @@ class _StreamingJSONReader:
             assert isinstance(key, str)
             self._record_object_key(scope, key)
             self.expect(":")
-            model.model_validate(self.value(materialize=True, depth=2))
+            self.entry_nodes_left = MAX_JSON_ENTRY_NODES
+            self.entry_chars_left = MAX_JSON_ENTRY_CHARS
+            try:
+                entry = self._entry_value(field_names)
+            finally:
+                self.entry_nodes_left = None
+            model.model_validate(entry)
             count += 1
             self.whitespace()
             separator = self.take()
@@ -654,6 +699,66 @@ class _StreamingJSONReader:
                 return count
             if separator != ",":
                 raise ValueError("JSON payload is malformed.")
+
+    def _entry_value(self, field_names: frozenset[str] | None) -> Any:
+        """Build one mapping entry, keeping only the fields the model reads.
+
+        Ignored fields are still parsed and their object keys still go through
+        the duplicate-key tracker, but nothing of them is retained.
+        """
+        self.whitespace()
+        if field_names is None or self.peek() != "{":
+            return self.value(materialize=True, depth=2)
+        self.take()
+        self._charge_entry(0)
+        result: dict[str, Any] = {}
+        scope = self._new_object_scope()
+        self.whitespace()
+        if self.peek() == "}":
+            self.take()
+            return result
+        while True:
+            key = self.string()
+            assert isinstance(key, str)
+            self._record_object_key(scope, key)
+            self.expect(":")
+            if key in field_names:
+                self._charge_entry_key(key)
+                result[key] = self.value(materialize=True, depth=3)
+            else:
+                self.value(materialize=False, depth=3)
+            self.whitespace()
+            separator = self.take()
+            if separator == "}":
+                return result
+            if separator != ",":
+                raise ValueError("JSON payload is malformed.")
+
+
+def _model_entry_field_names(model: Any) -> frozenset[str] | None:
+    """Return the entry keys a model reads, or None when every key matters.
+
+    None (build the whole entry, within the per-entry limits) is returned when
+    the model is not a plain pydantic model that ignores unknown fields, or
+    when its field names cannot be listed exactly, for example alias choices,
+    alias paths or an alias generator.
+    """
+    fields = getattr(model, "model_fields", None)
+    config = getattr(model, "model_config", None)
+    if not isinstance(fields, Mapping) or not isinstance(config, Mapping):
+        return None
+    if config.get("extra") not in (None, "ignore") or config.get("alias_generator"):
+        return None
+    names: set[str] = set()
+    for name, info in fields.items():
+        names.add(name)
+        for alias in (getattr(info, "alias", None), getattr(info, "validation_alias", None)):
+            if alias is None:
+                continue
+            if not isinstance(alias, str):
+                return None
+            names.add(alias)
+    return frozenset(names)
 
 
 @dataclass(slots=True)
