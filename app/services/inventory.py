@@ -1493,6 +1493,32 @@ async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> Re
     return worker.result()
 
 
+async def _run_mapping_store_write(
+    write: Callable[[], RetainedResultT],
+    on_committed: Callable[[RetainedResultT], None],
+) -> RetainedResultT:
+    """Run one mapping-store mutator on a worker thread, not the event loop.
+
+    The mutator may wait for another owner's writer lock (#1228). The caller
+    keeps ownership until the write finishes, even through cancellation, so a
+    write is never left running unobserved. A write that commits after its
+    caller was cancelled still runs ``on_committed`` (cache invalidation),
+    because that caller will not, and then reports the cancellation.
+    """
+    worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, write)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.wait({worker})
+        except asyncio.CancelledError:
+            cancelled = True
+    if not cancelled:
+        return worker.result()
+    if not worker.cancelled() and worker.exception() is None:
+        on_committed(worker.result())
+    raise asyncio.CancelledError
+
+
 class SmartDetailBatch:
     """Request-local persistence; never reuse the read snapshot for writes."""
 
@@ -7423,9 +7449,19 @@ class InventoryService:
         # as the pre-write read found it is bound here, so a write prepared
         # against another disk is refused before anything is stored (#1141).
         binding = self._slot_disk_binding(slot_view)
+
+        def invalidate_after_save(_saved: ManualMapping) -> None:
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="save_mapping",
+                enclosure_id=enclosure_id,
+            )
+
         try:
-            saved = self.mapping_store.save_mapping(
-                mapping, expected_revision=expected_revision, revision_binding=binding,
+            saved = await _run_mapping_store_write(
+                lambda: self.mapping_store.save_mapping(
+                    mapping, expected_revision=expected_revision, revision_binding=binding,
+                ),
+                invalidate_after_save,
             )
         except MappingRevisionConflict as conflict:
             self._refuse_if_slot_disk_changed(expected_revision, conflict, binding, MappingSlotDiskChanged)
@@ -7456,13 +7492,24 @@ class InventoryService:
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
         binding = self._slot_disk_binding(slot_view)
+
+        def invalidate_after_clear(cleared: bool) -> None:
+            if cleared:
+                self.invalidate_physical_enclosure_snapshot_cache(
+                    reason="clear_mapping",
+                    enclosure_id=enclosure_id,
+                )
+
         try:
-            cleared = self.mapping_store.clear_mapping(
-                self.system.id,
-                enclosure_id,
-                slot,
-                expected_revision=expected_revision,
-                revision_binding=binding,
+            cleared = await _run_mapping_store_write(
+                lambda: self.mapping_store.clear_mapping(
+                    self.system.id,
+                    enclosure_id,
+                    slot,
+                    expected_revision=expected_revision,
+                    revision_binding=binding,
+                ),
+                invalidate_after_clear,
             )
         except MappingRevisionConflict as conflict:
             self._refuse_if_slot_disk_changed(
@@ -8686,17 +8733,14 @@ class InventoryService:
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
-        mappings = self.mapping_store.list_mappings(self.system.id, mapping_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            mappings,
-        )
+        # Rows and revision from one read, so a save in between cannot pair
+        # one version's rows with another's revision (#1228).
+        mappings, revision = self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
             enclosure_id=mapping_enclosure_id,
-            revision=preview["revision"],
+            revision=revision,
             mappings=mappings,
         )
 
@@ -8893,13 +8937,16 @@ class InventoryService:
         )
         binding = self._mapping_import_bays_binding(bay_views)
         try:
-            result = self.mapping_store.apply_mapping_import(
-                self.system.id,
-                mapping_enclosure_id,
-                rewritten,
-                expected_revision=expected_revision,
-                import_digest=import_digest,
-                import_digest_binding=binding,
+            result = await _run_mapping_store_write(
+                lambda: self.mapping_store.apply_mapping_import(
+                    self.system.id,
+                    mapping_enclosure_id,
+                    rewritten,
+                    expected_revision=expected_revision,
+                    import_digest=import_digest,
+                    import_digest_binding=binding,
+                ),
+                lambda _result: self.invalidate_snapshot_cache(reason="import_mapping_bundle"),
             )
         except MappingImportDigestMismatch as mismatch:
             split = len(mismatch.current_import_digest) - MAPPING_REVISION_BINDING_LENGTH
