@@ -148,6 +148,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, a `--root` below a directory another user could rename
+  entries in, and missing fixtures before running any command. Every write,
+  move or removal inside the directory it created first checks, by device and
+  inode for the root and every parent, that it is still that directory, and a
+  recursive removal first checks every deployment directory it created inside
+  it. The directory is created private to the invoking user and must stay so
+  for the whole run, and the hardened scenario's ownership step runs as
+  separate checked commands that change each entry itself, deepest first,
+  without following a symlink. It pins one Compose project for startup,
+  teardown and the absence readback, reports success only after teardown and resource absence are
+  verified, also between the admin scenario's two phases, and keeps the root
+  and exits nonzero when cleanup fails or is unknown. Its header states what
+  this does not cover: a process running as the same user or as root that
+  swaps directories while it runs (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,
