@@ -119,7 +119,7 @@
     "test_system_backup": 282,
     "test_system_setup_api_dialect": 17,
     "test_system_setup_field_ownership": 6,
-    "test_system_setup_legacy_add": 24,
+    "test_system_setup_legacy_add": 36,
     "test_tls_trust": 30,
     "test_truenas_middleware_limits": 35,
     "test_truenas_ws": 66,

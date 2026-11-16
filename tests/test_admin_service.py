@@ -3683,6 +3683,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 )
                 setup_service = MagicMock()
                 setup_service.save_system.return_value = (saved, True)
+                setup_service.last_save_note = None
                 with (
                     patch("admin_service.routes.reload_app_settings", side_effect=[settings, settings]),
                     patch("admin_service.routes.SystemSetupService", return_value=setup_service),
