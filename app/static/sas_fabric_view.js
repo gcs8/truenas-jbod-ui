@@ -1541,11 +1541,26 @@
     if (!summary) {
       return "";
     }
-    if (Number.isFinite(Number(summary.power_on_days))) {
-      return `${formatInteger(summary.power_on_days)} d`;
+    // Null, missing and blank lifetime fields are unknown. Check presence
+    // before Number(): Number(null) and Number("") are 0, which would show
+    // unknown as "0 d" and hide a known hours value. A reported 0 stays 0.
+    const reported = (value) => {
+      if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
+      }
+      if (typeof value === "string" && value.trim() !== "") {
+        const numberValue = Number(value);
+        return Number.isFinite(numberValue) ? numberValue : null;
+      }
+      return null;
+    };
+    const days = reported(summary.power_on_days);
+    if (days !== null) {
+      return `${formatInteger(days)} d`;
     }
-    if (Number.isFinite(Number(summary.power_on_hours))) {
-      return `${formatInteger(summary.power_on_hours)} h`;
+    const hours = reported(summary.power_on_hours);
+    if (hours !== null) {
+      return `${formatInteger(hours)} h`;
     }
     return "";
   }
