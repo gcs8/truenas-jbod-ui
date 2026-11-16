@@ -620,6 +620,13 @@ class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
 
+# A timestamp this service writes is 32 characters, 64 bytes in a UTF-16
+# database. A restored database can hold text of any length in the same
+# column; retention deletes such a row like any other old text but does not
+# read its text back, so a batch holds at most this much for each row.
+_RETENTION_FLOOR_TEXT_MAX_BYTES = 256
+
+
 def _history_utc_instant(value: object) -> str | None:
     """Exact UTC instant of an offset-aware ISO-8601 timestamp, or None.
 
@@ -3521,16 +3528,26 @@ class HistoryStore:
         )
 
     @staticmethod
+    def _deleted_floor_text(timestamp_column: str) -> str:
+        """RETURNING expression: the deleted row's timestamp text, or NULL when too long."""
+
+        text = f"CAST({timestamp_column} AS BLOB)"
+        return f"CASE WHEN length({text}) <= {_RETENTION_FLOOR_TEXT_MAX_BYTES} THEN {text} END"
+
+    @staticmethod
     def _advance_scan_floor(
         connection: sqlite3.Connection,
         floors: dict[str, tuple[bytes | str, int]],
         name: str,
         deleted: list[Any],
     ) -> int:
-        # Every row before the last deleted one (by text, then key) was read by
-        # this batch: deleted, or rejected by the exact-time test.
-        if deleted:
-            text, key = max((bytes(row[0]), int(row[1])) for row in deleted)
+        # Every row before a deleted one (by text, then key) was read by this
+        # batch: deleted, or rejected by the exact-time test. The floor is the
+        # last deleted row whose text was short enough to be read back; leaving
+        # the others out can only keep the floor lower.
+        named = [(bytes(row[0]), int(row[1])) for row in deleted if row[0] is not None]
+        if named:
+            text, key = max(named)
             encoding = connection.execute("PRAGMA encoding").fetchone()[0]
             if encoding != "UTF-8":
                 # CAST(? AS TEXT) reads bound bytes as UTF-8, so a UTF-16 floor
@@ -3560,7 +3577,7 @@ class HistoryStore:
         subquery = cls._expired_rows_subquery(table_name, timestamp_column, floored=floor is not None)
         deleted = connection.execute(
             f"DELETE FROM {table_name} WHERE id IN ({subquery}) "
-            f"RETURNING CAST({timestamp_column} AS BLOB), id",
+            f"RETURNING {cls._deleted_floor_text(timestamp_column)}, id",
             (*cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()
         return cls._advance_scan_floor(connection, floors, table_name, deleted)
@@ -3710,7 +3727,7 @@ class HistoryStore:
                 ORDER BY bucket_start, rowid
                 LIMIT ?
             )
-            RETURNING CAST(bucket_start AS BLOB), rowid
+            RETURNING {cls._deleted_floor_text('bucket_start')}, rowid
             """,
             (bucket_seconds, *cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()

@@ -1507,6 +1507,160 @@ class RetentionUndecodableTimestampTests(unittest.TestCase):
         self.assertEqual(self._left(path)["samples"], [UNDECODABLE_OLD])
 
 
+# Text of any length is legal in a timestamp column of a restored database.
+# Both sort more than a day before the cutoff, so both are expired as old text.
+OVERSIZED_OLD = "2026-10-01" + "x" * 65_536
+LONGEST_HANDED_BACK = 256  # bytes; a timestamp this code writes is 32 characters
+
+
+class RetentionOversizedTimestampTests(unittest.TestCase):
+    """A stored timestamp of any length never grows what a batch holds.
+
+    Such a row is deleted like any other old text, but its text is neither
+    handed back by the delete nor kept as the pass's lower bound: for each
+    row a batch deletes it holds a short timestamp at most.
+    """
+
+    POPULATIONS = ("events", "valueless_samples", "3600", "86400")
+    FLOOR_NAMES = {
+        "events": "slot_events",
+        "valueless_samples": "metric_samples",
+        "3600": "rollups_3600",
+        "86400": "rollups_86400",
+    }
+    ENCODING = "UTF-8"
+    OVERSIZED_ROWS = 5
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-oversized-")
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+
+    def _store(self, name: str) -> tuple[Path, HistoryStore]:
+        path = self.root / f"{name}.db"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(f"PRAGMA encoding = '{self.ENCODING}'")
+            connection.execute("CREATE TABLE encoding_marker (value)")
+            connection.commit()
+        return path, HistoryStore(str(path))
+
+    def _watch_batches(self) -> tuple[list[int], dict[str, list[object]]]:
+        """Record the bytes each delete handed back and every floor a pass set."""
+
+        handed_back: list[int] = []
+        floors_seen: dict[str, list[object]] = {}
+        advance = HistoryStore._advance_scan_floor
+
+        def watching(connection, floors, name, deleted):
+            handed_back.extend(len(row[0]) for row in deleted if row[0] is not None)
+            count = advance(connection, floors, name, deleted)
+            if name in floors:
+                floors_seen.setdefault(name, []).append(floors[name][0])
+            return count
+
+        patcher = mock.patch.object(HistoryStore, "_advance_scan_floor", staticmethod(watching))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return handed_back, floors_seen
+
+    def _retain_all(self, store: HistoryStore, batch_size: int) -> dict:
+        return _retain(
+            store,
+            raw_metric_retention_days=1,
+            event_retention_days=1,
+            hourly_rollup_retention_days=1,
+            daily_rollup_retention_days=1,
+            batch_size=batch_size,
+            max_batches=200,
+        )
+
+    def _assert_short(self, handed_back: list[int], floors_seen: dict[str, list[object]]) -> None:
+        self.assertLessEqual(max(handed_back, default=0), LONGEST_HANDED_BACK)
+        for name, texts in floors_seen.items():
+            for text in texts:
+                size = len(text.encode(self.ENCODING) if isinstance(text, str) else text)
+                self.assertLessEqual(size, LONGEST_HANDED_BACK, name)
+
+    def test_oversized_old_timestamps_are_deleted_without_being_handed_back(self) -> None:
+        insert = RetentionUndecodableTimestampTests._insert
+        for population in self.POPULATIONS:
+            for batch_size in (100, 1):
+                with self.subTest(population=population, batch_size=batch_size):
+                    path, store = self._store(f"{population}-{batch_size}")
+                    # Readable expired rows sort on both sides of the oversized ones.
+                    insert(path, population, "2026-09-30T00:00:00+00:00", 1)
+                    for slot in range(self.OVERSIZED_ROWS):
+                        insert(path, population, OVERSIZED_OLD, 10 + slot)
+                    insert(path, population, "2026-10-02T00:00:00+00:00", 2)
+                    handed_back, floors_seen = self._watch_batches()
+
+                    result = self._retain_all(store, batch_size)
+
+                    left = RetentionUndecodableTimestampTests._left(path)
+                    self.assertEqual(left, {"events": [], "samples": [], "3600": [], "86400": []})
+                    self.assertFalse(result["has_more"])
+                    # The readable rows were handed back, so the watch saw the deletes.
+                    self.assertGreaterEqual(len(handed_back), 2)
+                    self._assert_short(handed_back, floors_seen)
+
+    def test_the_floor_is_the_last_short_timestamp_of_a_batch_with_oversized_rows(self) -> None:
+        insert = RetentionUndecodableTimestampTests._insert
+        for population in self.POPULATIONS:
+            with self.subTest(population=population):
+                path, store = self._store(f"floor-{population}")
+                # By text: first < second < the oversized row.
+                first, second = "2026-09-30T00:00:00+00:00", "2026-10-01T00:00:00+00:00"
+                insert(path, population, second, 2)
+                insert(path, population, OVERSIZED_OLD, 3)
+                insert(path, population, first, 1)
+                _handed_back, floors_seen = self._watch_batches()
+
+                self._retain_all(store, 100)
+
+                floor = floors_seen[self.FLOOR_NAMES[population]][0]
+                self.assertEqual(floor.decode() if isinstance(floor, bytes) else floor, second)
+
+    def test_a_batch_of_only_oversized_rows_sets_no_floor_and_the_pass_finishes(self) -> None:
+        insert = RetentionUndecodableTimestampTests._insert
+        for population in self.POPULATIONS:
+            with self.subTest(population=population):
+                path, store = self._store(f"only-{population}")
+                for slot in range(self.OVERSIZED_ROWS):
+                    insert(path, population, OVERSIZED_OLD, slot)
+                handed_back, floors_seen = self._watch_batches()
+
+                result = self._retain_all(store, 2)
+
+                left = RetentionUndecodableTimestampTests._left(path)
+                self.assertEqual(left, {"events": [], "samples": [], "3600": [], "86400": []})
+                self.assertFalse(result["has_more"])
+                self.assertEqual(handed_back, [])
+                self.assertNotIn(self.FLOOR_NAMES[population], floors_seen)
+
+    def test_text_at_the_limit_is_handed_back_and_one_character_longer_is_not(self) -> None:
+        insert = RetentionUndecodableTimestampTests._insert
+        width = len("x".encode(self.ENCODING))
+        at_limit = LONGEST_HANDED_BACK // width
+        for characters, expected in ((at_limit, [LONGEST_HANDED_BACK]), (at_limit + 1, [])):
+            with self.subTest(characters=characters):
+                path, store = self._store(f"limit-{characters}")
+                insert(path, "events", "2026-10-01" + "x" * (characters - 10), 1)
+                handed_back, _floors_seen = self._watch_batches()
+
+                result = self._retain_all(store, 100)
+
+                self.assertEqual(handed_back, expected)
+                self.assertEqual(result["events_removed"], 1)
+
+
+class RetentionOversizedTimestampUtf16Tests(RetentionOversizedTimestampTests):
+    ENCODING = "UTF-16le"
+
+
+class RetentionOversizedTimestampUtf16BigEndianTests(RetentionOversizedTimestampTests):
+    ENCODING = "UTF-16be"
+
+
 class RetentionQueryPlanTests(unittest.TestCase):
     """Every retention statement reads the tables through the timestamp index."""
 
