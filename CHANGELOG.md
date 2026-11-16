@@ -100,6 +100,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- CORE expander counter output that repeats a PHY marker, carries an invalid
+  one such as `ff`, repeats its header, or carries anything after its end
+  marker (such as a second answer) is now refused as a whole: those PHYs read
+  unknown (`rejected_output`) instead of keeping whichever frame came first
+  as a measured zero or error count (#1238).
 - The history service no longer fails to start when an interrupted segmented
   rotation or restore left its activation marker. It now stays up with
   history stopped, and `/healthz` reports down with the recovery command,
