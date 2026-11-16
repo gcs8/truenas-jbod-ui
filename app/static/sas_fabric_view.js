@@ -1562,6 +1562,24 @@
     return formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "not read" : "");
   }
 
+  // A field listed in unread_fields was reported but could not be read: it is
+  // shown as not read, and the slot does not fill it (the summary API already
+  // took any inventory reading of that field).
+  function smartFieldNotRead(summary, ...fields) {
+    const unread = Array.isArray(summary?.unread_fields) ? summary.unread_fields : [];
+    return fields.some((field) => unread.includes(field));
+  }
+
+  // The disk Health fact: SMART health and temperature, else the inventory's.
+  function smartHealthFact(summary, slot) {
+    const health = summary?.smart_health_status
+      || (smartFieldNotRead(summary, "smart_health_status") ? "SMART health not read" : slot?.health || slot?.state);
+    const temperature = summary?.temperature_c != null ? `${summary.temperature_c} C`
+      : smartFieldNotRead(summary, "temperature_c") ? "temperature not read"
+        : slot?.temperature_c ? `${slot.temperature_c} C` : null;
+    return [health, temperature].filter(Boolean).join(" / ");
+  }
+
   function smartSummaryLine(summary) {
     if (!summary) {
       return "";
@@ -1570,8 +1588,9 @@
       return summary.message || "SMART unavailable";
     }
     return [
-      summary.smart_health_status,
-      summary.temperature_c != null ? `${summary.temperature_c} C` : null,
+      summary.smart_health_status || (smartFieldNotRead(summary, "smart_health_status") ? "health not read" : null),
+      summary.temperature_c != null ? `${summary.temperature_c} C`
+        : smartFieldNotRead(summary, "temperature_c") ? "temperature not read" : null,
       formatSmartPowerOn(summary) || (smartPowerOnNotRead(summary) ? "power on not read" : null),
     ].filter(Boolean).join(" / ");
   }
@@ -1589,32 +1608,39 @@
     if (summary.available === false) {
       return `<div class="fabric-identity-card"><span class="fabric-empty-note">${escapeHtml(summary.message || "SMART detail is unavailable for this disk.")}</span></div>`;
     }
-    const lastTest = [summary.last_test_type, summary.last_test_status].filter(Boolean).join(" / ");
+    // Each fact: its reading, "not read" when it was refused, else left out.
+    const notRead = (field, text = "not read") => (smartFieldNotRead(summary, field) ? text : null);
+    const lastTest = notRead("last_test_type") || notRead("last_test_status")
+      || [summary.last_test_type, summary.last_test_status].filter(Boolean).join(" / ");
     const ioTotals = [
-      formatSmartBytes(summary.bytes_read) ? `R ${formatSmartBytes(summary.bytes_read)}` : null,
-      formatSmartBytes(summary.bytes_written) ? `W ${formatSmartBytes(summary.bytes_written)}` : null,
+      formatSmartBytes(summary.bytes_read) ? `R ${formatSmartBytes(summary.bytes_read)}` : notRead("bytes_read", "R not read"),
+      formatSmartBytes(summary.bytes_written) ? `W ${formatSmartBytes(summary.bytes_written)}` : notRead("bytes_written", "W not read"),
     ].filter(Boolean).join(" / ");
     const errorCounts = [
-      summary.media_errors != null ? `media ${formatInteger(summary.media_errors)}` : null,
+      summary.media_errors != null ? `media ${formatInteger(summary.media_errors)}` : notRead("media_errors", "media not read"),
       summary.non_medium_errors != null ? `non-medium ${formatInteger(summary.non_medium_errors)}` : null,
-      summary.interface_crc_errors != null ? `CRC ${formatInteger(summary.interface_crc_errors)}` : null,
+      summary.interface_crc_errors != null
+        ? `CRC ${formatInteger(summary.interface_crc_errors)}` : notRead("interface_crc_errors", "CRC not read"),
     ].filter(Boolean).join(" / ");
     const transport = [
-      summary.transport_protocol || slot?.transport_protocol,
-      summary.negotiated_link_rate,
-      summary.sas_address || slot?.sas_address,
+      summary.transport_protocol || notRead("transport_protocol") || slot?.transport_protocol,
+      summary.negotiated_link_rate || notRead("negotiated_link_rate", "link rate not read"),
+      summary.sas_address || notRead("sas_address", "SAS address not read") || slot?.sas_address,
     ].filter(Boolean).join(" / ");
+    const health = summary.smart_health_status || notRead("smart_health_status");
+    const temperature = summary.temperature_c != null ? `${summary.temperature_c} C` : notRead("temperature_c");
+    const firmware = summary.firmware_version || notRead("firmware_version");
     return `
       <div class="fabric-identity-card fabric-smart-card">
         <div>
-          ${summary.smart_health_status ? `<span><em>Health</em>${escapeHtml(summary.smart_health_status)}</span>` : ""}
-          ${summary.temperature_c != null ? `<span><em>Temp</em>${escapeHtml(`${summary.temperature_c} C`)}</span>` : ""}
+          ${health ? `<span><em>Health</em>${escapeHtml(health)}</span>` : ""}
+          ${temperature ? `<span><em>Temp</em>${escapeHtml(temperature)}</span>` : ""}
           ${formatSmartPowerOnFact(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOnFact(summary))}</span>` : ""}
           ${lastTest ? `<span><em>Last test</em>${escapeHtml(lastTest)}</span>` : ""}
           ${ioTotals ? `<span><em>I/O totals</em>${escapeHtml(ioTotals)}</span>` : ""}
           ${errorCounts ? `<span><em>Errors</em>${escapeHtml(errorCounts)}</span>` : ""}
           ${transport ? `<span><em>Transport</em>${escapeHtml(transport)}</span>` : ""}
-          ${summary.firmware_version ? `<span><em>Firmware</em>${escapeHtml(summary.firmware_version)}</span>` : ""}
+          ${firmware ? `<span><em>Firmware</em>${escapeHtml(firmware)}</span>` : ""}
         </div>
       </div>
     `;
@@ -3170,7 +3196,7 @@
         subtitle: diskSubtitle,
         facts: [
           ["Pool / vdev", [slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ")],
-          ["Health", [smartSummary?.smart_health_status || slot?.health || slot?.state, smartSummary?.temperature_c != null ? `${smartSummary.temperature_c} C` : slot?.temperature_c ? `${slot.temperature_c} C` : null].filter(Boolean).join(" / ")],
+          ["Health", smartHealthFact(smartSummary, slot)],
           ["SAS / LUN", mprDevice?.sas_address || diskSasAddress || diskLun],
           ["SMART", smartSummaryLine(smartSummary)],
           ["Member", mprDevice?.member_device_name || seed.device_name],

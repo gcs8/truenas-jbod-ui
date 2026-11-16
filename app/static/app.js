@@ -4659,10 +4659,29 @@
     }, SMART_PREFETCH_DELAY_MS);
   }
 
+  // A SMART field listed in the summary's unread_fields was reported in a form
+  // that could not be read: it is "not read", neither absent ("n/a") nor zero.
+  // The summary API already takes an inventory reading of the same field when
+  // it has one, so the page does not fill a listed field from the slot.
+  function smartFieldNotRead(smartEntry, ...fields) {
+    const unread = smartEntry?.data?.unread_fields;
+    return Array.isArray(unread) && fields.some((field) => unread.includes(field));
+  }
+
+  // `formatted` unless it is a no-value text and one of `fields` was not read.
+  function smartNotReadOr(smartEntry, fields, formatted) {
+    const noValue = ["n/a", "Unavailable", "Loading..."].includes(formatted);
+    return noValue && smartFieldNotRead(smartEntry, ...fields) ? "not read" : formatted;
+  }
+
   function formatTemperatureValue(slot, smartEntry) {
-    const temperature = smartEntry?.data?.temperature_c ?? slot.temperature_c;
+    const notRead = smartFieldNotRead(smartEntry, "temperature_c");
+    const temperature = smartEntry?.data?.temperature_c ?? (notRead ? null : slot.temperature_c);
     if (Number.isInteger(temperature)) {
       return `${temperature} C`;
+    }
+    if (notRead) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4672,10 +4691,14 @@
 
   function formatLastSmartTestValue(slot, smartEntry) {
     const data = smartEntry?.data;
+    if (smartFieldNotRead(smartEntry, "last_test_type", "last_test_status")) {
+      return "not read";
+    }
     const testType = data?.last_test_type || slot.last_smart_test_type;
     const testStatus = data?.last_test_status || slot.last_smart_test_status;
     const ageHours = data?.last_test_age_hours;
-    const lifetimeHours = data?.last_test_lifetime_hours ?? slot.last_smart_test_lifetime_hours;
+    const lifetimeNotRead = smartFieldNotRead(smartEntry, "last_test_lifetime_hours", "last_test_age_hours");
+    const lifetimeHours = data?.last_test_lifetime_hours ?? (lifetimeNotRead ? null : slot.last_smart_test_lifetime_hours);
 
     if (testType && testStatus) {
       let suffix = "";
@@ -4683,6 +4706,8 @@
         suffix = ` (${ageHours}h ago)`;
       } else if (Number.isInteger(lifetimeHours)) {
         suffix = ` (@ ${lifetimeHours}h)`;
+      } else if (lifetimeNotRead) {
+        suffix = " (time not read)";
       }
       return `${testType}: ${testStatus}${suffix}`;
     }
@@ -4712,18 +4737,24 @@
   }
 
   function formatPowerCycleValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.power_cycle_count, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.power_cycle_count, smartEntry, "power_cycle_count");
   }
 
   function formatPowerOnResetsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.power_on_resets, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.power_on_resets, smartEntry, "power_on_resets");
   }
 
   function formatSectorSizeValue(slot, smartEntry) {
-    const logical = smartEntry?.data?.logical_block_size ?? slot?.logical_block_size;
-    const physical = smartEntry?.data?.physical_block_size ?? slot?.physical_block_size;
-    if (Number.isInteger(logical) && Number.isInteger(physical)) {
-      return `Logical ${logical} B / Physical ${physical} B`;
+    const sizes = [["Logical", "logical_block_size"], ["Physical", "physical_block_size"]].map(([label, field]) => {
+      const notRead = smartFieldNotRead(smartEntry, field);
+      return { label, notRead, value: smartEntry?.data?.[field] ?? (notRead ? null : slot?.[field]) };
+    });
+    if (sizes.every(({ value }) => Number.isInteger(value))) {
+      return sizes.map(({ label, value }) => `${label} ${value} B`).join(" / ");
+    }
+    if (sizes.some(({ notRead }) => notRead)) {
+      return sizes.map(({ label, value, notRead }) => (Number.isInteger(value) ? `${label} ${value} B` : notRead ? `${label} not read` : null))
+        .filter(Boolean).join(" / ");
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4739,6 +4770,9 @@
     if (Number.isInteger(rpm)) {
       return `${rpm} rpm`;
     }
+    if (smartFieldNotRead(smartEntry, "rotation_rate_rpm")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -4749,6 +4783,9 @@
     const formFactor = smartEntry?.data?.form_factor;
     if (formFactor) {
       return formFactor;
+    }
+    if (smartFieldNotRead(smartEntry, "form_factor")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -4774,11 +4811,13 @@
   }
 
   function formatReadCacheValue(smartEntry) {
-    return formatCacheFlagValue(smartEntry?.data?.read_cache_enabled, smartEntry);
+    return smartNotReadOr(smartEntry, ["read_cache_enabled"],
+      formatCacheFlagValue(smartEntry?.data?.read_cache_enabled, smartEntry));
   }
 
   function formatWritebackCacheValue(smartEntry) {
-    return formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry);
+    return smartNotReadOr(smartEntry, ["writeback_cache_enabled"],
+      formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry));
   }
 
   function formatTrimSupportedValue(smartEntry) {
@@ -4807,6 +4846,9 @@
     if (transport) {
       return transport;
     }
+    if (smartFieldNotRead(smartEntry, "transport_protocol")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -4814,6 +4856,9 @@
   }
 
   function formatLogicalUnitIdValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "logical_unit_id")) {
+      return "not read";
+    }
     const logicalUnitId = smartEntry?.data?.logical_unit_id || slot?.logical_unit_id || slot?.multipath?.lunid;
     const formatted = formatHexIdentifier(logicalUnitId);
     if (formatted) {
@@ -4826,6 +4871,9 @@
   }
 
   function formatSasAddressValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "sas_address")) {
+      return "not read";
+    }
     const sasAddress = smartEntry?.data?.sas_address || slot?.sas_address;
     const formatted = formatHexIdentifier(sasAddress);
     if (formatted) {
@@ -4845,6 +4893,9 @@
   }
 
   function formatAttachedSasAddressValue(slot, smartEntry) {
+    if (smartFieldNotRead(smartEntry, "attached_sas_address")) {
+      return "not read";
+    }
     const formatted = formatHexIdentifier(
       smartEntry?.data?.attached_sas_address || slot?.raw_status?.attached_sas_address
     );
@@ -4861,6 +4912,9 @@
     const linkRate = smartEntry?.data?.negotiated_link_rate;
     if (linkRate) {
       return linkRate;
+    }
+    if (smartFieldNotRead(smartEntry, "negotiated_link_rate")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5031,7 +5085,8 @@
   }
 
   function formatNamespaceNguidValue(smartEntry) {
-    return formatNamespaceIdentifierValue(smartEntry?.data?.namespace_nguid, smartEntry);
+    return smartNotReadOr(smartEntry, ["namespace_nguid"],
+      formatNamespaceIdentifierValue(smartEntry?.data?.namespace_nguid, smartEntry));
   }
 
   function formatNamespaceEui64Value(slot, smartEntry) {
@@ -5042,6 +5097,9 @@
       (!persistentId || namespaceEui64.toLowerCase() !== String(persistentId).toLowerCase())
     ) {
       return namespaceEui64;
+    }
+    if (smartFieldNotRead(smartEntry, "namespace_eui64")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5054,6 +5112,9 @@
     if (firmwareVersion) {
       return firmwareVersion;
     }
+    if (smartFieldNotRead(smartEntry, "firmware_version")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5064,6 +5125,9 @@
     const protocolVersion = smartEntry?.data?.protocol_version;
     if (protocolVersion) {
       return protocolVersion;
+    }
+    if (smartFieldNotRead(smartEntry, "protocol_version")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5082,11 +5146,13 @@
   }
 
   function formatWarningTemperatureValue(smartEntry) {
-    return formatThresholdTemperatureValue(smartEntry?.data?.warning_temperature_c, smartEntry);
+    return smartNotReadOr(smartEntry, ["warning_temperature_c"],
+      formatThresholdTemperatureValue(smartEntry?.data?.warning_temperature_c, smartEntry));
   }
 
   function formatCriticalTemperatureValue(smartEntry) {
-    return formatThresholdTemperatureValue(smartEntry?.data?.critical_temperature_c, smartEntry);
+    return smartNotReadOr(smartEntry, ["critical_temperature_c"],
+      formatThresholdTemperatureValue(smartEntry?.data?.critical_temperature_c, smartEntry));
   }
 
   function formatMetricBytes(value) {
@@ -5104,9 +5170,12 @@
     return `${size.toFixed(fractionDigits)} ${suffixes[suffixIndex]}`;
   }
 
-  function formatOptionalCount(value, smartEntry) {
+  function formatOptionalCount(value, smartEntry, field = null) {
     if (Number.isInteger(value)) {
       return value.toLocaleString();
+    }
+    if (field && smartFieldNotRead(smartEntry, field)) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5126,6 +5195,9 @@
     if (Number.isInteger(used)) {
       return `${used}% used`;
     }
+    if (smartFieldNotRead(smartEntry, "endurance_used_percent", "endurance_remaining_percent")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5139,7 +5211,10 @@
       return `${spare}% (threshold ${threshold}%)`;
     }
     if (Number.isInteger(spare)) {
-      return `${spare}%`;
+      return smartFieldNotRead(smartEntry, "available_spare_threshold_percent") ? `${spare}% (threshold not read)` : `${spare}%`;
+    }
+    if (smartFieldNotRead(smartEntry, "available_spare_percent")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5159,11 +5234,11 @@
   }
 
   function formatBytesWrittenValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.bytes_written, smartEntry);
+    return smartNotReadOr(smartEntry, ["bytes_written"], formatBytesValue(smartEntry?.data?.bytes_written, smartEntry));
   }
 
   function formatBytesReadValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.bytes_read, smartEntry);
+    return smartNotReadOr(smartEntry, ["bytes_read"], formatBytesValue(smartEntry?.data?.bytes_read, smartEntry));
   }
 
   function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
@@ -5185,6 +5260,9 @@
     if (formatted) {
       return `${formatted}/yr`;
     }
+    if (smartFieldNotRead(smartEntry, "annualized_bytes_read")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5196,6 +5274,9 @@
     if (formatted) {
       return `${formatted}/yr`;
     }
+    if (smartFieldNotRead(smartEntry, "annualized_bytes_written")) {
+      return "not read";
+    }
     if (smartEntry?.loading) {
       return "Loading...";
     }
@@ -5203,15 +5284,16 @@
   }
 
   function formatEstimatedRemainingWriteValue(smartEntry) {
-    return formatBytesValue(smartEntry?.data?.estimated_remaining_bytes_written, smartEntry);
+    return smartNotReadOr(smartEntry, ["estimated_remaining_bytes_written"],
+      formatBytesValue(smartEntry?.data?.estimated_remaining_bytes_written, smartEntry));
   }
 
   function formatReadCommandsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.read_commands, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.read_commands, smartEntry, "read_commands");
   }
 
   function formatWriteCommandsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry, "write_commands");
   }
 
   function formatReadErrorCountValue(smartEntry) {
@@ -5237,7 +5319,7 @@
   }
 
   function formatMediaErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry, "media_errors");
   }
 
   function formatPredictiveErrorsValue(smartEntry) {
@@ -5249,21 +5331,24 @@
   }
 
   function formatUnsafeShutdownsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry, "unsafe_shutdowns");
   }
 
   function formatHardwareResetsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.hardware_resets, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.hardware_resets, smartEntry, "hardware_resets");
   }
 
   function formatInterfaceCrcErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.interface_crc_errors, smartEntry);
+    return formatOptionalCount(smartEntry?.data?.interface_crc_errors, smartEntry, "interface_crc_errors");
   }
 
   function formatSmartHealthStatusValue(smartEntry) {
     const status = smartEntry?.data?.smart_health_status;
     if (status) {
       return status;
+    }
+    if (smartFieldNotRead(smartEntry, "smart_health_status")) {
+      return "not read";
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -5513,7 +5598,8 @@
   }
 
   function heatmapSmartNumber(entry, fieldName, fallback = null) {
-    if (!entry || !heatmapEntryOccupied(entry)) {
+    // An unread SMART field has no value, and no inventory value stands in.
+    if (!entry || !heatmapEntryOccupied(entry) || smartFieldNotRead(entry.smartEntry, fieldName)) {
       return null;
     }
     return nullableMetricNumber(entry.smartEntry?.data?.[fieldName]) ?? nullableMetricNumber(fallback);
@@ -5868,6 +5954,22 @@
     return Math.min(highCap, numeric >= highStep ? highCap : lowStep);
   }
 
+  // The SMART fields the Attention Score weighs. When one of them was not
+  // read, a low score is not evidence of low risk.
+  function attentionScoreInputState(data) {
+    const inputs = [
+      "smart_health_status", "temperature_c", "endurance_used_percent", "endurance_remaining_percent",
+      "media_errors", "predictive_errors", "non_medium_errors", "read_error_count", "uncorrected_read_errors",
+      "write_error_count", "uncorrected_write_errors", "interface_crc_errors", "unsafe_shutdowns",
+      "annualized_bytes_written",
+    ];
+    const unread = Array.isArray(data?.unread_fields) ? data.unread_fields : [];
+    return {
+      notRead: inputs.some((field) => unread.includes(field)),
+      anyRead: inputs.some((field) => ![null, undefined, ""].includes(data?.[field])),
+    };
+  }
+
   function computeAttentionScore(entry, entries, evaluation = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return { value: null, reasons: [] };
@@ -5891,8 +5993,10 @@
       reasons.push("identify active");
     }
 
+    let unavailableScore = 0;
     if (entry.smartEntry?.data?.available === false || (entry.smartEntry && !entry.smartEntry.loading && data.message && !data.available)) {
-      score += 10;
+      unavailableScore = 10;
+      score += unavailableScore;
       reasons.push("SMART unavailable");
     }
 
@@ -6001,10 +6105,30 @@
       }
     }
 
-    return {
-      value: Math.max(0, Math.min(100, Math.round(score))),
-      reasons: reasons.slice(0, 4),
-    };
+    const value = Math.max(0, Math.min(100, Math.round(score)));
+    const inputs = attentionScoreInputState(data);
+    if (!inputs.notRead) {
+      return { value, reasons: reasons.slice(0, 4) };
+    }
+    // Read fault evidence keeps its score; with no risk input read and no
+    // such evidence there is nothing to score, and 0 would read as low risk.
+    if (!inputs.anyRead && !Number.isFinite(temperature) && score - unavailableScore <= 0) {
+      return { value: null, reasons: [], missingText: "not scored: SMART inputs not read" };
+    }
+    return { value, reasons: [...reasons.slice(0, 3), "SMART inputs not read"] };
+  }
+
+  // Why a bay has no heat-map value, when that is known: the metric says so,
+  // or the SMART field it shows was reported but could not be read.
+  function heatmapMissingText(metric, entry, rawResult, evaluation) {
+    if (rawResult && typeof rawResult === "object" && rawResult.missingText) {
+      return rawResult.missingText;
+    }
+    if (evaluation?.timelineActive || metric?.requiresHistory) {
+      return null;
+    }
+    const fields = Array.isArray(metric?.historyMetrics) && metric.historyMetrics.length ? metric.historyMetrics : [metric?.id];
+    return smartFieldNotRead(entry?.smartEntry, ...fields) ? "not read" : null;
   }
 
   function heatmapLiveEntry(slot) {
@@ -6093,6 +6217,7 @@
         entry,
         value: hasDiskIdentity && Number.isFinite(numericValue) ? numericValue : null,
         reasons,
+        missingText: isEmptySlot ? null : heatmapMissingText(metric, entry, rawResult, evaluation),
       };
       if (temperatureBands && Number.isFinite(record.value)) {
         record.thresholds = resolveHeatmapTemperatureThresholds(entry?.smartEntry?.data, entry?.slot);
@@ -6302,7 +6427,7 @@
       tile.classList.add("heatmap-missing");
       badge.textContent = "--";
       badge.dataset.placeholder = "";
-      badge.title = `${metric.label}: unknown`;
+      badge.title = `${metric.label}: ${record?.missingText || "unknown"}`;
       host.appendChild(badge);
       return;
     }
@@ -6364,7 +6489,7 @@
     const record = heatmapContext.records.get(String(entryKey));
     const metric = heatmapContext.metric;
     if (!record || !Number.isFinite(record.value)) {
-      return [`Heat Map: ${metric.label} unknown`];
+      return [`Heat Map: ${metric.label} ${record?.missingText || "unknown"}`];
     }
     const lines = [`Heat Map: ${metric.label} ${metric.format(record.value)}`];
     if (record.band && record.thresholds) {

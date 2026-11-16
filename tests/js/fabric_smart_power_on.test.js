@@ -34,6 +34,7 @@ const { formatInteger, formatSmartPowerOn, formatSmartPowerOnFact, smartSummaryL
     functionSource(FABRIC_SOURCE, "formatInteger"),
     functionSource(FABRIC_SOURCE, "formatSmartPowerOn"),
     functionSource(FABRIC_SOURCE, "smartPowerOnNotRead"),
+    functionSource(FABRIC_SOURCE, "smartFieldNotRead"),
     functionSource(FABRIC_SOURCE, "formatSmartPowerOnFact"),
     functionSource(FABRIC_SOURCE, "smartSummaryLine"),
     "return { formatInteger, formatSmartPowerOn, formatSmartPowerOnFact, smartSummaryLine };",
