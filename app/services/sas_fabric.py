@@ -1940,6 +1940,13 @@ def _mpr_unit_payload_observed(payload: dict[str, Any]) -> bool:
 _MPR_UNIT_COMMAND_PATTERN = re.compile(
     r"mprutil (?:-u (?P<unit>\S+) )?show (?P<subcommand>adapter|all|devices|enclosures|expanders|iocfacts)$"
 )
+# A failed read reaches the builder as a record that names no command: a fixed
+# context and, for a controller read, the controller. These two say which
+# records are controller reads; they must stay in step with the contexts the
+# inventory writes for the commands the pattern above matches.
+_MPR_UNIT_READ_FAILURE_CONTEXT = re.compile(r"sas_fabric_mprutil_(?:adapter|all|devices|enclosures|expanders|iocfacts)")
+_MPR_UNNUMBERED_READ_FAILURE_CONTEXT = "sas_fabric_mprutil"
+_MPR_FAILURE_CONTROLLER = re.compile(r"mpr(?P<unit>\d+)")
 _MPR_READ_NAME_LIMIT = 8
 
 
@@ -1967,11 +1974,7 @@ def _mpr_unit_read_results(
     }
     rejected = rejected_mpr_summary_unit_tokens(summary)
 
-    def note(command: str, *, text: bool, failed: bool) -> None:
-        match = _MPR_UNIT_COMMAND_PATTERN.match(command)
-        if not match:
-            return
-        token = match.group("unit")
+    def note(token: str | None, *, text: bool, failed: bool) -> None:
         unit = _LEGACY_MPR_UNIT_KEY if token is None else admit_mpr_unit_number(token)
         if unit is None:
             rejected.add(token)
@@ -1981,10 +1984,19 @@ def _mpr_unit_read_results(
         entry["failed"] = entry["failed"] or failed
 
     for command, value in outputs.items():
-        note(command, text=bool(value.strip()), failed=False)
+        match = _MPR_UNIT_COMMAND_PATTERN.match(command)
+        if match:
+            note(match.group("unit"), text=bool(value.strip()), failed=False)
     for failure in command_failures or []:
-        command = str(failure.get("canonical_command") or failure.get("command") or "")
-        note(canonicalize_ssh_command(command), text=False, failed=True)
+        context, controller = failure.get("context"), failure.get("controller")
+        if not isinstance(context, str) or not isinstance(controller, str):
+            continue
+        if context == _MPR_UNNUMBERED_READ_FAILURE_CONTEXT and controller == _LEGACY_MPR_CONTROLLER_NAME:
+            note(None, text=False, failed=True)
+        elif _MPR_UNIT_READ_FAILURE_CONTEXT.fullmatch(context):
+            numbered = _MPR_FAILURE_CONTROLLER.fullmatch(controller)
+            if numbered:
+                note(numbered.group("unit"), text=False, failed=True)
 
     numbered_read = any(unit >= 0 for unit in unit_data)
     results: list[dict[str, str]] = []
