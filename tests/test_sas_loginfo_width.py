@@ -112,5 +112,44 @@ class LoginfoSummaryBoundTests(unittest.TestCase):
         self.assertEqual(summary.get("loginfo_rejected_count"), 0)
 
 
+class KernelTextSummaryKeyTests(unittest.TestCase):
+    """Free kernel text is bounded like row text before it becomes a summary key."""
+
+    SCOPES = (("by_controller", "mpr0"), ("by_device", "da0"), ("by_controller_target", "mpr0:1"))
+
+    def test_long_kernel_text_is_bounded_before_it_becomes_a_summary_key(self) -> None:
+        reason = "r" * 5000
+        status = "s" * 5000
+        events = parse_mpr_dmesg_events(
+            f"(da0:mpr0:0:1:0): SCSI sense: ABORTED COMMAND asc:4b,04 ({reason})\n"
+            f"(da0:mpr0:0:1:0): CAM status: {status}\n"
+        )
+        for scope, key in self.SCOPES:
+            with self.subTest(scope=scope):
+                summary = events[scope][key]
+                # The metric view republishes sense_counts only.
+                for view, fields in (
+                    (summary, (("sense_counts", reason), ("cam_status_counts", status))),
+                    (_diagnostic_metric_summary(summary), (("sense_counts", reason),)),
+                ):
+                    for field, text in fields:
+                        counts = view[field]
+                        self.assertEqual(sum(counts.values()), 1)
+                        (only_key,) = counts
+                        self.assertLessEqual(len(only_key), 384)
+                        self.assertTrue(only_key.startswith(text[:64]))
+                        self.assertTrue(only_key.endswith("..."))
+
+    def test_short_kernel_text_keeps_its_exact_key(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "(da0:mpr0:0:1:0): SCSI sense: ABORTED COMMAND asc:4b,04 (synthetic reason)\n"
+            "(da0:mpr0:0:1:0): CAM status: SCSI Status Error\n"
+        )
+        summary = events["by_controller"]["mpr0"]
+
+        self.assertEqual(summary["sense_counts"], {"synthetic reason": 1})
+        self.assertEqual(summary["cam_status_counts"], {"SCSI Status Error": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

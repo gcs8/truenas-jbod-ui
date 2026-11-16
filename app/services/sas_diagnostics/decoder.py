@@ -225,13 +225,14 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
     if event_type == "scsi_sense":
         summary["sense_count"] += 1
         if event.get("reason"):
-            summary["sense_counts"][event["reason"]] += 1
+            # Kernel free text is bounded like row text before it becomes a key.
+            summary["sense_counts"][bound_diagnostic_value(str(event["reason"]))] += 1
     if event_type == "ioc_terminated":
         summary["ioc_terminated_count"] += 1
     if event_type == "cam_status":
         cam_status = str(event.get("message") or "").split(":", 1)[-1].strip()
         if cam_status:
-            summary["cam_status_counts"][cam_status] += 1
+            summary["cam_status_counts"][bound_diagnostic_value(cam_status)] += 1
     if event.get("device"):
         summary["devices"].add(event["device"])
     if event.get("target"):
