@@ -320,7 +320,7 @@ test("#1127 the CI fixture crawls a saved storage view through the real target U
   const ran = cli.statesFor(view, req("qa/ui-crawl/inventory").expandStates(req("qa/ui-crawl/inventory").loadInventory()), { fixture: "x", allow: [] }, {}).map((state) => state.id);
   assert.ok(ran.includes("main.heatmap") && ran.includes("main.heatmap.temperature"), ran.join(","));
   // The browser spec crawls the same target and requires the storage-view SMART read to be admitted there.
-  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage.spec.js"), "utf8");
+  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage-primary-crawl.spec.js"), "utf8");
   assert.match(spec, /storage_view_id=boot-doms/);
   assert.match(spec, /\/api\/storage-views\/\{view_id\}\/slots\/\{slot_index\}\/smart/);
   // The fixture builder answers the view slots' SMART reads with synthetic data.
