@@ -2303,6 +2303,45 @@
       .replace("Ses", "SES");
   }
 
+  // A count is a measurement only when its read was whole; the CORE payload
+  // says which controller-side counts were not read (`raw.controller_read`).
+  // Same rule as fabricCountPhrase on the Storage Fabric page.
+  function sasFabricCountPhrase(fabric, domain, count, noun) {
+    const counts = fabric?.raw?.controller_read?.counts;
+    const value = counts && typeof counts === "object" ? counts[domain] : "complete";
+    const readState = value === "complete" || value === "partial" ? value : "not_read";
+    const plural = `${noun}s`;
+    if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
+  }
+
+  // Unread controller data is not a report of no controllers.
+  function sasFabricNoControllerText(fabric, storagePayload) {
+    if (storagePayload) {
+      return { meta: "No storage sources reported", message: "No storage source rows are available yet." };
+    }
+    if (sasFabricCountPhrase(fabric, "controllers", 0, "controller") !== "0 controllers") {
+      return {
+        meta: "HBA controllers not read",
+        message: "Controller data could not be read. Check the SSH setup for this system in the admin console.",
+      };
+    }
+    return {
+      meta: "No HBA controllers reported",
+      message: "No controllers were reported. Check the SSH setup for this system in the admin console.",
+    };
+  }
+
+  function sasFabricCountSummary(fabric) {
+    return [
+      sasFabricCountPhrase(fabric, "controllers", sasFabricList(fabric.controllers).length, "source"),
+      sasFabricCountPhrase(fabric, "paths", sasFabricList(fabric.paths).length, "path"),
+      sasFabricCountPhrase(fabric, "expanders", sasFabricList(fabric.expanders).length, "expander"),
+      sasFabricCountPhrase(fabric, "enclosures", sasFabricList(fabric.enclosures).length, "enclosure"),
+      `${sasFabricList(fabric.traces).length} traces`,
+    ].join(" / ");
+  }
+
   function isStorageFabricPayload(fabric = state.sasFabric.data) {
     const kind = String(fabric?.raw?.fabric_kind || "");
     return fabric?.raw?.fabric_domain === "storage_fabric"
@@ -2595,16 +2634,17 @@
         related_slots: node.related_slots,
       }));
     if (!controllerRecords.length) {
+      const { meta, message } = sasFabricNoControllerText(fabric, storagePayload);
       return `
-        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: storagePayload ? "No storage sources reported" : "No HBA controllers reported" })}</div>
-        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controllers were reported. Check the SSH setup for this system in the admin console."}</div>
+        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta })}</div>
+        <div class="warning-item muted compact">${message}</div>
       `;
     }
     return `
       <div class="sas-fabric-host-row">
         ${renderSasFabricNodeButton(hostNode, {
           label: sasFabricDisplayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${storagePayload ? "source" : "controller"}${controllerRecords.length === 1 ? "" : "s"} / ${sasFabricList(fabric.nodes).length} nodes`,
+          meta: `${sasFabricCountPhrase(fabric, "controllers", controllerRecords.length, storagePayload ? "source" : "controller")} / ${sasFabricList(fabric.nodes).length} nodes`,
           extra: "sas-fabric-host-card",
         })}
       </div>
@@ -2735,13 +2775,7 @@
     }
     if (sasFabricSummary) {
       if (fabric) {
-        sasFabricSummary.textContent = [
-          `${sasFabricList(fabric.controllers).length} sources`,
-          `${sasFabricList(fabric.paths).length} paths`,
-          `${sasFabricList(fabric.expanders).length} expanders`,
-          `${sasFabricList(fabric.enclosures).length} enclosures`,
-          `${sasFabricList(fabric.traces).length} traces`,
-        ].join(" / ");
+        sasFabricSummary.textContent = sasFabricCountSummary(fabric);
       } else {
         sasFabricSummary.textContent = state.sasFabric.loading
           ? "Loading..."

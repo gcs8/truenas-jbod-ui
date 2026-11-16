@@ -1696,6 +1696,35 @@
       && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
   }
 
+  // A count is a measurement only when its read was whole. The producer says
+  // which controller-side counts were not read (CORE `raw.controller_read`).
+  // Payloads without that field keep their counts as before.
+  function fabricCountState(fabric, domain) {
+    const counts = fabric?.raw?.controller_read?.counts;
+    if (!counts || typeof counts !== "object") return "complete";
+    const value = counts[domain];
+    return value === "complete" || value === "partial" ? value : "not_read";
+  }
+
+  function fabricCountsIncomplete(fabric) {
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete");
+  }
+
+  // "3", "at least 3" (some reads missing) or "not read". Never a bare 0
+  // for a count whose read did not happen.
+  function fabricCountText(fabric, domain, count) {
+    const readState = fabricCountState(fabric, domain);
+    if (readState === "complete") return String(count);
+    return readState === "partial" && count > 0 ? `at least ${count}` : "not read";
+  }
+
+  function fabricCountPhrase(fabric, domain, count, noun) {
+    const readState = fabricCountState(fabric, domain);
+    const plural = `${noun}s`;
+    if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
+  }
+
   function hostDiskSummary(fabric) {
     const slots = sortedSlots(list(fabric.traces).filter((trace) => trace.kind === "bay").flatMap((trace) => list(trace.slots)));
     const noun = aggregateDiskNoun(slots);
@@ -1819,7 +1848,7 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${hostDiskSummary(fabric)}`,
+          meta: `${fabricCountPhrase(fabric, "controllers", controllerRecords.length, copy.hostControllerNoun)} / ${fabricCountPhrase(fabric, "paths", list(fabric.paths).length, "path")} / ${hostDiskSummary(fabric)}`,
           extra: "host",
         })}
       </div>
@@ -1836,11 +1865,14 @@
     if (fabric.platform !== "core" || !slots.length) {
       return '<div class="warning-item muted compact">No controller lanes are available yet.</div>';
     }
+    // Same location-aware noun as the controller lanes: Bays only when every
+    // drawn member has an affirmative physical location.
+    const physical = aggregateDiskNoun(slots) === "bay";
     return `
       <section class="fabric-dedicated-lane">
-        <div class="warning-item muted compact">Controller data could not be read. The bays below come from the inventory.</div>
+        <div class="warning-item muted compact">Controller data could not be read. The ${physical ? "bays" : "disks"} below come from the inventory.</div>
         <div class="fabric-stage">
-          <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
+          <span class="fabric-stage-title">${escapeHtml(physical ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
           <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
         </div>
       </section>
@@ -2009,6 +2041,13 @@
     }
     const text = String(value);
     return /bps|gb|mb/i.test(text) ? text : `${text} Gbps`;
+  }
+
+  // Linked PHYs over reported PHYs. A null linked count was not read whole:
+  // no fact rather than 0 (0 itself is a real, fully read count).
+  function phyFact(linked, total) {
+    if (!Number.isInteger(linked)) return null;
+    return total !== null && total !== undefined && total !== "" ? `${linked}/${total}` : String(linked);
   }
 
   function formatCountMap(value) {
@@ -3004,7 +3043,7 @@
         subtitle: fabric.selected_enclosure_label || fabric.system_id || "",
         facts: [
           [location.kind, location.label],
-          [linuxSes || storageFabric ? "Sources" : "Controllers", list(fabric.controllers).length],
+          [linuxSes || storageFabric ? "Sources" : "Controllers", fabricCountText(fabric, "controllers", list(fabric.controllers).length)],
         ],
         hoverFacts: [
           ["System ID", fabric.system_id],
@@ -3022,9 +3061,7 @@
           [linuxSes ? "SES devices" : storageFabric ? "Source" : "PCIe slot", linuxSes ? controllerNode?.metrics?.ses_device_count : storageFabric ? controllerNode?.raw?.source : controllerNode?.metrics?.pcie_slot || controllerNode?.raw?.pcie_slot],
           ["FW", linuxSes || storageFabric ? null : controllerNode?.metrics?.firmware || controllerNode?.raw?.firmware],
           ["Temp", linuxSes || storageFabric ? null : controllerNode?.metrics?.temperature],
-          ["PHY", linuxSes || storageFabric ? null : controllerNode?.metrics?.linked_phy_count && controllerNode?.metrics?.phy_count
-            ? `${controllerNode.metrics.linked_phy_count}/${controllerNode.metrics.phy_count}`
-            : controllerNode?.metrics?.linked_phys],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(controllerNode?.metrics?.linked_phy_count, controllerNode?.metrics?.phy_count)],
           ["IOC", linuxSes || storageFabric ? null : iocFacts.iocstatus],
           ["Events", linuxSes || storageFabric ? null : diagnosticSummary(controllerDiagnostics)],
         ],
@@ -3102,9 +3139,7 @@
         ].filter(Boolean).join(" / "),
         facts: [
           [linuxSes ? "SG device" : storageFabric ? "Evidence" : "WWN", linuxSes ? enclosureNode?.raw_id || seed.pathState?.ses_device : storageFabric ? enclosureNode?.raw?.source : expanderNode?.raw_id || enclosureNode?.raw_id],
-          ["PHY", linuxSes || storageFabric ? null : expanderNode?.metrics?.linked_phys && expanderNode?.metrics?.num_phys
-            ? `${expanderNode.metrics.linked_phys}/${expanderNode.metrics.num_phys}`
-            : expanderNode?.metrics?.linked_phys],
+          ["PHY", linuxSes || storageFabric ? null : phyFact(expanderNode?.metrics?.linked_phys, expanderNode?.metrics?.num_phys)],
           ["Enclosure", linuxSes ? enclosureNode?.raw?.enclosure_label : mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
           ["Devices", linuxSes || storageFabric ? null : formatCountMap(expanderNode?.raw?.device_counts)],
           ["PHY errors", linuxSes || storageFabric ? null : expanderNode?.metrics?.phy_error_counters],
@@ -3733,10 +3768,10 @@
     setSummaryCardText(elements.summaryPaths, ...copy.summary.paths);
     setSummaryCardText(elements.summaryExpanders, ...copy.summary.expanders);
     setSummaryCardText(elements.summaryEnclosures, ...copy.summary.enclosures);
-    elements.summaryControllers.textContent = String(list(fabric.controllers).length);
-    elements.summaryPaths.textContent = String(list(fabric.paths).length);
-    elements.summaryExpanders.textContent = String(list(fabric.expanders).length);
-    elements.summaryEnclosures.textContent = String(list(fabric.enclosures).length);
+    elements.summaryControllers.textContent = fabricCountText(fabric, "controllers", list(fabric.controllers).length);
+    elements.summaryPaths.textContent = fabricCountText(fabric, "paths", list(fabric.paths).length);
+    elements.summaryExpanders.textContent = fabricCountText(fabric, "expanders", list(fabric.expanders).length);
+    elements.summaryEnclosures.textContent = fabricCountText(fabric, "enclosures", list(fabric.enclosures).length);
     elements.summaryTraces.textContent = String(list(fabric.traces).length);
     elements.summaryLinks.textContent = String(list(fabric.links).length);
     elements.lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated || fabric.generated_at);
@@ -3833,13 +3868,17 @@
       .map(([name]) => String(name).toUpperCase());
     const actionableWarnings = (Array.isArray(fabric?.warnings) ? fabric.warnings : [])
       .filter((warning) => !isSasFabricEnrichmentWarning(warning));
-    if (failedSources.length || actionableWarnings.length) {
+    // A count the producer marks as not read whole never leaves the page OK.
+    const unreadCounts = fabricCountsIncomplete(fabric);
+    if (failedSources.length || actionableWarnings.length || unreadCounts) {
       const details = [];
       if (failedSources.length) {
         details.push(`Failed sources: ${failedSources.join(", ")}.`);
       }
       if (actionableWarnings.length) {
         details.push(String(actionableWarnings[0]));
+      } else if (unreadCounts) {
+        details.push("Some controller data was not read.");
       }
       return {
         chipTone: "partial",

@@ -49,9 +49,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   no `mprutil` output was returned; it says no controller or path data is
   available and still draws the bays, pools and vdevs the inventory knows.
   Output that cannot be read as controller data no longer creates a
-  controller, an adapter or expander PHY table that was not read shows its
-  PHY counts as unknown instead of 0, and an empty numbered `mprutil -u N`
-  result no longer hides the unnumbered adapter details. When only the
+  controller, an adapter or expander PHY table that was not read whole
+  (missing, short, malformed or repeated rows) shows its PHY counts as
+  unknown instead of 0, and an empty numbered `mprutil -u N` result no
+  longer hides the unnumbered adapter details. A controller, path, expander
+  or enclosure count whose read did not happen or was incomplete
+  now reads "not read" or "at least N" in the summary, host line, disk view
+  and main-page topology summary instead of 0, a controller unit that could
+  not be read is named in a warning and keeps the view partial, and the
+  no-controller lanes say "disks" for unmapped inventory. When only the
   unnumbered `mprutil show ...` commands answer, their board and firmware stay on one
   controller, and every link and controller reference names a node that is
   in the map (#1244, refs #1219).

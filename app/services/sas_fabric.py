@@ -767,13 +767,46 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         if node.kind in {"mpr-enclosure", "ses-enclosure"}
     ]
 
-    if _mpr_output_unreadable(normalized_outputs, unit_data):
+    unit_reads = _mpr_unit_read_results(normalized_outputs, unit_data, command_failures)
+    unread_units = [item["controller"] for item in unit_reads if item["result"] != "read"]
+    if not unit_data and any(item["result"] == "unreadable" for item in unit_reads):
         fabric_warnings.append(
             "CORE mprutil output was returned but could not be read as controller data, "
             "so controller details are unknown."
         )
     elif not controller_names and not paths:
         fabric_warnings.append("No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions.")
+    elif not unit_data:
+        fabric_warnings.append(
+            "CORE mprutil returned no controller data, so expander and enclosure counts and "
+            "controller details were not read."
+        )
+    elif unread_units:
+        fabric_warnings.append(
+            f"CORE controller data could not be read for {_bounded_name_list(unread_units)}, "
+            "so controller, expander and enclosure counts may be incomplete."
+        )
+    else:
+        missing_lists = _dedupe_strings([
+            name
+            for subcommand in ("expanders", "enclosures")
+            for name in _mpr_units_missing_list(normalized_outputs, unit_data, subcommand)
+        ])
+        if missing_lists:
+            fabric_warnings.append(
+                f"CORE controller {_bounded_name_list(missing_lists)} did not return an expander or "
+                "enclosure list, so those counts may be incomplete."
+            )
+    controller_read = {
+        "units": unit_reads,
+        "counts": _mpr_count_completeness(
+            normalized_outputs,
+            unit_data,
+            unit_reads,
+            controllers_seen=bool(controller_names),
+            paths_seen=bool(paths),
+        ),
+    }
     # Without controller data the bays, pools and vdevs the inventory already
     # knows are still drawn; the warning above says what could not be read.
     inventory_drawn = any(node.kind in {"bay", "pool", "vdev"} for node in nodes.values())
@@ -811,6 +844,9 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 "devices": sorted((mpr_kernel_diagnostics.get("by_device") or {}).keys()),
             },
             "command_failures": list(command_failures or []),
+            # Which controller-side counts were measured: the page shows
+            # "not read" instead of 0 for a count whose read did not happen.
+            "controller_read": controller_read,
         },
     )
 
@@ -1799,15 +1835,107 @@ def _mpr_unit_payload_observed(payload: dict[str, Any]) -> bool:
     )
 
 
-def _mpr_output_unreadable(outputs: dict[str, str], unit_data: dict[int, dict[str, Any]]) -> bool:
-    """Some mprutil unit command answered, yet no unit was admitted from it."""
-    if unit_data:
-        return False
-    return any(
-        value.strip()
-        for command, value in outputs.items()
-        if re.match(r"mprutil (?:-u \d+ )?show (?:adapter|devices|enclosures|expanders|iocfacts)$", command)
-    )
+_MPR_UNIT_COMMAND_PATTERN = re.compile(
+    r"mprutil (?:-u (?P<unit>\d+) )?show (?P<subcommand>adapter|devices|enclosures|expanders|iocfacts)$"
+)
+_MPR_READ_NAME_LIMIT = 8
+
+
+def _bounded_name_list(names: list[str]) -> str:
+    shown = names[:_MPR_READ_NAME_LIMIT]
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
+def _mpr_unit_read_results(
+    outputs: dict[str, str],
+    unit_data: dict[int, dict[str, Any]],
+    command_failures: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    """One result per attempted controller unit: read, unreadable, no_output or command_failed.
+
+    A unit was attempted when the adapter summary lists it or one of its unit
+    commands answered or failed. The unnumbered fallback counts only when no
+    numbered unit was read, because only then is it consulted.
+    """
+    attempted: dict[int, dict[str, bool]] = {
+        unit: {"text": False, "failed": False}
+        for unit in discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", ""))
+    }
+
+    def note(command: str, *, text: bool, failed: bool) -> None:
+        match = _MPR_UNIT_COMMAND_PATTERN.match(command)
+        if not match:
+            return
+        unit = int(match.group("unit")) if match.group("unit") is not None else _LEGACY_MPR_UNIT_KEY
+        entry = attempted.setdefault(unit, {"text": False, "failed": False})
+        entry["text"] = entry["text"] or text
+        entry["failed"] = entry["failed"] or failed
+
+    for command, value in outputs.items():
+        note(command, text=bool(value.strip()), failed=False)
+    for failure in command_failures or []:
+        command = str(failure.get("canonical_command") or failure.get("command") or "")
+        note(canonicalize_ssh_command(command), text=False, failed=True)
+
+    numbered_read = any(unit >= 0 for unit in unit_data)
+    results: list[dict[str, str]] = []
+    for unit in sorted(attempted):
+        if unit == _LEGACY_MPR_UNIT_KEY and numbered_read:
+            continue
+        entry = attempted[unit]
+        if unit in unit_data:
+            result = "read"
+        elif entry["text"]:
+            result = "unreadable"
+        elif entry["failed"]:
+            result = "command_failed"
+        else:
+            result = "no_output"
+        results.append({"controller": _mpr_controller_name_for_unit(unit), "result": result})
+    return results
+
+
+def _mpr_units_missing_list(outputs: dict[str, str], unit_data: dict[int, dict[str, Any]], subcommand: str) -> list[str]:
+    """Read units whose `show <subcommand>` did not answer (failed or never ran)."""
+    missing: list[str] = []
+    for unit in sorted(unit_data):
+        prefix = "mprutil show" if unit == _LEGACY_MPR_UNIT_KEY else f"mprutil -u {unit} show"
+        if f"{prefix} {subcommand}" not in outputs:
+            missing.append(_mpr_controller_name_for_unit(unit))
+    return missing
+
+
+def _mpr_count_completeness(
+    outputs: dict[str, str],
+    unit_data: dict[int, dict[str, Any]],
+    unit_reads: list[dict[str, str]],
+    *,
+    controllers_seen: bool,
+    paths_seen: bool,
+) -> dict[str, str]:
+    """complete, partial (a lower bound) or not_read for each controller-side count."""
+    if not unit_data:
+        mpr_state = "not_read"
+    elif any(item["result"] != "read" for item in unit_reads):
+        mpr_state = "partial"
+    else:
+        mpr_state = "complete"
+
+    def listed(subcommand: str) -> str:
+        if mpr_state != "complete":
+            return mpr_state
+        # A read unit whose list command did not answer leaves the count short.
+        return "partial" if _mpr_units_missing_list(outputs, unit_data, subcommand) else "complete"
+
+    return {
+        "controllers": "partial" if mpr_state == "not_read" and controllers_seen else mpr_state,
+        # Paths come from the inventory's multipath members; with no controller
+        # data and no paths at all, the producer cannot tell 0 from unread.
+        "paths": "not_read" if mpr_state == "not_read" and not controllers_seen and not paths_seen else "complete",
+        "expanders": listed("expanders"),
+        "enclosures": listed("enclosures"),
+    }
 
 
 def _path_counts_from_slots(slots: list[SlotView]) -> tuple[dict[str, Counter[str]], dict[str, dict[str, list[int]]]]:

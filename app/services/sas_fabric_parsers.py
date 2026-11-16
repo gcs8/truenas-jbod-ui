@@ -70,8 +70,10 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
                 malformed_phy_rows += 1
     rows = detail["phy_rows"]
     # Counts come only from a PHY table that was read whole. No table, a
-    # malformed row or a repeated PHY number leaves both counts unknown.
-    if rows and not malformed_phy_rows and len({row["phy"] for row in rows}) == len(rows):
+    # malformed row, a repeated PHY number or a gap in the PHY numbers
+    # (0 to n-1, as mprutil lists them) leaves both counts unknown.
+    phy_numbers = [int(row["phy"]) for row in rows]
+    if rows and not malformed_phy_rows and sorted(phy_numbers) == list(range(len(rows))):
         detail["phy_count"] = len(rows)
         detail["linked_phy_count"] = sum(1 for row in rows if row.get("device") and row.get("device") != "No Device")
     else:
@@ -178,14 +180,43 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
                 "device": device,
             }
         )
-    for expander in expanders:
-        counts = Counter(str(row.get("device") or "unknown").strip() for row in expander.get("phys") or [])
-        expander["device_counts"] = dict(counts)
-        # No PHY rows read under this expander: the linked count is unknown, not 0.
-        expander["linked_phys"] = (
-            sum(1 for row in expander["phys"] if row.get("device") != "No Device") if expander.get("phys") else None
-        )
+    candidate_lines = _mpr_expander_phy_candidate_lines(text, header_pattern)
+    for expander, candidates in zip(expanders, candidate_lines):
+        # Counts come only from a PHY table read whole: one row per reported
+        # PHY, each PHY number unique and in range, and no rejected rows.
+        # Otherwise the linked count and device tally are unknown, not 0.
+        if _mpr_expander_phy_table_complete(expander, candidates):
+            counts = Counter(str(row.get("device") or "unknown").strip() for row in expander["phys"])
+            expander["device_counts"] = dict(counts)
+            expander["linked_phys"] = sum(1 for row in expander["phys"] if row.get("device") != "No Device")
+        else:
+            expander["device_counts"] = None
+            expander["linked_phys"] = None
     return expanders
+
+
+def _mpr_expander_phy_candidate_lines(text: str, header_pattern: re.Pattern[str]) -> list[int]:
+    """Per expander header, the non-blank lines under it other than the column heading."""
+    counts: list[int] = []
+    for line in text.splitlines():
+        if header_pattern.match(line):
+            counts.append(0)
+            continue
+        stripped = line.strip()
+        if counts and stripped and not stripped.lower().startswith("phy "):
+            counts[-1] += 1
+    return counts
+
+
+def _mpr_expander_phy_table_complete(expander: dict[str, Any], candidate_lines: int) -> bool:
+    rows = expander.get("phys") or []
+    reported = str(expander.get("num_phys") or "")
+    if not rows or not reported.isdecimal() or len(rows) != int(reported) or candidate_lines != len(rows):
+        return False
+    numbers = [str(row.get("phy") or "") for row in rows]
+    if not all(number.isdecimal() and int(number) < int(reported) for number in numbers):
+        return False
+    return len({int(number) for number in numbers}) == len(numbers)
 
 
 def parse_mpr_iocfacts(text: str) -> dict[str, str]:

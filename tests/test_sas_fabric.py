@@ -570,7 +570,10 @@ process.stdout.write(ui.renderTraceMode(data.fabric));
                             f"36 {1:016x} 0001 ffff 0000 1", f"36 {2:016x} 0002 0001 0000 2",
                             f"36 {3:016x} 0003 0002 0000 3"])},
                     )
-                self.assertEqual(bool(fabric.warnings), limited)
+                self.assertEqual(
+                    "MPR expander ancestry resource limit exceeded; upstream connectivity is unknown." in fabric.warnings,
+                    limited,
+                )
                 self.assertEqual(sum(node.kind == "expander" for node in fabric.nodes), 1 if limited else 3)
                 self.assertEqual(any(link.kind == "expander-expander" for link in fabric.links), not limited)
 
@@ -1120,8 +1123,11 @@ Adapter     Chip           Board Name        Firmware
 
         self.assertEqual([row["unit"] for row in adapters], ["0", "1"])
         self.assertEqual(expanders[0]["sas_address"], "50030480090c4f7f")
-        self.assertEqual(expanders[0]["linked_phys"], 1)
-        self.assertEqual(expanders[0]["device_counts"]["End Device"], 1)
+        # The header reports 36 PHYs and only two rows follow: the table was
+        # not read whole, so its linked count and device tally are unknown.
+        self.assertEqual(len(expanders[0]["phys"]), 2)
+        self.assertIsNone(expanders[0]["linked_phys"])
+        self.assertIsNone(expanders[0]["device_counts"])
 
     def test_parse_pciconf_and_dmidecode_join_keys_for_supermicro_slots(self) -> None:
         controllers = parse_pciconf_sas_controllers(PCICONF_MPR_OUTPUT)
@@ -3223,6 +3229,16 @@ class SasFabricSnapshotTests(unittest.TestCase):
                     "mpr_sysctl_locations": {},
                     "mpr_kernel_events": {"event_count": 0, "controllers": [], "devices": []},
                     "command_failures": [],
+                    # Nothing was read, so no controller-side count is a measurement (#1219).
+                    "controller_read": {
+                        "units": [],
+                        "counts": {
+                            "controllers": "not_read",
+                            "paths": "not_read",
+                            "expanders": "not_read",
+                            "enclosures": "not_read",
+                        },
+                    },
                 },
             },
             "linux_ses": {
