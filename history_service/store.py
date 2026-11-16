@@ -3469,6 +3469,22 @@ class HistoryStore:
         connection.create_function("_history_utc_instant", 1, utc_instant, deterministic=True)
 
     @staticmethod
+    def _sample_order_instant(column: str) -> str:
+        """SQL for the instant a raw sample's last value is ordered by.
+
+        The exact instant where the text has one. Otherwise the instant SQLite
+        reads, to its millisecond: SQLite names the sample's bucket from the
+        same reading, so every sample that has a bucket has a place in the
+        order. A restored database can hold text only SQLite reads (padded
+        with spaces, or without an offset, which SQLite takes as UTC).
+        """
+
+        return (
+            f"COALESCE(_history_utc_instant(CAST({column} AS BLOB)), "
+            f"strftime('%Y-%m-%dT%H:%M:%f', {column}) || '000')"
+        )
+
+    @staticmethod
     def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
         """Return (cutoff, settled bound, cutoff instant) for a retention predicate.
 
@@ -3646,7 +3662,7 @@ class HistoryStore:
                         PARTITION BY
                             {bucket_expression}, system_id, enclosure_key, slot,
                             metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY _history_utc_instant(CAST(observed_at AS BLOB)) DESC, id DESC
+                        ORDER BY {cls._sample_order_instant("observed_at")} DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
                 WHERE id IN ({expired_rows})
@@ -3669,14 +3685,14 @@ class HistoryStore:
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
                 last_value = CASE
-                    WHEN _history_utc_instant(CAST(excluded.last_observed_at AS BLOB))
-                        >= _history_utc_instant(CAST(metric_rollups.last_observed_at AS BLOB))
+                    WHEN {cls._sample_order_instant("excluded.last_observed_at")}
+                        >= {cls._sample_order_instant("metric_rollups.last_observed_at")}
                     THEN excluded.last_value
                     ELSE metric_rollups.last_value
                 END,
                 last_observed_at = CASE
-                    WHEN _history_utc_instant(CAST(excluded.last_observed_at AS BLOB))
-                        >= _history_utc_instant(CAST(metric_rollups.last_observed_at AS BLOB))
+                    WHEN {cls._sample_order_instant("excluded.last_observed_at")}
+                        >= {cls._sample_order_instant("metric_rollups.last_observed_at")}
                     THEN excluded.last_observed_at
                     ELSE metric_rollups.last_observed_at
                 END,

@@ -1661,6 +1661,149 @@ class RetentionOversizedTimestampUtf16BigEndianTests(RetentionOversizedTimestamp
     ENCODING = "UTF-16be"
 
 
+# Text SQLite reads as a time (it names the row's bucket) that the exact
+# reading rejects. Each is 00:30 UTC on 2026-11-03. A restored database can
+# hold any of them; this service writes none.
+SQLITE_ONLY_0030 = {
+    "trailing spaces": "2026-11-03T00:30:00+00:00   ",
+    "trailing tab and newline": "2026-11-03T00:30:00+00:00\t\n",
+    "spaces after Z": "2026-11-03T00:30:00Z  ",
+    "no offset": "2026-11-03T00:30:00",
+    "text after a NUL": "2026-11-03T00:30:00+00:00\x00tail",
+    # 19:30 at -05:00 the day before: its text sorts before 00:15 UTC.
+    "another offset": "2026-11-02T19:30:00-05:00 ",
+}
+ORDINARY_0015 = "2026-11-03T00:15:00+00:00"
+ORDINARY_0045 = "2026-11-03T00:45:00+00:00"
+
+
+class RetentionSqliteReadableTimeTests(unittest.TestCase):
+    """A counter's last value follows time order for every time that has a bucket."""
+
+    ENCODING = "UTF-8"
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-sqlite-time-")
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+
+    def _store(self, name: str) -> tuple[Path, HistoryStore]:
+        path = self.root / f"{name}.db"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(f"PRAGMA encoding = '{self.ENCODING}'")
+            connection.execute("CREATE TABLE encoding_marker (value)")
+            connection.commit()
+        return path, HistoryStore(str(path))
+
+    @staticmethod
+    def _insert(path: Path, rows: list[tuple[str, int]]) -> None:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.executemany(
+                "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, slot, "
+                "slot_label, metric_name, value_integer) "
+                "VALUES (?, 'synthetic-system', '', 5, '05', 'bytes_read', ?)",
+                rows,
+            )
+            connection.commit()
+
+    @staticmethod
+    def _retain_counters(store: HistoryStore, batch_size: int) -> dict:
+        return _retain(
+            store,
+            raw_metric_retention_days=1,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=365,
+            batch_size=batch_size,
+            max_batches=50,
+        )
+
+    CASES = [
+        (form, text, batch_size, f"{index}-{batch_size}")
+        for index, (form, text) in enumerate(SQLITE_ONLY_0030.items())
+        for batch_size in (100, 2, 1)
+    ]
+
+    def test_the_forms_are_read_by_sqlite_and_not_by_the_exact_reading(self) -> None:
+        from history_service.store import _history_utc_instant
+
+        with closing(sqlite3.connect(":memory:")) as connection:
+            for name, text in SQLITE_ONLY_0030.items():
+                with self.subTest(form=name):
+                    self.assertIsNone(_history_utc_instant(text))
+                    self.assertEqual(
+                        connection.execute("SELECT strftime('%Y-%m-%dT%H:%M:%S', ?)", (text,)).fetchone()[0],
+                        "2026-11-03T00:30:00",
+                    )
+
+    def test_the_latest_sample_gives_the_last_value_when_only_sqlite_reads_its_time(self) -> None:
+        for form, text, batch_size, name in self.CASES:
+            with self.subTest(form=form, batch_size=batch_size):
+                path, store = self._store(f"latest-{name}")
+                self._insert(path, [(ORDINARY_0015, 15), (text, 30)])
+
+                result = self._retain_counters(store, batch_size)
+
+                self.assertEqual(result["metric_samples_removed"], 2)
+                self.assertEqual(_rollups(path), [(3600, 2, 30.0, text), (86400, 2, 30.0, text)])
+
+    def test_an_ordinary_later_sample_still_gives_the_last_value(self) -> None:
+        for form, text, batch_size, name in self.CASES:
+            with self.subTest(form=form, batch_size=batch_size):
+                path, store = self._store(f"earlier-{name}")
+                self._insert(path, [(text, 30), (ORDINARY_0045, 45)])
+
+                result = self._retain_counters(store, batch_size)
+
+                self.assertEqual(result["metric_samples_removed"], 2)
+                self.assertEqual(
+                    _rollups(path),
+                    [(3600, 2, 45.0, ORDINARY_0045), (86400, 2, 45.0, ORDINARY_0045)],
+                )
+
+    def test_a_merge_into_a_kept_bucket_follows_time_order_both_ways(self) -> None:
+        # The first pass writes the bucket; the second sample arrives late and merges.
+        for form, text, batch_size, name in self.CASES:
+            for first, second, last in (
+                ((ORDINARY_0015, 15), (text, 30), (30.0, text)),
+                ((text, 30), (ORDINARY_0015, 15), (30.0, text)),
+                ((text, 30), (ORDINARY_0045, 45), (45.0, ORDINARY_0045)),
+                ((ORDINARY_0045, 45), (text, 30), (45.0, ORDINARY_0045)),
+            ):
+                with self.subTest(form=form, batch_size=batch_size, first=first[1], second=second[1]):
+                    path, store = self._store(f"merge-{name}-{first[1]}-{second[1]}")
+                    self._insert(path, [first])
+                    self._retain_counters(store, batch_size)
+                    self._insert(path, [second])
+
+                    self._retain_counters(store, batch_size)
+
+                    self.assertEqual(_rollups(path), [(3600, 2, *last), (86400, 2, *last)])
+
+    def test_a_late_sample_at_the_same_instant_replaces_the_last_value_as_an_ordinary_one_does(self) -> None:
+        # Two samples at one instant: the one that arrives later gives the last
+        # value, whichever of the two readings names its instant.
+        ordinary = "2026-11-03T00:30:00+00:00"
+        padded = SQLITE_ONLY_0030["trailing spaces"]
+        for first, second in ((ordinary, ordinary), (ordinary, padded), (padded, ordinary), (padded, padded)):
+            with self.subTest(first=first, second=second):
+                path, store = self._store(f"tie-{len(first)}-{len(second)}")
+                self._insert(path, [(first, 30)])
+                self._retain_counters(store, 100)
+                self._insert(path, [(second, 31)])
+
+                self._retain_counters(store, 100)
+
+                self.assertEqual(_rollups(path), [(3600, 2, 31.0, second), (86400, 2, 31.0, second)])
+
+
+class RetentionSqliteReadableTimeUtf16Tests(RetentionSqliteReadableTimeTests):
+    ENCODING = "UTF-16le"
+
+
+class RetentionSqliteReadableTimeUtf16BigEndianTests(RetentionSqliteReadableTimeTests):
+    ENCODING = "UTF-16be"
+
+
 class RetentionQueryPlanTests(unittest.TestCase):
     """Every retention statement reads the tables through the timestamp index."""
 
