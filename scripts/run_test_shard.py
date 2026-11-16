@@ -208,6 +208,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_disk_inventory_sync",
         "test_disk_inventory_sync_grants",
         "test_esxi_host_prep",
+        "test_esxi_topology_alias_scope",
         "test_ghcr_release_contract",
         "test_history_routes",
         "test_history_schema_version_gate",

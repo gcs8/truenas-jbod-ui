@@ -109,6 +109,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_config_example",
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
+    "tests.test_esxi_topology_alias_scope",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",

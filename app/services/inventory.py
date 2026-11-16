@@ -15352,6 +15352,7 @@ class InventoryService:
     @staticmethod
     def _build_esxi_topology_members(disk_records: list[DiskRecord]) -> dict[str, ZpoolMember]:
         members: dict[str, ZpoolMember] = {}
+        key_counts: Counter[str] = Counter()
         for disk in disk_records:
             slot_key = normalize_text(disk.raw.get("storcli_slot")) or normalize_text(disk.device_name)
             storcli_state = normalize_text(
@@ -15427,6 +15428,7 @@ class InventoryService:
                 raw_name=disk.device_name or "",
                 raw_path=None,
             )
+            disk_keys: set[str] = set()
             for value in (
                 disk.device_name,
                 disk.serial,
@@ -15436,9 +15438,16 @@ class InventoryService:
                 disk.raw.get("storcli_slot"),
                 disk.raw.get("storcli_controller_slot"),
             ):
-                for key in normalize_lookup_keys(str(value) if value is not None else None):
-                    members[key] = member
-        return members
+                disk_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+            for key in disk_keys:
+                members[key] = member
+                key_counts[key] += 1
+        # Same policy as ESXi physical placement (#1213): a key claimed by more
+        # than one disk, such as a controller-local `13:0` slot repeated on a
+        # second controller, would hand one disk the other's pool and health.
+        # Drop it so lookup falls through to the disk's own serial or
+        # controller-qualified key instead of whichever row was listed last.
+        return {key: member for key, member in members.items() if key_counts[key] == 1}
 
     def _build_disk_records(
         self,
