@@ -1,14 +1,17 @@
 """#1191: the fixture-only browser specs run as parallel CI legs.
 
 Every fixture spec under ``qa/`` must run on exactly one leg of the
-``fixture-browser`` matrix in ``.github/workflows/ci.yml``, and the required
-``Checked-in public demo artifact`` check must fail unless every leg passed.
-These tests read the workflow and the ``qa/`` tree only; nothing runs a browser.
+``fixture-browser`` matrix in ``.github/workflows/ci.yml``. The legs need only
+the route job, so they start beside the unit shards; the required
+``Checked-in public demo artifact`` check must fail unless every leg and both
+source gates passed. These tests read the workflow and the ``qa/`` tree only;
+nothing runs a browser.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import os
 import re
 import subprocess
@@ -28,6 +31,15 @@ AGGREGATE_JOB = "public-demo-artifact"
 AGGREGATE_NAME = "Checked-in public demo artifact"
 EXPECTED_LEGS = ("1", "2", "3", "4")
 LEG_RUN_STEP = "Run fixture-only browser specs"
+SOURCE_GATES = ("javascript-source", "python-source")
+AGGREGATE_STEP = "Require every leg and both source gates to succeed"
+# Environment variable in the aggregate's check step -> the job whose result it holds.
+AGGREGATE_RESULT_ENV = {
+    "LEG_RESULT": LEG_JOB,
+    "JAVASCRIPT_SOURCE_RESULT": "javascript-source",
+    "PYTHON_SOURCE_RESULT": "python-source",
+}
+JOB_RESULTS = ("success", "failure", "cancelled", "skipped", "")
 
 # Spec files under qa/ that deliberately run on no fixture leg, and where they
 # run instead. A new spec file must be added to a leg or to this table.
@@ -108,6 +120,18 @@ def leg_assignment_problems(workflow: dict[str, Any], spec_files: list[str]) -> 
 
 def step_named(job: dict[str, Any], name: str) -> dict[str, Any]:
     return next(step for step in job["steps"] if step.get("name") == name)
+
+
+def aggregate_check_step(job: dict[str, Any]) -> dict[str, Any]:
+    """The required aggregate's one step, found without relying on its name."""
+    steps = job.get("steps", [])
+    assert len(steps) == 1, f"{AGGREGATE_JOB} should have exactly one step, has {len(steps)}"
+    return steps[0]
+
+
+def job_needs(job: dict[str, Any]) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
 
 
 class FixtureBrowserLegAssignmentTests(unittest.TestCase):
@@ -202,10 +226,15 @@ class FixtureBrowserLegJobTests(unittest.TestCase):
         self.assertIs(strategy["fail-fast"], False)
         self.assertEqual(strategy["max-parallel"], len(EXPECTED_LEGS))
         self.assertEqual(set(strategy["matrix"]), {"include"})
-        self.assertIn("route", self.legs["needs"])
+        self.assertIn("route", job_needs(self.legs))
         self.assertEqual(self.legs["if"], "needs.route.outputs.run == 'true'")
         self.assertIn("${{ matrix.leg }}", self.legs["name"])
         self.assertNotIn("continue-on-error", self.legs)
+
+    def test_legs_need_only_the_route_job(self) -> None:
+        # Nothing the source gates produce is used by a leg, so the legs start
+        # beside the unit shards; the required aggregate enforces the gates.
+        self.assertEqual(job_needs(self.legs), ["route"])
 
     def test_each_leg_runs_only_its_own_spec_list_once(self) -> None:
         step = step_named(self.legs, LEG_RUN_STEP)
@@ -257,33 +286,53 @@ class RequiredAggregateTests(unittest.TestCase):
         self.aggregate = self.workflow["jobs"][AGGREGATE_JOB]
 
     def test_the_required_check_waits_for_every_leg_and_requires_success(self) -> None:
-        needs = self.aggregate["needs"]
+        needs = job_needs(self.aggregate)
 
         self.assertEqual(self.aggregate["name"], AGGREGATE_NAME)
         self.assertEqual(self.aggregate["runs-on"], "ubuntu-latest")
-        self.assertIn(LEG_JOB, needs)
-        self.assertIn("route", needs)
-        # !cancelled() keeps it from being skipped when a leg fails or is
-        # skipped; the route check keeps a routed-off duplicate run skipped.
+        self.assertEqual(sorted(needs), sorted(["route", LEG_JOB, *SOURCE_GATES]))
+        self.assertEqual(len(needs), 4)
+        # !cancelled() keeps it from being skipped when a leg or a source gate
+        # fails or is skipped; the route check keeps a routed-off duplicate
+        # run skipped.
         self.assertEqual(self.aggregate["if"], "${{ !cancelled() && needs.route.outputs.run == 'true' }}")
         self.assertNotIn("continue-on-error", self.aggregate)
-        step = step_named(self.aggregate, "Require every fixture browser leg to succeed")
-        self.assertEqual(step["env"]["LEG_RESULT"], f"${{{{ needs.{LEG_JOB}.result }}}}")
-        self.assertEqual(step["run"].strip(), 'test "$LEG_RESULT" = success')
+        step = aggregate_check_step(self.aggregate)
+        self.assertEqual(step.get("name"), AGGREGATE_STEP)
+        self.assertEqual(
+            step.get("env"),
+            {name: f"${{{{ needs.{job}.result }}}}" for name, job in AGGREGATE_RESULT_ENV.items()},
+        )
+        self.assertNotIn("${{", step["run"])
+        self.assertNotIn("shell", step)
+        self.assertNotIn("continue-on-error", step)
+
+    def test_the_aggregate_is_the_only_job_that_needs_a_source_gate(self) -> None:
+        # Listed from the workflow, so a later edit cannot drop a gate from the
+        # required check, or hang a new job on one, without failing here.
+        jobs = self.workflow["jobs"]
+        for gate in SOURCE_GATES:
+            with self.subTest(gate=gate):
+                dependents = sorted(name for name, job in jobs.items() if gate in job_needs(job))
+                self.assertEqual(dependents, [AGGREGATE_JOB])
+        self.assertEqual(job_needs(jobs["python-source"]), ["route", "python-unittest"])
+        self.assertEqual(job_needs(jobs["javascript-source"]), ["route"])
 
     @unittest.skipIf(os.name == "nt", "runs the step's shell command with bash")
-    def test_the_result_check_fails_unless_the_legs_succeeded(self) -> None:
-        script = step_named(self.aggregate, "Require every fixture browser leg to succeed")["run"]
-        for result, expected in (("success", 0), ("failure", 1), ("cancelled", 1), ("skipped", 1), ("", 1)):
-            with self.subTest(result=result):
+    def test_the_result_check_fails_unless_the_legs_and_both_source_gates_succeeded(self) -> None:
+        script = aggregate_check_step(self.aggregate)["run"]
+        for results in itertools.product(JOB_RESULTS, repeat=len(AGGREGATE_RESULT_ENV)):
+            env = dict(zip(AGGREGATE_RESULT_ENV, results))
+            expected = 0 if all(result == "success" for result in results) else 1
+            with self.subTest(**env):
+                # GitHub runs an unspecified Linux shell as `bash -e {0}`.
                 completed = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env={"PATH": os.environ.get("PATH", ""), "LEG_RESULT": result},
+                    env={"PATH": os.environ.get("PATH", ""), **env},
                     capture_output=True,
                     check=False,
                 )
                 self.assertEqual(completed.returncode, expected)
-
 
 if __name__ == "__main__":
     unittest.main()

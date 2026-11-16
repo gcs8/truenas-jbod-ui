@@ -333,6 +333,16 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
         self.assertIn("fixture-browser", ci["jobs"]["public-demo-artifact"]["needs"])
 
+    def test_the_browser_legs_start_without_waiting_for_the_source_gates(self) -> None:
+        # #1191: the legs use nothing the source gates produce, so they need
+        # only the route job; the required check carries both source gates.
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["fixture-browser"]["needs"], ["route"])
+        self.assertEqual(
+            sorted(ci["jobs"]["public-demo-artifact"]["needs"]),
+            ["fixture-browser", "javascript-source", "python-source", "route"],
+        )
+
     def test_the_sole_public_demo_validation_always_runs_on_pull_requests(self) -> None:
         # With the publish workflow off pull_request, this job is the only PR
         # browser check of current source, so nothing may route it to skipped.
