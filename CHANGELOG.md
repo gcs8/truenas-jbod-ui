@@ -48,6 +48,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
+- Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
+  When days are not reported it shows the reported hours, and leaves the
+  value out when neither is known; a reported zero still shows (#1234).
+- Restore now refuses a history database whose schema version is outside the
+  range this release supports, in both backup formats and before anything is
+  activated, instead of replacing live history with a database the service
+  then refuses to start on. The message names the found and supported
+  versions, and live history is left unchanged (#1193).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
@@ -82,6 +96,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- On ESXi hosts where two RAID controllers report the same local slot (such
+  as `13:0`), a placed disk no longer takes the other controller's pool,
+  topology and fault state; a slot key shared by several disks is no longer
+  used for topology lookup (#1237, refs #1213).
 
 ### Performance
 

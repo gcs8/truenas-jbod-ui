@@ -2917,10 +2917,9 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await caller
             release.set()
-            for _ in range(100):
-                if coordinator.pending_key_count == 0:
-                    break
-                await asyncio.sleep(0)
+            # The executor reports the worker's exception to the loop from its
+            # own thread, so wait for the release rather than a fixed loop count.
+            await wait_bounds.wait_until(lambda: coordinator.pending_key_count == 0)
             await asyncio.sleep(0)
         finally:
             release.set()
