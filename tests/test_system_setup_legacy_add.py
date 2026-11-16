@@ -1096,6 +1096,94 @@ class ConfigStagingCleanupTests(_LegacyConfigMixin, unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), expected_final)
                 self.assertEqual(published_mode, expected_final)
 
+    def test_a_failed_write_closes_the_staging_file_before_removing_it(self) -> None:
+        # Some platforms refuse to remove a file that is still open. The
+        # cleanup must have closed the staging file first, or a failed save
+        # leaves a copy that can hold credentials. The removal here refuses
+        # while the file is open, as such a platform would.
+        real_open, real_fdopen, real_fchmod, real_unlink = os.open, os.fdopen, os.fchmod, Path.unlink
+
+        def failing_on_call(real, number, failure):
+            calls = []
+
+            def wrapper(*args, **kwargs):
+                calls.append(args)
+                if len(calls) == number:
+                    raise failure
+                return real(*args, **kwargs)
+
+            return wrapper
+
+        cases = {
+            "opening the stream": ("fdopen", lambda failure: failing_on_call(real_fdopen, 1, failure)),
+            "before the content": ("fchmod", lambda failure: failing_on_call(real_fchmod, 1, failure)),
+            "after the content": ("fchmod", lambda failure: failing_on_call(real_fchmod, 2, failure)),
+            "the sync": ("fsync", lambda failure: failing_on_call(os.fsync, 1, failure)),
+        }
+        for label, (name, build) in cases.items():
+            for failure in (OSError(errno.EIO, "synthetic write failure"), KeyboardInterrupt()):
+                with self.subTest(step=label, failure=type(failure).__name__):
+                    self._write(self.POPULATED)
+                    before = self._directory()
+                    descriptors: list[int] = []
+
+                    def recording_open(path, flags, mode=0o777, **kwargs):
+                        descriptor = real_open(path, flags, mode, **kwargs)
+                        if self.STAGING_NAME.match(Path(path).name):
+                            descriptors.append(descriptor)
+                        return descriptor
+
+                    def unlink_refusing_an_open_file(path, *args, **kwargs):
+                        for descriptor in descriptors:
+                            try:
+                                os.fstat(descriptor)
+                            except OSError:
+                                continue
+                            raise PermissionError(errno.EACCES, "the file is in use")
+                        return real_unlink(path, *args, **kwargs)
+
+                    with (
+                        mock.patch.object(secret_files.os, "open", side_effect=recording_open),
+                        mock.patch.object(secret_files.os, name, side_effect=build(failure)),
+                        mock.patch.object(Path, "unlink", unlink_refusing_an_open_file),
+                    ):
+                        with self.assertRaises(type(failure)):
+                            self.service.save_system(self._request("new-host"))
+                    self.assertEqual(len(descriptors), 1)
+                    self.assertEqual(self._directory(), before)
+
+    def test_the_staging_file_is_closed_before_it_is_renamed(self) -> None:
+        # Control for the above: a save that succeeds has also closed the
+        # staging file by the time it renames it, on every platform.
+        self._write(self.POPULATED)
+        real_open, real_replace = os.open, os.replace
+        descriptors: list[int] = []
+        open_at_rename: list[bool] = []
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            descriptor = real_open(path, flags, mode, **kwargs)
+            if self.STAGING_NAME.match(Path(path).name):
+                descriptors.append(descriptor)
+            return descriptor
+
+        def recording_replace(source, target):
+            for descriptor in descriptors:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    open_at_rename.append(False)
+                else:
+                    open_at_rename.append(True)
+            return real_replace(source, target)
+
+        with (
+            mock.patch.object(secret_files.os, "open", side_effect=recording_open),
+            mock.patch.object(secret_files.os, "replace", side_effect=recording_replace),
+        ):
+            self.service.save_system(self._request("new-host"))
+        self.assertEqual(open_at_rename, [False])
+        self.assertEqual(set(self._directory()), {"config.yaml"})
+
     def test_an_interrupt_after_the_rename_keeps_the_published_file(self) -> None:
         # Control: once the rename happened the new file is the config; the
         # cleanup must not remove it.

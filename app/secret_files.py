@@ -150,19 +150,24 @@ def write_text_atomically(path: Path, text: str) -> int:
     temp_path, descriptor = _create_staging_file(path)
     handle = None
     try:
-        handle = os.fdopen(descriptor, "wb")
-        if hasattr(os, "fchmod"):
-            # os.open applies the umask; keep the staging file exactly 0600.
-            os.fchmod(handle.fileno(), _STAGING_MODE)
-        handle.write(text.encode("utf-8"))
-        handle.flush()
-        if hasattr(os, "fchmod"):
-            # Complete: now take the destination's mode for publication.
-            os.fchmod(handle.fileno(), mode)
-        os.fsync(handle.fileno())
-        if os.name != "posix":
-            # Windows cannot rename a file that is still open.
-            handle.close()
+        try:
+            handle = os.fdopen(descriptor, "wb")
+            if hasattr(os, "fchmod"):
+                # os.open applies the umask; keep the staging file exactly 0600.
+                os.fchmod(handle.fileno(), _STAGING_MODE)
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            if hasattr(os, "fchmod"):
+                # Complete: now take the destination's mode for publication.
+                os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        finally:
+            # Closed before the rename and before any cleanup: Windows can
+            # neither rename nor remove a file that is still open.
+            if handle is not None:
+                handle.close()
+            else:
+                os.close(descriptor)
         os.replace(temp_path, path)
     except BaseException:
         # Nothing was published: remove this call's staging copy (it can
@@ -173,11 +178,6 @@ def write_text_atomically(path: Path, text: str) -> int:
         except OSError:
             pass
         raise
-    finally:
-        if handle is not None:
-            handle.close()
-        else:
-            os.close(descriptor)
     if os.name == "posix":
         # fsync the directory so the rename itself survives a power loss.
         try:
