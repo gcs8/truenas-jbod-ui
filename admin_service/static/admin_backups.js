@@ -505,11 +505,26 @@
 
     // ------------------------------------------------------------- load --
 
-    function load({ quiet = false } = {}) {
-      if (state.loadPromise) return state.loadPromise;
+    // One list read at a time: plain callers share the read in flight. A caller
+    // that just changed something (fresh) queues one follow-up read instead, so
+    // it never settles on a reply that started before its write (#1200).
+    function load({ quiet = false, fresh = false } = {}) {
+      if (state.loadQueued) return state.loadQueued;
+      if (state.loadPromise) {
+        if (!fresh) return state.loadPromise;
+        state.loadQueued = state.loadPromise
+          .catch(() => {})
+          .then(() => startLoad({ quiet }));
+        return state.loadQueued;
+      }
+      return startLoad({ quiet });
+    }
+
+    function startLoad({ quiet }) {
+      state.loadQueued = null;
       state.loading = true;
       if (!quiet) setStatus("Loading backups...");
-      state.loadPromise = (async () => {
+      const run = (async () => {
         try {
           const payload = await deps.fetchJson(API_ROOT);
           state.data = {
@@ -545,11 +560,13 @@
           scheduleRunningPoll();
         } finally {
           state.loading = false;
-          state.loadPromise = null;
           render();
         }
-      })();
-      return state.loadPromise;
+      })().finally(() => {
+        if (state.loadPromise === run) state.loadPromise = null;
+      });
+      state.loadPromise = run;
+      return run;
     }
 
     // While a backup runs, re-read the list now and then so the result shows
@@ -763,6 +780,7 @@
       const generation = state.dialogGeneration || 0;
       const live = () => generation === (state.dialogGeneration || 0) && Boolean(els.dialog?.open);
       return {
+        generation,
         live,
         result: (text) => (live() ? dialogResult(text) : null),
         actions: (...nodes) => {
@@ -952,9 +970,7 @@
       openDialog("Backup settings", [el("p", { className: "subtle", text: "Loading..." })], [cancelButton("Close")], trigger);
       const scope = dialogScope();
       try {
-        const view = await deps.fetchJson(POLICY_URL);
-        state.policyView = view;
-        showPolicyView(scope, view);
+        adoptPolicyView(scope, await deps.fetchJson(POLICY_URL));
       } catch (error) {
         scope.result(`Couldn't load the backup settings: ${errorText(error)}`);
       }
@@ -967,18 +983,43 @@
       scope.actions(cancelButton(), primary("Save", "policy-save"));
     }
 
-    function editorWithTargets(mutate) {
+    // The editor's model belongs to the dialog generation that loaded it, the
+    // same as its controls (#1199). A reply for a closed or replaced dialog
+    // cannot become the model that the open dialog saves.
+    function adoptPolicyView(scope, view) {
+      if (!scope.live()) return false;
+      state.policyView = view;
+      state.policyViewGeneration = scope.generation;
+      showPolicyView(scope, view);
+      return true;
+    }
+
+    function ownedPolicyView() {
+      const scope = dialogScope();
       const view = state.policyView;
-      if (!view) return;
-      // Keep what was typed: fold the current form back into the view first.
+      if (!view || !scope.live() || state.policyViewGeneration !== scope.generation) return null;
+      return { scope, view };
+    }
+
+    function editorWithTargets(mutate) {
+      const owned = ownedPolicyView();
+      if (!owned) return;
+      const { scope, view } = owned;
+      // Keep what was typed: fold the current form back into the view first,
+      // class settings as well as targets (#1198). Locked inputs are never
+      // read, so environment values stay as the server sent them.
       const edits = readEdits(view);
+      const classes = {};
+      Object.keys(view.classes || {}).forEach((backupClass) => {
+        const entry = view.classes[backupClass] || {};
+        classes[backupClass] = { ...entry, values: { ...entry.values, ...edits.classes[backupClass] } };
+      });
       const targets = view.targets.map((target, index) => ({
         ...target,
         values: { ...edits.targets[index].values },
         pendingSecrets: { ...edits.targets[index].secretChanges },
       }));
-      state.policyView = { ...view, targets: mutate(targets) };
-      showPolicyView(dialogScope(), state.policyView);
+      adoptPolicyView(scope, { ...view, classes, targets: mutate(targets) });
     }
 
     function addPolicyTarget() {
@@ -990,9 +1031,9 @@
     }
 
     function savePolicy() {
-      const view = state.policyView;
-      if (!view) return Promise.resolve();
-      const scope = dialogScope();
+      const owned = ownedPolicyView();
+      if (!owned) return Promise.resolve();
+      const { scope, view } = owned;
       const payload = buildPolicyPayload(view, readEdits(view));
       return once("policy-save", async () => {
         scope.result("Saving...");
@@ -1002,8 +1043,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
           });
-          state.policyView = saved;
-          showPolicyView(scope, saved);
+          adoptPolicyView(scope, saved);
           scope.result(`Saved. Restart the backup scheduler to use the new settings: ${saved.restart_command || "restart enclosure-backup-scheduler"}`);
           setBanner("Backup settings saved. Restart the backup scheduler to apply them.", "success");
         } catch (error) {
@@ -1095,7 +1135,7 @@
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1130,7 +1170,7 @@
           });
           if (scope.live()) closeDialog();
           setBanner("Backup kept.", "success");
-          await load({ quiet: true });
+          await load({ quiet: true, fresh: true });
         } catch (error) {
           scope.result(`Couldn't keep it: ${errorText(error)}`);
         }
@@ -1150,7 +1190,7 @@
         } catch (error) {
           setBanner(`Couldn't change it: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1174,7 +1214,7 @@
             setBanner(`Backup failed: ${errorText(error)}`, "error");
           }
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1305,7 +1345,7 @@
               canPublish: scope.live,
               failureMessage: "Backup restored, but the page could not refresh. Refresh to check the current settings and service status.",
             });
-            await load({ quiet: true });
+            await load({ quiet: true, fresh: true });
           } catch (_) {
             if (scope.live()) {
               setBanner("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.", "error");
@@ -1398,7 +1438,7 @@
           scope.result(text);
           setBanner(text, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 

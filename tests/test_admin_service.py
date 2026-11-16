@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import __version__
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
-from tests.wait_bounds import HANG_TIMEOUT_SECONDS
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS, wait_until
 from admin_service.config import AdminSettings
 from admin_service.services.backup_receipts import BackupInspectionReceiptStore
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
@@ -4180,10 +4180,16 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 tasks.append(asyncio.ensure_future(scans.scan()))
                 await asyncio.sleep(0.05)
                 scans.history_changed()  # each caller now needs its own scan
-            await asyncio.sleep(0.3)
-            with lock:
-                self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
-            release.set()
+            # The scans start on worker threads; wait for them, not a fixed time.
+            # Read the count only once every scan is running or queued on the
+            # limit, so a wider limit cannot hide behind a late thread start.
+            limit = scans._limit
+            try:
+                await wait_until(lambda: running[0] + len(limit._waiters or ()) == len(tasks))
+                with lock:
+                    self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+            finally:
+                release.set()
             await asyncio.gather(*tasks)
 
         with patch("admin_service.routes.get_history_store", return_value=history_store):

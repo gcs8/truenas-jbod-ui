@@ -117,7 +117,7 @@ test("Codex P2 1: live crawls admit the check only with --appliance-load; the CI
   assert.match(bootstrap, /"tls_ca_bundle_path": "[^"]+"/);
   assert.match(builder, /"admin:\/api\/admin\/tls\/saved-status":/);
   // The browser spec requires the check to have been sent (and admitted) in admin.system-form.
-  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage.spec.js"), "utf8");
+  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage-primary-crawl.spec.js"), "utf8");
   assert.match(spec, /appliance-load GET \/api\/admin\/tls\/saved-status/);
 });
 
@@ -245,7 +245,7 @@ test("Codex P2 3: fabric.diagnostics switches to Disk Path, then requires the ev
   assert.match(builder, /parse_mpr_dmesg_events/);
   assert.match(builder, /kernel_diagnostics/);
   // The browser spec requires the state to have run, not been skipped.
-  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage.spec.js"), "utf8");
+  const spec = fs.readFileSync(path.join(root, "qa/ui-coverage-primary-crawl.spec.js"), "utf8");
   assert.match(spec, /fabric\.diagnostics/);
 });
 
