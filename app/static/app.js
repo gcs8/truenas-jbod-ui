@@ -1080,9 +1080,6 @@
       tile.className = liveSlot
         ? `slot-tile state-${liveSlot.state || "unknown"}`
         : `slot-tile state-${visualState} storage-view-slot`;
-      if (selectedView.kind === "nvme_carrier") {
-        tile.classList.add("storage-view-slot-nvme");
-      }
       if (selectedView.kind === "boot_devices") {
         tile.classList.add("storage-view-slot-boot");
       }
@@ -1109,12 +1106,10 @@
         tile.setAttribute("aria-describedby", "slot-tooltip");
       }
       tile.innerHTML =
-        selectedView.kind === "nvme_carrier"
-          ? buildNvmeRuntimeTileMarkup(slot, selectedView)
-          : selectedView.kind === "boot_devices"
-            ? (isSatadomBootTemplate(selectedView)
-              ? buildSatadomRuntimeTileMarkup(slot, selectedView)
-              : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
+        selectedView.kind === "boot_devices"
+          ? (isSatadomBootTemplate(selectedView)
+            ? buildSatadomRuntimeTileMarkup(slot, selectedView)
+            : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
           : liveSlot
             ? buildLiveSlotTileMarkup(liveSlot, sharedMountPoolName(state.snapshot?.slots, currentPlatform()))
           : `
