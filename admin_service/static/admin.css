@@ -1428,8 +1428,7 @@ h3 {
   max-width: 980px;
 }
 
-.builder-panel-copy .panel-copy,
-.builder-panel-note {
+.builder-panel-copy .panel-copy {
   margin: 0;
   max-width: 80ch;
 }
