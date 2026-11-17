@@ -6,10 +6,11 @@ import errno
 import json
 import logging
 import socket
+import sys
 from datetime import (
-    datetime,
-    timedelta,
-    timezone,
+    datetime,  # noqa: F401  (kept importable here)
+    timedelta,  # noqa: F401  (kept importable here)
+    timezone,  # noqa: F401  (kept importable here)
 )
 from typing import Any, Literal
 
@@ -25,10 +26,14 @@ from fastapi.responses import (
     JSONResponse,
     Response,
 )
-from pydantic import ValidationError
+from pydantic import ValidationError  # noqa: F401  (kept importable here)
 from websockets.exceptions import ConnectionClosed
 
 from app import __version__
+from app.history_routes import (
+    add_history_routes,
+    add_storage_view_slot_history_route,
+)
 from app.models.domain import (
     DiskInventorySyncRequest,
     InventoryReadResponse,
@@ -56,9 +61,9 @@ from app.settings_reload import config_reload_problems
 from app.route_support import (
     get_settings,
     INVALID_MAPPING_BUNDLE_DETAIL,
-    HistoryRefreshProxyRequest,
-    HistoryScopeProxyRequest,
-    HistoryScopesProxyRequest,
+    HistoryRefreshProxyRequest,  # noqa: F401  (kept importable here)
+    HistoryScopeProxyRequest,  # noqa: F401  (kept importable here)
+    HistoryScopesProxyRequest,  # noqa: F401  (kept importable here)
     _load_live_enclosure_export_sources,
     _load_snapshot_export_source,
     _load_storage_view_export_source,
@@ -68,7 +73,7 @@ from app.route_support import (
     check_slot_bounds,
     ensure_read_slot_bounds,
     ensure_slot_bounds,
-    get_history_backend,
+    get_history_backend,  # noqa: F401  (kept importable here)
     get_inventory_registry,
     get_release_status_service,
     get_snapshot_export_service,
@@ -91,11 +96,11 @@ from app.route_support import (
 from app.services import upgrade_notice
 from app.services.backup_health import backup_archive_problems
 from app.services.history_backend import (
-    HISTORY_BACKEND_DEGRADED_DETAIL,
-    HistoryBackendBusyError,
-    HistoryBackendPolicyError,
+    HISTORY_BACKEND_DEGRADED_DETAIL,  # noqa: F401  (kept importable here)
+    HistoryBackendBusyError,  # noqa: F401  (kept importable here)
+    HistoryBackendPolicyError,  # noqa: F401  (kept importable here)
 )
-from app.services.history_status import project_public_collector_status
+from app.services.history_status import project_public_collector_status  # noqa: F401  (kept importable here)
 from app.services.inventory import (
     DiskInventorySyncBusy,
     LedSessionBusyError,
@@ -124,15 +129,20 @@ from app.services.truenas_ws import (
     log_failure,
 )
 from history_service.operation_bounds import (
-    ALLOWED_HISTORY_METRICS,
+    ALLOWED_HISTORY_METRICS,  # noqa: F401  (kept importable here)
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
-    MAX_TARGETS,
-    HistoryBudgetExceeded,
-    HistoryRequestShapeError,
-    build_history_read_plan,
+    MAX_TARGETS,  # noqa: F401  (kept importable here)
+    HistoryBudgetExceeded,  # noqa: F401  (kept importable here)
+    HistoryRequestShapeError,  # noqa: F401  (kept importable here)
+    build_history_read_plan,  # noqa: F401  (kept importable here)
 )
-from history_service.refresh_auth import read_limited_request_body
+from history_service.refresh_auth import read_limited_request_body  # noqa: F401  (kept importable here)
+
+# Imports marked "kept importable here" are no longer used in this file since
+# the history endpoints moved to app.history_routes. They stay so that every
+# name this module had is still importable from it, and app.history_routes
+# reads several of them from here at request time.
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
 
@@ -1068,37 +1078,9 @@ def build_router() -> APIRouter:
         except TrueNASAPIError as exc:
             raise _smart_remote_http_exception(exc) from exc
 
-    @router.get("/api/storage-views/{view_id}/slots/{slot_index}/history")
-    async def get_storage_view_slot_history(
-        view_id: str,
-        slot_index: int,
-        system_id: str | None = None,
-        enclosure_id: str | None = None,
-        window_hours: int | None = None,
-    ) -> JSONResponse:
-        registry = get_inventory_registry()
-        service = registry.get_service(system_id)
-        history_slot, history_enclosure_id = await service.resolve_storage_view_slot_history_target(
-            view_id,
-            slot_index,
-            selected_enclosure_id=enclosure_id,
-        )
-        add_perf_metadata(
-            system_id=service.system.id,
-            platform=service.system.truenas.platform,
-            storage_view_id=view_id,
-            slot=slot_index,
-            history_slot=history_slot,
-            enclosure_id=history_enclosure_id,
-        )
-        history_backend = get_history_backend()
-        payload = await history_backend.get_slot_history(
-            history_slot,
-            service.system.id,
-            history_enclosure_id,
-            window_hours=window_hours,
-        )
-        return JSONResponse(payload)
+    # The history routes live in app.history_routes and are added here, at
+    # their place in the route table, reading their collaborators from this module.
+    add_storage_view_slot_history_route(router, sys.modules[__name__])
 
     @router.post("/api/slots/smart-batch", response_model=SmartBatchResponse)
     async def get_slot_smart_summaries(
@@ -1254,301 +1236,8 @@ def build_router() -> APIRouter:
             ) from exc
         return SmartBatchResponse(summaries=summaries)
 
-    @router.get("/api/history/status")
-    async def get_history_status() -> JSONResponse:
-        history_backend = get_history_backend()
-        payload = await history_backend.get_status()
-        return JSONResponse(
-            {
-                **payload,
-                "collector": project_public_collector_status(
-                    payload.get("collector"),
-                    last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
-                ),
-            }
-        )
-
-    @router.post(
-        "/api/history/refresh",
-        dependencies=[Depends(require_read_ui_mutation_authorization)],
-    )
-    async def refresh_history_proxy(payload: HistoryRefreshProxyRequest) -> JSONResponse:
-        history_backend = get_history_backend()
-        try:
-            result = await history_backend.refresh(payload.mode)
-        except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
-        return JSONResponse(result)
-
-    history_scopes_request_schema = HistoryScopesProxyRequest.model_json_schema()
-    history_scopes_request_schema["properties"]["scopes"]["items"] = (
-        HistoryScopeProxyRequest.model_json_schema()
-    )
-    history_scopes_request_schema.pop("$defs", None)
-
-    @router.post(
-        "/api/history/scopes/bundle",
-        openapi_extra={
-            "requestBody": {
-                "required": True,
-                "content": {
-                    "application/json": {
-                        "schema": history_scopes_request_schema,
-                    }
-                },
-            }
-        },
-    )
-    async def get_history_scopes_bundle(request: Request) -> JSONResponse:
-        if not _is_json_media_type(request.headers.get("content-type")):
-            raise HTTPException(
-                status_code=415,
-                detail="Send this request with Content-Type: application/json.",
-            )
-        body = await read_limited_request_body(
-            request,
-            limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
-            detail="History request is too large.",
-        )
-        try:
-            document = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=422, detail="History request must be valid JSON.") from exc
-        try:
-            payload = HistoryScopesProxyRequest.model_validate(document)
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail="History request body is invalid.") from exc
-        history_backend = get_history_backend()
-        try:
-            result = await history_backend.get_scopes_history(
-                scopes=[scope.model_dump() for scope in payload.scopes],
-                metrics=payload.metrics,
-                since=payload.since,
-                event_limit=payload.event_limit,
-                metric_limit=payload.metric_limit,
-            )
-        except HistoryBackendBusyError:
-            return _history_read_busy_response()
-        except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
-        except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
-            raise HTTPException(
-                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
-                detail=str(exc),
-            ) from exc
-        return JSONResponse(result)
-
-    @router.get("/api/slots/{slot}/history")
-    async def get_slot_history(
-        slot: int,
-        system_id: str | None = None,
-        enclosure_id: str | None = None,
-        window_hours: int | None = None,
-    ) -> JSONResponse:
-        registry = get_inventory_registry()
-        service = registry.get_service(system_id)
-        layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
-        resolved_system_id = service.system.id
-        add_perf_metadata(
-            system_id=resolved_system_id,
-            platform=service.system.truenas.platform,
-            slot=slot,
-            enclosure_id=enclosure_id,
-            history_window_hours=window_hours,
-        )
-        history_backend = get_history_backend()
-        payload = await history_backend.get_slot_history(
-            slot,
-            resolved_system_id,
-            enclosure_id,
-            window_hours=window_hours,
-        )
-        return JSONResponse({**payload, "layout_bounds": layout_bounds})
-
-    @router.get("/api/history/scope")
-    async def get_history_scope(
-        system_id: str | None = None,
-        enclosure_id: str | None = None,
-        slots: list[int] | None = Query(default=None),
-        window_hours: int | None = None,
-        metrics: list[str] | None = Query(default=None),
-        event_limit: int = Query(default=12),
-        metric_limit: int = 60,
-    ) -> JSONResponse:
-        requested_slots = [int(slot) for slot in (slots or [])]
-        if len(requested_slots) > MAX_TARGETS:
-            raise HTTPException(
-                status_code=413,
-                detail=f"History can be requested for at most {MAX_TARGETS} slots at a time.",
-            )
-        registry = get_inventory_registry()
-        service = registry.get_service(system_id)
-        if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="Choose at least one slot and a time range between 1 hour and 1 year.")
-        selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
-        since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
-        try:
-            build_history_read_plan(
-                scopes=[{
-                    "system_id": service.system.id,
-                    "enclosure_id": enclosure_id,
-                    "slots": requested_slots,
-                }],
-                metrics=selected_metrics,
-                since=since,
-                event_limit=event_limit,
-                metric_limit=metric_limit,
-            )
-        except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
-            raise HTTPException(
-                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
-                detail=str(exc),
-            ) from exc
-        normalized_slots = sorted(set(requested_slots))
-        layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
-        for slot in normalized_slots:
-            if layout_slots is not None:
-                check_slot_bounds(slot, layout_slots)
-        add_perf_metadata(
-            system_id=service.system.id,
-            platform=service.system.truenas.platform,
-            enclosure_id=enclosure_id,
-            slot_count=len(normalized_slots),
-            history_window_hours=window_hours,
-        )
-        history_backend = get_history_backend()
-        try:
-            payload = await history_backend.get_scope_history(
-                system_id=service.system.id,
-                enclosure_id=enclosure_id,
-                slots=normalized_slots,
-                window_hours=window_hours,
-                metrics=selected_metrics,
-                event_limit=event_limit,
-                metric_limit=metric_limit,
-            )
-        except HistoryBackendBusyError:
-            return _history_read_busy_response()
-        return JSONResponse(
-            {
-                "configured": history_backend.configured,
-                "system_id": service.system.id,
-                "enclosure_id": enclosure_id,
-                "layout_bounds": layout_bounds,
-                "histories": {str(slot): history for slot, history in payload.items()},
-            }
-        )
-
-    @router.get("/api/storage-views/{view_id}/history")
-    async def get_storage_view_history(
-        view_id: str,
-        system_id: str | None = None,
-        enclosure_id: str | None = None,
-        window_hours: int | None = None,
-        metrics: list[str] | None = Query(default=None),
-        event_limit: int = Query(default=12),
-        metric_limit: int = 60,
-    ) -> JSONResponse:
-        if not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="Choose a time range between 1 hour and 1 year.")
-        registry = get_inventory_registry()
-        service = registry.get_service(system_id)
-        try:
-            runtime = await service.get_storage_view_runtime(
-                force_refresh=False,
-                selected_enclosure_id=enclosure_id,
-            )
-        except TrueNASAPIError as exc:
-            raise _read_failure_http_exception(
-                exc,
-                operation="Storage view history request",
-                detail=STORAGE_VIEW_HISTORY_FAILURE_DETAIL,
-            ) from exc
-        runtime_view = next((view for view in runtime.views if view.id == view_id), None)
-        if not runtime_view:
-            raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')
-
-        display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
-        slots_by_enclosure: dict[str | None, set[int]] = {}
-        bay_enclosure_id = (
-            runtime_view.backing_enclosure_id
-            if getattr(runtime_view, "source", None) == "selected_enclosure_snapshot"
-            and runtime_view.backing_enclosure_id
-            else enclosure_id or runtime_view.backing_enclosure_id
-        )
-        for runtime_slot in runtime_view.slots:
-            # A bay number only names a disk inside its own enclosure; a candidate
-            # from another enclosure reads the view's own history scope instead.
-            if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, bay_enclosure_id}:
-                history_slot = int(runtime_slot.snapshot_slot)
-                history_enclosure_id = bay_enclosure_id
-            else:
-                history_slot = int(runtime_slot.slot_index)
-                history_enclosure_id = f"storage-view:{runtime_view.id}"
-            slots_by_enclosure.setdefault(history_enclosure_id, set()).add(history_slot)
-            display_slot_by_target.setdefault(
-                (history_enclosure_id, history_slot),
-                [],
-            ).append(int(runtime_slot.slot_index))
-
-        add_perf_metadata(
-            system_id=service.system.id,
-            platform=service.system.truenas.platform,
-            storage_view_id=view_id,
-            slot_count=len(runtime_view.slots),
-            history_window_hours=window_hours,
-        )
-        selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
-        scopes = [
-            {
-                "system_id": service.system.id,
-                "enclosure_id": history_enclosure_id,
-                "slots": sorted(history_slots),
-            }
-            for history_enclosure_id, history_slots in slots_by_enclosure.items()
-        ]
-        history_backend = get_history_backend()
-        try:
-            payload = await history_backend.get_scopes_history(
-                scopes=scopes,
-                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
-                metrics=selected_metrics,
-                event_limit=event_limit,
-                metric_limit=metric_limit,
-            )
-        except HistoryBackendBusyError:
-            return _history_read_busy_response()
-        except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
-            # The local read planner rejected the request shape or budget
-            # before any backend call (#1044); other errors stay server errors.
-            raise HTTPException(
-                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
-                detail=str(exc),
-            ) from exc
-        histories_by_display_slot: dict[str, dict[str, Any]] = {}
-        for scope_payload in payload.get("scopes", []):
-            if not isinstance(scope_payload, dict):
-                continue
-            history_enclosure_id = scope_payload.get("enclosure_id")
-            histories = scope_payload.get("histories")
-            if not isinstance(histories, dict):
-                continue
-            for history_slot, history_payload in histories.items():
-                if not isinstance(history_payload, dict):
-                    continue
-                for display_slot in display_slot_by_target.get(
-                    (history_enclosure_id, int(history_slot)), []
-                ):
-                    histories_by_display_slot[str(display_slot)] = history_payload
-
-        return JSONResponse(
-            {
-                "configured": history_backend.configured,
-                "system_id": service.system.id,
-                "storage_view_id": runtime_view.id,
-                "histories": histories_by_display_slot,
-            }
-        )
+    # The other history routes, also from app.history_routes, at their place.
+    add_history_routes(router, sys.modules[__name__])
 
     @router.post("/api/export/enclosure-snapshot")
     async def export_enclosure_snapshot(
