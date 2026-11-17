@@ -41,6 +41,11 @@ body.fabric-topology-mode .fabric-page-shell {
   grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
+  /* The trace band's reserved lines (more on narrow pages, below), its line
+     height, and its whole height: lines, 4 px padding each side, 1 px border. */
+  --topology-trace-lines: 1;
+  --topology-trace-line: 1.25rem;
+  --topology-trace-band: calc(var(--topology-trace-lines) * var(--topology-trace-line) + 9px);
 }
 
 /* Narrow pages: the parts, legend and notices wrap inside the panel, long
@@ -172,10 +177,22 @@ body.fabric-topology-mode .fabric-page-shell {
   gap: 6px 12px;
 }
 
-/* The trace line sits below the drawing, so its wrapping never moves it. */
+/* The trace line sits below the drawing, so its wrapping never moves it,
+   and sticks to the window's bottom edge so it is read without scrolling.
+   Its lines are reserved: the idle hint, "Tracing" and "Pinned" take the
+   same band, which never grows over the item under the pointer. A longer
+   sentence still wraps in full. */
 .fabric-topology .fabric-topology-pin {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
   min-width: 0;
+  min-height: calc(var(--topology-trace-lines) * var(--topology-trace-line));
   margin: 0;
+  padding: 4px 0;
+  border-top: 1px solid var(--panel-border);
+  background: var(--surface);
+  line-height: var(--topology-trace-line);
 }
 
 .fabric-topology-scroll {
@@ -418,8 +435,10 @@ body.fabric-topology-mode .fabric-page-shell {
   stroke: var(--text);
 }
 
+/* A focused item scrolls clear of the trace band. */
 .fabric-topology-svg [role="button"] {
   cursor: pointer;
+  scroll-margin-bottom: var(--topology-trace-band);
 }
 
 .fabric-topology-svg [role="button"]:focus {
@@ -456,9 +475,21 @@ body.fabric-topology-mode .fabric-page-shell {
   opacity: 0.3;
 }
 
+/* Narrower pages: the longest trace sentence takes two lines. */
+@media (max-width: 820px) {
+  .fabric-topology {
+    --topology-trace-lines: 2;
+  }
+}
+
 /* Narrow screens: the search label sits above an input at least 240 px wide;
-   the header wraps only while the Topology search row is shown. */
+   the header wraps only while the Topology search row is shown. The longest
+   trace sentence takes three lines. */
 @media (max-width: 640px) {
+  .fabric-topology {
+    --topology-trace-lines: 3;
+  }
+
   .fabric-view-panel .panel-header:has(> .fabric-topology-search-row:not([hidden])) {
     flex-wrap: wrap;
   }

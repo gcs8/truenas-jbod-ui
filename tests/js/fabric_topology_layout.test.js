@@ -1008,3 +1008,93 @@ test("an expander tier label never leaves its level number alone on a line", () 
     }
   }
 });
+
+// ---- the trace sentence stays in the window ------------------------------------
+
+function cssRule(css, selector) {
+  return new RegExp(`(?:^|\\n|\\{)\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
+}
+
+function mediaBlock(css, width) {
+  return new RegExp(`@media \\(max-width: ${width}px\\)\\s*\\{([\\s\\S]*?)\\n\\}`).exec(css)?.[1] || "";
+}
+
+test("the trace sentence sticks to the window's bottom in an opaque band whose reserved height a focused item is kept clear of", () => {
+  const css = topologyCss();
+  const band = cssRule(css, ".fabric-topology .fabric-topology-pin");
+  assert.match(band, /position:\s*sticky;/);
+  assert.match(band, /bottom:\s*0;/);
+  // Opaque: the page's surface colour, a six-digit colour with no alpha.
+  assert.match(band, /background:\s*var\(--surface\);/);
+  assert.match(ROOT_CSS, /--surface:\s*#[0-9a-f]{6};/i);
+  assert.match(band, /border-top:\s*1px solid var\(--panel-border\);/);
+  assert.ok(Number(/z-index:\s*(\d+);/.exec(band)?.[1]) >= 1, "painted above the drawing");
+  // Its height is reserved in lines, the same for the hint, a trace and a pin;
+  // a longer sentence may grow it and is never clipped.
+  assert.match(band, /min-height:\s*calc\(var\(--topology-trace-lines\) \* var\(--topology-trace-line\)\);/);
+  assert.match(band, /line-height:\s*var\(--topology-trace-line\);/);
+  assert.doesNotMatch(band, /(?:^|[\s;])(?:height|max-height|overflow|text-overflow|-webkit-line-clamp|line-clamp)\s*:/);
+  const view = cssRule(css, ".fabric-topology");
+  assert.match(view, /--topology-trace-line:\s*1\.25rem;/);
+  const reserved = (text) => Number(/--topology-trace-lines:\s*(\d+);/.exec(text)?.[1]);
+  assert.equal(reserved(view), 1, "one line on wide pages");
+  assert.equal(reserved(cssRule(mediaBlock(css, 820), ".fabric-topology")), 2, "two lines up to 820 px");
+  assert.equal(reserved(cssRule(mediaBlock(css, 640), ".fabric-topology")), 3, "three lines at phone width");
+  assert.ok(css.indexOf("@media (max-width: 820px)") < css.indexOf("@media (max-width: 640px)"), "the narrower rule comes last and wins");
+  // The band's whole height: its lines, padding on both sides and its border.
+  const padding = /padding:\s*(\d+)px 0;/.exec(band);
+  assert.ok(padding, "vertical padding in px");
+  const whole = 2 * Number(padding[1]) + 1;
+  assert.match(view, new RegExp(`--topology-trace-band:\\s*calc\\(var\\(--topology-trace-lines\\) \\* var\\(--topology-trace-line\\) \\+ ${whole}px\\);`));
+  // Every item that takes keyboard focus scrolls clear of the band.
+  assert.match(cssRule(css, `.fabric-topology-svg [role="button"]`), /scroll-margin-bottom:\s*var\(--topology-trace-band\);/);
+  const T = H.loadTopology();
+  for (const [name, model] of Object.entries(fixtures(T, { width: 1100 }))) {
+    const html = T.renderTopology(model, {});
+    const focusable = [...html.matchAll(/<[a-z]+\b[^>]*\btabindex="0"[^>]*>/g)].map((match) => match[0]);
+    assert.ok(focusable.length, name);
+    assert.ok(focusable.every((tag) => tag.includes('role="button"')), `${name}: every focusable item is covered by the rule`);
+  }
+  // Only the band sticks; nothing above the drawing or in it is placed by this.
+  assert.equal((css.match(/position:\s*sticky/g) || []).length, 1);
+});
+
+test("the trace sentence is one element after the drawing's scroll box, the same element for the hint, a hover and a pin", () => {
+  const handlers = new Map();
+  const pin = { textContent: "" };
+  const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
+  const container = {
+    dataset: {},
+    querySelector: (selector) => (selector === ".fabric-topology" ? root : null),
+    addEventListener: (name, handler) => handlers.set(name, handler),
+  };
+  const T = H.loadTopology({ document: { addEventListener() {} } });
+  T.attach(container, null, null, {});
+  const fabric = H.twoHbaCascade().fabric;
+  const tag = (html) => {
+    const found = [...html.matchAll(/<p [^>]*data-topology-pin[^>]*>/g)].map((match) => match[0]);
+    assert.equal(found.length, 1, "one trace sentence");
+    const at = html.indexOf(found[0]);
+    assert.ok(at > html.indexOf('<div class="fabric-topology-scroll">'), "after the scroll box");
+    assert.ok(at > html.lastIndexOf("</svg></div>"), "after the drawing, outside its box");
+    assert.ok(at < html.indexOf("fabric-topology-not-shown"), "before the footer");
+    return found[0];
+  };
+  const idle = tag(T.render(fabric, { width: 1100 }));
+  const model = T.drawnModel();
+  const link = [...model.links].find((item) => !item.bundle);
+  const element = {
+    dataset: { topoLink: link.id },
+    closest(selector) {
+      if (selector === ".fabric-topology") return root;
+      return /\[data-topo-/.test(selector) ? this : null;
+    },
+  };
+  handlers.get("mouseover")({ target: element });
+  assert.match(pin.textContent, /^Tracing: /, "a hover writes into the same element");
+  handlers.get("click")({ target: element });
+  assert.ok(T.inspectorDetail(), "the line is pinned");
+  const pinned = T.render(fabric, { width: 1100 });
+  assert.equal(tag(pinned), idle, "the pinned redraw has the same element");
+  assert.match(pinned, /data-topology-pin>Pinned: /);
+});
