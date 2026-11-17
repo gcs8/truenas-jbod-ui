@@ -970,6 +970,40 @@ test("no two boxes with different ids show the same title, also where a generate
   assert.deepEqual(titles(plain), titles(cascade));
 });
 
+// Two pairs of boxes whose generated titles equal each other: each title is
+// its name and its id, and one box's name and id read as the other's. The
+// box with the lower id keeps the title and the other takes " #2", whatever
+// the payload's order.
+test("two generated titles that are equal get their numbers in identifier order, not payload order", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const boxes = [
+    ["enc:2", "Shelf (enc:1)"], ["enc:3", "Shelf (enc:1)"], ["enc:1) (enc:2", "Shelf"], ["enc:4", "Shelf"],
+    ["enc:6", "Tray (enc:5)"], ["enc:7", "Tray (enc:5)"], ["enc:5) (enc:6", "Tray"], ["enc:8", "Tray"],
+  ];
+  for (const [index, [id, label]] of boxes.entries()) {
+    const item = H.addEnclosure(fabric, "mpr0", `00${index}`, label, null);
+    delete item.controller_id;
+    item.id = id;
+    fabric.links.push(H.link(hba.id, id, "controller-enclosure"));
+  }
+  const visible = (payload) => Object.fromEntries([...T.buildTopologyModel(payload).nodes]
+    .filter((item) => item.tier === "enclosures")
+    .map((item) => [item.id, item.lines.slice(0, item.titleLines).join(" ")]));
+  const forward = visible(fabric);
+  assert.deepEqual(Object.keys(forward).sort(), boxes.map(([id]) => id).sort(), "every box is drawn");
+  assert.equal(forward["enc:1) (enc:2"], "Shelf (enc:1) (enc:2)", "the lower id keeps the generated title");
+  assert.equal(forward["enc:2"], "Shelf (enc:1) (enc:2) #2", "the higher id takes the number");
+  assert.equal(forward["enc:5) (enc:6"], "Tray (enc:5) (enc:6)");
+  assert.equal(forward["enc:6"], "Tray (enc:5) (enc:6) #2");
+  assert.equal(new Set(Object.values(forward)).size, boxes.length, Object.values(forward).join(" | "));
+  const reversed = JSON.parse(JSON.stringify(fabric));
+  reversed.nodes.reverse();
+  reversed.links.reverse();
+  assert.deepEqual(visible(reversed), forward, "the same titles in reversed payload order");
+});
+
 // ---- a storage kind is accepted only on a platform that produces it ------------
 
 test("a named storage kind is accepted only on a platform that produces it; every other pair makes no collection claim and draws every record", () => {
