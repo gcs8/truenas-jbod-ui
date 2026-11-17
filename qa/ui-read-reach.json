@@ -82,7 +82,7 @@
   "admin": {
    "service": "admin",
    "template": "admin_service/templates/index.html",
-   "scripts": ["admin_service/static/admin_backup_model.js","admin_service/static/admin_backups.js","admin_service/static/admin.js"],
+   "scripts": ["admin_service/static/admin_backup_model.js","admin_service/static/admin_backups.js","admin_service/static/admin_profile_model.js","admin_service/static/admin.js"],
    "scopes": {
     "page": [
      {"method":"GET","path":"/api/admin/backups","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin_backups.js#(top level)"]},

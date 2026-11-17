@@ -196,7 +196,7 @@ test("manual SSH-user edits suppress automatic recommendation reloads", () => {
 test("profile catalog cards are native pressed buttons", () => {
   const renderSource = sourceBetween(
     "  function renderProfileCatalog()",
-    "\n  function slugify"
+    "\n  function getStorageViewTemplate"
   );
   const elements = sparseElements({
     profileCatalog: { innerHTML: "" },

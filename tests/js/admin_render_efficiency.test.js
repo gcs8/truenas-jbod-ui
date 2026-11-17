@@ -7,7 +7,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
-const SOURCE = fs.readFileSync(path.join(ROOT, "admin_service/static/admin.js"), "utf8");
+const SOURCE = ["admin_service/static/admin_profile_model.js", "admin_service/static/admin.js"].map((file) => fs.readFileSync(path.join(ROOT, file), "utf8")).join("\n");
 const MAIN_PY = ["admin_service/main.py", "admin_service/route_support.py"]
   .map((relative) => fs.readFileSync(path.join(ROOT, relative), "utf8"))
   .join("\n");

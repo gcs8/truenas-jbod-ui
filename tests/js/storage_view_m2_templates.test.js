@@ -7,7 +7,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const SCRIPT_PATH = path.resolve(__dirname, "../../admin_service/static/admin.js");
-const SOURCE = fs.readFileSync(SCRIPT_PATH, "utf8");
+const SOURCE = [path.resolve(__dirname, "../../admin_service/static/admin_profile_model.js"), SCRIPT_PATH].map((file) => fs.readFileSync(file, "utf8")).join("\n");
 
 function sourceBetween(startMarker, endMarker) {
   const start = SOURCE.indexOf(startMarker);
