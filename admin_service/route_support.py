@@ -33,11 +33,11 @@ from app.config import (
 )
 from app.logging_config import configure_service_logging
 from app.http_auth import (
+    BrowserWriteOriginDecision,
     basic_auth_matches,
+    browser_write_origin_decision,
     configured_origin_identity,
     origin_identity,
-    request_origin_allowed,
-    request_host_allows_writes,
     unlisted_host_rejection_detail,
 )
 from app.metrics import observe_backup_operation
@@ -245,15 +245,27 @@ def _accepted_origin(request: Request, settings: AdminSettings) -> str:
     return (settings.public_origin or f"{request.url.scheme}://{request.url.netloc}").rstrip("/")
 
 
+def _origin_decision(request: Request, settings: AdminSettings) -> BrowserWriteOriginDecision:
+    # #779, #737: the Host-derived origin is only trusted for IPs, localhost and listed names.
+    # A configured origin is compared without its trailing slashes; one made only
+    # of slashes stays configured and matches no request origin.
+    configured = settings.public_origin
+    if configured:
+        configured = configured.rstrip("/") or configured
+    return browser_write_origin_decision(
+        request,
+        configured,
+        settings.allowed_host_names,
+        allow_host_fallback=True,
+    )
+
+
 def _unlisted_host(request: Request, settings: AdminSettings) -> bool:
-    # #779: the Host-derived origin is only trusted for IPs, localhost and listed names.
-    return not settings.public_origin and not request_host_allows_writes(request, settings.allowed_host_names)
+    return _origin_decision(request, settings) == "unlisted_host"
 
 
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    return not _unlisted_host(request, settings) and request_origin_allowed(
-        request, _accepted_origin(request, settings)
-    )
+    return _origin_decision(request, settings) == "allow"
 
 
 def _describe_request_origin(request: Request) -> str:
