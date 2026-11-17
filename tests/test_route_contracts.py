@@ -927,6 +927,46 @@ class RouteContractTests(unittest.TestCase):
     def test_main_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(app_main.create_app()), APP_ROUTE_MATRIX)
 
+    def test_build_router_keeps_route_order_and_mutation_authorization(self) -> None:
+        # build_router is the one place that composes the main routes, including
+        # those registered from other modules, so its own ordered table is pinned.
+        router = app_routes.build_router()
+        app_only = {"openapi", "static", "prometheus_metrics_endpoint"}
+        self.assertEqual(
+            [
+                (route.path, tuple(sorted(route.methods)), route.name)
+                for route in router.routes
+                if isinstance(route, APIRoute)
+            ],
+            [row[:3] for row in APP_ROUTE_MATRIX if row[2] not in app_only],
+        )
+        self.assertTrue(all(isinstance(route, APIRoute) for route in router.routes))
+        dependencies = {
+            (method, route.path): tuple(
+                dependency.dependency for dependency in route.dependencies
+            )
+            for route in router.routes
+            if isinstance(route, APIRoute)
+            for method in route.methods
+            if route.dependencies
+        }
+        mutation = (app_routes.require_read_ui_mutation_authorization,)
+        self.assertEqual(
+            dependencies,
+            {
+                ("POST", "/api/upgrade-notice/dismiss"): mutation,
+                ("GET", "/api/read-ui/auth/verify"): (app_routes.require_read_ui_basic_credentials,),
+                ("POST", "/api/sas-fabric/aliases"): mutation,
+                ("POST", "/api/slots/{slot}/led"): mutation,
+                ("POST", "/api/systems/{system_id}/disk-inventory-sync"): mutation,
+                ("POST", "/api/system-locator"): mutation,
+                ("POST", "/api/slots/{slot}/mapping"): mutation,
+                ("DELETE", "/api/slots/{slot}/mapping"): mutation,
+                ("POST", "/api/mappings/import"): mutation,
+                ("POST", "/api/history/refresh"): mutation,
+            },
+        )
+
     def test_inventory_route_maps_unknown_enclosure_to_bounded_404(self) -> None:
         service = MagicMock()
         service.get_snapshot = AsyncMock(side_effect=UnknownEnclosureError())
