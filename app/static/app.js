@@ -11039,6 +11039,7 @@
         enclosureSelect.selectedIndex = 0;
       }
       enclosureSelect.disabled = (state.snapshotMode && !snapshotNavigationAvailable) || (visibleEnclosures.length + storageViews.length) <= 1;
+      syncSelectTitle(enclosureSelect);
       showSelectAsTextInSnapshot(enclosureSelect, enclosureSelectStatic);
     }
     updateSasFabricViewLink();
@@ -12419,6 +12420,7 @@
   }
   if (enclosureSelect) {
     enclosureSelect.addEventListener("change", async (event) => {
+      syncSelectTitle(enclosureSelect);
       const rawValue = event.target.value || "";
       const currentValue = state.selectedStorageViewRuntimeId
         ? `view:${state.selectedStorageViewRuntimeId}`

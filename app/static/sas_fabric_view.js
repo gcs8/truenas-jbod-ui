@@ -3846,6 +3846,63 @@
     select.title = (selectedOption?.textContent || "").trim();
   }
 
+  // The header grid gives each select card the room its SELECTED label needs
+  // when the row has it and shares any shortfall (style.css). A select's own
+  // intrinsic width follows its longest option, so the room is measured from a
+  // hidden copy that holds only the selected label: the browser's own font,
+  // padding and arrow. A measurement is reused while the label is unchanged.
+  const selectCardRoomCache = new WeakMap();
+
+  function selectCardRoom(select) {
+    const card = select?.closest?.(".meta-card");
+    const label = (select?.options?.[select.selectedIndex]?.textContent || "").trim();
+    if (!card || !label) {
+      return null;
+    }
+    const cached = selectCardRoomCache.get(select);
+    if (cached && cached.label === label) {
+      return cached.room;
+    }
+    const probe = document.createElement("select");
+    probe.className = select.className;
+    probe.tabIndex = -1;
+    probe.setAttribute("aria-hidden", "true");
+    probe.style.cssText = "position: absolute; left: 0; top: 0; visibility: hidden; width: auto; min-width: 0; max-width: none;";
+    const option = document.createElement("option");
+    option.textContent = label;
+    probe.append(option);
+    card.append(probe);
+    const selectWidth = probe.getBoundingClientRect().width;
+    probe.remove();
+    if (!(selectWidth > 0)) {
+      return null;
+    }
+    const style = getComputedStyle(card);
+    const chrome = ["paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth"]
+      .reduce((sum, key) => sum + (Number.parseFloat(style[key]) || 0), 0);
+    const room = Math.ceil(selectWidth + chrome);
+    selectCardRoomCache.set(select, { label, room });
+    return room;
+  }
+
+  function syncHeaderSelectRoom() {
+    const row = elements.systemSelect?.closest?.(".topbar-meta");
+    if (!row) {
+      return;
+    }
+    [
+      [elements.systemSelect, "--fabric-system-card-room"],
+      [elements.enclosureSelect, "--fabric-enclosure-card-room"],
+    ].forEach(([select, property]) => {
+      const room = selectCardRoom(select);
+      if (room) {
+        row.style.setProperty(property, `${room}px`);
+      } else {
+        row.style.removeProperty(property);
+      }
+    });
+  }
+
   function renderSelectors() {
     const systems = list(state.snapshot.systems);
     const enclosures = list(state.snapshot.enclosures);
@@ -3867,6 +3924,8 @@
     setSelectOptionsIfChanged(elements.enclosureSelect, enclosureOptions);
     elements.enclosureSelect.value = state.selectedEnclosureId || "";
     elements.enclosureSelect.disabled = enclosures.length <= 1 || state.loading;
+    syncSelectTitle(elements.enclosureSelect);
+    syncHeaderSelectRoom();
   }
 
   function renderSummary() {
@@ -4482,6 +4541,7 @@
 
   elements.systemSelect.addEventListener("change", () => {
     syncSelectTitle(elements.systemSelect);
+    syncHeaderSelectRoom();
     state.smartRequests = {};
     state.smartSummaries = {};
     state.smartSummaryTimes = {};
@@ -4498,6 +4558,8 @@
   });
 
   elements.enclosureSelect.addEventListener("change", () => {
+    syncSelectTitle(elements.enclosureSelect);
+    syncHeaderSelectRoom();
     state.smartRequests = {};
     state.smartSummaries = {};
     state.smartSummaryTimes = {};

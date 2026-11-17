@@ -1667,9 +1667,12 @@ textarea {
 
 .fabric-page-topbar .topbar-meta {
   display: grid;
-  /* The System track grows to fit the longest system name before the others
-     share the rest; a name that still does not fit ends in an ellipsis. */
-  grid-template-columns: minmax(170px, max-content) minmax(170px, 1.15fr) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
+  /* sas_fabric_view.js publishes the card width each select needs for its
+     selected label. The two select tracks grow to that room when the row has
+     it and share any shortfall equally; Last Updated and Version take what is
+     left. A label that still does not fit ends in an ellipsis. Without the
+     measurement the selects keep their fixed shares. */
+  grid-template-columns: minmax(170px, var(--fabric-system-card-room, 1.15fr)) minmax(170px, var(--fabric-enclosure-card-room, 1.15fr)) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
   min-width: 0;
 }
 
