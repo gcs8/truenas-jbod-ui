@@ -38,7 +38,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/services/parsers.py": 6500,
 
-    "app/services/sas_fabric.py": 4500,
+    "app/services/sas_fabric.py": 3500,
 
     "app/services/snapshot_export.py": 3500,
 
