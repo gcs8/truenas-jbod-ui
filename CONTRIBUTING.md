@@ -922,15 +922,20 @@ fragments. A pull request does not edit `CHANGELOG.md`. The rules:
   `internal`. A second and later entry in the same section is
   `changelog.d/<N>.<section>.<k>.md`, with `k` from 2. The file holds the text
   of one bullet as one inline paragraph: past tense, no leading `- `, no
-  heading, no HTML comment, no raw HTML outside backticks (`<` followed by a
-  letter, `/`, `!` or `?`), no link reference definition, at most 4096 bytes,
+  heading, no HTML comment, no raw HTML (`<` followed by a letter, `/`, `!`
+  or `?`, in backticks too; write a placeholder as `NAME` or `{name}` and
+  describe a tag in words), no link reference definition, at most 4096 bytes,
   wrapped at about 80 columns. `changelog.d/README.md` has the format and two
   examples. A pull request may add more than one fragment (for example `fixed`
   and `upgrade`).
 - **Only your own number.** Every fragment a pull request adds is named for
   that pull request's number; the gate refuses any other name and says the
   name to use. A pull request that carries work from other pull requests (a
-  staging branch) names its fragments with its own number.
+  staging branch) names its fragments with its own number; that fragment is
+  the entry for the staged work. Release coverage still asks for each inner
+  pull request, so the maintainer applies `no-changelog` to each inner pull
+  request, before or after merge; coverage reads labels from the merged pull
+  request records.
 - **No `#N` inside parentheses.** Do not write your own pull request number in
   the text; the release appends `(#N)` from the file name. Any `#N` inside
   parentheses is refused, because the release tooling reads every `(#N)` as a
@@ -939,8 +944,10 @@ fragments. A pull request does not edit `CHANGELOG.md`. The rules:
 - **Other pull requests' fragments stay.** A fragment that is already on `main`
   belongs to its pull request: deleting, renaming or editing it, or changing
   its mode, is refused, even with `no-changelog` or `dependencies`. A
-  maintainer applies the `changelog-edit-ok` label after reading, for example
-  on a revert; it waives that protection and nothing else.
+  maintainer applies the `changelog-edit-ok` label after reading the diff,
+  for example on a revert, or on the release pull request that collects the
+  fragments; it waives that protection and nothing else. On a release, the
+  coverage run on the new section is what catches a lost number.
 - **Subsections**, in this order: `Highlights`, `Breaking changes`,
   `Upgrade notes`, `Security`, `Added`, `Changed`, `Fixed`, `Performance`,
   `Docs`, `Internal`, matching the fragment sections. There is no
@@ -1002,10 +1009,8 @@ Three scripts enforce this:
   every pull request. First, before the labels and in advisory mode too, it
   refuses a fragment the diff adds (including a rename or copy target) that
   is not named for this pull request, and any change to a fragment already on
-  the base (deleted, renamed, edited, mode or type changed) unless the pull
-  request carries `changelog-edit-ok` or is a release cut whose new section
-  holds, for each fragment it deletes, the bullet `collect` renders for it,
-  `(#N)` included, as a whole bullet under the matching subsection. Then,
+  the base (deleted, renamed, edited, mode or type changed), release cuts
+  included, unless the pull request carries `changelog-edit-ok`. Then,
   unless `no-changelog` or `dependencies` is set, it requires the diff to add
   at least one valid fragment named for this pull request, and a `breaking`
   or `upgrade` fragment when `breaking` is set. An invalid fragment (bad name,

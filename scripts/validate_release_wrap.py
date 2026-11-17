@@ -598,7 +598,8 @@ def unconsumed_fragment_issues(repository: Path, ref: str) -> list[ValidationIss
             resolved = _git(repository, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
             if resolved.returncode != 0:
                 return [ValidationIssue(f"cannot check {FRAGMENT_DIRECTORY}/: git cannot resolve {ref}")]
-            listed = _git(repository, "ls-tree", "-r", "-z", "--name-only", ref, "--", f"{FRAGMENT_DIRECTORY}/")
+            # No trailing slash, so a changelog.d that is not a directory is listed too.
+            listed = _git(repository, "ls-tree", "-r", "-z", "--name-only", ref, "--", FRAGMENT_DIRECTORY)
             if listed.returncode != 0:
                 return [ValidationIssue(f"cannot list {FRAGMENT_DIRECTORY}/ at {ref}: {_git_error(listed)}")]
             paths = [path for path in listed.stdout.split("\0") if path]

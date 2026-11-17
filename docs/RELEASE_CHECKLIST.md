@@ -498,7 +498,10 @@ owner-approved `workflow_dispatch`.
 - run the coverage gate against the previous tag and `## Unreleased` (the
   existing bullets plus every fragment), then fix every missing pull request
   number before proceeding. It also fails, naming the file, when a fragment's
-  number is not a pull request merged since the previous tag:
+  number is not a pull request merged since the previous tag. For a
+  squash-merged staging branch the outer pull request's fragment is the entry
+  for the staged work; apply `no-changelog` to each inner pull request it
+  reports as missing (the labels are read from `merged-prs.json`):
   `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json`
 - collect the fragments into the release section. This renames
   `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, adds each fragment as a bullet
@@ -508,15 +511,16 @@ owner-approved `workflow_dispatch`.
   It refuses, writing nothing, when a fragment changed between the read and
   the write. After the write it deletes a fragment only while its bytes are
   still the ones it read; a fragment that changed, or that it cannot delete,
-  is left in place and listed with whether its text is already in the new
-  section, the other fragments are still deleted, and the run exits non-zero.
-  A second run for the same version is refused; if a run stopped after
-  writing `CHANGELOG.md`, it lists the fragments still present and whether
-  each is already in the section. Review the diff; only
-  `changelog.d/README.md` may remain, and the release wrap validator refuses a
-  release tree with any other fragment. If you reword a collected bullet, the
-  release pull request needs the `changelog-edit-ok` label, because the gate
-  matches each deleted fragment's bullet as a whole
+  is left in place and listed, the other fragments are still deleted, and the
+  run exits non-zero. A second run for the same version is refused and lists
+  the fragments still present; compare them with the written section, or
+  restore `CHANGELOG.md` from Git and collect again. It keeps the text of the
+  older sections and writes LF line endings, which `.gitattributes` requires.
+  Review the diff; only `changelog.d/README.md` may remain, and the release
+  wrap validator refuses a release tree with any other fragment. The release
+  pull request deletes fragments that are already on `main`, so the
+  maintainer applies `changelog-edit-ok` to it after reading its diff; the
+  coverage run on the new section below is what catches a lost number
 - write three to five `### Highlights` bullets, review every
   `### Upgrade notes` bullet as an operator would, and rerun the coverage gate
   against the final header

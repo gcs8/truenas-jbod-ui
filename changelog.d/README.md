@@ -50,9 +50,9 @@ tense:
 
 - no leading `- `, no heading, no blank line, no code fence, no HTML comment,
   no link reference definition (`[label]: target`; use an inline link);
-- no raw HTML: `<` followed by a letter, `/`, `!` or `?` is refused outside
-  backticks, so put a tag or a placeholder such as `<action>` in backticks;
-  `a < b` is fine;
+- no raw HTML: `<` followed by a letter, `/`, `!` or `?` is refused, in
+  backticks too. Write a placeholder as `NAME` or `{name}` and describe a tag
+  in words; `a < b` is fine;
 - do not write your own pull request number; the release appends `(#N)` from
   the file name. Any `#N` inside parentheses is refused, because the release
   tooling reads every `(#N)` as a pull request reference. A plain mention of
@@ -63,7 +63,8 @@ tense:
 A fragment that is already on `main` belongs to its pull request: another pull
 request may not delete, rename or edit it, or change its mode, even with
 `no-changelog`. A maintainer applies the `changelog-edit-ok` label after
-reading, for example on a revert; it waives that protection and nothing else.
+reading the diff, for example on a revert or on the release pull request that
+collects the fragments; it waives that protection and nothing else.
 
 Advisory mode softens only a missing or invalid entry, for contributors who
 cannot apply labels. A fragment named for another number and a change to a

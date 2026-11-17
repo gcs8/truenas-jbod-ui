@@ -11,10 +11,8 @@ for the format. The checks, in order:
    the file and the name it should have.
 2. A fragment that is already on the base branch belongs to another pull
    request: deleting, renaming, editing, or changing its mode or type is
-   refused. A release cut may delete fragments when each one's rendered
-   bullet, ``(#N)`` included, is a whole bullet of its subsection in the
-   release section the cut adds. The ``changelog-edit-ok`` label, applied by a
-   maintainer after reading, waives this check and nothing else.
+   refused, on a release cut too. The ``changelog-edit-ok`` label, applied by
+   a maintainer after reading the diff, waives this check and nothing else.
 3. The ``no-changelog`` or ``dependencies`` label makes an entry optional.
 4. Otherwise the diff must add at least one valid fragment named for this pull
    request, and every fragment it adds or changes must be valid. A pull
@@ -302,9 +300,8 @@ def fragment_changes(repo: Path, base: str, head: str) -> list[tuple[str, str]]:
     addition of the new one, and a copy is an addition.
     """
 
-    raw = _git_bytes(
-        repo, "diff", "--name-status", "-z", "--no-renames", f"{base}...{head}", "--", f"{fragments.FRAGMENT_DIR}/"
-    )
+    # No trailing slash: a path named exactly changelog.d that is not a directory shows up too.
+    raw = _git_bytes(repo, "diff", "--name-status", "-z", "--no-renames", f"{base}...{head}", "--", fragments.FRAGMENT_DIR)
     fields = raw.decode("utf-8", "surrogateescape").split("\0")
     return [(fields[index][0], fields[index + 1]) for index in range(0, len(fields) - 1, 2) if fields[index]]
 
@@ -315,9 +312,7 @@ def _expected_name(path: str, pr_number: int) -> str:
     return f"{fragments.FRAGMENT_DIR}/{pr_number}.{section}.md"
 
 
-def _protected_result(
-    repo: Path, base: str, head: str, pr_number: int, labels: set[str], paths: list[str]
-) -> GateResult | None:
+def _protected_result(repo: Path, base: str, head: str, pr_number: int, labels: set[str]) -> GateResult | None:
     """Checks 1 and 2: fragments named for another pull request, and changes to
     fragments already on the base branch. Neither label nor advisory mode
     softens them; ``changelog-edit-ok`` waives check 2 only."""
@@ -339,31 +334,14 @@ def _protected_result(
 
     changed = sorted((path, status) for status, path in changes if status != "A")
     if changed and EDIT_LABEL not in labels:
-        heading = _added_release_heading(repo, base, head, paths)
-        if heading is None:
-            messages += [
-                f"#{pr_number} changes changelog fragments that are already on the base branch; they belong "
-                "to other pull requests:",
-                *(f"  {path}: {_change_word(status)}" for path, status in changed),
-                "Restore them; the exemption labels and advisory mode do not allow this. A maintainer may "
-                f"apply the '{EDIT_LABEL}' label after reading, for example on a revert.",
-            ]
-        else:
-            section = fragments.section_text("\n".join(_head_changelog_lines(repo, head)), heading)
-            merge_base = _git(repo, "merge-base", base, head).strip()
-            refused = []
-            for path, status in changed:
-                reason = _release_cut_problem(repo, merge_base, path, status, section)
-                if reason is not None:
-                    refused.append(f"  {path}: {reason}")
-            if refused:
-                messages += [
-                    f"#{pr_number} cuts '{heading}' but does not carry every changelog fragment it removes as "
-                    "a whole bullet under its subsection:",
-                    *refused,
-                    "Collect them with scripts/changelog_fragments.py collect, or restore them. A maintainer "
-                    f"who rewords an entry at release time applies the '{EDIT_LABEL}' label.",
-                ]
+        messages += [
+            f"#{pr_number} changes changelog fragments that are already on the base branch; they belong "
+            "to other pull requests:",
+            *(f"  {path}: {_change_word(status)}" for path, status in changed),
+            "Restore them; the exemption labels and advisory mode do not allow this. A maintainer may "
+            f"apply the '{EDIT_LABEL}' label after reading the diff, for example on a revert or on the release "
+            "pull request that collects them.",
+        ]
     if not messages:
         return None
     return GateResult(False, messages, protected=True)
@@ -371,21 +349,6 @@ def _protected_result(
 
 def _change_word(status: str) -> str:
     return {"D": "deleted or renamed", "M": "content or mode changed", "T": "type changed"}.get(status, "changed")
-
-
-def _release_cut_problem(repo: Path, merge_base: str, path: str, status: str, section: str) -> str | None:
-    """Why the release cut does not account for base fragment ``path``, or None."""
-
-    if status != "D":
-        return f"{_change_word(status)}; a release cut only deletes the fragments it collected"
-    data, regular = _fragment_at(repo, merge_base, path)
-    if fragments.fragment_problem(path, data, regular_file=regular) is not None:
-        return "not a valid fragment on the base branch, so the cut cannot carry it"
-    fragment = fragments.parse_fragment(path, data)
-    if fragments.bullet_in_section(fragment, section):
-        return None
-    bullet = " ".join(" ".join(fragments.render_bullet(fragment)).split())
-    return f"needs the bullet '{bullet}' under '### {fragment.heading}'"
 
 
 def _fragment_at(repo: Path, head: str, path: str) -> tuple[bytes, bool]:
@@ -437,7 +400,7 @@ def _evaluate(
 ) -> GateResult:
     paths = changed_paths(repo, base, head)
 
-    protected = _protected_result(repo, base, head, pr_number, labels, paths)
+    protected = _protected_result(repo, base, head, pr_number, labels)
     if protected is not None:
         return protected
 

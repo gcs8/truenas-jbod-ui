@@ -10,8 +10,8 @@ request number, instead of editing ``CHANGELOG.md``::
 leading zeros. ``<section>`` is one of ``breaking``, ``upgrade``,
 ``security``, ``added``, ``changed``, ``fixed``, ``performance``, ``docs`` or
 ``internal``. The file holds the text of one bullet as one inline paragraph:
-past tense, no leading ``- ``, no heading, no HTML comment, no raw HTML outside
-backticks, no link reference definition, at most 4096 bytes, and no ``#N``
+past tense, no leading ``- ``, no heading, no HTML comment, no raw HTML (not
+even in backticks), no link reference definition, at most 4096 bytes, and no ``#N``
 inside parentheses (the release tooling reads every ``(#N)`` as a pull request
 reference; a plain mention such as ``see #123`` is allowed). It may wrap over
 several lines. The collector appends `` (#N)`` from the file name; nothing
@@ -29,7 +29,9 @@ it read and prints them. It re-reads every fragment just before writing and
 refuses if one changed; it deletes a file only while its bytes are still the
 bytes it read. If a deletion fails after the write, it goes on with the rest
 and lists the files still present. It refuses a version that already has a
-section, so a second run cannot insert the same entries twice.
+section, so a second run cannot insert the same entries twice. It keeps the
+text of the older sections and writes LF line endings, which ``.gitattributes``
+requires.
 """
 
 from __future__ import annotations
@@ -73,12 +75,10 @@ SETEXT_UNDERLINE = re.compile(r"^(?:=+|-+)$")
 LINK_DEFINITION = re.compile(r"^\[(?:[^\]\\]|\\.)+\]:")
 COMMENT_DELIMITER = ("<!--", "-->")
 RAW_HTML = re.compile(r"<[A-Za-z/!?]")
-BACKTICKS = re.compile(r"`+")
 FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
 LIST_MARKER = re.compile(r"^\s*[-*+]\s")
 PARENTHETICAL = re.compile(r"\(([^()]*)\)")
 PR_TOKEN = re.compile(r"(?<![\w#])#(\d+)(?!\d)")
-COMMENT_SPAN = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 SEMVER_CORE = r"(?:0|[1-9][0-9]*)"
 SEMVER_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
 VERSION = re.compile(
@@ -86,7 +86,10 @@ VERSION = re.compile(
 )
 
 
-RECOVERY_TEXT = "Delete the ones already in that section and commit, or restore CHANGELOG.md from Git and collect again."
+RECOVERY_TEXT = (
+    "Compare them with the section that was written, delete the ones already in it and commit, or restore "
+    "CHANGELOG.md from Git and collect again."
+)
 
 
 class CollectError(ValueError):
@@ -156,32 +159,6 @@ def name_number(path: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _outside_code_spans(text: str) -> str:
-    """``text`` with every inline code span blanked out.
-
-    A run of backticks opens a span that the next run of the same length
-    closes; a run without a partner is literal text.
-    """
-
-    pieces: list[str] = []
-    position = 0
-    while True:
-        opening = BACKTICKS.search(text, position)
-        if opening is None:
-            pieces.append(text[position:])
-            return "".join(pieces)
-        closing = next(
-            (run for run in BACKTICKS.finditer(text, opening.end()) if len(run.group()) == len(opening.group())),
-            None,
-        )
-        if closing is None:
-            pieces.append(text[position:opening.end()])
-            position = opening.end()
-            continue
-        pieces.append(text[position:opening.start()] + " ")
-        position = closing.end()
-
-
 def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
     """Return the normalized lines of a fragment and the reason it is invalid."""
 
@@ -209,10 +186,10 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
             return (), "contains a heading line; write only the bullet text"
     if any(delimiter in text for delimiter in COMMENT_DELIMITER):
         return (), "contains an HTML comment delimiter ('<!--' or '-->'); it can hide the entries after it"
-    if RAW_HTML.search(_outside_code_spans("\n".join(normalized))):
+    if RAW_HTML.search("\n".join(normalized)):
         return (), (
-            "contains raw HTML ('<' followed by a letter, '/', '!' or '?'); it can change the entries "
-            "around it, so put that text in backticks"
+            "contains raw HTML ('<' followed by a letter, '/', '!' or '?'), even in backticks; it can change "
+            "the entries around it. Write a placeholder as `NAME` or `{name}` and describe a tag in words"
         )
     if any(LINK_DEFINITION.match(line) for line in normalized):
         return (), (
@@ -272,57 +249,6 @@ def render_bullet(fragment: Fragment) -> list[str]:
     return lines
 
 
-def _normalized(lines: list[str]) -> str:
-    return " ".join(" ".join(lines).split())
-
-
-def section_bullets(section: str) -> dict[str, list[str]]:
-    """Whole top-level bullets per ``### `` subsection of one release section.
-
-    Each bullet is its ``- `` line joined with its indented continuation lines,
-    whitespace normalized. HTML comments and fenced blocks are skipped, so text
-    inside them is never a bullet.
-    """
-
-    text = COMMENT_SPAN.sub(lambda match: "\n" * match.group().count("\n"), section)
-    bullets: dict[str, list[str]] = {}
-    subsection = ""
-    current: list[str] = []
-    fenced = False
-
-    def flush() -> None:
-        if current:
-            bullets.setdefault(subsection, []).append(_normalized(current))
-            current.clear()
-
-    for raw in text.split("\n"):
-        if FENCE_LINE.match(raw):
-            flush()
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        if raw.startswith("### "):
-            flush()
-            subsection = raw[4:].strip()
-        elif raw.startswith("- "):
-            flush()
-            current.append(raw)
-        elif current and raw.startswith("  ") and raw.strip():
-            current.append(raw)
-        else:
-            flush()
-    flush()
-    return bullets
-
-
-def bullet_in_section(fragment: Fragment, section: str) -> bool:
-    """True when the bullet ``fragment`` renders to is one whole bullet of its
-    subsection in ``section``, compared after whitespace normalization."""
-
-    return _normalized(render_bullet(fragment)) in section_bullets(section).get(fragment.heading, [])
-
-
 def _read_regular(path: Path) -> bytes | None:
     """Bytes of ``path`` when it is a regular file, else None."""
 
@@ -340,6 +266,8 @@ def load_fragments(root: Path) -> tuple[list[Fragment], list[str]]:
     directory = root / FRAGMENT_DIR
     fragments: list[Fragment] = []
     problems: list[str] = []
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        return fragments, [f"{FRAGMENT_DIR}: not a directory (a symbolic link or a file); nothing in it was read"]
     if not directory.is_dir():
         return fragments, problems
     for entry in sorted(directory.iterdir(), key=lambda item: item.name):
@@ -492,21 +420,18 @@ def _remove_fragment(path: Path) -> None:
     path.unlink()
 
 
-def _recovery_lines(root: Path, heading: str, released: str) -> list[str]:
-    """Each fragment still on disk, whether its bullet is in ``released``, and what to do."""
+def _recovery_lines(root: Path) -> list[str]:
+    """Each fragment still on disk, and what to do."""
 
     fragments, _problems = load_fragments(root)
     if not fragments:
         return []
-    lines = [
+    return [
         "These fragments are still in changelog.d/ (a previous collect may have been interrupted "
-        "after writing CHANGELOG.md):"
+        "after writing CHANGELOG.md):",
+        *(f"  {fragment.path}" for fragment in fragments),
+        RECOVERY_TEXT,
     ]
-    for fragment in fragments:
-        where = "already in" if bullet_in_section(fragment, released) else "not in"
-        lines.append(f"  {fragment.path}: {where} '{heading}'")
-    lines.append(RECOVERY_TEXT)
-    return lines
 
 
 def _write_changelog(path: Path, text: str) -> None:
@@ -568,7 +493,7 @@ def collect(root: Path, *, version: str, date: str) -> CollectResult:
     cannot be read or deleted, is left in place and reported with
     CleanupIncomplete after the others are done. That is two steps, not one
     atomic change: if the deletions are interrupted, the next run for the same
-    version refuses and lists the fragments that are already in the section.
+    version refuses and lists the fragments still present.
     """
 
     heading = _release_heading(version, date)
@@ -588,7 +513,7 @@ def collect(root: Path, *, version: str, date: str) -> CollectResult:
     fragments, problems = load_fragments(root)
     if existing is not None:
         message = [f"{CHANGELOG_PATH} already has '{existing}'; refusing to collect v{version.removeprefix('v')} twice."]
-        message += _recovery_lines(root, existing, section_text(text, existing))
+        message += _recovery_lines(root)
         for problem in problems:
             message.append(f"  invalid fragment {problem}")
         raise CollectError("\n".join(message))
@@ -659,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(section_text(combined, UNRELEASED_HEADING))
         for note in notes:
             print(f"note: {note}", file=sys.stderr)
-        return 0
+        return 1 if notes else 0
 
     try:
         result = collect(root, version=args.version, date=args.date)
