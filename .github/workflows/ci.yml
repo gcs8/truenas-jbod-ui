@@ -1084,10 +1084,10 @@ jobs:
     # (qa/ui-coverage-primary-crawl.spec.js, about 9 minutes, with its own
     # 16-minute test timeout); keep headroom over that.
     timeout-minutes: 25
+    # The legs use nothing the source gates produce, so they start beside the
+    # unit shards; the required aggregate below enforces both source gates.
     needs:
       - route
-      - javascript-source
-      - python-source
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -1105,7 +1105,7 @@ jobs:
             smoke: false
             specs: >-
               qa/ui-coverage.spec.js
-              qa/header-and-disk-path-layout.spec.js
+              qa/ui-scope-safety.spec.js
               qa/connections-clear-selection.spec.js
               qa/chassis-row-overflow.spec.js
               qa/upgrade-notice.spec.js
@@ -1114,7 +1114,7 @@ jobs:
             specs: >-
               qa/heatmap-temperature-bands.spec.js
               qa/ui-a11y-narrow-layout.spec.js
-              qa/ui-scope-safety.spec.js
+              qa/header-and-disk-path-layout.spec.js
           - leg: "4"
             smoke: false
             specs: >-
@@ -1235,18 +1235,32 @@ jobs:
 
   public-demo-artifact:
     name: Checked-in public demo artifact
-    # Runs after the legs whether they passed or failed (not when the run was
-    # cancelled), so this required check turns red when any leg failed, was
-    # cancelled, or was skipped because a job it needs failed. A routed-off
-    # duplicate run still skips it, as before.
+    # Runs after the legs and both source gates whether they passed or failed
+    # (not when the run was cancelled), so this required check turns red when
+    # any leg or either source gate failed, was cancelled, or was skipped. A
+    # routed-off duplicate run still skips it, as before.
     if: "${{ !cancelled() && needs.route.outputs.run == 'true' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - route
       - fixture-browser
+      - javascript-source
+      - python-source
     steps:
-      - name: Require every fixture browser leg to succeed
+      - name: Require every leg and both source gates to succeed
         env:
           LEG_RESULT: ${{ needs.fixture-browser.result }}
-        run: test "$LEG_RESULT" = success
+          JAVASCRIPT_SOURCE_RESULT: ${{ needs.javascript-source.result }}
+          PYTHON_SOURCE_RESULT: ${{ needs.python-source.result }}
+        run: |
+          status=0
+          for check in "fixture browser legs:$LEG_RESULT" \
+            "javascript-source:$JAVASCRIPT_SOURCE_RESULT" \
+            "python-source:$PYTHON_SOURCE_RESULT"; do
+            if [ "${check#*:}" != success ]; then
+              echo "::error::${check%%:*} result is '${check#*:}', not success"
+              status=1
+            fi
+          done
+          exit "$status"

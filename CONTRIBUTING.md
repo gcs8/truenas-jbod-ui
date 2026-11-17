@@ -384,8 +384,10 @@ In CI they run as four parallel `Fixture browser specs (leg N)` jobs. Each leg
 runs the explicit spec list in its matrix entry in `.github/workflows/ci.yml`,
 in the `Run fixture-only browser specs` step, with one Playwright worker; leg 1
 also runs the public demo checks and the current-source demo smoke once. The
+legs need only the route job, so they start beside the unit shards. The
 required `Checked-in public demo artifact` check waits for all four legs and
-fails unless every one succeeded. A new fixture spec must be added to exactly
+for the `javascript-source` and `python-source` gates, and fails unless each of
+those succeeded. A new fixture spec must be added to exactly
 one leg (pick the one with the least measured time); a spec that should not run
 there goes in `NOT_ON_A_FIXTURE_LEG` in `tests/test_ci_browser_legs.py` with
 the place it runs instead. That test fails on a spec that is on no leg or on
