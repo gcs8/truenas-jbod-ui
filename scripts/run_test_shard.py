@@ -200,6 +200,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_container_contract",
         "test_core_fabric_legacy_controller",
         "test_enclosure_aliases",
+        "test_fabric_topology_fixture",
         "test_history_activation_marker_startup",
         "test_history_backend_bounds",
         "test_history_bulk_bounds",

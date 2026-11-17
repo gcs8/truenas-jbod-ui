@@ -1384,6 +1384,10 @@
   }
 
   function defaultSelectionRef(fabric = state.fabric, mode = state.mode) {
+    if (mode === "topology") {
+      // Topology selects only what is pinned in its drawing.
+      return null;
+    }
     if (mode === "disk") {
       const diskTraceId = defaultDiskTraceId(fabric);
       return diskTraceId ? { kind: "trace", id: diskTraceId } : null;
@@ -3762,6 +3766,12 @@
       elements.inspectorBody.innerHTML = "No fabric data loaded.";
       return;
     }
+    const topologyDetail = state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
+    if (topologyDetail) {
+      elements.inspectorTitle.textContent = topologyDetail.title;
+      elements.inspectorBody.innerHTML = topologyDetail.html;
+      return;
+    }
     if (trace) {
       const nodes = nodeMap(fabric);
       const pathStates = list(trace.metrics?.path_states);
@@ -4202,6 +4212,9 @@
     ensureSelectionForMode(fabric);
     pruneSelectionTrail(fabric);
     renderFocusStrip(fabric);
+    if (state.mode !== "topology") {
+      window.SasFabricTopology?.release();
+    }
     if (state.mode === "impact") {
       elements.mapPanel.innerHTML = renderImpactMode(fabric);
     } else if (state.mode === "trace") {
@@ -4209,8 +4222,10 @@
     } else if (state.mode === "disk") {
       elements.mapPanel.innerHTML = renderDiskPathMode(fabric);
     } else if (state.mode === "topology") {
+      // The drawing pins what the inspector shows; serials and disk identities
+      // for its search come from the inventory snapshot of the same scope.
       elements.mapPanel.innerHTML = window.SasFabricTopology
-        ? window.SasFabricTopology.render(fabric, { expanded: state.expandedSlotLists })
+        ? window.SasFabricTopology.render(fabric, { expanded: state.expandedSlotLists, selection: currentSelectionRef(), inventory: state.snapshot })
         : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
     } else {
       elements.mapPanel.innerHTML = renderLanesMode(fabric);
@@ -4421,6 +4436,9 @@
       const forceSelection = (mode === "disk" && current?.kind !== "trace")
         || (mode === "disk" && traceById(current?.id)?.kind !== "bay")
         || (mode === "impact" && (current?.kind !== "trace" || traceById(current?.id)?.kind !== "path"));
+      if (mode === "topology" && state.mode !== "topology") {
+        clearFabricSelection();
+      }
       state.mode = mode;
       closeAliasEditor();
       ensureSelectionForMode(state.fabric, { force: forceSelection, mode });
@@ -4699,7 +4717,16 @@
     });
   }
 
-  window.SasFabricTopology?.attach(elements.mapPanel, elements.topologySearch, elements.topologySearchStatus);
+  function clearFabricSelection() {
+    state.selectedTraceId = null;
+    state.selectedNodeId = null;
+    state.selectionTrail = [];
+  }
+
+  window.SasFabricTopology?.attach(elements.mapPanel, elements.topologySearch, elements.topologySearchStatus, {
+    clearSelection: clearFabricSelection,
+    requestRender: render,
+  });
   ensureSelectionForMode(state.fabric);
   render();
   if (!state.fabric) {

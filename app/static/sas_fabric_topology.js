@@ -4,17 +4,20 @@
 //
 //   - a pure layout model (buildTopologyModel, tracePath, searchTopology,
 //     renderTopology): payload in, tiers, nodes, link routes, labels and an
-//     SVG string out, no DOM. tests/js/fabric_topology_model.test.js loads it
-//     in Node the same way the other fabric tests load sas_fabric_view.js;
-//   - a small DOM layer (render, attach) that sas_fabric_view.js calls to draw
-//     the mode and to trace a path on hover, focus, click, search and Esc.
+//     SVG string out, no DOM. tests/js/fabric_topology_*.test.js load it in
+//     Node the same way the other fabric tests load sas_fabric_view.js;
+//   - a small DOM layer (render, mount, attach, release) that
+//     sas_fabric_view.js calls to draw the mode and to trace a path on hover,
+//     focus, click, search and Esc.
 //
 // Rules: one drawn line per payload link between drawn nodes; links into bays
 // are drawn as one bundle per enclosure and bay group, labelled with the count
 // of payload links it carries. No node, link, lane count, PHY number or rate is
 // ever invented. A tier the payload does not carry says "not read" or "not
-// collected", never an empty tier that looks healthy. A large bay group is
-// collapsed into a summary block that expands; no bay is ever dropped.
+// collected", never an empty tier that looks healthy. Every input record is
+// either drawn or named in a notice. A large bay group is collapsed into a
+// summary block that expands; no bay is ever dropped. A disk whose physical
+// location the producer does not know is never drawn as a bay.
 (function () {
   "use strict";
 
@@ -22,10 +25,16 @@
   const NOT_SHOWN = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
     + "Backplane zones, the CORE multipath groupings (shown instead as path marks on each bay) "
     + "and PHY error counters (Disk Path) are not drawn either.";
+  const LOCATION_UNKNOWN = "physical location unavailable";
   // A bay group larger than this is drawn as a summary block until expanded.
   const BAY_DETAIL_LIMIT = 96;
   const CELLS_PER_ROW = 24;
-  const CELL = 32;
+  // A bay cell is a CELL_BOX square on a CELL pitch; its path marks are
+  // MARK px wide on a MARK_PITCH.
+  const CELL = 34;
+  const CELL_BOX = 32;
+  const MARK = 8;
+  const MARK_PITCH = 9;
   const NODE_W = 184;
   const NODE_H = 62;
   const H_GAP = 28;
@@ -35,23 +44,49 @@
   const SUMMARY_W = 300;
   const SUMMARY_H = 104;
   const GROUP_HEAD = 42;
+  const NAME_LIMIT = 4;
   const LANE_LINKS = new Set(["controller-expander", "expander-expander"]);
   const HIDDEN_KINDS = new Set(["pool", "vdev", "backplane"]);
+  const MEMBER_HEALTH = "member-health-not-transport";
+  const CACHE_FRESH = new Set(["hit", "hit-after-wait", "miss", "forced-refresh"]);
+  // Path states as the producers emit them: sas_fabric.py normalize_path_state
+  // (active, passive, fail, missing, unknown), the Linux SES builder (mapped,
+  // unmapped) and the platform builders (present, mixed, or a member health
+  // word, marked by state_basis).
   const PATH_STATE_TONES = {
     active: "active",
     online: "active",
     optimal: "active",
     passive: "standby",
     standby: "standby",
-    mapped: "mapped",
+    fail: "fault",
     failed: "fault",
     fault: "fault",
-    degraded: "fault",
-    offline: "fault",
+    missing: "missing",
+    unknown: "unknown",
+    mapped: "mapped",
+    unmapped: "unmapped",
+    present: "member",
+    mixed: "member",
+  };
+  const PATH_CAPTIONS = {
+    block: "block device",
+    nvme: "NVMe device",
+    mdadm: "mdadm member",
+    "scale-storage": "SCALE storage path",
+    "storcli-member": "RAID member",
+    "esxi-storage": "ESXi storage path",
+    "bmc-slot": "BMC slot",
+    quantastor: "Quantastor path",
+    "quantastor-ha": "Quantastor HA path",
   };
 
   function list(value) {
     return Array.isArray(value) ? value : [];
+  }
+
+  function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
   function escapeHtml(value) {
@@ -71,21 +106,41 @@
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
+  // The producer sends SAS levels and PHY counts as decimal strings
+  // (sas_fabric_parsers.parse_mpr_expanders) and some counts as integers.
+  // Only plain digits, bounded, are a reading; anything else stays unknown.
+  function decimal(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+    return typeof value === "string" && /^[0-9]{1,9}$/.test(value) ? Number(value) : null;
+  }
+
   function naturalCompare(left, right) {
     return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true, sensitivity: "base" });
   }
 
+  function plural(count, one, many = `${one}s`) {
+    return `${count} ${count === 1 ? one : many}`;
+  }
+
+  function named(values) {
+    const shown = values.slice(0, NAME_LIMIT).join(", ");
+    return values.length > NAME_LIMIT ? `${shown} and ${values.length - NAME_LIMIT} more` : shown;
+  }
+
   function fabricKind(fabric) {
-    if (fabric?.raw?.fabric_kind) {
+    if (typeof fabric?.raw?.fabric_kind === "string" && fabric.raw.fabric_kind) {
       return fabric.raw.fabric_kind;
     }
     return fabric?.platform === "core" ? "core_sas" : "unknown";
   }
 
+  // complete | partial | not_read, or unknown when the payload does not say.
   function readState(fabric, domain) {
     const counts = fabric?.raw?.controller_read?.counts;
-    if (!counts || typeof counts !== "object") {
-      return "complete";
+    if (!isRecord(counts) || counts[domain] === undefined || counts[domain] === null) {
+      return "unknown";
     }
     const value = counts[domain];
     return value === "complete" || value === "partial" ? value : "not_read";
@@ -128,7 +183,76 @@
     return value.length > max ? `${value.slice(0, max - 1)}…` : value;
   }
 
-  // ---- tiers and nodes -----------------------------------------------------
+  // ---- reading the payload ---------------------------------------------------
+
+  // The fabric bay metric `present` is true, false or "unknown" (#1218); any
+  // other value is unknown too. The model keeps its own tri-state.
+  function bayOccupancy(metrics) {
+    const value = isRecord(metrics) ? metrics.present : undefined;
+    return value === true ? "yes" : value === false ? "no" : "unknown";
+  }
+
+  function locationKnown(...sources) {
+    return !sources.some((item) => isRecord(item) && (item.physical_location_known === false || item.virtual_enclosure === true));
+  }
+
+  // Collections and members the view can read; what it cannot is named.
+  function readPayload(fabric) {
+    const problems = [];
+    if (!isRecord(fabric)) {
+      problems.push("the fabric payload is not an object");
+      return { nodes: [], links: [], traces: [], problems, nodesReadable: false };
+    }
+    const collection = (name, one, many) => {
+      if (!Array.isArray(fabric[name])) {
+        problems.push(`${name} is not a list`);
+        return { items: [], readable: false };
+      }
+      const items = fabric[name].filter((item) => isRecord(item) && typeof item.id === "string" && item.id);
+      const skipped = fabric[name].length - items.length;
+      if (skipped) {
+        problems.push(`${plural(skipped, `${one} entry`, `${many} entries`)} without an object and an id ${skipped === 1 ? "was" : "were"} skipped`);
+      }
+      return { items, readable: !skipped };
+    };
+    const nodes = collection("nodes", "node", "node");
+    const links = collection("links", "link", "link");
+    const traces = collection("traces", "trace", "trace");
+    return { nodes: nodes.items, links: links.items, traces: traces.items, problems, nodesReadable: nodes.readable };
+  }
+
+  // The inventory snapshot the page holds, when it belongs to the same system
+  // and enclosure as the fabric payload: serials and disk identities by slot.
+  function inventoryBySlot(fabric, inventory) {
+    const slots = new Map();
+    if (!isRecord(inventory) || !isRecord(fabric)) return slots;
+    const differs = (left, right) => Boolean(left && right && left !== right);
+    if (differs(fabric.system_id, inventory.selected_system_id) || differs(fabric.selected_enclosure_id, inventory.selected_enclosure_id)) {
+      return slots;
+    }
+    for (const slot of list(inventory.slots)) {
+      if (isRecord(slot) && Number.isInteger(slot.slot) && !slots.has(slot.slot)) slots.set(slot.slot, slot);
+    }
+    return slots;
+  }
+
+  function searchTerms(item, trace, slot) {
+    const metrics = isRecord(item.metrics) ? item.metrics : {};
+    const raw = isRecord(item.raw) ? item.raw : {};
+    const traced = isRecord(trace?.metrics) ? trace.metrics : {};
+    const multipath = isRecord(slot?.multipath) ? slot.multipath : {};
+    const values = [
+      metrics.device_name, traced.device_name, metrics.serial, raw.serial, metrics.sas_address, raw.sas_address,
+      metrics.logical_unit_id, metrics.gptid,
+      ...list(traced.path_states).map((state) => state?.device_name),
+      ...list(traced.mpr_devices).flatMap((device) => [device?.sas_address, device?.member_device_name]),
+      slot?.serial, slot?.device_name, slot?.sas_address, slot?.logical_unit_id, slot?.gptid, slot?.persistent_id_label,
+      multipath.device_name, ...list(multipath.members).map((member) => member?.device_name),
+    ];
+    return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
+  }
+
+  // ---- tiers and nodes -------------------------------------------------------
 
   function tierForNode(item, core) {
     const kind = String(item.kind || "");
@@ -137,14 +261,17 @@
     if (kind === "expander") return core ? "expanders" : null;
     if (kind === "path") return core ? null : "devices";
     if (kind === "bay") return "bays";
-    if (HIDDEN_KINDS.has(kind)) return null;
     if (kind.endsWith("enclosure")) return "enclosures";
     return null;
   }
 
+  // Kinds the view leaves out on purpose; anything else it cannot draw is named.
+  function hiddenByDesign(item, core) {
+    return HIDDEN_KINDS.has(String(item.kind || "")) || (core && item.kind === "path");
+  }
+
   function expanderLevel(item) {
-    const level = finite(item?.metrics?.sas_level) ?? finite(item?.raw?.sas_level);
-    return level === null ? null : level;
+    return decimal(item?.metrics?.sas_level) ?? decimal(item?.raw?.sas_level);
   }
 
   function countTier(fabric, domain, count, base) {
@@ -153,27 +280,38 @@
       if (state === "partial") {
         return { state: "partial", note: `at least ${count}; some controller reads are missing` };
       }
-      return { state: "drawn", note: `${count} ${count === 1 ? base.one : base.many}` };
+      const note = plural(count, base.one, base.many);
+      return { state: "drawn", note: state === "complete" ? note : `${note}; read completeness not reported` };
     }
     if (state === "complete") {
       return { state: "none", note: base.none };
     }
-    return { state: "not_read", note: `${base.many} not read` };
+    return { state: "not_read", note: state === "unknown" ? `${base.many}: read not reported` : `${base.many} not read` };
   }
 
-  function nodeFacts(item, core) {
-    const metrics = item.metrics || {};
+  function pathCaption(item, kind) {
+    const metrics = isRecord(item.metrics) ? item.metrics : {};
+    const raw = isRecord(item.raw) ? item.raw : {};
+    const ses = kind === "linux_ses" || raw.source === "linux_ses" || raw.fabric_kind === "linux_ses" || Boolean(metrics.ses_device);
+    const caption = ses ? "SES device" : PATH_CAPTIONS[metrics.path_type] || "storage path";
+    if (!item.status) return caption;
+    return metrics.state_basis === MEMBER_HEALTH ? `${caption} · member health ${item.status}` : `${caption} · ${item.status}`;
+  }
+
+  function nodeFacts(item, core, kind) {
+    const metrics = isRecord(item.metrics) ? item.metrics : {};
     const notRead = new Set(list(metrics.not_read));
     const facts = [];
     if (item.kind === "controller") {
       if (core) {
         const board = item.raw?.board;
         if (board) facts.push(String(board));
+        const phys = decimal(metrics.phy_count);
         if (notRead.has("phy_count") || notRead.has("linked_phy_count")) {
           facts.push("PHY table not read");
-        } else if (finite(metrics.phy_count) !== null) {
-          const linked = finite(metrics.linked_phy_count);
-          facts.push(`${linked === null ? "?" : linked} of ${metrics.phy_count} PHYs linked`);
+        } else if (phys !== null) {
+          const linked = decimal(metrics.linked_phy_count);
+          facts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
         }
       } else {
         facts.push("storage source, not an HBA");
@@ -181,40 +319,53 @@
     } else if (item.kind === "expander") {
       const level = expanderLevel(item);
       const parts = [level === null ? "level not reported" : `level ${level}`];
+      const phys = decimal(metrics.num_phys);
       if (notRead.has("linked_phys")) {
         parts.push("PHY table not read");
-      } else if (finite(metrics.num_phys) !== null) {
-        parts.push(`${finite(metrics.linked_phys) ?? "?"} of ${metrics.num_phys} PHYs linked`);
+      } else if (phys !== null) {
+        const linked = decimal(metrics.linked_phys);
+        parts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
       }
       facts.push(parts.join(" · "));
     } else if (item.kind === "host") {
       facts.push("host");
     } else if (item.kind === "path") {
-      facts.push(item.status ? `SES device · ${item.status}` : "SES device");
+      facts.push(pathCaption(item, kind));
     } else {
       facts.push(String(item.kind || "").replace(/-/g, " "));
     }
     return facts;
   }
 
-  // ---- model ---------------------------------------------------------------
+  // ---- model -----------------------------------------------------------------
 
   function buildTopologyModel(fabric, options = {}) {
-    const expanded = options.expanded || {};
+    const expanded = isRecord(options.expanded) ? options.expanded : {};
     const kind = fabricKind(fabric);
     const core = kind === "core_sas";
-    const payloadNodes = list(fabric?.nodes);
-    const payloadLinks = list(fabric?.links);
-    const traces = new Map(list(fabric?.traces).map((trace) => [trace.id, trace]));
+    const payload = readPayload(fabric);
+    const traces = new Map(payload.traces.map((trace) => [trace.id, trace]));
+    const inventory = inventoryBySlot(fabric, options.inventory);
+    const skipped = { unsupported: [], duplicateNodes: [], missingEnd: [], duplicateLinks: [], unjoined: [] };
 
     const nodes = [];
     const nodeById = new Map();
-    const bayNodes = [];
-    for (const item of payloadNodes) {
+    const payloadNodeIds = new Map();
+    const bayRows = [];
+    for (const item of payload.nodes) {
+      if (payloadNodeIds.has(item.id)) {
+        skipped.duplicateNodes.push(item.id);
+        if (item.kind === "bay") bayRows.push(item);
+        continue;
+      }
+      payloadNodeIds.set(item.id, item);
       const tier = tierForNode(item, core);
-      if (!tier || nodeById.has(item.id)) continue;
+      if (!tier) {
+        if (!hiddenByDesign(item, core)) skipped.unsupported.push(`${item.kind || "no kind"}: ${item.id}`);
+        continue;
+      }
       if (tier === "bays") {
-        bayNodes.push(item);
+        bayRows.push(item);
         continue;
       }
       const entry = {
@@ -225,7 +376,7 @@
         rawId: item.raw_id || "",
         status: item.status || "",
         level: item.kind === "expander" ? expanderLevel(item) : null,
-        facts: nodeFacts(item, core),
+        facts: nodeFacts(item, core, kind),
         phyGroups: [],
         parentUnknown: false,
         x: 0,
@@ -236,23 +387,40 @@
       nodes.push(entry);
       nodeById.set(entry.id, entry);
     }
+    const bayIds = new Set(bayRows.map((item) => item.id));
 
-    // Lines: every payload link whose both ends are drawn nodes.
+    // Lines: every payload link whose both ends are drawn nodes. Every other
+    // link is either into a bay (a bundle), touches a kind left out on
+    // purpose, or is named in the notice.
     const links = [];
     const linkById = new Map();
     const bayLinks = [];
-    const bayIdSet = new Set(bayNodes.map((item) => item.id));
-    for (const item of payloadLinks) {
-      const source = nodeById.get(item.source);
-      if (!source) continue;
-      if (bayIdSet.has(item.target)) {
-        if (source.tier === "enclosures" || (!core && source.tier === "devices")) {
-          bayLinks.push(item);
-        }
+    const seenLinks = new Set();
+    for (const item of payload.links) {
+      if (seenLinks.has(item.id)) {
+        skipped.duplicateLinks.push(item.id);
         continue;
       }
-      if (!nodeById.has(item.target) || linkById.has(item.id) || item.source === item.target) continue;
-      const lanesPayload = item.reported_lanes && typeof item.reported_lanes === "object" ? item.reported_lanes : null;
+      seenLinks.add(item.id);
+      const sourceItem = payloadNodeIds.get(item.source);
+      const targetItem = payloadNodeIds.get(item.target);
+      if (!sourceItem || !targetItem) {
+        skipped.missingEnd.push(item.id);
+        continue;
+      }
+      const source = nodeById.get(item.source);
+      const target = nodeById.get(item.target);
+      const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, core) && !hiddenByDesign(end, core));
+      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices"))) {
+        bayLinks.push(item);
+        continue;
+      }
+      if (!source || !target || item.source === item.target) {
+        const hiddenEnd = [sourceItem, targetItem].some((end) => hiddenByDesign(end, core) || (end.kind === "bay" && !source));
+        if (!hiddenEnd && !unsupportedEnd) skipped.unjoined.push(item.id);
+        continue;
+      }
+      const lanesPayload = isRecord(item.reported_lanes) ? item.reported_lanes : null;
       let lanes = null;
       if (lanesPayload && Number.isInteger(lanesPayload.lane_count)) {
         lanes = {
@@ -318,45 +486,49 @@
       bayLinkIds.get(key).push(item.id);
     }
     const pathStatesByBay = new Map();
-    for (const item of payloadLinks) {
+    for (const item of payload.links) {
       if (item.kind !== "path-bay") continue;
       const controller = String(item.source || "").split(":")[1] || "";
       if (!pathStatesByBay.has(item.target)) pathStatesByBay.set(item.target, []);
-      pathStatesByBay.get(item.target).push({ controller, state: String(item.status || "unknown") });
+      pathStatesByBay.get(item.target).push({ controller, state: String(item.status || "unknown"), basis: "" });
     }
     const groupsByKey = new Map();
     const groupByBay = new Map();
     const bays = [];
-    const seenBays = new Set();
-    for (const item of bayNodes) {
-      if (seenBays.has(item.id)) continue;
-      seenBays.add(item.id);
+    for (const item of bayRows) {
+      if (payloadNodeIds.get(item.id) !== item) continue;
       const trace = traces.get(item.id);
-      const traced = list(trace?.metrics?.path_states).map((state) => ({
-        controller: String(state?.controller ?? ""),
-        state: String(state?.state ?? "unknown"),
+      const metrics = isRecord(item.metrics) ? item.metrics : {};
+      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
+        controller: String(state.controller ?? ""),
+        state: String(state.state ?? "unknown"),
+        basis: String(state.state_basis ?? ""),
       }));
       const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id));
-      const present = item.metrics?.present;
+      const slot = Number.isInteger(item.slot) ? item.slot : null;
+      const inventorySlot = slot === null ? null : inventory.get(slot);
+      const located = locationKnown(metrics, item.raw, trace?.metrics, inventorySlot, inventorySlot?.raw_status);
       const bay = {
         bayId: item.id,
         traceId: trace ? trace.id : "",
-        slot: Number.isInteger(item.slot) ? item.slot : null,
+        slot,
         label: nodeLabel(item),
+        locationKnown: located,
         status: item.status || "",
-        present: present === true ? "yes" : present === false ? "no" : "unknown",
-        deviceName: item.metrics?.device_name || trace?.metrics?.device_name || "",
-        serial: item.metrics?.serial || item.raw?.serial || trace?.metrics?.serial || "",
-        sasAddress: item.metrics?.sas_address || item.raw?.sas_address || "",
+        occupancy: bayOccupancy(metrics),
+        deviceName: metrics.device_name || trace?.metrics?.device_name || "",
+        terms: searchTerms(item, trace, inventorySlot),
         pathStates,
         sources: [...(baySources.get(item.id) || [])].sort(naturalCompare),
         x: 0,
         y: 0,
+        w: CELL_BOX,
       };
       bays.push(bay);
-      const key = bay.sources.join("|");
+      const key = `${bay.sources.join("|")}#${located ? "located" : "logical"}`;
       if (!groupsByKey.has(key)) {
-        groupsByKey.set(key, { id: `group:${key || "unlinked"}`, enclosureIds: bay.sources, bays: [] });
+        const id = `group:${bay.sources.join("|") || "unlinked"}${located ? "" : ":logical"}`;
+        groupsByKey.set(key, { id, enclosureIds: bay.sources, locationKnown: located, bays: [] });
       }
       groupsByKey.get(key).bays.push(bay);
     }
@@ -367,8 +539,8 @@
       const collapsed = raw.bays.length > BAY_DETAIL_LIMIT && !expanded[expandKey];
       const summary = { bays: raw.bays.length, withDisk: 0, empty: 0, unknown: 0, pathStates: {} };
       for (const bay of raw.bays) {
-        if (bay.present === "yes") summary.withDisk += 1;
-        else if (bay.present === "no") summary.empty += 1;
+        if (bay.occupancy === "yes") summary.withDisk += 1;
+        else if (bay.occupancy === "no") summary.empty += 1;
         else summary.unknown += 1;
         for (const state of bay.pathStates) {
           const name = state.controller || "path";
@@ -376,13 +548,19 @@
           summary.pathStates[name][state.state] = (summary.pathStates[name][state.state] || 0) + 1;
         }
       }
+      // A disk without a physical location is drawn with its own label, so
+      // its cell is as wide as the longest label in the group.
+      const cellWidth = raw.locationKnown ? CELL_BOX : Math.max(CELL_BOX, ...raw.bays.map((bay) => bay.label.length * CHAR_W + 12));
+      for (const bay of raw.bays) bay.w = cellWidth;
       const group = {
         id: raw.id,
         tier: "bays",
         enclosureIds: raw.enclosureIds,
+        locationKnown: raw.locationKnown,
         bayIds: raw.bays.map((bay) => bay.bayId),
         bays: raw.bays,
         cells: collapsed ? [] : raw.bays,
+        cellWidth,
         collapsed,
         expandable: raw.bays.length > BAY_DETAIL_LIMIT,
         expandKey,
@@ -410,7 +588,7 @@
           bundle: true,
           lanes: null,
           lanesState: "n/a",
-          labelLines: [`${memberLinkIds.length} ${memberLinkIds.length === 1 ? "bay" : "bays"}`],
+          labelLines: [plural(memberLinkIds.length, group.locationKnown ? "bay" : "disk")],
           memberLinkIds,
           count: memberLinkIds.length,
         };
@@ -426,7 +604,15 @@
     // Tier rows, top to bottom.
     const tiers = [];
     const tierNodes = (name) => nodes.filter((entry) => entry.tier === name);
-    tiers.push({ id: "host", label: "Host", state: "drawn", note: "", nodeIds: tierNodes("host").map((entry) => entry.id) });
+    const unreadable = !payload.nodesReadable;
+    const hosts = tierNodes("host");
+    tiers.push({
+      id: "host",
+      label: "Host",
+      state: hosts.length ? "drawn" : "not_read",
+      note: hosts.length ? "" : "host not in the payload",
+      nodeIds: hosts.map((entry) => entry.id),
+    });
     const controllers = tierNodes("controllers");
     if (core) {
       const status = countTier(fabric, "controllers", controllers.length, { one: "HBA", many: "HBAs", none: "no HBAs reported" });
@@ -443,7 +629,7 @@
             id: `expanders:${level ?? "unknown"}`,
             label: level === null ? "Expanders, level not reported" : `Expanders, level ${level}`,
             state: expanderStatus.state,
-            note: expanderStatus.state === "partial" ? expanderStatus.note : `${members.length} ${members.length === 1 ? "expander" : "expanders"}`,
+            note: expanderStatus.state === "partial" ? expanderStatus.note : plural(members.length, "expander"),
             nodeIds: members.map((entry) => entry.id),
           });
           for (const entry of members) entry.tier = `expanders:${level ?? "unknown"}`;
@@ -457,7 +643,7 @@
         id: "controllers",
         label: "Source",
         state: controllers.length ? "drawn" : "none",
-        note: controllers.length ? `${controllers.length} ${controllers.length === 1 ? "source" : "sources"}` : "no source reported",
+        note: controllers.length ? plural(controllers.length, "source") : "no source reported",
         nodeIds: controllers.map((entry) => entry.id),
       });
       tiers.push({ id: "not-collected", label: "HBAs and expanders", state: "not_collected", note: NOT_COLLECTED, nodeIds: [] });
@@ -467,7 +653,7 @@
           id: "devices",
           label: kind === "linux_ses" ? "SES devices" : "Storage paths",
           state: "drawn",
-          note: `${devices.length} ${devices.length === 1 ? "device" : "devices"}`,
+          note: plural(devices.length, "device"),
           nodeIds: devices.map((entry) => entry.id),
         });
       }
@@ -476,17 +662,34 @@
         id: "enclosures",
         label: "Enclosures",
         state: enclosures.length ? "drawn" : "none",
-        note: enclosures.length ? `${enclosures.length} ${enclosures.length === 1 ? "enclosure" : "enclosures"}` : "no enclosure reported",
+        note: enclosures.length ? plural(enclosures.length, "enclosure") : "no enclosure reported",
         nodeIds: enclosures.map((entry) => entry.id),
       });
     }
+    const located = bays.filter((bay) => bay.locationKnown).length;
+    const logical = bays.length - located;
+    let bayNote = "no bays in this payload";
+    if (located && logical) bayNote = `${plural(located, "bay")}; ${plural(logical, "disk")} without a physical location`;
+    else if (logical) bayNote = `${plural(logical, "disk")}; ${LOCATION_UNKNOWN}`;
+    else if (located) bayNote = plural(located, "bay");
     tiers.push({
       id: "bays",
-      label: "Bays",
+      label: logical && !located ? "Disks" : logical ? "Bays and disks" : "Bays",
       state: bays.length ? "drawn" : "none",
-      note: bays.length ? `${bays.length} ${bays.length === 1 ? "bay" : "bays"}` : "no bays in this payload",
+      note: bayNote,
       nodeIds: groups.map((group) => group.id),
     });
+    if (payload.problems.length && !payload.nodesReadable) {
+      // Node entries could not all be read: nothing drawn is a measured zero.
+      for (const tier of tiers) {
+        if ((tier.state === "none" || tier.state === "drawn") && !tier.nodeIds.length) {
+          tier.state = "not_read";
+          tier.note = "payload not readable";
+        } else if (unreadable && tier.state === "none") {
+          tier.state = "not_read";
+        }
+      }
+    }
 
     const model = {
       kind,
@@ -505,18 +708,32 @@
       outgoing,
       parts: modelParts(fabric, core),
       notices: [],
-      counts: { bayNodes: seenBays.size, baysPlaced: groups.reduce((total, group) => total + group.bayIds.length, 0) },
+      counts: { bayNodes: bayRows.length, baysPlaced: groups.reduce((total, group) => total + group.bayIds.length, 0) },
+      scope: isRecord(fabric) ? `${fabric.system_id ?? ""}\u0000${fabric.selected_enclosure_id ?? ""}` : "",
       width: 0,
       height: 0,
     };
+    if (payload.problems.length) {
+      model.notices.push(`Payload not readable: ${payload.problems.join("; ")}. What could not be read is not drawn.`);
+    }
+    const notDrawn = [];
+    if (skipped.unsupported.length) notDrawn.push(`${plural(skipped.unsupported.length, "node")} of a kind this view does not draw (${named(skipped.unsupported)})`);
+    if (skipped.missingEnd.length) notDrawn.push(`${plural(skipped.missingEnd.length, "link")} with an end the payload does not carry (${named(skipped.missingEnd)})`);
+    if (skipped.unjoined.length) notDrawn.push(`${plural(skipped.unjoined.length, "link")} between items this view does not join (${named(skipped.unjoined)})`);
+    if (skipped.duplicateNodes.length) notDrawn.push(`${plural(skipped.duplicateNodes.length, "duplicate node id")} (${named(skipped.duplicateNodes)})`);
+    if (skipped.duplicateLinks.length) notDrawn.push(`${plural(skipped.duplicateLinks.length, "duplicate link id")} (${named(skipped.duplicateLinks)})`);
+    if (model.counts.bayNodes !== model.counts.baysPlaced) {
+      notDrawn.push(`${plural(model.counts.bayNodes, "bay row")} in the payload, ${plural(model.counts.baysPlaced, "bay")} drawn`);
+    }
+    if (notDrawn.length) {
+      model.notices.push(`Not drawn: ${notDrawn.join("; ")}.`);
+    }
     for (const group of groups) {
       if (group.collapsed) {
         const names = group.enclosureIds.map((id) => nodeById.get(id)?.label || id).join(" and ");
-        model.notices.push(`${group.bayIds.length} bays${names ? ` behind ${names}` : ""} are shown as a summary block; expand it to draw each bay.`);
+        const what = group.locationKnown ? "bays" : "disks";
+        model.notices.push(`${group.bayIds.length} ${what}${names ? ` behind ${names}` : ""} are shown as a summary block; expand it to draw each one.`);
       }
-    }
-    if (model.counts.baysPlaced !== model.counts.bayNodes) {
-      model.notices.push(`${model.counts.bayNodes - model.counts.baysPlaced} bays in the payload could not be placed.`);
     }
     layoutModel(model);
     return model;
@@ -524,21 +741,24 @@
 
   function modelParts(fabric, core) {
     const parts = [];
-    for (const [name, source] of Object.entries(fabric?.sources || {})) {
+    for (const [name, source] of Object.entries(isRecord(fabric?.sources) ? fabric.sources : {})) {
       let state = "ok";
-      if (!source?.enabled) state = "disabled";
+      if (!isRecord(source)) state = "not reported";
+      else if (!source.enabled) state = "disabled";
       else if (!source.ok) state = source.required_ok ? "partial" : "failed";
-      parts.push({ name, label: name, state, title: source?.message || "" });
+      parts.push({ name, label: name, state, title: isRecord(source) ? source.message || "" : "" });
     }
     const caches = [fabric?.snapshot_cache_state, fabric?.source_cache_state];
-    let cache = "ok";
+    let cache = "not reported";
     if (caches.includes("trusted-fallback")) cache = "fallback";
     else if (caches.includes("stale-hit")) cache = "stale";
-    parts.push({ name: "cache", label: "cache", state: cache, title: caches.filter(Boolean).join(", ") });
+    else if (caches.every((value) => CACHE_FRESH.has(value))) cache = "ok";
+    parts.push({ name: "cache", label: "cache", state: cache, title: caches.filter((value) => typeof value === "string").join(", ") });
     if (core) {
       for (const [domain, label] of [["controllers", "HBAs"], ["expanders", "expanders"], ["enclosures", "enclosures"]]) {
         const state = readState(fabric, domain);
-        parts.push({ name: domain, label, state: state === "complete" ? "ok" : state === "partial" ? "partial" : "not read", title: "" });
+        const shown = { complete: "ok", partial: "partial", unknown: "not reported" }[state] || "not read";
+        parts.push({ name: domain, label, state: shown, title: "" });
       }
       if (Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0) {
         parts.push({ name: "phy-tables", label: "PHY tables", state: "partial", title: "" });
@@ -547,17 +767,22 @@
     return parts;
   }
 
-  // ---- layout --------------------------------------------------------------
+  // ---- layout ----------------------------------------------------------------
 
   function groupSize(group) {
     if (group.collapsed) {
       return [SUMMARY_W, SUMMARY_H];
     }
     const count = group.cells.length;
-    const columns = Math.max(1, Math.min(CELLS_PER_ROW, count));
-    const rows = Math.max(1, Math.ceil(count / CELLS_PER_ROW));
-    // An unlinked group is wide enough to say so in full.
-    return [Math.max(group.enclosureIds.length ? NODE_W : 240, columns * CELL + 16), GROUP_HEAD + rows * CELL + 10];
+    const pitch = group.cellWidth + (CELL - CELL_BOX);
+    const perRow = group.locationKnown ? CELLS_PER_ROW : Math.max(1, Math.floor((CELLS_PER_ROW * CELL) / pitch));
+    const columns = Math.max(1, Math.min(perRow, count));
+    const rows = Math.max(1, Math.ceil(count / perRow));
+    group.perRow = perRow;
+    group.pitch = pitch;
+    // An unlinked or logical group is wide enough to say so in full.
+    const minimum = group.enclosureIds.length && group.locationKnown ? NODE_W : 360;
+    return [Math.max(minimum, columns * pitch + 16), GROUP_HEAD + rows * CELL + 10];
   }
 
   function layoutModel(model) {
@@ -597,7 +822,6 @@
 
     // Vertical: each gap holds a bus track per parent and the stacked labels.
     let y = MARGIN + 8;
-    const rowTop = new Map();
     rows.forEach((row, index) => {
       const into = model.links.filter((link) => row.items.some((item) => item.id === link.target));
       if (index > 0) {
@@ -613,7 +837,6 @@
         y += row.busZone + maxIncoming * step + 14;
         if (!into.length) y += 8;
       }
-      rowTop.set(row.tier.id, y);
       row.y = y;
       const height = row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36;
       row.height = height;
@@ -628,8 +851,8 @@
     // Cells inside bay groups.
     for (const group of model.groups) {
       group.cells.forEach((bay, index) => {
-        bay.x = group.x + 8 + (index % CELLS_PER_ROW) * CELL;
-        bay.y = group.y + GROUP_HEAD + Math.floor(index / CELLS_PER_ROW) * CELL;
+        bay.x = group.x + 8 + (index % group.perRow) * group.pitch;
+        bay.y = group.y + GROUP_HEAD + Math.floor(index / group.perRow) * CELL;
       });
     }
 
@@ -665,7 +888,7 @@
     }
   }
 
-  // ---- path trace and search -----------------------------------------------
+  // ---- path trace and search -------------------------------------------------
 
   function emptyPath() {
     return { nodes: new Set(), links: new Set(), groups: new Set(), bays: new Set() };
@@ -686,7 +909,7 @@
     }
   }
 
-  function walkDown(model, id, path, onlyBays = null) {
+  function walkDown(model, id, path) {
     const pending = [id];
     while (pending.length) {
       const current = pending.pop();
@@ -697,7 +920,7 @@
           const group = model.groupById.get(link.target);
           path.groups.add(link.target);
           for (const bay of list(group?.bays)) {
-            if (bay.sources.includes(link.source) && (!onlyBays || onlyBays.has(bay.bayId))) path.bays.add(bay.bayId);
+            if (bay.sources.includes(link.source)) path.bays.add(bay.bayId);
           }
           continue;
         }
@@ -758,6 +981,9 @@
     return path;
   }
 
+  // A number (or "bay N") is a bay number and matches only bays with a
+  // physical location; any other text matches labels, disk names, serials,
+  // disk and expander SAS addresses.
   function searchTopology(model, query) {
     const text = String(query ?? "").trim().toLowerCase();
     const result = { query: text, matches: [], path: emptyPath() };
@@ -767,9 +993,9 @@
       const group = model.groupByBay.get(bay.bayId);
       let hit = false;
       if (bayNumber) {
-        hit = bay.slot !== null && bay.slot === Number(bayNumber[1]);
+        hit = bay.locationKnown && bay.slot !== null && bay.slot === Number(bayNumber[1]);
       } else {
-        hit = [bay.label, bay.deviceName, bay.serial, bay.sasAddress].some((value) => value && String(value).toLowerCase().includes(text));
+        hit = bay.label.toLowerCase().includes(text) || bay.terms.some((value) => value.includes(text));
       }
       if (hit) {
         result.matches.push({ id: bay.bayId, kind: "bay", label: bay.label, groupId: group?.id || "", collapsed: Boolean(group?.collapsed) });
@@ -788,7 +1014,20 @@
     return result;
   }
 
-  // ---- SVG rendering -------------------------------------------------------
+  // ---- SVG rendering ---------------------------------------------------------
+
+  // Path marks differ by shape as well as colour (8 px, centred on cx, cy).
+  const MARK_SHAPES = {
+    active: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="4"`,
+    standby: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="3.25"`,
+    fault: (cx, cy) => `<path d="M${cx - 4} ${cy - 4}L${cx + 4} ${cy + 4}M${cx + 4} ${cy - 4}L${cx - 4} ${cy + 4}"`,
+    missing: (cx, cy) => `<rect x="${cx - 3.25}" y="${cy - 3.25}" width="6.5" height="6.5"`,
+    mapped: (cx, cy) => `<path d="M${cx} ${cy - 4.5}L${cx + 4.5} ${cy}L${cx} ${cy + 4.5}L${cx - 4.5} ${cy}Z"`,
+    unmapped: (cx, cy) => `<path d="M${cx} ${cy - 4}L${cx + 4} ${cy}L${cx} ${cy + 4}L${cx - 4} ${cy}Z"`,
+    unknown: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8"`,
+    member: (cx, cy) => `<path d="M${cx} ${cy - 4}L${cx + 4.5} ${cy + 4}L${cx - 4.5} ${cy + 4}Z"`,
+    other: (cx, cy) => `<path d="M${cx} ${cy - 3.5}L${cx + 4} ${cy + 3.5}L${cx - 4} ${cy + 3.5}Z"`,
+  };
 
   const LEGEND = {
     "is-lanes-reported": ["line", "lanes reported by both ends: count, rate, PHYs at each end"],
@@ -801,15 +1040,26 @@
     "bay-yes": ["bay", "bay with a disk"],
     "bay-no": ["bay", "empty bay"],
     "bay-unknown": ["bay", "occupancy not read"],
-    "path-active": ["dot", "path active"],
-    "path-standby": ["dot", "path passive or standby"],
-    "path-fault": ["dot", "path failed or degraded"],
-    "path-mapped": ["dot", "mapped by SES (no path state)"],
-    "path-other": ["dot", "path state not recognised"],
+    "path-active": ["shape", "path active (filled circle)"],
+    "path-standby": ["shape", "path passive or standby (ring)"],
+    "path-fault": ["shape", "path failed (cross)"],
+    "path-missing": ["shape", "path missing (open square)"],
+    "path-mapped": ["shape", "mapped by SES, no path state (diamond)"],
+    "path-unmapped": ["shape", "no SES mapping (open diamond)"],
+    "path-unknown": ["shape", "path state unknown (square)"],
+    "path-member": ["shape", "member health, not a path state (triangle)"],
+    "path-other": ["shape", "path state not recognised (open triangle)"],
+    "path-more": ["text", "+N: more paths than the cell can draw; the cell's name lists every path"],
   };
 
-  function pathTone(state) {
-    return PATH_STATE_TONES[String(state || "").toLowerCase()] || "other";
+  function pathTone(state, basis = "") {
+    const tone = PATH_STATE_TONES[String(state || "").toLowerCase()];
+    if (tone) return tone;
+    return basis === MEMBER_HEALTH ? "member" : "other";
+  }
+
+  function markShape(tone, cx, cy, state) {
+    return `${MARK_SHAPES[tone](cx, cy)} class="topo-path-mark path-${tone}" data-path-state="${escapeHtml(state)}"></${tone === "active" || tone === "standby" ? "circle" : tone === "missing" || tone === "unknown" ? "rect" : "path"}>`;
   }
 
   function onPathClass(path, set, id) {
@@ -826,14 +1076,15 @@
 
   function linkName(model, link) {
     const source = model.nodeById.get(link.source)?.label || link.source;
-    const target = model.nodeById.get(link.target)?.label || (link.bundle ? "bay group" : link.target);
+    const group = model.groupById.get(link.target);
+    const target = model.nodeById.get(link.target)?.label || (group ? (group.locationKnown ? "bay group" : "disk group") : link.target);
     return `Link ${source} to ${target}`;
   }
 
   function linkDescription(model, link) {
     const parts = [linkName(model, link)];
     if (link.lanesState === "reported") {
-      parts.push(`${link.lanes.count} ${link.lanes.count === 1 ? "lane" : "lanes"}`, formatRate(link.lanes.rate));
+      parts.push(plural(link.lanes.count, "lane"), formatRate(link.lanes.rate));
       parts.push(`PHYs ${link.lanes.sourcePhys.join(", ") || "not listed"} to PHYs ${link.lanes.targetPhys.join(", ") || "not listed"}`);
     } else if (link.lanesState === "not_reported") {
       parts.push("lanes not reported");
@@ -852,7 +1103,6 @@
     const name = linkDescription(model, link);
     const line = `<polyline class="topo-link ${style}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title>${escapeHtml(name)}</title></polyline>`;
     const box = link.labelBox;
-    const targetAttr = model.nodeById.has(link.target) ? ` data-fabric-node="${escapeHtml(link.target)}"` : "";
     let body;
     if (link.labelLines.length) {
       body = `<rect class="topo-label-box" x="${Math.round(box.x)}" y="${Math.round(box.y)}" width="${Math.round(box.w)}" height="${Math.round(box.h)}" rx="7"></rect>`
@@ -860,7 +1110,7 @@
     } else {
       body = `<circle class="topo-junction" cx="${Math.round(box.x + box.w / 2)}" cy="${Math.round(box.y + box.h / 2)}" r="6"></circle>`;
     }
-    const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}"${targetAttr} data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(name)}"><title>${escapeHtml(name)}</title>${body}</g>`;
+    const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}" data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(name)}"><title>${escapeHtml(name)}</title>${body}</g>`;
     return { line, label };
   }
 
@@ -881,25 +1131,41 @@
   }
 
   function bayTitle(bay) {
-    const occupancy = bay.present === "yes" ? "disk present" : bay.present === "no" ? "empty" : "occupancy not read";
+    const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
       ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.state}`).join(", ")}`
       : "no path state in payload";
-    return [bay.label, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
+    return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
+  }
+
+  // How many marks fit in a cell, keeping room for a "+N" count when needed.
+  function marksFor(bay) {
+    const fit = Math.max(1, Math.floor((bay.w - 4) / MARK_PITCH));
+    if (bay.pathStates.length <= fit) return { shown: bay.pathStates, more: 0 };
+    const shown = bay.pathStates.slice(0, Math.max(1, fit - 1));
+    return { shown, more: bay.pathStates.length - shown.length };
   }
 
   function renderBayCell(bay, path, used) {
     const highlight = onPathClass(path, "bays", bay.bayId);
-    used.add(`bay-${bay.present}`);
+    used.add(`bay-${bay.occupancy}`);
     const hook = bay.traceId ? `data-fabric-trace="${escapeHtml(bay.traceId)}"` : `data-fabric-node="${escapeHtml(bay.bayId)}"`;
-    const dots = bay.pathStates.slice(0, 4).map((state, index) => {
-      const tone = pathTone(state.state);
+    const { shown, more } = marksFor(bay);
+    const markY = bay.y + CELL_BOX - 8;
+    const marks = shown.map((state, index) => {
+      const tone = pathTone(state.state, state.basis);
       used.add(`path-${tone}`);
-      return `<circle class="topo-path-dot path-${tone}" cx="${bay.x + 6 + index * 6}" cy="${bay.y + CELL - 8}" r="2.4"></circle>`;
+      return markShape(tone, bay.x + 2 + MARK / 2 + index * MARK_PITCH, markY, state.state);
     }).join("");
+    let count = "";
+    if (more) {
+      used.add("path-more");
+      count = `<text class="topo-path-more" x="${bay.x + bay.w - 2}" y="${markY + 4}" text-anchor="end">+${more}</text>`;
+    }
     const title = bayTitle(bay);
-    const number = bay.slot === null ? "" : `<text class="topo-bay-number" x="${bay.x + (CELL - 2) / 2}" y="${bay.y + 13}" text-anchor="middle">${escapeHtml(bay.slot)}</text>`;
-    return `<g class="topo-bay bay-${bay.present} state-${token(bay.status)}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${CELL - 2}" height="${CELL - 2}" rx="3"></rect>${number}${dots}</g>`;
+    const shownLabel = bay.locationKnown ? (bay.slot === null ? "" : String(bay.slot)) : bay.label;
+    const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
+    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number}${marks}${count}</g>`;
   }
 
   function pathSummary(summary) {
@@ -909,13 +1175,21 @@
       .join(" · ");
   }
 
-  function renderGroup(model, group, path, used) {
-    const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
+  function groupHeading(group) {
+    if (!group.locationKnown) {
+      return `Disks, ${LOCATION_UNKNOWN} · ${plural(group.bayIds.length, "disk")}`;
+    }
+    const count = plural(group.bayIds.length, "bay");
+    if (!group.enclosureIds.length) return `No enclosure link · ${count}`;
     const slots = group.bays.map((bay) => bay.slot).filter((slot) => slot !== null);
     const range = slots.length ? `Bays ${Math.min(...slots)}–${Math.max(...slots)}` : "Bays";
-    const count = `${group.bayIds.length} ${group.bayIds.length === 1 ? "bay" : "bays"}`;
+    return `${range} · ${count}`;
+  }
+
+  function renderGroup(model, group, path, used) {
+    const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
     if (!group.enclosureIds.length) used.add("mark-not-read");
-    const head = clip(group.enclosureIds.length ? `${range} · ${count}` : `No enclosure link · ${count}`, group.w);
+    const head = clip(groupHeading(group), group.w);
     const parts = [`<rect class="topo-group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="8"></rect>`,
       `<text class="topo-node-title" x="${group.x + 10}" y="${group.y + 18}">${escapeHtml(head)}</text>`];
     const summaryText = pathSummary(group.summary);
@@ -929,12 +1203,12 @@
     const cells = group.cells.map((bay) => renderBayCell(bay, path, used)).join("");
     let toggle = "";
     if (group.expandable) {
-      const label = group.collapsed ? `Draw all ${group.bayIds.length} bays` : "Collapse to a summary";
+      const label = group.collapsed ? `Draw all ${group.bayIds.length} ${group.locationKnown ? "bays" : "disks"}` : "Collapse to a summary";
       const y = group.collapsed ? group.y + group.h - 30 : group.y + 4;
       const x = group.collapsed ? group.x + 10 : group.x + group.w - 170;
       toggle = `<g class="topo-expand" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(group.expandKey)}" aria-expanded="${group.collapsed ? "false" : "true"}" aria-label="${escapeHtml(label)}"><rect x="${x}" y="${y}" width="160" height="22" rx="6"></rect><text class="topo-label-text" x="${x + 80}" y="${y + 15}" text-anchor="middle">${escapeHtml(label)}</text></g>`;
     }
-    const name = `${head}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`;
+    const name = `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`;
     return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join("")}${cells}${toggle}</g>`;
   }
 
@@ -954,7 +1228,8 @@
     return label + band;
   }
 
-  // view: { pin: ref, hover: ref, query }
+  // view: { pin: ref, hover: ref, query }. Hover wins while it lasts; a pin is
+  // newer than the search it was made after, and typing a search clears it.
   function activePath(model, view = {}) {
     if (view.hover) return tracePath(model, view.hover);
     if (view.pin) return tracePath(model, view.pin);
@@ -979,6 +1254,17 @@
     return entry ? [entry.label, ...entry.facts].join(", ") : "";
   }
 
+  function legendSwatch(style, shape) {
+    if (shape === "shape") {
+      const tone = style.replace(/^path-/, "");
+      return `<svg class="fabric-topology-swatch swatch-shape" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">${markShape(tone, 6, 6, tone)}</svg>`;
+    }
+    if (shape === "text") {
+      return '<span class="fabric-topology-swatch swatch-text" aria-hidden="true">+N</span>';
+    }
+    return `<span class="fabric-topology-swatch swatch-${shape} ${style}" aria-hidden="true"></span>`;
+  }
+
   function renderTopology(model, view = {}) {
     const path = activePath(model, view);
     const used = new Set();
@@ -1000,7 +1286,7 @@
     const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${token(part.state)}"${part.title ? ` title="${escapeHtml(part.title)}"` : ""}>${escapeHtml(part.label)}: ${escapeHtml(part.state)}</span>`).join("");
     const legend = Object.entries(LEGEND)
       .filter(([style]) => used.has(style))
-      .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}"><span class="fabric-topology-swatch swatch-${shape} ${style}" aria-hidden="true"></span>${escapeHtml(text)}</span>`)
+      .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(text)}</span>`)
       .join("");
     const notices = model.notices.map((text) => `<div class="warning-item muted compact">${escapeHtml(text)}</div>`).join("");
     const pinned = view.pin ? `Pinned: ${refLabel(model, view.pin)}. Esc clears.` : "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
@@ -1014,9 +1300,40 @@
       + "</div>";
   }
 
-  // ---- DOM layer (browser only) --------------------------------------------
+  // The facts of a pinned link for the page's inspector: a bay bundle names its
+  // source enclosure and the bays it carries; a lane link its lanes.
+  function linkDetail(model, linkId) {
+    const link = model?.linkById.get(linkId);
+    if (!link) return null;
+    const source = model.nodeById.get(link.source);
+    const row = (label, value) => `<div class="kv-row"><span class="kv-label">${escapeHtml(label)}</span><span class="kv-value">${escapeHtml(value)}</span></div>`;
+    if (link.bundle) {
+      const group = model.groupById.get(link.target);
+      const carried = list(group?.bays).filter((bay) => bay.sources.includes(link.source));
+      const unit = group?.locationKnown ? "bay" : "disk";
+      const names = carried.length <= 48
+        ? carried.map((bay) => bay.label).join(", ")
+        : `${carried.length} ${unit}s, slots ${phyRanges(carried.map((bay) => bay.slot).filter((slot) => slot !== null).sort((a, b) => a - b))}`;
+      return {
+        title: `Selected ${unit} bundle`,
+        html: `<div class="kv-grid">${row("Source enclosure", source ? `${source.label} (${source.id})` : link.source)}`
+          + `${row(group?.locationKnown ? "Bays" : "Disks", plural(link.count, unit))}`
+          + `${row(`${group?.locationKnown ? "Bays" : "Disks"} it carries`, names || "none")}</div>`,
+      };
+    }
+    const target = model.nodeById.get(link.target);
+    const rows = [row("From", source?.label || link.source), row("To", target?.label || link.target), row("Kind", link.kind.replace(/-/g, " "))];
+    if (link.lanesState === "reported") {
+      rows.push(row("Lanes", link.labelLines[0]), row("PHYs", link.labelLines[1].replace(/^PHY /, "")));
+    } else if (link.lanesState === "not_reported") {
+      rows.push(row("Lanes", "not reported"));
+    }
+    return { title: "Selected link", html: `<div class="kv-grid">${rows.join("")}</div>` };
+  }
 
-  const live = { model: null, pin: null, hover: null, query: "" };
+  // ---- DOM layer (browser only) ----------------------------------------------
+
+  const live = { model: null, pin: null, hover: null, query: "", scope: null, container: null, input: null, status: null, hooks: {} };
 
   function refExists(model, ref) {
     if (!model || !ref) return false;
@@ -1026,11 +1343,54 @@
     return model.nodeById.has(ref.id);
   }
 
+  // The page's selection ({ kind: "trace" | "node", id }) as a drawn item.
+  function refFromSelection(model, selection) {
+    if (!model || !selection) return null;
+    if (model.bayById.has(selection.id)) return { kind: "bay", id: selection.id };
+    const bay = selection.kind === "trace" ? model.bays.find((item) => item.traceId === selection.id) : null;
+    if (bay) return { kind: "bay", id: bay.bayId };
+    return model.nodeById.has(selection.id) ? { kind: "node", id: selection.id } : null;
+  }
+
+  function clearInput() {
+    live.query = "";
+    if (live.input) live.input.value = "";
+    if (live.status) live.status.textContent = "";
+  }
+
   function render(fabric, options = {}) {
-    live.model = buildTopologyModel(fabric, options);
-    if (!refExists(live.model, live.pin)) live.pin = null;
+    const model = buildTopologyModel(fabric, options);
+    if (live.scope !== null && model.scope !== live.scope) {
+      live.pin = null;
+      clearInput();
+    }
+    live.scope = model.scope;
+    live.model = model;
+    if (options.selection !== undefined) {
+      const selected = refFromSelection(model, options.selection);
+      if (selected) live.pin = selected;
+      else if (live.pin?.kind !== "link") live.pin = null;
+    }
+    if (!refExists(model, live.pin)) live.pin = null;
     live.hover = null;
-    return renderTopology(live.model, { pin: live.pin, query: live.query });
+    updateSearchStatus();
+    return renderTopology(model, { pin: live.pin, query: live.query });
+  }
+
+  // Leaving the mode: no pin, hover or search carries over.
+  function release() {
+    live.pin = null;
+    live.hover = null;
+    live.scope = null;
+    clearInput();
+  }
+
+  function view() {
+    return { pin: live.pin, hover: live.hover, query: live.query };
+  }
+
+  function inspectorDetail() {
+    return live.pin?.kind === "link" ? linkDetail(live.model, live.pin.id) : null;
   }
 
   function refFromElement(element) {
@@ -1042,8 +1402,8 @@
     return { kind: "group", id: target.dataset.topoGroup };
   }
 
-  function applyHighlight(container) {
-    const root = container?.querySelector?.(".fabric-topology");
+  function applyHighlight() {
+    const root = live.container?.querySelector?.(".fabric-topology");
     if (!root || !live.model) return;
     const path = activePath(live.model, { hover: live.hover, pin: live.pin, query: live.query });
     const mark = (selector, set, key) => {
@@ -1065,7 +1425,8 @@
     }
   }
 
-  function updateSearchStatus(status) {
+  function updateSearchStatus() {
+    const status = live.status;
     if (!status) return;
     if (!live.query) {
       status.textContent = "";
@@ -1081,20 +1442,22 @@
     status.textContent = `${found.matches.length} ${found.matches.length === 1 ? "match" : "matches"}: ${names.join(", ")}${more}.`;
   }
 
-  function attach(container, searchInput, searchStatus) {
+  // hooks: { clearSelection(), requestRender() } from the page, so a link pin,
+  // a typed search and Esc keep the page's inspector selection in step.
+  function attach(container, searchInput, searchStatus, hooks = {}) {
     if (!container || container.dataset?.topologyAttached) return;
     if (container.dataset) container.dataset.topologyAttached = "true";
+    Object.assign(live, { container, input: searchInput || null, status: searchStatus || null, hooks: hooks || {} });
     const hover = (event) => {
       const ref = refFromElement(event.target);
       if (!ref) return;
       live.hover = ref;
-      applyHighlight(container);
+      applyHighlight();
     };
     const leave = (event) => {
       if (!live.hover) return;
-      const next = refFromElement(event.relatedTarget);
-      live.hover = next;
-      applyHighlight(container);
+      live.hover = refFromElement(event.relatedTarget);
+      applyHighlight();
     };
     container.addEventListener("mouseover", hover);
     container.addEventListener("focusin", hover);
@@ -1105,7 +1468,12 @@
       const ref = refFromElement(element);
       if (!ref) return;
       live.pin = ref;
-      applyHighlight(container);
+      applyHighlight();
+      if (ref.kind === "link") {
+        // A link is not a page selection: the inspector shows its facts.
+        live.hooks.clearSelection?.();
+        live.hooks.requestRender?.();
+      }
     });
     container.addEventListener("keydown", (event) => {
       const element = event.target?.closest?.(".fabric-topology [role=\"button\"]");
@@ -1118,16 +1486,23 @@
       if (event.target?.closest?.("[data-fabric-alias-form]")) return;
       live.pin = null;
       live.hover = null;
-      live.query = "";
-      if (searchInput) searchInput.value = "";
-      updateSearchStatus(searchStatus);
-      applyHighlight(container);
+      clearInput();
+      applyHighlight();
+      // Esc clears the drawing's pin and the inspector's selection together.
+      live.hooks.clearSelection?.();
+      live.hooks.requestRender?.();
     });
     if (searchInput) {
       searchInput.addEventListener("input", () => {
         live.query = searchInput.value.trim();
-        updateSearchStatus(searchStatus);
-        applyHighlight(container);
+        const hadPin = Boolean(live.pin);
+        if (live.query) live.pin = null;
+        updateSearchStatus();
+        applyHighlight();
+        if (hadPin && live.query) {
+          live.hooks.clearSelection?.();
+          live.hooks.requestRender?.();
+        }
       });
     }
   }
@@ -1139,7 +1514,12 @@
     tracePath,
     searchTopology,
     renderTopology,
+    pathTone,
+    linkDetail,
     render,
+    release,
+    view,
+    inspectorDetail,
     attach,
   };
 })();

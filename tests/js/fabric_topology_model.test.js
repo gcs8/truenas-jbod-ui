@@ -81,7 +81,7 @@ function addBays(fabric, slots, enclosureIds, paths = []) {
       slot,
       status: "healthy",
       related_slots: [slot],
-      metrics: { present: true, device_name: `da${slot}`, serial: `SYN-SER-${slot}` },
+      metrics: { present: true, device_name: `da${slot}`, serial: `SANITIZED-SER-${slot}` },
     }));
     for (const enclosureId of enclosureIds) {
       const kind = enclosureId.startsWith("ses:") ? "ses-bay" : "mpr-enclosure-bay";
@@ -137,7 +137,7 @@ function addController(fabric, name) {
 function oneHbaOneExpander({ reported = null, bayCount = 4 } = {}) {
   const fabric = coreFabric();
   const hba = addController(fabric, "mpr0");
-  const exp = expander("mpr0", "5000aa0000000001", 1);
+  const exp = expander("mpr0", `5000c500${(0xaa01).toString(16).padStart(8, "0")}`, 1);
   const enc = enclosure("mpr0", "0x0001");
   fabric.nodes.push(exp, enc);
   fabric.links.push(link(hba.id, exp.id, "controller-expander", { reported_lanes: reported }));
@@ -429,9 +429,9 @@ test("search finds a bay, a disk identifier or an expander and returns its path"
   const model = T.buildTopologyModel(fabric);
   assert.deepEqual([...T.searchTopology(model, "bay 5").matches].map((item) => item.id), ["bay:5"]);
   assert.deepEqual([...T.searchTopology(model, "5").matches].map((item) => item.id), ["bay:5"], "a number is a bay number, not a substring");
-  assert.deepEqual([...T.searchTopology(model, "SYN-SER-6").matches].map((item) => item.id), ["bay:6"]);
+  assert.deepEqual([...T.searchTopology(model, "SANITIZED-SER-6").matches].map((item) => item.id), ["bay:6"]);
   assert.deepEqual([...T.searchTopology(model, "da7").matches].map((item) => item.id), ["bay:7"]);
-  const found = T.searchTopology(model, "5000b00000000020");
+  const found = T.searchTopology(model, parts.mpr1.level2.raw_id);
   assert.deepEqual([...found.matches].map((item) => item.id), [parts.mpr1.level2.id]);
   assert.ok(found.path.nodes.has(parts.mpr1.hba.id));
   assert.equal(T.searchTopology(model, "no-such-thing").matches.length, 0);

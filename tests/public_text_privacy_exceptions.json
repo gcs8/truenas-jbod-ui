@@ -723,6 +723,14 @@
     },
     "reason": "Synthetic builder output from the CORE Storage Fabric test inputs; exact detector counts are pinned."
   },
+  "tests/fixtures/sas_fabric/topology_fabric.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:2d718b96696ad85f77b670cd01639ff894c2ad22e8e25da182053a3375d99b11": 273
+      }
+    },
+    "reason": "Synthetic builder output from the Storage Fabric Topology test inputs; exact detector counts are pinned."
+  },
   "tests/test_core_fabric_legacy_controller.py": {
     "findings": {
       "sas_wwn_identifier": {
