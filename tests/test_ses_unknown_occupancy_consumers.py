@@ -267,6 +267,7 @@ OCCUPANCY_READ_EXEMPT_FILES = {
     "history_service/system_backup.py": "`present` is backup group membership, not a bay",
     "history_service/segment_catalog.py": "`present` is backup segment membership, not a bay",
     "admin_service/static/admin_backups.js": "`present` is a secret file on disk, not a bay",
+    "admin_service/static/admin_backup_model.js": "`present` is a secret file on disk, not a bay",
 }
 # (file, function) -> (direct reads, reason). Nothing here states emptiness,
 # counts a disk or words a message about the current occupant.

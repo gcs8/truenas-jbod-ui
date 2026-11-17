@@ -1626,7 +1626,7 @@ test("library copy stays plain and the module has no framework or innerHTML", ()
     assert.doesNotMatch(strings, word);
   }
   assert.doesNotMatch(LIBRARY_SOURCE, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
-  assert.doesNotMatch(LIBRARY_SOURCE, /require\(|import /);
+  assert.doesNotMatch(LIBRARY_SOURCE.replace('require("./admin_backup_model.js")', ""), /require\(|import /);
 });
 
 // Restore acceptance uses the actual controller and complete production transport.
@@ -2087,4 +2087,82 @@ test("the panel offers Edit settings and no longer calls the settings read-only"
   assert.match(TEMPLATE, /id="backup-library-edit-button"[^>]*>Edit settings</);
   assert.doesNotMatch(TEMPLATE, /shown here read-only/);
   assert.match(ADMIN_SOURCE, /editButton: document\.getElementById\("backup-library-edit-button"\)/);
+});
+
+// The pure model lives in its own script (admin_backup_model.js). It loads on
+// its own, the library takes its names from it, and the page loads it first.
+// The URL builders stay in the library beside the requests that use them.
+const MODEL_PATH = path.join(ROOT, "admin_service/static/admin_backup_model.js");
+const LIBRARY_PATH = path.join(ROOT, "admin_service/static/admin_backups.js");
+const MODEL_NAMES = [
+  "buildPolicyPayload", "secretStateText", "scrubText", "validId", "artifactUrl", "targetUrl", "providerLabel",
+  "locationLabel", "isRestorable", "canDownload", "stateLabel", "groupArtifacts", "describePolicy",
+  "humanizePlanReason", "normalizePlan", "lastRunSummary", "cleanupSummary",
+];
+const LIBRARY_URL_BUILDERS = ["artifactUrl", "targetUrl"];
+
+function runBrowserScripts(context, ...files) {
+  vm.createContext(context);
+  for (const file of files) {
+    vm.runInContext(fs.readFileSync(file, "utf8"), context, { filename: file });
+  }
+  return context;
+}
+
+test("the backup model loads on its own, as a browser script and as a CommonJS module", () => {
+  const page = runBrowserScripts({}, MODEL_PATH);
+  assert.equal(page.AdminBackupLibrary, undefined);
+  assert.equal(page.AdminBackupModel.scrubText("see /srv/a/b now"), "see [path] now");
+  const loaded = require("node:child_process").execFileSync(process.execPath, ["-e", [
+    `const api = require(${JSON.stringify(MODEL_PATH)});`,
+    "const files = Object.keys(require.cache).map((name) => require('node:path').basename(name));",
+    "process.stdout.write(JSON.stringify({ files, names: Object.keys(api) }));",
+  ].join("\n")], { encoding: "utf8" });
+  const result = JSON.parse(loaded);
+  assert.deepEqual(result.files, ["admin_backup_model.js"]);
+  assert.deepEqual(result.names, Object.keys(page.AdminBackupModel));
+});
+
+test("the library's model keeps every name, the moved ones the model script's own functions", () => {
+  const standalone = require(MODEL_PATH);
+  assert.deepEqual(Object.keys(model), MODEL_NAMES);
+  for (const name of MODEL_NAMES) {
+    assert.equal(typeof model[name], "function", name);
+    if (!LIBRARY_URL_BUILDERS.includes(name)) assert.equal(model[name], standalone[name], name);
+  }
+  for (const name of LIBRARY_URL_BUILDERS) assert.equal(standalone[name], undefined, name);
+  assert.equal(model.artifactUrl("a1", "/verify"), "/api/admin/backups/a1/verify");
+  assert.throws(() => model.targetUrl("../x"), /That target id is not valid\./);
+});
+
+test("in a page the library uses the model script loaded before it", () => {
+  const page = runBrowserScripts({}, MODEL_PATH, LIBRARY_PATH);
+  for (const name of MODEL_NAMES.filter((item) => !LIBRARY_URL_BUILDERS.includes(item))) {
+    assert.equal(page.AdminBackupLibrary.model[name], page.AdminBackupModel[name], name);
+  }
+  // The library binds the names of whichever model the page loaded, not copies of its own.
+  const ids = [];
+  const substitute = { ...page.AdminBackupModel, validId: (value) => { ids.push(value); return true; } };
+  const other = runBrowserScripts({ AdminBackupModel: substitute }, LIBRARY_PATH);
+  assert.equal(other.AdminBackupLibrary.model.validId, substitute.validId);
+  assert.equal(other.AdminBackupLibrary.model.artifactUrl("../x"), "/api/admin/backups/..%2Fx");
+  assert.deepEqual(ids, ["../x"]);
+  const modelAt = BASE.indexOf("path='admin_backup_model.js'");
+  assert.ok(modelAt > 0 && modelAt < BASE.indexOf("path='admin_backups.js'"), "base.html must load the model before the library");
+});
+
+test("the model script keeps the library's source rules", () => {
+  const source = fs.readFileSync(MODEL_PATH, "utf8");
+  const strings = (source.match(/text: "[^"]*"|`[A-Z][^`]*`/g) || []).join("\n").replace(/\$\{[^}]*\}/g, "");
+  assert.ok(strings.includes("Last clean-up"), "the scan must find the model's operator-facing strings");
+  for (const word of [/artifact/i, /tombstone/i, /grooming/i, /lifecycle/i, /catalog/i]) {
+    assert.doesNotMatch(strings, word);
+  }
+  assert.doesNotMatch(source, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
+  assert.doesNotMatch(source, /require\(|import /);
+  assert.doesNotMatch(source, /copy\/copies|deletion\/deletions/);
+  assert.doesNotMatch(source, /cleanup_running|no longer running|cleanupWatch|bannerRevision/);
+  assert.doesNotMatch(source, /When the running one finishes, its result shows in the Last clean-up line/);
+  // Request paths stay in the library, where the read-reach generator resolves them.
+  assert.doesNotMatch(source, /\/api\//);
 });
