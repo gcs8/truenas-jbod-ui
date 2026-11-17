@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,6 +128,24 @@ class CollectResult:
 
 def section_names() -> str:
     return ", ".join(SECTIONS)
+
+
+# Control characters (line breaks included), line and paragraph separators, and
+# the lone surrogates that stand for undecodable bytes in a file name.
+_UNPRINTABLE = frozenset({"Cc", "Cs", "Zl", "Zp"})
+
+
+def printable(text: str) -> str:
+    """``text`` on one line, for printing a file name, git argument or git error.
+
+    Each control character, line or paragraph separator and undecodable byte
+    is written as its Python escape (``\\n``, ``\\x1b``, ``\\udcff``), so the
+    text can never start a log line of its own. Anything else, a backslash
+    included, is kept, so ordinary text is unchanged and escaping twice changes
+    nothing more.
+    """
+
+    return "".join(repr(char)[1:-1] if unicodedata.category(char) in _UNPRINTABLE else char for char in text)
 
 
 def name_problem(path: str) -> str | None:
@@ -275,13 +294,13 @@ def load_fragments(root: Path) -> tuple[list[Fragment], list[str]]:
         if entry.name == README_NAME and entry.is_file() and not entry.is_symlink():
             continue
         if entry.is_dir() and not entry.is_symlink():
-            problems.append(f"{relative}/: fragments live directly in {FRAGMENT_DIR}/, not in a subdirectory")
+            problems.append(printable(f"{relative}/: fragments live directly in {FRAGMENT_DIR}/, not in a subdirectory"))
             continue
         regular = entry.is_file() and not entry.is_symlink()
         data = entry.read_bytes() if regular else b""
         problem = fragment_problem(relative, data, regular_file=regular)
         if problem is not None:
-            problems.append(f"{relative}: {problem}")
+            problems.append(printable(f"{relative}: {problem}"))
             continue
         fragments.append(parse_fragment(relative, data))
     return fragments, problems

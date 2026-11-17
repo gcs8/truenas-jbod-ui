@@ -164,6 +164,31 @@ def _git(repo: Path, *args: str) -> str:
 _COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
+def resolve_commit(repo: Path, option: str, value: str) -> str:
+    """The commit id that ``value``, given as ``option``, names.
+
+    Every git call after this one receives the id, never ``value``. A value
+    that is empty, starts with '-' or names no single commit (a tree, a blob,
+    a missing object, a range) is refused, so git never reads it as an option.
+    """
+
+    detail = ""
+    if value and not value.startswith("-"):
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "--end-of-options", f"{value}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        commit = completed.stdout.strip()
+        if completed.returncode == 0 and _COMMIT_ID.fullmatch(commit):
+            return commit
+        detail = completed.stderr.strip()
+    raise GateError(f"{option} {value} does not name a commit" + (f": {detail}" if detail else ""))
+
+
 def merge_commit_base(repo: Path, *, head: str, pull_request_head: str) -> str:
     """Return the base commit that ``head`` merged the pull request into.
 
@@ -309,6 +334,9 @@ def evaluate(
     is already on the base branch.
     """
 
+    # Every git call below receives these commit ids, never the given values.
+    base = resolve_commit(repo, "--base", base)
+    head = resolve_commit(repo, "--head", head)
     result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
     if result.ok or not advisory or result.protected:
         return result
@@ -619,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             event_number, event_labels = labels_from_event(args.event)
         except (OSError, ValueError) as exc:
-            print(f"could not read event payload {args.event}: {exc}")
+            print(fragments.printable(f"could not read event payload {args.event}: {exc}"))
             return 2
         labels = event_labels
         if pr_number is None:
@@ -627,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.labels is not None:
         labels = parse_labels(args.labels)
     if pr_number is None:
-        print("a pull request number is required (--pr or --event)")
+        print(fragments.printable("a pull request number is required (--pr or --event)"))
         return 2
 
     try:
@@ -643,11 +671,13 @@ def main(argv: list[str] | None = None) -> int:
             advisory=args.advisory,
         )
     except GateError as exc:
-        print(str(exc))
+        print(fragments.printable(str(exc)))
         return 2
 
+    # File names, git arguments and git errors are printed through printable(),
+    # so none of them can start a log line of its own.
     for message in result.messages:
-        print(message)
+        print(fragments.printable(message))
     return 0 if result.ok else 1
 
 
