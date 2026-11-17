@@ -178,7 +178,50 @@ function fourShelves() {
   return { fabric, expanders };
 }
 
+// Eight HBAs in four pairs; each pair serves four dual-pathed 106-bay shelves,
+// one level-1 expander per HBA and shelf, four lanes each: 16 of 16 PHYs.
+function eightHbaSixteenShelves() {
+  const fabric = coreFabric();
+  const names = range(0, 8).map((index) => `mpr${index}`);
+  for (const name of names) addController(fabric, name, { phys: 16, linked: 16 });
+  let start = 0;
+  for (let shelf = 0; shelf < 16; shelf += 1) {
+    const pair = Math.floor(shelf / 4);
+    const enclosures = [];
+    for (const side of [0, 1]) {
+      const name = names[pair * 2 + side];
+      const phys = [0, 1, 2, 3].map((phy) => phy + (shelf % 4) * 4);
+      const exp = addExpander(fabric, name, 0xe000 + shelf * 0x10 + pair * 2 + side, 1, `controller:${name}`, { reported_lanes: lanes(phys, [32, 33, 34, 35]) });
+      enclosures.push(addEnclosure(fabric, name, `s${shelf}`, `SYNTH-SHELF-${shelf}-${side ? "B" : "A"}`, exp.id).id);
+    }
+    addBays(fabric, range(start, start + 106), enclosures, [{ controller: names[pair * 2], state: "active" }, { controller: names[pair * 2 + 1], state: "passive" }]);
+    start += 106;
+  }
+  return { fabric };
+}
+
+// Two HBAs, three dual-pathed 24-bay shelves; each side cascades through
+// expander levels 1, 2 and 3, one shelf per level.
+function threeLevelCascade() {
+  const fabric = coreFabric();
+  const enclosures = [[], [], []];
+  for (const [side, name] of ["mpr0", "mpr1"].entries()) {
+    const hba = addController(fabric, name);
+    let parent = hba.id;
+    for (let level = 1; level <= 3; level += 1) {
+      const upstream = level === 1 ? [0, 1, 2, 3] : [28, 29, 30, 31];
+      const exp = addExpander(fabric, name, 0xe000 + (level - 1) * 0x10 + side, level, parent, { reported_lanes: lanes(upstream, level === 1 ? [32, 33, 34, 35] : [0, 1, 2, 3]) });
+      enclosures[level - 1].push(addEnclosure(fabric, name, `s${level - 1}`, `SYNTH-L${level}-${side ? "B" : "A"}`, exp.id).id);
+      parent = exp.id;
+    }
+  }
+  enclosures.forEach((ids, index) => addBays(fabric, range(index * 24, index * 24 + 24), ids, DUAL));
+  return { fabric };
+}
+
 module.exports = {
+  eightHbaSixteenShelves,
+  threeLevelCascade,
   range,
   twoHbaCascade,
   fourShelves,

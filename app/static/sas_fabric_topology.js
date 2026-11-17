@@ -47,6 +47,7 @@
   const NODE_MAX_CHARS = 37;
   const TIER_LABEL_CHARS = 16;
   const TIER_NOTE_CHARS = 20;
+  const BAND_CHARS = 30;
   const H_GAP = 48;
   const LEFT = 168;
   const MARGIN = 16;
@@ -429,6 +430,7 @@
         tier,
         label: nodeLabel(item),
         rawId: item.raw_id || "",
+        controllerId: typeof item.controller_id === "string" ? item.controller_id : "",
         status: item.status || "",
         level: item.kind === "expander" ? expanderLevel(item) : null,
         facts: nodeFacts(item, mode, kind),
@@ -522,9 +524,6 @@
       outgoing.get(item.source).push(item);
     }
     for (const entry of nodes) {
-      if ((entry.tier === "expanders" || entry.tier === "enclosures" || entry.tier === "devices" || entry.tier === "controllers") && !incoming.has(entry.id)) {
-        entry.parentUnknown = true;
-      }
       if (entry.kind === "controller") {
         entry.phyGroups = list(outgoing.get(entry.id))
           .filter((item) => item.lanesState === "reported" && item.lanes.sourcePhys.length)
@@ -772,6 +771,27 @@
       }
     }
 
+    // A link that points up the tiers (an expander to the host, say) is named
+    // and not drawn: lines run from a tier down to a lower one.
+    const rowOf = new Map();
+    tiers.forEach((tier, index) => tier.nodeIds.forEach((id) => rowOf.set(id, index)));
+    for (const link of links.slice()) {
+      if (link.bundle) continue;
+      const from = rowOf.get(link.source);
+      const to = rowOf.get(link.target);
+      if (from === undefined || to === undefined || to > from || (to === from && to > 0)) continue;
+      skipped.upward.push(link.id);
+      links.splice(links.indexOf(link), 1);
+      linkById.delete(link.id);
+      incoming.set(link.target, list(incoming.get(link.target)).filter((item) => item !== link));
+      outgoing.set(link.source, list(outgoing.get(link.source)).filter((item) => item !== link));
+    }
+    for (const entry of nodes) {
+      if (["expanders", "enclosures", "devices", "controllers"].includes(entry.tier.replace(/:.*$/, "")) && !list(incoming.get(entry.id)).length) {
+        entry.parentUnknown = true;
+      }
+    }
+
     const model = {
       kind,
       core,
@@ -791,7 +811,7 @@
       contract: mode,
       notices: [],
       counts: { bayNodes: bayRows.length, baysPlaced: groups.reduce((total, group) => total + group.bayIds.length, 0) },
-      scope: isRecord(fabric) ? `${fabric.system_id ?? ""}\u0000${fabric.selected_enclosure_id ?? ""}` : "",
+      scope: scopeOf(fabric),
       width: 0,
       height: 0,
     };
@@ -808,6 +828,7 @@
     if (orphanTraces.length) notDrawn.push(`${plural(orphanTraces.length, "bay trace")} without a bay node (${named(orphanTraces)})`);
     if (skipped.duplicateTraces.length) notDrawn.push(`${plural(skipped.duplicateTraces.length, "duplicate trace id")} (${named(skipped.duplicateTraces)})`);
     if (skipped.unsupportedTraces.length) notDrawn.push(`${plural(skipped.unsupportedTraces.length, "trace")} of a kind this view does not draw (${named(skipped.unsupportedTraces)})`);
+    if (skipped.upward.length) notDrawn.push(`${plural(skipped.upward.length, "link")} that ${skipped.upward.length === 1 ? "points" : "point"} up the tiers (${named(skipped.upward)})`);
     if (skipped.duplicateLinks.length) notDrawn.push(`${plural(skipped.duplicateLinks.length, "duplicate link id")} (${named(skipped.duplicateLinks)})`);
     if (model.counts.bayNodes !== model.counts.baysPlaced) {
       notDrawn.push(`${plural(model.counts.bayNodes, "bay row")} in the payload, ${plural(model.counts.baysPlaced, "bay")} drawn`);
@@ -825,6 +846,10 @@
     layoutModel(model, options);
     model.box = { width: Number(options.width) || 0, height: Number(options.height) || 0 };
     return model;
+  }
+
+  function scopeOf(fabric) {
+    return isRecord(fabric) ? `${fabric.system_id ?? ""}\u0000${fabric.selected_enclosure_id ?? ""}` : "";
   }
 
   function modelParts(fabric, core) {
@@ -867,8 +892,10 @@
 
   // Wrap text to lines of at most `max` characters at spaces; a single word
   // longer than that is shortened (its whole text stays in the item's name).
-  function wrap(text, max) {
-    const words = String(text ?? "").split(/\s+/).filter(Boolean);
+  // With `whole`, a long word is broken over lines instead of shortened.
+  function wrap(text, max, whole = false) {
+    const words = String(text ?? "").split(/\s+/).filter(Boolean)
+      .flatMap((word) => (whole && word.length > max ? word.match(new RegExp(`.{1,${max}}`, "g")) : [word]));
     const lines = [];
     let line = "";
     for (const word of words) {
@@ -890,10 +917,33 @@
     if (entry.parentUnknown && entry.kind !== "host") parts.push("parent link not reported");
     const longest = Math.max(...parts.map((part) => String(part).length));
     const chars = Math.min(NODE_MAX_CHARS, Math.max(NODE_MIN_CHARS, longest));
-    entry.titleLines = wrap(entry.label, chars).length || 1;
-    entry.lines = parts.flatMap((part) => wrap(part, chars));
+    entry.titleLines = wrap(entry.label, chars, entry.wholeTitle).length || 1;
+    entry.lines = parts.flatMap((part, index) => wrap(part, chars, index === 0 && entry.wholeTitle));
     entry.w = Math.max(entry.w, Math.max(...entry.lines.map((line) => line.length)) * TEXT_W + 20);
     entry.h = Math.max(NODE_H, 14 + entry.lines.length * LINE_H + 8);
+  }
+
+  // Two boxes in one tier never show the same title unless they are the same
+  // item: first the whole name, then the HBA it hangs off, then its id.
+  function distinctTitles(model) {
+    const title = (entry) => entry.lines.slice(0, entry.titleLines).join(" ");
+    for (let pass = 0; pass < 3; pass += 1) {
+      const byTitle = new Map();
+      for (const entry of model.nodes) {
+        const key = `${entry.tier}\u0000${title(entry)}`;
+        if (!byTitle.has(key)) byTitle.set(key, []);
+        byTitle.get(key).push(entry);
+      }
+      const clashes = [...byTitle.values()].filter((group) => group.length > 1);
+      if (!clashes.length) return;
+      for (const entry of clashes.flat()) {
+        const via = model.nodeById.get(entry.controllerId)?.label;
+        if (pass === 0) entry.wholeTitle = true;
+        else if (pass === 1 && via && via !== entry.label) entry.label = `${entry.label} via ${via}`;
+        else if (pass === 2) entry.label = `${entry.label} (${entry.id})`;
+        sizeNode(entry);
+      }
+    }
   }
 
   function groupText(group) {
@@ -998,6 +1048,24 @@
     return count;
   }
 
+  // Where a vertical piece of one link crosses a horizontal piece of another:
+  // the vertical continues, the horizontal is drawn with a small gap.
+  function crossingMarks(links) {
+    const pieces = (vertical) => links.flatMap((link) => (link.points || []).slice(1).map((point, index) => [link, link.points[index], point])
+      .filter(([, a, b]) => (vertical ? a[0] === b[0] && a[1] !== b[1] : a[1] === b[1] && a[0] !== b[0])));
+    const verticals = pieces(true);
+    const marks = [];
+    for (const [under, a, b] of pieces(false)) {
+      const [left, right] = [Math.min(a[0], b[0]), Math.max(a[0], b[0])];
+      for (const [over, c, d] of verticals) {
+        if (over === under) continue;
+        const [top, bottom] = [Math.min(c[1], d[1]), Math.max(c[1], d[1])];
+        if (c[0] > left + 1 && c[0] < right - 1 && a[1] > top + 1 && a[1] < bottom - 1) marks.push({ x: c[0], y: a[1], over: over.id, under: under.id });
+      }
+    }
+    return marks;
+  }
+
   // Row orders to try: the starting order and every barycentre sweep after it.
   function orderCandidates(rows, links, rowIndex) {
     const parents = new Map();
@@ -1033,11 +1101,16 @@
     return candidates;
   }
 
-  // Horizontal placement for one order.
+  // Horizontal placement for one order. The widest row is spread across the
+  // width; the rows under it are placed under their parents; then, from the
+  // bottom row up, every parent is centred over the span of all its direct
+  // children (in any row below), as near that span's midpoint as the order
+  // and the gaps between boxes allow.
   function placeRows(rows, links, rowIndex, available) {
     const parents = new Map();
     const children = new Map();
     for (const link of links) {
+      if (rowIndex.get(link.target) <= rowIndex.get(link.source)) continue;
       if (!parents.has(link.target)) parents.set(link.target, []);
       if (!children.has(link.source)) children.set(link.source, []);
       parents.get(link.target).push(link.source);
@@ -1063,32 +1136,50 @@
         return left;
       });
     };
-    const anchorRow = rows[anchor];
-    spread(anchorRow).forEach((x, index) => {
-      anchorRow.items[index].x = x;
-    });
-    const place = (r, neighbours, placed) => {
+    for (const row of rows) spread(row).forEach((x, index) => { row.items[index].x = x; });
+    const place = (r, wanted) => {
       const row = rows[r];
       if (!row.items.length) return;
-      const fallback = spread(row);
-      const desired = row.items.map((item, index) => {
-        let ids = list(neighbours.get(item.id)).filter((id) => placed(rowIndex.get(id)));
-        if (!ids.length) return fallback[index];
-        // Children in several rows: sit over the farthest, so the link that
-        // skips a row runs straight down instead of sweeping across it.
-        const far = Math.max(...ids.map((id) => Math.abs(rowIndex.get(id) - r)));
-        ids = ids.filter((id) => Math.abs(rowIndex.get(id) - r) === far);
-        return ids.reduce((sum, id) => sum + centreOf(byId.get(id)), 0) / ids.length - item.w / 2;
-      });
-      placeRow(row.items, desired, H_GAP, lo, hi);
+      placeRow(row.items, row.items.map((item) => wanted(item) ?? item.x), H_GAP, lo, hi);
     };
-    for (let r = anchor - 1; r >= 0; r -= 1) place(r, children, (other) => other > r);
-    for (let r = anchor + 1; r < rows.length; r += 1) place(r, parents, (other) => other < r);
+    for (let r = anchor + 1; r < rows.length; r += 1) {
+      place(r, (item) => {
+        const ids = list(parents.get(item.id)).filter((id) => byId.has(id));
+        return ids.length ? ids.reduce((sum, id) => sum + centreOf(byId.get(id)), 0) / ids.length - item.w / 2 : null;
+      });
+    }
+    for (let r = rows.length - 2; r >= 0; r -= 1) {
+      place(r, (item) => {
+        const ids = list(children.get(item.id)).filter((id) => byId.has(id));
+        if (!ids.length) return null;
+        const left = Math.min(...ids.map((id) => byId.get(id).x));
+        const right = Math.max(...ids.map((id) => byId.get(id).x + byId.get(id).w));
+        return (left + right) / 2 - item.w / 2;
+      });
+    }
     return width;
+  }
+
+  // Parents whose centre is outside the span of their direct children.
+  function spanViolations(links, byId, rowIndex) {
+    const spans = new Map();
+    for (const link of links) {
+      if (rowIndex.get(link.target) <= rowIndex.get(link.source)) continue;
+      const child = byId.get(link.target);
+      const span = spans.get(link.source) || [Infinity, -Infinity];
+      spans.set(link.source, [Math.min(span[0], child.x), Math.max(span[1], child.x + child.w)]);
+    }
+    let count = 0;
+    for (const [id, [left, right]] of spans) {
+      const centre = centreOf(byId.get(id));
+      if (centre < left - 0.5 || centre > right + 0.5) count += 1;
+    }
+    return count;
   }
 
   // Routes, tracks and labels for one placement. Returns the drawing height.
   function routeLinks(model, rows, links, rowIndex, width) {
+    model.work.routePasses += 1;
     const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
     const gaps = rows.map(() => ({ horizontals: [], labels: [], verticals: [] }));
     // Exits: spread on the parent's bottom edge in the order of their targets.
@@ -1150,7 +1241,7 @@
         y = Math.max(y, gap.top + 32);
       }
       row.y = y;
-      const height = Math.max(row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36, row.labelH || 0);
+      const height = Math.max(row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36, row.labelH || 0, row.bandH || 0);
       row.height = height;
       for (const item of row.items) item.y = y;
       row.tier.y = y;
@@ -1158,6 +1249,18 @@
       y += height;
     });
     const height = y + MARGIN + (spans.some((span) => span.up) ? 40 : 0);
+    // A "not read" or "not collected" band and its note: placed where no
+    // straight drop has to pass, and an obstacle for every corridor.
+    rows.forEach((row, r) => {
+      row.band = null;
+      if (!row.bandLines) return;
+      const avoid = spans
+        .filter((span) => (span.skip && span.from < r && span.to > r) || (span.up && span.from < r))
+        .flatMap((span) => (span.up ? [width - MARGIN - 4] : [exits.get(span.link), drops.get(span.link)]));
+      const fits = (x) => x + row.bandW <= width - MARGIN && avoid.every((v) => v < x - 16 || v > x + row.bandW + 16);
+      const x = [LEFT, ...avoid.map((v) => v + 17).sort((a, b) => a - b)].find(fits) ?? LEFT;
+      row.band = { id: `band:${row.tier.id}`, x, y: row.y, w: row.bandW, h: row.height };
+    });
     // Corridors for links that skip rows: a free x through every row and label
     // band in between, 10 px from every other vertical there.
     const corridors = [];
@@ -1174,6 +1277,7 @@
       const blocked = [];
       for (let r = top; r < bottom; r += 1) {
         for (const item of rows[r]?.items || []) blocked.push([item.x - 12, item.x + item.w + 12]);
+        if (rows[r]?.band) blocked.push([rows[r].band.x - 12, rows[r].band.x + rows[r].band.w + 12]);
         for (const link of gaps[r]?.labels || []) {
           const x = drops.get(link);
           const half = linkWidth(link) / 2;
@@ -1185,13 +1289,13 @@
       }
       for (const other of corridors) if (other.top <= bottom && other.bottom >= top) blocked.push([other.x - TRACK, other.x + TRACK]);
       const target = span.up ? width - MARGIN - 4 : (exit + drop) / 2;
-      const free = (candidate) => candidate >= 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
+      // Never through the tier label column on the left.
+      const free = (candidate) => candidate >= LEFT + 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
       // Straight down under the drop or the exit when that is free: one bend fewer.
       let x = span.up ? null : [drop, exit].find(free) ?? null;
       for (let step = 0; step <= width && x === null; step += 2) {
         for (const candidate of [target - step, target + step]) {
-          if (candidate < 4 || candidate > width - 4) continue;
-          if (blocked.every(([left, right]) => candidate <= left || candidate >= right)) {
+          if (free(candidate)) {
             x = candidate;
             break;
           }
@@ -1210,19 +1314,24 @@
         const out = part === "first" && !span.skip && !span.up ? drops.get(span.link) : part === "first" ? span.corridor : drops.get(span.link);
         return { piece, into, out, lo: Math.min(into, out), hi: Math.max(into, out) };
       });
-      const cost = (a, b) => (b.into > a.lo && b.into < a.hi ? 1 : 0) + (a.out > b.lo && a.out < b.hi ? 1 : 0);
+      // cost(a, b): crossings when track a lies above track b. Inserting an
+      // end at each position in turn changes the total by one pair, so each
+      // insertion is linear and a gap is quadratic in its lines.
+      const cost = (a, b) => {
+        model.work.trackCosts += 1;
+        return (b.into > a.lo && b.into < a.hi ? 1 : 0) + (a.out > b.lo && a.out < b.hi ? 1 : 0);
+      };
       const ordered = [];
       for (const end of ends.sort((a, b) => a.lo - b.lo)) {
+        let total = 0;
+        for (const other of ordered) total += cost(end, other);
         let bestIndex = 0;
-        let bestCost = Infinity;
-        for (let index = 0; index <= ordered.length; index += 1) {
-          let total = 0;
-          ordered.forEach((other, position) => {
-            total += position < index ? cost(other, end) : cost(end, other);
-          });
+        let bestCost = total;
+        for (let index = 0; index < ordered.length; index += 1) {
+          total += cost(ordered[index], end) - cost(end, ordered[index]);
           if (total < bestCost) {
             bestCost = total;
-            bestIndex = index;
+            bestIndex = index + 1;
           }
         }
         ordered.splice(bestIndex, 0, end);
@@ -1288,7 +1397,10 @@
 
   function layoutModel(model, options = {}) {
     const available = Math.max(0, Number(options.width) || 0);
+    // Work counters, so a test can bound the cost by counting, not timing.
+    model.work = { trackCosts: 0, routePasses: 0 };
     for (const entry of model.nodes) sizeNode(entry);
+    distinctTitles(model);
     const rows = model.tiers.map((tier) => ({
       tier,
       items: tier.id === "bays" ? model.groups : tier.nodeIds.map((id) => model.nodeById.get(id)).filter(Boolean),
@@ -1296,43 +1408,78 @@
     for (const group of model.groups) [group.w, group.h] = groupSize(group);
     for (const row of rows) {
       row.labelH = tierLines(row.tier);
-      const missing = row.tier.state === "not_read" || row.tier.state === "not_collected" || row.tier.state === "none";
-      row.bandWidth = missing ? row.tier.note.length * TEXT_W + 24 : 0;
+      const missing = !row.items.length && (row.tier.state === "not_read" || row.tier.state === "not_collected" || row.tier.state === "none");
+      row.bandLines = missing ? wrap(row.tier.note, BAND_CHARS) : null;
+      row.bandW = missing ? Math.max(NODE_W, ...row.bandLines.map((line) => line.length * TEXT_W + 24)) : 0;
+      row.bandH = missing ? 14 + row.bandLines.length * LINE_H : 0;
+      row.bandWidth = row.bandW;
     }
     // A child with several labelled arrivals is wide enough for them side by
-    // side, and a bay group as wide as the enclosures above it, so they all
-    // sit over it.
+    // side, and a child with several parents wide enough that every parent's
+    // centre can sit over it (a bay group: as wide as its enclosures).
     for (const item of [...model.nodes, ...model.groups]) {
       const into = list(model.incoming.get(item.id));
       if (into.length > 1) item.w = Math.max(item.w, into.reduce((sum, link) => sum + linkWidth(link) + 12, 12));
-      if (item.tier === "bays" && into.length > 1) {
-        const parents = into.map((link) => model.nodeById.get(link.source)).filter(Boolean);
-        item.w = Math.max(item.w, parents.reduce((sum, parent) => sum + parent.w, 0) + (parents.length - 1) * H_GAP);
+      const parents = into.map((link) => model.nodeById.get(link.source)).filter(Boolean);
+      if (parents.length > 1) {
+        const row = parents.reduce((sum, parent) => sum + parent.w, 0) + (parents.length - 1) * H_GAP;
+        const needed = item.tier === "bays" ? row : row - (parents[0].w + parents[parents.length - 1].w) / 2 + 40;
+        item.w = Math.max(item.w, needed);
       }
     }
     const rowIndex = new Map();
     rows.forEach((row, index) => row.items.forEach((item) => rowIndex.set(item.id, index)));
     const links = model.links.filter((link) => rowIndex.has(link.source) && rowIndex.has(link.target) && link.source !== link.target);
+    // The order that keeps every parent over its children wins; then the one
+    // with the fewest crossings; then the shortest sideways runs.
+    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
+    // The order drawn last time for this scope is tried first and kept on a
+    // tie, so expanding a shelf does not reorder the drawing under the operator.
+    const candidates = orderCandidates(rows, links, rowIndex);
+    const previous = isRecord(options.previousOrder) ? options.previousOrder : null;
+    if (previous) {
+      candidates.unshift(rows.map((row) => {
+        const known = list(own(previous, row.tier.id));
+        const rank = (item) => (known.includes(item.id) ? known.indexOf(item.id) : known.length);
+        return row.items.slice().sort((left, right) => rank(left) - rank(right));
+      }));
+    }
     let best = null;
-    for (const candidate of orderCandidates(rows, links, rowIndex)) {
+    for (const [number, candidate] of candidates.entries()) {
       rows.forEach((row, index) => {
         row.items = candidate[index];
       });
       const width = placeRows(rows, links, rowIndex, available);
-      const height = routeLinks(model, rows, links, rowIndex, width);
+      routeLinks(model, rows, links, rowIndex, width);
+      const violations = spanViolations(links, byId, rowIndex);
       const score = countCrossings(links);
       const length = links.reduce((sum, link) => sum + link.points.reduce((total, point, index, all) => total + (index ? Math.abs(point[0] - all[index - 1][0]) : 0), 0), 0);
-      if (!best || score < best.score || (score === best.score && length < best.length - 0.5)) best = { score, length, candidate };
-      void height;
+      const kept = previous && number === 0 ? 0 : 1;
+      const better = !best || violations < best.violations
+        || (violations === best.violations && (score < best.score
+          || (score === best.score && (kept < best.kept || (kept === best.kept && length < best.length - 0.5)))));
+      if (better) best = { violations, score, kept, length, candidate };
     }
     rows.forEach((row, index) => {
       row.items = best ? best.candidate[index] : row.items;
     });
     model.width = placeRows(rows, links, rowIndex, available);
     model.height = routeLinks(model, rows, links, rowIndex, model.width);
+    // No coordinate is ever NaN: a link that could not be routed is named.
+    for (const link of links) {
+      if (link.points && !link.points.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) {
+        link.points = null;
+        link.labelBox = null;
+        model.notices.push(`Not drawn: ${linkName(model, link)} could not be routed.`);
+      }
+    }
     model.crossings = countCrossings(links);
+    model.crossingMarks = crossingMarks(links);
+    model.bands = [];
     model.tiers.forEach((tier, index) => {
       tier.order = rows[index].items.map((item) => item.id);
+      tier.band = rows[index].band ? { ...rows[index].band, lines: rows[index].bandLines } : null;
+      if (tier.band) model.bands.push(tier.band);
     });
     for (const group of model.groups) {
       group.cells.forEach((bay, index) => {
@@ -1551,6 +1698,22 @@
     return parts.join(", ");
   }
 
+  // Each HBA chain's look: one of four palette colours and one of eight line
+  // patterns. The first eight chains differ in pattern, so a chain never
+  // depends on colour alone there; any two of the first sixteen differ in
+  // colour, pattern or both.
+  const CHAIN_COLOURS = 4;
+  const CHAIN_DASHES = 8;
+  function chainStyle(index) {
+    return { colour: (index + Math.floor(index / CHAIN_DASHES)) % CHAIN_COLOURS, dash: index % CHAIN_DASHES };
+  }
+
+  function chainClass(index) {
+    if (index < 0) return " chain-none";
+    const style = chainStyle(index);
+    return ` chain-${index} chain-colour-${style.colour} chain-dash-${style.dash}`;
+  }
+
   function renderLink(model, link, path, used) {
     if (!link.points) return { line: "", label: "" };
     const style = linkStyle(link);
@@ -1558,7 +1721,7 @@
     const highlight = onPathClass(path, "links", link.id) + (pinnedRef(path, "link", link.id) ? " is-pinned" : "");
     const points = link.points.map(([x, y]) => `${Math.round(x)},${Math.round(y)}`).join(" ");
     const name = linkDescription(model, link);
-    const chain = ` chain-${link.chain ? model.chains.indexOf(link.chain) : "none"}`;
+    const chain = chainClass(link.chain ? model.chains.indexOf(link.chain) : -1);
     const line = `<polyline class="topo-link ${style}${chain}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title>${escapeHtml(name)}</title></polyline>`;
     const box = link.labelBox;
     let body;
@@ -1671,10 +1834,10 @@
       + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join("")
       + "</g>";
     let band = "";
-    if (missing) {
-      const width = Math.max(model.width - LEFT - MARGIN, NODE_W);
-      band = `<g class="topo-missing-tier mark-not-read tone-${tone}"><rect x="${LEFT}" y="${y}" width="${width}" height="${tier.h || 36}" rx="8"></rect>`
-        + `<text class="topo-node-fact" x="${LEFT + 12}" y="${y + 22}">${escapeHtml(tier.note)}</text></g>`;
+    if (missing && tier.band) {
+      const { x, w, h, lines } = tier.band;
+      band = `<g class="topo-missing-tier mark-not-read tone-${tone}" data-topo-band="${escapeHtml(tier.id)}"><rect x="${Math.round(x)}" y="${y}" width="${Math.round(w)}" height="${h}" rx="8"></rect>`
+        + lines.map((line, index) => `<text class="topo-node-fact" x="${Math.round(x) + 12}" y="${y + 22 + index * LINE_H}">${escapeHtml(line)}</text>`).join("") + "</g>";
     }
     return label + band;
   }
@@ -1759,6 +1922,18 @@
       labels.push(rendered.label);
     }
     const tiers = model.tiers.map((tier) => renderTier(tier, model)).join("");
+    // At a crossing the horizontal line has a small gap and the vertical one
+    // runs through it: a short background stroke, then the vertical again.
+    const crossings = list(model.crossingMarks).map((mark) => {
+      const over = model.linkById.get(mark.over);
+      if (!over) return "";
+      const cross = onPathClass(path, "links", over.id);
+      const chain = chainClass(over.chain ? model.chains.indexOf(over.chain) : -1);
+      const x = Math.round(mark.x);
+      const y = Math.round(mark.y);
+      return `<line class="topo-cross-gap" x1="${x - 7}" y1="${y}" x2="${x + 7}" y2="${y}"></line>`
+        + `<line class="topo-link topo-cross-over ${linkStyle(over)}${chain}${cross}" data-topo-cross="${escapeHtml(over.id)}" x1="${x}" y1="${y - 9}" x2="${x}" y2="${y + 9}"></line>`;
+    }).join("");
     if (model.tiers.some((tier) => tier.state === "not_read" || tier.state === "not_collected")) used.add("mark-not-read");
     const nodes = model.nodes.map((entry) => renderNode(entry, path, used)).join("");
     const groups = model.groups.map((group) => renderGroup(model, group, path, used)).join("");
@@ -1771,15 +1946,18 @@
     const shownW = Math.max(1, Math.floor(fullW * scale));
     const shownH = Math.max(1, Math.floor(fullH * scale));
     const svg = `<svg class="fabric-topology-svg${view.fit ? " is-fitted" : ""}" role="group" aria-label="${escapeHtml(svgLabel)}" width="${shownW}" height="${shownH}" viewBox="0 0 ${fullW} ${fullH}">`
-      + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
+      + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-crossings">${crossings}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
     const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${token(part.state)}"${part.title ? ` title="${escapeHtml(part.title)}"` : ""}>${escapeHtml(part.label)}: ${escapeHtml(part.state)}</span>`).join("");
     const source = model.core ? "HBA" : model.contract === "storage" ? "source" : "controller or source";
-    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><span class="fabric-topology-swatch swatch-line chain-${index}" aria-hidden="true"></span>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this ${source} down`)}</span>`).join("");
+    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><svg class="fabric-topology-swatch swatch-chain" width="28" height="8" viewBox="0 0 28 8" aria-hidden="true"><line class="topo-link is-lanes-reported${chainClass(index)}" x1="0" y1="4" x2="28" y2="4"></line></svg>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this ${source} down`)}</span>`).join("");
     const legend = chains + Object.entries(LEGEND)
       .filter(([style]) => used.has(style))
       .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(legendText(model, style, text))}</span>`)
       .join("");
     const fitControl = `<button class="button secondary small fabric-topology-fit" type="button" data-topology-fit="${view.fit ? "actual" : "fit"}" aria-pressed="${view.fit ? "true" : "false"}">${view.fit ? "Actual size" : "Fit"}</button>`;
+    const wide = !view.fit && box.width && fullW > box.width + 1
+      ? `<p class="fabric-topology-wide-notice subtle" data-topology-wide-notice>The drawing is ${fullW} px wide, wider than its box (${Math.round(box.width)} px): scroll sideways for the rest, or choose Fit.</p>`
+      : "";
     const smallest = 12 * scale;
     const fitNotice = scale < 1
       ? `<p class="fabric-topology-fit-notice warning-item muted compact" data-topology-fit-notice>Fitted to ${Math.round(scale * 100)}% of its size: its smallest text is ${smallest.toFixed(1)} px, under 12 px. Choose Actual size to read it.</p>`
@@ -1790,7 +1968,7 @@
       + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
       + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
       + notices
-      + `<div class="fabric-topology-bar">${fitControl}<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p></div>`
+      + `<div class="fabric-topology-bar">${fitControl}${wide}<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p></div>`
       + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
@@ -1833,6 +2011,9 @@
   const live = {
     model: null, pin: null, hover: null, query: "", scope: null, fit: false, scroll: { left: 0, top: 0 },
     container: null, input: null, status: null, hooks: {},
+    // Why the next mount chooses the scroll position: "open", "actual",
+    // { expand: group id, anchor: its centre on screen } or null (keep).
+    firstView: null, expandedKeys: null, refocusFit: false, quiet: null,
   };
   const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
 
@@ -1847,6 +2028,10 @@
     if (ref.kind === "bay") return model.bayById.has(ref.id);
     if (ref.kind === "group") return model.groupById.has(ref.id);
     return model.nodeById.has(ref.id);
+  }
+
+  function sameRef(left, right) {
+    return Boolean(left && right && left.kind === right.kind && left.id === right.id);
   }
 
   // The page's selection ({ kind: "trace" | "node", id }) as a drawn item.
@@ -1864,18 +2049,39 @@
     if (live.status) live.status.textContent = "";
   }
 
+  // The bay groups drawn in full, from the page's expanded list.
+  function expandedKeys(options) {
+    const expanded = isRecord(options.expanded) ? options.expanded : {};
+    return new Set(Object.keys(expanded).filter((key) => key.startsWith("topology:") && expanded[key]));
+  }
+
   function render(fabric, options = {}) {
-    const model = buildTopologyModel(fabric, options);
+    listen();
+    const previous = live.model;
+    const sameScope = live.scope !== null && previous?.scope === scopeOf(fabric);
+    const previousOrder = sameScope ? Object.fromEntries(previous.tiers.map((tier) => [tier.id, tier.order || []])) : null;
+    const model = buildTopologyModel(fabric, { ...options, previousOrder });
     // The page replaces the map on every render: keep the drawing's scroll
     // position for the same scope, and start a new scope at the origin.
     const box = scrollBox(live.container);
-    if (live.scope !== null && model.scope !== live.scope) {
-      live.pin = null;
-      clearInput();
+    const keys = expandedKeys(options);
+    if (live.scope === null || model.scope !== live.scope) {
+      if (live.scope !== null) {
+        live.pin = null;
+        clearInput();
+      }
       live.scroll = { left: 0, top: 0 };
-    } else if (box) {
-      live.scroll = { left: Number(box.scrollLeft) || 0, top: Number(box.scrollTop) || 0 };
+      live.firstView = "open";
+    } else {
+      if (box) live.scroll = { left: Number(box.scrollLeft) || 0, top: Number(box.scrollTop) || 0 };
+      // A shelf expanded or collapsed: keep it where the operator saw it.
+      const toggled = [...model.groups].find((group) => keys.has(group.expandKey) !== Boolean(live.expandedKeys?.has(group.expandKey)));
+      const before = toggled && previous?.groupById.get(toggled.id);
+      if (toggled && before && live.firstView === null) {
+        live.firstView = { expand: toggled.id, anchor: centreOf(before) - live.scroll.left };
+      }
     }
+    live.expandedKeys = keys;
     live.scope = model.scope;
     live.model = model;
     if (options.selection !== undefined) {
@@ -1895,25 +2101,75 @@
     return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
   }
 
-  // After the page has put the drawing in place: restore its scroll position.
-  function mount(container) {
-    const box = scrollBox(container);
-    if (!box) return;
-    if (box.scrollLeft !== live.scroll.left) box.scrollLeft = live.scroll.left;
-    if (box.scrollTop !== live.scroll.top) box.scrollTop = live.scroll.top;
+  // Where the scroll box starts: with the host and every HBA inside it when
+  // they fit its width, and, after a shelf is expanded or collapsed, with
+  // that shelf still where the operator saw it if both can hold.
+  function firstViewLeft(model, reason, width, current) {
+    const top = model.nodes.filter((entry) => entry.kind === "host" || entry.kind === "controller");
+    const span = top.length ? [Math.min(...top.map((entry) => entry.x)), Math.max(...top.map((entry) => entry.x + entry.w))] : null;
+    const fits = span && span[1] - span[0] <= width;
+    let wanted = current;
+    let range = [0, Math.max(0, model.width - width)];
+    if (fits) range = [Math.max(range[0], span[1] - width), Math.min(range[1], span[0])];
+    if (reason === "open" || reason === "actual") {
+      wanted = span ? (span[0] + span[1]) / 2 - width / 2 : 0;
+    } else if (reason?.expand) {
+      const group = model.groupById.get(reason.expand);
+      if (group) {
+        wanted = centreOf(group) - reason.anchor;
+        // The shelf itself stays in view: at least 200 px of it, or all of it.
+        const keep = Math.min(group.w, width, 200);
+        const own = [group.x + keep - width, group.x + group.w - keep];
+        const both = [Math.max(range[0], own[0]), Math.min(range[1], own[1])];
+        range = both[0] <= both[1] ? both : [Math.max(0, own[0]), Math.max(0, own[1])];
+      }
+    }
+    return Math.round(Math.min(range[1], Math.max(range[0], wanted)));
   }
 
-  // Leaving the mode: no pin, hover or search carries over.
+  // After the page has put the drawing in place: set its scroll position,
+  // and give focus back to Fit after a Fit click.
+  function mount(container) {
+    const box = scrollBox(container);
+    if (box) {
+      const reason = live.firstView;
+      live.firstView = null;
+      const width = Number(box.clientWidth) || live.model?.box?.width || 0;
+      let left = live.scroll.left;
+      let top = live.scroll.top;
+      if (reason && live.model && !live.fit && width) {
+        left = firstViewLeft(live.model, reason, width, live.scroll.left);
+        if (reason === "open" || reason === "actual") top = 0;
+      }
+      if (box.scrollLeft !== left) box.scrollLeft = left;
+      if (box.scrollTop !== top) box.scrollTop = top;
+    }
+    if (live.refocusFit) {
+      live.refocusFit = false;
+      container?.querySelector?.("[data-topology-fit]")?.focus?.({ preventScroll: true });
+    }
+  }
+
+  // Leaving the mode: no pin, hover or search carries over, and the view's
+  // document and window listeners are removed.
   function release() {
     live.pin = null;
     live.hover = null;
+    live.quiet = null;
     live.scope = null;
+    live.firstView = null;
     live.scroll = { left: 0, top: 0 };
     clearInput();
+    unlisten();
   }
 
   function view() {
     return { pin: live.pin, hover: live.hover, query: live.query };
+  }
+
+  // The model the last render drew.
+  function drawnModel() {
+    return live.model;
   }
 
   function inspectorDetail() {
@@ -1942,6 +2198,7 @@
     };
     mark("[data-topo-node]", "nodes", "data-topo-node");
     mark("[data-topo-link]", "links", "data-topo-link");
+    mark("[data-topo-cross]", "links", "data-topo-cross");
     mark("[data-topo-bay]", "bays", "data-topo-bay");
     mark("[data-topo-group]", "groups", "data-topo-group");
     // The line under the legend names what is traced in full, so text a box
@@ -1971,20 +2228,70 @@
     status.textContent = `${found.matches.length} ${found.matches.length === 1 ? "match" : "matches"}: ${names.join(", ")}${more}.`;
   }
 
+  // One document Esc handler and one window resize handler for the page,
+  // however often the view is attached; added while Topology is shown and
+  // removed when it is left.
+  const globals = { listening: false, timer: null };
+
+  function onEscape(event) {
+    if (event.key !== "Escape" || !live.container?.querySelector?.(".fabric-topology")) return;
+    if (event.target?.closest?.("[data-fabric-alias-form]")) return;
+    // The item that has focus stays quiet until focus or the pointer moves
+    // to an item: the page puts focus back on it after the redraw.
+    live.quiet = refFromElement(event.target) || live.hover || live.pin;
+    live.pin = null;
+    live.hover = null;
+    clearInput();
+    applyHighlight();
+    // Esc clears the drawing's pin and the inspector's selection together.
+    live.hooks.clearSelection?.();
+    live.hooks.requestRender?.();
+  }
+
+  function onResize() {
+    // The layout takes the box's width: lay it out again when that changes.
+    if (globals.timer !== null) window.clearTimeout(globals.timer);
+    globals.timer = window.setTimeout(() => {
+      globals.timer = null;
+      if (live.container?.querySelector?.(".fabric-topology")) live.hooks.requestRender?.();
+    }, 200);
+  }
+
+  function listen() {
+    if (globals.listening) return;
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") document.addEventListener("keydown", onEscape);
+    if (typeof window.addEventListener === "function") window.addEventListener("resize", onResize);
+    globals.listening = true;
+  }
+
+  function unlisten() {
+    if (!globals.listening) return;
+    if (typeof document !== "undefined" && typeof document.removeEventListener === "function") document.removeEventListener("keydown", onEscape);
+    if (typeof window.removeEventListener === "function") window.removeEventListener("resize", onResize);
+    if (globals.timer !== null && typeof window.clearTimeout === "function") window.clearTimeout(globals.timer);
+    globals.timer = null;
+    globals.listening = false;
+  }
+
   // hooks: { clearSelection(), requestRender() } from the page, so a link pin,
   // a typed search and Esc keep the page's inspector selection in step.
   function attach(container, searchInput, searchStatus, hooks = {}) {
-    if (!container || container.dataset?.topologyAttached) return;
-    if (container.dataset) container.dataset.topologyAttached = "true";
+    if (!container) return;
     Object.assign(live, { container, input: searchInput || null, status: searchStatus || null, hooks: hooks || {} });
+    listen();
+    if (container.dataset?.topologyAttached) return;
+    if (container.dataset) container.dataset.topologyAttached = "true";
     const hover = (event) => {
+      if (live.container !== container) return;
       const ref = refFromElement(event.target);
       if (!ref) return;
+      if (live.quiet && event.type === "focusin" && sameRef(ref, live.quiet)) return;
+      live.quiet = null;
       live.hover = ref;
       applyHighlight();
     };
     const leave = (event) => {
-      if (!live.hover) return;
+      if (live.container !== container || !live.hover) return;
       live.hover = refFromElement(event.relatedTarget);
       applyHighlight();
     };
@@ -1993,14 +2300,18 @@
     container.addEventListener("mouseout", leave);
     container.addEventListener("focusout", leave);
     container.addEventListener("click", (event) => {
+      if (live.container !== container) return;
       if (event.target?.closest?.("[data-topology-fit]")) {
         live.fit = !live.fit;
+        live.refocusFit = true;
+        if (!live.fit) live.firstView = "actual";
         live.hooks.requestRender?.();
         return;
       }
       const element = event.target?.closest?.("[data-topo-link], [data-topo-bay], [data-topo-node]");
       const ref = refFromElement(element);
       if (!ref) return;
+      live.quiet = null;
       live.pin = ref;
       applyHighlight();
       if (ref.kind === "link") {
@@ -2015,28 +2326,6 @@
       event.preventDefault();
       element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    document.addEventListener("keydown", (event) => {
-      if (event.key !== "Escape" || !container.querySelector(".fabric-topology")) return;
-      if (event.target?.closest?.("[data-fabric-alias-form]")) return;
-      live.pin = null;
-      live.hover = null;
-      clearInput();
-      applyHighlight();
-      // Esc clears the drawing's pin and the inspector's selection together.
-      live.hooks.clearSelection?.();
-      live.hooks.requestRender?.();
-    });
-    if (typeof window.addEventListener === "function") {
-      // The layout takes the box's width: lay it out again when that changes.
-      let timer = null;
-      window.addEventListener("resize", () => {
-        if (timer !== null) window.clearTimeout(timer);
-        timer = window.setTimeout(() => {
-          timer = null;
-          if (container.querySelector(".fabric-topology")) live.hooks.requestRender?.();
-        }, 200);
-      });
-    }
     if (searchInput) {
       searchInput.addEventListener("input", () => {
         live.query = searchInput.value.trim();
@@ -2060,12 +2349,14 @@
     searchTopology,
     renderTopology,
     pathTone,
+    chainStyle,
     searchHelp,
     linkDetail,
     render,
     mount,
     release,
     view,
+    drawnModel,
     inspectorDetail,
     attach,
   };

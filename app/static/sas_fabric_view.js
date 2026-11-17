@@ -4180,6 +4180,10 @@
     if (elements.topologySearchRow) {
       elements.topologySearchRow.hidden = state.mode !== "topology";
     }
+    // The Path Focus and Disk Path strip describes a selection Topology does not draw.
+    if (elements.focusStrip) {
+      elements.focusStrip.hidden = state.mode === "topology";
+    }
     // Only Topology widens the page to the full window (sas_fabric_topology.css).
     document.body?.classList?.toggle("fabric-topology-mode", state.mode === "topology");
   }

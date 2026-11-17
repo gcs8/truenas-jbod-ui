@@ -47,6 +47,8 @@ function boxes(model) {
   for (const link of model.links) {
     if (link.labelBox) result.push({ id: `label:${link.id}`, kind: "label", link: link.id, ...link.labelBox });
   }
+  // "Not read" and "not collected" bands with their notes are obstacles too.
+  for (const band of model.bands || []) result.push({ id: band.id, kind: "band", x: band.x, y: band.y, w: band.w, h: band.h });
   return result;
 }
 

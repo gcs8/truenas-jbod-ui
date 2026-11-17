@@ -798,3 +798,25 @@ test("leaving Topology through the mode buttons clears its pin, trace and search
     assert.doesNotMatch(panel.innerHTML, /is-on-path|is-pinned/, variant);
   }
 });
+
+test("the Path Focus and Disk Path strip is hidden in Topology and returns in the older modes", () => {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  const { page, elements, click } = loadFullPage(T, dom.document, fabric, cases.core_cascade.snapshot);
+  const strip = elements.get("fabric-focus-strip");
+  click("lanes");
+  const before = strip.innerHTML;
+  assert.equal(strip.hidden, false);
+  assert.ok(before.length > 0, "the older modes fill the strip");
+  click("topology");
+  assert.equal(strip.hidden, true, "Topology hides the strip");
+  for (const mode of ["lanes", "impact", "trace", "disk"]) {
+    click(mode);
+    assert.equal(strip.hidden, false, mode);
+    assert.ok(strip.innerHTML.length > 0, `${mode} fills the strip`);
+    click("topology");
+    assert.equal(strip.hidden, true, `topology after ${mode}`);
+  }
+  void page;
+});
