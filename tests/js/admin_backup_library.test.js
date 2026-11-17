@@ -2161,7 +2161,7 @@ test("the model script keeps the library's source rules", () => {
   assert.doesNotMatch(source, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
   assert.doesNotMatch(source, /require\(|import /);
   assert.doesNotMatch(source, /copy\/copies|deletion\/deletions/);
-  assert.doesNotMatch(source, /cleanup_running|no longer running|cleanupWatch|bannerRevision/);
+  assert.doesNotMatch(source, /cleanup_running|cleanup_not_running|no longer running|cleanupWatch|bannerRevision/);
   assert.doesNotMatch(source, /When the running one finishes, its result shows in the Last clean-up line/);
   // Request paths stay in the library, where the read-reach generator resolves them.
   assert.doesNotMatch(source, /\/api\//);
