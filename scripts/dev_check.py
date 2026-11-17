@@ -141,6 +141,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_sas_cdb_malformed_tokens",
     "tests.test_sas_decoder_byte_tokens",
     "tests.test_sas_loginfo_width",
+    "tests.test_sas_sense_ascq_4b_family",
     "tests.test_scripts_help",
     "tests.test_smart_json_shapes",
     "tests.test_source_shape",
