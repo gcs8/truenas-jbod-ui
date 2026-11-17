@@ -441,7 +441,7 @@ test("the page's inspector shows a pinned bundle's facts, and Topology selects n
   // A bay the page selects is the drawing's pin; the inventory reaches the search.
   assert.ok(api.setSelectionRef({ kind: "trace", id: "bay:6" }));
   api.renderMap();
-  assert.match(elements.get("fabric-map-panel").innerHTML, /Pinned: Bay 06/);
+  assert.match(elements.get("fabric-map-panel").innerHTML, /data-topology-pin>Pinned: Bay 06/);
   assert.equal(T.inspectorDetail(), null);
   assert.deepEqual([...T.searchTopology(T.buildTopologyModel(fabric, { inventory: snapshot }), "SANITIZED-TOPO-6").matches].map((item) => item.id), ["bay:6"]);
   // Esc clears the pin and asks the page to clear its selection.
@@ -449,7 +449,8 @@ test("the page's inspector shows a pinned bundle's facts, and Topology selects n
   assert.equal(cleared.length, 2);
   assert.equal(T.view().pin, null);
   assert.equal(api.state.selectedTraceId, null);
-  assert.doesNotMatch(elements.get("fabric-map-panel").innerHTML, /Pinned:/);
+  // The visible sentence (the band's hidden sizers hold every pinned sentence).
+  assert.doesNotMatch(elements.get("fabric-map-panel").innerHTML, /data-topology-pin>Pinned:/);
 });
 
 // ---- the CORE builder's own kind name, and traces with no drawn record ------

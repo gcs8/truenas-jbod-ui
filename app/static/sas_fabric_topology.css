@@ -180,13 +180,15 @@ body.fabric-topology-mode .fabric-page-shell {
 
 /* The trace line sits below the drawing, so its wrapping never moves it,
    and sticks to the window's bottom edge so it is read without scrolling.
-   The band is one grid cell: the visible sentence and hidden sizers, the
-   longest sentences this drawing can show, share it, so the band is as tall
-   as the tallest of them at any width, and the idle hint, "Tracing" and
+   The band is one grid cell: the visible sentence and a hidden sizer for
+   every sentence this drawing can show share it, so the band is as tall as
+   the tallest of them at any width, and the idle hint, "Tracing" and
    "Pinned" take the same band, which never grows over the item under the
-   pointer. Its reserved lines are the floor. The page sizes boxes by their
-   border, so the reserved height is the whole band, padding and border
-   included. Every sentence wraps in full. */
+   pointer. The column's minimum is fixed, so the sizers do not size the
+   column: each is laid out at the band's width and the row takes the
+   tallest. Its reserved lines are the floor. The
+   page sizes boxes by their border, so the reserved height is the whole
+   band, padding and border included. Every sentence wraps in full. */
 .fabric-topology .fabric-topology-trace {
   position: sticky;
   bottom: 0;

@@ -2154,14 +2154,12 @@
     return DEFAULT_HINT;
   }
 
-  // The band keeps the height of the longest sentence its drawing can show:
-  // these sentences share its one grid cell, hidden, with the visible one.
-  // Character count only stands in for the drawn width (glyphs differ, and a
-  // long unbreakable identifier can wrap a shorter sentence to more lines),
-  // so the few longest are kept, not one: eight reach past the two longest
-  // length tiers in every system tested (each port is drawn once per HBA
-  // side), and stay eight short elements whatever the fabric's size.
-  const TRACE_SIZERS = 8;
+  // The band is as tall as the tallest sentence its drawing can show: each
+  // distinct sentence shares the band's one grid cell, hidden, with the
+  // visible one, and the layout takes the tallest at any width. No count or
+  // length stands in for drawn height, so none is left out and there is no
+  // limit: the count follows the drawing. The only sentence without its own
+  // sizer is a plain trace, which is the start of its own held-pin trace.
   function traceSizers(model, view = {}) {
     // What a pointer or keyboard can reach in this drawing: bays inside a
     // collapsed shelf are not drawn, so their sentences belong to the drawing
@@ -2173,23 +2171,17 @@
       reachable.push({ kind: "group", id: group.id });
       for (const bay of group.cells) reachable.push({ kind: "bay", id: bay.bayId });
     }
-    // Any item that can be pinned gives every trace its held-pin form, the longest.
+    // Any item that can be pinned gives every trace its held-pin form.
     const pin = reachable.find((ref) => ref.kind !== "group") || view.pin || null;
-    const kept = [];
-    const offer = (text) => {
-      if (kept.length === TRACE_SIZERS && text.length <= kept[kept.length - 1].length) return;
-      if (kept.includes(text)) return;
-      let at = kept.length;
-      while (at > 0 && kept[at - 1].length < text.length) at -= 1;
-      kept.splice(at, 0, text);
-      if (kept.length > TRACE_SIZERS) kept.pop();
-    };
-    offer(traceSentence(model));
-    // A pin this drawing does not show (a bay inside a collapsed shelf) is
-    // only ever shown pinned; a drawn one's held-pin trace is longer.
-    if (view.pin && !reachable.some((ref) => sameRef(ref, view.pin))) offer(traceSentence(model, { pin: view.pin }));
-    for (const ref of reachable) offer(traceSentence(model, { hover: ref, pin }));
-    return kept;
+    const kept = new Set([traceSentence(model)]);
+    // A pin this drawing does not show (a bay inside a collapsed shelf).
+    if (view.pin && !reachable.some((ref) => sameRef(ref, view.pin))) kept.add(traceSentence(model, { pin: view.pin }));
+    for (const ref of reachable) {
+      kept.add(traceSentence(model, { hover: ref, pin }));
+      // A group is not pinned: a click on it pins nothing.
+      if (ref.kind !== "group") kept.add(traceSentence(model, { pin: ref }));
+    }
+    return [...kept];
   }
 
   // Legend words for what this payload has: bays, disks without a physical
@@ -2294,7 +2286,7 @@
       + `<div class="fabric-topology-scroll">${svg}</div>`
       // Below the drawing: hover text that wraps to more lines never moves
       // the drawing, and a label, from under the pointer. The band is as tall
-      // as the longest of its sentences, so its height stays the same.
+      // as the tallest sentence the drawing can show, so its height stays the same.
       + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>${sizers}</div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
