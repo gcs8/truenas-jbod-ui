@@ -5551,15 +5551,6 @@ class InventoryService(InventorySourceCollectionMixin):
                 )
             ).lower()
 
-    def _persist_slot_detail_entries(self, entries: Any) -> None:
-        if not self.slot_detail_store:
-            return
-
-        normalized_entries = [entry for entry in entries if entry is not None]
-        if not normalized_entries:
-            return
-        self.slot_detail_store.save_entries(normalized_entries)
-
     def _slot_detail_entry_is_bound_here(
         self, entry: SlotDetailCacheEntry, *, binding: str | None = None,
     ) -> bool:
