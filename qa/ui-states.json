@@ -574,6 +574,9 @@
   ],
   "runtime_controls": [],
   "render_gaps": [
+    {"key": "[data-fabric-topology-link]", "reason": "The crawl fixtures' synthetic CORE fabric carries no links, so Topology draws no link labels there; tests/js/fabric_topology_truth.test.js and fabric_topology_layout.test.js render them from the real builder's output."},
+    {"key": "[data-topo-link]", "reason": "The crawl fixtures' synthetic CORE fabric carries no links, so Topology draws no lines there; tests/js/fabric_topology_truth.test.js and fabric_topology_layout.test.js render them from the real builder's output."},
+    {"key": "[data-topo-bay]", "reason": "The crawl fixtures' synthetic CORE fabric carries bay traces but no bay nodes, so Topology draws no bay cells there (it names the traces in a notice); tests/js/fabric_topology_truth.test.js renders them from the real builder's output."},
     {"key": "[data-path-pill]", "reason": "Multipath member pills render only for a selected bay that has multipath members; the crawl fixtures have none yet. qa/ui-a11y-narrow-layout.spec.js renders them on a synthetic multipath bay and checks keyboard reveal (#1112)."},
     {"key": "#backup-import-file", "reason": "Hidden file input; its visible pick button #backup-import-pick-button is rendered and audited."},
     {"key": "#mapping-import-file", "reason": "Hidden file input; its visible button #import-mappings-button is rendered and audited."},

@@ -444,3 +444,34 @@ test("the page's inspector shows a pinned bundle's facts, and Topology selects n
   assert.equal(api.state.selectedTraceId, null);
   assert.doesNotMatch(elements.get("fabric-map-panel").innerHTML, /Pinned:/);
 });
+
+// ---- the CORE builder's own kind name, and traces with no drawn record ------
+
+test("a CORE payload that names its builder kind core_mpr is drawn as CORE", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  fabric.raw.fabric_kind = "core_mpr";
+  const hba = H.addController(fabric, "mpr0");
+  const exp = H.addExpander(fabric, "mpr0", 0xa1, 1, hba.id);
+  H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", exp.id);
+  const model = T.buildTopologyModel(fabric);
+  assert.deepEqual([...model.tiers].map((tier) => tier.id), ["host", "controllers", "expanders:1", "enclosures", "bays"]);
+  assert.ok(model.nodeById.has(exp.id));
+  assert.doesNotMatch(T.renderTopology(model, {}), /not collected on this platform/);
+  assert.deepEqual([...model.notices], []);
+});
+
+test("bay traces without a bay node are named, not silently left out", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", null);
+  fabric.links.push(H.link(hba.id, enc.id, "controller-enclosure"));
+  H.addBays(fabric, [0, 1, 2, 3], [enc.id]);
+  // Two traces whose bay node the payload does not carry.
+  fabric.nodes = fabric.nodes.filter((item) => !["bay:2", "bay:3"].includes(item.id));
+  fabric.links = fabric.links.filter((item) => !["bay:2", "bay:3"].includes(item.target));
+  const model = T.buildTopologyModel(fabric);
+  assert.equal(model.counts.baysPlaced, 2);
+  assert.match([...model.notices].join(" "), /2 bay traces without a bay node \(bay:2, bay:3\)/);
+});

@@ -354,7 +354,8 @@
   function buildTopologyModel(fabric, options = {}) {
     const expanded = isRecord(options.expanded) ? options.expanded : {};
     const kind = fabricKind(fabric);
-    const core = kind === "core_sas";
+    // The CORE builder's payload may name its kind (core_mpr) or not; either way it is CORE.
+    const core = fabric?.platform === "core" || /^core_/.test(kind);
     const payload = readPayload(fabric);
     const traces = new Map(payload.traces.map((trace) => [trace.id, trace]));
     const inventory = inventoryBySlot(fabric, options.inventory);
@@ -733,6 +734,8 @@
     if (skipped.missingEnd.length) notDrawn.push(`${plural(skipped.missingEnd.length, "link")} with an end the payload does not carry (${named(skipped.missingEnd)})`);
     if (skipped.unjoined.length) notDrawn.push(`${plural(skipped.unjoined.length, "link")} between items this view does not join (${named(skipped.unjoined)})`);
     if (skipped.duplicateNodes.length) notDrawn.push(`${plural(skipped.duplicateNodes.length, "duplicate node id")} (${named(skipped.duplicateNodes)})`);
+    const orphanTraces = payload.traces.filter((trace) => trace.kind === "bay" && !payloadNodeIds.has(trace.id)).map((trace) => trace.id);
+    if (orphanTraces.length) notDrawn.push(`${plural(orphanTraces.length, "bay trace")} without a bay node (${named(orphanTraces)})`);
     if (skipped.duplicateLinks.length) notDrawn.push(`${plural(skipped.duplicateLinks.length, "duplicate link id")} (${named(skipped.duplicateLinks)})`);
     if (model.counts.bayNodes !== model.counts.baysPlaced) {
       notDrawn.push(`${plural(model.counts.bayNodes, "bay row")} in the payload, ${plural(model.counts.baysPlaced, "bay")} drawn`);
