@@ -3,7 +3,12 @@
   // Deadline for one SMART summary read; the main page uses the same value
   // (app.js, #1161).
   const SMART_SUMMARY_REQUEST_TIMEOUT_MS = 15000;
-  const modeIds = new Set(["lanes", "impact", "trace", "disk"]);
+  const modeIds = new Set(["lanes", "impact", "trace", "disk", "topology"]);
+  // The Topology mode is drawn by sas_fabric_topology.js (#937); same copy on every platform.
+  const topologyModeCopy = {
+    title: "Topology",
+    subtitle: "Wiring diagram from the host down to the bays. Hover or focus anything to trace its path; click or Enter pins it; Esc clears.",
+  };
   const modeCopy = {
     lanes: {
       title: "Storage Lanes",
@@ -124,6 +129,9 @@
     inspectorTitle: document.getElementById("fabric-inspector-title"),
     inspectorBody: document.getElementById("fabric-inspector-body"),
     modeButtons: Array.from(document.querySelectorAll("[data-fabric-mode]")),
+    topologySearchRow: document.getElementById("fabric-topology-search-row"),
+    topologySearch: document.getElementById("fabric-topology-search"),
+    topologySearchStatus: document.getElementById("fabric-topology-search-status"),
   };
 
   function list(value) {
@@ -4138,7 +4146,7 @@
 
   function renderModeChrome() {
     const copy = fabricViewCopy(state.fabric);
-    const modeDetails = copy.modes[state.mode] || copy.modes.lanes;
+    const modeDetails = state.mode === "topology" ? topologyModeCopy : copy.modes[state.mode] || copy.modes.lanes;
     if (elements.pageEyebrow) {
       elements.pageEyebrow.textContent = copy.eyebrow;
     }
@@ -4159,6 +4167,9 @@
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
+    if (elements.topologySearchRow) {
+      elements.topologySearchRow.hidden = state.mode !== "topology";
+    }
   }
 
   function renderMap() {
@@ -4197,6 +4208,10 @@
       elements.mapPanel.innerHTML = renderTraceMode(fabric);
     } else if (state.mode === "disk") {
       elements.mapPanel.innerHTML = renderDiskPathMode(fabric);
+    } else if (state.mode === "topology") {
+      elements.mapPanel.innerHTML = window.SasFabricTopology
+        ? window.SasFabricTopology.render(fabric, { expanded: state.expandedSlotLists })
+        : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
     } else {
       elements.mapPanel.innerHTML = renderLanesMode(fabric);
     }
@@ -4210,6 +4225,7 @@
     "data-fabric-breadcrumb",
     "data-fabric-trace-home",
     "data-fabric-expand-slots",
+    "data-fabric-topology-link",
     "data-fabric-alias-edit",
     "data-fabric-alias-input",
     "data-fabric-alias-cancel",
@@ -4683,6 +4699,7 @@
     });
   }
 
+  window.SasFabricTopology?.attach(elements.mapPanel, elements.topologySearch, elements.topologySearchStatus);
   ensureSelectionForMode(state.fabric);
   render();
   if (!state.fabric) {
