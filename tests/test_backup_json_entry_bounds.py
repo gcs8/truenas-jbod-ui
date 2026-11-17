@@ -11,11 +11,16 @@ duplicate-key and syntax validation still cover the skipped values.
 
 from __future__ import annotations
 
+import importlib
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -279,6 +284,101 @@ class FileBackedJsonEntryBoundTests(unittest.TestCase):
                 {MAPPING_FILE_KEY: path},
             )
         self.assertEqual(str(raised.exception.__cause__), ENTRY_LIMIT_MESSAGE)
+
+
+class BackupJsonModuleSplitTests(unittest.TestCase):
+    """The streaming reader lives in backup_json; system_backup keeps its names."""
+
+    MOVED_PLAIN_NAMES = (
+        "JSON_STREAM_CHUNK_CHARS",
+        "MAX_JSON_KEY_CHARS",
+        "JSON_DUPLICATE_CACHE_KIB",
+        "MAX_JSON_ENTRY_NODES",
+        "MAX_JSON_ENTRY_CHARS",
+        "JSON_ENTRY_LIMIT_MESSAGE",
+        "_DiskBackedDuplicateKeyTracker",
+        "_model_entry_field_names",
+    )
+
+    def setUp(self) -> None:
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="json-split-"))
+        self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
+        self.member = self.temp_dir / "mapping.json"
+        self.member.write_text(
+            '{"slot_mappings":{"first":{"slot":0,"ignored":[1]},"second":{"slot":1}}}',
+            encoding="utf-8",
+        )
+
+    def test_backup_json_imports_without_system_backup(self) -> None:
+        script = (
+            "import sys\n"
+            "import history_service.backup_json as moved\n"
+            "assert 'history_service.system_backup' not in sys.modules, 'system_backup was imported'\n"
+            "print(moved._StreamingJSONReader.__module__)\n"
+        )
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "history_service.backup_json")
+
+    def test_system_backup_keeps_the_moved_names(self) -> None:
+        backup_json = importlib.import_module("history_service.backup_json")
+        for name in self.MOVED_PLAIN_NAMES:
+            with self.subTest(name=name):
+                self.assertIs(getattr(system_backup_module, name), getattr(backup_json, name))
+        self.assertTrue(
+            issubclass(system_backup_module._StreamingJSONReader, backup_json._StreamingJSONReader)
+        )
+
+    def test_replaced_reader_on_system_backup_is_used(self) -> None:
+        real_reader = system_backup_module._StreamingJSONReader
+        created: list[Any] = []
+
+        class RecordingReader(real_reader):  # type: ignore[misc, valid-type]
+            def __init__(self, source: Any) -> None:
+                super().__init__(source)
+                created.append(self)
+
+        with mock.patch.object(system_backup_module, "_StreamingJSONReader", RecordingReader):
+            self.assertEqual(_validate(self.member, "slot_mappings", ManualMapping), 2)
+        self.assertEqual(len(created), 1)
+
+    def test_replaced_tracker_on_system_backup_is_used(self) -> None:
+        real_tracker = system_backup_module._DiskBackedDuplicateKeyTracker
+        entered: list[Any] = []
+
+        class RecordingTracker(real_tracker):  # type: ignore[misc, valid-type]
+            __slots__ = ()
+
+            def __enter__(self) -> Any:
+                entered.append(self)
+                return super().__enter__()
+
+        with mock.patch.object(system_backup_module, "_DiskBackedDuplicateKeyTracker", RecordingTracker):
+            self.assertEqual(_validate(self.member, "slot_mappings", ManualMapping), 2)
+        self.assertEqual(len(entered), 1)
+
+    def test_replaced_field_name_helper_on_system_backup_is_used(self) -> None:
+        real_helper = system_backup_module._model_entry_field_names
+        seen: list[Any] = []
+
+        def recording_helper(model: Any) -> frozenset[str] | None:
+            seen.append(model)
+            return real_helper(model)
+
+        recorder = _RecordingModel(ManualMapping)
+        with mock.patch.object(system_backup_module, "_model_entry_field_names", recording_helper):
+            self.assertEqual(_validate(self.member, "slot_mappings", recorder), 2)
+        self.assertEqual(seen, [recorder])
+        self.assertEqual(recorder.values, [{"slot": 0}, {"slot": 1}])
 
 
 if __name__ == "__main__":

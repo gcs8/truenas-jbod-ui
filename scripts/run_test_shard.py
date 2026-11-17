@@ -170,6 +170,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_sas_cdb_malformed_tokens",
         "test_sas_decoder_byte_tokens",
         "test_sas_loginfo_width",
+        "test_sas_sense_ascq_4b_family",
         "test_script_json",
         "test_script_platform_guards",
         "test_scripts_help",

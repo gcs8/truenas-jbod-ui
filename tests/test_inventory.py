@@ -26769,3 +26769,226 @@ class BackgroundSnapshotRefreshSupersessionTests(unittest.IsolatedAsyncioTestCas
         # The public 503 text is unchanged.
         self.assertEqual(str(inventory_module.SnapshotStateBusyError(reason="x")),
                          "The server is busy. Try again in a moment.")
+
+
+# The source collection and command planning methods that live in
+# app.services.inventory_sources, with the kind each has on InventoryService.
+MOVED_SOURCE_COLLECTION_METHODS = {
+    "_summarize_ssh_failures": classmethod,
+    "_ssh_failure_details": classmethod,
+    "_ssh_command_failure_context": staticmethod,
+    "_is_configured_sg_ses_page_probe_failure": staticmethod,
+    "_suppress_scale_configured_sg_ses_failures": classmethod,
+    "_esxi_storcli_runtime_warning": staticmethod,
+    "_extract_enabled_passthrough_addresses": staticmethod,
+    "_extract_megaraid_pci_addresses": staticmethod,
+    "_linux_storage_enrichment_probe_commands": type(lambda: None),
+    "_ssh_inventory_enrichment_probe_commands": type(lambda: None),
+    "_storcli_answered": staticmethod,
+    "_esxi_storcli_initial_commands": type(lambda: None),
+    "_esxi_storcli_fallback_commands": type(lambda: None),
+    "_resolve_esxi_storcli_forms": type(lambda: None),
+    "_dedupe_unseen_ssh_commands": staticmethod,
+    "_esxi_controller_diagnostic_commands": type(lambda: None),
+    "_core_mprutil_seed_probe_commands": type(lambda: None),
+    "_core_mprutil_unit_probe_commands": type(lambda: None),
+    "_smp_counter_clock": staticmethod,
+    "_smp_counter_wall_clock": staticmethod,
+    "_reset_smp_counter_plan": type(lambda: None),
+    "_record_smp_counter_reads": type(lambda: None),
+    "expander_counter_reads": type(lambda: None),
+    "_record_smp_counter_capability": type(lambda: None),
+    "retry_expander_counter_capability": type(lambda: None),
+    "_smp_counter_read_commands": type(lambda: None),
+    "_smp_counter_next_chunks": type(lambda: None),
+    "_core_expander_counter_probe_commands": type(lambda: None),
+    "_core_zpool_by_device_probe_commands": type(lambda: None),
+    "_core_mpr_dmesg_probe_commands": type(lambda: None),
+    "_core_pci_slot_probe_commands": type(lambda: None),
+    "_collect_inventory_source_bundle": type(lambda: None),
+}
+MOVED_SOURCE_COLLECTION_MODULE_NAMES = (
+    "SCALE_CONFIGURED_SG_SES_FAILURE_REGEX",
+    "SSH_LOGIN_FAILURE_REASONS",
+    "SSH_PARTIAL_INTERNAL_ERROR_STATUS",
+    "LINUX_NVME_LIST_SUBSYS_COMMAND",
+    "LINUX_ENCLOSURE_SYSFS_MAP_COMMAND",
+    "SSH_FAILURE_CONTEXTS_BY_COMMAND",
+    "SSH_FAILURE_CONTEXTS_BY_PREFIX",
+    "MPRUTIL_UNIT_COMMAND_PATTERN",
+    "MPRUTIL_UNNUMBERED_READ_PATTERN",
+    "MPRUTIL_SUBCOMMAND_LABELS",
+    "DEFAULT_SSH_FAILURE_CONTEXT",
+    "SSH_COMMAND_FAILURE_REASON",
+    "SourcePublication",
+    "InventorySourceBundle",
+)
+
+
+class InventorySourceCollectionModuleTests(unittest.IsolatedAsyncioTestCase):
+    """The source collector lives in its own module and stays part of the service."""
+
+    def make_service(self, platform="scale"):
+        service, _raw, _bmc = InventoryOverlayStatusTests.make_service(self, platform)
+        service._fetch_scale_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+        return service
+
+    def test_source_collection_module_imports_without_the_inventory_module(self):
+        import subprocess
+        import sys
+
+        code = (
+            "import sys\n"
+            "import app.services.inventory_sources as sources\n"
+            "assert 'app.services.inventory' not in sys.modules, 'inventory module imported'\n"
+            "print(sources.InventorySourceCollectionMixin.__name__)\n"
+        )
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip(), "InventorySourceCollectionMixin")
+
+    def test_moved_methods_stay_reachable_on_the_service_class_and_instance(self):
+        from app.services import inventory_sources
+
+        mixin = inventory_sources.InventorySourceCollectionMixin
+        self.assertIn(mixin, InventoryService.__mro__)
+        service = self.make_service()
+        for name, kind in MOVED_SOURCE_COLLECTION_METHODS.items():
+            with self.subTest(name=name):
+                descriptor = mixin.__dict__[name]
+                self.assertIsInstance(descriptor, kind)
+                # One definition, inherited: no forwarder on the service class.
+                self.assertNotIn(name, InventoryService.__dict__)
+                self.assertIs(inspect.getattr_static(InventoryService, name), descriptor)
+                bound = getattr(service, name)
+                if kind is classmethod:
+                    self.assertIs(bound.__self__, InventoryService)
+                elif kind is staticmethod:
+                    self.assertIs(bound, descriptor.__func__)
+                else:
+                    self.assertIs(bound.__self__, service)
+                    self.assertIs(bound.__func__, descriptor)
+
+    def test_moved_module_names_are_the_same_objects_on_the_inventory_module(self):
+        from app.services import inventory_sources
+
+        for name in MOVED_SOURCE_COLLECTION_MODULE_NAMES:
+            with self.subTest(name=name):
+                self.assertIs(getattr(inventory_module, name), getattr(inventory_sources, name))
+        self.assertIs(inventory_module.InventorySourceCollectionMixin, inventory_sources.InventorySourceCollectionMixin)
+        # The leaf helpers stay defined in, and owned by, the inventory module.
+        for name in ("_drain_inventory_worker", "_certificate_verify_code_label", "_public_source_failure_message"):
+            with self.subTest(helper=name):
+                self.assertEqual(getattr(inventory_module, name).__module__, "app.services.inventory")
+                self.assertIsNot(getattr(inventory_sources, name), getattr(inventory_module, name))
+        # One logger, under the inventory module's name.
+        self.assertIs(inventory_sources.logger, inventory_module.logger)
+        self.assertEqual(inventory_sources.logger.name, "app.services.inventory")
+
+    def test_replacement_on_the_instance_reaches_moved_planning(self):
+        from app.services import inventory_sources
+
+        self.assertIn("_ssh_inventory_enrichment_probe_commands", inventory_sources.InventorySourceCollectionMixin.__dict__)
+        service = self.make_service("linux")
+        # Control: nothing replaced, no seed command and no GPIO read.
+        self.assertNotIn("cat /sys/kernel/debug/gpio", service._ssh_inventory_enrichment_probe_commands([]))
+        # A moved sibling and a host callback, both replaced on the instance.
+        service._should_probe_unifi_gpio_debug = lambda results: True
+        self.assertIn("cat /sys/kernel/debug/gpio", service._ssh_inventory_enrichment_probe_commands([]))
+        service._core_mprutil_seed_probe_commands = lambda results: ["synthetic seed"]
+        self.assertEqual(service._ssh_inventory_enrichment_probe_commands([]), ["synthetic seed"])
+
+    def test_replacement_on_the_class_reaches_moved_class_and_static_methods(self):
+        from app.services import inventory_sources
+
+        mixin = inventory_sources.InventorySourceCollectionMixin
+        self.assertIn("_ssh_failure_details", mixin.__dict__)
+        self.assertIn("_esxi_storcli_runtime_warning", mixin.__dict__)
+        failed = SSHCommandResult(command="synthetic read", ok=False, stderr="", exit_code=1)
+        # Control: the default context names the command by its position.
+        self.assertEqual(InventoryService._ssh_failure_details([failed])[0]["context"], "ssh_command_1")
+        replaced_context = {"context": "synthetic_context", "context_label": "Synthetic", "criticality": "enrichment"}
+        with patch.object(InventoryService, "_ssh_command_failure_context", return_value=replaced_context):
+            self.assertEqual(InventoryService._ssh_failure_details([failed])[0]["context"], "synthetic_context")
+
+        outputs = {"storcli /c0 show": "Number of Controllers = 0", "lspci": "", "esxcli hardware pci pcipassthru list": ""}
+        control = InventoryService._esxi_storcli_runtime_warning(outputs)
+        self.assertNotIn("0000:03:00.0", control or "")
+        # The literal ``InventoryService.`` lookups inside the moved static method read the class at call time.
+        with patch.object(InventoryService, "_extract_megaraid_pci_addresses", return_value=["0000:03:00.0"]), \
+                patch.object(InventoryService, "_extract_enabled_passthrough_addresses", return_value={"0000:03:00.0"}):
+            replaced = InventoryService._esxi_storcli_runtime_warning(outputs)
+        self.assertIn("0000:03:00.0", replaced or "")
+
+    async def test_replacement_on_the_inventory_module_reaches_moved_collection(self):
+        from app.services import inventory_sources
+
+        self.assertIn("_collect_inventory_source_bundle", inventory_sources.InventorySourceCollectionMixin.__dict__)
+        service = self.make_service()
+        service.truenas_client.fetch_all.side_effect = RuntimeError("SYNTHETIC-SECRET")
+        with patch("app.services.inventory.logger.exception"):
+            control = await service._collect_inventory_source_bundle()
+        self.assertNotEqual(control.sources["api"].message, "synthetic public message")
+
+        drained = []
+        original_drain = inventory_module._drain_inventory_worker
+
+        async def drain(worker):
+            drained.append(worker)
+            return await original_drain(worker)
+
+        with patch.object(inventory_module, "_public_source_failure_message", return_value="synthetic public message"), \
+                patch.object(inventory_module, "_drain_inventory_worker", side_effect=drain), \
+                patch("app.services.inventory.logger.exception") as error_log:
+            bundle = await service._collect_inventory_source_bundle()
+        self.assertEqual(bundle.sources["api"].message, "synthetic public message")
+        self.assertEqual(len(drained), 1, "the BMC read drains through the inventory module's helper")
+        error_log.assert_called()
+
+        import ssl
+
+        service.truenas_client.fetch_all.side_effect = ssl.SSLCertVerificationError("synthetic verify failure")
+        with patch.object(inventory_module, "_certificate_verify_code_label", return_value="synthetic label"), \
+                patch("app.services.inventory.logger.exception"), patch("app.services.inventory.logger.error"):
+            bundle = await service._collect_inventory_source_bundle()
+        self.assertIn("certificate verification failed (synthetic label).", bundle.sources["api"].message)
+
+    async def test_moved_collection_logs_through_the_inventory_logger(self):
+        from app.services import inventory_sources
+
+        self.assertIs(inventory_sources.logger, inventory_module.logger)
+        service = self.make_service()
+        service.truenas_client.fetch_all.side_effect = RuntimeError("SYNTHETIC-SECRET")
+        with self.assertLogs("app.services.inventory", level="ERROR") as captured:
+            await service._collect_inventory_source_bundle()
+        self.assertTrue(captured.records)
+        self.assertEqual({record.name for record in captured.records}, {"app.services.inventory"})
+
+    def test_mixin_docstring_lists_exactly_what_it_reads_on_its_host(self):
+        import ast
+        import re
+
+        from app.services import inventory_sources
+
+        mixin = inventory_sources.InventorySourceCollectionMixin
+        tree = ast.parse(Path(inventory_sources.__file__).read_text(encoding="utf-8"))
+        node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == mixin.__name__)
+        defined = {item.name for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        read = {
+            item.attr
+            for item in ast.walk(node)
+            if isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name) and item.value.id in {"self", "cls"}
+        }
+        literal = {
+            call.args[1].value
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "getattr"
+            and len(call.args) >= 2 and isinstance(call.args[0], ast.Name) and call.args[0].id == "self"
+            and isinstance(call.args[1], ast.Constant)
+        }
+        documented = set(re.findall(r"``([A-Za-z_][A-Za-z0-9_]*)``", mixin.__doc__))
+        documented -= {"InventoryService", "_reset_smp_counter_plan"}
+        self.assertEqual(documented, (read | literal) - defined)

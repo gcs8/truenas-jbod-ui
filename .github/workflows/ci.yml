@@ -152,7 +152,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
         run: |
@@ -167,6 +167,13 @@ jobs:
           # fragment already on the base unless `changelog-edit-ok` is
           # applied. The gate script itself only runs git; it never talks to
           # the network.
+          #
+          # The checkout is the merge commit of the pull request. The script
+          # takes the base from its first parent, after confirming the second
+          # parent is this pull request's head. The base commit in the event
+          # payload is not used: it stays where the pull request opened, so
+          # after another pull request merges it no longer matches the base
+          # this commit was merged with.
           labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
 
           # Only a contributor with write access can apply `no-changelog`, so
@@ -181,7 +188,7 @@ jobs:
           esac
 
           python3 scripts/check_changelog_entry.py \
-            --base "$PR_BASE_SHA" \
+            --merged-head "$PR_HEAD_SHA" \
             --head HEAD \
             --pr "$PR_NUMBER" \
             --labels "$labels" \

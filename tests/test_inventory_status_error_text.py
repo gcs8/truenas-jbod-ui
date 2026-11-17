@@ -670,7 +670,7 @@ class FailureOriginTests(_InventoryFixture):
                 self.assertEqual(record.name, "app.services.inventory")
                 self.assertIn(f"exception={type_name}", record.getMessage())
                 # Stack frames, so the bug can be found; no exception message.
-                self.assertIn("inventory.py", record.getMessage())
+                self.assertRegex(record.getMessage(), r"\binventory(?:_sources)?\.py:\d+ in ")
                 self.assertFalse(record.exc_info)
                 self.assertNotIn(PRIVATE_MARKER, logs.text())
                 self.assertNotIn(PRIVATE_MARKER, serialized)

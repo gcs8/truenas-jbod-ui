@@ -828,7 +828,14 @@ class CIWorkflowContractTests(unittest.TestCase):
         gate_step = next(
             step for step in job["steps"] if "check_changelog_entry.py" in str(step.get("run", ""))
         )
-        self.assertEqual(gate_step["env"]["PR_BASE_SHA"], "${{ github.event.pull_request.base.sha }}")
+        # The base is read from the checked-out merge commit. The base recorded
+        # in the event goes stale as soon as another pull request merges.
+        self.assertNotIn("ref", checkout["with"])
+        self.assertNotIn("PR_BASE_SHA", gate_step["env"])
+        self.assertNotIn("--base", gate_step["run"])
+        self.assertEqual(gate_step["env"]["PR_HEAD_SHA"], "${{ github.event.pull_request.head.sha }}")
+        self.assertIn('--merged-head "$PR_HEAD_SHA"', gate_step["run"])
+        self.assertIn("--head HEAD", gate_step["run"])
         self.assertEqual(gate_step["env"]["PR_NUMBER"], "${{ github.event.pull_request.number }}")
         self.assertNotIn("${{", gate_step["run"])
         self.assertIn('--labels "$labels"', gate_step["run"])
