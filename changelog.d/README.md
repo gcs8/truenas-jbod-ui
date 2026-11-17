@@ -58,6 +58,10 @@ tense:
   tooling reads every `(#N)` as a pull request reference. A plain mention of
   an issue or another pull request in the sentence is allowed, for example
   `see #123`;
+- no control or formatting character: no tab, no lone carriage return, no
+  line or paragraph separator, no bidi control or zero-width character. The
+  check names the file and shows the character escaped, for example `\t`.
+  Ordinary line ends, LF or CRLF, are fine;
 - it may wrap over several lines; at most 4096 bytes.
 
 A fragment that is already on `main` belongs to its pull request: another pull

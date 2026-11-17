@@ -98,6 +98,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_bounded_parser_work",
         "test_changelog_entry_gate",
         "test_changelog_fragments",
+        "test_changelog_gate_output",
         "test_dev_check",
         "test_disk_retention_accounting",
         "test_heap_probe",
