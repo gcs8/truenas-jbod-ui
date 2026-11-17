@@ -47,6 +47,7 @@ EXPECTED_INPUT_PATHS = {
     Path("scripts/public_demo_inputs.py"),
     Path("scripts/public_demo_source_parity.py"),
     Path("app/static/app.js"),
+    Path("app/static/app_smart_formatters.js"),
     Path("app/static/style.css"),
     Path("app/templates/base.html"),
     Path("app/templates/index.html"),
@@ -195,6 +196,23 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         self.assertEqual(set(actual), EXPECTED_INPUT_PATHS)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertEqual(actual, tuple(sorted(actual, key=lambda path: path.as_posix())))
+
+    def test_inlined_smart_formatters_are_a_declared_input_with_their_own_marker(self) -> None:
+        inputs = importlib.import_module("scripts.public_demo_inputs")
+        parity = importlib.import_module("scripts.public_demo_source_parity")
+        formatters = Path("app/static/app_smart_formatters.js")
+
+        self.assertIn(formatters, inputs.PUBLIC_DEMO_INPUT_PATHS)
+        self.assertEqual(
+            parity.INLINE_SOURCE_WRAPPERS[formatters],
+            ('<script data-inline-source="app_smart_formatters.js">\n', "\n</script>"),
+        )
+        self.assertEqual(parity.INLINE_SOURCE_WRAPPERS[Path("app/static/app.js")], ("<script>\n", "\n</script>"))
+        recorded = parity.recorded_parity_rules(
+            (ROOT / "scripts/public_demo_source_parity.py").read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(recorded)
+        self.assertEqual(recorded.inline_wrappers, parity.INLINE_SOURCE_WRAPPERS)
 
     def test_shared_input_graph_covers_recursive_local_python_imports(self) -> None:
         module = importlib.import_module("scripts.public_demo_inputs")

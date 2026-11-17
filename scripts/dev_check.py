@@ -17,6 +17,7 @@ from typing import TextIO
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_JAVASCRIPT_PATHS = (
     "app/static/app.js",
+    "app/static/app_smart_formatters.js",
     "app/static/sas_fabric_view.js",
     "app/static/sas_fabric_topology.js",
     "admin_service/static/admin.js",
@@ -70,6 +71,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
             "set -euo pipefail",
             "shopt -s nullglob",
             "node --check app/static/app.js",
+            "node --check app/static/app_smart_formatters.js",
             "node --check app/static/sas_fabric_view.js",
             "node --check app/static/sas_fabric_topology.js",
             "node --check admin_service/static/admin.js",

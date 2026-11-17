@@ -39,6 +39,7 @@ OFFLINE_IMAGE_INPUTS: dict[Path, str] = {
 }
 INLINE_SOURCE_WRAPPERS: dict[Path, tuple[str, str]] = {
     Path("app/static/app.js"): ("<script>\n", "\n</script>"),
+    Path("app/static/app_smart_formatters.js"): ('<script data-inline-source="app_smart_formatters.js">\n', "\n</script>"),
     Path("app/static/style.css"): ("<style>\n", "\n</style>"),
 }
 # This module as it existed at a recorded revision. Like the input

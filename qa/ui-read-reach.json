@@ -5,7 +5,7 @@
   "main": {
    "service": "ui",
    "template": "app/templates/index.html",
-   "scripts": ["app/static/app.js"],
+   "scripts": ["app/static/app_smart_formatters.js","app/static/app.js"],
    "scopes": {
     "enclosure": [
      {"method":"GET","path":"/api/history/scope","class":"read","query":["enclosure_id","event_limit","metric_limit","metrics","slots","storage_view_id","system_id","window_hours"],"bind":["system_id","enclosure_id"],"bind_if_sent":["storage_view_id"],"sites":["app/static/app.js#heatmapHistoryScopeRequest"]},
