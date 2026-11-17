@@ -8,7 +8,9 @@ own module in as `store_module` (and itself as `store` for the instance
 helpers). Every store-module name, including `HistoryStore`, its constants and
 its logger, is looked up on `store_module` at call time, so a replacement made
 on the store module or class still reaches this code. This module does not
-import the store module.
+import the store module. Multi-line SQL keeps the indentation it had in the
+class, so every statement, and the index SQL a new database stores, is
+byte-for-byte the released text.
 """
 
 from __future__ import annotations
@@ -40,11 +42,11 @@ def _synchronize_table_counts(store_module: ModuleType, connection: sqlite3.Conn
             continue
         connection.execute(
             f"""
-            INSERT INTO history_table_counts (table_name, row_count)
-            VALUES (?, (SELECT COUNT(*) FROM {table_name}))
-            ON CONFLICT (table_name) DO UPDATE SET
-                row_count = excluded.row_count
-            """,
+                INSERT INTO history_table_counts (table_name, row_count)
+                VALUES (?, (SELECT COUNT(*) FROM {table_name}))
+                ON CONFLICT (table_name) DO UPDATE SET
+                    row_count = excluded.row_count
+                """,
             (table_name,),
         )
         counted.append(table_name)
@@ -113,10 +115,10 @@ def _recount_implausible_table_counts(
 def _recount_table(store_module: ModuleType, connection: sqlite3.Connection, table_name: str) -> None:
     connection.execute(
         f"""
-        UPDATE history_table_counts
-        SET row_count = (SELECT COUNT(*) FROM {table_name})
-        WHERE table_name = ?
-        """,
+            UPDATE history_table_counts
+            SET row_count = (SELECT COUNT(*) FROM {table_name})
+            WHERE table_name = ?
+            """,
         (table_name,),
     )
 
@@ -166,18 +168,18 @@ def _backfill_disk_identity_batch(
 ) -> int:
     cursor = connection.execute(
         f"""
-        UPDATE {table_name}
-        SET disk_identity_key =
-            lower(trim(serial)) || '|' ||
-            lower(trim(coalesce(nullif(persistent_id_label, ''), 'unknown'))) || '|' ||
-            lower(trim(gptid))
-        WHERE rowid IN (
-            SELECT rowid
-            FROM {table_name}
-            WHERE {store_module._DISK_IDENTITY_BACKFILL_PENDING_SQL}
-            LIMIT ?
-        )
-        """,
+            UPDATE {table_name}
+            SET disk_identity_key =
+                lower(trim(serial)) || '|' ||
+                lower(trim(coalesce(nullif(persistent_id_label, ''), 'unknown'))) || '|' ||
+                lower(trim(gptid))
+            WHERE rowid IN (
+                SELECT rowid
+                FROM {table_name}
+                WHERE {store_module._DISK_IDENTITY_BACKFILL_PENDING_SQL}
+                LIMIT ?
+            )
+            """,
         (batch_size,),
     )
     return max(0, int(cursor.rowcount))
@@ -186,15 +188,15 @@ def _backfill_disk_identity_batch(
 def _ensure_identity_indexes(store_module: ModuleType, connection: sqlite3.Connection) -> None:
     connection.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_slot_state_disk_identity
-            ON slot_state_current (disk_identity_key)
-        """
+            CREATE INDEX IF NOT EXISTS idx_slot_state_disk_identity
+                ON slot_state_current (disk_identity_key)
+            """
     )
     connection.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_metric_samples_disk_identity
-            ON metric_samples (disk_identity_key, metric_name, observed_at DESC)
-        """
+            CREATE INDEX IF NOT EXISTS idx_metric_samples_disk_identity
+                ON metric_samples (disk_identity_key, metric_name, observed_at DESC)
+            """
     )
 
 

@@ -1997,6 +1997,33 @@ class StoreSchemaModuleTests(unittest.TestCase):
             store_module.HISTORY_COUNTED_TABLES,
         )
 
+    def test_moved_sql_text_is_byte_for_byte_the_released_text(self) -> None:
+        # A fresh database stores the identity index SQL as released, with its
+        # original whitespace.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            HistoryStore(str(path), recover_unreadable_database=False)
+            with closing(sqlite3.connect(path)) as connection:
+                stored = dict(
+                    connection.execute(
+                        "SELECT name, sql FROM sqlite_master WHERE name LIKE 'idx_%_disk_identity'"
+                    ).fetchall()
+                )
+        self.assertEqual(
+            stored,
+            {
+                "idx_slot_state_disk_identity": (
+                    "CREATE INDEX idx_slot_state_disk_identity\n"
+                    "                ON slot_state_current (disk_identity_key)\n            "
+                ),
+                "idx_metric_samples_disk_identity": (
+                    "CREATE INDEX idx_metric_samples_disk_identity\n"
+                    "                ON metric_samples (disk_identity_key, metric_name, observed_at DESC)\n"
+                    "            "
+                ),
+            },
+        )
+
     def test_store_schema_opens_ends_and_locks_nothing(self) -> None:
         import ast
 
