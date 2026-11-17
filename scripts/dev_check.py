@@ -124,6 +124,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_logging_config",
     "tests.test_nonroot_cli",
     "tests.test_parsers",
+    "tests.test_placement_index",
     "tests.test_profile_builder",
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
