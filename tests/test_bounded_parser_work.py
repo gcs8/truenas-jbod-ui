@@ -75,6 +75,13 @@ from app.services.sas_fabric_parsers import (
     parse_pciconf_sas_controllers,
 )
 
+# Modules whose code moved out of a measured module. `measure(module, ...)` also
+# meters each module listed here for it, so calls that reach the moved code
+# through a name kept on the old module are still counted.
+ALSO_METERED: dict[str, tuple[types.ModuleType, ...]] = {
+    parsers.__name__: (parsers_smart,),
+}
+
 SIZES = (2000, 4000, 8000)
 # Doubling the input of a linear pass doubles the count plus a constant.
 MAX_GROWTH_PER_DOUBLING = 2.5
@@ -200,7 +207,8 @@ def measure(
     """Run `call` and count regex and Python-line work inside `module`."""
 
     meter = _WorkMeter(linear_patterns)
-    target_file = module.__file__
+    modules = (module, *ALSO_METERED.get(module.__name__, ()))
+    target_files = {metered.__file__ for metered in modules}
 
     def local_trace(frame, event, arg):  # noqa: ANN001, ANN202 - trace protocol
         if event == "line":
@@ -208,14 +216,16 @@ def measure(
         return local_trace
 
     def global_trace(frame, event, arg):  # noqa: ANN001, ANN202 - trace protocol
-        if frame.f_code.co_filename == target_file:
+        if frame.f_code.co_filename in target_files:
             return local_trace
         return None
 
-    patches: list = [mock.patch.object(module, "re", _metered_re(meter))]
-    for name, value in vars(module).items():
-        if isinstance(value, re.Pattern):
-            patches.append(mock.patch.object(module, name, _MeteredPattern(value, meter)))
+    patches: list = []
+    for metered in modules:
+        patches.append(mock.patch.object(metered, "re", _metered_re(meter)))
+        for name, value in vars(metered).items():
+            if isinstance(value, re.Pattern):
+                patches.append(mock.patch.object(metered, name, _MeteredPattern(value, meter)))
     for patcher in patches:
         patcher.start()
     previous = sys.gettrace()
@@ -252,6 +262,41 @@ class BoundedWorkAssertions(unittest.TestCase):
                 SIZES[0],
                 f"a regex was handed {max_region} characters of a {length}-character input",
             )
+
+
+class MovedParserCodeIsMeteredTests(unittest.TestCase):
+    """Work done by code moved out of `parsers` is still counted by `measure(parsers, ...)`."""
+
+    # (call through a name kept on parsers, result, regex calls, regex work), as measured
+    # before the SMART readers moved to parsers_smart.
+    CASES = (
+        ("normalize_hex_identifier", lambda: parsers.normalize_hex_identifier("0x10"), "10", 2, 32),
+        (
+            "_parse_sg_ses_common_field",
+            lambda: parsers._parse_sg_ses_common_field("attached SAS address: 0x10"),
+            ("attached_sas_address", "10"),
+            2,
+            32,
+        ),
+        (
+            "parse_smartctl_text_enrichment",
+            lambda: parsers.parse_smartctl_text_enrichment(
+                "SATA Version is:  SATA 3.3, 6.0 Gb/s (current: 6.0 Gb/s)\n"
+            )["available"],
+            True,
+            1,
+            1444,
+        ),
+    )
+
+    def test_calls_through_parsers_meter_the_moved_code(self) -> None:
+        for name, call, expected, regex_calls, regex_work in self.CASES:
+            with self.subTest(name=name):
+                result, meter = measure(parsers, call)
+                self.assertEqual(result, expected)
+                self.assertEqual(meter.regex_calls, regex_calls)
+                self.assertEqual(meter.regex_work, regex_work)
+                self.assertGreater(meter.python_lines, 0)
 
 
 class MprCdbDecodeWorkTests(BoundedWorkAssertions):
