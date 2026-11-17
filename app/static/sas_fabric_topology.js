@@ -2180,8 +2180,9 @@
 
   function renderTopology(model, view = {}) {
     const path = activePath(model, view);
-    const used = new Set();
-    if (path) used.add("is-on-path");
+    // The traced-path entry is listed whatever is traced, so hover, focus,
+    // search and a pin never change the legend's height above the drawing.
+    const used = new Set(["is-on-path"]);
     const lines = [];
     const labels = [];
     for (const link of model.links) {

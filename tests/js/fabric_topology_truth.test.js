@@ -28,6 +28,13 @@ function cellsOf(html) {
   return cells;
 }
 
+// The drawing alone, without the legend's swatches.
+function drawing(html) {
+  const found = /<div class="fabric-topology-scroll">[\s\S]*?<\/svg><\/div>/.exec(html);
+  assert.ok(found, "a drawing is shown");
+  return found[0];
+}
+
 function points(html, linkId) {
   const escaped = linkId.replace(/>/g, "&gt;").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = new RegExp(`<polyline class="topo-link[^"]*" data-topo-link="${escaped}" points="([^"]+)"`).exec(html);
@@ -247,7 +254,7 @@ test("pin and search belong to one system and enclosure, and a typed search clea
   T.render(second, {});
   assert.equal(dom.search.value, "");
   assert.equal(dom.status.textContent, "");
-  assert.doesNotMatch(T.renderTopology(T.buildTopologyModel(second), T.view()), /is-on-path/);
+  assert.doesNotMatch(drawing(T.renderTopology(T.buildTopologyModel(second), T.view())), /is-on-path/);
   // Leaving the mode clears them too.
   dom.search.value = "bay 4";
   dom.searchHandlers.get("input")();
@@ -798,7 +805,7 @@ test("leaving Topology through the mode buttons clears its pin, trace and search
     assert.equal(T.view().pin, null, variant);
     assert.equal(T.view().query, "", variant);
     assert.equal(search.value, "", variant);
-    assert.doesNotMatch(panel.innerHTML, /is-on-path|is-pinned/, variant);
+    assert.doesNotMatch(drawing(panel.innerHTML), /is-on-path|is-pinned/, variant);
   }
 });
 
@@ -1536,4 +1543,42 @@ test("a control kept in place above the drawing's top edge gets room there, and 
   click({ "data-fabric-expand-slots": shelf.key });
   assert.equal(origin()[1], 0, "no room before the top edge once the view does not need it");
   assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), was, "expanding again moves nothing");
+});
+
+// At 390 px a pin that added the traced-path entry made the legend a row
+// taller and moved the drawing down under the pointer.
+test("hover, focus, search and a pin never change the legend's entries, so the drawing does not move", () => {
+  const T = H.loadTopology();
+  for (const [name, fabric] of [["four shelves", H.fourShelves().fabric], ["1,024-bay shelf", bigShelf()], ["cascade", cases.core_cascade.fabric]]) {
+    const model = T.buildTopologyModel(fabric, { width: 322 });
+    const legend = (view) => /<div class="fabric-topology-legend"[^>]*>[\s\S]*?<\/div>/.exec(T.renderTopology(model, view))[0];
+    const idle = legend({});
+    const link = [...model.links].find((item) => !item.bundle);
+    const bay = [...model.bays][0];
+    assert.ok(link && bay, name);
+    const query = bay.number === "" ? bay.label : `bay ${bay.number}`;
+    assert.ok(T.searchTopology(model, query).matches.length, `${name}: "${query}" finds a bay`);
+    const views = {
+      "hover or focus on a line": { hover: { kind: "link", id: link.id } },
+      "hover or focus on a bay": { hover: { kind: "bay", id: bay.bayId } },
+      "a pinned line": { pin: { kind: "link", id: link.id } },
+      "a pinned bay": { pin: { kind: "bay", id: bay.bayId } },
+      "a search": { query },
+    };
+    for (const [what, view] of Object.entries(views)) {
+      assert.match(drawing(T.renderTopology(model, view)), /is-on-path/, `${name}, ${what}: something is traced`);
+      assert.equal(legend(view), idle, `${name}, ${what}: the same legend`);
+    }
+    assert.match(idle, /data-topology-legend="is-on-path"/, `${name}: the traced-path entry is listed before anything is traced`);
+  }
+  // Through the page at 390 px: pinning a line keeps the box where it was.
+  const { panel, click } = topologyPage(cases.core_cascade.fabric, { inner: 322, height: 658 });
+  const legendOf = () => /<div class="fabric-topology-legend"[^>]*>[\s\S]*?<\/div>/.exec(panel.innerHTML)[0];
+  const before = legendOf();
+  const top = panel.box.getBoundingClientRect().top;
+  const [link] = [...H.loadTopology().buildTopologyModel(cases.core_cascade.fabric, { width: 322 }).links].filter((item) => !item.bundle);
+  click({ "data-topo-link": link.id, "data-fabric-topology-link": link.id });
+  assert.match(panel.innerHTML, /data-topology-pin>Pinned: /, "the line is pinned");
+  assert.equal(legendOf(), before, "the pin leaves the legend as it was");
+  assert.equal(panel.box.getBoundingClientRect().top, top, "and the drawing's box where it was");
 });
