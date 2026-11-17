@@ -1039,10 +1039,13 @@ test("the trace sentence sticks to the window's bottom in an opaque band whose r
   assert.match(view, /--topology-trace-line:\s*1\.25rem;/);
   const reserved = (text) => Number(/--topology-trace-lines:\s*(\d+);/.exec(text)?.[1]);
   assert.equal(reserved(view), 1, "one line on wide pages");
+  assert.equal(reserved(cssRule(mediaBlock(css, 1480), ".fabric-topology")), 2, "two lines up to 1480 px, beside the inspector");
   assert.equal(reserved(cssRule(mediaBlock(css, 1240), ".fabric-topology")), 2, "two lines up to 1240 px, the page's one-column width");
   assert.equal(reserved(cssRule(mediaBlock(css, 640), ".fabric-topology")), 3, "three lines at phone width");
   assert.match(ROOT_CSS, /@media \(max-width: 1240px\)/, "an existing page breakpoint");
+  assert.ok(css.indexOf("@media (max-width: 1480px)") < css.indexOf("@media (max-width: 1240px)"), "the narrower rule comes later and wins");
   assert.ok(css.indexOf("@media (max-width: 1240px)") < css.indexOf("@media (max-width: 640px)"), "the narrower rule comes last and wins");
+  assert.match(mediaBlock(css, 1480), /^\s*\.fabric-topology\s*\{\s*--topology-trace-lines:\s*2;\s*\}\s*$/, "the 1480 px rule changes only the reserved lines");
   // The band's whole height: its lines, padding on both sides and its border.
   const padding = /padding:\s*(\d+)px 0;/.exec(band);
   assert.ok(padding, "vertical padding in px");
@@ -1221,5 +1224,41 @@ test("the trace band's reserved height is the whole band at every breakpoint, un
     seen.push(reserved);
   }
   assert.equal(sizing.value, "border-box", "the page sizes every box by its border");
-  assert.deepEqual(seen, [29, 49, 69], "29, 49 and 69 px bands");
+  assert.deepEqual(seen, [29, 49, 49, 69], "29, 49, 49 and 69 px bands");
+  // Beside the inspector (above 1240 px) the band is the window less 466 px:
+  // the inspector's 380 px, the 12 px gap and the page's padding. Each line is
+  // filled word by word at 7.25 px a character (the text's 16 px Arial-metric
+  // glyphs, which give the line counts a browser showed at 390 px) plus a 10%
+  // margin. The three sentence forms, as the browser showed them for a link:
+  const label = "Link mpr1 to 5000b00000000010, 4 lanes, 12 Gb/s, PHYs 0, 1, 2, 3 to PHYs 32, 33, 34, 35";
+  const forms = [`Tracing: ${label}.`, `Pinned: ${label}. Esc clears.`, `Tracing: ${label}. Pinned item kept; Esc clears.`];
+  const glyph = 7.25 * 1.1;
+  const lines = (text, width) => {
+    let count = 1;
+    let used = 0;
+    for (const word of text.split(" ")) {
+      const wide = word.length * glyph;
+      if (used && used + glyph + wide > width) {
+        count += 1;
+        used = 0;
+      }
+      used += (used ? glyph : 0) + wide;
+    }
+    return count;
+  };
+  // The narrowest max-width rule that reaches a width comes last and wins.
+  const count = (text) => Number(/--topology-trace-lines:\s*(\d+);/.exec(text)?.[1]);
+  const limits = [...css.matchAll(/@media \(max-width: (\d+)px\)/g)].map((match) => Number(match[1]))
+    .filter((limit) => count(cssRule(mediaBlock(css, limit), ".fabric-topology")));
+  const reservedAt = (width) => {
+    const rule = limits.filter((limit) => width <= limit).sort((a, b) => a - b)[0];
+    return count(rule ? cssRule(mediaBlock(css, rule), ".fabric-topology") : view);
+  };
+  for (let width = 1241; width <= 3840; width += 1) {
+    const needed = Math.max(...forms.map((text) => lines(text, width - 466)));
+    assert.ok(needed <= reservedAt(width), `${width} px: ${needed} line(s) for ${reservedAt(width)} reserved`);
+  }
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1241 - 466))), 2, "two lines needed just above 1240 px");
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1481 - 466))), 1, "one line just above 1480 px, with the margin");
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1478 - 466))), 2, "the margin is used up just below 1480 px");
 });

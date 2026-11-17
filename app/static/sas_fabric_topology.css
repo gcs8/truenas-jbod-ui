@@ -476,6 +476,14 @@ body.fabric-topology-mode .fabric-page-shell {
   opacity: 0.3;
 }
 
+/* Beside the inspector, up to 1480 px, the band is too narrow for the
+   longest trace sentence on one line: two lines are reserved there too. */
+@media (max-width: 1480px) {
+  .fabric-topology {
+    --topology-trace-lines: 2;
+  }
+}
+
 /* One-column pages, where the inspector moves below the drawing: the
    longest trace sentence takes two lines. */
 @media (max-width: 1240px) {
