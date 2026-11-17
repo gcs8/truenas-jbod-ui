@@ -99,6 +99,7 @@ CROSS_PACKAGE_IMPORTS: dict[tuple[str, str], tuple[str, ...]] = {
         "admin_service/services/maintenance.py",
     ),
     ("app", "history_service"): (
+        "app/history_routes.py",
         "app/metrics.py",
         "app/routes.py",
         "app/services/backup_health.py",
