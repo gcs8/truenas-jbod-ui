@@ -235,8 +235,8 @@ test("diagnostic evidence starts collapsed behind an operator summary", () => {
 
 test("Fabric modes retain simpler pressed-button toolbar semantics", () => {
   assert.match(FABRIC_TEMPLATE, /class="fabric-mode-tabs" role="group" aria-label="Storage Fabric map mode"/);
-  assert.equal((FABRIC_TEMPLATE.match(/data-fabric-mode=/g) || []).length, 4);
-  assert.equal((FABRIC_TEMPLATE.match(/aria-pressed=/g) || []).length, 4);
+  assert.equal((FABRIC_TEMPLATE.match(/data-fabric-mode=/g) || []).length, 5);
+  assert.equal((FABRIC_TEMPLATE.match(/aria-pressed=/g) || []).length, 5);
   assert.doesNotMatch(FABRIC_TEMPLATE, /role="tab(list)?"/);
 });
 

@@ -184,8 +184,8 @@ test("Fabric mode controls use button-group semantics without fake tabs", () => 
   assert.ok(groupLine);
   assert.match(groupLine, /role="group"/);
   assert.doesNotMatch(groupLine, /role="tablist"/);
-  assert.equal((template.match(/data-fabric-mode=/g) || []).length, 4);
-  assert.equal((template.match(/aria-pressed=/g) || []).length, 4);
+  assert.equal((template.match(/data-fabric-mode=/g) || []).length, 5);
+  assert.equal((template.match(/aria-pressed=/g) || []).length, 5);
 });
 
 test("dynamic panels announce status nodes instead of rebuilt panel contents", () => {
