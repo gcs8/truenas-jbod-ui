@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts import check_changelog_entry as gate
@@ -449,14 +450,63 @@ class ChangelogEntryGateTests(unittest.TestCase):
             "not a merge": (head, head),
             "second parent is another commit": (merge_commit, base_when_opened),
             "parents swapped": (merge_commit, _git(self.repo, "rev-parse", "main").strip()),
-            "abbreviated head": (merge_commit, head[:12]),
-            "option-like head": (merge_commit, "--help"),
-            "ref name instead of a commit id": (merge_commit, "topic"),
-            "empty head": (merge_commit, ""),
         }
         for label, (checked_out, pull_request_head) in cases.items():
-            with self.subTest(label), self.assertRaises(gate.GateError):
+            with self.subTest(label), self.assertRaisesRegex(gate.GateError, "is not the merge of pull request head"):
                 gate.merge_commit_base(self.repo, head=checked_out, pull_request_head=pull_request_head)
+
+    def test_merge_commit_base_refuses_a_merge_with_more_than_two_parents(self) -> None:
+        base_when_opened, head, _merge_commit = self._merged_pull_request()
+        _git(self.repo, "checkout", "-q", "-b", "extra", base_when_opened)
+        self._write("app/extra.py", "EXTRA = 1\n")
+        self._commit("feat: a third line of history")
+        _git(self.repo, "checkout", "-q", "--detach", "main")
+        _git(self.repo, "merge", "-q", "--no-edit", "topic", "extra")
+        three_parent_merge = _git(self.repo, "rev-parse", "HEAD").strip()
+        parents = _git(self.repo, "rev-list", "--parents", "--max-count=1", three_parent_merge).split()[1:]
+        self.assertEqual(len(parents), 3)
+        self.assertEqual(parents[1], head)
+
+        with self.assertRaisesRegex(gate.GateError, "is not the merge of pull request head"):
+            gate.merge_commit_base(self.repo, head=three_parent_merge, pull_request_head=head)
+
+    def test_merge_commit_base_checks_the_pull_request_head_before_running_git(self) -> None:
+        _base_when_opened, head, merge_commit = self._merged_pull_request()
+
+        cases = {
+            "abbreviated": head[:12],
+            "upper case": head.upper(),
+            "one character short": head[:-1],
+            "one character long": head + "0",
+            "option-like": "--help",
+            "ref name": "topic",
+            "empty": "",
+            "trailing newline": head + "\n",
+            "leading space": " " + head,
+        }
+        for label, pull_request_head in cases.items():
+            with (
+                self.subTest(label),
+                mock.patch.object(gate, "_git", side_effect=AssertionError("git must not run")),
+                self.assertRaisesRegex(gate.GateError, "must be a full lowercase commit id"),
+            ):
+                gate.merge_commit_base(self.repo, head=merge_commit, pull_request_head=pull_request_head)
+
+    def test_merge_commit_base_never_reads_the_checked_out_commit_as_an_option(self) -> None:
+        _base_when_opened, head, _merge_commit = self._merged_pull_request()
+
+        # Without the end-of-options marker, --all would list the merge commit
+        # that is checked out and the gate would accept it.
+        for option in ("--all", "--max-count=5", "--help", "-n1"):
+            with self.subTest(option), self.assertRaisesRegex(gate.GateError, "bad revision"):
+                gate.merge_commit_base(self.repo, head=option, pull_request_head=head)
+            with self.subTest(f"command line {option}"), contextlib.redirect_stdout(io.StringIO()) as refused:
+                code = gate.main(
+                    ["--repo", str(self.repo), f"--head={option}", "--merged-head", head, "--pr", "42", "--labels", ""]
+                )
+            with self.subTest(f"command line {option}"):
+                self.assertEqual(code, 2)
+                self.assertIn("bad revision", refused.getvalue())
 
     def test_command_line_takes_the_base_from_the_merge_commit(self) -> None:
         base_when_opened, head, merge_commit = self._merged_pull_request()
