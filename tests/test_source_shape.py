@@ -34,11 +34,11 @@ MAX_CEILING_ROOM = 750
 SIZE_CEILINGS: dict[str, int] = {
     "admin_service/static/admin.js": 9750,
 
-    "app/services/inventory.py": 19750,
+    "app/services/inventory.py": 18250,
 
-    "app/services/parsers.py": 6500,
+    "app/services/parsers.py": 5000,
 
-    "app/services/sas_fabric.py": 4500,
+    "app/services/sas_fabric.py": 3500,
 
     "app/services/snapshot_export.py": 3500,
 
@@ -48,9 +48,9 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/static/style.css": 7500,
 
-    "history_service/store.py": 6000,
+    "history_service/store.py": 5500,
 
-    "history_service/system_backup.py": 8500,
+    "history_service/system_backup.py": 8000,
 
     "tests/test_admin_service.py": 6500,
 
@@ -99,6 +99,7 @@ CROSS_PACKAGE_IMPORTS: dict[tuple[str, str], tuple[str, ...]] = {
         "admin_service/services/maintenance.py",
     ),
     ("app", "history_service"): (
+        "app/history_routes.py",
         "app/metrics.py",
         "app/routes.py",
         "app/services/backup_health.py",

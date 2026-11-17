@@ -158,6 +158,76 @@ def _create_app_node(module) -> ast.FunctionDef:
     )
 
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _main_endpoint_source_files() -> dict[Path, set[str]]:
+    """Every source file that defines an endpoint of the main router, with the endpoint names.
+
+    The file-based sweeps below read this instead of a fixed file name, so an
+    endpoint that moves to another module stays inside them.
+    """
+    files: dict[Path, set[str]] = {}
+    for route in app_routes.build_router().routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            continue
+        source_file = inspect.getsourcefile(inspect.unwrap(endpoint))
+        if source_file is None:
+            continue
+        path = Path(source_file).resolve()
+        if _REPOSITORY_ROOT in path.parents:
+            files.setdefault(path, set()).add(endpoint.__name__)
+    return files
+
+
+def _route_helper_name(call: object) -> str | None:
+    """Name of a helper called bare or through the ``routes`` module argument."""
+    if not isinstance(call, ast.Call):
+        return None
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "routes"
+    ):
+        return call.func.attr
+    return None
+
+
+def _contiguous_perf_preamble_endpoints(source: str) -> tuple[list[str], set[str]]:
+    """Functions nested in a top-level function that repeat the perf preamble, and all names read."""
+    duplicate_endpoints: list[str] = []
+    swept: set[str] = set()
+    for registrar in ast.parse(source).body:
+        if not isinstance(registrar, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for endpoint in registrar.body:
+            if (
+                not isinstance(endpoint, (ast.FunctionDef, ast.AsyncFunctionDef))
+                or endpoint.name == "route_service"
+            ):
+                continue
+            swept.add(endpoint.name)
+            statements = endpoint.body
+            for index in range(len(statements) - 2):
+                first, second, third = statements[index : index + 3]
+                first_call = first.value if isinstance(first, ast.Assign) else None
+                second_call = second.value if isinstance(second, ast.Assign) else None
+                third_call = third.value if isinstance(third, ast.Expr) else None
+                if not (
+                    _route_helper_name(first_call) == "get_inventory_registry"
+                    and isinstance(second_call, ast.Call)
+                    and isinstance(second_call.func, ast.Attribute)
+                    and second_call.func.attr == "get_service"
+                    and _route_helper_name(third_call) == "add_perf_metadata"
+                ):
+                    continue
+                duplicate_endpoints.append(endpoint.name)
+    return duplicate_endpoints, swept
+
+
 class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         import tempfile
@@ -927,6 +997,46 @@ class RouteContractTests(unittest.TestCase):
     def test_main_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(app_main.create_app()), APP_ROUTE_MATRIX)
 
+    def test_build_router_keeps_route_order_and_mutation_authorization(self) -> None:
+        # build_router is the one place that composes the main routes, including
+        # those registered from other modules, so its own ordered table is pinned.
+        router = app_routes.build_router()
+        app_only = {"openapi", "static", "prometheus_metrics_endpoint"}
+        self.assertEqual(
+            [
+                (route.path, tuple(sorted(route.methods)), route.name)
+                for route in router.routes
+                if isinstance(route, APIRoute)
+            ],
+            [row[:3] for row in APP_ROUTE_MATRIX if row[2] not in app_only],
+        )
+        self.assertTrue(all(isinstance(route, APIRoute) for route in router.routes))
+        dependencies = {
+            (method, route.path): tuple(
+                dependency.dependency for dependency in route.dependencies
+            )
+            for route in router.routes
+            if isinstance(route, APIRoute)
+            for method in route.methods
+            if route.dependencies
+        }
+        mutation = (app_routes.require_read_ui_mutation_authorization,)
+        self.assertEqual(
+            dependencies,
+            {
+                ("POST", "/api/upgrade-notice/dismiss"): mutation,
+                ("GET", "/api/read-ui/auth/verify"): (app_routes.require_read_ui_basic_credentials,),
+                ("POST", "/api/sas-fabric/aliases"): mutation,
+                ("POST", "/api/slots/{slot}/led"): mutation,
+                ("POST", "/api/systems/{system_id}/disk-inventory-sync"): mutation,
+                ("POST", "/api/system-locator"): mutation,
+                ("POST", "/api/slots/{slot}/mapping"): mutation,
+                ("DELETE", "/api/slots/{slot}/mapping"): mutation,
+                ("POST", "/api/mappings/import"): mutation,
+                ("POST", "/api/history/refresh"): mutation,
+            },
+        )
+
     def test_inventory_route_maps_unknown_enclosure_to_bounded_404(self) -> None:
         service = MagicMock()
         service.get_snapshot = AsyncMock(side_effect=UnknownEnclosureError())
@@ -1491,8 +1601,12 @@ class RouteContractTests(unittest.TestCase):
         )
 
     def test_route_modules_do_not_import_their_main_compatibility_facades(self) -> None:
+        main_endpoint_files = sorted(
+            path.relative_to(_REPOSITORY_ROOT).as_posix() for path in _main_endpoint_source_files()
+        )
+        self.assertIn("app/routes.py", main_endpoint_files)
         for relative_path, forbidden_module in (
-            ("app/routes.py", "app.main"),
+            *((path, "app.main") for path in main_endpoint_files),
             ("admin_service/routes.py", "admin_service.main"),
         ):
             with self.subTest(route_module=relative_path):
@@ -1507,7 +1621,7 @@ class RouteContractTests(unittest.TestCase):
         # (which would hide a mistyped name) must not come back.
         for relative_path in (
             "app/main.py",
-            "app/routes.py",
+            *main_endpoint_files,
             "admin_service/main.py",
             "admin_service/routes.py",
         ):
@@ -1517,40 +1631,47 @@ class RouteContractTests(unittest.TestCase):
                 self.assertNotRegex(source, r"(?m)^# pyright: report")
 
     def test_main_routes_deduplicate_contiguous_service_perf_preambles(self) -> None:
-        route_path = Path(__file__).resolve().parents[1] / "app" / "routes.py"
-        tree = ast.parse(route_path.read_text(encoding="utf-8"))
-        build_router = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "build_router"
-        )
+        endpoint_files = _main_endpoint_source_files()
+        self.assertIn(_REPOSITORY_ROOT / "app" / "routes.py", endpoint_files)
         duplicate_endpoints: list[str] = []
-        for endpoint in build_router.body:
-            if (
-                not isinstance(endpoint, (ast.FunctionDef, ast.AsyncFunctionDef))
-                or endpoint.name == "route_service"
-            ):
-                continue
-            statements = endpoint.body
-            for index in range(len(statements) - 2):
-                first, second, third = statements[index : index + 3]
-                first_call = first.value if isinstance(first, ast.Assign) else None
-                second_call = second.value if isinstance(second, ast.Assign) else None
-                third_call = third.value if isinstance(third, ast.Expr) else None
-                if not (
-                    isinstance(first_call, ast.Call)
-                    and isinstance(first_call.func, ast.Name)
-                    and first_call.func.id == "get_inventory_registry"
-                    and isinstance(second_call, ast.Call)
-                    and isinstance(second_call.func, ast.Attribute)
-                    and second_call.func.attr == "get_service"
-                    and isinstance(third_call, ast.Call)
-                    and isinstance(third_call.func, ast.Name)
-                    and third_call.func.id == "add_perf_metadata"
-                ):
-                    continue
-                duplicate_endpoints.append(endpoint.name)
+        for path, endpoint_names in sorted(endpoint_files.items()):
+            with self.subTest(route_module=path.name):
+                duplicates, swept = _contiguous_perf_preamble_endpoints(path.read_text(encoding="utf-8"))
+                # Every registered endpoint of this file was read by the sweep.
+                self.assertEqual(sorted(endpoint_names - swept), [])
+                duplicate_endpoints.extend(duplicates)
         self.assertEqual(duplicate_endpoints, [])
+
+    def test_perf_preamble_sweep_reads_both_helper_spellings(self) -> None:
+        template = (
+            "def add_routes(router, routes):\n"
+            "    async def synthetic_endpoint(system_id):\n"
+            "        registry = {prefix}get_inventory_registry()\n"
+            "        service = registry.get_service(system_id)\n"
+            "{between}"
+            "        {prefix}add_perf_metadata(service)\n"
+        )
+        for prefix in ("", "routes."):
+            with self.subTest(prefix=prefix):
+                duplicates, swept = _contiguous_perf_preamble_endpoints(
+                    template.format(prefix=prefix, between="")
+                )
+                self.assertEqual(duplicates, ["synthetic_endpoint"])
+                self.assertEqual(swept, {"synthetic_endpoint"})
+                duplicates, _ = _contiguous_perf_preamble_endpoints(
+                    template.format(prefix=prefix, between="        payload = load(service)\n")
+                )
+                self.assertEqual(duplicates, [])
+
+    def test_route_sweeps_cover_the_module_of_every_main_endpoint(self) -> None:
+        endpoint_files = _main_endpoint_source_files()
+        registered = {
+            route.endpoint.__name__
+            for route in app_routes.build_router().routes
+            if getattr(route, "endpoint", None) is not None
+        }
+        self.assertEqual(set().union(*endpoint_files.values()), registered)
+        self.assertIn(_REPOSITORY_ROOT / "app" / "history_routes.py", endpoint_files)
 
     def test_route_handler_resolves_routes_module_patch_after_app_creation(self) -> None:
         application = app_main.create_app()
