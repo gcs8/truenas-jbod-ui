@@ -29,27 +29,49 @@ MAX_CEILING_ROOM = 750
 # Every in-scope file over DEFAULT_LINE_LIMIT, with its ceiling computed once as
 # (lines // 250 + 2) * 250. Lower an entry when the file shrinks; remove it when
 # the file is at or under the default.
+# One blank line between entries, so two pull requests that lower different
+# entries merge without a conflict.
 SIZE_CEILINGS: dict[str, int] = {
     "admin_service/static/admin.js": 9750,
+
     "app/services/inventory.py": 19750,
+
     "app/services/parsers.py": 6500,
+
     "app/services/sas_fabric.py": 4500,
+
     "app/services/snapshot_export.py": 3500,
+
     "app/static/app.js": 13750,
+
     "app/static/sas_fabric_view.js": 5000,
+
     "app/static/style.css": 7500,
+
     "history_service/store.py": 6000,
+
     "history_service/system_backup.py": 8500,
+
     "tests/test_admin_service.py": 6500,
+
     "tests/test_backup_integration.py": 4250,
+
     "tests/test_history_service.py": 13000,
+
     "tests/test_image_upgrade_contract.py": 3750,
+
     "tests/test_inventory.py": 27250,
+
     "tests/test_mapping_store.py": 4500,
+
     "tests/test_parsers.py": 5500,
+
     "tests/test_sas_fabric.py": 7000,
+
     "tests/test_segmented_history_reader.py": 4000,
+
     "tests/test_snapshot_export.py": 4000,
+
     "tests/test_system_backup.py": 10000,
 }
 
