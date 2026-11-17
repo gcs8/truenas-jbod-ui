@@ -5551,15 +5551,6 @@ class InventoryService(InventorySourceCollectionMixin):
                 )
             ).lower()
 
-    def _persist_slot_detail_entries(self, entries: Any) -> None:
-        if not self.slot_detail_store:
-            return
-
-        normalized_entries = [entry for entry in entries if entry is not None]
-        if not normalized_entries:
-            return
-        self.slot_detail_store.save_entries(normalized_entries)
-
     def _slot_detail_entry_is_bound_here(
         self, entry: SlotDetailCacheEntry, *, binding: str | None = None,
     ) -> bool:
@@ -10580,15 +10571,6 @@ class InventoryService(InventorySourceCollectionMixin):
             hints.groups.append((row, False))
             hints.identities.append(identity)
         return hints
-
-    @classmethod
-    def _resolve_quantastor_cli_disk_hint(
-        cls,
-        disk: dict[str, Any],
-        hints: _QuantastorCliDiskHints,
-    ) -> dict[str, Any] | None:
-        # Compatibility for single-query callers. Inventory uses one batch.
-        return cls._resolve_quantastor_cli_disk_hints([disk], hints)[0]
 
     @classmethod
     def _resolve_quantastor_cli_disk_hints(

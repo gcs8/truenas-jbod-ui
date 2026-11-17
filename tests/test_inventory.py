@@ -55,6 +55,7 @@ from app.services.inventory import (
     InventoryService,
     InventorySourceBundle,
     LINUX_ENCLOSURE_SYSFS_MAP_COMMAND,
+    SmartDetailBatch,
     SnapshotStateBusyError,
     build_lunid_alias_tiers,
     build_lunid_aliases,
@@ -15350,6 +15351,18 @@ Enclosure Status diagnostic page:
         )
 
 
+def _flush_through_smart_detail_batch(
+    service: InventoryService, entries: list[SlotDetailCacheEntry | None],
+) -> None:
+    """Save entries the way a SMART read does: one request batch, one flush."""
+    async def flush() -> None:
+        batch = SmartDetailBatch(service.slot_detail_store)
+        batch.pending.extend(entry for entry in entries if entry is not None)
+        await batch.flush()
+
+    asyncio.run(flush())
+
+
 class InventorySlotDetailCacheTests(unittest.TestCase):
     def test_historical_identity_cannot_change_observed_smart_admission(self) -> None:
         fields = ("serial", "logical_unit_id", "sas_address", "gptid")
@@ -15515,7 +15528,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 size_human="12 TB",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
             self.assertEqual(full.identity_state, "known")
@@ -15551,7 +15564,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             self.assertEqual(degraded_key[-1][0], "unknown")
             self.assertNotEqual(degraded_key[-1], first_key[-1])
             self.assertFalse(service._smart_request_is_current(first_key, first_generation))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 degraded, smart_summary=SmartSummaryView(available=True, power_on_hours=999),
             )])
             entry = store.get_entry("default", "enc-1", 5)
@@ -15644,7 +15657,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 size_human="12 TB",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
             self.assertEqual(
@@ -15705,7 +15718,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
 
@@ -15744,7 +15757,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             service = make_service()
             full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
 
@@ -15815,7 +15828,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 device_name="da5", serial="SER-VERIFY-005", sas_address="sas-invented-005",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_entries([service._build_slot_detail_entry(
+            _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
 
@@ -16142,9 +16155,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 assert store is not None
                 store._write = MagicMock(wraps=store._write)  # type: ignore[method-assign]
 
-                service._persist_slot_detail_entries(
-                    service._build_slot_detail_entry(slot, smart_summary=None) for slot in slots
-                )
+                asyncio.run(service._apply_and_persist_snapshot_slot_details(slots))
 
                 self.assertEqual(store._write.call_count, 1)
                 self.assertEqual(len(store.load_all()), slot_count)
@@ -23494,7 +23505,6 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
 
             service._run_ssh_commands = AsyncMock(side_effect=inventory_commands)
             build_hints = service._build_quantastor_cli_disk_hints
-            resolve_hint = service._resolve_quantastor_cli_disk_hint
             resolver_comparisons = []
 
             def observe_hints(parsed_rows):
@@ -23503,16 +23513,6 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                 hint_comparisons.append(comparisons - before)
                 hint_sizes.append(len(parsed_rows))
                 return result
-
-            def observe_resolver(row, hints):
-                nonlocal in_resolver
-                before = comparisons
-                in_resolver = True
-                try:
-                    return resolve_hint(row, hints)
-                finally:
-                    in_resolver = False
-                    resolver_comparisons.append(comparisons - before)
 
             normalize = InventoryService._quantastor_cli_identity
 
@@ -23524,21 +23524,19 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                 return normalize(row)
 
             service._build_quantastor_cli_disk_hints = observe_hints
-            service._resolve_quantastor_cli_disk_hint = observe_resolver
-            if hasattr(service, "_resolve_quantastor_cli_disk_hints"):
-                resolve_batch = service._resolve_quantastor_cli_disk_hints
+            resolve_batch = service._resolve_quantastor_cli_disk_hints
 
-                def observe_batch(disks, hints):
-                    nonlocal in_resolver
-                    before = comparisons
-                    in_resolver = True
-                    try:
-                        return resolve_batch(disks, hints)
-                    finally:
-                        in_resolver = False
-                        resolver_comparisons.extend([comparisons - before] + [0] * (len(disks) - 1))
+            def observe_batch(disks, hints):
+                nonlocal in_resolver
+                before = comparisons
+                in_resolver = True
+                try:
+                    return resolve_batch(disks, hints)
+                finally:
+                    in_resolver = False
+                    resolver_comparisons.extend([comparisons - before] + [0] * (len(disks) - 1))
 
-                service._resolve_quantastor_cli_disk_hints = observe_batch
+            service._resolve_quantastor_cli_disk_hints = observe_batch
             with patch.object(InventoryService, "_quantastor_cli_identity", side_effect=observe_identity):
                 snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
             snapshot_comparisons = comparisons
