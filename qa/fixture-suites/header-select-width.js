@@ -226,7 +226,9 @@ function expectEllipsis(geometry, label) {
   expect(geometry.width, `${detail}: a long label is expected not to fit`).toBeLessThan(geometry.natural - 1);
   expect(geometry.textOverflow, detail).toBe("ellipsis");
   expect(geometry.whiteSpace, detail).toBe("nowrap");
-  expect(geometry.overflowX, detail).toBe("hidden");
+  // Chromium's own select rule computes the authored `hidden` as `clip`;
+  // both cut the text at the padding box, which the ellipsis needs.
+  expect(["hidden", "clip"], detail).toContain(geometry.overflowX);
 }
 
 function expectCommon(geometry, label) {
