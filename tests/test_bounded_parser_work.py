@@ -42,6 +42,7 @@ from pydantic import ValidationError
 from app.config import SSHConfig
 from app.services.ssh_probe import SSHCommandResult
 from app.services import parsers
+from app.services import parsers_smart
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.parsers import (
     ParsedSSHData,
@@ -1970,7 +1971,7 @@ class SesOverlayMergeWorkTests(LinearGrowthAssertions):
 # where a pattern is only linear at its call site. A pattern added later is
 # swept the same way without editing this test.
 
-SWEPT_MODULES = (parsers, sas_fabric_parsers, scsi)
+SWEPT_MODULES = (parsers, parsers_smart, sas_fabric_parsers, scsi)
 _RE_FUNCTIONS = frozenset({"compile", "match", "search", "fullmatch", "findall", "finditer", "sub", "subn", "split"})
 _PATTERN_METHODS = frozenset(_RE_FUNCTIONS - {"compile"})
 _FLAG_POSITIONS = {"compile": 1, "match": 2, "search": 2, "fullmatch": 2, "findall": 2, "finditer": 2, "sub": 4,
