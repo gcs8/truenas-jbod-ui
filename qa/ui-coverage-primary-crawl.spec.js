@@ -42,6 +42,7 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
     "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
     "ui-dense-sleds": "https://ui-dense-sleds.synthetic.invalid",
+    "ui-fabric-topology": "https://ui-fabric-topology.synthetic.invalid",
   };
   const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
@@ -62,6 +63,8 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "offline", ready: "main", label: "fixture/offline", url: `${origins.offline}/` },
     { page: "main", ready: "main", variant: "write-sign-in", label: "fixture/main-write-sign-in", url: `${origins["ui-write-sign-in"]}/` },
     { page: "fabric", ready: "fabric", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${origins["ui-write-sign-in"]}/sas-fabric` },
+    // #937: Topology drawn from the real builder's synthetic cascade (bays, lines, link labels).
+    { page: "fabric", ready: "fabric", variant: "fabric-topology", label: "fixture/fabric-topology", url: `${origins["ui-fabric-topology"]}/sas-fabric` },
     { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
     // Sol #1108: a QuantaStor page sends a forced startup read; only its declared page-load window admits it.
     { page: "main", ready: "main", variant: "quantastor", platform: "quantastor", label: "fixture/main-quantastor", url: `${origins["ui-quantastor"]}/` },

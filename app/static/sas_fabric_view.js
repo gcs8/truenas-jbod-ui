@@ -3,7 +3,12 @@
   // Deadline for one SMART summary read; the main page uses the same value
   // (app.js, #1161).
   const SMART_SUMMARY_REQUEST_TIMEOUT_MS = 15000;
-  const modeIds = new Set(["lanes", "impact", "trace", "disk"]);
+  const modeIds = new Set(["lanes", "impact", "trace", "disk", "topology"]);
+  // The Topology mode is drawn by sas_fabric_topology.js (#937); same copy on every platform.
+  const topologyModeCopy = {
+    title: "Topology",
+    subtitle: "Wiring diagram from the host down to the bays. Hover or focus anything to trace its path; click or Enter pins it; Esc clears.",
+  };
   const modeCopy = {
     lanes: {
       title: "Storage Lanes",
@@ -124,6 +129,9 @@
     inspectorTitle: document.getElementById("fabric-inspector-title"),
     inspectorBody: document.getElementById("fabric-inspector-body"),
     modeButtons: Array.from(document.querySelectorAll("[data-fabric-mode]")),
+    topologySearchRow: document.getElementById("fabric-topology-search-row"),
+    topologySearch: document.getElementById("fabric-topology-search"),
+    topologySearchStatus: document.getElementById("fabric-topology-search-status"),
   };
 
   function list(value) {
@@ -1376,6 +1384,10 @@
   }
 
   function defaultSelectionRef(fabric = state.fabric, mode = state.mode) {
+    if (mode === "topology") {
+      // Topology selects only what is pinned in its drawing.
+      return null;
+    }
     if (mode === "disk") {
       const diskTraceId = defaultDiskTraceId(fabric);
       return diskTraceId ? { kind: "trace", id: diskTraceId } : null;
@@ -3754,6 +3766,12 @@
       elements.inspectorBody.innerHTML = "No fabric data loaded.";
       return;
     }
+    const topologyDetail = state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
+    if (topologyDetail) {
+      elements.inspectorTitle.textContent = topologyDetail.title;
+      elements.inspectorBody.innerHTML = topologyDetail.html;
+      return;
+    }
     if (trace) {
       const nodes = nodeMap(fabric);
       const pathStates = list(trace.metrics?.path_states);
@@ -4138,7 +4156,7 @@
 
   function renderModeChrome() {
     const copy = fabricViewCopy(state.fabric);
-    const modeDetails = copy.modes[state.mode] || copy.modes.lanes;
+    const modeDetails = state.mode === "topology" ? topologyModeCopy : copy.modes[state.mode] || copy.modes.lanes;
     if (elements.pageEyebrow) {
       elements.pageEyebrow.textContent = copy.eyebrow;
     }
@@ -4159,6 +4177,15 @@
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
+    if (elements.topologySearchRow) {
+      elements.topologySearchRow.hidden = state.mode !== "topology";
+    }
+    // The Path Focus and Disk Path strip describes a selection Topology does not draw.
+    if (elements.focusStrip) {
+      elements.focusStrip.hidden = state.mode === "topology";
+    }
+    // Only Topology widens the page to the full window (sas_fabric_topology.css).
+    document.body?.classList?.toggle("fabric-topology-mode", state.mode === "topology");
   }
 
   function renderMap() {
@@ -4168,6 +4195,10 @@
     elements.inspectorBody.inert = inert;
     elements.focusStrip.inert = inert;
     state.diagnosticPayloads = {};
+    // Leaving Topology clears its pin, trace and search, with or without a payload.
+    if (state.mode !== "topology") {
+      window.SasFabricTopology?.release();
+    }
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       renderFocusStrip(null);
@@ -4175,6 +4206,8 @@
       return;
     }
     if (fabric.available === false) {
+      // Nothing is drawn for this scope, so a pin from the scope before it must not stay.
+      window.SasFabricTopology?.release();
       const copy = fabricViewCopy(fabric);
       elements.mapPanel.innerHTML = `<div class="warning-item muted compact">${escapeHtml(copy.unavailableMap)}</div>`;
       renderFocusStrip(fabric);
@@ -4197,6 +4230,20 @@
       elements.mapPanel.innerHTML = renderTraceMode(fabric);
     } else if (state.mode === "disk") {
       elements.mapPanel.innerHTML = renderDiskPathMode(fabric);
+    } else if (state.mode === "topology") {
+      // The drawing pins what the inspector shows; serials and disk identities
+      // for its search come from the inventory snapshot of the same scope.
+      // The layout takes the box it is drawn in; the scroll position is kept.
+      elements.mapPanel.innerHTML = window.SasFabricTopology
+        ? window.SasFabricTopology.render(fabric, {
+          expanded: state.expandedSlotLists,
+          selection: currentSelectionRef(),
+          inventory: state.snapshot,
+          width: elements.mapPanel.clientWidth,
+          height: Math.round((window.innerHeight || 0) * 0.78),
+        })
+        : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
+      window.SasFabricTopology?.mount(elements.mapPanel);
     } else {
       elements.mapPanel.innerHTML = renderLanesMode(fabric);
     }
@@ -4210,6 +4257,7 @@
     "data-fabric-breadcrumb",
     "data-fabric-trace-home",
     "data-fabric-expand-slots",
+    "data-fabric-topology-link",
     "data-fabric-alias-edit",
     "data-fabric-alias-input",
     "data-fabric-alias-cancel",
@@ -4405,6 +4453,9 @@
       const forceSelection = (mode === "disk" && current?.kind !== "trace")
         || (mode === "disk" && traceById(current?.id)?.kind !== "bay")
         || (mode === "impact" && (current?.kind !== "trace" || traceById(current?.id)?.kind !== "path"));
+      if (mode === "topology" && state.mode !== "topology") {
+        clearFabricSelection();
+      }
       state.mode = mode;
       closeAliasEditor();
       ensureSelectionForMode(state.fabric, { force: forceSelection, mode });
@@ -4683,6 +4734,16 @@
     });
   }
 
+  function clearFabricSelection() {
+    state.selectedTraceId = null;
+    state.selectedNodeId = null;
+    state.selectionTrail = [];
+  }
+
+  window.SasFabricTopology?.attach(elements.mapPanel, elements.topologySearch, elements.topologySearchStatus, {
+    clearSelection: clearFabricSelection,
+    requestRender: render,
+  });
   ensureSelectionForMode(state.fabric);
   render();
   if (!state.fabric) {

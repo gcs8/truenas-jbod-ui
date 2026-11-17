@@ -364,6 +364,22 @@
       "covers": ["[data-fabric-breadcrumb]", "[data-fabric-trace-home]"]
     },
     {
+      "id": "fabric.topology", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-topology"}, {"wait": 1000}],
+      "covers": ["#fabric-mode-topology", "#fabric-topology-search", "[data-fabric-topology-link]"]
+    },
+    {
+      "id": "fabric.topology.pin", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-topology"}, {"wait": 1000}, {"clickIfPresent": "#fabric-map-panel [data-topo-bay]"}, {"wait": 600}, {"clickIfPresent": "#fabric-map-panel .topo-link-label[data-topo-link]"}, {"wait": 600}, {"clickIfPresent": "#fabric-map-panel [data-topology-fit]"}, {"wait": 600}],
+      "covers": ["[data-topo-bay]", "[data-topo-link]", "[data-topology-fit]"]
+    },
+    {
+      "id": "fabric.topology.drawn", "page": "fabric", "safety": "read", "fixture_only": true, "ci": true, "variant": "fabric-topology",
+      "description": "Topology drawn from the real builder's synthetic two-HBA cascade (fixture variant): bay cells, lines and link labels; pins a bay, then a link label.",
+      "steps": [{"click": "#fabric-mode-topology"}, {"wait": 1000}, {"requireVisible": "#fabric-map-panel [data-topo-bay]"}, {"click": "#fabric-map-panel [data-topo-bay]"}, {"wait": 600}, {"requireVisible": "#fabric-map-panel [data-fabric-topology-link]"}, {"click": "#fabric-map-panel [data-fabric-topology-link]"}, {"wait": 600}],
+      "covers": ["[data-topo-bay]", "[data-topo-link]", "[data-fabric-topology-link]"]
+    },
+    {
       "id": "fabric.disk", "page": "fabric", "safety": "read", "ci": true,
       "steps": [{"click": "#fabric-mode-disk"}, {"wait": 1000}],
       "covers": ["#fabric-mode-disk"]

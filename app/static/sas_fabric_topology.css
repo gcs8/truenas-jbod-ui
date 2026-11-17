@@ -1,0 +1,477 @@
+/* Storage Fabric Topology mode (sas_fabric_topology.js, #937). Loaded by
+   sas_fabric.html only; colours are the page's custom properties from
+   style.css. */
+
+/* Topology alone may use the full page width; the other modes keep the
+   capped column. */
+body.fabric-topology-mode .fabric-page-shell {
+  max-width: none;
+}
+
+.fabric-topology-search-row {
+  display: flex;
+  flex: 1 1 18rem;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.fabric-topology-search-row[hidden] {
+  display: none;
+}
+
+.fabric-topology-search {
+  box-sizing: border-box;
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.fabric-topology {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Narrow pages: the parts, legend and notices wrap inside the panel, long
+   ids included; only the drawing scrolls sideways, inside its own box. */
+.fabric-topology > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology .warning-item {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology-parts,
+.fabric-topology-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.fabric-topology-part {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 2px 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+}
+
+.fabric-topology-part.tone-ok {
+  border-color: var(--healthy);
+}
+
+.fabric-topology-part:is(.tone-failed, .tone-not-read) {
+  border-color: var(--fault);
+  color: var(--text);
+}
+
+.fabric-topology-part:is(.tone-stale, .tone-partial, .tone-fallback, .tone-disabled, .tone-not-reported) {
+  border-color: var(--unmapped);
+  color: var(--text);
+}
+
+.fabric-topology-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology-swatch {
+  display: inline-block;
+  flex: none;
+  width: 22px;
+  height: 0;
+  border-top: 2px solid var(--muted);
+}
+
+.fabric-topology-swatch.is-lanes-reported {
+  border-top-width: 3px;
+}
+
+.fabric-topology-swatch.is-lanes-unreported {
+  border-top-width: 2px;
+}
+
+.fabric-topology-swatch.is-plain-link {
+  border-top-width: 1px;
+}
+
+.fabric-topology-swatch.is-bundle {
+  border-top-width: 6px;
+  opacity: 0.7;
+}
+
+.fabric-topology-swatch.is-on-path {
+  border-top-width: 3px;
+  border-top-color: var(--selected);
+}
+
+.fabric-topology-swatch.swatch-chain {
+  width: 28px;
+  height: 8px;
+  border: 0;
+}
+
+.fabric-topology-swatch:is(.swatch-mark, .swatch-bay) {
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--muted);
+  border-radius: 3px;
+}
+
+.fabric-topology-swatch:is(.mark-parent-unknown, .mark-not-read) {
+  border-style: dashed;
+  border-color: var(--unmapped);
+}
+
+.fabric-topology-swatch.bay-yes {
+  background: color-mix(in srgb, var(--healthy) 35%, var(--panel-2));
+}
+
+.fabric-topology-swatch.bay-no {
+  background: color-mix(in srgb, var(--empty) 50%, var(--panel-2));
+}
+
+.fabric-topology-swatch.swatch-shape {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  overflow: visible;
+}
+
+.fabric-topology-swatch.swatch-text {
+  width: auto;
+  height: auto;
+  border: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.fabric-topology-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+/* The trace line sits below the drawing, so its wrapping never moves it. */
+.fabric-topology .fabric-topology-pin {
+  min-width: 0;
+  margin: 0;
+}
+
+.fabric-topology-scroll {
+  max-width: 100%;
+  max-height: 78vh;
+  overflow: auto;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.fabric-topology-svg {
+  display: block;
+  font-family: var(--sans);
+  font-size: 0.75rem;
+}
+
+.fabric-topology-svg text {
+  fill: var(--text);
+  font-size: 0.75rem;
+}
+
+.fabric-topology-svg .topo-node-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.fabric-topology-svg :is(.topo-node-fact, .topo-tier-note) {
+  fill: var(--muted);
+}
+
+.fabric-topology-svg .topo-tier-label {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.fabric-topology-svg .topo-tier-note:is(.tone-not-read, .tone-not-collected) {
+  fill: var(--unmapped);
+}
+
+.fabric-topology-svg .topo-missing-tier > rect {
+  fill: none;
+  stroke: var(--unmapped);
+  stroke-dasharray: 6 4;
+}
+
+.fabric-topology-svg .topo-node > rect {
+  fill: var(--panel-2);
+  stroke: var(--panel-border);
+}
+
+.fabric-topology-svg .topo-group > rect {
+  fill: var(--panel-2);
+  stroke: var(--panel-border);
+}
+
+.fabric-topology-svg .topo-node.mark-parent-unknown > rect {
+  stroke: var(--unmapped);
+  stroke-dasharray: 5 3;
+}
+
+/* Lines: the colour says which HBA a line hangs off; width and dash say what
+   kind of link it is. A bay bundle at 0.7 opacity keeps at least 3:1 against
+   the drawing's surface in every chain colour. */
+.fabric-topology-svg .topo-link {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+}
+
+.fabric-topology-svg .topo-link.is-lanes-reported {
+  stroke-width: 3;
+}
+
+.fabric-topology-svg .topo-link.is-lanes-unreported {
+  stroke-width: 2;
+}
+
+.fabric-topology-svg .topo-link.is-plain-link {
+  stroke-width: 1.5;
+}
+
+.fabric-topology-svg .topo-link.is-bundle {
+  stroke-width: 6;
+  stroke-opacity: 0.7;
+}
+
+/* Each HBA chain: a palette colour and a line pattern (chainStyle in
+   sas_fabric_topology.js), in the drawing and in its legend swatch. */
+.fabric-topology-swatch.swatch-chain .topo-link {
+  fill: none;
+  stroke-width: 3;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-colour-0 {
+  stroke: var(--history-read);
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-colour-1 {
+  stroke: var(--identify);
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-colour-2 {
+  stroke: var(--unmapped);
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-colour-3 {
+  stroke: var(--metal-1);
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-1 {
+  stroke-dasharray: 12 4;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-2 {
+  stroke-dasharray: 4 3;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-3 {
+  stroke-dasharray: 12 3 2 3;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-4 {
+  stroke-dasharray: 2 3;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-5 {
+  stroke-dasharray: 16 4 4 4;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-6 {
+  stroke-dasharray: 10 3 2 3 2 3;
+}
+
+:is(.fabric-topology-svg, .swatch-chain) .topo-link.chain-dash-7 {
+  stroke-dasharray: 6 6;
+}
+
+/* A crossing: the horizontal line has a gap the vertical runs through. */
+.fabric-topology-svg .topo-cross-gap {
+  stroke: var(--surface);
+  stroke-width: 10;
+}
+
+.fabric-topology-svg :is(.topo-label-box, .topo-junction, .topo-expand rect) {
+  fill: var(--panel);
+  stroke: var(--panel-border);
+}
+
+.fabric-topology-svg .topo-link-label.is-lanes-unreported .topo-label-box {
+  stroke: var(--unmapped);
+  stroke-dasharray: 4 3;
+}
+
+/* Bay cells are dark enough that every path mark keeps 3:1 against them. */
+.fabric-topology-svg .topo-bay > rect {
+  stroke: var(--panel-border);
+}
+
+.fabric-topology-svg .topo-bay.bay-yes > rect {
+  fill: var(--healthy);
+  fill-opacity: 0.35;
+}
+
+.fabric-topology-svg .topo-bay.bay-no > rect {
+  fill: var(--empty);
+  fill-opacity: 0.5;
+}
+
+.fabric-topology-svg .topo-bay.bay-unknown > rect {
+  fill: none;
+  stroke: var(--muted);
+  stroke-dasharray: 3 2;
+}
+
+.fabric-topology-svg .topo-bay.state-fault > rect {
+  fill: var(--fault);
+  fill-opacity: 0.35;
+}
+
+.fabric-topology-svg .topo-bay.state-failed > rect {
+  fill: var(--fault);
+  fill-opacity: 0.35;
+}
+
+.fabric-topology-svg .topo-bay .topo-bay-number {
+  font-size: 0.75rem;
+}
+
+.fabric-topology-svg .topo-path-more {
+  fill: var(--text);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* Path marks: open shapes carry fill="none" on the element, so these rules
+   only paint what each shape draws. */
+.topo-path-mark {
+  stroke-width: 1.5;
+}
+
+.topo-path-mark.path-active {
+  fill: var(--history-read);
+  stroke: var(--history-read);
+}
+
+.topo-path-mark.path-standby {
+  stroke: var(--history-write);
+  stroke-width: 2;
+}
+
+.topo-path-mark.path-fault {
+  stroke: var(--identify);
+  stroke-width: 2.25;
+}
+
+.topo-path-mark.path-missing {
+  stroke: var(--text);
+  stroke-width: 1.75;
+}
+
+.topo-path-mark.path-mapped {
+  fill: var(--muted);
+}
+
+.topo-path-mark.path-unmapped {
+  stroke: var(--muted);
+}
+
+.topo-path-mark.path-unknown {
+  fill: var(--muted);
+}
+
+.topo-path-mark.path-member {
+  fill: var(--text);
+}
+
+.topo-path-mark.path-other {
+  stroke: var(--text);
+}
+
+.fabric-topology-svg [role="button"] {
+  cursor: pointer;
+}
+
+.fabric-topology-svg [role="button"]:focus {
+  outline: none;
+}
+
+.fabric-topology-svg [role="button"]:focus-visible > :is(rect, circle) {
+  stroke: var(--selected);
+  stroke-width: 3;
+}
+
+.fabric-topology-svg .topo-link.is-on-path {
+  stroke: var(--selected);
+  stroke-opacity: 1;
+  opacity: 1;
+}
+
+.fabric-topology-svg .is-on-path > :is(rect, circle) {
+  stroke: var(--selected);
+  stroke-width: 2;
+}
+
+/* The pinned item is what the inspector shows. */
+.fabric-topology-svg .is-pinned > rect {
+  stroke: var(--selected);
+  stroke-width: 3.5;
+}
+
+.fabric-topology-svg .topo-link.is-pinned {
+  stroke-width: 5;
+}
+
+.fabric-topology-svg .is-dim {
+  opacity: 0.3;
+}
+
+/* Narrow screens: the search label sits above an input at least 240 px wide;
+   the header wraps only while the Topology search row is shown. */
+@media (max-width: 640px) {
+  .fabric-view-panel .panel-header:has(> .fabric-topology-search-row:not([hidden])) {
+    flex-wrap: wrap;
+  }
+
+  .fabric-topology-search-row {
+    flex: 1 1 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .fabric-topology-search-row .fabric-topology-search {
+    flex: none;
+    width: 100%;
+    min-width: 15rem;
+  }
+}

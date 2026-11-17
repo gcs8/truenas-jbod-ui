@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Storage Fabric - TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
+<link rel="stylesheet" href="{{ url_for('static', path='sas_fabric_topology.css') }}?v={{ app_version }}">
 <div class="app-shell fabric-page-shell">
   <header class="topbar fabric-page-topbar">
     <div>
@@ -53,6 +54,7 @@
       <button class="button secondary small" id="fabric-mode-impact" type="button" data-fabric-mode="impact" aria-pressed="false">Impact Map</button>
       <button class="button secondary small" id="fabric-mode-trace" type="button" data-fabric-mode="trace" aria-pressed="false">Physical Trace</button>
       <button class="button secondary small" id="fabric-mode-disk" type="button" data-fabric-mode="disk" aria-pressed="false">Disk Path</button>
+      <button class="button secondary small" id="fabric-mode-topology" type="button" data-fabric-mode="topology" aria-pressed="false">Topology</button>
     </div>
     <div class="fabric-view-actions">
       <a class="button secondary" id="fabric-back-button" data-fabric-back-link href="/">Back to Enclosure</a>
@@ -136,6 +138,11 @@
         <h2 id="fabric-map-title">Storage Lanes</h2>
         <p id="fabric-map-subtitle" class="subtle">Each HBA in its own lane: paths, expanders, enclosures and the bays behind them.</p>
       </div>
+      <div class="fabric-topology-search-row" id="fabric-topology-search-row" hidden>
+        <label class="meta-label" for="fabric-topology-search">Find a bay, disk or expander</label>
+        <input class="fabric-topology-search" id="fabric-topology-search" type="search" autocomplete="off" placeholder="Bay number, disk name, serial or SAS address">
+        <span class="subtle" id="fabric-topology-search-status" role="status" aria-live="polite"></span>
+      </div>
     </div>
     <div id="fabric-warning-list" class="fabric-warning-list"></div>
     <div id="fabric-focus-strip" class="fabric-focus-strip"></div>
@@ -156,5 +163,6 @@
 </script>
 {% endblock %}
 {% block scripts %}
+<script src="{{ url_for('static', path='sas_fabric_topology.js') }}" defer></script>
 <script src="{{ url_for('static', path='sas_fabric_view.js') }}" defer></script>
 {% endblock %}

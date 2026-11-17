@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXED_JAVASCRIPT_PATHS = (
     "app/static/app.js",
     "app/static/sas_fabric_view.js",
+    "app/static/sas_fabric_topology.js",
     "admin_service/static/admin.js",
     "history_service/static/dashboard.js",
     "scripts/capture_public_demo_screenshots.js",
@@ -70,6 +71,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
             "shopt -s nullglob",
             "node --check app/static/app.js",
             "node --check app/static/sas_fabric_view.js",
+            "node --check app/static/sas_fabric_topology.js",
             "node --check admin_service/static/admin.js",
             "node --check history_service/static/dashboard.js",
             "node --check scripts/capture_public_demo_screenshots.js",
@@ -114,6 +116,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
     "tests.test_esxi_topology_alias_scope",
+    "tests.test_fabric_topology_fixture",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",

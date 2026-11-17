@@ -289,6 +289,7 @@ OCCUPANCY_READ_ALLOWLIST = {
     ("app/static/app.js", "smartDiskIdentity"): (2, "SMART cache identity"),
     ("app/static/sas_fabric_view.js", "diskTraceHasDisk"): (1, "disk trace admission; an unread bay traces no disk"),
     ("app/static/sas_fabric_view.js", "smartCacheKey"): (1, "SMART cache key"),
+    ("app/static/sas_fabric_topology.js", "bayOccupancy"): (1, 'Topology reader of the fabric bay metric: only true or false is known; "unknown" and anything else draw unknown'),
     ("history_service/backup_7z.py", "_build_7z_archive_to_path"): (1, "`present` is backup group membership, not a bay"),
     ("history_service/collector.py", "HistoryCollector._has_stable_disk_identity"): (2, "compares two rows after unread bays took their recorded row"),
     ("history_service/collector.py", "HistoryCollector._scope_history_skip_reason"): (4, "degraded-scan guard: an unread new row skips the scope, keeping history"),
