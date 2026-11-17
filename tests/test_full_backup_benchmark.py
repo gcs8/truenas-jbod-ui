@@ -343,14 +343,56 @@ raise SystemExit(b.main())
         marker = self.root / "late-owned-write"
         child = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).touch()"
 
+        # The worker hides every exception by design, so an early exit only
+        # shows up as "failed". These notes say how far it got. They go
+        # through one descriptor opened before the fork and hold fixed words
+        # and exception type names only.
+        notes = tempfile.TemporaryFile()
+        self.addCleanup(notes.close)
+        real_worker = self.b.worker
+
+        def note(text):
+            try:
+                os.write(notes.fileno(), text + b"\n")
+            except BaseException:
+                pass
+
+        def noted_worker(phase):
+            note(b"worker-start")
+            try:
+                code = real_worker(phase)
+            except BaseException as error:
+                note(b"worker-raised " + type(error).__name__.encode())
+                raise
+            note(b"worker-returned %d" % code)
+            return code
+
         def blocked_operation(*args):
-            subprocess.Popen([sys.executable, "-c", child])
+            note(b"operation-start")
+            try:
+                subprocess.Popen([sys.executable, "-c", child])
+            except BaseException as error:
+                note(b"operation-raised " + type(error).__name__.encode())
+                raise
+            note(b"operation-spawned")
             time.sleep(5)
 
+        def diagnosis(result):
+            notes.seek(0)
+            with open("/proc/self/status", encoding="ascii") as status:
+                memory = [line.split()[1] for line in status if line.startswith(("VmSize:", "VmRSS:"))]
+            return (
+                f"exit_code={result['exit_code']} "
+                f"supervisor_wall_seconds={result['supervisor_wall_seconds']:.3f} "
+                f"runner_vm_size_kib={memory[0]} runner_vm_rss_kib={memory[1]} "
+                f"worker_notes={notes.read().decode('ascii', 'replace').splitlines()}"
+            )
+
         request = {"root": str(self.root), "target_bytes": self.b.MIB, "timeout": 5}
-        with patch.object(self.b, "operation", side_effect=blocked_operation):
+        with patch.object(self.b, "operation", side_effect=blocked_operation), \
+                patch.object(self.b, "worker", noted_worker):
             result = self.b.measure_process([], request, self.root, timeout=0.3, owned_phase="fixture")
-        self.assertEqual(result["state"], "timeout")
+        self.assertEqual(result["state"], "timeout", diagnosis(result))
         time.sleep(1.1)
         self.assertFalse(marker.exists())
 
