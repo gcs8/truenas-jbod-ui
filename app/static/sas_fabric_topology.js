@@ -2145,6 +2145,53 @@
     return group ? groupHeading(group) : "";
   }
 
+  // The sentence under the drawing for what is hovered or focused and what is
+  // pinned. The band's hidden sizers are written by this function too, so the
+  // wording is in one place.
+  function traceSentence(model, view = {}) {
+    if (view.hover) return `Tracing: ${refLabel(model, view.hover)}.${view.pin ? " Pinned item kept; Esc clears." : ""}`;
+    if (view.pin) return `Pinned: ${refLabel(model, view.pin)}. Esc clears.`;
+    return DEFAULT_HINT;
+  }
+
+  // The band keeps the height of the longest sentence its drawing can show:
+  // these sentences share its one grid cell, hidden, with the visible one.
+  // Character count only stands in for the drawn width (glyphs differ, and a
+  // long unbreakable identifier can wrap a shorter sentence to more lines),
+  // so the few longest are kept, not one: eight reach past the two longest
+  // length tiers in every system tested (each port is drawn once per HBA
+  // side), and stay eight short elements whatever the fabric's size.
+  const TRACE_SIZERS = 8;
+  function traceSizers(model, view = {}) {
+    // What a pointer or keyboard can reach in this drawing: bays inside a
+    // collapsed shelf are not drawn, so their sentences belong to the drawing
+    // that shows the shelf in full.
+    const reachable = [];
+    for (const link of model.links) if (link.points) reachable.push({ kind: "link", id: link.id });
+    for (const entry of model.nodes) reachable.push({ kind: "node", id: entry.id });
+    for (const group of model.groups) {
+      reachable.push({ kind: "group", id: group.id });
+      for (const bay of group.cells) reachable.push({ kind: "bay", id: bay.bayId });
+    }
+    // Any item that can be pinned gives every trace its held-pin form, the longest.
+    const pin = reachable.find((ref) => ref.kind !== "group") || view.pin || null;
+    const kept = [];
+    const offer = (text) => {
+      if (kept.length === TRACE_SIZERS && text.length <= kept[kept.length - 1].length) return;
+      if (kept.includes(text)) return;
+      let at = kept.length;
+      while (at > 0 && kept[at - 1].length < text.length) at -= 1;
+      kept.splice(at, 0, text);
+      if (kept.length > TRACE_SIZERS) kept.pop();
+    };
+    offer(traceSentence(model));
+    // A pin this drawing does not show (a bay inside a collapsed shelf) is
+    // only ever shown pinned; a drawn one's held-pin trace is longer.
+    if (view.pin && !reachable.some((ref) => sameRef(ref, view.pin))) offer(traceSentence(model, { pin: view.pin }));
+    for (const ref of reachable) offer(traceSentence(model, { hover: ref, pin }));
+    return kept;
+  }
+
   // Legend words for what this payload has: bays, disks without a physical
   // location, or both.
   function legendText(model, style, text) {
@@ -2237,7 +2284,7 @@
       ? `<p class="fabric-topology-fit-notice warning-item muted compact" data-topology-fit-notice>Fitted to ${Math.round(scale * 100)}% of its size: its smallest text is ${smallest.toFixed(1)} px, under 12 px. Choose Actual size to read it.</p>`
       : "";
     const notices = model.notices.map((text) => `<div class="warning-item muted compact">${escapeHtml(text)}</div>`).join("");
-    const pinned = view.pin ? `Pinned: ${refLabel(model, view.pin)}. Esc clears.` : DEFAULT_HINT;
+    const sizers = traceSizers(model, { pin: view.pin }).map((text) => `<span class="fabric-topology-trace-sizer subtle" aria-hidden="true" data-topology-sizer="${escapeHtml(text)}"></span>`).join("");
     return `<div class="fabric-topology" data-topology-kind="${escapeHtml(model.kind)}">`
       + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
       + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
@@ -2246,8 +2293,9 @@
       + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
       // Below the drawing: hover text that wraps to more lines never moves
-      // the drawing, and a label, from under the pointer.
-      + `<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p>`
+      // the drawing, and a label, from under the pointer. The band is as tall
+      // as the longest of its sentences, so it keeps one height.
+      + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>${sizers}</div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
   }
@@ -2539,9 +2587,40 @@
     }
   }
 
+  // A focused item scrolls clear of the band at the band's own height: one
+  // observer follows the band in place and writes its whole height to the
+  // topology root, where the items' scroll margin reads it. Until then, and
+  // in a browser without ResizeObserver, the reserved height is the margin.
+  const bandWatch = { observer: null, band: null };
+
+  function onBandResize(entries) {
+    for (const entry of entries) {
+      const height = Number(entry?.borderBoxSize?.[0]?.blockSize);
+      const root = entry?.target?.closest?.(".fabric-topology");
+      if (root?.style && Number.isFinite(height) && height > 0) root.style.setProperty("--topology-trace-height", `${Math.ceil(height)}px`);
+    }
+  }
+
+  function watchBand(container) {
+    if (typeof window.ResizeObserver !== "function") return;
+    const band = container?.querySelector?.("[data-topology-trace]") || null;
+    if (band === bandWatch.band) return;
+    unwatchBand();
+    if (!band) return;
+    if (!bandWatch.observer) bandWatch.observer = new window.ResizeObserver(onBandResize);
+    bandWatch.observer.observe(band, { box: "border-box" });
+    bandWatch.band = band;
+  }
+
+  function unwatchBand() {
+    bandWatch.observer?.disconnect();
+    bandWatch.band = null;
+  }
+
   // Leaving the mode: no pin, hover or search carries over, and the view's
   // document and window listeners are removed.
   function release() {
+    unwatchBand();
     live.pin = null;
     live.hover = null;
     live.quiet = null;
@@ -2599,11 +2678,7 @@
     // The line under the legend names what is traced in full, so text a box
     // had to shorten is readable on hover and on keyboard focus alike.
     const pin = root.querySelector("[data-topology-pin]");
-    if (pin) {
-      if (live.hover) pin.textContent = `Tracing: ${refLabel(live.model, live.hover)}.${live.pin ? " Pinned item kept; Esc clears." : ""}`;
-      else if (live.pin) pin.textContent = `Pinned: ${refLabel(live.model, live.pin)}. Esc clears.`;
-      else pin.textContent = DEFAULT_HINT;
-    }
+    if (pin) pin.textContent = traceSentence(live.model, { hover: live.hover, pin: live.pin });
   }
 
   function updateSearchStatus() {
@@ -2757,7 +2832,12 @@
     searchHelp,
     linkDetail,
     render,
-    mount,
+    // After the drawing is in place: mount sets its view, and the band's
+    // height is followed from then on.
+    mount: (container, ...rest) => {
+      mount(container, ...rest);
+      watchBand(container);
+    },
     release,
     view,
     drawnModel,
