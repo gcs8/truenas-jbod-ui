@@ -6,7 +6,6 @@ raise through the typed summary boundary and must never become a reading.
 Valid payloads are the controls: they still produce the same readings.
 """
 
-import ast
 import json
 import subprocess
 import sys
@@ -1431,13 +1430,106 @@ class LiveRefusedPowerOnTests(unittest.IsolatedAsyncioTestCase):
 class ParsersSmartModuleTests(unittest.TestCase):
     """The SMART and NVMe readers live in parsers_smart; parsers keeps every name."""
 
+    # The full namespace, dir(), of app.services.parsers before the move.
+    BASE_PARSERS_NAMES = (
+        "Any", "CASEFOLDED_SSH_COMMAND_PREFIXES", "CORE_ZPOOL_STATUS_BY_DEVICE_COMMAND",
+        "CORE_ZPOOL_STATUS_BY_DEVICE_OPTIONAL_COMMAND", "Callable", "CamcontrolInfo", "CamcontrolPeers",
+        "Counter", "DELL_MD1280_PROFILE_ID", "DEVICE_NAME_REGEX", "DEVICE_REGEX", "Decimal",
+        "DecimalException", "ESXCLI_STORCLI_SCOPES", "ESXCLI_STORCLI_SHORT_OPTIONS", "ESXI_STORCLI_BINARY",
+        "GEOM_LABEL_NAMESPACES", "GPTID_REGEX", "GUID_REGEX", "GlabelInfo", "HEX_IDENTIFIER_ERROR_SPLIT_REGEX",
+        "HEX_VALUE_REGEX", "Iterator", "LinuxMdArray", "LinuxScsiDevice", "MAX_SES_AES_DESCRIPTORS",
+        "MAX_SES_DEVICE_NAMES_PER_SLOT", "MAX_SES_DEVICE_NAME_LENGTH", "MAX_SES_ELEMENTS",
+        "MAX_SES_OUTPUT_CHARS", "MultipathConsumer", "MultipathInfo", "ParsedSSHData",
+        "SCALE_SSG_FRONT_24_PROFILE_ID", "SCALE_SSG_REAR_12_PROFILE_ID", "SESMapEnclosure", "SESMapSlot",
+        "SES_EVIDENCE_SOURCE_STRENGTH", "SES_STATUS_BYTES_REGEX", "SG_SES_COMMON_FIELD_PREFIXES",
+        "SG_SES_DISCOVERY_PLATFORMS", "SG_SES_JOIN_ELEMENT_TYPE_LABEL", "SIMPLE_SSH_COMMAND_PREFIXES",
+        "SIMPLE_SSH_EXECUTABLES", "SLOT_REGEX", "SMARTCTL_CACHE_TOGGLE_PREFIXES",
+        "SMART_COUNTER_METADATA_MAX_CHARS", "SMART_SAS_PORT_ROW_CAP", "SMART_SATA_PHY_EVENT_CAP",
+        "SMART_SUMMARY_UNREAD_MESSAGE", "SSH_OUTPUT_PARSERS", "SYSFS_JOINABLE_SLOT_NUMBER_SOURCES", "Sequence",
+        "TRAILING_CASEFOLDED_SSH_COMMAND_PREFIXES", "ZpoolMember", "_ATA_RAW_STRING_REGEX", "_ATA_SECTOR_UNIT",
+        "_ATA_UNIT_LIKE_REGEX", "_ATA_UNIT_NAME_REGEX", "_ATA_UNIT_SCALES", "_BYTE_COUNTER_LIMIT",
+        "_BoundedIdentityRows", "_CAMCONTROL_DEVICE_LINE_PATTERN", "_CELSIUS_MAX", "_CELSIUS_MIN",
+        "_LSSCSI_TRANSPORT_PATTERN", "_LSSCSI_TRANSPORT_RUN_PATTERN", "_NVME_EUI64_REGEX",
+        "_NVME_HEALTH_FIELDS", "_NVME_KELVIN_LIMIT", "_NVME_NGUID_REGEX", "_SAS_PORT_TEXT_LABELS",
+        "_SATA_CURRENT_LINK_RATE_PATTERN", "_SCSI_GIGABYTES_LIMIT", "_SCSI_SELF_TEST_INDEX_REGEX",
+        "_SMARTCTL_TEMPERATURE_FIELDS", "_SMARTCTL_THRESHOLD_NOT_AVAILABLE", "_SMART_LATEST_TEST_FIELDS",
+        "_SMART_ROW_CONFLICT", "_SMART_ROW_MISSING", "_STORCLI_PD_SECTION_HEADING_PATTERN",
+        "_STORCLI_PD_SECTION_VD_PATTERN", "_UNIFI_GPIO_LINE_HEAD_PATTERN", "_UNIFI_GPIO_LINE_PATTERN",
+        "_WORD_BOUNDARY_PATTERN", "__builtins__", "__cached__", "__doc__", "__file__", "__loader__",
+        "__name__", "__package__", "__spec__", "_add_control_targets", "_add_ses_device_name",
+        "_annualize_bytes", "_apply_enclosure_sysfs_device_names", "_apply_inferred_ses_profile",
+        "_apply_resolved_ses_descriptor_presence", "_apply_ses_device_name_evidence",
+        "_apply_ses_presence_evidence", "_apply_ses_sas_address_evidence", "_apply_ses_status_bytes",
+        "_apply_sg_ses_status_line", "_ata_attribute_raw_value_to_bytes", "_ata_attribute_unit_bytes",
+        "_ata_attributes_unreadable", "_ata_device_stats_unreadable", "_ata_raw_count", "_bounded_byte_count",
+        "_bounded_ses_device_names", "_coerce_int_like", "_coerce_non_negative_int",
+        "_collect_storcli_drive_details", "_collect_storcli_pd_sections",
+        "_collect_storcli_physical_drive_rows", "_collect_storcli_virtual_drive_details",
+        "_collect_storcli_virtual_drive_rows", "_compose_topology_label", "_degraded_slot_presence",
+        "_demote_repeated_ses_slot_number", "_derive_nested_vdev_label", "_derive_top_level_vdev_label",
+        "_derived_unread", "_device_name_sort_key", "_enclosure_sort_key", "_ensure_ses_device_name_index",
+        "_ensure_unmapped_slot_index", "_esxcli_storcli_key", "_extract_ata_attribute_entry",
+        "_extract_ata_attribute_raw_value", "_extract_ata_device_stat_bytes", "_extract_ata_device_stat_int",
+        "_extract_sg_ses_device", "_extract_sg_ses_enclosure_name", "_extract_slot_number",
+        "_extract_smartctl_latest_test", "_extract_smartctl_sas_phy", "_extract_smartctl_sas_ports",
+        "_extract_smartctl_sas_ports_text", "_extract_smartctl_sata_phy_events",
+        "_extract_smartctl_sata_phy_text", "_extract_smartctl_temperature_thresholds",
+        "_extract_smartctl_traffic_and_wear", "_extract_storcli_drive_path",
+        "_finalize_ses_device_slot_evidence", "_finalize_ses_invalid_descriptor_evidence", "_finalize_summary",
+        "_first_detail_value", "_flag_degraded_ses_sas_addresses", "_flatten_candidates",
+        "_flatten_storcli_detail", "_format_nvme_eui64", "_format_nvme_nguid", "_format_nvme_version",
+        "_format_scaled_size", "_infer_scale_enclosure_profile", "_infer_ses_slot_count",
+        "_is_ses_device_slot_type", "_is_sg_ses_join_element_header", "_iter_ata_attribute_entries",
+        "_iter_ata_device_stat_entries", "_json_celsius", "_json_text", "_kelvin_to_celsius",
+        "_load_json_object", "_lookup_simple_ssh_command", "_match_camcontrol_device_line",
+        "_match_sg_ses_join_element_header", "_merge_candidate_device_names", "_merge_candidate_presence",
+        "_merge_candidate_sas_address", "_merge_control_targets", "_merge_ses_enclosures",
+        "_merge_ses_slot_evidence", "_named_front_or_rear", "_normalize_table_key",
+        "_normalize_vdev_path_for_grouping", "_nvme_data_units_to_bytes", "_parse_enabled_disabled",
+        "_parse_sg_ses_common_field", "_parse_storcli_controllers", "_parse_storcli_eid_slot",
+        "_parse_storcli_json", "_parse_storcli_physical_drive_response",
+        "_parse_storcli_virtual_drive_response", "_pick_preferred_enclosures", "_positive_int",
+        "_reads_front_or_rear", "_record_ses_slot", "_record_sg_ses_aes_fallback_slot",
+        "_record_unmapped_ses_slot", "_replace_ses_device_names", "_reported", "_reported_cache_flag",
+        "_reported_kelvin", "_reported_namespace_eui64", "_reported_object", "_reported_sas_address",
+        "_reported_test_text", "_reported_text", "_reported_threshold", "_sas_port_row", "_sata_phy_event_row",
+        "_scan_sg_ses_signed_decimal", "_scsi_gigabytes_processed_to_bytes", "_search_lsscsi_transport",
+        "_ses_candidate_presence", "_ses_control_host", "_ses_control_slot_number",
+        "_ses_enclosures_share_identity", "_ses_evidence_strength", "_ses_input_exceeds_bounds",
+        "_skip_sg_ses_whitespace", "_smart_counter_metadata", "_smartctl_threshold_celsius",
+        "_stack_enclosures", "_stage_ses_device_slot_evidence", "_starts_with_sg_ses_slot_bracket",
+        "_storcli_controller_id", "_storcli_slot_key", "_tag_control_targets_with_reported_shelf",
+        "_unmapped_slot_key", "annotations", "build_slot_candidates_from_ses_enclosures",
+        "canonicalize_ssh_command", "dataclass", "dell_md1280_drawer_slot_layout",
+        "esxi_storcli_fallback_command", "extract_enclosure_slot_candidates", "extract_enclosure_slot_count",
+        "extract_nvme_controller_name", "field", "fixed_device_sg_ses_note", "fixed_device_sg_ses_reads",
+        "format_bytes", "format_hex_identifier", "is_ahci_sgpio_enclosure", "is_fixed_device_sg_ses_read",
+        "is_geom_label_path", "json", "merge_enclosure_meta", "merge_linux_scsi_devices",
+        "merge_slot_candidate_maps", "normalize_device_name", "normalize_gptid", "normalize_hex_identifier",
+        "normalize_lookup_keys", "normalize_text", "normalize_value_text", "parse_camcontrol_devlist",
+        "parse_enclosure_sysfs_map", "parse_esxcli_key_value_sections", "parse_esxcli_smart_get",
+        "parse_esxcli_table", "parse_glabel_status", "parse_gmultipath_list", "parse_lsblk_json",
+        "parse_lsscsi_devices", "parse_mdadm_detail_scan", "parse_nvme_id_ctrl_summary",
+        "parse_nvme_id_ns_summary", "parse_nvme_list_subsys_json", "parse_nvme_smart_log_summary",
+        "parse_pool_query_topology", "parse_sesutil_map", "parse_sesutil_map_enclosure_ids",
+        "parse_sesutil_show_enclosures", "parse_sg_ses_aes", "parse_sg_ses_enclosure_logical_id",
+        "parse_sg_ses_enclosure_status", "parse_sg_ses_join_filter", "parse_smart_test_results",
+        "parse_smartctl_summary", "parse_smartctl_text_enrichment", "parse_ssh_outputs",
+        "parse_storcli_controller_info", "parse_storcli_physical_drives", "parse_storcli_virtual_drives",
+        "parse_ubntstorage_json", "parse_unifi_gpio_debug", "parse_zpool_pool_states", "parse_zpool_status",
+        "parse_zpool_status_by_device", "re", "shift_hex_identifier", "shlex", "smp_output_key",
+        "storcli_physical_drive_list_complete",
+    )
+    # The modules and names parsers_smart imports; every other name in it is moved.
+    SMART_IMPORTS = ("annotations", "json", "re", "Iterator", "Decimal", "DecimalException", "Any", "normalize_text")
+
     # Every top-level name defined in app.services.parsers_smart.
     MOVED_NAMES = (
         "HEX_VALUE_REGEX", "HEX_IDENTIFIER_ERROR_SPLIT_REGEX", "normalize_hex_identifier",
         "format_hex_identifier", "_coerce_non_negative_int", "_json_text", "_reported_object", "_reported",
         "_reported_text", "_positive_int", "_load_json_object", "_BYTE_COUNTER_LIMIT", "_SCSI_GIGABYTES_LIMIT",
         "_bounded_byte_count", "_nvme_data_units_to_bytes", "_scsi_gigabytes_processed_to_bytes",
-        "_annualize_bytes", "_NVME_KELVIN_LIMIT", "_json_celsius", "_kelvin_to_celsius", "_reported_kelvin",
+        "_annualize_bytes", "_NVME_KELVIN_LIMIT", "_CELSIUS_MIN", "_CELSIUS_MAX", "_json_celsius", "_kelvin_to_celsius", "_reported_kelvin",
         "_format_nvme_version", "_NVME_EUI64_REGEX", "_NVME_NGUID_REGEX", "_format_nvme_eui64",
         "_format_nvme_nguid", "_ata_attributes_unreadable", "_ATA_RAW_STRING_REGEX", "_ata_raw_count",
         "_iter_ata_attribute_entries", "_extract_ata_attribute_raw_value", "_extract_ata_attribute_entry",
@@ -1477,18 +1569,13 @@ class ParsersSmartModuleTests(unittest.TestCase):
         import app.services.parsers as parsers
         import app.services.parsers_smart as smart
 
-        tree = ast.parse(Path(str(smart.__file__)).read_text(encoding="utf-8"))
-        defined: list[str] = []
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-                defined.append(node.name)
-            elif isinstance(node, ast.Assign):
-                defined.extend(target.id for target in node.targets if isinstance(target, ast.Name))
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                defined.append(node.target.id)
-        self.assertEqual(sorted(defined), sorted(self.MOVED_NAMES))
-        for name in self.MOVED_NAMES:
+        self.assertEqual(len(self.MOVED_NAMES), 84)
+        smart_names = {name for name in vars(smart) if not name.startswith("__")}
+        self.assertEqual(smart_names, set(self.MOVED_NAMES) | set(self.SMART_IMPORTS))
+        self.assertEqual(sorted(set(self.BASE_PARSERS_NAMES) - set(dir(parsers))), [])
+        for name in sorted(smart_names):
             with self.subTest(name=name):
+                self.assertIn(name, self.BASE_PARSERS_NAMES)
                 self.assertIs(getattr(parsers, name), getattr(smart, name))
 
     def test_replacing_a_moved_name_on_the_old_module_reaches_its_old_callers(self) -> None:

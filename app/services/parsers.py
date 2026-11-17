@@ -31,6 +31,8 @@ from app.services.parsers_smart import (  # noqa: F401 - re-exported; callers im
     _scsi_gigabytes_processed_to_bytes,
     _annualize_bytes,
     _NVME_KELVIN_LIMIT,
+    _CELSIUS_MIN,
+    _CELSIUS_MAX,
     _json_celsius,
     _kelvin_to_celsius,
     _reported_kelvin,
