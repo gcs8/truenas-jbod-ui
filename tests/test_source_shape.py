@@ -36,7 +36,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/services/inventory.py": 18250,
 
-    "app/services/parsers.py": 5000,
+    "app/services/parsers.py": 4500,
 
     "app/services/sas_fabric.py": 3500,
 
@@ -56,7 +56,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "tests/test_backup_integration.py": 4250,
 
-    "tests/test_history_service.py": 13000,
+    "tests/test_history_service.py": 11750,
 
     "tests/test_image_upgrade_contract.py": 3750,
 

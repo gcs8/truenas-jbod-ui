@@ -31,8 +31,7 @@ from app.settings_reload import SettingsGeneration, SettingsRuntime, config_relo
 from app.services.profile_registry import build_profile_reference_warnings
 from app.http_auth import (
     basic_auth_matches,
-    request_host_allows_writes,
-    request_origin_allowed,
+    browser_write_origin_decision,
     unlisted_host_rejection_detail,
 )
 from app.logging_config import configure_logging
@@ -668,11 +667,14 @@ def require_read_ui_basic_credentials(request: Request) -> None:
 def require_read_ui_mutation_authorization(request: Request) -> None:
     auth_settings = request.app.state.operator_auth_settings
     if auth_settings.auth_mode == "network":
-        public_origin = request.app.state.read_ui_public_origin
-        # #779: the Host-derived origin is only trusted for IPs, localhost and listed names.
-        if not public_origin and not request_host_allows_writes(
-            request, getattr(auth_settings, "allowed_host_names", frozenset())
-        ):
+        # #779, #737: the Host-derived origin is only trusted for IPs, localhost and listed names.
+        decision = browser_write_origin_decision(
+            request,
+            request.app.state.read_ui_public_origin,
+            getattr(auth_settings, "allowed_host_names", frozenset()),
+            allow_host_fallback=True,
+        )
+        if decision == "unlisted_host":
             raise HTTPException(
                 status_code=403,
                 detail=unlisted_host_rejection_detail(
@@ -682,8 +684,7 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
                     container="main UI",
                 ),
             )
-        public_origin = public_origin or f"{request.url.scheme}://{request.url.netloc}"
-        if not request_origin_allowed(request, public_origin):
+        if decision != "allow":
             raise HTTPException(
                 status_code=403,
                 detail="This request came from a different site and was blocked.",
@@ -695,7 +696,16 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
             detail="Changes are disabled because the sign-in settings could not be read.",
         )
     require_read_ui_basic_credentials(request)
-    if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
+    # Basic mode never trusts the request's own Host: only the configured origin.
+    if (
+        browser_write_origin_decision(
+            request,
+            request.app.state.read_ui_public_origin,
+            frozenset(),
+            allow_host_fallback=False,
+        )
+        != "allow"
+    ):
         raise HTTPException(
             status_code=403,
             detail="This request came from a different site and was blocked.",

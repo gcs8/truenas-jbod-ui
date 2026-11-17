@@ -46,13 +46,13 @@ in advisory mode too, because the author can fix them alone.
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 if __package__:
     from scripts import changelog_fragments as fragments
@@ -147,21 +147,45 @@ class GateResult:
     protected: bool = False
 
 
+def _run_git(repo: Path, args: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], check=False, capture_output=True, **kwargs)
+    except OSError as exc:
+        raise GateError("could not run git; install git and put it on PATH") from exc
+
+
 def _git(repo: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    completed = _run_git(repo, args, text=True, encoding="utf-8", errors="replace")
     if completed.returncode != 0:
         raise GateError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
     return completed.stdout
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def resolve_commit(repo: Path, option: str, value: str) -> str:
+    """The commit id that ``value``, given as ``option``, names.
+
+    Every git call after this one receives the id, never ``value``. A value
+    that is empty, starts with '-' or names no single commit (a tree, a blob,
+    a missing object, a range) is refused, so git never reads it as an option.
+    """
+
+    detail = ""
+    if value and not value.startswith("-"):
+        completed = _run_git(
+            repo,
+            ("rev-parse", "--verify", "--quiet", "--end-of-options", f"{value}^{{commit}}"),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        commit = completed.stdout.strip()
+        if completed.returncode == 0 and _COMMIT_ID.fullmatch(commit):
+            return commit
+        detail = completed.stderr.strip()
+    raise GateError(f"{option} {value} does not name a commit" + (f": {detail}" if detail else ""))
 
 
 def merge_commit_base(repo: Path, *, head: str, pull_request_head: str) -> str:
@@ -309,6 +333,9 @@ def evaluate(
     is already on the base branch.
     """
 
+    # Every git call below receives these commit ids, never the given values.
+    base = resolve_commit(repo, "--base", base)
+    head = resolve_commit(repo, "--head", head)
     result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
     if result.ok or not advisory or result.protected:
         return result
@@ -316,7 +343,7 @@ def evaluate(
 
 
 def _git_bytes(repo: Path, *args: str) -> bytes:
-    completed = subprocess.run(["git", "-C", str(repo), *args], check=False, capture_output=True)
+    completed = _run_git(repo, args)
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip()
         raise GateError(f"git {' '.join(args)} failed: {detail}")
@@ -558,14 +585,15 @@ def _entry_was_added(entry: Entry, entries: list[Entry], added: set[int]) -> boo
 
 
 def labels_from_event(path: Path) -> tuple[int | None, set[str]]:
+    """Number and labels of the pull request in an event payload; ValueError if it has another shape."""
+
     payload = json.loads(path.read_text(encoding="utf-8"))
-    pull_request = payload.get("pull_request") or {}
-    number = pull_request.get("number")
-    labels = {
-        str(label.get("name", "")).strip()
-        for label in pull_request.get("labels", [])
-        if isinstance(label, dict)
-    }
+    pull_request = (payload.get("pull_request") or {}) if isinstance(payload, dict) else None
+    number = pull_request.get("number") if isinstance(pull_request, dict) else None
+    raw_labels = pull_request.get("labels", []) if isinstance(pull_request, dict) else None
+    if not isinstance(raw_labels, list) or isinstance(number, bool) or not isinstance(number, (int, str, type(None))):
+        raise ValueError("it is not the payload of a pull request event")
+    labels = {str(label.get("name", "")).strip() for label in raw_labels if isinstance(label, dict)}
     return (int(number) if number is not None else None), {label for label in labels if label}
 
 
@@ -576,7 +604,8 @@ def parse_labels(raw: str | None) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # Escapes the program name and every parser error, which can quote command-line text.
+    parser = fragments.ArgumentParser(description=__doc__.splitlines()[0])
     base_source = parser.add_mutually_exclusive_group(required=True)
     base_source.add_argument("--base", help="Base ref or SHA (the pull request target).")
     base_source.add_argument(
@@ -619,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             event_number, event_labels = labels_from_event(args.event)
         except (OSError, ValueError) as exc:
-            print(f"could not read event payload {args.event}: {exc}")
+            print(fragments.printable(f"could not read event payload {args.event}: {exc}"))
             return 2
         labels = event_labels
         if pr_number is None:
@@ -627,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.labels is not None:
         labels = parse_labels(args.labels)
     if pr_number is None:
-        print("a pull request number is required (--pr or --event)")
+        print(fragments.printable("a pull request number is required (--pr or --event)"))
         return 2
 
     try:
@@ -643,11 +672,13 @@ def main(argv: list[str] | None = None) -> int:
             advisory=args.advisory,
         )
     except GateError as exc:
-        print(str(exc))
+        print(fragments.printable(str(exc)))
         return 2
 
+    # File names, git arguments and git errors are printed through printable(),
+    # so none of them can start a log line of its own.
     for message in result.messages:
-        print(message)
+        print(fragments.printable(message))
     return 0 if result.ok else 1
 
 
