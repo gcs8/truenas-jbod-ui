@@ -7055,7 +7055,7 @@ class SystemBackupService:
         extracted_members: dict[str, ExtractedMember],
         target_path: Path,
         restored_paths: list[str],
-        transaction: _ImportActivationTransaction | None = None,
+        transaction: _ImportActivationTransaction,
     ) -> None:
         group_entry = group_entries.get(group_key)
         if not self._manifest_group_selected(group_entry):
@@ -7065,13 +7065,7 @@ class SystemBackupService:
             member_key = member_entries[0]["key"]
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
-            if transaction is None:
-                self._write_bytes_atomic(
-                    target_path,
-                    self._extracted_member_bytes(extracted_members[member_key]),
-                )
-            else:
-                transaction.activate_file(target_path, member_key)
+            transaction.activate_file(target_path, member_key)
             restored_paths.append(str(target_path))
             return
         if self._manifest_group_present(group_entry):
@@ -7087,7 +7081,7 @@ class SystemBackupService:
         extracted_members: dict[str, ExtractedMember],
         target_dir: Path,
         restored_paths: list[str],
-        transaction: _ImportActivationTransaction | None = None,
+        transaction: _ImportActivationTransaction,
     ) -> None:
         group_entry = group_entries.get(group_key)
         if not self._manifest_group_selected(group_entry):
@@ -7111,15 +7105,7 @@ class SystemBackupService:
             restore_targets.append((member_key, target_path))
             transaction_members.append((member_key, relative_path))
 
-        if transaction is None:
-            self._remove_tree_if_exists(target_dir)
-            for member_key, target_path in restore_targets:
-                self._write_bytes_atomic(
-                    target_path,
-                    self._extracted_member_bytes(extracted_members[member_key]),
-                )
-        else:
-            transaction.activate_directory(target_dir, transaction_members)
+        transaction.activate_directory(target_dir, transaction_members)
         restored_paths.extend(str(target_path) for _member_key, target_path in restore_targets)
 
     @staticmethod
@@ -7491,23 +7477,6 @@ class SystemBackupService:
             combined_output[:2000].replace(passphrase, "***") if passphrase else combined_output[:2000],
         )
         raise ValueError(f"{message} The 7-Zip step failed (exit {result.returncode}).")
-
-    @staticmethod
-    def _write_bytes_atomic(target_path: Path, content: bytes) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
-        temp_path.write_bytes(content)
-        temp_path.replace(target_path)
-
-    @staticmethod
-    def _remove_tree_if_exists(target_dir: Path) -> None:
-        if not target_dir.exists():
-            return
-        for file_path in sorted((path for path in target_dir.rglob("*") if path.is_file()), reverse=True):
-            file_path.unlink(missing_ok=True)
-        for directory in sorted((path for path in target_dir.rglob("*") if path.is_dir()), reverse=True):
-            directory.rmdir()
-        target_dir.rmdir()
 
     def _read_scrubbed_yaml_file(self, path: Path, scrubber: DebugScrubber | None) -> bytes:
         if not path.exists():

@@ -4316,16 +4316,24 @@ sys.stdout.flush()
         group_entries = {SSH_KEYS_KEY: {"selected": True, "present": True}}
         restored_paths: list[str] = []
 
+        # Production always restores inside an import transaction; the member
+        # check must refuse before the directory is handed to it.
         with self.assertRaisesRegex(ValueError, "missing the selected ssh_keys member"):
-            self.backup_service._restore_directory_group(
-                SSH_KEYS_KEY,
-                manifest,
-                group_entries,
-                {},
-                target_dir,
-                restored_paths,
-            )
+            with _ImportActivationTransaction({}, history_store=self.store) as transaction:
+                with patch.object(
+                    transaction, "activate_directory", wraps=transaction.activate_directory,
+                ) as activate_directory:
+                    self.backup_service._restore_directory_group(
+                        SSH_KEYS_KEY,
+                        manifest,
+                        group_entries,
+                        {},
+                        target_dir,
+                        restored_paths,
+                        transaction,
+                    )
 
+        activate_directory.assert_not_called()
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertEqual(restored_paths, [])
 
