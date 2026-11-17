@@ -213,6 +213,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_incomplete_refresh_status",
             "tests.test_interrupted_restore_recovery",
             "tests.test_inventory",
+            "tests.test_inventory_helpers",
             "tests.test_inventory_nested_slot_zero",
             "tests.test_inventory_registry_routes",
             "tests.test_inventory_status_error_text",

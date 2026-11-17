@@ -247,6 +247,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_schema_version_gate",
         "test_history_service",
         "test_inventory",
+        "test_inventory_helpers",
         "test_inventory_nested_slot_zero",
         "test_inventory_registry_routes",
         "test_inventory_status_error_text",

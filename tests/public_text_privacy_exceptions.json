@@ -487,13 +487,24 @@
         "sha256:2c4bad5b735e2092c0fe4941ec6ec0cce684ba68e202180166d25e5fec72f9fe": 3
       },
       "rfc1918_ipv4": {
-        "sha256:1863c834b4ee013a4376220cdf2e1057444270458b9a697fe56ad5c48d4facb8": 117
+        "sha256:1dcbec214c335287b7d5381f812ca247487d70cc969bb1741a9864f840387d35": 108
       },
       "sas_wwn_identifier": {
-        "sha256:592bf798cf1d494aceb478251706cb8fc5657b050d807d41dfc97ad7f6fcb541": 223
+        "sha256:6f59b1e17684d69a6130084787d42a569048cec71d91174dc4148f0e7f9313d9": 161
       }
     },
     "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. Issue 926 adds six literal occurrences of one invented enclosure identifier for dual-path locate-light confirmation; no captured device identity is added."
+  },
+  "tests/test_inventory_helpers.py": {
+    "findings": {
+      "rfc1918_ipv4": {
+        "sha256:43428151b4155ec6f6079a469dbd49c9639edd5857e6d2bf6f0f92d96493e760": 9
+      },
+      "sas_wwn_identifier": {
+        "sha256:99628bdbed74362f60e8ffb36dcaa9e5ef020d1855db72459e866881bd14807d": 62
+      }
+    },
+    "reason": "Synthetic or adversarial test literals; exact values and counts are pinned."
   },
   "tests/test_parsers.py": {
     "findings": {
