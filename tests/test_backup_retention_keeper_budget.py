@@ -568,6 +568,7 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
         import re
 
         page = (ROOT / "admin_service/static/admin_backups.js").read_text()
+        model = (ROOT / "admin_service/static/admin_backup_model.js").read_text()
         route = (ROOT / "admin_service/routes.py").read_text()
         # Join the "..." + "..." (page) and adjacent "..." "..." (route) string pieces.
         joined_page = re.sub(r'"\s*\+\s*"', "", " ".join(page.split()))
@@ -575,7 +576,7 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
         self.assertTrue(f'"{CLEANUP_STATE_UNKNOWN}"' in joined_page)
         self.assertTrue(f'"{CLEANUP_STATE_UNKNOWN}"' in joined_route)
         # One message: no running, not-running or settled state is left after a lost answer.
-        for name, source in (("page", page), ("route", route)):
+        for name, source in (("page", page), ("model", model), ("route", route)):
             for gone in ("cleanup_running", "cleanup_not_running", "no longer running"):
                 with self.subTest(source=name, gone=gone):
                     self.assertFalse(gone in " ".join(source.split()), gone)
