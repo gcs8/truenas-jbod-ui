@@ -490,12 +490,40 @@ owner-approved `workflow_dispatch`.
   it because a pull request can enter the candidate through an intermediate
   same-repository branch:
   `gh pr list -R gcs8/truenas-jbod-ui --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository > merged-prs.json`
-- run the coverage gate against the previous tag and `## Unreleased`, then fix
-  every missing pull request number before proceeding:
+- validate the fragments:
+  `python scripts/changelog_fragments.py check`
+- preview `## Unreleased` with the fragments merged in, each ending in the
+  `(#N)` of its file name:
+  `python scripts/changelog_fragments.py preview`
+- run the coverage gate against the previous tag and `## Unreleased` (the
+  existing bullets plus every fragment), then fix every missing pull request
+  number before proceeding. It also fails, naming the file, when a fragment's
+  number is not a pull request merged since the previous tag. For a
+  squash-merged staging branch the outer pull request's fragment is the entry
+  for the staged work; apply `no-changelog` to each inner pull request it
+  reports as missing (the labels are read from `merged-prs.json`):
   `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json`
-- rename `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, write three to five
-  `### Highlights` bullets, review every `### Upgrade notes` bullet as an
-  operator would, and rerun the coverage gate against the final header
+- collect the fragments into the release section. This renames
+  `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, adds each fragment as a bullet
+  ending in its `(#N)` under its subsection, after the bullets already there,
+  and deletes the fragments it consumed (it prints them):
+  `python scripts/changelog_fragments.py collect --version X.Y.Z --date YYYY-MM-DD`
+  It refuses, writing nothing, when a fragment changed between the read and
+  the write. After the write it deletes a fragment only while its bytes are
+  still the ones it read; a fragment that changed, or that it cannot delete,
+  is left in place and listed, the other fragments are still deleted, and the
+  run exits non-zero. A second run for the same version is refused and lists
+  the fragments still present; compare them with the written section, or
+  restore `CHANGELOG.md` from Git and collect again. It keeps the text of the
+  older sections and writes LF line endings, which `.gitattributes` requires.
+  Review the diff; only `changelog.d/README.md` may remain, and the release
+  wrap validator refuses a release tree with any other fragment. The release
+  pull request deletes fragments that are already on `main`, so the
+  maintainer applies `changelog-edit-ok` to it after reading its diff; the
+  coverage run on the new section below is what catches a lost number
+- write three to five `### Highlights` bullets, review every
+  `### Upgrade notes` bullet as an operator would, and rerun the coverage gate
+  against the final header
 - render and retain the release body head:
   `python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md`
 - record the exact `Changelog coverage: pass (<N> PRs)` line in the release wrap
@@ -775,7 +803,9 @@ to the next full run. A deferred gate is not a pass and not a waiver.
 - after local, Linux, and production deployments are all current and healthy,
   tear down only the temporary Linux QA restore containers, networks, and
   scratch runtime directories
-- start a new `Unreleased` section in `CHANGELOG.md` for follow-up work
+- follow-up work adds fragments under `changelog.d/`; do not reopen an
+  `Unreleased` section in `CHANGELOG.md` (the next `collect` creates the
+  release section from the fragments)
 - `git mv` the previous release's `docs/RELEASE_NOTES_<version>.md` and
   `docs/RELEASE_WRAP_<version>.md` into `docs/archive/` so only the current
   release stays at the top level; `scripts/validate_release_wrap.py` reads

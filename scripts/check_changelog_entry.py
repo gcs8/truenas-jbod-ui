@@ -1,25 +1,39 @@
-"""Pull-request gate: require a CHANGELOG.md line for code-visible changes.
+"""Pull-request gate: require a changelog fragment under changelog.d/.
 
 The gate reads the ``base...head`` diff of one pull request with ``git`` only.
-It never talks to the network. A pull request must either carry the
-``no-changelog`` or ``dependencies`` escape label, or touch an operator-visible
-path and add at least one bullet under
-``## Unreleased``, or under the first SemVer release section when Unreleased has
-been cut for a release candidate, in one of the allowed ``### `` subsections
-whose trailing parenthetical names the pull request as ``(#N)``. A pull request
-labelled ``breaking`` must add that bullet under ``### Breaking changes`` or
-``### Upgrade notes``.
+It never talks to the network. A fragment is named for the pull request that
+adds it, ``changelog.d/<N>.<section>.md`` (``<N>.<section>.<k>.md`` for a
+second and later entry, ``k`` from 2); see ``scripts/changelog_fragments.py``
+for the format. The checks, in order:
+
+1. Every path the diff adds under ``changelog.d/`` (including a rename or copy
+   target) must be named for this pull request's number; the failure names
+   the file and the name it should have.
+2. A fragment that is already on the base branch belongs to another pull
+   request: deleting, renaming, editing, or changing its mode or type is
+   refused, on a release cut too. The ``changelog-edit-ok`` label, applied by
+   a maintainer after reading the diff, waives this check and nothing else.
+3. The ``no-changelog`` or ``dependencies`` label makes an entry optional.
+4. Otherwise the diff must add at least one valid fragment named for this pull
+   request, and every fragment it adds or changes must be valid. A pull
+   request labelled ``breaking`` must add one in the ``breaking`` or
+   ``upgrade`` section. Editing ``CHANGELOG.md`` does not count, except for a
+   release cut: a pull request that introduces the first SemVer release
+   heading and adds a bullet naming itself as ``(#N)`` in that new section
+   passes as before.
 
 Usage from a checkout that has both refs::
 
-    python scripts/check_changelog_entry.py --base origin/main --head HEAD \
+    python scripts/check_changelog_entry.py --base origin/main --head HEAD \\
         --pr 123 --labels bug,breaking
 
 In GitHub Actions ``--event "$GITHUB_EVENT_PATH"`` supplies the pull request
 number and labels from the event payload; ``--pr`` and ``--labels`` override
-those values when given. ``--advisory`` keeps every message but exits 0; the
-workflow passes it for pull requests whose author has no write access and so
-cannot apply the ``no-changelog`` label the failure text asks for.
+those values when given. ``--advisory`` is passed for pull requests whose
+author has no write access and so cannot apply the ``no-changelog`` label.
+Advisory mode softens only a missing or invalid entry (checks 3 and 4): it
+keeps the message and exits 0. It never softens checks 1 and 2, which exit 1
+in advisory mode too, because the author can fix them alone.
 """
 
 from __future__ import annotations
@@ -31,6 +45,11 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__:
+    from scripts import changelog_fragments as fragments
+else:
+    import changelog_fragments as fragments  # type: ignore[no-redef]
 
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
@@ -48,6 +67,10 @@ NO_CHANGELOG_LABEL = "no-changelog"
 # release body under "Dependencies" through .github/release.yml.
 SKIP_LABELS = (NO_CHANGELOG_LABEL, "dependencies")
 BREAKING_LABEL = "breaking"
+# Applied by a maintainer after reading: allows changing or deleting a fragment
+# that is already on the base branch (for example on a revert). It waives that
+# protection only.
+EDIT_LABEL = "changelog-edit-ok"
 
 ALLOWED_SUBSECTIONS = (
     "Breaking changes",
@@ -111,6 +134,9 @@ class Entry:
 class GateResult:
     ok: bool
     messages: list[str] = field(default_factory=list)
+    # A refusal the author can fix alone (rename an own fragment, restore
+    # another one), so advisory mode does not turn it into a pass.
+    protected: bool = False
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -229,8 +255,9 @@ def current_entries(lines: list[str]) -> tuple[str, list[Entry]]:
 ADVISORY_PREFIX = (
     "Advisory only: this pull request's author cannot apply repository labels, "
     "so the changelog gate reports instead of blocking. Before merge a "
-    "maintainer either applies the label named below or adds the bullet."
+    "maintainer either applies the label named below or adds the fragment."
 )
+BREAKING_FRAGMENT_SECTIONS = ("breaking", "upgrade")
 
 
 def evaluate(
@@ -244,16 +271,123 @@ def evaluate(
 ) -> GateResult:
     """Decide the gate for one pull request.
 
-    ``advisory`` keeps every message but turns a failure into a pass. It is
-    used for contributors without write access, who cannot apply the
-    ``no-changelog`` label the failure text asks for; a maintainer resolves the
-    reported item before merge.
+    ``advisory`` is used for contributors without write access, who cannot
+    apply the ``no-changelog`` label the failure text asks for. Advisory mode
+    softens only a missing or invalid entry: it keeps the messages and passes,
+    and a maintainer resolves the reported item before merge. It never softens
+    a fragment named for another pull request or a change to a fragment that
+    is already on the base branch.
     """
 
     result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
-    if result.ok or not advisory:
+    if result.ok or not advisory or result.protected:
         return result
     return GateResult(True, [ADVISORY_PREFIX, *result.messages])
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    completed = subprocess.run(["git", "-C", str(repo), *args], check=False, capture_output=True)
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git {' '.join(args)} failed: {detail}")
+    return completed.stdout
+
+
+def fragment_changes(repo: Path, base: str, head: str) -> list[tuple[str, str]]:
+    """(status letter, path) for every changelog.d/ path the diff touches.
+
+    Renames are not detected, so a rename is a deletion of the old path plus an
+    addition of the new one, and a copy is an addition.
+    """
+
+    # No trailing slash: a path named exactly changelog.d that is not a directory shows up too.
+    raw = _git_bytes(repo, "diff", "--name-status", "-z", "--no-renames", f"{base}...{head}", "--", fragments.FRAGMENT_DIR)
+    fields = raw.decode("utf-8", "surrogateescape").split("\0")
+    return [(fields[index][0], fields[index + 1]) for index in range(0, len(fields) - 1, 2) if fields[index]]
+
+
+def _expected_name(path: str, pr_number: int) -> str:
+    pieces = path.replace("\\", "/").rsplit("/", 1)[-1].split(".")
+    section = pieces[1] if len(pieces) > 1 and pieces[1] in fragments.SECTIONS else "<section>"
+    return f"{fragments.FRAGMENT_DIR}/{pr_number}.{section}.md"
+
+
+def _protected_result(repo: Path, base: str, head: str, pr_number: int, labels: set[str]) -> GateResult | None:
+    """Checks 1 and 2: fragments named for another pull request, and changes to
+    fragments already on the base branch. Neither label nor advisory mode
+    softens them; ``changelog-edit-ok`` waives check 2 only."""
+
+    readme = f"{fragments.FRAGMENT_DIR}/{fragments.README_NAME}"
+    changes = [(status, path) for status, path in fragment_changes(repo, base, head) if path != readme]
+    messages: list[str] = []
+
+    misnamed = sorted(path for status, path in changes if status == "A" and fragments.name_number(path) != pr_number)
+    if misnamed:
+        messages += [
+            f"#{pr_number} adds changelog fragments that are not named for it; a pull request adds only "
+            f"fragments named {fragments.FRAGMENT_DIR}/{pr_number}.<section>.md:",
+            *(f"  {path}: name it {_expected_name(path, pr_number)}" for path in misnamed),
+            f"Use {fragments.FRAGMENT_DIR}/{pr_number}.<section>.<k>.md, with k from 2, for a second entry in "
+            "the same section. A pull request that carries work from other pull requests names its fragments "
+            "with its own number. Labels and advisory mode do not waive this.",
+        ]
+
+    changed = sorted((path, status) for status, path in changes if status != "A")
+    if changed and EDIT_LABEL not in labels:
+        messages += [
+            f"#{pr_number} changes changelog fragments that are already on the base branch; they belong "
+            "to other pull requests:",
+            *(f"  {path}: {_change_word(status)}" for path, status in changed),
+            "Restore them; the exemption labels and advisory mode do not allow this. A maintainer may "
+            f"apply the '{EDIT_LABEL}' label after reading the diff, for example on a revert or on the release "
+            "pull request that collects them.",
+        ]
+    if not messages:
+        return None
+    return GateResult(False, messages, protected=True)
+
+
+def _change_word(status: str) -> str:
+    return {"D": "deleted or renamed", "M": "content or mode changed", "T": "type changed"}.get(status, "changed")
+
+
+def _fragment_at(repo: Path, head: str, path: str) -> tuple[bytes, bool]:
+    """Content of ``path`` at ``head`` and whether it is a regular file."""
+
+    entry = _git_bytes(repo, "ls-tree", "-z", head, "--", path).decode("utf-8", "surrogateescape")
+    meta, _tab, _name = entry.partition("\t")
+    parts = meta.split(" ")
+    if len(parts) != 3 or parts[0] not in {"100644", "100755"} or parts[1] != "blob":
+        return b"", False
+    return _git_bytes(repo, "cat-file", "blob", parts[2]), True
+
+
+def _missing_fragment_messages(pr_number: int, paths: list[str]) -> list[str]:
+    directory = fragments.FRAGMENT_DIR
+    messages = [
+        f"No changelog fragment added for #{pr_number}. Add one file named for this pull request, for example "
+        f"add {directory}/{pr_number}.fixed.md, holding one past-tense sentence about the change. The release "
+        f"appends '(#{pr_number})' from the file name, so do not write it; any #N inside parentheses is refused, "
+        "and a plain mention of an issue or another pull request, such as 'see #123', is allowed.",
+        f"Name it {directory}/{pr_number}.<section>.md ({directory}/{pr_number}.<section>.<k>.md, with k from 2, "
+        f"for a second entry in the same section); <section> is one of: {fragments.section_names()}. "
+        f"See {directory}/README.md.",
+    ]
+    if CHANGELOG_PATH in paths:
+        messages.append(
+            f"This pull request edits {CHANGELOG_PATH}; that no longer counts as an entry. Move the "
+            f"bullet into a fragment and drop the {CHANGELOG_PATH} edit."
+        )
+    if not any(is_relevant_path(path) for path in paths):
+        messages.append(
+            "The diff touches no operator-visible path; an 'internal' fragment is accepted for tests, "
+            "CI or tooling."
+        )
+    messages.append(
+        f"If this pull request is intentionally invisible to operators, apply the "
+        f"'{NO_CHANGELOG_LABEL}' label and re-run the check instead."
+    )
+    return messages
 
 
 def _evaluate(
@@ -265,7 +399,10 @@ def _evaluate(
     labels: set[str],
 ) -> GateResult:
     paths = changed_paths(repo, base, head)
-    relevant = sorted(path for path in paths if is_relevant_path(path))
+
+    protected = _protected_result(repo, base, head, pr_number, labels)
+    if protected is not None:
+        return protected
 
     skipping = [label for label in SKIP_LABELS if label in labels]
     if skipping:
@@ -273,28 +410,65 @@ def _evaluate(
             True,
             [f"{skipping[0]} label present; CHANGELOG entry not required for #{pr_number}."],
         )
-    if not relevant:
+
+    problems: list[str] = []
+    added: list[fragments.Fragment] = []
+    for status, path in fragment_changes(repo, base, head):
+        if status == "D" or path == f"{fragments.FRAGMENT_DIR}/{fragments.README_NAME}":
+            continue
+        data, regular = _fragment_at(repo, head, path)
+        problem = fragments.fragment_problem(path, data, regular_file=regular)
+        if problem is not None:
+            problems.append(f"{path}: {problem}")
+        elif status == "A":
+            added.append(fragments.parse_fragment(path, data))
+    if problems:
         return GateResult(
             False,
             [
-                f"No operator-visible paths changed for #{pr_number}; apply the "
-                f"'{NO_CHANGELOG_LABEL}' label and re-run the check."
+                f"Invalid changelog fragment(s) in #{pr_number}:",
+                *(f"  {problem}" for problem in problems),
+                f"See {fragments.FRAGMENT_DIR}/README.md for the format.",
             ],
         )
 
+    if added:
+        sections = {fragment.section for fragment in added}
+        if BREAKING_LABEL in labels and not sections & set(BREAKING_FRAGMENT_SECTIONS):
+            return GateResult(
+                False,
+                [
+                    f"#{pr_number} carries the '{BREAKING_LABEL}' label, so it must also add "
+                    f"{fragments.FRAGMENT_DIR}/{pr_number}.breaking.md or "
+                    f"{fragments.FRAGMENT_DIR}/{pr_number}.upgrade.md that says what an operator must "
+                    "do on upgrade."
+                ],
+            )
+        listed = ", ".join(f"{fragment.path} ({fragment.heading})" for fragment in added)
+        return GateResult(True, [f"Changelog fragment for #{pr_number}: {listed}."])
+
+    release_cut = _release_cut_result(repo, base, head, pr_number, labels, paths)
+    if release_cut is not None:
+        return release_cut
+    return GateResult(False, _missing_fragment_messages(pr_number, paths))
+
+
+def _release_cut_result(
+    repo: Path, base: str, head: str, pr_number: int, labels: set[str], paths: list[str]
+) -> GateResult | None:
+    """Admit a release cut the way the gate always has, or return None.
+
+    A release cut introduces the first SemVer release heading of CHANGELOG.md
+    (the collector renames Unreleased) and adds a bullet naming this pull
+    request in that new section.
+    """
+
+    selected_heading = _added_release_heading(repo, base, head, paths)
+    if selected_heading is None:
+        return None
     head_lines = _head_changelog_lines(repo, head)
-    added = added_line_numbers(repo, base, head, CHANGELOG_PATH) if CHANGELOG_PATH in paths else set()
-    selected_heading, entries = current_entries(head_lines) if added else (UNRELEASED_HEADING, [])
-    if selected_heading != UNRELEASED_HEADING and not _heading_was_added(head_lines, selected_heading, added):
-        return GateResult(
-            False,
-            [
-                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section on this branch, so a bullet for "
-                f"#{pr_number} would land in the already shipped '{selected_heading}' section.",
-                f"Insert '{UNRELEASED_HEADING}', a blank line, and a '### <Subsection>' heading directly "
-                f"above '{selected_heading}', then put the bullet there.",
-            ],
-        )
+    added = added_line_numbers(repo, base, head, CHANGELOG_PATH)
+    _heading, entries = current_entries(head_lines)
     touched = [
         entry
         for entry in entries
@@ -302,46 +476,35 @@ def _evaluate(
         and entry.names_pr(pr_number)
         and _entry_was_added(entry, entries, added)
     ]
-
-    messages: list[str] = []
     if not touched:
-        messages.append(
-            f"CHANGELOG.md needs an entry for #{pr_number}. The diff touches "
-            f"operator-visible paths ({', '.join(relevant[:5])}"
-            f"{', ...' if len(relevant) > 5 else ''}) but adds no bullet under "
-            f"'{selected_heading}' that ends with '(#{pr_number})'."
-        )
-        messages.append(
-            f"Add one line under '{selected_heading}' in one of these subsections: "
-            + ", ".join(f"'### {name}'" for name in ALLOWED_SUBSECTIONS)
-            + f". Shape: '- <one sentence in past tense> (#{pr_number})'. "
-            "Wrap at about 80 columns; the '(#N)' may sit on the continuation line."
-        )
-        if UNRELEASED_HEADING not in {line.strip() for line in head_lines if line.startswith("## ")}:
-            messages.append(
-                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section yet; insert it directly above the "
-                "top release heading first."
-            )
-        messages.append(
-            f"If this pull request is intentionally invisible to operators, apply the "
-            f"'{NO_CHANGELOG_LABEL}' label and re-run the check instead."
-        )
-        return GateResult(False, messages)
-
+        return None
     if BREAKING_LABEL in labels and not any(entry.subsection in BREAKING_SUBSECTIONS for entry in touched):
-        messages.append(
-            f"#{pr_number} carries the '{BREAKING_LABEL}' label, so CHANGELOG.md must also add "
-            f"a bullet ending in '(#{pr_number})' under '### Breaking changes' or "
-            f"'### Upgrade notes' that says what an operator must do on upgrade."
+        return GateResult(
+            False,
+            [
+                f"#{pr_number} carries the '{BREAKING_LABEL}' label, so CHANGELOG.md must also add "
+                f"a bullet ending in '(#{pr_number})' under '### Breaking changes' or "
+                f"'### Upgrade notes' that says what an operator must do on upgrade."
+            ],
         )
-        return GateResult(False, messages)
-
     subsections = sorted({entry.subsection for entry in touched})
-    messages.append(
-        f"CHANGELOG entry for #{pr_number} found in {selected_heading} under: "
-        f"{', '.join(subsections)}."
+    return GateResult(
+        True,
+        [f"CHANGELOG entry for #{pr_number} found in {selected_heading} under: {', '.join(subsections)}."],
     )
-    return GateResult(True, messages)
+
+
+def _added_release_heading(repo: Path, base: str, head: str, paths: list[str]) -> str | None:
+    """The release heading this pull request introduces in CHANGELOG.md, or None."""
+
+    if CHANGELOG_PATH not in paths:
+        return None
+    head_lines = _head_changelog_lines(repo, head)
+    selected_heading, _entries = current_entries(head_lines)
+    added = added_line_numbers(repo, base, head, CHANGELOG_PATH)
+    if selected_heading == UNRELEASED_HEADING or not _heading_was_added(head_lines, selected_heading, added):
+        return None
+    return selected_heading
 
 
 def _heading_was_added(lines: list[str], heading: str, added: set[int]) -> bool:

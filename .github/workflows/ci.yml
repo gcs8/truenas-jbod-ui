@@ -148,7 +148,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Require a CHANGELOG entry for this pull request
+      - name: Require a changelog fragment for this pull request
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -160,13 +160,20 @@ jobs:
           # Labels are read live so applying `no-changelog` and re-running the
           # job takes effect without a new push. `dependencies` (Dependabot)
           # skips the gate the same way; release.yml still lists those PRs
-          # under Dependencies. The gate script itself only runs git; it
-          # never talks to the network.
+          # under Dependencies. Otherwise the pull request must add a valid
+          # changelog fragment named for its own number,
+          # changelog.d/<N>.<section>.md. Before the labels, the gate refuses
+          # an added fragment named for another number, and any change to a
+          # fragment already on the base unless `changelog-edit-ok` is
+          # applied. The gate script itself only runs git; it never talks to
+          # the network.
           labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
 
           # Only a contributor with write access can apply `no-changelog`, so
           # for everyone else the gate reports what is missing and passes; a
-          # maintainer adds the label or the bullet before merge (#TBD).
+          # maintainer adds the label or the fragment before merge (#TBD).
+          # Advisory mode softens only a missing or invalid entry; the two
+          # refusals above still fail.
           mode=()
           case "${PR_AUTHOR_ASSOCIATION:-NONE}" in
             OWNER|MEMBER|COLLABORATOR) ;;

@@ -28,6 +28,12 @@ entered the previous release.
 Every collected number must appear as ``(#N)`` (alone or inside a longer
 parenthetical such as ``(#12, #13, and #14)``) somewhere in the target
 ``CHANGELOG.md`` section. Missing numbers are printed and the gate exits 1.
+For ``## Unreleased`` the target is the combined view: the Unreleased text plus
+every fragment in ``changelog.d/``, each ending in the ``(#N)`` of its file name
+(``scripts/changelog_fragments.py``). A fragment whose number is not a pull
+request merged into the candidate since the tag, with or without an escape
+label, also fails the gate, named. A
+released section is read as written; fragments never count for it.
 
 When ``wiki/`` changed since the tag, the gate also requires ``--wiki-commit
 <sha>`` and confirms with ``git ls-remote`` that the sha is a branch tip of the
@@ -44,6 +50,11 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__:
+    from scripts import changelog_fragments as fragments
+else:
+    import changelog_fragments as fragments  # type: ignore[no-redef]
 
 CHANGELOG_PATH = "CHANGELOG.md"
 WIKI_DIRECTORY = "wiki/"
@@ -193,7 +204,9 @@ def pr_number_sets_from_json(
     previous_tag: str | None = None,
     head: str = "HEAD",
     not_after: str | None = None,
-) -> tuple[set[int], set[int]]:
+) -> tuple[set[int], set[int], set[int]]:
+    """Numbers that need an entry, labelled-out numbers, and this release's members (labelled or not)."""
+
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise CoverageError(f"{path} must hold a JSON list")
@@ -253,8 +266,10 @@ def pr_number_sets_from_json(
 
     candidate_rows = _branch_scoped_indices(records, {"candidate"})
     released_rows = _branch_scoped_indices(records, {"released"})
+    members: set[int] = set()
     for index, record in enumerate(records):
         if index in candidate_rows and index not in released_rows:
+            members.add(record.number)
             if not record.skipped:
                 numbers.add(record.number)
             continue
@@ -265,9 +280,10 @@ def pr_number_sets_from_json(
             continue
         if not_after and record.merged_at is not None and record.merged_at <= _iso_key(not_after):
             continue
+        members.add(record.number)
         if not record.skipped:
             numbers.add(record.number)
-    return numbers, excluded
+    return numbers, excluded, members
 
 
 def _iso_key(value: str) -> str:
@@ -345,8 +361,9 @@ def evaluate(
     result = CoverageResult(ok=True)
 
     expected = merged_pr_numbers_from_git(repo, previous_tag, head)
+    members: set[int] = set()
     if merged_prs_json is not None:
-        json_numbers, excluded = pr_number_sets_from_json(
+        json_numbers, excluded, members = pr_number_sets_from_json(
             merged_prs_json,
             repo=repo,
             previous_tag=previous_tag,
@@ -355,9 +372,17 @@ def evaluate(
         )
         expected |= json_numbers
         expected -= excluded
-    expected -= released_pr_numbers(repo, previous_tag)
+    released = released_pr_numbers(repo, previous_tag)
+    expected -= released
 
     changelog = (changelog_path or repo / CHANGELOG_PATH).read_text(encoding="utf-8")
+    fragment_notes: list[str] = []
+    stray: list[str] = []
+    if section_header.strip() == fragments.UNRELEASED_HEADING:
+        root = changelog_path.parent if changelog_path is not None else repo
+        changelog, fragment_notes, pending = fragments.combined_view(root, changelog)
+        merged = (expected | members) - released
+        stray = [f"  {item.path} (#{item.number})" for item in pending if item.number not in merged]
     present = pr_numbers_in_section(changelog_section(changelog, section_header))
     result.covered = expected & present
     result.missing = expected - present
@@ -373,6 +398,18 @@ def evaluate(
         )
     else:
         result.messages.append(f"Changelog coverage: pass ({len(expected)} PRs)")
+    if stray:
+        result.ok = False
+        result.messages.append(
+            f"Changelog fragments: FAIL, named for pull requests that did not merge into {head} since "
+            f"{previous_tag}:"
+        )
+        result.messages.extend(stray)
+        result.messages.append(
+            "Rename or remove each one (a maintainer applies 'changelog-edit-ok'), or, when the pull request "
+            "did merge and its squash title lost the number, list it in --merged-prs-json."
+        )
+    result.messages.extend(f"Changelog fragment: {note}" for note in fragment_notes)
 
     result.wiki_changed = wiki_changed_since(repo, previous_tag, head)
     if result.wiki_changed:
