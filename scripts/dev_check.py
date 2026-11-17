@@ -192,6 +192,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_routes",
             "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
+            "tests.test_backup_7z_split",
             "tests.test_backup_archive_journal",
             "tests.test_backup_integration",
             "tests.test_backup_json_entry_bounds",
