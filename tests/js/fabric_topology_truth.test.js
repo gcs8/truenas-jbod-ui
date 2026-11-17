@@ -776,7 +776,7 @@ function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {},
   page?.bind(sandbox.window);
   vm.runInContext(source.replace(/\}\)\(\);\s*$/, "  window.__page = { state, render };\n})();"), sandbox);
   const click = (mode) => buttons.find((button) => button.dataset.fabricMode === mode).handlers.get("click")();
-  return { page: sandbox.window.__page, elements, click };
+  return { page: sandbox.window.__page, elements, click, sandbox };
 }
 
 test("leaving Topology through the mode buttons clears its pin, trace and search, also with no payload", () => {
@@ -1217,10 +1217,16 @@ test("of two bay traces with one id the first is kept, and the notice says so", 
 // box grew, to 485 px at 2560x1440; from 190 to 0 px, where it stayed while
 // the box grew, at 3840x2160. `anchoring: false` leaves only the clamp.
 function fakePage({ viewport, above, below, anchoring = true }) {
-  const page = { innerHeight: viewport, above, below, scrollX: 0, scrollY: 0, panelHeight: () => 0, scrolls: [] };
+  const page = { innerHeight: viewport, above, below, scrollX: 0, scrollY: 0, panelHeight: () => 0, scrolls: [], windows: [], reads: 0 };
   let wanted = 0;
-  page.height = () => Math.max(viewport, page.above + page.panelHeight() + page.below);
-  page.range = () => Math.max(0, page.height() - viewport);
+  page.height = () => Math.max(page.innerHeight, page.above + page.panelHeight() + page.below);
+  page.range = () => Math.max(0, page.height() - page.innerHeight);
+  // The document's root element, as a script reads the page's length; every
+  // read is counted.
+  page.root = {
+    get scrollHeight() { page.reads += 1; return page.height(); },
+    get clientHeight() { page.reads += 1; return page.innerHeight; },
+  };
   page.layout = () => {
     page.scrollY = Math.min(wanted, page.range());
     if (!anchoring || page.scrollY === 0) wanted = page.scrollY;
@@ -1236,6 +1242,7 @@ function fakePage({ viewport, above, below, anchoring = true }) {
     const read = (name) => ({ get: () => page[name], configurable: true, enumerable: true });
     Object.defineProperties(win, { scrollX: read("scrollX"), scrollY: read("scrollY"), innerHeight: read("innerHeight") });
     win.scrollTo = page.scrollTo;
+    page.windows.push(win);
     return win;
   };
   return page;
@@ -1253,7 +1260,8 @@ function fakePage({ viewport, above, below, anchoring = true }) {
 // Like the page's box, which has only a maximum height, the box is as tall as
 // its drawing up to `height`: growing the drawing after it is in place grows
 // the box. With `page` (a fakePage), the page around the box scrolls too.
-function scrollingPanel(item, { inner = 1100, height = 600, page = null } = {}) {
+// `height` may be a function, for a window whose height changes.
+function scrollingPanel(item, { inner = 1100, height: limit = 600, page = null } = {}) {
   let html = "";
   const pin = { textContent: "" };
   const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
@@ -1288,7 +1296,7 @@ function scrollingPanel(item, { inner = 1100, height = 600, page = null } = {}) 
     const top = 100 + legendHeight(above) + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
     let left = 0;
     let down = 0;
-    const client = () => Math.min(height, Number(attributes.height) || 0);
+    const client = () => Math.min(typeof limit === "function" ? limit() : limit, Number(attributes.height) || 0);
     const extent = (name, size) => Math.max(0, (Number(attributes[name]) || 0) - size);
     // The box's part of the document: what sits above it in the panel, the
     // box itself and its two 1 px borders.
@@ -1367,10 +1375,11 @@ function expandControls(panel) {
 // With `size.page` (a fakePage), both scripts share that page as their window.
 function topologyPage(fabric, size) {
   const dom = fakeDom();
+  if (size.page) dom.document.documentElement = size.page.root;
   const T = H.loadTopology(size.page ? { document: dom.document, window: size.page.bind({}) } : { document: dom.document });
   const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
   let panel = null;
-  const { page, elements, click: mode } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+  const { page, elements, click: mode, sandbox } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
     if (id === "fabric-map-panel") {
       panel = item;
       scrollingPanel(item, size);
@@ -1384,7 +1393,7 @@ function topologyPage(fabric, size) {
     panel.handlers.get("click")({ type: "click", target });
     documentClick({ type: "click", target });
   };
-  return { T, page, elements, panel, click, mode };
+  return { T, page, elements, panel, click, mode, sandbox, snapshot };
 }
 
 test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both scroll offsets, and an expanded or collapsed shelf keeps its control in place", () => {
@@ -1684,7 +1693,7 @@ const MEASURED_FOUR_SHELVES = [
 // and exit and every window.scrollTo with the step it came from.
 function measuredPage(fabric, size, { anchoring = true } = {}) {
   const page = fakePage({ viewport: size.viewport, above: 0, below: size.below, anchoring });
-  const view = topologyPage(fabric, { inner: size.inner, height: size.limit, page });
+  const view = topologyPage(fabric, { inner: size.inner, height: () => size.limit, page });
   page.above = size.summaryTop - view.panel.box.getBoundingClientRect().top;
   page.layout();
   const trace = [];
@@ -1905,16 +1914,416 @@ test("the first view, the older modes and a later view that needs no room leave 
   assert.deepEqual(calls, ["topology"]);
   assert.deepEqual(page.scrolls.slice(1).filter((call) => call.from !== call.accepted), [], "nothing moved the page");
   // After a kept control needed room after the drawing's bottom edge, the next
-  // redraw whose view does not need it gives the room back.
+  // redraw whose view does not need it gives the room back where that moves
+  // nothing: here once the page is at its top. Before that, with the page
+  // 190 px down and less slack below it than the room, the room stays but
+  // for that slack, and the page stays where it was.
   const size = MEASURED_WINDOWS[7];
   const big = measuredPage(bigShelf(), size);
   const key = expandControls(big.panel)[0].key;
   toggleFrom(big, size, key, "bottom", size.expandY);
   toggleFrom(big, size, key, "bottom", size.collapseY);
   const natural = big.T.drawnModel().height;
-  assert.ok(Number(big.panel.box.svg.getAttribute("height")) > natural, "room after the drawing's bottom edge");
+  const height = () => Number(big.panel.box.svg.getAttribute("height"));
+  const room = height();
+  assert.ok(room > natural, "room after the drawing's bottom edge");
   big.panel.box.scrollTop = 0;
+  const slack = slackOf(big.page);
+  assert.ok(slack < room - Math.ceil(natural), `less slack (${slack}) than room (${room - Math.ceil(natural)})`);
   big.click({ "data-topo-bay": "bay:1", "data-fabric-trace": "bay:1" });
-  assert.equal(Number(big.panel.box.svg.getAttribute("height")), Math.ceil(natural), "the room is given back");
-  assert.deepEqual(big.trace.filter(([step]) => step === "mount scrollTo").length, 1, "only the collapse's mount scrolled the page");
+  assert.equal(big.page.scrollY, size.collapseY, "the page stays");
+  assert.equal(height(), room - slack, "the room stays but for the page's slack");
+  big.page.scrollTo(0, 0);
+  big.click({ "data-topo-bay": "bay:2", "data-fabric-trace": "bay:2" });
+  assert.equal(big.page.scrollY, 0, "the page stays at its top");
+  assert.equal(height(), Math.ceil(natural), "the room is given back");
+  assert.deepEqual(big.trace.filter(([step]) => step === "mount scrollTo").length, 2, "the collapse's mount and the first selection's put the page back");
+});
+
+
+// ---- the redraw after a collapse ------------------------------------------------
+
+// The 1,024-bay shelf expanded and collapsed again from one of the measured
+// starts, its control kept in place; the drawing's offsets and the page are
+// then left as the collapse left them.
+function collapsedFrom(size, start) {
+  const view = measuredPage(bigShelf(), size);
+  const key = expandControls(view.panel)[0].key;
+  toggleFrom(view, size, key, start, size.expandY);
+  const collapse = toggleFrom(view, size, key, start, size.collapseY);
+  assert.ok(collapse.visible && !collapse.dx && !collapse.dy, `${size.name}, ${start}: the collapse keeps the control at ${collapse.was}`);
+  return { ...view, key };
+}
+
+// Where the control is in the window, the page's scroll position and the
+// drawing's offsets in drawing coordinates.
+function heldView(view) {
+  const { panel, page, key } = view;
+  const origin = String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+  return {
+    control: screenPoint(panel, expandControls(panel).find((item) => item.key === key)),
+    pageY: page.scrollY,
+    offsets: [panel.box.scrollLeft + origin[0], panel.box.scrollTop + origin[1]],
+  };
+}
+
+function pinLink(view) {
+  const link = [...view.T.drawnModel().links].find((item) => item.kind === "controller-expander");
+  view.click({ "data-topo-link": link.id, "data-fabric-topology-link": link.id });
+}
+
+// The page's refresh button, answered with the same inventory and fabric again.
+async function refreshSame(view, fabric) {
+  const data = JSON.stringify(fabric);
+  const inventory = JSON.stringify(view.snapshot);
+  view.sandbox.fetch = async (url) => ({ ok: true, status: 200, json: async () => JSON.parse(String(url).includes("/api/sas-fabric") ? data : inventory) });
+  view.elements.get("fabric-refresh-button").handlers.get("click")();
+  for (let turn = 0; turn < 20 && view.app.state.loading; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(view.app.state.loading, false, "the refresh finished");
+}
+
+// The box's height and the drawing's, room included.
+function sized(view) {
+  return { box: view.panel.box.clientHeight, drawing: Number(view.panel.box.svg.getAttribute("height")) };
+}
+
+// What the page can lose below its scroll position before it is held back:
+// everything at its top, where nothing can hold it back.
+function slackOf(page) {
+  return page.scrollY > 0 ? page.range() - page.scrollY : Infinity;
+}
+
+// After a collapse the box is for a moment only as tall as the collapsed
+// drawing. A browser measured the next pin moving the control (top / bottom
+// start) 19/0 px at 1600x900 and 1920x900, 159/126 at 1600x1080 and
+// 1920x1080, 440/440 at 1600x1440 and 2560x1440 and 636/190 at 3840x2160,
+// where the page also dropped to the top. A redraw that keeps the view moves
+// neither the page nor the drawing, and the box gets shorter only by what
+// the page can lose below its scroll position.
+test("a pin, a selection, a search and a refresh after a collapse leave the shelf control and the page where they were", async () => {
+  const moved = [];
+  for (const size of MEASURED_WINDOWS) {
+    for (const start of ["top", "bottom"]) {
+      const view = collapsedFrom(size, start);
+      const steps = {
+        "pin": () => pinLink(view),
+        "selection": () => view.click({ "data-topo-bay": "bay:1", "data-fabric-trace": "bay:1" }),
+        "search": () => {
+          const search = view.elements.get("fabric-topology-search");
+          search.value = "bay 3";
+          search.handlers.get("input")();
+        },
+        "refresh": () => refreshSame(view, view.app.state.fabric),
+      };
+      for (const [step, act] of Object.entries(steps)) {
+        const before = heldView(view);
+        const box = sized(view).box;
+        const slack = slackOf(view.page);
+        await act();
+        const after = heldView(view);
+        const lost = box - sized(view).box;
+        if (JSON.stringify(after) !== JSON.stringify(before) || lost > slack) {
+          moved.push(`${size.name}, ${start}, ${step}: control ${after.control[0] - before.control[0]}/${after.control[1] - before.control[1]}, page ${before.pageY}>${after.pageY}, offsets ${before.offsets}>${after.offsets}, box ${lost} px shorter for ${slack} px of slack`);
+        }
+      }
+      assert.match(view.panel.innerHTML, /aria-expanded="false"/, `${size.name}, ${start}: still collapsed`);
+    }
+  }
+  assert.deepEqual(moved, [], "nothing moves");
+});
+
+// Room after the drawing goes as far as the page lets it: all of it where
+// the page's slack covers it, exactly the slack where that is smaller, and
+// none for a view below the drawing's top edge, which needs the box at its
+// height to stay reachable.
+test("after a collapse the room after the drawing goes as far as the page's slack allows, and no further", () => {
+  const results = {};
+  const cases = [
+    // The 3840x2160 page: its slack under 190 px is smaller than the room.
+    ["part, 3840x2160 bottom", MEASURED_WINDOWS[7], "bottom"],
+    // A page long enough below the panel: the slack covers the room.
+    ["all, 1920x1080 bottom, long page", { ...MEASURED_WINDOWS[4], below: 3000 }, "bottom"],
+    ["all, 1600x1440 bottom, long page", { ...MEASURED_WINDOWS[5], below: 3000 }, "bottom"],
+    // The view lies 551 px below the drawing's top edge: nothing goes.
+    ["none, 1920x1080 top, long page", { ...MEASURED_WINDOWS[4], below: 3000 }, "top"],
+  ];
+  for (const [name, size, start] of cases) {
+    const view = collapsedFrom(size, start);
+    const before = { held: heldView(view), ...sized(view), slack: slackOf(view.page) };
+    const natural = Math.ceil(view.T.drawnModel().height);
+    const origin = String(view.panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+    const room = before.drawing - Math.max(natural, before.held.offsets[1] + before.box) - -origin[1];
+    pinLink(view);
+    assert.deepEqual(heldView(view), before.held, `${name}: nothing moves`);
+    const after = sized(view);
+    results[name] = { released: before.drawing - after.drawing, room: before.drawing - natural - -origin[1], slack: Number.isFinite(before.slack) ? before.slack : "page at its top" };
+    assert.equal(room, 0, `${name}: the drawing was sized exactly for the box before the pin`);
+    assert.equal(before.box - after.box, results[name].released, `${name}: the box shrinks with the drawing`);
+  }
+  for (const [name, { released, room, slack }] of Object.entries(results)) {
+    assert.ok(room > 0, `${name}: there is room after the drawing (${room})`);
+    if (name.startsWith("part")) {
+      assert.ok(slack > 0 && slack < room, `${name}: the slack (${slack}) is smaller than the room (${room})`);
+      assert.equal(released, slack, `${name}: exactly the slack goes`);
+    } else if (name.startsWith("all")) {
+      assert.ok(slack >= room, `${name}: the slack (${slack}) covers the room (${room})`);
+      assert.equal(released, room, `${name}: all of the room goes`);
+    } else {
+      assert.ok(slack > 0, `${name}: the page has slack (${slack})`);
+      assert.equal(released, 0, `${name}: nothing goes`);
+    }
+  }
+});
+
+// The first view sizes the drawing for itself; a pin then keeps that size.
+test("a pin after the first view leaves the box at the drawing's natural height, sized once and without reading the page's length", () => {
+  for (const size of [MEASURED_WINDOWS[0], MEASURED_WINDOWS[4], MEASURED_WINDOWS[7]]) {
+    const view = measuredPage(bigShelf(), size);
+    const natural = Math.ceil(view.T.drawnModel().height);
+    const first = sized(view);
+    assert.deepEqual(first, { box: Math.min(natural, size.limit), drawing: natural }, `${size.name}: the first view`);
+    const heights = [];
+    const reads = view.page.reads;
+    const mount = view.T.mount;
+    view.T.mount = (...args) => {
+      const own = view.panel.box.svg;
+      let count = 0;
+      const write = own.setAttribute;
+      own.setAttribute = (name, value) => {
+        if (name === "height") count += 1;
+        write(name, value);
+      };
+      mount(...args);
+      heights.push(count);
+    };
+    pinLink(view);
+    assert.deepEqual(sized(view), first, `${size.name}: the pin keeps the box's height`);
+    assert.deepEqual(heights, [1], `${size.name}: sized once`);
+    assert.equal(view.page.reads, reads, `${size.name}: the page's length is not read`);
+  }
+});
+
+// The loss a browser measured repeated on each further redraw: five pins in
+// a row leave every number where the first left it.
+test("five pins in a row after a collapse leave every number where the first pin left it", () => {
+  const crept = [];
+  for (const size of MEASURED_WINDOWS) {
+    for (const start of ["top", "bottom"]) {
+      const view = collapsedFrom(size, start);
+      pinLink(view);
+      const first = { ...heldView(view), ...sized(view) };
+      for (let pin = 2; pin <= 5; pin += 1) {
+        pinLink(view);
+        const now = { ...heldView(view), ...sized(view) };
+        if (JSON.stringify(now) !== JSON.stringify(first)) crept.push(`${size.name}, ${start}, pin ${pin}: ${JSON.stringify(first)} > ${JSON.stringify(now)}`);
+      }
+    }
+  }
+  assert.deepEqual(crept, [], "nothing creeps");
+});
+
+// The window got shorter between two redraws: the box's height limit fell
+// from 840 to 700 px. The next redraw keeps the view and sizes the room for
+// the box as it is now, not as it was at the last redraw.
+test("a redraw after the window got shorter keeps the view and sizes the room for the box's new height", () => {
+  const results = [];
+  for (const start of ["top", "bottom"]) {
+    const size = { ...MEASURED_WINDOWS[4] };
+    const view = collapsedFrom(size, start);
+    pinLink(view);
+    assert.ok(sized(view).box > 700, `${start}: the box taller than its new limit before (${sized(view).box})`);
+    size.limit = 700;
+    view.page.innerHeight = 900;
+    view.page.layout();
+    const before = heldView(view);
+    pinLink(view);
+    assert.deepEqual(heldView(view), before, `${start}: nothing moves`);
+    const origin = String(view.panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+    const natural = Math.ceil(view.T.drawnModel().height);
+    const { box, drawing } = sized(view);
+    results.push({ start, box, room: drawing - -origin[1] - natural, tallest: Math.max(natural, Math.ceil(before.offsets[1] + 700)) - natural });
+  }
+  for (const { start, box, room, tallest } of results) {
+    assert.ok(box <= 700, `${start}: the box within its new limit (${box})`);
+    assert.ok(room <= tallest, `${start}: no room for the box's old height (${room} > ${tallest})`);
+  }
+  // The bottom start's view is at the drawing's top, and the page has the
+  // slack for the box to go back to the drawing's own height.
+  assert.deepEqual(results.map(({ start, box }) => [start, box]), [["top", 700], ["bottom", 681]]);
+});
+
+// An expand or collapse whose control was not in view keeps the drawing's
+// vertical offset (its horizontal one keeps the shelf in view, as before):
+// the page and the box's height stay as they would for a pin. At the 1,920 px
+// widths the legend above the box keeps its rows, so the box stays put too.
+test("a collapse whose control is out of view keeps the vertical offset, the page and the box's height", () => {
+  const moved = [];
+  for (const size of [MEASURED_WINDOWS[1], MEASURED_WINDOWS[2], MEASURED_WINDOWS[4]]) {
+    const view = measuredPage(bigShelf(), size);
+    const { panel, page } = view;
+    const key = expandControls(panel)[0].key;
+    view.click({ "data-fabric-expand-slots": key });
+    const control = expandControls(panel).find((item) => item.key === key);
+    // Scrolled down past the control, and past the collapsed drawing's height.
+    panel.box.scrollTop = control.y + 1000;
+    page.scrollTo(0, size.collapseY);
+    const rect = panel.box.getBoundingClientRect();
+    const at = screenPoint(panel, control);
+    assert.ok(at[1] + 22 < rect.top, `${size.name}: the control is out of view above the box`);
+    const before = { pageY: page.scrollY, top: heldView({ ...view, key }).offsets[1], boxTop: rect.top };
+    const box = sized(view).box;
+    view.click({ "data-fabric-expand-slots": key });
+    assert.match(panel.innerHTML, /aria-expanded="false"/, `${size.name}: collapsed`);
+    const after = { pageY: page.scrollY, top: heldView({ ...view, key }).offsets[1], boxTop: panel.box.getBoundingClientRect().top };
+    if (JSON.stringify(after) !== JSON.stringify(before) || sized(view).box !== box) moved.push(`${size.name}: ${JSON.stringify(before)} > ${JSON.stringify(after)}, box ${box} > ${sized(view).box}`);
+  }
+  assert.deepEqual(moved, [], "nothing moves");
+});
+
+// Only a redraw whose kept view needs room after the drawing for the box's
+// recorded height sizes twice; one with no room that needs none sizes once
+// and reads nothing of the page.
+test("a redraw sizes the room once, without reading the page's length, where its kept view needs no room after the drawing", () => {
+  const measure = (view, act) => {
+    const counts = [];
+    const reads = view.page.reads;
+    const mount = view.T.mount;
+    view.T.mount = (...args) => {
+      let heights = 0;
+      const svg = view.panel.box.svg;
+      const set = svg.setAttribute;
+      svg.setAttribute = (name, value) => {
+        if (name === "height") heights += 1;
+        set(name, value);
+      };
+      mount(...args);
+      counts.push(heights);
+    };
+    act();
+    view.T.mount = mount;
+    return { sizings: counts, pageReads: view.page.reads - reads };
+  };
+  const counts = {};
+  // The shelf drawn in full and scrolled well inside it.
+  const full = measuredPage(bigShelf(), MEASURED_WINDOWS[4]);
+  full.click({ "data-fabric-expand-slots": expandControls(full.panel)[0].key });
+  full.panel.box.scrollTop = 400;
+  counts["inside the drawing"] = measure(full, () => pinLink(full));
+  // 1920x700: the collapsed drawing is taller than the box, scrolled inside it.
+  const low = measuredPage(bigShelf(), MEASURED_WINDOWS[2]);
+  low.panel.box.scrollTop = 100;
+  counts["inside a drawing taller than its box"] = measure(low, () => pinLink(low));
+  // After a collapse from the bottom start, the page scrolled: room is kept or released.
+  const bottom = collapsedFrom(MEASURED_WINDOWS[4], "bottom");
+  counts["room at the drawing's top"] = measure(bottom, () => pinLink(bottom));
+  // After a collapse from the top start: the view lies below the drawing's top.
+  const top = collapsedFrom(MEASURED_WINDOWS[4], "top");
+  counts["room below the drawing's top"] = measure(top, () => pinLink(top));
+  assert.deepEqual(counts, {
+    "inside the drawing": { sizings: [1], pageReads: 0 },
+    "inside a drawing taller than its box": { sizings: [1], pageReads: 0 },
+    "room at the drawing's top": { sizings: [2], pageReads: 2 },
+    "room below the drawing's top": { sizings: [2], pageReads: 0 },
+  });
+});
+
+// Any other caller of mount, one without a page position: the drawing's
+// offsets and the box's height are kept, and mount never scrolls the page.
+// The page's own restoration after the redraw puts the page back here.
+test("a kept view after a collapse keeps its offsets and box height and never scrolls the page when mount has no page position", () => {
+  const moves = [];
+  for (const size of [MEASURED_WINDOWS[0], MEASURED_WINDOWS[4], MEASURED_WINDOWS[7]]) {
+    for (const start of ["top", "bottom"]) {
+      const view = collapsedFrom(size, start);
+      let held = null;
+      view.T.mount = (container) => {
+        const from = view.page.scrolls.length;
+        view.mount(container);
+        assert.deepEqual(view.page.scrolls.slice(from), [], `${size.name}, ${start}: no page scroll from mount`);
+        held = { offsets: heldView(view).offsets, box: sized(view).box };
+      };
+      const before = heldView(view);
+      const box = sized(view).box;
+      pinLink(view);
+      assert.deepEqual(held, { offsets: before.offsets, box }, `${size.name}, ${start}: mount keeps the offsets and the box's height`);
+      const after = heldView(view);
+      moves.push(`${size.name}, ${start}: ${after.control[0] - before.control[0]}/${after.control[1] - before.control[1]}`);
+    }
+  }
+  assert.deepEqual(moves, ["1600x900, top: 0/0", "1600x900, bottom: 0/0", "1920x1080, top: 0/0", "1920x1080, bottom: 0/0", "3840x2160, top: 0/0", "3840x2160, bottom: 0/0"]);
+});
+
+
+// The room first sized for the tallest box is never left behind: when
+// putting the page back throws, mount still sizes the room exactly for the
+// view it set, and the error is not swallowed.
+test("the room first sized for the tallest box goes also when putting the page back throws", () => {
+  const size = MEASURED_WINDOWS[7];
+  const exact = (view) => {
+    const { panel } = view;
+    const origin = String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+    const top = panel.box.scrollTop + origin[1];
+    const natural = Math.ceil(view.T.drawnModel().height);
+    return { height: Number(panel.box.svg.getAttribute("height")), exact: Math.max(natural, Math.ceil(top + panel.box.clientHeight)) - origin[1], tallest: Math.ceil(top + size.viewport) - origin[1] };
+  };
+  const broken = (view) => {
+    const [own] = view.page.windows;
+    own.scrollTo = () => {
+      throw new Error("synthetic scroll failure");
+    };
+    return () => {
+      own.scrollTo = view.page.scrollTo;
+    };
+  };
+  const results = {};
+  // A collapse whose control is kept, and a pin after a collapse.
+  const toggled = measuredPage(bigShelf(), size);
+  const key = expandControls(toggled.panel)[0].key;
+  toggleFrom(toggled, size, key, "top", size.expandY);
+  const repair = broken(toggled);
+  assert.throws(() => toggleFrom(toggled, size, key, "top", size.collapseY), /synthetic scroll failure/, "collapse: the error reaches the page");
+  repair();
+  results.collapse = exact(toggled);
+  const pinned = collapsedFrom(size, "top");
+  pinned.page.scrollTo(0, 100);
+  const restore = broken(pinned);
+  assert.throws(() => pinLink(pinned), /synthetic scroll failure/, "pin: the error reaches the page");
+  restore();
+  results.pin = exact(pinned);
+  for (const [name, { height, exact: wanted, tallest }] of Object.entries(results)) {
+    assert.ok(tallest > wanted, `${name}: the tallest box's room (${tallest}) is more than the exact room (${wanted})`);
+    assert.equal(height, wanted, `${name}: the drawing is sized exactly for its view`);
+  }
+});
+
+// A browser saw the box's own horizontal offset go from 100 to 0 px on a
+// refresh with unchanged data at 1920x1080. The drawing was then kept 208 px
+// right of its left edge by the expand that drew the shelf in full, and the
+// box was scrolled 100 px into that room: the view lies 108 px before the
+// drawing's left edge. The refresh sizes the room for that view, 108 px, so
+// the box's offset into it is 0 while nothing on the screen moves.
+test("a refresh with unchanged data keeps the drawing, its offsets and the page where they were, also scrolled sideways", async () => {
+  for (const [size, left] of [[MEASURED_WINDOWS[4], 100], [MEASURED_WINDOWS[0], 100], [MEASURED_WINDOWS[4], 0]]) {
+    const fabric = bigShelf();
+    const view = measuredPage(fabric, size);
+    const { panel, page } = view;
+    view.click({ "data-fabric-expand-slots": expandControls(panel)[0].key });
+    const origin = () => String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number).slice(0, 2);
+    assert.deepEqual(origin(), [-208, 0], `${size.name}: room before the drawing's left edge after the expand`);
+    panel.box.scrollLeft = left;
+    panel.box.scrollTop = 200;
+    page.scrollTo(0, 100);
+    const label = `${size.name}, ${left}`;
+    assert.deepEqual([panel.box.scrollLeft, panel.box.scrollTop, page.scrollY], [left, 200, 100], label);
+    const bay = () => {
+      const item = view.T.drawnModel().bays[5];
+      return screenPoint(panel, { x: item.x, y: item.y });
+    };
+    const offsets = () => [panel.box.scrollLeft + origin()[0], panel.box.scrollTop + origin()[1]];
+    const before = { bay: bay(), offsets: offsets(), pageY: page.scrollY };
+    await refreshSame(view, fabric);
+    assert.equal(bay()[0], before.bay[0], `${label}: a drawn bay keeps its x in the window`);
+    assert.deepEqual({ bay: bay(), offsets: offsets(), pageY: page.scrollY }, before, `${label}: nothing moves`);
+    assert.deepEqual([panel.box.scrollLeft, origin()[0]], left ? [0, left - 208] : [0, -208], `${label}: the room the view needs, and the box at its start`);
+  }
 });
