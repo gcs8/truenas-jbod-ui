@@ -95,6 +95,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
     "1": (
         "test_account_bootstrap",
         "test_admin_config",
+        "test_backup_7z_split",
         "test_bounded_parser_work",
         "test_changelog_entry_gate",
         "test_changelog_fragments",
