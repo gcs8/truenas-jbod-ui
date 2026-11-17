@@ -977,12 +977,6 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
             return "power_condition"
         if asc_code in {0x67, 0x68, 0x69, 0x6C, 0x6D}:
             return "target_failure"
-    if asc == (0x4B, 0x03):
-        return "timeout"
-    if asc == (0x4B, 0x04):
-        return "sas_protocol"
-    if asc == (0x4B, 0x07):
-        return "link_loss"
     if "nak" in lowered:
         return "sas_protocol"
     if "connection lost" in lowered:

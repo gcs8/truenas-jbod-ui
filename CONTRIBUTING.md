@@ -1038,6 +1038,9 @@ Three scripts enforce this:
   the failure names the fragment to add. The one exception is a release cut: a
   pull request that introduces the first release heading and adds a bullet
   naming itself in that new section passes as before.
+  In CI "the base" is the first parent of the merge commit the job checks
+  out, so fragments that other pull requests merged since this one opened are
+  not counted against it.
 - `scripts/changelog_fragments.py` validates fragments (`check`), prints
   `## Unreleased` with the fragments merged in (`preview`) and, at release
   time, writes them into `CHANGELOG.md` (`collect --version X.Y.Z --date
