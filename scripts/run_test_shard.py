@@ -242,6 +242,8 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_esxi_host_prep",
         "test_esxi_topology_alias_scope",
         "test_ghcr_release_contract",
+        "test_history_domain_config",
+        "test_history_publication",
         "test_history_routes",
         "test_history_schema_version_gate",
         "test_history_service",

@@ -56,7 +56,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "tests/test_backup_integration.py": 4250,
 
-    "tests/test_history_service.py": 13000,
+    "tests/test_history_service.py": 11750,
 
     "tests/test_image_upgrade_contract.py": 3750,
 
