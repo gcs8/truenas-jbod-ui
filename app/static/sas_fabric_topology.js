@@ -2465,8 +2465,10 @@
   }
 
   // After the page has put the drawing in place: set its scroll position,
-  // and give focus back to Fit after a Fit click.
-  function mount(container) {
+  // and give focus back to Fit after a Fit click. pageScroll: the page's own
+  // scroll position ({ x, y }) from before this redraw, when the caller keeps
+  // one to put back; without it a kept control is aimed at the page as it is.
+  function mount(container, pageScroll = null) {
     const box = scrollBox(container);
     if (box) {
       const reason = live.firstView;
@@ -2488,8 +2490,22 @@
           left = rect.left + control.x - reason.control.x;
           top = rect.top + control.y - reason.control.y;
         };
+        const page = pageScroll && Number.isFinite(pageScroll.x) && Number.isFinite(pageScroll.y) ? pageScroll : null;
         aim();
-        sizeRoom(box, left, top);
+        if (page) {
+          // The box is never taller than the window, so room of one window
+          // height after the aimed view lets it reach its height limit. While
+          // that room is there the page is as long as it gets, and its own
+          // scroll position, lost while the shorter drawing was in place,
+          // can be put back before the control is aimed at for good.
+          const roomToHeightLimit = Number(window.innerHeight) || 0;
+          sizeRoom(box, left, top + roomToHeightLimit);
+          if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
+            window.scrollTo(page.x, page.y);
+          }
+        } else {
+          sizeRoom(box, left, top);
+        }
         aim();
       } else if (reason && live.model && !live.fit && width) {
         left = firstViewLeft(live.model, reason, width, live.scroll.left);

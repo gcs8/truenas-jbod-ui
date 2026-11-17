@@ -4188,7 +4188,9 @@
     document.body?.classList?.toggle("fabric-topology-mode", state.mode === "topology");
   }
 
-  function renderMap() {
+  // pageScroll: the page's scroll position render keeps, for Topology to put
+  // back before it aims an expanded or collapsed shelf's control.
+  function renderMap(pageScroll = null) {
     const fabric = state.fabric;
     const inert = !fabricScopeIsCurrent();
     elements.mapPanel.inert = inert;
@@ -4243,7 +4245,7 @@
           height: Math.round((window.innerHeight || 0) * 0.78),
         })
         : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
-      window.SasFabricTopology?.mount(elements.mapPanel);
+      window.SasFabricTopology?.mount(elements.mapPanel, pageScroll);
     } else {
       elements.mapPanel.innerHTML = renderLanesMode(fabric);
     }
@@ -4345,7 +4347,7 @@
     renderModeChrome();
     renderFabricWritePolicyNotice();
     renderFabricReadUiAuth();
-    renderMap();
+    renderMap(pageScroll);
     ensureSelectedSmartSummary();
     syncLocation();
     elements.refreshButton.disabled = state.loading;
