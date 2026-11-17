@@ -180,14 +180,15 @@ body.fabric-topology-mode .fabric-page-shell {
 /* The trace line sits below the drawing, so its wrapping never moves it,
    and sticks to the window's bottom edge so it is read without scrolling.
    Its lines are reserved: the idle hint, "Tracing" and "Pinned" take the
-   same band, which never grows over the item under the pointer. A longer
-   sentence still wraps in full. */
+   same band, which never grows over the item under the pointer. The page
+   sizes boxes by their border, so the reserved height is the whole band,
+   padding and border included. A longer sentence still wraps in full. */
 .fabric-topology .fabric-topology-pin {
   position: sticky;
   bottom: 0;
   z-index: 1;
   min-width: 0;
-  min-height: calc(var(--topology-trace-lines) * var(--topology-trace-line));
+  min-height: var(--topology-trace-band);
   margin: 0;
   padding: 4px 0;
   border-top: 1px solid var(--panel-border);
@@ -475,8 +476,9 @@ body.fabric-topology-mode .fabric-page-shell {
   opacity: 0.3;
 }
 
-/* Narrower pages: the longest trace sentence takes two lines. */
-@media (max-width: 820px) {
+/* One-column pages, where the inspector moves below the drawing: the
+   longest trace sentence takes two lines. */
+@media (max-width: 1240px) {
   .fabric-topology {
     --topology-trace-lines: 2;
   }
