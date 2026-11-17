@@ -6,6 +6,7 @@ raise through the typed summary boundary and must never become a reading.
 Valid payloads are the controls: they still produce the same readings.
 """
 
+import ast
 import json
 import subprocess
 import sys
@@ -1425,6 +1426,90 @@ class LiveRefusedPowerOnTests(unittest.IsolatedAsyncioTestCase):
         for reader, lifetime in self._readers().items():
             with self.subTest(reader=reader):
                 self.assertEqual(lifetime, (100, 4, []))
+
+
+class ParsersSmartModuleTests(unittest.TestCase):
+    """The SMART and NVMe readers live in parsers_smart; parsers keeps every name."""
+
+    # Every top-level name defined in app.services.parsers_smart.
+    MOVED_NAMES = (
+        "HEX_VALUE_REGEX", "HEX_IDENTIFIER_ERROR_SPLIT_REGEX", "normalize_hex_identifier",
+        "format_hex_identifier", "_coerce_non_negative_int", "_json_text", "_reported_object", "_reported",
+        "_reported_text", "_positive_int", "_load_json_object", "_BYTE_COUNTER_LIMIT", "_SCSI_GIGABYTES_LIMIT",
+        "_bounded_byte_count", "_nvme_data_units_to_bytes", "_scsi_gigabytes_processed_to_bytes",
+        "_annualize_bytes", "_NVME_KELVIN_LIMIT", "_json_celsius", "_kelvin_to_celsius", "_reported_kelvin",
+        "_format_nvme_version", "_NVME_EUI64_REGEX", "_NVME_NGUID_REGEX", "_format_nvme_eui64",
+        "_format_nvme_nguid", "_ata_attributes_unreadable", "_ATA_RAW_STRING_REGEX", "_ata_raw_count",
+        "_iter_ata_attribute_entries", "_extract_ata_attribute_raw_value", "_extract_ata_attribute_entry",
+        "_ATA_UNIT_SCALES", "_ATA_UNIT_NAME_REGEX", "_ATA_UNIT_LIKE_REGEX", "_ATA_SECTOR_UNIT",
+        "_ata_attribute_unit_bytes", "_ata_attribute_raw_value_to_bytes", "_iter_ata_device_stat_entries",
+        "_ata_device_stats_unreadable", "_extract_ata_device_stat_int", "_extract_ata_device_stat_bytes",
+        "_parse_enabled_disabled", "SMARTCTL_CACHE_TOGGLE_PREFIXES", "SMART_SUMMARY_UNREAD_MESSAGE",
+        "_finalize_summary", "_NVME_HEALTH_FIELDS", "_derived_unread", "_extract_smartctl_traffic_and_wear",
+        "_SMART_LATEST_TEST_FIELDS", "_SCSI_SELF_TEST_INDEX_REGEX", "_reported_test_text",
+        "_extract_smartctl_latest_test", "_reported_sas_address", "_extract_smartctl_sas_phy",
+        "SMART_SAS_PORT_ROW_CAP", "SMART_SATA_PHY_EVENT_CAP", "_SMART_ROW_CONFLICT", "_SMART_ROW_MISSING",
+        "_BoundedIdentityRows", "SMART_COUNTER_METADATA_MAX_CHARS", "_smart_counter_metadata", "_sas_port_row",
+        "_extract_smartctl_sas_ports", "_SAS_PORT_TEXT_LABELS", "_extract_smartctl_sas_ports_text",
+        "_sata_phy_event_row", "_extract_smartctl_sata_phy_events", "_extract_smartctl_sata_phy_text",
+        "_smartctl_threshold_celsius", "_SMARTCTL_THRESHOLD_NOT_AVAILABLE", "_reported_threshold",
+        "_extract_smartctl_temperature_thresholds", "_SMARTCTL_TEMPERATURE_FIELDS", "_reported_namespace_eui64",
+        "_reported_cache_flag", "parse_smartctl_summary", "parse_nvme_smart_log_summary",
+        "parse_nvme_id_ctrl_summary", "parse_nvme_id_ns_summary", "_SATA_CURRENT_LINK_RATE_PATTERN",
+        "parse_smartctl_text_enrichment",
+    )
+
+    def test_new_module_imports_without_the_old_module(self) -> None:
+        code = (
+            "import sys\n"
+            "import app.services.parsers_smart as smart\n"
+            "assert 'app.services.parsers' not in sys.modules, 'parsers_smart imported parsers'\n"
+            "print(smart.parse_nvme_id_ns_summary('{}')['available'])\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(Path(__file__).resolve().parents[1]), capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "False")
+
+    def test_old_module_keeps_every_moved_name_as_the_same_object(self) -> None:
+        import app.services.parsers as parsers
+        import app.services.parsers_smart as smart
+
+        tree = ast.parse(Path(str(smart.__file__)).read_text(encoding="utf-8"))
+        defined: list[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                defined.append(node.name)
+            elif isinstance(node, ast.Assign):
+                defined.extend(target.id for target in node.targets if isinstance(target, ast.Name))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                defined.append(node.target.id)
+        self.assertEqual(sorted(defined), sorted(self.MOVED_NAMES))
+        for name in self.MOVED_NAMES:
+            with self.subTest(name=name):
+                self.assertIs(getattr(parsers, name), getattr(smart, name))
+
+    def test_replacing_a_moved_name_on_the_old_module_reaches_its_old_callers(self) -> None:
+        import app.services.parsers as parsers
+        import app.services.parsers_smart as smart
+
+        self.assertIs(parsers._finalize_summary, smart._finalize_summary)
+        calls: list[str] = []
+
+        def finalize(data, message, **kwargs):
+            calls.append(message)
+            return {"replaced": True}
+
+        with unittest.mock.patch.object(parsers, "_finalize_summary", finalize):
+            summary = parsers.parse_esxcli_smart_get("Health Status  OK\n")
+        self.assertEqual(summary, {"replaced": True})
+        self.assertEqual(len(calls), 1)
+
+        self.assertIs(parsers.normalize_hex_identifier, smart.normalize_hex_identifier)
+        with unittest.mock.patch.object(parsers, "normalize_hex_identifier", lambda value: "10"):
+            self.assertEqual(parsers.shift_hex_identifier("anything", 1), "11")
 
 
 if __name__ == "__main__":
