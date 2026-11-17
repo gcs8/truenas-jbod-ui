@@ -1884,5 +1884,210 @@ class HistorySqliteTemporaryDirectoryTests(unittest.TestCase):
                     self.assertEqual(events, expected if apply else [("work", source)])
 
 
+# The schema and index helpers live in history_service.store_schema; HistoryStore
+# keeps every name below as a thin method that hands the store module (and, for
+# instance helpers, the store) to the moved code, which looks every store-module
+# name up at call time.
+_MOVED_STATIC_HELPERS = (
+    "_synchronize_table_counts",
+    "_rowid_span",
+    "_has_table",
+    "_recount_implausible_table_counts",
+    "_recount_table",
+    "_recount_restored_table_counts",
+    "_backfill_disk_identity_keys_once",
+    "_ensure_slot_state_columns",
+    "_ensure_slot_event_columns",
+    "_ensure_metric_sample_columns",
+    "_backfill_disk_identity_batch",
+    "_ensure_identity_indexes",
+    "_missing_chronological_indexes",
+    "_ensure_chronological_indexes",
+    "_apply_bulk_maintenance_profile",
+    "_filesystem_key",
+    "_index_key_columns",
+    "_index_build_disk_needs",
+    "_ensure_columns",
+)
+_MOVED_INSTANCE_HELPERS = (
+    "_describe_free_space",
+    "_require_index_build_space",
+    "_describe_startup_space_failure",
+)
+
+
+def _store_schema():
+    from history_service import store_schema
+
+    return store_schema
+
+
+class StoreSchemaModuleTests(unittest.TestCase):
+    def test_store_schema_imports_without_the_store_module(self) -> None:
+        import ast
+        import json
+        import os
+        import subprocess
+        import sys
+
+        repository = Path(__file__).resolve().parents[1]
+        child = (
+            "import json, sys\n"
+            "import history_service.store_schema\n"
+            "print(json.dumps(sorted(name for name in sys.modules if name.startswith('history_service'))))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                [sys.executable, "-c", child],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env={**os.environ, "PYTHONPATH": str(repository)},
+                cwd=directory,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
+        loaded = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertIn("history_service.store_schema", loaded)
+        self.assertNotIn("history_service.store", loaded)
+
+        # No first-party import at all: the store module is passed in.
+        tree = ast.parse((repository / "history_service" / "store_schema.py").read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+        self.assertFalse(
+            {name for name in imported if name.split(".")[0] in {"app", "admin_service", "history_service"}}
+        )
+
+    def test_history_store_keeps_every_moved_name_with_its_signature(self) -> None:
+        import inspect
+
+        store_schema = _store_schema()
+        for name in _MOVED_STATIC_HELPERS + _MOVED_INSTANCE_HELPERS:
+            with self.subTest(name=name):
+                static = name in _MOVED_STATIC_HELPERS
+                kept = inspect.getattr_static(HistoryStore, name)
+                self.assertIsInstance(kept, staticmethod if static else type(lambda: None))
+                moved = getattr(store_schema, name)
+                # The store module comes first, then the store for instance helpers.
+                moved_parameters = list(inspect.signature(moved).parameters.values())
+                self.assertEqual(moved_parameters[0].name, "store_module")
+                kept_signature = inspect.signature(getattr(HistoryStore, name))
+                kept_parameters = list(kept_signature.parameters.values())
+                if not static:
+                    self.assertEqual(kept_parameters[0].name, "self")
+                    self.assertEqual(moved_parameters[1].name, "store")
+                kept_parameters = kept_parameters[0 if static else 1 :]
+                moved_parameters = moved_parameters[1 if static else 2 :]
+                self.assertEqual(
+                    [(p.name, p.kind, p.annotation) for p in kept_parameters],
+                    [(p.name, p.kind, p.annotation) for p in moved_parameters],
+                )
+                for kept_parameter, moved_parameter in zip(kept_parameters, moved_parameters):
+                    # A default bound to a store-module value stays on the kept
+                    # method only, which always passes the argument on.
+                    if moved_parameter.default is not inspect.Parameter.empty:
+                        self.assertEqual(kept_parameter.default, moved_parameter.default)
+                self.assertEqual(kept_signature.return_annotation, inspect.signature(moved).return_annotation)
+        self.assertIs(
+            inspect.signature(HistoryStore._recount_implausible_table_counts).parameters["table_names"].default,
+            store_module.HISTORY_COUNTED_TABLES,
+        )
+
+    def test_store_schema_opens_ends_and_locks_nothing(self) -> None:
+        import ast
+
+        # HistoryStore keeps the connection, the migration lock and every
+        # commit or rollback; the moved helpers only run statements on the
+        # connection they are given.
+        source = Path(_store_schema().__file__).read_text(encoding="utf-8")
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+        }
+        self.assertFalse(
+            called
+            & {"commit", "rollback", "close", "connect", "closing", "_connect", "_read_connection",
+               "history_write_lock", "history_migration_lock"}
+        )
+
+    def test_a_replaced_store_method_reaches_the_moved_helper(self) -> None:
+        from unittest.mock import Mock
+
+        store_schema = _store_schema()
+        replacement = Mock(return_value=None)
+        with (
+            closing(sqlite3.connect(":memory:")) as connection,
+            patch.object(HistoryStore, "_ensure_columns", staticmethod(replacement)),
+            patch.object(
+                store_schema,
+                "_ensure_metric_sample_columns",
+                wraps=store_schema._ensure_metric_sample_columns,
+            ) as moved,
+        ):
+            HistoryStore._ensure_metric_sample_columns(connection)
+        moved.assert_called_once_with(store_module, connection)
+        replacement.assert_called_once_with(
+            connection, "metric_samples", store_module.METRIC_SAMPLE_OPTIONAL_COLUMNS
+        )
+
+    def test_a_replaced_store_module_name_reaches_the_moved_helper(self) -> None:
+        from unittest.mock import Mock
+
+        store_schema = _store_schema()
+        logger = Mock()
+        with closing(sqlite3.connect(":memory:")) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("CREATE TABLE slot_events (id INTEGER PRIMARY KEY)")
+            connection.execute("CREATE TABLE metric_samples (id INTEGER PRIMARY KEY)")
+            connection.execute("INSERT INTO slot_events (id) VALUES (5)")
+            with (
+                patch.object(store_module, "SLOT_EVENT_OPTIONAL_COLUMNS", {"synthetic_note": "TEXT"}),
+                patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 1),
+                patch.object(store_module, "logger", logger),
+                patch.object(
+                    store_schema,
+                    "_ensure_chronological_indexes",
+                    wraps=store_schema._ensure_chronological_indexes,
+                ) as moved,
+            ):
+                HistoryStore._ensure_slot_event_columns(connection)
+                pending = HistoryStore._ensure_chronological_indexes(connection)
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(slot_events)")}
+        self.assertIn("synthetic_note", columns)
+        moved.assert_called_once_with(store_module, connection)
+        self.assertEqual(pending, tuple(name for name, _ in CHRONOLOGICAL_INDEXES))
+        logger.info.assert_called_once()
+
+    def test_a_replaced_instance_method_reaches_the_moved_helper(self) -> None:
+        from unittest.mock import Mock
+
+        store_schema = _store_schema()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = HistoryStore(str(path), recover_unreadable_database=False)
+            filesystem_key = Mock(return_value=("synthetic-volume",))
+            with (
+                patch.object(store, "sqlite_temporary_directory", return_value=Path(directory) / "tmp"),
+                patch.object(store, "_filesystem_key", filesystem_key),
+                patch.object(store_module, "host_repair_path", return_value="HOST-PATH"),
+                patch.object(
+                    store_schema, "_describe_free_space", wraps=store_schema._describe_free_space
+                ) as moved,
+            ):
+                description = store._describe_free_space()
+        moved.assert_called_once_with(store_module, store)
+        # Both directories map to one replaced filesystem key, so one line.
+        self.assertEqual(
+            [call.args for call in filesystem_key.call_args_list],
+            [(path.absolute().parent,), ((Path(directory) / "tmp").absolute(),)],
+        )
+        self.assertRegex(description, r"^Now \d+ MiB free under HOST-PATH\.$")
+
+
 if __name__ == "__main__":
     unittest.main()
