@@ -1154,7 +1154,9 @@ function reachesPin(selector) {
 }
 
 function declared(body, property) {
-  return [...body.matchAll(new RegExp(`(?:^|[;{\\s])${property.replace(/[-]/g, "\\-")}\\s*:\\s*([^;]+);`, "g"))].map((match) => match[1].trim());
+  // A property name is letters and hyphens, which need no escaping here.
+  assert.match(property, /^[a-z-]+$/);
+  return [...body.matchAll(new RegExp(`(?:^|[;{\\s])${property}\\s*:\\s*([^;]+);`, "g"))].map((match) => match[1].trim());
 }
 
 function pinBoxSizing(sheets) {
