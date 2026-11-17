@@ -38,6 +38,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from history_service.backup_archive import stream_envelope
+# The six JSON limits are re-exported so existing imports keep working. The
+# reader and the duplicate-key tracker read them in history_service.backup_json;
+# replacing one on this module does not change what they enforce.
 from history_service.backup_json import (
     JSON_DUPLICATE_CACHE_KIB as JSON_DUPLICATE_CACHE_KIB,
     JSON_ENTRY_LIMIT_MESSAGE as JSON_ENTRY_LIMIT_MESSAGE,
