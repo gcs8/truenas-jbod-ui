@@ -1229,8 +1229,9 @@ test("the trace band's reserved height is the whole band at every breakpoint, un
   // the inspector's 380 px, the 12 px gap and the page's padding. Each line is
   // filled word by word at 7.25 px a character (the text's 16 px Arial-metric
   // glyphs, which give the line counts a browser showed at 390 px) plus a 10%
-  // margin. The three sentence forms, as the browser showed them for a link:
-  const label = "Link mpr1 to 5000b00000000010, 4 lanes, 12 Gb/s, PHYs 0, 1, 2, 3 to PHYs 32, 33, 34, 35";
+  // margin. The three sentence forms, as the browser showed them for a link
+  // (its 16-character SAS address as a placeholder of the same length):
+  const label = `Link mpr1 to ${"a".repeat(16)}, 4 lanes, 12 Gb/s, PHYs 0, 1, 2, 3 to PHYs 32, 33, 34, 35`;
   const forms = [`Tracing: ${label}.`, `Pinned: ${label}. Esc clears.`, `Tracing: ${label}. Pinned item kept; Esc clears.`];
   const glyph = 7.25 * 1.1;
   const lines = (text, width) => {
