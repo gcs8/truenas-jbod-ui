@@ -147,6 +147,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_source_shape",
     "tests.test_ssh_connection_keep",
     "tests.test_ssh_failure_contexts",
+    "tests.test_storcli_split",
     "tests.test_script_platform_guards",
     "tests.test_startup_config",
     "tests.test_system_setup_api_dialect",
