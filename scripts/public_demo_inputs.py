@@ -33,6 +33,7 @@ PUBLIC_DEMO_INPUT_PATHS: tuple[Path, ...] = tuple(
             Path("scripts/public_demo_inputs.py"),
             Path("scripts/public_demo_source_parity.py"),
             Path("app/static/app.js"),
+            Path("app/static/app_smart_formatters.js"),
             Path("app/static/style.css"),
             Path("app/templates/base.html"),
             Path("app/templates/index.html"),

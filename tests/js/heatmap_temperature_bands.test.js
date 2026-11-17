@@ -11,7 +11,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
-const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
+const APP_SOURCE = ["app/static/app.js", "app/static/app_smart_formatters.js"].map((file) => fs.readFileSync(path.join(ROOT, file), "utf8")).join("\n");
 const STYLE_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/style.css"), "utf8");
 const TEMPLATE_SOURCE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 

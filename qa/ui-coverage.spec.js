@@ -120,7 +120,7 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
 // heat fixtures below use exactly the colours, bands and badge chips a real
 // tile gets (applyHeatmapToTile), not hand-copied numbers.
 function appHeatApi() {
-  const source = fs.readFileSync(path.join(root, "app/static/app.js"), "utf8");
+  const source = ["app/static/app.js", "app/static/app_smart_formatters.js"].map((file) => fs.readFileSync(path.join(root, file), "utf8")).join("\n");
   const functionSource = (name) => {
     const start = source.indexOf(`function ${name}(`);
     if (start < 0) throw new Error(`app.js has no function ${name}`);

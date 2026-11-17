@@ -2893,13 +2893,21 @@ class SnapshotExportService:
         """
         inline_css = self._static_text("style.css")
         inline_js = self._static_text("app.js")
+        inline_formatters_js = self._static_text("app_smart_formatters.js")
         stylesheet_href = f"{request.url_for('static', path='style.css')}?v={__version__}"
         script_src = f"{request.url_for('static', path='app.js')}?v={__version__}"
+        formatters_src = f"{request.url_for('static', path='app_smart_formatters.js')}?v={__version__}"
 
         html = self._replace_once(
             html,
             f'<link rel="stylesheet" href="{stylesheet_href}">',
             f"<style>\n{inline_css}\n</style>",
+        )
+        # The SMART formatters run before app.js, which takes its names from them.
+        html = self._replace_once(
+            html,
+            f'<script src="{formatters_src}" defer></script>',
+            f'<script data-inline-source="app_smart_formatters.js">\n{inline_formatters_js}\n</script>',
         )
         html = self._replace_once(
             html,

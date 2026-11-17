@@ -11,7 +11,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, "../../app/static/app.js"), "utf8");
+const APP_SOURCE = require("./helpers/main_page_source").mainPageSource();
 
 function functionSource(source, name) {
   const start = source.indexOf(`function ${name}(`);

@@ -42,7 +42,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/services/snapshot_export.py": 3500,
 
-    "app/static/app.js": 13750,
+    "app/static/app.js": 13250,
 
     "app/static/sas_fabric_view.js": 5000,
 

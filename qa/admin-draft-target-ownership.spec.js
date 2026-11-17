@@ -54,7 +54,7 @@ async function openFixture(page, { platformBindings = false, beforeCandidate = n
       return route.abort();
     }
     if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: fixtureHtml });
-    if (["admin.js", "admin_backup_model.js", "admin_backups.js", "admin.css"].some((name) => url.pathname === `/static/${name}`)) {
+    if (["admin.js", "admin_backup_model.js", "admin_backups.js", "admin_profile_model.js", "admin.css"].some((name) => url.pathname === `/static/${name}`)) {
       // Optional exact predecessor bytes allow semantic RED replay without editing the candidate.
       const source = url.pathname === "/static/admin.js" && process.env.ADMIN_DRAFT_SCRIPT
         ? path.resolve(process.env.ADMIN_DRAFT_SCRIPT) : path.join(root, "admin_service", url.pathname);

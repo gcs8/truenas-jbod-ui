@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.resolve(__dirname, "../../admin_service/static/admin.js"), "utf8");
+const source = ["admin_profile_model.js", "admin.js"].map((file) => fs.readFileSync(path.resolve(__dirname, "../../admin_service/static", file), "utf8")).join("\n");
 
 function functionSource(name, optional = false) {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));

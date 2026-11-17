@@ -8,6 +8,7 @@ const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(repoRoot, "app/static/app.js"), "utf8");
+const smartFormattersSource = fs.readFileSync(path.join(repoRoot, "app/static/app_smart_formatters.js"), "utf8");
 const styleSource = fs.readFileSync(path.join(repoRoot, "app/static/style.css"), "utf8");
 const syntheticRuntime = {
   system_id: "synthetic-system",
@@ -149,6 +150,7 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
       await route.fulfill({ status: 200, contentType: "text/html", body: fixture.html });
       return;
     }
+    if (url.pathname === "/static/app_smart_formatters.js") return route.fulfill({ status: 200, contentType: "text/javascript", body: smartFormattersSource });
     if (url.pathname === "/static/app.js") {
       await route.fulfill({ status: 200, contentType: "text/javascript", body: appSource });
       return;
@@ -248,6 +250,7 @@ test("effective order is flat, opens first, and explicit URL selection wins", as
       await route.fulfill({ status: 200, contentType: "text/html", body: orderedFixture.html });
       return;
     }
+    if (url.pathname === "/static/app_smart_formatters.js") return route.fulfill({ status: 200, contentType: "text/javascript", body: smartFormattersSource });
     if (url.pathname === "/static/app.js") {
       await route.fulfill({ status: 200, contentType: "text/javascript", body: appSource });
       return;
@@ -302,6 +305,7 @@ test("selected enclosure B cannot supply live actions to the owner-backed Primar
       await route.fulfill({ status: 200, contentType: "text/html", body: ownerBackedFixture.html });
       return;
     }
+    if (url.pathname === "/static/app_smart_formatters.js") return route.fulfill({ status: 200, contentType: "text/javascript", body: smartFormattersSource });
     if (url.pathname === "/static/app.js") {
       await route.fulfill({ status: 200, contentType: "text/javascript", body: appSource });
       return;
