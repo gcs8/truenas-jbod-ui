@@ -48,7 +48,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/static/style.css": 7500,
 
-    "history_service/store.py": 6000,
+    "history_service/store.py": 5500,
 
     "history_service/system_backup.py": 8500,
 
