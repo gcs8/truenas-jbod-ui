@@ -11,7 +11,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
-const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
+const APP_SOURCE = require("./helpers/main_page_source").mainPageSource();
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 
 function functionSource(name) {

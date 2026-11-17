@@ -8,6 +8,7 @@ const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(repoRoot, "app/static/app.js"), "utf8");
+const smartFormattersSource = fs.readFileSync(path.join(repoRoot, "app/static/app_smart_formatters.js"), "utf8");
 const styleSource = fs.readFileSync(path.join(repoRoot, "app/static/style.css"), "utf8");
 const syntheticRuntime = {
   system_id: "synthetic-system",
@@ -98,6 +99,7 @@ async function openFixture(page) {
   await page.route("https://synthetic.invalid/**", async route => {
     const url = new URL(route.request().url());
     if (url.pathname === "/") return route.fulfill({contentType:"text/html",body:fixture.html.replace('historyConfigured: false', 'historyConfigured: true')});
+    if (url.pathname === "/static/app_smart_formatters.js") return route.fulfill({contentType:"text/javascript",body:smartFormattersSource});
     if (url.pathname === "/static/app.js") return route.fulfill({contentType:"text/javascript",body:appSource});
     if (url.pathname === "/static/style.css") return route.fulfill({contentType:"text/css",body:styleSource});
     let payload = {ok:true,available:false};

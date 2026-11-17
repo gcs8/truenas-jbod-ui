@@ -5,7 +5,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
 const root = path.resolve(__dirname, "../..");
-const source = fs.readFileSync(path.join(root, "app/static/app.js"), "utf8");
+const source = require("./helpers/main_page_source").mainPageSource();
 const helperText = fs.readFileSync(path.join(__dirname, "refresh_races.test.js"), "utf8");
 const helpers = vm.createContext({ assert });
 vm.runInContext(helperText.slice(helperText.indexOf("function functionSource("), helperText.indexOf("function loadFunction(")), helpers);

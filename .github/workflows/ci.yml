@@ -506,6 +506,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           node --check app/static/app.js
+          node --check app/static/app_smart_formatters.js
           node --check app/static/sas_fabric_view.js
           node --check app/static/sas_fabric_topology.js
           node --check admin_service/static/admin.js

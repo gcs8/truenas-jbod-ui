@@ -907,6 +907,23 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         slot_labels = re.findall(r'"slot_label"\s*:\s*"(\d+)"', html)
         self.assertEqual(sorted(set(slot_labels)), ["01", "02", "03", "04", "05", "06", "07"])
 
+    async def test_export_inlines_the_smart_formatters_before_the_page_script(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(), snapshot=build_snapshot(), smart_summary_cache={},
+            selected_slot=0, history_window_hours=24, io_chart_mode="total",
+        )
+        formatters = (snapshot_export.STATIC_DIR / "app_smart_formatters.js").read_text(encoding="utf-8")
+        page_script = (snapshot_export.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        formatter_block = f'<script data-inline-source="app_smart_formatters.js">\n{formatters}\n</script>'
+        page_start = f"<script>\n{page_script[:400]}"
+
+        self.assertEqual(rendered.html.count(formatter_block), 1)
+        self.assertEqual(rendered.html.count(page_start), 1)
+        self.assertLess(rendered.html.index(formatter_block), rendered.html.index(page_start))
+        self.assertNotIn("app_smart_formatters.js?v=", rendered.html)
+        self.assertNotIn('src="/static/app_smart_formatters.js', rendered.html)
+
     async def test_static_assets_are_read_once_per_service(self) -> None:
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
         runtime = self._runtime_with_view(
@@ -938,7 +955,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
                     io_chart_mode="total",
                 )
 
-        self.assertEqual(reads, {"style.css": 1, "app.js": 1, "hyper-m2-gen3-card.png": 1})
+        self.assertEqual(reads, {"style.css": 1, "app.js": 1, "app_smart_formatters.js": 1, "hyper-m2-gen3-card.png": 1})
 
     async def test_oversize_export_redacts_the_snapshot_once_across_passes(self) -> None:
         exporter = SnapshotExportService(
