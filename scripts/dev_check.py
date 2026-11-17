@@ -143,6 +143,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_sas_loginfo_width",
     "tests.test_scripts_help",
     "tests.test_smart_json_shapes",
+    "tests.test_source_shape",
     "tests.test_ssh_connection_keep",
     "tests.test_ssh_failure_contexts",
     "tests.test_script_platform_guards",
