@@ -1226,7 +1226,7 @@ function scrollingPanel(item, { inner = 1100, height = 600, page = null } = {}) 
   const lines = (text) => Math.max(1, Math.ceil((text.length * 7) / Math.max(1, inner - 20)));
   const legendHeight = (markup) => {
     const legend = /<div class="fabric-topology-legend"[^>]*>([\s\S]*?)<\/div>/.exec(markup)?.[1] || "";
-    const widths = legend.split("data-topology-legend=").slice(1).map((part) => 34 + 3.3 * part.replace(/^[^>]*>/, "").replace(/<[^>]+>/g, "").length);
+    const widths = legend.split("data-topology-legend=").slice(1).map((part) => 34 + 3.3 * part.replace(/^[^>]*>/, "").split(/<[^>]+>/).join("").length);
     let rows = widths.length ? 1 : 0;
     let used = 0;
     for (const width of widths) {
