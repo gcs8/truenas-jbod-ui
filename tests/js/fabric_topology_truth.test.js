@@ -28,6 +28,13 @@ function cellsOf(html) {
   return cells;
 }
 
+// The drawing alone, without the legend's swatches.
+function drawing(html) {
+  const found = /<div class="fabric-topology-scroll">[\s\S]*?<\/svg><\/div>/.exec(html);
+  assert.ok(found, "a drawing is shown");
+  return found[0];
+}
+
 function points(html, linkId) {
   const escaped = linkId.replace(/>/g, "&gt;").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = new RegExp(`<polyline class="topo-link[^"]*" data-topo-link="${escaped}" points="([^"]+)"`).exec(html);
@@ -247,7 +254,7 @@ test("pin and search belong to one system and enclosure, and a typed search clea
   T.render(second, {});
   assert.equal(dom.search.value, "");
   assert.equal(dom.status.textContent, "");
-  assert.doesNotMatch(T.renderTopology(T.buildTopologyModel(second), T.view()), /is-on-path/);
+  assert.doesNotMatch(drawing(T.renderTopology(T.buildTopologyModel(second), T.view())), /is-on-path/);
   // Leaving the mode clears them too.
   dom.search.value = "bay 4";
   dom.searchHandlers.get("input")();
@@ -710,7 +717,7 @@ test("occupancy that is not a boolean is drawn unknown, never empty", () => {
 
 // ---- leaving Topology through the page's mode buttons ------------------------
 
-function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {}) {
+function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {}, page = null) {
   const fs = require("node:fs");
   const path = require("node:path");
   const vm = require("node:vm");
@@ -766,6 +773,7 @@ function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {})
     },
     document: sharedDocument,
   });
+  page?.bind(sandbox.window);
   vm.runInContext(source.replace(/\}\)\(\);\s*$/, "  window.__page = { state, render };\n})();"), sandbox);
   const click = (mode) => buttons.find((button) => button.dataset.fabricMode === mode).handlers.get("click")();
   return { page: sandbox.window.__page, elements, click };
@@ -798,7 +806,7 @@ test("leaving Topology through the mode buttons clears its pin, trace and search
     assert.equal(T.view().pin, null, variant);
     assert.equal(T.view().query, "", variant);
     assert.equal(search.value, "", variant);
-    assert.doesNotMatch(panel.innerHTML, /is-on-path|is-pinned/, variant);
+    assert.doesNotMatch(drawing(panel.innerHTML), /is-on-path|is-pinned/, variant);
   }
 });
 
@@ -961,6 +969,40 @@ test("no two boxes with different ids show the same title, also where a generate
   const plain = JSON.parse(JSON.stringify(cascade));
   plain.nodes.reverse();
   assert.deepEqual(titles(plain), titles(cascade));
+});
+
+// Two pairs of boxes whose generated titles equal each other: each title is
+// its name and its id, and one box's name and id read as the other's. The
+// box with the lower id keeps the title and the other takes " #2", whatever
+// the payload's order.
+test("two generated titles that are equal get their numbers in identifier order, not payload order", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const boxes = [
+    ["enc:2", "Shelf (enc:1)"], ["enc:3", "Shelf (enc:1)"], ["enc:1) (enc:2", "Shelf"], ["enc:4", "Shelf"],
+    ["enc:6", "Tray (enc:5)"], ["enc:7", "Tray (enc:5)"], ["enc:5) (enc:6", "Tray"], ["enc:8", "Tray"],
+  ];
+  for (const [index, [id, label]] of boxes.entries()) {
+    const item = H.addEnclosure(fabric, "mpr0", `00${index}`, label, null);
+    delete item.controller_id;
+    item.id = id;
+    fabric.links.push(H.link(hba.id, id, "controller-enclosure"));
+  }
+  const visible = (payload) => Object.fromEntries([...T.buildTopologyModel(payload).nodes]
+    .filter((item) => item.tier === "enclosures")
+    .map((item) => [item.id, item.lines.slice(0, item.titleLines).join(" ")]));
+  const forward = visible(fabric);
+  assert.deepEqual(Object.keys(forward).sort(), boxes.map(([id]) => id).sort(), "every box is drawn");
+  assert.equal(forward["enc:1) (enc:2"], "Shelf (enc:1) (enc:2)", "the lower id keeps the generated title");
+  assert.equal(forward["enc:2"], "Shelf (enc:1) (enc:2) #2", "the higher id takes the number");
+  assert.equal(forward["enc:5) (enc:6"], "Tray (enc:5) (enc:6)");
+  assert.equal(forward["enc:6"], "Tray (enc:5) (enc:6) #2");
+  assert.equal(new Set(Object.values(forward)).size, boxes.length, Object.values(forward).join(" | "));
+  const reversed = JSON.parse(JSON.stringify(fabric));
+  reversed.nodes.reverse();
+  reversed.links.reverse();
+  assert.deepEqual(visible(reversed), forward, "the same titles in reversed payload order");
 });
 
 // ---- a storage kind is accepted only on a platform that produces it ------------
@@ -1164,40 +1206,108 @@ test("of two bay traces with one id the first is kept, and the notice says so", 
 
 // ---- the drawing's scroll position across the page's own redraws ----------------
 
+// The page around the map panel, as the browser keeps it: the document is the
+// content above the panel, the panel down to the scroll box's bottom border
+// and the content below it, and never shorter than the window. Whenever that
+// leaves a smaller scroll range the page's scroll position is held back to it;
+// window.scrollTo is held back the same way. When the document grows again the
+// browser's scroll anchoring takes the page back towards the position it was
+// held back from, but not from the top, where nothing is anchored. Measured
+// in the browser on a collapse: the page went from 506 to 45 px and, as the
+// box grew, to 485 px at 2560x1440; from 190 to 0 px, where it stayed while
+// the box grew, at 3840x2160. `anchoring: false` leaves only the clamp.
+function fakePage({ viewport, above, below, anchoring = true }) {
+  const page = { innerHeight: viewport, above, below, scrollX: 0, scrollY: 0, panelHeight: () => 0, scrolls: [] };
+  let wanted = 0;
+  page.height = () => Math.max(viewport, page.above + page.panelHeight() + page.below);
+  page.range = () => Math.max(0, page.height() - viewport);
+  page.layout = () => {
+    page.scrollY = Math.min(wanted, page.range());
+    if (!anchoring || page.scrollY === 0) wanted = page.scrollY;
+  };
+  page.scrollTo = (x, y) => {
+    const call = { to: Number(y) || 0, from: page.scrollY };
+    wanted = Math.max(0, call.to);
+    page.layout();
+    page.scrolls.push({ ...call, accepted: page.scrollY });
+  };
+  // A script's window reads and scrolls this page.
+  page.bind = (win) => {
+    const read = (name) => ({ get: () => page[name], configurable: true, enumerable: true });
+    Object.defineProperties(win, { scrollX: read("scrollX"), scrollY: read("scrollY"), innerHeight: read("innerHeight") });
+    win.scrollTo = page.scrollTo;
+    return win;
+  };
+  return page;
+}
+
 // The page's map panel with a real-shaped scroll box: replacing the panel's
 // HTML makes a new box at offset 0 that clamps its offsets to its drawing's
 // current size (the drawing's attributes may be changed after it is put in
 // place), and sits lower on the page for every notice above it, more so when
-// a notice wraps onto more lines in a narrow panel.
-function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
+// a notice wraps onto more lines in a narrow panel, and for every row of
+// legend entries: 15 px rows 6 px apart, entries packed by a width per
+// character chosen to give the rows a browser measured for the 1,024-bay
+// shelf (57 px drawn in full and 36 px as a summary in a 1,132 px box,
+// 36 px both ways in a 1,452 px box).
+// Like the page's box, which has only a maximum height, the box is as tall as
+// its drawing up to `height`: growing the drawing after it is in place grows
+// the box. With `page` (a fakePage), the page around the box scrolls too.
+function scrollingPanel(item, { inner = 1100, height = 600, page = null } = {}) {
   let html = "";
   const pin = { textContent: "" };
   const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
   const lines = (text) => Math.max(1, Math.ceil((text.length * 7) / Math.max(1, inner - 20)));
+  const legendHeight = (markup) => {
+    const legend = /<div class="fabric-topology-legend"[^>]*>([\s\S]*?)<\/div>/.exec(markup)?.[1] || "";
+    const widths = legend.split("data-topology-legend=").slice(1).map((part) => 34 + 3.3 * part.replace(/^[^>]*>/, "").split(/<[^>]+>/).join("").length);
+    let rows = widths.length ? 1 : 0;
+    let used = 0;
+    for (const width of widths) {
+      if (used && used + 12 + width > inner) {
+        rows += 1;
+        used = 0;
+      }
+      used += (used ? 12 : 0) + width;
+    }
+    return rows ? 21 * rows - 6 : 0;
+  };
   const box = (markup) => {
     const tag = /<svg class="fabric-topology-svg[^"]*"[^>]*>/.exec(markup)?.[0] || "";
     const attributes = Object.fromEntries([...tag.matchAll(/ (width|height|viewBox)="([^"]*)"/g)].map((match) => [match[1], match[2]]));
     const svg = {
       getAttribute: (name) => attributes[name] ?? null,
-      setAttribute: (name, value) => { attributes[name] = String(value); },
+      setAttribute: (name, value) => {
+        attributes[name] = String(value);
+        page?.layout();
+      },
     };
     const above = markup.slice(0, markup.indexOf("fabric-topology-scroll"));
     const notices = [...above.matchAll(/<div class="warning-item[^"]*">([^<]*)<\/div>/g)].map((match) => match[1]);
     const bar = /<div class="fabric-topology-bar">([\s\S]*?)<\/div>/.exec(above)?.[1].replace(/<[^>]+>/g, " ") || "";
-    const top = 100 + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
+    const top = 100 + legendHeight(above) + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
     let left = 0;
     let down = 0;
-    const extent = (name, client) => Math.max(0, (Number(attributes[name]) || 0) - client);
+    const client = () => Math.min(height, Number(attributes.height) || 0);
+    const extent = (name, size) => Math.max(0, (Number(attributes[name]) || 0) - size);
+    // The box's part of the document: what sits above it in the panel, the
+    // box itself and its two 1 px borders.
+    if (page) page.panelHeight = () => top + client() + 2;
+    const rect = () => {
+      const y = page ? page.above + top - page.scrollY : top;
+      return { left: 20, top: y, right: 20 + inner, bottom: y + client(), width: inner, height: client() };
+    };
     return {
       clientWidth: inner,
-      clientHeight: height,
+      get clientHeight() { return client(); },
       svg,
       querySelector: (selector) => (selector === ".fabric-topology-svg" || selector === "svg" ? svg : null),
-      get scrollLeft() { return left; },
+      // A drawing made smaller after an offset was set clamps it, as the browser does.
+      get scrollLeft() { return Math.min(left, extent("width", inner)); },
       set scrollLeft(value) { left = Math.max(0, Math.min(extent("width", inner), Number(value) || 0)); },
-      get scrollTop() { return down; },
-      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", height), Number(value) || 0)); },
-      getBoundingClientRect: () => ({ left: 20, top, right: 20 + inner, bottom: top + height, width: inner, height }),
+      get scrollTop() { return Math.min(down, extent("height", client())); },
+      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", client()), Number(value) || 0)); },
+      getBoundingClientRect: rect,
     };
   };
   item.clientWidth = inner + 2;
@@ -1207,6 +1317,8 @@ function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
     set(value) {
       html = value;
       item.box = value.includes("fabric-topology-scroll") ? box(value) : null;
+      if (page && !item.box) page.panelHeight = () => 0;
+      page?.layout();
     },
   });
   item.querySelector = (selector) => {
@@ -1252,17 +1364,18 @@ function expandControls(panel) {
 // The whole page script on a panel of the given inner width and height,
 // in Topology, with clicks sent through the panel's and the document's
 // real handlers.
+// With `size.page` (a fakePage), both scripts share that page as their window.
 function topologyPage(fabric, size) {
   const dom = fakeDom();
-  const T = H.loadTopology({ document: dom.document });
+  const T = H.loadTopology(size.page ? { document: dom.document, window: size.page.bind({}) } : { document: dom.document });
   const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
   let panel = null;
-  const { page, elements } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+  const { page, elements, click: mode } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
     if (id === "fabric-map-panel") {
       panel = item;
       scrollingPanel(item, size);
     }
-  });
+  }, size.page || null);
   Object.assign(page.state, { fabricScopeReady: true, loading: false, selectedSystemId: fabric.system_id, selectedEnclosureId: fabric.selected_enclosure_id, mode: "topology", fabric });
   page.render();
   const documentClick = dom.documentHandlers.find((item) => item.name === "click").handler;
@@ -1271,7 +1384,7 @@ function topologyPage(fabric, size) {
     panel.handlers.get("click")({ type: "click", target });
     documentClick({ type: "click", target });
   };
-  return { T, page, elements, panel, click };
+  return { T, page, elements, panel, click, mode };
 }
 
 test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both scroll offsets, and an expanded or collapsed shelf keeps its control in place", () => {
@@ -1437,4 +1550,371 @@ test("the trace line sits below the drawing, so hover text that wraps cannot mov
     assert.ok(html.indexOf("data-topology-pin") > html.indexOf("fabric-topology-scroll"), `${name}: after the drawing's scroll box`);
   }
   assert.match(pinned, /data-topology-pin>Pinned: /);
+});
+
+// Collapsing a shelf drawn in full while its control is in view: the shorter
+// drawing makes the box shorter until mount adds room after it, the legend
+// above may lose a row, and on a tall page the page itself is held back while
+// the shorter drawing is in place. The control stays where it was.
+test("a collapsed shelf's control stays in place when the redraw changes the box's height, the legend above it or the page's scroll", () => {
+  const cases = [
+    // 1,600 x 900: the legend goes from 57 to 36 px and the box from 700 to
+    // 681 px until the room is added; offset 236 must become 215.
+    { name: "1,024 bays, 1600x900", fabric: bigShelf, size: { inner: 1132, height: 700 }, top: 236, legend: -21, wanted: 215 },
+    // 1,920 x 900: the legend keeps its rows; the box still shrinks for a moment.
+    { name: "1,024 bays, 1920x900", fabric: bigShelf, size: { inner: 1452, height: 700 }, top: 236, legend: 0, wanted: 236 },
+    // 1,920 x 700: the collapsed drawing (681 px) is taller than the box (544 px).
+    { name: "1,024 bays, 1920x700", fabric: bigShelf, size: { inner: 1452, height: 544 }, top: 314, legend: 0, wanted: 314 },
+    // 1,600 x 1,080 with the page scrolled 592 px: while the 681 px drawing is
+    // in place the page can only scroll 443 px, so the box sits 149 px lower
+    // until the room is added.
+    { name: "1,024 bays, 1600x1080, page scrolled", fabric: bigShelf, size: { inner: 1132, height: 840, page: fakePage({ above: 480, below: 150, viewport: 1080 }) }, scrollY: 592, top: 166, legend: -21, wanted: 145 },
+    // The four-shelf system: its other shelves keep the legend's rows.
+    { name: "four shelves, 1600x900", fabric: () => H.fourShelves().fabric, size: { inner: 1132, height: 700 }, top: 400, legend: 0, wanted: 400 },
+  ];
+  const moved = [];
+  for (const { name, fabric, size, scrollY, top, legend, wanted } of cases) {
+    const { panel, click } = topologyPage(fabric(), size);
+    const [shelf] = expandControls(panel);
+    panel.box.scrollLeft = Math.max(0, shelf.x - 200);
+    panel.box.scrollTop = 0;
+    click({ "data-fabric-expand-slots": shelf.key });
+    const before = expandControls(panel).find((item) => item.key === shelf.key);
+    assert.equal(before.expanded, "true", `${name}: drawn in full`);
+    panel.box.scrollTop = top - Number(String(panel.box.svg.getAttribute("viewBox")).split(" ")[1]);
+    if (size.page) size.page.scrollTo(0, scrollY);
+    const rect = panel.box.getBoundingClientRect();
+    const was = screenPoint(panel, before);
+    assert.ok(was[0] >= rect.left && was[0] + 160 <= rect.right && was[1] >= rect.top && was[1] + 22 <= rect.bottom, `${name}: the control is in view at ${was}`);
+    click({ "data-fabric-expand-slots": shelf.key });
+    const after = expandControls(panel).find((item) => item.key === shelf.key);
+    assert.equal(after.expanded, "false", `${name}: a summary again`);
+    const now = screenPoint(panel, after);
+    if (!size.page) assert.equal(panel.box.getBoundingClientRect().top - rect.top, legend, `${name}: the box moves with the legend's height`);
+    const offset = panel.box.scrollTop + Number(String(panel.box.svg.getAttribute("viewBox")).split(" ")[1]);
+    if (now[0] !== was[0] || now[1] !== was[1] || offset !== wanted) moved.push(`${name}: from ${was} to ${now}, offset ${offset} for ${wanted}`);
+  }
+  assert.deepEqual(moved, [], "every control stays in place");
+});
+
+// The redraw needs room before the drawing's top edge: the box moves up by
+// the legend row the collapse removes, with the drawing's offset at 0.
+test("a control kept in place above the drawing's top edge gets room there, and the room goes once no view needs it", () => {
+  const { panel, click } = topologyPage(bigShelf(), { inner: 1132, height: 700 });
+  const [shelf] = expandControls(panel);
+  const origin = () => String(panel.box.svg.getAttribute("viewBox")).split(" ").slice(0, 2).map(Number);
+  panel.box.scrollLeft = 0;
+  panel.box.scrollTop = 0;
+  click({ "data-fabric-expand-slots": shelf.key });
+  panel.box.scrollTop = -origin()[1];
+  const before = expandControls(panel)[0];
+  const was = screenPoint(panel, before);
+  assert.ok(was[1] >= panel.box.getBoundingClientRect().top, `the control is in view at ${was}`);
+  click({ "data-fabric-expand-slots": shelf.key });
+  assert.equal(origin()[1], -21, "21 px of room before the drawing's top edge");
+  assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), was, "collapsing moves nothing");
+  // Drawn in full again: the view no longer needs that room, and the control stays.
+  click({ "data-fabric-expand-slots": shelf.key });
+  assert.equal(origin()[1], 0, "no room before the top edge once the view does not need it");
+  assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), was, "expanding again moves nothing");
+});
+
+// At 390 px a pin that added the traced-path entry made the legend a row
+// taller and moved the drawing down under the pointer.
+test("hover, focus, search and a pin never change the legend's entries, so the drawing does not move", () => {
+  const T = H.loadTopology();
+  for (const [name, fabric] of [["four shelves", H.fourShelves().fabric], ["1,024-bay shelf", bigShelf()], ["cascade", cases.core_cascade.fabric]]) {
+    const model = T.buildTopologyModel(fabric, { width: 322 });
+    const legend = (view) => /<div class="fabric-topology-legend"[^>]*>[\s\S]*?<\/div>/.exec(T.renderTopology(model, view))[0];
+    const idle = legend({});
+    const link = [...model.links].find((item) => !item.bundle);
+    const bay = [...model.bays][0];
+    assert.ok(link && bay, name);
+    const query = bay.number === "" ? bay.label : `bay ${bay.number}`;
+    assert.ok(T.searchTopology(model, query).matches.length, `${name}: "${query}" finds a bay`);
+    const views = {
+      "hover or focus on a line": { hover: { kind: "link", id: link.id } },
+      "hover or focus on a bay": { hover: { kind: "bay", id: bay.bayId } },
+      "a pinned line": { pin: { kind: "link", id: link.id } },
+      "a pinned bay": { pin: { kind: "bay", id: bay.bayId } },
+      "a search": { query },
+    };
+    for (const [what, view] of Object.entries(views)) {
+      assert.match(drawing(T.renderTopology(model, view)), /is-on-path/, `${name}, ${what}: something is traced`);
+      assert.equal(legend(view), idle, `${name}, ${what}: the same legend`);
+    }
+    assert.match(idle, /data-topology-legend="is-on-path"/, `${name}: the traced-path entry is listed before anything is traced`);
+  }
+  // Through the page at 390 px: pinning a line keeps the box where it was.
+  const { panel, click } = topologyPage(cases.core_cascade.fabric, { inner: 322, height: 658 });
+  const legendOf = () => /<div class="fabric-topology-legend"[^>]*>[\s\S]*?<\/div>/.exec(panel.innerHTML)[0];
+  const before = legendOf();
+  const top = panel.box.getBoundingClientRect().top;
+  const [link] = [...H.loadTopology().buildTopologyModel(cases.core_cascade.fabric, { width: 322 }).links].filter((item) => !item.bundle);
+  click({ "data-topo-link": link.id, "data-fabric-topology-link": link.id });
+  assert.match(panel.innerHTML, /data-topology-pin>Pinned: /, "the line is pinned");
+  assert.equal(legendOf(), before, "the pin leaves the legend as it was");
+  assert.equal(panel.box.getBoundingClientRect().top, top, "and the drawing's box where it was");
+});
+
+// ---- the shelf control and the page's own scroll position ---------------------
+
+// What a browser measured around the 1,024-bay shelf at eight window sizes:
+// the box's inner width and height limit, its top on the page with the shelf
+// as a summary (`summaryTop`) and drawn in full (`fullTop`), the page below
+// it, and where the page was scrolled before an expand and before a collapse.
+const MEASURED_WINDOWS = [
+  { name: "1600x900", viewport: 900, inner: 1132, limit: 700, summaryTop: 689.625, fullTop: 710.625, below: 152.375, expandY: 625, collapseY: 611 },
+  { name: "1920x900", viewport: 900, inner: 1452, limit: 700, summaryTop: 689.625, fullTop: 689.625, below: 152.375, expandY: 625, collapseY: 590 },
+  { name: "1920x700", viewport: 700, inner: 1452, limit: 544, summaryTop: 689.625, fullTop: 689.625, below: 152.375, expandY: 688, collapseY: 612 },
+  { name: "1600x1080", viewport: 1080, inner: 1132, limit: 840, summaryTop: 689.625, fullTop: 710.625, below: 152.375, expandY: 445, collapseY: 592 },
+  { name: "1920x1080", viewport: 1080, inner: 1452, limit: 840, summaryTop: 689.625, fullTop: 689.625, below: 152.375, expandY: 445, collapseY: 571 },
+  { name: "1600x1440", viewport: 1440, inner: 1132, limit: 1121, summaryTop: 689.625, fullTop: 710.625, below: 152.375, expandY: 85, collapseY: 546 },
+  { name: "2560x1440", viewport: 1440, inner: 2092, limit: 1121, summaryTop: 668.625, fullTop: 689.625, below: 133.375, expandY: 45, collapseY: 506 },
+  { name: "3840x2160", viewport: 2160, inner: 3372, limit: 1683, summaryTop: 668.625, fullTop: 668.625, below: 132.375, expandY: 0, collapseY: 190 },
+];
+// The four-shelf system at two of them; its legend keeps its rows.
+const MEASURED_FOUR_SHELVES = [
+  { name: "four shelves, 1600x900", viewport: 900, inner: 1132, limit: 700, summaryTop: 767.625, below: 152.375, expandY: 722, collapseY: 722 },
+  { name: "four shelves, 1920x1080", viewport: 1080, inner: 1452, limit: 840, summaryTop: 746.625, below: 152.375, expandY: 661, collapseY: 661 },
+];
+
+// The whole page on one of those windows, the page's top placed where the
+// browser had it. `trace` lists the page's scroll position at mount's entry
+// and exit and every window.scrollTo with the step it came from.
+function measuredPage(fabric, size, { anchoring = true } = {}) {
+  const page = fakePage({ viewport: size.viewport, above: 0, below: size.below, anchoring });
+  const view = topologyPage(fabric, { inner: size.inner, height: size.limit, page });
+  page.above = size.summaryTop - view.panel.box.getBoundingClientRect().top;
+  page.layout();
+  const trace = [];
+  const mount = view.T.mount;
+  view.T.mount = (...args) => {
+    trace.push(["mount entry", page.scrollY]);
+    const from = page.scrolls.length;
+    mount(...args);
+    page.scrolls.slice(from).forEach((call) => trace.push(["mount scrollTo", call]));
+    trace.push(["mount exit", page.scrollY]);
+  };
+  return { ...view, app: view.page, page, trace, mount };
+}
+
+// One expand or collapse from the start the browser measured: the control
+// 24 px below the box's top or 24 px above its bottom, as far as the box
+// allows, and the page where it was. Returns the control's move in the window.
+function toggleFrom(view, size, key, start, y) {
+  const { panel, page, click } = view;
+  const before = expandControls(panel).find((item) => item.key === key);
+  const origin = String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+  panel.box.scrollLeft = Math.max(0, before.x - origin[0] - 200);
+  panel.box.scrollTop = start === "top" ? before.y - origin[1] - 24 : before.y - origin[1] + 22 + 24 - size.limit;
+  page.scrollTo(0, y);
+  page.scrolls.length = 0;
+  view.trace.length = 0;
+  const was = screenPoint(panel, before);
+  const rect = panel.box.getBoundingClientRect();
+  const visible = was[1] >= rect.top && was[1] + 22 <= rect.bottom && was[1] >= 0 && was[1] + 22 <= size.viewport;
+  click({ "data-fabric-expand-slots": key });
+  const now = screenPoint(panel, expandControls(panel).find((item) => item.key === key));
+  return { visible, was, dx: now[0] - was[0], dy: now[1] - was[1], pageY: [y, page.scrollY] };
+}
+
+// Expand, then collapse, from each start: the moves that are not 0.
+function shelfMoves(sizes, fabric, { anchoring = true, keys = null } = {}) {
+  const moves = [];
+  for (const size of sizes) {
+    for (const start of ["top", "bottom"]) {
+      const probe = measuredPage(fabric(), size, { anchoring });
+      for (const key of keys || [expandControls(probe.panel)[0].key]) {
+        const view = measuredPage(fabric(), size, { anchoring });
+        for (const step of ["expand", "collapse"]) {
+          const move = toggleFrom(view, size, key, start, step === "expand" ? size.expandY : size.collapseY);
+          assert.ok(move.visible, `${size.name}, ${start}, ${step}: the control is in view before the click at ${move.was}`);
+          if (move.dx || move.dy) moves.push(`${size.name}, ${key.slice(-6)}, ${start}, ${step}: ${move.dx}, ${move.dy}`);
+        }
+      }
+    }
+  }
+  return moves;
+}
+
+test("the fake page is held back while the document is short and comes back as it grows, but not from the top", () => {
+  const page = fakePage({ viewport: 1000, above: 500, below: 100 });
+  let box = 1000;
+  page.panelHeight = () => box;
+  page.layout();
+  page.scrollTo(0, 400);
+  assert.equal(page.scrollY, 400);
+  box = 600;
+  page.layout();
+  assert.equal(page.scrollY, 200, "held back to the shorter document");
+  box = 1000;
+  page.layout();
+  assert.equal(page.scrollY, 400, "back as the document grows again");
+  box = 300;
+  page.layout();
+  assert.equal(page.scrollY, 0);
+  box = 1000;
+  page.layout();
+  assert.equal(page.scrollY, 0, "from the top, the page stays there");
+  page.scrollTo(0, 900);
+  assert.deepEqual(page.scrolls.at(-1), { to: 900, from: 0, accepted: 600 }, "scrollTo is held back the same way");
+});
+
+// The browser's page around the 1,024-bay shelf at the seven sizes where the
+// control already kept its place, and the four-shelf system.
+test("an expanded or collapsed shelf's control keeps its place in the window at seven measured window sizes and with four shelves", () => {
+  assert.deepEqual(shelfMoves(MEASURED_WINDOWS.slice(0, 7), bigShelf), [], "every control stays in place");
+  const four = measuredPage(H.fourShelves().fabric, MEASURED_FOUR_SHELVES[0]);
+  const keys = expandControls(four.panel).map((item) => item.key);
+  assert.equal(keys.length, 2, "two shelves can be expanded");
+  assert.deepEqual(shelfMoves(MEASURED_FOUR_SHELVES, () => H.fourShelves().fabric, { keys }), [], "every four-shelf control stays in place");
+  // The model's legend puts the box where the browser had it with the shelf drawn in full.
+  for (const size of MEASURED_WINDOWS) {
+    const view = measuredPage(bigShelf(), size);
+    view.click({ "data-fabric-expand-slots": expandControls(view.panel)[0].key });
+    assert.equal(view.panel.box.getBoundingClientRect().top + view.page.scrollY, size.fullTop, `${size.name}: the box's top with the shelf drawn in full`);
+  }
+});
+
+// At 3840x2160 the page cannot scroll at all while the collapsed drawing is
+// in place, so it drops to the top; the page's own redraw puts it back only
+// after mount has aimed the control, or cannot when the box has not grown.
+test("at 3840x2160 a collapsed shelf's control keeps its place in the window from the top and the bottom start", () => {
+  assert.deepEqual(shelfMoves(MEASURED_WINDOWS.slice(7), bigShelf), [], "every control stays in place");
+});
+
+// Mount puts the page back before it aims; the page's redraw then puts it
+// back again for every mode. Where mount's succeeded the second has nothing
+// to do; where the page could not get back there either, it moves nothing.
+test("mount's and the page's own page-scroll restorations do not fight", () => {
+  for (const size of MEASURED_WINDOWS.slice(6)) {
+    for (const start of ["top", "bottom"]) {
+      const view = measuredPage(bigShelf(), size);
+      const key = expandControls(view.panel)[0].key;
+      toggleFrom(view, size, key, start, size.expandY);
+      const move = toggleFrom(view, size, key, start, size.collapseY);
+      const label = `${size.name}, ${start}`;
+      assert.equal(move.dy, 0, label);
+      const inMount = view.trace.filter(([step]) => step === "mount scrollTo").map(([, call]) => call);
+      assert.equal(inMount.length, 1, `${label}: mount puts the page back once`);
+      assert.equal(inMount[0].to, size.collapseY, label);
+      const afterMount = view.page.scrolls.slice(view.page.scrolls.indexOf(view.page.scrolls.find((call) => call.to === inMount[0].to)) + 1);
+      if (inMount[0].accepted === size.collapseY) assert.deepEqual(afterMount, [], `${label}: the page's own restoration has nothing left to do`);
+      afterMount.forEach((call) => assert.equal(call.accepted, call.from, `${label}: the page's own restoration moves nothing`));
+    }
+  }
+  // 3840x2160: mount's restoration succeeds, so the page makes no call of its own.
+  const view = measuredPage(bigShelf(), MEASURED_WINDOWS[7]);
+  const key = expandControls(view.panel)[0].key;
+  toggleFrom(view, MEASURED_WINDOWS[7], key, "top", 0);
+  toggleFrom(view, MEASURED_WINDOWS[7], key, "top", 190);
+  assert.deepEqual(view.page.scrolls, [{ to: 190, from: 0, accepted: 190 }]);
+});
+
+// Any other caller of mount, one without a page position, gets what the
+// drawing had before mount took one: the control aimed at the page as it
+// is, and no page scroll. At 3840x2160 that is the move a browser measured.
+test("mount without a page position aims at the page as it is and never scrolls the page", () => {
+  const size = MEASURED_WINDOWS[7];
+  const moves = [];
+  for (const start of ["top", "bottom"]) {
+    const view = measuredPage(bigShelf(), size);
+    view.T.mount = (container) => {
+      const from = view.page.scrolls.length;
+      view.mount(container);
+      assert.deepEqual(view.page.scrolls.slice(from), [], `${start}: no page scroll from mount`);
+    };
+    const key = expandControls(view.panel)[0].key;
+    toggleFrom(view, size, key, start, size.expandY);
+    moves.push(toggleFrom(view, size, key, start, size.collapseY).dy);
+  }
+  assert.deepEqual(moves, [176, 190]);
+});
+
+// No control to keep in place: mount never scrolls the page. Fit takes the
+// offsets to what the fitted drawing allows and Actual size gives them back;
+// pinning, selecting, searching and a refresh keep them, and the page stays.
+test("a redraw with no shelf control to keep does not scroll the page, and Fit and Actual size still drop and restore the offsets", () => {
+  const size = MEASURED_WINDOWS[4];
+  const view = measuredPage(bigShelf(), size);
+  const { panel, page, click, T, elements } = view;
+  click({ "data-fabric-expand-slots": expandControls(panel)[0].key });
+  panel.box.scrollLeft = 300;
+  panel.box.scrollTop = 400;
+  page.scrollTo(0, size.collapseY);
+  page.scrolls.length = 0;
+  view.trace.length = 0;
+  // In drawing coordinates: room no view needs any more may go meanwhile.
+  const offsets = () => {
+    const origin = String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+    return [panel.box.scrollLeft + origin[0], panel.box.scrollTop + origin[1]];
+  };
+  const held = offsets();
+  assert.ok(held[1] > 0 && page.scrollY > 0, `the drawing and the page are scrolled: ${held}, ${page.scrollY}`);
+  const still = (what) => {
+    assert.deepEqual(page.scrolls, [], `${what}: no page scroll`);
+    assert.equal(page.scrollY, size.collapseY, `${what}: the page stays`);
+    assert.deepEqual(offsets(), held, `${what}: the offsets stay`);
+  };
+  click({ "data-topo-bay": "bay:10", "data-fabric-trace": "bay:10" });
+  still("selecting a bay");
+  const link = [...T.drawnModel().links].find((item) => item.kind === "controller-expander");
+  click({ "data-topo-link": link.id, "data-fabric-topology-link": link.id });
+  assert.ok(T.inspectorDetail(), "the link is pinned");
+  still("pinning a link");
+  const search = elements.get("fabric-topology-search");
+  search.value = "bay 3";
+  search.handlers.get("input")();
+  still("searching");
+  view.app.render();
+  still("a refresh");
+  click({ "data-topology-fit": "fit" });
+  assert.match(panel.innerHTML, /is-fitted/);
+  // The fitted drawing is scaled to 78% of the window, the box's inner height
+  // is that less its borders: what is left to scroll is at most those 2 px.
+  const slack = [Number(panel.box.svg.getAttribute("width")) - panel.box.clientWidth, Number(panel.box.svg.getAttribute("height")) - panel.box.clientHeight];
+  assert.ok(slack.every((value) => value <= 2), `the fitted drawing fits the box: ${slack}`);
+  assert.deepEqual(offsets(), held.map((value, index) => Math.min(value, Math.max(0, slack[index]))), "Fit keeps only what the fitted drawing allows");
+  click({ "data-topology-fit": "actual" });
+  assert.deepEqual(offsets(), held, "Actual size gives them back");
+  assert.deepEqual(view.trace.filter(([step]) => step === "mount scrollTo"), [], "mount scrolls the page for none of these");
+});
+
+// The page's first view of the drawing, the older modes, and the room the
+// kept control needed after the drawing's bottom edge.
+test("the first view, the older modes and a later view that needs no room leave the new page restoration alone", () => {
+  // The page is already scrolled when Topology first draws: mount starts the
+  // drawing at its top and leaves the page where it is.
+  const page = fakePage({ viewport: 1080, above: 2000, below: 152.375 });
+  page.scrollTo(0, 500);
+  const view = topologyPage(bigShelf(), { inner: 1452, height: 840, page });
+  assert.deepEqual(page.scrolls, [{ to: 500, from: 0, accepted: 500 }], "the first view scrolls nothing");
+  assert.equal(page.scrollY, 500);
+  assert.equal(view.panel.box.scrollTop, 0, "the drawing starts at its top");
+  // The four older modes never call mount; Topology's own first view again does not scroll the page.
+  const calls = [];
+  const mount = view.T.mount;
+  view.T.mount = (...args) => {
+    calls.push(view.page.state.mode);
+    mount(...args);
+  };
+  for (const mode of ["lanes", "impact", "trace", "disk"]) view.mode(mode);
+  assert.deepEqual(calls, [], "no older mode calls mount");
+  view.mode("topology");
+  assert.deepEqual(calls, ["topology"]);
+  assert.deepEqual(page.scrolls.slice(1).filter((call) => call.from !== call.accepted), [], "nothing moved the page");
+  // After a kept control needed room after the drawing's bottom edge, the next
+  // redraw whose view does not need it gives the room back.
+  const size = MEASURED_WINDOWS[7];
+  const big = measuredPage(bigShelf(), size);
+  const key = expandControls(big.panel)[0].key;
+  toggleFrom(big, size, key, "bottom", size.expandY);
+  toggleFrom(big, size, key, "bottom", size.collapseY);
+  const natural = big.T.drawnModel().height;
+  assert.ok(Number(big.panel.box.svg.getAttribute("height")) > natural, "room after the drawing's bottom edge");
+  big.panel.box.scrollTop = 0;
+  big.click({ "data-topo-bay": "bay:1", "data-fabric-trace": "bay:1" });
+  assert.equal(Number(big.panel.box.svg.getAttribute("height")), Math.ceil(natural), "the room is given back");
+  assert.deepEqual(big.trace.filter(([step]) => step === "mount scrollTo").length, 1, "only the collapse's mount scrolled the page");
 });

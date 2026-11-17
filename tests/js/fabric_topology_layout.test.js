@@ -1008,3 +1008,258 @@ test("an expander tier label never leaves its level number alone on a line", () 
     }
   }
 });
+
+// ---- the trace sentence stays in the window ------------------------------------
+
+function cssRule(css, selector) {
+  return new RegExp(`(?:^|\\n|\\{)\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
+}
+
+function mediaBlock(css, width) {
+  return new RegExp(`@media \\(max-width: ${width}px\\)\\s*\\{([\\s\\S]*?)\\n\\}`).exec(css)?.[1] || "";
+}
+
+test("the trace sentence sticks to the window's bottom in an opaque band whose reserved height a focused item is kept clear of", () => {
+  const css = topologyCss();
+  const band = cssRule(css, ".fabric-topology .fabric-topology-pin");
+  assert.match(band, /position:\s*sticky;/);
+  assert.match(band, /bottom:\s*0;/);
+  // Opaque: the page's surface colour, a six-digit colour with no alpha.
+  assert.match(band, /background:\s*var\(--surface\);/);
+  assert.match(ROOT_CSS, /--surface:\s*#[0-9a-f]{6};/i);
+  assert.match(band, /border-top:\s*1px solid var\(--panel-border\);/);
+  assert.ok(Number(/z-index:\s*(\d+);/.exec(band)?.[1]) >= 1, "painted above the drawing");
+  // Its height is reserved in lines, the same for the hint, a trace and a pin;
+  // a longer sentence may grow it and is never clipped. The reserved height
+  // itself is checked by the next test.
+  assert.match(band, /min-height:\s*var\(--topology-trace-band\);/);
+  assert.match(band, /line-height:\s*var\(--topology-trace-line\);/);
+  assert.doesNotMatch(band, /(?:^|[\s;])(?:height|max-height|overflow|text-overflow|-webkit-line-clamp|line-clamp)\s*:/);
+  const view = cssRule(css, ".fabric-topology");
+  assert.match(view, /--topology-trace-line:\s*1\.25rem;/);
+  const reserved = (text) => Number(/--topology-trace-lines:\s*(\d+);/.exec(text)?.[1]);
+  assert.equal(reserved(view), 1, "one line on wide pages");
+  assert.equal(reserved(cssRule(mediaBlock(css, 1480), ".fabric-topology")), 2, "two lines up to 1480 px, beside the inspector");
+  assert.equal(reserved(cssRule(mediaBlock(css, 1240), ".fabric-topology")), 2, "two lines up to 1240 px, the page's one-column width");
+  assert.equal(reserved(cssRule(mediaBlock(css, 640), ".fabric-topology")), 3, "three lines at phone width");
+  assert.match(ROOT_CSS, /@media \(max-width: 1240px\)/, "an existing page breakpoint");
+  assert.ok(css.indexOf("@media (max-width: 1480px)") < css.indexOf("@media (max-width: 1240px)"), "the narrower rule comes later and wins");
+  assert.ok(css.indexOf("@media (max-width: 1240px)") < css.indexOf("@media (max-width: 640px)"), "the narrower rule comes last and wins");
+  assert.match(mediaBlock(css, 1480), /^\s*\.fabric-topology\s*\{\s*--topology-trace-lines:\s*2;\s*\}\s*$/, "the 1480 px rule changes only the reserved lines");
+  // The band's whole height: its lines, padding on both sides and its border.
+  const padding = /padding:\s*(\d+)px 0;/.exec(band);
+  assert.ok(padding, "vertical padding in px");
+  const whole = 2 * Number(padding[1]) + 1;
+  assert.match(view, new RegExp(`--topology-trace-band:\\s*calc\\(var\\(--topology-trace-lines\\) \\* var\\(--topology-trace-line\\) \\+ ${whole}px\\);`));
+  // Every item that takes keyboard focus scrolls clear of the band.
+  assert.match(cssRule(css, `.fabric-topology-svg [role="button"]`), /scroll-margin-bottom:\s*var\(--topology-trace-band\);/);
+  const T = H.loadTopology();
+  for (const [name, model] of Object.entries(fixtures(T, { width: 1100 }))) {
+    const html = T.renderTopology(model, {});
+    const focusable = [...html.matchAll(/<[a-z]+\b[^>]*\btabindex="0"[^>]*>/g)].map((match) => match[0]);
+    assert.ok(focusable.length, name);
+    assert.ok(focusable.every((tag) => tag.includes('role="button"')), `${name}: every focusable item is covered by the rule`);
+  }
+  // Only the band sticks; nothing above the drawing or in it is placed by this.
+  assert.equal((css.match(/position:\s*sticky/g) || []).length, 1);
+});
+
+test("the trace sentence is one element after the drawing's scroll box, the same element for the hint, a hover and a pin", () => {
+  const handlers = new Map();
+  const pin = { textContent: "" };
+  const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
+  const container = {
+    dataset: {},
+    querySelector: (selector) => (selector === ".fabric-topology" ? root : null),
+    addEventListener: (name, handler) => handlers.set(name, handler),
+  };
+  const T = H.loadTopology({ document: { addEventListener() {} } });
+  T.attach(container, null, null, {});
+  const fabric = H.twoHbaCascade().fabric;
+  const tag = (html) => {
+    const found = [...html.matchAll(/<p [^>]*data-topology-pin[^>]*>/g)].map((match) => match[0]);
+    assert.equal(found.length, 1, "one trace sentence");
+    const at = html.indexOf(found[0]);
+    assert.ok(at > html.indexOf('<div class="fabric-topology-scroll">'), "after the scroll box");
+    assert.ok(at > html.lastIndexOf("</svg></div>"), "after the drawing, outside its box");
+    assert.ok(at < html.indexOf("fabric-topology-not-shown"), "before the footer");
+    return found[0];
+  };
+  const idle = tag(T.render(fabric, { width: 1100 }));
+  const model = T.drawnModel();
+  const link = [...model.links].find((item) => !item.bundle);
+  const element = {
+    dataset: { topoLink: link.id },
+    closest(selector) {
+      if (selector === ".fabric-topology") return root;
+      return /\[data-topo-/.test(selector) ? this : null;
+    },
+  };
+  handlers.get("mouseover")({ target: element });
+  assert.match(pin.textContent, /^Tracing: /, "a hover writes into the same element");
+  handlers.get("click")({ target: element });
+  assert.ok(T.inspectorDetail(), "the line is pinned");
+  const pinned = T.render(fabric, { width: 1100 });
+  assert.equal(tag(pinned), idle, "the pinned redraw has the same element");
+  assert.match(pinned, /data-topology-pin>Pinned: /);
+});
+
+// The page's stylesheet decides how a min-height is measured: under
+// `box-sizing: border-box` it is the whole box, padding and border included,
+// so the reserved height must be the whole band or the band still grows when
+// its lines fill. Which box-sizing reaches the sentence is read from both
+// stylesheets, in their load order, for the sentence's own element.
+const PIN_ELEMENT = { tag: "p", classes: new Set(["fabric-topology-pin", "subtle"]), attributes: new Set(["data-topology-pin"]) };
+const PIN_ANCESTOR_CLASSES = new Set(["fabric-topology", "fabric-map-panel", "fabric-view-layout", "fabric-view-panel", "panel", "app-shell", "fabric-page-shell"]);
+
+function cssRules(css) {
+  const rules = [];
+  const text = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const match of text.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const prelude = match[1].trim();
+    if (!prelude.startsWith("@")) rules.push({ selectors: prelude.split(",").map((part) => part.trim()), body: match[2] });
+  }
+  return rules;
+}
+
+function compound(part) {
+  const tokens = part.match(/\*|[a-z][a-z0-9-]*|\.[\w-]+|#[\w-]+|\[[^\]]+\]|::?[\w-]+(?:\([^)]*\))?/gi) || [];
+  return {
+    tag: tokens.find((token) => /^(?:\*|[a-z])/i.test(token)) || null,
+    classes: tokens.filter((token) => token.startsWith(".")).map((token) => token.slice(1)),
+    ids: tokens.filter((token) => token.startsWith("#")),
+    attributes: tokens.filter((token) => token.startsWith("[")).map((token) => token.slice(1, -1)),
+    pseudo: tokens.filter((token) => token.startsWith(":")),
+  };
+}
+
+// Whether a selector reaches the sentence's element, and its specificity.
+// A selector this reader cannot decide fails the test rather than being skipped.
+function reachesPin(selector) {
+  const parts = selector.replace(/\s*>\s*/g, " ").split(/\s+/);
+  assert.ok(!/[+~]/.test(selector), `sibling combinator in ${selector}`);
+  const last = compound(parts[parts.length - 1]);
+  const all = parts.map(compound);
+  const specificity = [
+    all.reduce((sum, item) => sum + item.ids.length, 0),
+    all.reduce((sum, item) => sum + item.classes.length + item.attributes.length + item.pseudo.filter((token) => !token.startsWith("::")).length, 0),
+    all.reduce((sum, item) => sum + (item.tag && item.tag !== "*" ? 1 : 0) + item.pseudo.filter((token) => token.startsWith("::")).length, 0),
+  ];
+  const own = (!last.tag || last.tag === "*" || last.tag === PIN_ELEMENT.tag)
+    && !last.ids.length
+    && last.classes.every((name) => PIN_ELEMENT.classes.has(name))
+    && last.attributes.every((name) => PIN_ELEMENT.attributes.has(name));
+  if (!own || last.pseudo.some((token) => token.startsWith("::"))) return null;
+  assert.equal(last.pseudo.length, 0, `state-dependent selector ${selector}`);
+  const ancestors = all.slice(0, -1).every((item) => !item.ids.length && !item.pseudo.length && item.attributes.length === 0
+    && item.classes.every((name) => PIN_ANCESTOR_CLASSES.has(name)) && (!item.tag || ["*", "div", "body", "html", "main", "section"].includes(item.tag)));
+  return ancestors ? specificity : null;
+}
+
+function declared(body, property) {
+  // A property name is letters and hyphens, which need no escaping here.
+  assert.match(property, /^[a-z-]+$/);
+  return [...body.matchAll(new RegExp(`(?:^|[;{\\s])${property}\\s*:\\s*([^;]+);`, "g"))].map((match) => match[1].trim());
+}
+
+function pinBoxSizing(sheets) {
+  let winner = { value: "content-box", specificity: [-1, -1, -1] };
+  const more = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  for (const css of sheets) {
+    for (const rule of cssRules(css)) {
+      for (const value of declared(rule.body, "box-sizing")) {
+        for (const selector of rule.selectors) {
+          const specificity = reachesPin(selector);
+          if (specificity && more(specificity, winner.specificity) >= 0) winner = { value, specificity, selector };
+        }
+      }
+    }
+  }
+  return winner;
+}
+
+function cssPixels(expression, properties) {
+  let text = expression;
+  for (let depth = 0; /var\(/.test(text); depth += 1) {
+    assert.ok(depth < 10, `unresolved ${expression}`);
+    text = text.replace(/var\((--[\w-]+)\)/g, (_, name) => {
+      assert.ok(properties.has(name), `${name} is defined`);
+      return `(${properties.get(name)})`;
+    });
+  }
+  text = text.replace(/calc\(/g, "(").replace(/([\d.]+)rem\b/g, (_, value) => String(Number(value) * 16)).replace(/([\d.]+)px\b/g, "$1");
+  assert.match(text, /^[\d.\s+*()-]+$/, `plain arithmetic: ${text}`);
+  return Function(`"use strict"; return (${text});`)();
+}
+
+test("the trace band's reserved height is the whole band at every breakpoint, under the box sizing that reaches it", () => {
+  const css = topologyCss();
+  const sizing = pinBoxSizing([ROOT_CSS, css]);
+  const band = cssRule(css, ".fabric-topology .fabric-topology-pin");
+  assert.equal(cssRules(css).filter((rule) => rule.selectors.some((selector) => /fabric-topology-pin/.test(selector))).length, 1, "one rule sizes the band, at every width");
+  const [minHeight] = declared(band, "min-height");
+  assert.ok(minHeight, "the band reserves a height");
+  const padding = declared(band, "padding")[0].split(/\s+/).map((value) => Number.parseFloat(value));
+  const vertical = padding[0] + (padding.length > 2 ? padding[2] : padding[0]);
+  const border = Number.parseFloat(declared(band, "border-top")[0]);
+  assert.equal(declared(band, "border-bottom").length + declared(band, "border").length, 0, "only a top border");
+  const view = cssRule(css, ".fabric-topology");
+  const base = new Map([...view.matchAll(/(--topology-[\w-]+):\s*([^;]+);/g)].map((match) => [match[1], match[2].trim()]));
+  const breakpoints = [["wide", base]];
+  for (const match of css.matchAll(/@media \(max-width: (\d+)px\)/g)) {
+    const inner = cssRule(mediaBlock(css, Number(match[1])), ".fabric-topology");
+    const set = new Map([...inner.matchAll(/(--topology-[\w-]+):\s*([^;]+);/g)].map((item) => [item[1], item[2].trim()]));
+    if (set.size) breakpoints.push([`${match[1]} px`, new Map([...base, ...set])]);
+  }
+  assert.ok(breakpoints.length >= 3, "a wide reservation and the narrower ones");
+  const seen = [];
+  for (const [name, properties] of breakpoints) {
+    const lines = cssPixels("var(--topology-trace-lines)", properties);
+    const line = cssPixels("var(--topology-trace-line)", properties);
+    const reserved = cssPixels(minHeight, properties);
+    const whole = lines * line + (sizing.value === "border-box" ? vertical + border : 0);
+    assert.equal(reserved, whole, `${name}: ${lines} line(s) of ${line} px under ${sizing.value} (from ${sizing.selector || "the initial value"})`);
+    // A focused item scrolls clear of the same whole band.
+    assert.equal(cssPixels("var(--topology-trace-band)", properties), lines * line + vertical + border, `${name}: the band's whole height`);
+    seen.push(reserved);
+  }
+  assert.equal(sizing.value, "border-box", "the page sizes every box by its border");
+  assert.deepEqual(seen, [29, 49, 49, 69], "29, 49, 49 and 69 px bands");
+  // Beside the inspector (above 1240 px) the band is the window less 466 px:
+  // the inspector's 380 px, the 12 px gap and the page's padding. Each line is
+  // filled word by word at 7.25 px a character (the text's 16 px Arial-metric
+  // glyphs, which give the line counts a browser showed at 390 px) plus a 10%
+  // margin. The three sentence forms, as the browser showed them for a link
+  // (its 16-character SAS address as a placeholder of the same length):
+  const label = `Link mpr1 to ${"a".repeat(16)}, 4 lanes, 12 Gb/s, PHYs 0, 1, 2, 3 to PHYs 32, 33, 34, 35`;
+  const forms = [`Tracing: ${label}.`, `Pinned: ${label}. Esc clears.`, `Tracing: ${label}. Pinned item kept; Esc clears.`];
+  const glyph = 7.25 * 1.1;
+  const lines = (text, width) => {
+    let count = 1;
+    let used = 0;
+    for (const word of text.split(" ")) {
+      const wide = word.length * glyph;
+      if (used && used + glyph + wide > width) {
+        count += 1;
+        used = 0;
+      }
+      used += (used ? glyph : 0) + wide;
+    }
+    return count;
+  };
+  // The narrowest max-width rule that reaches a width comes last and wins.
+  const count = (text) => Number(/--topology-trace-lines:\s*(\d+);/.exec(text)?.[1]);
+  const limits = [...css.matchAll(/@media \(max-width: (\d+)px\)/g)].map((match) => Number(match[1]))
+    .filter((limit) => count(cssRule(mediaBlock(css, limit), ".fabric-topology")));
+  const reservedAt = (width) => {
+    const rule = limits.filter((limit) => width <= limit).sort((a, b) => a - b)[0];
+    return count(rule ? cssRule(mediaBlock(css, rule), ".fabric-topology") : view);
+  };
+  for (let width = 1241; width <= 3840; width += 1) {
+    const needed = Math.max(...forms.map((text) => lines(text, width - 466)));
+    assert.ok(needed <= reservedAt(width), `${width} px: ${needed} line(s) for ${reservedAt(width)} reserved`);
+  }
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1241 - 466))), 2, "two lines needed just above 1240 px");
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1481 - 466))), 1, "one line just above 1480 px, with the margin");
+  assert.equal(Math.max(...forms.map((text) => lines(text, 1478 - 466))), 2, "the margin is used up just below 1480 px");
+});

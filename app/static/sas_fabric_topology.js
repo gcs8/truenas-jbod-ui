@@ -2180,8 +2180,9 @@
 
   function renderTopology(model, view = {}) {
     const path = activePath(model, view);
-    const used = new Set();
-    if (path) used.add("is-on-path");
+    // The traced-path entry is listed whatever is traced, so hover, focus,
+    // search and a pin never change the legend's height above the drawing.
+    const used = new Set(["is-on-path"]);
     const lines = [];
     const labels = [];
     for (const link of model.links) {
@@ -2464,8 +2465,10 @@
   }
 
   // After the page has put the drawing in place: set its scroll position,
-  // and give focus back to Fit after a Fit click.
-  function mount(container) {
+  // and give focus back to Fit after a Fit click. pageScroll: the page's own
+  // scroll position ({ x, y }) from before this redraw, when the caller keeps
+  // one to put back; without it a kept control is aimed at the page as it is.
+  function mount(container, pageScroll = null) {
     const box = scrollBox(container);
     if (box) {
       const reason = live.firstView;
@@ -2478,10 +2481,32 @@
       if (reason?.control && group && !live.fit) {
         // The shelf's expand control where it was on the screen: both
         // offsets, and the box's own move on the page, taken into account.
+        // The room changes the drawing's height, so the box's own height
+        // (up to its limit) and the page around it can still change: aim
+        // again from where the box settled, and size the room for that.
         const control = toggleBox(group);
-        const rect = boxRect(box);
-        left = rect.left + control.x - reason.control.x;
-        top = rect.top + control.y - reason.control.y;
+        const aim = () => {
+          const rect = boxRect(box);
+          left = rect.left + control.x - reason.control.x;
+          top = rect.top + control.y - reason.control.y;
+        };
+        const page = pageScroll && Number.isFinite(pageScroll.x) && Number.isFinite(pageScroll.y) ? pageScroll : null;
+        aim();
+        if (page) {
+          // The box is never taller than the window, so room of one window
+          // height after the aimed view lets it reach its height limit. While
+          // that room is there the page is as long as it gets, and its own
+          // scroll position, lost while the shorter drawing was in place,
+          // can be put back before the control is aimed at for good.
+          const roomToHeightLimit = Number(window.innerHeight) || 0;
+          sizeRoom(box, left, top + roomToHeightLimit);
+          if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
+            window.scrollTo(page.x, page.y);
+          }
+        } else {
+          sizeRoom(box, left, top);
+        }
+        aim();
       } else if (reason && live.model && !live.fit && width) {
         left = firstViewLeft(live.model, reason, width, live.scroll.left);
         if (reason === "open") top = 0;
