@@ -18,6 +18,7 @@ from typing import get_args
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from tests.mapping_fixtures import write_v1_mappings
+from tests.inventory_fixtures import build_inventory_service
 from app.config import (
     BMCConfig,
     EnclosureProfileConfig,
@@ -104,26 +105,6 @@ from app.services.storage_views import resolve_system_storage_views
 from app.services.storage_view_templates import get_storage_view_template, list_storage_view_templates
 from app.services.supermicro_bmc import BMCInventory, BMCControllerRecord, BMCDriveRecord
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
-
-
-def build_inventory_service(
-    settings: Settings,
-    system: SystemConfig,
-    truenas_client,
-    ssh_probe,
-    temp_dir: str,
-    bmc_service=None,
-) -> InventoryService:
-    return InventoryService(
-        settings,
-        system,
-        truenas_client,
-        ssh_probe,
-        bmc_service,
-        MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
-        ProfileRegistry(settings),
-        SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
-    )
 
 
 def fake_led_sequence(respond):
