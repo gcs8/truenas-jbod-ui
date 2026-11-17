@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import secrets
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -78,7 +79,8 @@ from admin_service.services.runtime_control import (
     RuntimeBusyError,
     reserve_runtime_targets,
 )
-from admin_service.services.tls_trust import TLSTrustStoreService
+from admin_service.services.tls_trust import TLSTrustStoreService  # noqa: F401  (kept importable here)
+from admin_service.transport_routes import add_transport_routes
 from app import __version__
 from app.config import (
     TrueNASConfig,
@@ -93,14 +95,14 @@ from app.models.domain import (
     ESXiHostPrepInstallRequest,
     HistoryAdoptRequest,
     QuantastorNodeDiscoveryRequest,
-    SSHKeyGenerateRequest,
+    SSHKeyGenerateRequest,  # noqa: F401  (kept importable here)
     SystemBackupExportRequest,
     SystemSetupBootstrapRequest,
     SystemSetupRequest,
     SystemSetupSudoPreviewRequest,
-    TLSCertificateImportRequest,
-    TLSCertificateInspectRequest,
-    TLSRemoteCertificateTrustRequest,
+    TLSCertificateImportRequest,  # noqa: F401  (kept importable here)
+    TLSCertificateInspectRequest,  # noqa: F401  (kept importable here)
+    TLSRemoteCertificateTrustRequest,  # noqa: F401  (kept importable here)
 )
 from app.secret_files import ReplacedDurabilityUncertainError
 from app.services.config_change_journal import record_config_change
@@ -115,9 +117,9 @@ from app.services.inventory_registry import InventoryRegistry
 from app.services.parsers import fixed_device_sg_ses_note, fixed_device_sg_ses_reads, normalize_text
 from app.services.profile_builder import ProfileBuilderService
 from app.services.quantastor_api import QuantastorRESTClient
-from app.services.ssh_key_manager import SSHKeyManager
+from app.services.ssh_key_manager import SSHKeyManager  # noqa: F401  (kept importable here)
 from app.services.system_setup import _CONFIG_WRITE_LOCK, SystemSetupService
-from app.services.tls_context import host_uses_tls
+from app.services.tls_context import host_uses_tls  # noqa: F401  (kept importable here)
 
 
 # History-summary scans allowed to hold worker threads at once, so a slow scan
@@ -725,118 +727,9 @@ def build_router(admin_settings: Any) -> APIRouter:
             }
         )
 
-    @router.get("/api/admin/ssh-keys")
-    async def list_ssh_keys() -> JSONResponse:
-        settings = reload_app_settings()
-        key_manager = SSHKeyManager(settings.config_file)
-        keys = await asyncio.to_thread(key_manager.list_keys)
-        return JSONResponse({"ok": True, "keys": keys})
-
-    @router.post("/api/admin/ssh-keys/generate")
-    async def generate_ssh_key(payload: SSHKeyGenerateRequest) -> JSONResponse:
-        settings = reload_app_settings()
-        key_manager = SSHKeyManager(settings.config_file)
-        try:
-            generated_key = await asyncio.to_thread(key_manager.generate_keypair, payload.name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        keys = await asyncio.to_thread(key_manager.list_keys)
-        return JSONResponse({"ok": True, "key": generated_key, "keys": keys})
-
-    @router.post("/api/admin/tls/inspect")
-    async def inspect_tls_certificate(payload: TLSCertificateInspectRequest) -> JSONResponse:
-        settings = reload_app_settings()
-        trust_service = TLSTrustStoreService(settings.config_file)
-        try:
-            inspection = await asyncio.to_thread(
-                trust_service.inspect_remote_certificate,
-                payload.host,
-                payload.timeout_seconds,
-                tls_server_name=payload.tls_server_name,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, "inspection": inspection})
-
-    @router.post("/api/admin/tls/import")
-    async def import_tls_bundle(payload: TLSCertificateImportRequest) -> JSONResponse:
-        settings = reload_app_settings()
-        trust_service = TLSTrustStoreService(settings.config_file)
-        try:
-            imported = await asyncio.to_thread(
-                trust_service.import_pem_bundle,
-                payload.pem_text,
-                bundle_name=payload.bundle_name,
-                system_id=payload.system_id,
-                host=payload.host,
-            )
-            validation = None
-            if payload.host:
-                validation = await asyncio.to_thread(
-                    trust_service.validate_bundle_for_host,
-                    payload.host,
-                    imported["bundle_path"],
-                    tls_server_name=payload.tls_server_name,
-                )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, **imported, "validation": validation})
-
-    @router.post("/api/admin/tls/trust-remote")
-    async def trust_remote_tls_certificate(payload: TLSRemoteCertificateTrustRequest) -> JSONResponse:
-        settings = reload_app_settings()
-        trust_service = TLSTrustStoreService(settings.config_file)
-        try:
-            trusted = await asyncio.to_thread(
-                trust_service.trust_remote_certificate,
-                payload.host,
-                timeout_seconds=payload.timeout_seconds,
-                bundle_name=payload.bundle_name,
-                system_id=payload.system_id,
-                tls_server_name=payload.tls_server_name,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, **trusted})
-
-    @router.get("/api/admin/tls/saved-status")
-    async def saved_tls_bundle_status(system_id: str = Query(..., max_length=128)) -> JSONResponse:
-        # #954: a reload re-checks the saved bundle so the admin can show the real
-        # failure (expired, name mismatch, unreachable) instead of "not validated
-        # yet". No probe runs when verification is off or no bundle is saved.
-        settings = reload_app_settings()
-        system = next((item for item in settings.systems if item.id == system_id), None)
-        if system is None:
-            raise HTTPException(status_code=404, detail="That system is not in the saved config.")
-        truenas = system.truenas
-        bundle_path = str(truenas.tls_ca_bundle_path or "").strip()
-        if not truenas.verify_ssl or not bundle_path or not host_uses_tls(str(truenas.host or "")):
-            return JSONResponse({"ok": True, "system_id": system.id, "validation": None})
-        trust_service = TLSTrustStoreService(settings.config_file)
-        try:
-            validation = await asyncio.to_thread(
-                trust_service.validate_bundle_for_host,
-                truenas.host,
-                bundle_path,
-                timeout_seconds=min(int(truenas.timeout_seconds or 10), 10),
-                tls_server_name=truenas.tls_server_name,
-            )
-        except ValueError:
-            # Fixed wording only: the exception text is not echoed (CodeQL
-            # py/stack-trace-exposure). The service raises ValueError for a
-            # missing bundle or a non-HTTPS target.
-            bundle_present = await asyncio.to_thread(Path(bundle_path).is_file)
-            validation = {
-                "validated": False,
-                "host": truenas.host,
-                "bundle_path": bundle_path,
-                "detail": (
-                    "The saved bundle could not be checked: the bundle file could not be found."
-                    if not bundle_present
-                    else "The saved bundle could not be checked against this host."
-                ),
-            }
-        return JSONResponse({"ok": True, "system_id": system.id, "validation": validation})
+    # The SSH key and TLS trust routes live in admin_service.transport_routes
+    # and are added here, at their place in the route table.
+    add_transport_routes(router, sys.modules[__name__])
 
     @router.post("/api/admin/system-setup/quantastor-nodes")
     async def discover_quantastor_nodes(payload: QuantastorNodeDiscoveryRequest) -> JSONResponse:

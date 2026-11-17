@@ -470,10 +470,18 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/test_history_domain_config.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:57ea4f81c343d0cd69a01e1b7ded2ac09fbbdac7a41d6305555cfd7d3953e817": 14
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
   "tests/test_history_service.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:0c10903c0b9341a6962bb8367ed1cfd2c3617e9b24bee4e1ec589058e23f744b": 87
+        "sha256:a72d304df6612225ad4b18f3f84df30ce7dfe9541a1a4fa76d4bd2f9d8f385fe": 73
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
