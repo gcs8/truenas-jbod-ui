@@ -355,14 +355,81 @@ class StorageFabricSummaryCountTests(unittest.TestCase):
             {"controllers": "at least 1", "paths": "0", "expanders": "not read", "enclosures": "not read", "traces": "0"},
         )
 
-    def test_whole_or_unlabelled_counts_render_as_numbers(self) -> None:
+    def test_whole_counts_render_as_numbers(self) -> None:
         complete = {"controllers": "complete", "paths": "complete", "expanders": "complete", "enclosures": "complete"}
-        for raw in ({}, {"controller_read": {"counts": complete}}):
-            with self.subTest(raw=raw):
-                fabric = SasFabricSnapshot(available=True, platform="core", controllers=[{"id": "controller:mpr0"}], raw=raw)
+        fabric = SasFabricSnapshot(
+            available=True, platform="core", controllers=[{"id": "controller:mpr0"}], raw={"controller_read": {"counts": complete}},
+        )
+        self.assertEqual(
+            self._render_summary(fabric),
+            {"controllers": "1", "paths": "0", "expanders": "0", "enclosures": "0", "traces": "0"},
+        )
+
+    def test_core_counts_without_reported_completeness_say_not_reported(self) -> None:
+        # Same rule as fabricCountText (#1347): a CORE count nobody vouched
+        # for is never a plain number, and an omitted or null domain is not
+        # "not read" either. Reported states keep their text.
+        complete = {"controllers": "complete", "paths": "complete", "expanders": "complete", "enclosures": "complete"}
+        unknown = {0: "not reported", 1: "1, completeness not reported"}
+        layouts: dict[str, tuple[dict[str, Any], dict[int, str]]] = {
+            "absent": ({}, unknown),
+            "counts-absent": ({"controller_read": {"units": []}}, unknown),
+            "domain-absent": ({"controller_read": {"counts": {"controllers": "complete", "paths": "complete"}}}, unknown),
+            "domain-null": ({"controller_read": {"counts": {**complete, "expanders": None, "enclosures": None}}}, unknown),
+            "complete": ({"controller_read": {"counts": complete}}, {0: "0", 1: "1"}),
+            "partial": (
+                {"controller_read": {"counts": {**complete, "expanders": "partial", "enclosures": "partial"}}},
+                {0: "not read", 1: "at least 1"},
+            ),
+            "not-read": (
+                {"controller_read": {"counts": {**complete, "expanders": "not_read", "enclosures": "not_read"}}},
+                {0: "not read", 1: "not read"},
+            ),
+        }
+        cases = 0
+        for name, (raw, expected) in layouts.items():
+            for count in (0, 1):
+                fabric = SasFabricSnapshot(
+                    available=True,
+                    platform="core",
+                    controllers=[{"id": "controller:mpr0"}],
+                    expanders=[{"id": f"expander:{index}"} for index in range(count)],
+                    enclosures=[{"id": f"enclosure:{index}"} for index in range(count)],
+                    raw=raw,
+                )
+                summary = self._render_summary(fabric)
+                for domain in ("expanders", "enclosures"):
+                    cases += 1
+                    with self.subTest(completeness=name, count=count, domain=domain):
+                        self.assertEqual(summary[domain], expected[count])
+        self.assertEqual(cases, 28)
+
+    def test_sibling_counts_and_core_kind_follow_the_same_rule(self) -> None:
+        fabric = SasFabricSnapshot(available=True, platform="core", controllers=[{"id": "controller:mpr0"}], raw={})
+        self.assertEqual(
+            self._render_summary(fabric),
+            {
+                "controllers": "1, completeness not reported",
+                "paths": "not reported",
+                "expanders": "not reported",
+                "enclosures": "not reported",
+                "traces": "0",
+            },
+        )
+        # A CORE controller payload identified by its kind alone.
+        by_kind = SasFabricSnapshot(available=True, controllers=[{"id": "controller:mpr0"}], raw={"fabric_kind": "core_mpr"})
+        self.assertEqual(self._render_summary(by_kind)["controllers"], "1, completeness not reported")
+        self.assertEqual(self._render_summary(by_kind)["expanders"], "not reported")
+
+    def test_payloads_outside_the_core_contract_keep_plain_counts(self) -> None:
+        for platform in ("linux", "quantastor", "scale", None):
+            with self.subTest(platform=platform):
+                fabric = SasFabricSnapshot(
+                    available=True, platform=platform, controllers=[{"id": "controller:0"}], expanders=[{"id": "e"}], raw={},
+                )
                 self.assertEqual(
                     self._render_summary(fabric),
-                    {"controllers": "1", "paths": "0", "expanders": "0", "enclosures": "0", "traces": "0"},
+                    {"controllers": "1", "paths": "0", "expanders": "1", "enclosures": "0", "traces": "0"},
                 )
 
 
