@@ -346,6 +346,16 @@ class RetentionSqlTextTests(_StoreCase):
         digest = hashlib.sha256("\0".join(texts).encode("utf-8")).hexdigest()
         self.assertEqual(digest, RELEASED_SQL_SHA256)
 
+    def test_an_unsupported_rollup_interval_is_refused_with_the_released_message(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            HistoryStore._roll_up_metric_rows(
+                self.connection(), cutoff=CUTOFF, batch_size=20, bucket_seconds=7200, floor=None
+            )
+        self.assertEqual(
+            (type(caught.exception), str(caught.exception)),
+            (ValueError, "Unsupported history rollup interval."),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
