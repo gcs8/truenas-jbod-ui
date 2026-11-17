@@ -11,6 +11,7 @@ const SCRIPT_PATH = path.join(REPO_ROOT, "admin_service/static/admin.js");
 const SOURCE = fs.readFileSync(SCRIPT_PATH, "utf8");
 const TEMPLATE = fs.readFileSync(path.join(REPO_ROOT, "admin_service/templates/index.html"), "utf8");
 const ROUTES = fs.readFileSync(path.join(REPO_ROOT, "admin_service/routes.py"), "utf8");
+const TRANSPORT_ROUTES = fs.readFileSync(path.join(REPO_ROOT, "admin_service/transport_routes.py"), "utf8");
 const MAIN = fs.readFileSync(path.join(REPO_ROOT, "admin_service/route_support.py"), "utf8");
 
 function functionSource(name) {
@@ -215,9 +216,16 @@ test("every save, delete, and timing result goes through renderSaveResult and no
     assert.match(functionSource(name), /renderSaveResult\(/, `${name} should render its result through renderSaveResult`);
   }
   assert.ok((SOURCE.match(/renderSaveResult\(/g) || []).length >= 6);
-  for (const [label, text] of [["admin.js", SOURCE], ["index.html", TEMPLATE], ["routes.py", ROUTES]]) {
+  for (const [label, text] of [
+    ["admin.js", SOURCE],
+    ["index.html", TEMPLATE],
+    ["routes.py", ROUTES],
+    ["transport_routes.py", TRANSPORT_ROUTES],
+  ]) {
     assert.doesNotMatch(text, /read ui/i, `${label} must say main UI`);
   }
+  // The SSH key and TLS handlers live in transport_routes.py; the sweep must read them.
+  assert.match(TRANSPORT_ROUTES, /The saved bundle could not be checked against this host\./);
   assert.match(TEMPLATE, /Saved systems appear after the main UI next handles a page or API request\./);
   assert.match(ROUTES, /The main UI needs a restart to apply this\./);
   assert.match(ROUTES, /The main UI applies it when it next handles a page or API request; /);
