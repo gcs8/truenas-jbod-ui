@@ -2478,10 +2478,18 @@
       if (reason?.control && group && !live.fit) {
         // The shelf's expand control where it was on the screen: both
         // offsets, and the box's own move on the page, taken into account.
+        // The room changes the drawing's height, so the box's own height
+        // (up to its limit) and the page around it can still change: aim
+        // again from where the box settled, and size the room for that.
         const control = toggleBox(group);
-        const rect = boxRect(box);
-        left = rect.left + control.x - reason.control.x;
-        top = rect.top + control.y - reason.control.y;
+        const aim = () => {
+          const rect = boxRect(box);
+          left = rect.left + control.x - reason.control.x;
+          top = rect.top + control.y - reason.control.y;
+        };
+        aim();
+        sizeRoom(box, left, top);
+        aim();
       } else if (reason && live.model && !live.fit && width) {
         left = firstViewLeft(live.model, reason, width, live.scroll.left);
         if (reason === "open") top = 0;

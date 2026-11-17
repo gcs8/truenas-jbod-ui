@@ -1168,12 +1168,35 @@ test("of two bay traces with one id the first is kept, and the notice says so", 
 // HTML makes a new box at offset 0 that clamps its offsets to its drawing's
 // current size (the drawing's attributes may be changed after it is put in
 // place), and sits lower on the page for every notice above it, more so when
-// a notice wraps onto more lines in a narrow panel.
-function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
+// a notice wraps onto more lines in a narrow panel, and for every row of
+// legend entries: 15 px rows 6 px apart, entries packed by a width per
+// character chosen to give the rows a browser measured for the 1,024-bay
+// shelf (57 px drawn in full and 36 px as a summary in a 1,132 px box,
+// 36 px both ways in a 1,452 px box).
+// Like the page's box, which has only a maximum height, the box is as tall as
+// its drawing up to `height`: growing the drawing after it is in place grows
+// the box. With `page`, the page scrolls as well: it keeps the offset it was
+// given, held back while the document is too short for it, as the browser
+// clamps the page for a moment while a shorter drawing is in place.
+function scrollingPanel(item, { inner = 1100, height = 600, page = null } = {}) {
   let html = "";
   const pin = { textContent: "" };
   const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
   const lines = (text) => Math.max(1, Math.ceil((text.length * 7) / Math.max(1, inner - 20)));
+  const legendHeight = (markup) => {
+    const legend = /<div class="fabric-topology-legend"[^>]*>([\s\S]*?)<\/div>/.exec(markup)?.[1] || "";
+    const widths = legend.split("data-topology-legend=").slice(1).map((part) => 34 + 3.3 * part.replace(/^[^>]*>/, "").replace(/<[^>]+>/g, "").length);
+    let rows = widths.length ? 1 : 0;
+    let used = 0;
+    for (const width of widths) {
+      if (used && used + 12 + width > inner) {
+        rows += 1;
+        used = 0;
+      }
+      used += (used ? 12 : 0) + width;
+    }
+    return rows ? 21 * rows - 6 : 0;
+  };
   const box = (markup) => {
     const tag = /<svg class="fabric-topology-svg[^"]*"[^>]*>/.exec(markup)?.[0] || "";
     const attributes = Object.fromEntries([...tag.matchAll(/ (width|height|viewBox)="([^"]*)"/g)].map((match) => [match[1], match[2]]));
@@ -1184,20 +1207,30 @@ function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
     const above = markup.slice(0, markup.indexOf("fabric-topology-scroll"));
     const notices = [...above.matchAll(/<div class="warning-item[^"]*">([^<]*)<\/div>/g)].map((match) => match[1]);
     const bar = /<div class="fabric-topology-bar">([\s\S]*?)<\/div>/.exec(above)?.[1].replace(/<[^>]+>/g, " ") || "";
-    const top = 100 + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
+    const top = 100 + legendHeight(above) + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
     let left = 0;
     let down = 0;
-    const extent = (name, client) => Math.max(0, (Number(attributes[name]) || 0) - client);
+    const client = () => Math.min(height, Number(attributes.height) || 0);
+    const extent = (name, size) => Math.max(0, (Number(attributes[name]) || 0) - size);
+    const rect = () => {
+      let y = top;
+      if (page) {
+        const documentHeight = page.above + top + client() + 2 + page.below;
+        y = page.above + top - Math.min(page.scrollY, Math.max(0, documentHeight - page.viewport));
+      }
+      return { left: 20, top: y, right: 20 + inner, bottom: y + client(), width: inner, height: client() };
+    };
     return {
       clientWidth: inner,
-      clientHeight: height,
+      get clientHeight() { return client(); },
       svg,
       querySelector: (selector) => (selector === ".fabric-topology-svg" || selector === "svg" ? svg : null),
-      get scrollLeft() { return left; },
+      // A drawing made smaller after an offset was set clamps it, as the browser does.
+      get scrollLeft() { return Math.min(left, extent("width", inner)); },
       set scrollLeft(value) { left = Math.max(0, Math.min(extent("width", inner), Number(value) || 0)); },
-      get scrollTop() { return down; },
-      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", height), Number(value) || 0)); },
-      getBoundingClientRect: () => ({ left: 20, top, right: 20 + inner, bottom: top + height, width: inner, height }),
+      get scrollTop() { return Math.min(down, extent("height", client())); },
+      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", client()), Number(value) || 0)); },
+      getBoundingClientRect: rect,
     };
   };
   item.clientWidth = inner + 2;
@@ -1437,4 +1470,70 @@ test("the trace line sits below the drawing, so hover text that wraps cannot mov
     assert.ok(html.indexOf("data-topology-pin") > html.indexOf("fabric-topology-scroll"), `${name}: after the drawing's scroll box`);
   }
   assert.match(pinned, /data-topology-pin>Pinned: /);
+});
+
+// Collapsing a shelf drawn in full while its control is in view: the shorter
+// drawing makes the box shorter until mount adds room after it, the legend
+// above may lose a row, and on a tall page the page itself is held back while
+// the shorter drawing is in place. The control stays where it was.
+test("a collapsed shelf's control stays in place when the redraw changes the box's height, the legend above it or the page's scroll", () => {
+  const cases = [
+    // 1,600 x 900: the legend goes from 57 to 36 px and the box from 700 to
+    // 681 px until the room is added; offset 236 must become 215.
+    { name: "1,024 bays, 1600x900", fabric: bigShelf, size: { inner: 1132, height: 700 }, top: 236, legend: -21, wanted: 215 },
+    // 1,920 x 900: the legend keeps its rows; the box still shrinks for a moment.
+    { name: "1,024 bays, 1920x900", fabric: bigShelf, size: { inner: 1452, height: 700 }, top: 236, legend: 0, wanted: 236 },
+    // 1,920 x 700: the collapsed drawing (681 px) is taller than the box (544 px).
+    { name: "1,024 bays, 1920x700", fabric: bigShelf, size: { inner: 1452, height: 544 }, top: 314, legend: 0, wanted: 314 },
+    // 1,600 x 1,080 with the page scrolled 592 px: while the 681 px drawing is
+    // in place the page can only scroll 443 px, so the box sits 149 px lower
+    // until the room is added.
+    { name: "1,024 bays, 1600x1080, page scrolled", fabric: bigShelf, size: { inner: 1132, height: 840, page: { above: 480, below: 150, viewport: 1080, scrollY: 592 } }, top: 166, legend: -21, wanted: 145 },
+    // The four-shelf system: its other shelves keep the legend's rows.
+    { name: "four shelves, 1600x900", fabric: () => H.fourShelves().fabric, size: { inner: 1132, height: 700 }, top: 400, legend: 0, wanted: 400 },
+  ];
+  const moved = [];
+  for (const { name, fabric, size, top, legend, wanted } of cases) {
+    const { panel, click } = topologyPage(fabric(), size);
+    const [shelf] = expandControls(panel);
+    panel.box.scrollLeft = Math.max(0, shelf.x - 200);
+    panel.box.scrollTop = 0;
+    click({ "data-fabric-expand-slots": shelf.key });
+    const before = expandControls(panel).find((item) => item.key === shelf.key);
+    assert.equal(before.expanded, "true", `${name}: drawn in full`);
+    panel.box.scrollTop = top - Number(String(panel.box.svg.getAttribute("viewBox")).split(" ")[1]);
+    const rect = panel.box.getBoundingClientRect();
+    const was = screenPoint(panel, before);
+    assert.ok(was[0] >= rect.left && was[0] + 160 <= rect.right && was[1] >= rect.top && was[1] + 22 <= rect.bottom, `${name}: the control is in view at ${was}`);
+    click({ "data-fabric-expand-slots": shelf.key });
+    const after = expandControls(panel).find((item) => item.key === shelf.key);
+    assert.equal(after.expanded, "false", `${name}: a summary again`);
+    const now = screenPoint(panel, after);
+    if (!size.page) assert.equal(panel.box.getBoundingClientRect().top - rect.top, legend, `${name}: the box moves with the legend's height`);
+    const offset = panel.box.scrollTop + Number(String(panel.box.svg.getAttribute("viewBox")).split(" ")[1]);
+    if (now[0] !== was[0] || now[1] !== was[1] || offset !== wanted) moved.push(`${name}: from ${was} to ${now}, offset ${offset} for ${wanted}`);
+  }
+  assert.deepEqual(moved, [], "every control stays in place");
+});
+
+// The redraw needs room before the drawing's top edge: the box moves up by
+// the legend row the collapse removes, with the drawing's offset at 0.
+test("a control kept in place above the drawing's top edge gets room there, and the room goes once no view needs it", () => {
+  const { panel, click } = topologyPage(bigShelf(), { inner: 1132, height: 700 });
+  const [shelf] = expandControls(panel);
+  const origin = () => String(panel.box.svg.getAttribute("viewBox")).split(" ").slice(0, 2).map(Number);
+  panel.box.scrollLeft = 0;
+  panel.box.scrollTop = 0;
+  click({ "data-fabric-expand-slots": shelf.key });
+  panel.box.scrollTop = -origin()[1];
+  const before = expandControls(panel)[0];
+  const was = screenPoint(panel, before);
+  assert.ok(was[1] >= panel.box.getBoundingClientRect().top, `the control is in view at ${was}`);
+  click({ "data-fabric-expand-slots": shelf.key });
+  assert.equal(origin()[1], -21, "21 px of room before the drawing's top edge");
+  assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), was, "collapsing moves nothing");
+  // Drawn in full again: the view no longer needs that room, and the control stays.
+  click({ "data-fabric-expand-slots": shelf.key });
+  assert.equal(origin()[1], 0, "no room before the top edge once the view does not need it");
+  assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), was, "expanding again moves nothing");
 });
