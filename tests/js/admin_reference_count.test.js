@@ -10,7 +10,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "../..");
-const FILES = ["admin_service/static/admin.js", "admin_service/static/admin_backups.js"];
+const FILES = ["admin_service/static/admin.js", "admin_service/static/admin_backups.js", "admin_service/static/admin_backup_model.js"];
 
 function stripComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");

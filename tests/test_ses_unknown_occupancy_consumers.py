@@ -273,6 +273,7 @@ OCCUPANCY_READ_EXEMPT_FILES = {
 OCCUPANCY_READ_ALLOWLIST = {
     ("app/models/domain.py", "slot_occupancy"): (6, "the reader itself"),
     ("app/static/app.js", "slotOccupancy"): (4, "the page's reader itself"),
+    ("admin_service/static/admin_backup_model.js", "secretStateText"): (2, "`present` is a secret file on disk, not a bay"),
     ("app/services/inventory.py", "InventoryService._build_slot_view"): (2, "producer: decides occupancy from raw evidence and sets presence_known"),
     ("app/services/inventory.py", "InventoryService._correlate_quantastor"): (1, "producer: raw SES candidate before the slot view"),
     ("app/services/inventory.py", "InventoryService._correlate_esxi_host"): (1, "producer: a whole StorCLI census decides raw empty evidence"),
@@ -400,6 +401,25 @@ class OccupancyReaderTests(unittest.TestCase):
             script = Path(directory) / "probe.js"
             script.write_text("  function g(slot) {\n    return slot?.occupied || slot.present;\n  }\n", encoding="utf-8")
             self.assertEqual(_javascript_occupancy_reads(script), ["g", "g"])
+
+    def test_the_backup_model_allows_only_its_secret_state_reads(self) -> None:
+        # Control for a function-scoped entry: the model file is scanned, and a new
+        # function in it that reads a bay's presence is reported.
+        relative = "admin_service/static/admin_backup_model.js"
+        self.assertNotIn(relative, OCCUPANCY_READ_EXEMPT_FILES)
+        expected = {key: count for key, (count, _reason) in OCCUPANCY_READ_ALLOWLIST.items()}
+        source = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            copy = Path(directory) / "admin_backup_model.js"
+            copy.write_text(source + "\nfunction syntheticBayRead(slot) {\n  return slot.present;\n}\n", encoding="utf-8")
+            counts: dict[tuple[str, str], int] = {}
+            for function in _javascript_occupancy_reads(copy):
+                counts[(relative, function)] = counts.get((relative, function), 0) + 1
+        self.assertEqual(counts, {(relative, "secretStateText"): 2, (relative, "syntheticBayRead"): 1})
+        self.assertEqual(
+            {key: count for key, count in counts.items() if expected.get(key) != count},
+            {(relative, "syntheticBayRead"): 1},
+        )
 
 
 class FleetAlertEvidenceTests(unittest.TestCase):
