@@ -2294,7 +2294,7 @@
       + `<div class="fabric-topology-scroll">${svg}</div>`
       // Below the drawing: hover text that wraps to more lines never moves
       // the drawing, and a label, from under the pointer. The band is as tall
-      // as the longest of its sentences, so it keeps one height.
+      // as the longest of its sentences, so its height stays the same.
       + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>${sizers}</div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
