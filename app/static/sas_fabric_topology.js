@@ -37,13 +37,26 @@
   const MARK_PITCH = 9;
   const NODE_W = 184;
   const NODE_H = 62;
-  const H_GAP = 28;
+  // Text is sized at 8 px a character (12-13 px type), 16 px a line; a box
+  // grows to 37 characters and then wraps rather than cutting a fact off.
+  const TEXT_W = 8;
+  const LINE_H = 16;
+  const NODE_MIN_CHARS = 21;
+  const NODE_MAX_CHARS = 37;
+  const TIER_LABEL_CHARS = 16;
+  const TIER_NOTE_CHARS = 20;
+  const H_GAP = 48;
   const LEFT = 168;
   const MARGIN = 16;
   const CHAR_W = 7;
   const SUMMARY_W = 300;
-  const SUMMARY_H = 104;
-  const GROUP_HEAD = 42;
+  // Gaps between rows: a 10 px track per link, then its label, 8 px clear of
+  // the tracks above and of the box below.
+  const TRACK = 10;
+  const GAP_PAD = 10;
+  const LABEL_GAP = 8;
+  const LABEL_CLEAR = 8;
+  const JUNCTION = 14;
   const NAME_LIMIT = 4;
   const LANE_LINKS = new Set(["controller-expander", "expander-expander"]);
   const HIDDEN_KINDS = new Set(["pool", "vdev", "backplane"]);
@@ -318,15 +331,14 @@
       }
     } else if (item.kind === "expander") {
       const level = expanderLevel(item);
-      const parts = [level === null ? "level not reported" : `level ${level}`];
+      facts.push(level === null ? "level not reported" : `level ${level}`);
       const phys = decimal(metrics.num_phys);
       if (notRead.has("linked_phys")) {
-        parts.push("PHY table not read");
+        facts.push("PHY table not read");
       } else if (phys !== null) {
         const linked = decimal(metrics.linked_phys);
-        parts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
+        facts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
       }
-      facts.push(parts.join(" · "));
     } else if (item.kind === "host") {
       facts.push("host");
     } else if (item.kind === "path") {
@@ -500,7 +512,7 @@
       const trace = traces.get(item.id);
       const metrics = isRecord(item.metrics) ? item.metrics : {};
       const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
-        controller: String(state.controller ?? ""),
+        controller: String(state.controller_label || state.controller || ""),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
       }));
@@ -735,7 +747,8 @@
         model.notices.push(`${group.bayIds.length} ${what}${names ? ` behind ${names}` : ""} are shown as a summary block; expand it to draw each one.`);
       }
     }
-    layoutModel(model);
+    layoutModel(model, options);
+    model.box = { width: Number(options.width) || 0, height: Number(options.height) || 0 };
     return model;
   }
 
@@ -768,10 +781,65 @@
   }
 
   // ---- layout ----------------------------------------------------------------
+  //
+  // Rows are the tiers. Every row's order is chosen by barycentre sweeps and
+  // the candidate with the fewest line crossings wins. The widest row is
+  // spread across the available width; every other row sits under or over the
+  // items it links to. Each link then gets its own track in the gap above its
+  // child, so no two links share a track; a link that skips a row runs down a
+  // free corridor between that row's boxes; and its label sits on its own
+  // drop, clear of the boxes above and below.
+
+  // Wrap text to lines of at most `max` characters at spaces; a single word
+  // longer than that is shortened (its whole text stays in the item's name).
+  function wrap(text, max) {
+    const words = String(text ?? "").split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = "";
+    for (const word of words) {
+      const piece = word.length > max ? `${word.slice(0, max - 1)}…` : word;
+      if (!line) line = piece;
+      else if (line.length + 1 + piece.length <= max) line = `${line} ${piece}`;
+      else {
+        lines.push(line);
+        line = piece;
+      }
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  function sizeNode(entry) {
+    const parts = [entry.label, ...entry.facts];
+    if (entry.phyGroups.length) parts.push(`PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}`);
+    if (entry.parentUnknown && entry.kind !== "host") parts.push("parent link not reported");
+    const longest = Math.max(...parts.map((part) => String(part).length));
+    const chars = Math.min(NODE_MAX_CHARS, Math.max(NODE_MIN_CHARS, longest));
+    entry.titleLines = wrap(entry.label, chars).length || 1;
+    entry.lines = parts.flatMap((part) => wrap(part, chars));
+    entry.w = Math.max(entry.w, Math.max(...entry.lines.map((line) => line.length)) * TEXT_W + 20);
+    entry.h = Math.max(NODE_H, 14 + entry.lines.length * LINE_H + 8);
+  }
+
+  function groupText(group) {
+    const lines = [{ text: groupHeading(group), title: true }];
+    const summary = pathSummary(group.summary);
+    if (group.collapsed) {
+      lines.push({ text: `${group.summary.withDisk} with a disk · ${group.summary.empty} empty · ${group.summary.unknown} not read` });
+      lines.push({ text: summary || "no path state in payload" });
+    } else if (summary) {
+      lines.push({ text: summary });
+    }
+    return lines;
+  }
 
   function groupSize(group) {
+    const texts = groupText(group);
     if (group.collapsed) {
-      return [SUMMARY_W, SUMMARY_H];
+      const width = Math.max(SUMMARY_W, ...texts.map((line) => line.text.length * TEXT_W + 20));
+      group.lines = texts.flatMap((line) => wrap(line.text, Math.floor((width - 20) / TEXT_W)).map((text) => ({ ...line, text })));
+      group.headH = 10 + group.lines.length * LINE_H;
+      return [width, group.headH + 40];
     }
     const count = group.cells.length;
     const pitch = group.cellWidth + (CELL - CELL_BOX);
@@ -781,111 +849,423 @@
     group.perRow = perRow;
     group.pitch = pitch;
     // An unlinked or logical group is wide enough to say so in full.
-    const minimum = group.enclosureIds.length && group.locationKnown ? NODE_W : 360;
-    return [Math.max(minimum, columns * pitch + 16), GROUP_HEAD + rows * CELL + 10];
+    const toggle = group.expandable ? 180 : 0;
+    const minimum = Math.max(NODE_W, texts[0].text.length * TEXT_W + 20 + toggle);
+    const width = Math.max(minimum, columns * pitch + 16);
+    group.lines = texts.flatMap((line, index) => wrap(line.text, Math.floor((width - 20 - (index ? 0 : toggle)) / TEXT_W)).map((text) => ({ ...line, text })));
+    group.headH = 12 + group.lines.length * LINE_H;
+    return [width, group.headH + rows * CELL + 10];
   }
 
-  function layoutModel(model) {
-    const rows = model.tiers.map((tier) => ({
-      tier,
-      items: tier.id === "bays" ? model.groups : tier.nodeIds.map((id) => model.nodeById.get(id)).filter(Boolean),
-    }));
-    for (const group of model.groups) {
-      [group.w, group.h] = groupSize(group);
-    }
-    const centre = (item) => item.x + item.w / 2;
-    const sweep = (items, desired) => {
-      items.sort((left, right) => desired(left) - desired(right) || naturalCompare(left.label || left.id, right.label || right.id));
-      let cursor = LEFT;
-      for (const item of items) {
-        const want = desired(item) - item.w / 2;
-        item.x = Math.max(cursor, Number.isFinite(want) ? want : cursor);
-        cursor = item.x + item.w + H_GAP;
-      }
-    };
-    // Top down: each item under the mean of its parents; then bottom up.
-    let order = 0;
-    for (const row of rows) {
-      sweep(row.items, (item) => {
-        const parents = list(model.incoming.get(item.id)).map((link) => model.nodeById.get(link.source)).filter(Boolean);
-        return parents.length ? parents.reduce((sum, parent) => sum + centre(parent), 0) / parents.length : LEFT + (order += 1);
-      });
-    }
-    for (let index = rows.length - 2; index >= 0; index -= 1) {
-      sweep(rows[index].items, (item) => {
-        const children = list(model.outgoing.get(item.id))
-          .map((link) => model.nodeById.get(link.target) || model.groupById.get(link.target))
-          .filter(Boolean);
-        return children.length ? children.reduce((sum, child) => sum + centre(child), 0) / children.length : centre(item);
-      });
-    }
+  function centreOf(item) {
+    return item.x + item.w / 2;
+  }
 
-    // Vertical: each gap holds a bus track per parent and the stacked labels.
-    let y = MARGIN + 8;
+  // Isotonic placement: keep the order, stay as close as possible to each
+  // desired left edge, keep `gap` between neighbours and stay in [lo, hi].
+  function placeRow(items, desired, gap, lo, hi) {
+    const offsets = [];
+    let offset = 0;
+    for (const item of items) {
+      offsets.push(offset);
+      offset += item.w + gap;
+    }
+    const blocks = [];
+    items.forEach((item, index) => {
+      blocks.push({ sum: desired[index] - offsets[index], count: 1, start: index });
+      while (blocks.length > 1) {
+        const last = blocks[blocks.length - 1];
+        const previous = blocks[blocks.length - 2];
+        if (previous.sum / previous.count <= last.sum / last.count) break;
+        previous.sum += last.sum;
+        previous.count += last.count;
+        blocks.pop();
+      }
+    });
+    const lastIndex = items.length - 1;
+    const upper = Math.max(lo, hi - offsets[lastIndex] - items[lastIndex].w);
+    for (const [index, block] of blocks.entries()) {
+      const end = index + 1 < blocks.length ? blocks[index + 1].start : items.length;
+      const value = Math.min(upper, Math.max(lo, block.sum / block.count));
+      for (let position = block.start; position < end; position += 1) items[position].x = value + offsets[position];
+    }
+  }
+
+  function linkWidth(link) {
+    return link.labelLines.length ? Math.max(...link.labelLines.map((line) => line.length)) * TEXT_W + 14 : JUNCTION;
+  }
+
+  function linkHeight(link) {
+    return link.labelLines.length ? link.labelLines.length * 15 + 5 : JUNCTION;
+  }
+
+  function properCross(p, q, r, s) {
+    const d = (q[0] - p[0]) * (s[1] - r[1]) - (q[1] - p[1]) * (s[0] - r[0]);
+    if (Math.abs(d) < 1e-9) return false;
+    const t = ((r[0] - p[0]) * (s[1] - r[1]) - (r[1] - p[1]) * (s[0] - r[0])) / d;
+    const u = ((r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0])) / d;
+    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99;
+  }
+
+  // Proper crossings between the drawn segments of different links.
+  function countCrossings(links) {
+    const segments = [];
+    for (const link of links) {
+      const points = link.points || [];
+      for (let index = 0; index + 1 < points.length; index += 1) segments.push([link, points[index], points[index + 1]]);
+    }
+    let count = 0;
+    for (let i = 0; i < segments.length; i += 1) {
+      for (let j = i + 1; j < segments.length; j += 1) {
+        if (segments[i][0] !== segments[j][0] && properCross(segments[i][1], segments[i][2], segments[j][1], segments[j][2])) count += 1;
+      }
+    }
+    return count;
+  }
+
+  // Row orders to try: the starting order and every barycentre sweep after it.
+  function orderCandidates(rows, links, rowIndex) {
+    const parents = new Map();
+    const children = new Map();
+    for (const link of links) {
+      if (!parents.has(link.target)) parents.set(link.target, []);
+      if (!children.has(link.source)) children.set(link.source, []);
+      parents.get(link.target).push(link.source);
+      children.get(link.source).push(link.target);
+    }
+    let order = rows.map((row) => row.items.slice());
+    const snapshot = () => order.map((items) => items.slice());
+    const candidates = [snapshot()];
+    const position = () => {
+      const result = new Map();
+      for (const items of order) items.forEach((item, index) => result.set(item.id, (index + 0.5) / items.length));
+      return result;
+    };
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      const down = iteration % 2 === 0;
+      const sequence = down ? order.map((_, index) => index).slice(1) : order.map((_, index) => index).reverse().slice(1);
+      for (const r of sequence) {
+        const at = position();
+        const neighbours = down ? parents : children;
+        const key = new Map(order[r].map((item) => {
+          const ids = list(neighbours.get(item.id)).filter((id) => (down ? rowIndex.get(id) < r : rowIndex.get(id) > r));
+          return [item.id, ids.length ? ids.reduce((sum, id) => sum + at.get(id), 0) / ids.length : at.get(item.id)];
+        }));
+        order[r] = order[r].slice().sort((left, right) => key.get(left.id) - key.get(right.id));
+      }
+      candidates.push(snapshot());
+    }
+    return candidates;
+  }
+
+  // Horizontal placement for one order.
+  function placeRows(rows, links, rowIndex, available) {
+    const parents = new Map();
+    const children = new Map();
+    for (const link of links) {
+      if (!parents.has(link.target)) parents.set(link.target, []);
+      if (!children.has(link.source)) children.set(link.source, []);
+      parents.get(link.target).push(link.source);
+      children.get(link.source).push(link.target);
+    }
+    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
+    const rowWidth = (row) => row.items.reduce((sum, item) => sum + item.w, 0) + Math.max(0, row.items.length - 1) * H_GAP;
+    const content = Math.max(NODE_W, ...rows.map(rowWidth), ...rows.map((row) => row.bandWidth || 0));
+    const width = Math.max(available, LEFT + content + MARGIN);
+    const lo = LEFT;
+    const hi = width - MARGIN;
+    let anchor = 0;
     rows.forEach((row, index) => {
-      const into = model.links.filter((link) => row.items.some((item) => item.id === link.target));
-      if (index > 0) {
-        const parents = new Set(into.map((link) => link.source));
-        const perChild = new Map();
-        for (const link of into) perChild.set(link.target, (perChild.get(link.target) || 0) + 1);
-        const maxIncoming = Math.max(0, ...perChild.values());
-        const step = into.some((link) => link.labelLines.length > 1) ? 34 : 20;
-        row.track = Math.min(6, 90 / Math.max(1, parents.size));
-        row.busZone = 12 + parents.size * row.track;
-        row.step = step;
-        row.gapTop = y;
-        y += row.busZone + maxIncoming * step + 14;
-        if (!into.length) y += 8;
+      if (rowWidth(row) >= rowWidth(rows[anchor])) anchor = index;
+    });
+    const spread = (row) => {
+      const extra = Math.max(0, hi - lo - rowWidth(row));
+      const step = row.items.length ? extra / row.items.length : 0;
+      let x = lo + step / 2;
+      return row.items.map((item) => {
+        const left = x;
+        x += item.w + H_GAP + step;
+        return left;
+      });
+    };
+    const anchorRow = rows[anchor];
+    spread(anchorRow).forEach((x, index) => {
+      anchorRow.items[index].x = x;
+    });
+    const place = (r, neighbours, placed) => {
+      const row = rows[r];
+      if (!row.items.length) return;
+      const fallback = spread(row);
+      const desired = row.items.map((item, index) => {
+        let ids = list(neighbours.get(item.id)).filter((id) => placed(rowIndex.get(id)));
+        if (!ids.length) return fallback[index];
+        // Children in several rows: sit over the farthest, so the link that
+        // skips a row runs straight down instead of sweeping across it.
+        const far = Math.max(...ids.map((id) => Math.abs(rowIndex.get(id) - r)));
+        ids = ids.filter((id) => Math.abs(rowIndex.get(id) - r) === far);
+        return ids.reduce((sum, id) => sum + centreOf(byId.get(id)), 0) / ids.length - item.w / 2;
+      });
+      placeRow(row.items, desired, H_GAP, lo, hi);
+    };
+    for (let r = anchor - 1; r >= 0; r -= 1) place(r, children, (other) => other > r);
+    for (let r = anchor + 1; r < rows.length; r += 1) place(r, parents, (other) => other < r);
+    return width;
+  }
+
+  // Routes, tracks and labels for one placement. Returns the drawing height.
+  function routeLinks(model, rows, links, rowIndex, width) {
+    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
+    const gaps = rows.map(() => ({ horizontals: [], labels: [], verticals: [] }));
+    // Exits: spread on the parent's bottom edge in the order of their targets.
+    const exits = new Map();
+    const arrivals = new Map();
+    for (const item of byId.values()) {
+      const out = links.filter((link) => link.source === item.id).sort((a, b) => centreOf(byId.get(a.target)) - centreOf(byId.get(b.target)));
+      out.forEach((link, index) => exits.set(link, item.x + item.w * (index + 1) / (out.length + 1)));
+      const into = links.filter((link) => link.target === item.id).sort((a, b) => centreOf(byId.get(a.source)) - centreOf(byId.get(b.source)));
+      arrivals.set(item.id, into);
+    }
+    // Drops: spread on the child's top edge, kept 10 px from every exit in the
+    // same gap and from the labels of other drops.
+    const drops = new Map();
+    rows.forEach((row, r) => {
+      const exitXs = links.filter((link) => rowIndex.get(link.source) === r - 1).map((link) => exits.get(link));
+      const taken = [];
+      for (const item of row.items) {
+        const into = arrivals.get(item.id) || [];
+        into.forEach((link, index) => {
+          const ideal = item.x + item.w * (index + 1) / (into.length + 1);
+          const half = link.labelLines.length ? linkWidth(link) / 2 : JUNCTION / 2;
+          const clear = (x) => exitXs.every((exit) => Math.abs(exit - x) >= TRACK)
+            && taken.every((other) => Math.abs(other.x - x) >= Math.max(TRACK, other.half + 4, half + 4));
+          let best = ideal;
+          for (let step = 0; step <= item.w; step += 2) {
+            const options = [ideal - step, ideal + step].filter((x) => x >= item.x + 10 && x <= item.x + item.w - 10);
+            const found = options.find(clear);
+            if (found !== undefined) {
+              best = found;
+              break;
+            }
+          }
+          drops.set(link, best);
+          taken.push({ x: best, half });
+        });
+      }
+    });
+    // Vertical sizes: tracks per gap, label band, row heights.
+    const spans = links.map((link) => {
+      const from = rowIndex.get(link.source);
+      const to = rowIndex.get(link.target);
+      return { link, from, to, skip: to > from + 1, up: to <= from };
+    });
+    for (const span of spans) {
+      const first = Math.min(span.from + 1, rows.length - 1);
+      gaps[first].horizontals.push({ span, part: "first" });
+      if (span.skip || span.up) gaps[span.to].horizontals.push({ span, part: "last" });
+      gaps[span.to].labels.push(span.link);
+    }
+    let y = MARGIN + 8;
+    rows.forEach((row, r) => {
+      if (r > 0) {
+        const gap = gaps[r];
+        gap.top = y;
+        gap.trackTop = y + GAP_PAD;
+        const labelH = Math.max(0, ...gap.labels.map(linkHeight));
+        y += GAP_PAD + gap.horizontals.length * TRACK + LABEL_GAP + labelH + LABEL_CLEAR;
+        y = Math.max(y, gap.top + 32);
       }
       row.y = y;
-      const height = row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36;
+      const height = Math.max(row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36, row.labelH || 0);
       row.height = height;
       for (const item of row.items) item.y = y;
       row.tier.y = y;
       row.tier.h = height;
       y += height;
     });
-    model.height = y + MARGIN;
-    model.width = Math.max(LEFT + NODE_W + MARGIN, ...rows.flatMap((row) => row.items.map((item) => item.x + item.w + MARGIN)));
+    const height = y + MARGIN + (spans.some((span) => span.up) ? 40 : 0);
+    // Corridors for links that skip rows: a free x through every row and label
+    // band in between, 10 px from every other vertical there.
+    const corridors = [];
+    const verticalsIn = (r) => [
+      ...links.filter((link) => rowIndex.get(link.source) === r - 1).map((link) => exits.get(link)),
+      ...links.filter((link) => rowIndex.get(link.target) === r).map((link) => drops.get(link)),
+    ];
+    for (const span of spans) {
+      if (!span.skip && !span.up) continue;
+      const exit = exits.get(span.link);
+      const drop = drops.get(span.link);
+      const top = span.up ? span.from + 1 : span.from + 1;
+      const bottom = span.up ? rows.length : span.to;
+      const blocked = [];
+      for (let r = top; r < bottom; r += 1) {
+        for (const item of rows[r]?.items || []) blocked.push([item.x - 12, item.x + item.w + 12]);
+        for (const link of gaps[r]?.labels || []) {
+          const x = drops.get(link);
+          const half = linkWidth(link) / 2;
+          blocked.push([x - half - 8, x + half + 8]);
+        }
+      }
+      for (let r = top; r <= Math.min(bottom, rows.length - 1); r += 1) {
+        for (const x of verticalsIn(r)) if (x !== exit && x !== drop) blocked.push([x - TRACK, x + TRACK]);
+      }
+      for (const other of corridors) if (other.top <= bottom && other.bottom >= top) blocked.push([other.x - TRACK, other.x + TRACK]);
+      const target = span.up ? width - MARGIN - 4 : (exit + drop) / 2;
+      const free = (candidate) => candidate >= 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
+      // Straight down under the drop or the exit when that is free: one bend fewer.
+      let x = span.up ? null : [drop, exit].find(free) ?? null;
+      for (let step = 0; step <= width && x === null; step += 2) {
+        for (const candidate of [target - step, target + step]) {
+          if (candidate < 4 || candidate > width - 4) continue;
+          if (blocked.every(([left, right]) => candidate <= left || candidate >= right)) {
+            x = candidate;
+            break;
+          }
+        }
+      }
+      span.corridor = x === null ? width - 4 : x;
+      corridors.push({ x: span.corridor, top, bottom });
+    }
+    // Tracks: one per horizontal, ordered in each gap to cross as little as possible.
+    rows.forEach((row, r) => {
+      const gap = gaps[r];
+      if (!gap.horizontals.length) return;
+      const ends = gap.horizontals.map((piece) => {
+        const { span, part } = piece;
+        const into = part === "first" ? exits.get(span.link) : span.corridor;
+        const out = part === "first" && !span.skip && !span.up ? drops.get(span.link) : part === "first" ? span.corridor : drops.get(span.link);
+        return { piece, into, out, lo: Math.min(into, out), hi: Math.max(into, out) };
+      });
+      const cost = (a, b) => (b.into > a.lo && b.into < a.hi ? 1 : 0) + (a.out > b.lo && a.out < b.hi ? 1 : 0);
+      const ordered = [];
+      for (const end of ends.sort((a, b) => a.lo - b.lo)) {
+        let bestIndex = 0;
+        let bestCost = Infinity;
+        for (let index = 0; index <= ordered.length; index += 1) {
+          let total = 0;
+          ordered.forEach((other, position) => {
+            total += position < index ? cost(other, end) : cost(end, other);
+          });
+          if (total < bestCost) {
+            bestCost = total;
+            bestIndex = index;
+          }
+        }
+        ordered.splice(bestIndex, 0, end);
+      }
+      ordered.forEach((end, index) => {
+        end.piece.y = gap.trackTop + index * TRACK;
+        end.piece.span[end.piece.part] = end.piece.y;
+      });
+    });
+    // Points and labels.
+    for (const span of spans) {
+      const { link } = span;
+      const parent = byId.get(link.source);
+      const child = byId.get(link.target);
+      const exit = exits.get(link);
+      const drop = drops.get(link);
+      const start = parent.y + parent.h;
+      if (span.skip || span.up) {
+        link.points = [[exit, start], [exit, span.first], [span.corridor, span.first], [span.corridor, span.last], [drop, span.last], [drop, child.y]];
+      } else {
+        link.points = [[exit, start], [exit, span.first], [drop, span.first], [drop, child.y]];
+      }
+      // Drop repeated points and the middle of three in a straight line.
+      const points = link.points.filter((point, index, all) => index === 0 || point[0] !== all[index - 1][0] || point[1] !== all[index - 1][1]);
+      link.points = points.filter((point, index, all) => {
+        if (index === 0 || index === all.length - 1) return true;
+        const [a, b] = [all[index - 1], all[index + 1]];
+        return !((a[0] === point[0] && point[0] === b[0]) || (a[1] === point[1] && point[1] === b[1]));
+      });
+      const w = linkWidth(link);
+      const h = linkHeight(link);
+      link.labelBox = { x: drop - w / 2, y: child.y - LABEL_CLEAR - h, w, h };
+    }
+    return height;
+  }
 
-    // Cells inside bay groups.
+  function tierLines(tier) {
+    tier.labelLines = wrap(tier.label, TIER_LABEL_CHARS);
+    tier.noteLines = wrap(tier.note, TIER_NOTE_CHARS);
+    return 10 + (tier.labelLines.length + tier.noteLines.length) * 17;
+  }
+
+  // Each link's HBA: the controller it hangs off, for its line colour.
+  function assignChains(model) {
+    const chainOf = new Map();
+    const controllers = model.nodes.filter((entry) => entry.kind === "controller");
+    controllers.forEach((entry) => chainOf.set(entry.id, entry.id));
+    const pending = controllers.map((entry) => entry.id);
+    while (pending.length) {
+      const id = pending.shift();
+      for (const link of list(model.outgoing.get(id))) {
+        if (!chainOf.has(link.target)) {
+          chainOf.set(link.target, chainOf.get(id));
+          pending.push(link.target);
+        }
+      }
+    }
+    for (const link of model.links) {
+      link.chain = model.nodeById.get(link.target)?.kind === "controller" ? link.target : chainOf.get(link.source) || null;
+    }
+    model.chains = controllers.map((entry) => entry.id).filter((id) => model.links.some((link) => link.chain === id));
+  }
+
+  function layoutModel(model, options = {}) {
+    const available = Math.max(0, Number(options.width) || 0);
+    for (const entry of model.nodes) sizeNode(entry);
+    const rows = model.tiers.map((tier) => ({
+      tier,
+      items: tier.id === "bays" ? model.groups : tier.nodeIds.map((id) => model.nodeById.get(id)).filter(Boolean),
+    }));
+    for (const group of model.groups) [group.w, group.h] = groupSize(group);
+    for (const row of rows) {
+      row.labelH = tierLines(row.tier);
+      const missing = row.tier.state === "not_read" || row.tier.state === "not_collected" || row.tier.state === "none";
+      row.bandWidth = missing ? row.tier.note.length * TEXT_W + 24 : 0;
+    }
+    // A child with several labelled arrivals is wide enough for them side by
+    // side, and a bay group as wide as the enclosures above it, so they all
+    // sit over it.
+    for (const item of [...model.nodes, ...model.groups]) {
+      const into = list(model.incoming.get(item.id));
+      if (into.length > 1) item.w = Math.max(item.w, into.reduce((sum, link) => sum + linkWidth(link) + 12, 12));
+      if (item.tier === "bays" && into.length > 1) {
+        const parents = into.map((link) => model.nodeById.get(link.source)).filter(Boolean);
+        item.w = Math.max(item.w, parents.reduce((sum, parent) => sum + parent.w, 0) + (parents.length - 1) * H_GAP);
+      }
+    }
+    const rowIndex = new Map();
+    rows.forEach((row, index) => row.items.forEach((item) => rowIndex.set(item.id, index)));
+    const links = model.links.filter((link) => rowIndex.has(link.source) && rowIndex.has(link.target) && link.source !== link.target);
+    let best = null;
+    for (const candidate of orderCandidates(rows, links, rowIndex)) {
+      rows.forEach((row, index) => {
+        row.items = candidate[index];
+      });
+      const width = placeRows(rows, links, rowIndex, available);
+      const height = routeLinks(model, rows, links, rowIndex, width);
+      const score = countCrossings(links);
+      const length = links.reduce((sum, link) => sum + link.points.reduce((total, point, index, all) => total + (index ? Math.abs(point[0] - all[index - 1][0]) : 0), 0), 0);
+      if (!best || score < best.score || (score === best.score && length < best.length - 0.5)) best = { score, length, candidate };
+      void height;
+    }
+    rows.forEach((row, index) => {
+      row.items = best ? best.candidate[index] : row.items;
+    });
+    model.width = placeRows(rows, links, rowIndex, available);
+    model.height = routeLinks(model, rows, links, rowIndex, model.width);
+    model.crossings = countCrossings(links);
+    model.tiers.forEach((tier, index) => {
+      tier.order = rows[index].items.map((item) => item.id);
+    });
     for (const group of model.groups) {
       group.cells.forEach((bay, index) => {
         bay.x = group.x + 8 + (index % group.perRow) * group.pitch;
-        bay.y = group.y + GROUP_HEAD + Math.floor(index / group.perRow) * CELL;
+        bay.y = group.y + group.headH + Math.floor(index / group.perRow) * CELL;
       });
     }
-
-    // Routes: parent exit -> bus track above the child's row -> drop -> child.
-    const rowOf = new Map();
-    rows.forEach((row) => row.items.forEach((item) => rowOf.set(item.id, row)));
-    const itemOf = (id) => model.nodeById.get(id) || model.groupById.get(id);
-    for (const row of rows) {
-      const into = model.links.filter((link) => rowOf.get(link.target) === row);
-      const parents = [...new Set(into.map((link) => link.source))]
-        .sort((left, right) => centre(itemOf(left)) - centre(itemOf(right)));
-      for (const link of into) {
-        const parent = itemOf(link.source);
-        const child = itemOf(link.target);
-        if (!parent || !child) continue;
-        const siblings = list(model.outgoing.get(link.source)).slice().sort((left, right) => centre(itemOf(left.target)) - centre(itemOf(right.target)));
-        const exitIndex = siblings.indexOf(link);
-        const exitX = parent.x + parent.w * (exitIndex + 1) / (siblings.length + 1);
-        const arrivals = list(model.incoming.get(link.target)).slice().sort((left, right) => centre(itemOf(left.source)) - centre(itemOf(right.source)));
-        const k = arrivals.indexOf(link);
-        const dropX = child.x + child.w * (k + 1) / (arrivals.length + 1);
-        const busY = row.gapTop + 8 + parents.indexOf(link.source) * row.track;
-        const startY = parent.y + parent.h;
-        link.points = startY < busY
-          ? [[exitX, startY], [exitX, busY], [dropX, busY], [dropX, child.y]]
-          : [[exitX, startY], [dropX, child.y]];
-        const lines = link.labelLines.length ? link.labelLines : [];
-        const width = lines.length ? Math.max(...lines.map((line) => line.length)) * CHAR_W + 14 : 14;
-        const height = lines.length ? lines.length * 15 + 4 : 14;
-        const labelBottom = child.y - 6 - (arrivals.length - 1 - k) * row.step;
-        link.labelBox = { x: dropX - width / 2, y: labelBottom - height, w: width, h: height };
-      }
-    }
+    assignChains(model);
   }
 
   // ---- path trace and search -------------------------------------------------
@@ -1016,17 +1396,18 @@
 
   // ---- SVG rendering ---------------------------------------------------------
 
-  // Path marks differ by shape as well as colour (8 px, centred on cx, cy).
+  // Path marks differ by shape as well as colour (at least 8 px, centred on
+  // cx, cy); an open shape is a state with something missing or unknown.
   const MARK_SHAPES = {
     active: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="4"`,
-    standby: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="3.25"`,
-    fault: (cx, cy) => `<path d="M${cx - 4} ${cy - 4}L${cx + 4} ${cy + 4}M${cx + 4} ${cy - 4}L${cx - 4} ${cy + 4}"`,
-    missing: (cx, cy) => `<rect x="${cx - 3.25}" y="${cy - 3.25}" width="6.5" height="6.5"`,
+    standby: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="4" fill="none"`,
+    fault: (cx, cy) => `<path d="M${cx - 4} ${cy - 4}L${cx + 4} ${cy + 4}M${cx + 4} ${cy - 4}L${cx - 4} ${cy + 4}" fill="none"`,
+    missing: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8" fill="none"`,
     mapped: (cx, cy) => `<path d="M${cx} ${cy - 4.5}L${cx + 4.5} ${cy}L${cx} ${cy + 4.5}L${cx - 4.5} ${cy}Z"`,
-    unmapped: (cx, cy) => `<path d="M${cx} ${cy - 4}L${cx + 4} ${cy}L${cx} ${cy + 4}L${cx - 4} ${cy}Z"`,
-    unknown: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8"`,
+    unmapped: (cx, cy) => `<path d="M${cx} ${cy - 4.5}L${cx + 4.5} ${cy}L${cx} ${cy + 4.5}L${cx - 4.5} ${cy}Z" fill="none"`,
+    unknown: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8" rx="2"`,
     member: (cx, cy) => `<path d="M${cx} ${cy - 4}L${cx + 4.5} ${cy + 4}L${cx - 4.5} ${cy + 4}Z"`,
-    other: (cx, cy) => `<path d="M${cx} ${cy - 3.5}L${cx + 4} ${cy + 3.5}L${cx - 4} ${cy + 3.5}Z"`,
+    other: (cx, cy) => `<path d="M${cx - 4.5} ${cy - 4}L${cx + 4.5} ${cy - 4}L${cx} ${cy + 4}Z" fill="none"`,
   };
 
   const LEGEND = {
@@ -1098,10 +1479,11 @@
     if (!link.points) return { line: "", label: "" };
     const style = linkStyle(link);
     used.add(style);
-    const highlight = onPathClass(path, "links", link.id);
+    const highlight = onPathClass(path, "links", link.id) + (pinnedRef(path, "link", link.id) ? " is-pinned" : "");
     const points = link.points.map(([x, y]) => `${Math.round(x)},${Math.round(y)}`).join(" ");
     const name = linkDescription(model, link);
-    const line = `<polyline class="topo-link ${style}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title>${escapeHtml(name)}</title></polyline>`;
+    const chain = ` chain-${link.chain ? model.chains.indexOf(link.chain) : "none"}`;
+    const line = `<polyline class="topo-link ${style}${chain}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title>${escapeHtml(name)}</title></polyline>`;
     const box = link.labelBox;
     let body;
     if (link.labelLines.length) {
@@ -1114,18 +1496,16 @@
     return { line, label };
   }
 
+  function nodeTitle(entry) {
+    const phys = entry.phyGroups.length ? `PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}` : "";
+    return [entry.label, ...entry.facts, phys, entry.parentUnknown && entry.kind !== "host" ? "parent link not reported" : ""].filter(Boolean).join(", ");
+  }
+
   function renderNode(entry, path, used) {
-    const highlight = onPathClass(path, "nodes", entry.id);
-    const title = [entry.label, ...entry.facts, entry.parentUnknown ? "parent link not reported" : ""].filter(Boolean).join(", ");
-    const lines = [clip(entry.label, entry.w), ...entry.facts.map((fact) => clip(fact, entry.w))].slice(0, 3);
-    if (entry.phyGroups.length) {
-      lines[2] = clip(`PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}`, entry.w);
-    }
-    if (entry.parentUnknown && entry.kind !== "host") {
-      used.add("mark-parent-unknown");
-      lines[2] = "parent link not reported";
-    }
-    const text = lines.filter(Boolean).map((line, index) => `<text class="topo-node-${index ? "fact" : "title"}" x="${entry.x + 10}" y="${entry.y + 20 + index * 16}">${escapeHtml(line)}</text>`).join("");
+    const highlight = onPathClass(path, "nodes", entry.id) + (pinnedRef(path, "node", entry.id) ? " is-pinned" : "");
+    const title = nodeTitle(entry);
+    if (entry.parentUnknown && entry.kind !== "host") used.add("mark-parent-unknown");
+    const text = entry.lines.map((line, index) => `<text class="topo-node-${index < entry.titleLines ? "title" : "fact"}" x="${entry.x + 10}" y="${entry.y + 20 + index * LINE_H}">${escapeHtml(line)}</text>`).join("");
     const unknown = entry.parentUnknown && entry.kind !== "host" ? " mark-parent-unknown" : "";
     return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
   }
@@ -1147,7 +1527,7 @@
   }
 
   function renderBayCell(bay, path, used) {
-    const highlight = onPathClass(path, "bays", bay.bayId);
+    const highlight = onPathClass(path, "bays", bay.bayId) + (pinnedRef(path, "bay", bay.bayId) ? " is-pinned" : "");
     used.add(`bay-${bay.occupancy}`);
     const hook = bay.traceId ? `data-fabric-trace="${escapeHtml(bay.traceId)}"` : `data-fabric-node="${escapeHtml(bay.bayId)}"`;
     const { shown, more } = marksFor(bay);
@@ -1189,17 +1569,9 @@
   function renderGroup(model, group, path, used) {
     const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
     if (!group.enclosureIds.length) used.add("mark-not-read");
-    const head = clip(groupHeading(group), group.w);
     const parts = [`<rect class="topo-group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="8"></rect>`,
-      `<text class="topo-node-title" x="${group.x + 10}" y="${group.y + 18}">${escapeHtml(head)}</text>`];
+      ...group.lines.map((line, index) => `<text class="topo-node-${line.title ? "title" : "fact"}" x="${group.x + 10}" y="${group.y + 18 + index * LINE_H}">${escapeHtml(line.text)}</text>`)];
     const summaryText = pathSummary(group.summary);
-    if (group.collapsed) {
-      const counts = `${group.summary.withDisk} with a disk · ${group.summary.empty} empty · ${group.summary.unknown} not read`;
-      parts.push(`<text class="topo-node-fact" x="${group.x + 10}" y="${group.y + 36}">${escapeHtml(clip(counts, group.w))}</text>`);
-      parts.push(`<text class="topo-node-fact" x="${group.x + 10}" y="${group.y + 52}">${escapeHtml(clip(summaryText || "no path state in payload", group.w))}</text>`);
-    } else if (summaryText) {
-      parts.push(`<text class="topo-node-fact" x="${group.x + 10}" y="${group.y + 34}">${escapeHtml(clip(summaryText, group.w))}</text>`);
-    }
     const cells = group.cells.map((bay) => renderBayCell(bay, path, used)).join("");
     let toggle = "";
     if (group.expandable) {
@@ -1216,9 +1588,12 @@
     const y = tier.y ?? 0;
     const missing = tier.state === "not_read" || tier.state === "not_collected" || tier.state === "none";
     const tone = tier.state === "drawn" ? "ok" : token(tier.state);
+    const labelLines = tier.labelLines || [tier.label];
+    const noteLines = tier.noteLines || [tier.note];
     const label = `<g class="topo-tier"><title>${escapeHtml(`${tier.label}: ${tier.note}`)}</title>`
-      + `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18}">${escapeHtml(clip(tier.label, LEFT - MARGIN))}</text>`
-      + `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 36}">${escapeHtml(clip(tier.note, LEFT - MARGIN))}</text></g>`;
+      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join("")
+      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join("")
+      + "</g>";
     let band = "";
     if (missing) {
       const width = Math.max(model.width - LEFT - MARGIN, NODE_W);
@@ -1231,13 +1606,20 @@
   // view: { pin: ref, hover: ref, query }. Hover wins while it lasts; a pin is
   // newer than the search it was made after, and typing a search clears it.
   function activePath(model, view = {}) {
-    if (view.hover) return tracePath(model, view.hover);
-    if (view.pin) return tracePath(model, view.pin);
-    if (view.query) {
+    let path = null;
+    if (view.hover) path = tracePath(model, view.hover);
+    else if (view.pin) path = tracePath(model, view.pin);
+    else if (view.query) {
       const found = searchTopology(model, view.query);
-      return found.matches.length ? found.path : null;
+      path = found.matches.length ? found.path : null;
     }
-    return null;
+    if (path) path.pin = view.pin || null;
+    return path;
+  }
+
+  // The pinned item itself: what the page's inspector shows as selected.
+  function pinnedRef(path, kind, id) {
+    return Boolean(path?.pin && path.pin.kind === kind && path.pin.id === id);
   }
 
   function refLabel(model, ref) {
@@ -1251,7 +1633,9 @@
       return bay ? bayTitle(bay) : "";
     }
     const entry = model.nodeById.get(ref.id);
-    return entry ? [entry.label, ...entry.facts].join(", ") : "";
+    if (entry) return nodeTitle(entry);
+    const group = model.groupById.get(ref.id);
+    return group ? groupHeading(group) : "";
   }
 
   function legendSwatch(style, shape) {
@@ -1281,20 +1665,34 @@
     const nodes = model.nodes.map((entry) => renderNode(entry, path, used)).join("");
     const groups = model.groups.map((group) => renderGroup(model, group, path, used)).join("");
     const svgLabel = `Storage Fabric topology: ${model.tiers.map((tier) => `${tier.label} ${tier.note}`).join("; ")}`;
-    const svg = `<svg class="fabric-topology-svg" role="group" aria-label="${escapeHtml(svgLabel)}" width="${Math.ceil(model.width)}" height="${Math.ceil(model.height)}" viewBox="0 0 ${Math.ceil(model.width)} ${Math.ceil(model.height)}">`
+    const fullW = Math.ceil(model.width);
+    const fullH = Math.ceil(model.height);
+    // Fit: the whole drawing scaled into the box it was laid out for, never enlarged.
+    const box = model.box || {};
+    const scale = view.fit ? Math.min(1, box.width ? box.width / fullW : 1, box.height ? box.height / fullH : 1) : 1;
+    const shownW = Math.max(1, Math.floor(fullW * scale));
+    const shownH = Math.max(1, Math.floor(fullH * scale));
+    const svg = `<svg class="fabric-topology-svg${view.fit ? " is-fitted" : ""}" role="group" aria-label="${escapeHtml(svgLabel)}" width="${shownW}" height="${shownH}" viewBox="0 0 ${fullW} ${fullH}">`
       + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
     const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${token(part.state)}"${part.title ? ` title="${escapeHtml(part.title)}"` : ""}>${escapeHtml(part.label)}: ${escapeHtml(part.state)}</span>`).join("");
-    const legend = Object.entries(LEGEND)
+    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><span class="fabric-topology-swatch swatch-line chain-${index}" aria-hidden="true"></span>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this HBA down`)}</span>`).join("");
+    const legend = chains + Object.entries(LEGEND)
       .filter(([style]) => used.has(style))
       .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(text)}</span>`)
       .join("");
+    const fitControl = `<button class="button secondary small fabric-topology-fit" type="button" data-topology-fit="${view.fit ? "actual" : "fit"}" aria-pressed="${view.fit ? "true" : "false"}">${view.fit ? "Actual size" : "Fit"}</button>`;
+    const smallest = 12 * scale;
+    const fitNotice = scale < 1
+      ? `<p class="fabric-topology-fit-notice warning-item muted compact" data-topology-fit-notice>Fitted to ${Math.round(scale * 100)}% of its size: its smallest text is ${smallest.toFixed(1)} px, under 12 px. Choose Actual size to read it.</p>`
+      : "";
     const notices = model.notices.map((text) => `<div class="warning-item muted compact">${escapeHtml(text)}</div>`).join("");
-    const pinned = view.pin ? `Pinned: ${refLabel(model, view.pin)}. Esc clears.` : "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
+    const pinned = view.pin ? `Pinned: ${refLabel(model, view.pin)}. Esc clears.` : DEFAULT_HINT;
     return `<div class="fabric-topology" data-topology-kind="${escapeHtml(model.kind)}">`
       + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
       + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
       + notices
-      + `<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p>`
+      + `<div class="fabric-topology-bar">${fitControl}<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p></div>`
+      + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(NOT_SHOWN)}</p>`
       + "</div>";
@@ -1333,7 +1731,16 @@
 
   // ---- DOM layer (browser only) ----------------------------------------------
 
-  const live = { model: null, pin: null, hover: null, query: "", scope: null, container: null, input: null, status: null, hooks: {} };
+  const live = {
+    model: null, pin: null, hover: null, query: "", scope: null, fit: false, scroll: { left: 0, top: 0 },
+    container: null, input: null, status: null, hooks: {},
+  };
+  const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
+
+  function scrollBox(container) {
+    const box = container?.querySelector?.(".fabric-topology-scroll");
+    return box && typeof box === "object" ? box : null;
+  }
 
   function refExists(model, ref) {
     if (!model || !ref) return false;
@@ -1360,9 +1767,15 @@
 
   function render(fabric, options = {}) {
     const model = buildTopologyModel(fabric, options);
+    // The page replaces the map on every render: keep the drawing's scroll
+    // position for the same scope, and start a new scope at the origin.
+    const box = scrollBox(live.container);
     if (live.scope !== null && model.scope !== live.scope) {
       live.pin = null;
       clearInput();
+      live.scroll = { left: 0, top: 0 };
+    } else if (box) {
+      live.scroll = { left: Number(box.scrollLeft) || 0, top: Number(box.scrollTop) || 0 };
     }
     live.scope = model.scope;
     live.model = model;
@@ -1374,7 +1787,15 @@
     if (!refExists(model, live.pin)) live.pin = null;
     live.hover = null;
     updateSearchStatus();
-    return renderTopology(model, { pin: live.pin, query: live.query });
+    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
+  }
+
+  // After the page has put the drawing in place: restore its scroll position.
+  function mount(container) {
+    const box = scrollBox(container);
+    if (!box) return;
+    if (box.scrollLeft !== live.scroll.left) box.scrollLeft = live.scroll.left;
+    if (box.scrollTop !== live.scroll.top) box.scrollTop = live.scroll.top;
   }
 
   // Leaving the mode: no pin, hover or search carries over.
@@ -1382,6 +1803,7 @@
     live.pin = null;
     live.hover = null;
     live.scope = null;
+    live.scroll = { left: 0, top: 0 };
     clearInput();
   }
 
@@ -1417,11 +1839,13 @@
     mark("[data-topo-link]", "links", "data-topo-link");
     mark("[data-topo-bay]", "bays", "data-topo-bay");
     mark("[data-topo-group]", "groups", "data-topo-group");
+    // The line under the legend names what is traced in full, so text a box
+    // had to shorten is readable on hover and on keyboard focus alike.
     const pin = root.querySelector("[data-topology-pin]");
     if (pin) {
-      pin.textContent = live.pin
-        ? `Pinned: ${refLabel(live.model, live.pin)}. Esc clears.`
-        : "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
+      if (live.hover) pin.textContent = `Tracing: ${refLabel(live.model, live.hover)}.${live.pin ? " Pinned item kept; Esc clears." : ""}`;
+      else if (live.pin) pin.textContent = `Pinned: ${refLabel(live.model, live.pin)}. Esc clears.`;
+      else pin.textContent = DEFAULT_HINT;
     }
   }
 
@@ -1464,6 +1888,11 @@
     container.addEventListener("mouseout", leave);
     container.addEventListener("focusout", leave);
     container.addEventListener("click", (event) => {
+      if (event.target?.closest?.("[data-topology-fit]")) {
+        live.fit = !live.fit;
+        live.hooks.requestRender?.();
+        return;
+      }
       const element = event.target?.closest?.("[data-topo-link], [data-topo-bay], [data-topo-node]");
       const ref = refFromElement(element);
       if (!ref) return;
@@ -1492,6 +1921,17 @@
       live.hooks.clearSelection?.();
       live.hooks.requestRender?.();
     });
+    if (typeof window.addEventListener === "function") {
+      // The layout takes the box's width: lay it out again when that changes.
+      let timer = null;
+      window.addEventListener("resize", () => {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          timer = null;
+          if (container.querySelector(".fabric-topology")) live.hooks.requestRender?.();
+        }, 200);
+      });
+    }
     if (searchInput) {
       searchInput.addEventListener("input", () => {
         live.query = searchInput.value.trim();
@@ -1517,6 +1957,7 @@
     pathTone,
     linkDetail,
     render,
+    mount,
     release,
     view,
     inspectorDetail,

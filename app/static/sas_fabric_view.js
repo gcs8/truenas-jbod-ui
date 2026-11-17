@@ -4180,6 +4180,8 @@
     if (elements.topologySearchRow) {
       elements.topologySearchRow.hidden = state.mode !== "topology";
     }
+    // Only Topology widens the page to the full window (sas_fabric_topology.css).
+    document.body?.classList?.toggle("fabric-topology-mode", state.mode === "topology");
   }
 
   function renderMap() {
@@ -4224,9 +4226,17 @@
     } else if (state.mode === "topology") {
       // The drawing pins what the inspector shows; serials and disk identities
       // for its search come from the inventory snapshot of the same scope.
+      // The layout takes the box it is drawn in; the scroll position is kept.
       elements.mapPanel.innerHTML = window.SasFabricTopology
-        ? window.SasFabricTopology.render(fabric, { expanded: state.expandedSlotLists, selection: currentSelectionRef(), inventory: state.snapshot })
+        ? window.SasFabricTopology.render(fabric, {
+          expanded: state.expandedSlotLists,
+          selection: currentSelectionRef(),
+          inventory: state.snapshot,
+          width: elements.mapPanel.clientWidth,
+          height: Math.round((window.innerHeight || 0) * 0.78),
+        })
         : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
+      window.SasFabricTopology?.mount(elements.mapPanel);
     } else {
       elements.mapPanel.innerHTML = renderLanesMode(fabric);
     }

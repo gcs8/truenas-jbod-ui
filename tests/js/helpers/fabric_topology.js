@@ -128,7 +128,58 @@ function addBays(fabric, slots, enclosureIds, paths = []) {
   }
 }
 
+
+const range = (start, end) => Array.from({ length: end - start }, (_, index) => start + index);
+const DUAL = [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }];
+
+// The default two-HBA system: each HBA has a level-1 expander feeding a front
+// enclosure and a level-2 expander feeding a rear one; 48 dual-pathed bays.
+function twoHbaCascade() {
+  const fabric = coreFabric();
+  const ids = {};
+  for (const [index, name] of ["mpr0", "mpr1"].entries()) {
+    const hba = addController(fabric, name);
+    const level1 = addExpander(fabric, name, 0xa10 + index * 0x100, 1, hba.id, { reported_lanes: lanes([0, 1, 2, 3], [32, 33, 34, 35]) });
+    const level2 = addExpander(fabric, name, 0xa20 + index * 0x100, 2, level1.id, { reported_lanes: lanes([28, 29, 30, 31], [0, 1, 2, 3]) });
+    const front = addEnclosure(fabric, name, "0x0001", `SYNTH-FRONT-${name.toUpperCase()}`, level1.id);
+    const rear = addEnclosure(fabric, name, "0x0002", `SYNTH-REAR-${name.toUpperCase()}`, level2.id);
+    ids[name] = { hba, level1, level2, front, rear };
+  }
+  addBays(fabric, range(0, 24), [ids.mpr0.front.id, ids.mpr1.front.id], DUAL);
+  addBays(fabric, range(24, 48), [ids.mpr0.rear.id, ids.mpr1.rear.id], DUAL);
+  return { fabric, ids };
+}
+
+// Two HBAs and four dual-pathed shelves of 60, 84, 102 and 106 bays; shelf D
+// hangs off shelf C's expanders (a level-2 cascade).
+function fourShelves() {
+  const fabric = coreFabric();
+  const shelves = [["A", 60], ["B", 84], ["C", 102], ["D", 106]];
+  const expanders = { mpr0: {}, mpr1: {} };
+  for (const name of ["mpr0", "mpr1"]) addController(fabric, name);
+  let start = 0;
+  shelves.forEach(([shelf, count], index) => {
+    const enclosures = [];
+    for (const [side, name] of ["mpr0", "mpr1"].entries()) {
+      const level = shelf === "D" ? 2 : 1;
+      const parent = shelf === "D" ? expanders[name].C.id : `controller:${name}`;
+      const extra = shelf === "D"
+        ? { reported_lanes: lanes([32, 33, 34, 35], [0, 1, 2, 3]) }
+        : { reported_lanes: lanes([0, 1, 2, 3].map((phy) => phy + index * 4), [36, 37, 38, 39]) };
+      const exp = addExpander(fabric, name, 0xd000 + side * 0x100 + (index + 1) * 0x10 + level, level, parent, extra);
+      expanders[name][shelf] = exp;
+      enclosures.push(addEnclosure(fabric, name, `0x000${index + 1}`, `SYNTH-SHELF-${shelf}-${side ? "IOM-B" : "IOM-A"}`, exp.id).id);
+    }
+    addBays(fabric, range(start, start + count), enclosures, DUAL);
+    start += count;
+  });
+  return { fabric, expanders };
+}
+
 module.exports = {
+  range,
+  twoHbaCascade,
+  fourShelves,
   ROOT,
   loadTopology,
   producerCases,

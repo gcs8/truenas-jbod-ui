@@ -49,8 +49,8 @@ test("levels and PHY counts the producer sends as decimal strings draw the casca
   assert.equal(level(2).length, 2);
   for (const lower of level(2)) for (const upper of level(1)) assert.ok(lower.y > upper.y, "level 2 is drawn below level 1");
   const html = T.renderTopology(model, {});
-  assert.match(html, /level 1 · 8 of 36 PHYs linked/);
-  assert.match(html, /level 2 · 4 of 36 PHYs linked/);
+  assert.match(html, />level 1<\/text><text[^>]*>8 of 36 PHYs linked</);
+  assert.match(html, />level 2<\/text><text[^>]*>4 of 36 PHYs linked</);
   assert.doesNotMatch(html, /level not reported/);
 
   // Strict reader: anything but plain decimal digits stays unknown.
@@ -211,7 +211,15 @@ function fakeDom() {
   const search = { value: "", addEventListener: (name, handler) => searchHandlers.set(name, handler) };
   const status = { textContent: "" };
   const document = { addEventListener: (name, handler) => documentHandlers.push({ name, handler }) };
-  const element = (dataset) => ({ dataset, closest(selector) { return selector === ".fabric-topology" ? root : this; } });
+  // closest() answers like the DOM: the drawing's root, the item itself for
+  // the selectors that name it, nothing for anything else.
+  const element = (dataset) => ({
+    dataset,
+    closest(selector) {
+      if (selector === ".fabric-topology") return root;
+      return /\[data-topo-/.test(selector) ? this : null;
+    },
+  });
   return { handlers, searchHandlers, documentHandlers, pinText, container, search, status, document, element };
 }
 

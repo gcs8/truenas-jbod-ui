@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Storage Fabric - TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
+<link rel="stylesheet" href="{{ url_for('static', path='sas_fabric_topology.css') }}?v={{ app_version }}">
 <div class="app-shell fabric-page-shell">
   <header class="topbar fabric-page-topbar">
     <div>
