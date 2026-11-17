@@ -10,7 +10,7 @@ from typing import Callable
 
 from fastapi import HTTPException, Request
 
-from app.http_auth import origin_identity, request_origin_allowed
+from app.http_auth import browser_write_origin_decision
 from history_service.config import HistorySettings
 
 MAX_REFRESH_REQUEST_BYTES = 256
@@ -126,28 +126,25 @@ async def read_limited_request_body(request: Request, *, limit: int, detail: str
     return b"".join(chunks)
 
 
-def _request_self_origin(request: Request) -> tuple[str, str, int] | None:
-    host = request.url.hostname
-    if host is None:
-        return None
-    port = request.url.port
-    if port is None:
-        port = 443 if request.url.scheme == "https" else 80
-    return request.url.scheme.lower(), host.lower(), port
+# History has no list of extra host names: without a public origin, only an IP
+# address or localhost in the request's own Host can give the accepted origin.
+_NO_EXTRA_ALLOWED_HOSTS: frozenset[str] = frozenset()
 
 
 def authorize_refresh_request(request: Request, settings: HistorySettings) -> None:
-    supplied_origins = request.headers.getlist("origin") + request.headers.getlist("referer")
-    if settings.public_origin:
-        origin_allowed = request_origin_allowed(request, settings.public_origin)
-    else:
-        self_origin = _request_self_origin(request)
-        origin_allowed = not supplied_origins or (
-            self_origin is not None
-            and all(origin_identity(candidate) == self_origin for candidate in supplied_origins)
+    # A request with neither Origin nor Referer is not a browser write (the main
+    # UI's server-side refresh call is one); the refresh authentication mode
+    # below decides it. Every other request gets the same write-origin decision
+    # as main and admin (#737), before and independently of the token check.
+    if request.headers.getlist("origin") or request.headers.getlist("referer"):
+        decision = browser_write_origin_decision(
+            request,
+            settings.public_origin,
+            _NO_EXTRA_ALLOWED_HOSTS,
+            allow_host_fallback=True,
         )
-    if not origin_allowed:
-        raise HTTPException(status_code=403, detail="Cross-origin history refresh rejected.")
+        if decision != "allow":
+            raise HTTPException(status_code=403, detail="Cross-origin history refresh rejected.")
 
     if settings.refresh_auth_mode == "network":
         return
