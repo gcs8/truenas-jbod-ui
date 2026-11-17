@@ -358,6 +358,7 @@ test("a stale or unavailable part is marked: not read is never an empty healthy 
   // Bays the inventory knows are still drawn, in a group that says it has no enclosure link.
   assert.equal(model.counts.baysPlaced, 4);
   assert.deepEqual([...model.groups[0].enclosureIds], []);
+  assert.match(T.renderTopology(model, {}), /No enclosure link · 4 bays/);
   const parts = Object.fromEntries([...model.parts].map((part) => [part.name, part.state]));
   assert.equal(parts.cache, "stale");
   assert.equal(parts.ssh, "failed");

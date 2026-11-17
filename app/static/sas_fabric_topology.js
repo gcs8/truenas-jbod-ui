@@ -556,7 +556,8 @@
     const count = group.cells.length;
     const columns = Math.max(1, Math.min(CELLS_PER_ROW, count));
     const rows = Math.max(1, Math.ceil(count / CELLS_PER_ROW));
-    return [Math.max(NODE_W, columns * CELL + 16), GROUP_HEAD + rows * CELL + 10];
+    // An unlinked group is wide enough to say so in full.
+    return [Math.max(group.enclosureIds.length ? NODE_W : 240, columns * CELL + 16), GROUP_HEAD + rows * CELL + 10];
   }
 
   function layoutModel(model) {
@@ -912,9 +913,9 @@
     const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
     const slots = group.bays.map((bay) => bay.slot).filter((slot) => slot !== null);
     const range = slots.length ? `Bays ${Math.min(...slots)}–${Math.max(...slots)}` : "Bays";
-    const linked = group.enclosureIds.length ? "" : " · no enclosure link in payload";
+    const count = `${group.bayIds.length} ${group.bayIds.length === 1 ? "bay" : "bays"}`;
     if (!group.enclosureIds.length) used.add("mark-not-read");
-    const head = clip(`${range} · ${group.bayIds.length} ${group.bayIds.length === 1 ? "bay" : "bays"}${linked}`, group.w);
+    const head = clip(group.enclosureIds.length ? `${range} · ${count}` : `No enclosure link · ${count}`, group.w);
     const parts = [`<rect class="topo-group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="8"></rect>`,
       `<text class="topo-node-title" x="${group.x + 10}" y="${group.y + 18}">${escapeHtml(head)}</text>`];
     const summaryText = pathSummary(group.summary);
