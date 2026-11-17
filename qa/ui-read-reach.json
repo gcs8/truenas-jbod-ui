@@ -82,12 +82,12 @@
   "admin": {
    "service": "admin",
    "template": "admin_service/templates/index.html",
-   "scripts": ["admin_service/static/admin_backups.js","admin_service/static/admin.js"],
+   "scripts": ["admin_service/static/admin_backup_model.js","admin_service/static/admin_backups.js","admin_service/static/admin.js"],
    "scopes": {
     "page": [
      {"method":"GET","path":"/api/admin/backups","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin_backups.js#(top level)"]},
      {"method":"GET","path":"/api/admin/backups/{artifact_id}","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin_backups.js#showDetails via artifactUrl"]},
-     {"method":"GET","path":"/api/admin/backups/policy","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin_backups.js#createBackupLibrary"]},
+     {"method":"GET","path":"/api/admin/backups/policy","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin_backups.js#(top level)"]},
      {"method":"GET","path":"/api/admin/history/orphaned","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin.js#purgeOrphanedHistory","admin_service/static/admin.js#runOrphanedHistoryScan"]},
      {"method":"GET","path":"/api/admin/history/systems","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin.js#loadHistoryRowCounts"]},
      {"method":"GET","path":"/api/admin/runtime","class":"read","query":[],"bind":[],"sites":["admin_service/static/admin.js#waitForRuntimeConvergence"]},
@@ -133,7 +133,7 @@
     {"method":"POST","path":"/api/admin/tls/import","class":"forbidden","sites":["admin_service/static/admin.js#importTlsBundle"]},
     {"method":"POST","path":"/api/admin/tls/inspect","class":"appliance-load","sites":["admin_service/static/admin.js#inspectTlsCertificate"]},
     {"method":"POST","path":"/api/admin/tls/trust-remote","class":"forbidden","sites":["admin_service/static/admin.js#trustRemoteTlsCertificate"]},
-    {"method":"PUT","path":"/api/admin/backups/policy","class":"forbidden","sites":["admin_service/static/admin_backups.js#createBackupLibrary"]}
+    {"method":"PUT","path":"/api/admin/backups/policy","class":"forbidden","sites":["admin_service/static/admin_backups.js#(top level)"]}
    ]
   },
   "offline": {

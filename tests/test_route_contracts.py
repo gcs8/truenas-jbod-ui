@@ -1608,6 +1608,7 @@ class RouteContractTests(unittest.TestCase):
         for relative_path, forbidden_module in (
             *((path, "app.main") for path in main_endpoint_files),
             ("admin_service/routes.py", "admin_service.main"),
+            ("admin_service/transport_routes.py", "admin_service.main"),
         ):
             with self.subTest(route_module=relative_path):
                 tree = ast.parse(Path(relative_path).read_text(encoding="utf-8"))
@@ -1624,6 +1625,7 @@ class RouteContractTests(unittest.TestCase):
             *main_endpoint_files,
             "admin_service/main.py",
             "admin_service/routes.py",
+            "admin_service/transport_routes.py",
         ):
             with self.subTest(blanket_suppression=relative_path):
                 source = Path(relative_path).read_text(encoding="utf-8")

@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import re
 from collections.abc import Collection
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr
@@ -154,6 +155,32 @@ def request_host_allows_writes(request: Request, allowed_hosts: Collection[str])
     if name is None:
         return False
     return name == "localhost" or _is_ip_address(name) or name in allowed_hosts
+
+
+BrowserWriteOriginDecision = Literal["allow", "unlisted_host", "cross_origin"]
+
+
+def browser_write_origin_decision(
+    request: Request,
+    public_origin: str | None,
+    allowed_hosts: Collection[str],
+    *,
+    allow_host_fallback: bool,
+) -> BrowserWriteOriginDecision:
+    """The one write-origin decision shared by the main, admin and history services (#737).
+
+    A configured public origin is authoritative. Without one, the request's own
+    Host gives the accepted origin only when ``allow_host_fallback`` is set and
+    that Host is exactly one valid host passing ``request_host_allows_writes``.
+    Every supplied Origin and Referer must then agree with the accepted origin.
+    Credentials, the order of checks and the response wording stay with each
+    service.
+    """
+    if not public_origin and allow_host_fallback:
+        if not request_host_allows_writes(request, allowed_hosts):
+            return "unlisted_host"
+        public_origin = f"{request.url.scheme}://{request.url.netloc}"
+    return "allow" if request_origin_allowed(request, public_origin) else "cross_origin"
 
 
 def unlisted_host_rejection_detail(request: Request, *, service: str, origin_setting: str, container: str) -> str:

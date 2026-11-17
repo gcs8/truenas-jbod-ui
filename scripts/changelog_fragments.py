@@ -11,7 +11,9 @@ leading zeros. ``<section>`` is one of ``breaking``, ``upgrade``,
 ``security``, ``added``, ``changed``, ``fixed``, ``performance``, ``docs`` or
 ``internal``. The file holds the text of one bullet as one inline paragraph:
 past tense, no leading ``- ``, no heading, no HTML comment, no raw HTML (not
-even in backticks), no link reference definition, at most 4096 bytes, and no ``#N``
+even in backticks), no link reference definition, no control or formatting
+character (a tab, a lone carriage return, a bidi control) other than its line
+breaks, at most 4096 bytes, and no ``#N``
 inside parentheses (the release tooling reads every ``(#N)`` as a pull request
 reference; a plain mention such as ``see #123`` is allowed). It may wrap over
 several lines. The collector appends `` (#N)`` from the file name; nothing
@@ -43,8 +45,10 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NoReturn
 
 CHANGELOG_PATH = "CHANGELOG.md"
 FRAGMENT_DIR = "changelog.d"
@@ -129,6 +133,43 @@ def section_names() -> str:
     return ", ".join(SECTIONS)
 
 
+# Control characters (line breaks included), format characters (bidi controls,
+# zero-width characters), line and paragraph separators, and the lone
+# surrogates that stand for undecodable bytes in a file name.
+_UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def printable(text: str) -> str:
+    """``text`` on one line, for printing a file name, git argument or git error.
+
+    Each control or format character, line or paragraph separator and
+    undecodable byte is written as its Python escape (``\\n``, ``\\x1b``,
+    ``\\u202e``, ``\\udcff``), so the text can never start a log line of its
+    own or hide or reorder the text around it. Anything else, a backslash
+    included, is kept, so ordinary text is unchanged and escaping twice changes
+    nothing more; the price is that an escape and the same characters typed
+    literally print alike.
+    """
+
+    return "".join(repr(char)[1:-1] if unicodedata.category(char) in _UNPRINTABLE else char for char in text)
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """``argparse.ArgumentParser`` that prints command-line text through printable().
+
+    The program name and every error message (an unrecognized argument, an
+    ambiguous option) are escaped; usage and help text are otherwise unchanged.
+    Sub-command parsers are of this class too.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.prog = printable(self.prog)
+
+    def error(self, message: str) -> NoReturn:
+        super().error(printable(message))
+
+
 def name_problem(path: str) -> str | None:
     """Reason a repository-relative path is not a valid fragment name, or None."""
 
@@ -170,6 +211,10 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return (), "is not UTF-8 text"
+    # Preview and collect write the text as it is, so it holds nothing printable() would escape.
+    escaped = next((char for char in text.replace("\r\n", "\n") if char != "\n" and printable(char) != char), None)
+    if escaped is not None:
+        return (), f"contains a control or formatting character ({printable(escaped)}); write plain text on ordinary lines"
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
     while lines and not lines[0]:
         lines.pop(0)
@@ -275,13 +320,13 @@ def load_fragments(root: Path) -> tuple[list[Fragment], list[str]]:
         if entry.name == README_NAME and entry.is_file() and not entry.is_symlink():
             continue
         if entry.is_dir() and not entry.is_symlink():
-            problems.append(f"{relative}/: fragments live directly in {FRAGMENT_DIR}/, not in a subdirectory")
+            problems.append(printable(f"{relative}/: fragments live directly in {FRAGMENT_DIR}/, not in a subdirectory"))
             continue
         regular = entry.is_file() and not entry.is_symlink()
         data = entry.read_bytes() if regular else b""
         problem = fragment_problem(relative, data, regular_file=regular)
         if problem is not None:
-            problems.append(f"{relative}: {problem}")
+            problems.append(printable(f"{relative}: {problem}"))
             continue
         fragments.append(parse_fragment(relative, data))
     return fragments, problems
@@ -416,6 +461,13 @@ def _release_heading(version: str, date: str) -> str:
     return f"## v{version} - {date}"
 
 
+def _read_changelog(root: Path) -> str:
+    try:
+        return (root / CHANGELOG_PATH).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise CollectError(f"{CHANGELOG_PATH} is not UTF-8 text") from None
+
+
 def _remove_fragment(path: Path) -> None:
     path.unlink()
 
@@ -468,7 +520,7 @@ def _cleanup(root: Path, fragments: list[Fragment], heading: str, result: Collec
             if os.path.lexists(path):
                 left.append(
                     f"  {fragment.path}: still present (could not check and delete it: "
-                    f"{type(exc).__name__}: {exc}); its text is already in '{heading}'"
+                    f"{printable(f'{type(exc).__name__}: {exc}')}); its text is already in '{heading}'"
                 )
             else:
                 left.append(f"  {fragment.path}: gone after it was read")
@@ -498,7 +550,7 @@ def collect(root: Path, *, version: str, date: str) -> CollectResult:
 
     heading = _release_heading(version, date)
     changelog_path = root / CHANGELOG_PATH
-    text = changelog_path.read_text(encoding="utf-8")
+    text = _read_changelog(root)
     lines = text.split("\n")
     version_heading = heading.rsplit(" - ", 1)[0]
     existing = next(
@@ -512,7 +564,9 @@ def collect(root: Path, *, version: str, date: str) -> CollectResult:
     )
     fragments, problems = load_fragments(root)
     if existing is not None:
-        message = [f"{CHANGELOG_PATH} already has '{existing}'; refusing to collect v{version.removeprefix('v')} twice."]
+        message = [
+            f"{CHANGELOG_PATH} already has '{printable(existing)}'; refusing to collect v{version.removeprefix('v')} twice."
+        ]
         message += _recovery_lines(root)
         for problem in problems:
             message.append(f"  invalid fragment {problem}")
@@ -548,7 +602,7 @@ def collect(root: Path, *, version: str, date: str) -> CollectResult:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Repository root (default: cwd).")
     commands = parser.add_subparsers(dest="command", required=True, metavar="{check,preview,collect}")
     commands.add_parser("check", help="Validate every fragment in changelog.d/.")
@@ -576,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "preview":
         try:
-            text = (root / CHANGELOG_PATH).read_text(encoding="utf-8")
+            text = _read_changelog(root)
             combined, notes = combined_changelog(root, text)
         except (OSError, CollectError) as exc:
             print(str(exc), file=sys.stderr)
