@@ -87,12 +87,12 @@ CROSS_PACKAGE_IMPORTS: dict[tuple[str, str], tuple[str, ...]] = {
         "admin_service/main.py",
         "admin_service/route_support.py",
         "admin_service/routes.py",
-        "admin_service/transport_routes.py",
         "admin_service/services/account_bootstrap.py",
         "admin_service/services/esxi_host_prep.py",
         "admin_service/services/maintenance.py",
         "admin_service/services/runtime_control.py",
         "admin_service/services/tls_trust.py",
+        "admin_service/transport_routes.py",
     ),
     ("admin_service", "history_service"): (
         "admin_service/route_support.py",
