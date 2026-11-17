@@ -613,13 +613,15 @@ test("an unknown or conflicting fabric kind gets its own notice and makes no cla
   assert.equal(namedModel.core, true);
   assert.deepEqual([...namedModel.notices], []);
   assert.deepEqual([...namedModel.tiers].map((tier) => tier.id), ["host", "controllers", "expanders:1", "enclosures", "bays"]);
-  // Every storage kind the producers emit is a non-CORE platform drawing.
-  for (const kind of ["linux_ses", "storage_scale", "storage_linux", "storage_quantastor", "storage_esxi", "storage_bmc", "storage_generic"]) {
+  // Every storage kind the producers emit is a non-CORE drawing on a platform
+  // that produces it (each pair is checked in full in the kind/platform test).
+  for (const [kind, platform] of [["linux_ses", "scale"], ["linux_ses", "linux"], ["storage_scale", "scale"], ["storage_linux", "linux"], ["storage_quantastor", "quantastor"], ["storage_esxi", "esxi"], ["storage_bmc", "ipmi"], ["storage_generic", "other"]]) {
     const fabric = JSON.parse(JSON.stringify(cases.linux_virtual.fabric));
     fabric.raw.fabric_kind = kind;
+    fabric.platform = platform;
     const model = T.buildTopologyModel(fabric);
     assert.equal(model.core, false, kind);
-    assert.deepEqual([...model.notices], [], kind);
+    assert.deepEqual([...model.notices], [], `${kind} on ${platform}`);
     assert.match(T.renderTopology(model, {}), /not collected on this platform/, kind);
   }
 });
@@ -819,4 +821,228 @@ test("the Path Focus and Disk Path strip is hidden in Topology and returns in th
     assert.equal(strip.hidden, true, `topology after ${mode}`);
   }
   void page;
+});
+
+// ---- a bay label without a supported number ------------------------------------
+
+test("a bay label with no supported number is drawn as the producer wrote it, and no detail invents a number", () => {
+  const T = H.loadTopology();
+  // The real builder keeps a slot label of Arabic-Indic digits as "Bay ١".
+  const { fabric, snapshot } = cases.ses_non_ascii_labels;
+  const model = T.buildTopologyModel(fabric, { inventory: snapshot });
+  const cells = cellsOf(T.renderTopology(model, {}));
+  assert.equal(cells.size, 4);
+  assert.deepEqual(cells.get("bay:0").text, ["Bay \u0661"]);
+  assert.deepEqual(cells.get("bay:2").text, ["Bay \u0663"]);
+  assert.deepEqual(cells.get("bay:3").text, ["04"], "control: an ASCII number is shown as the number");
+  for (const bay of model.bays) {
+    const shown = bay.number || bay.label;
+    assert.ok(bay.w >= shown.length * 7 + 12 || shown.length * 7 + 12 <= 32, `${bay.bayId}: "${shown}" fits its ${bay.w} px cell`);
+  }
+  // Its label text finds it; a number finds only the bay that carries one.
+  assert.deepEqual([...T.searchTopology(model, "\u0661").matches].map((item) => item.id), ["bay:0"]);
+  assert.deepEqual([...T.searchTopology(model, "4").matches].filter((item) => item.kind === "bay").map((item) => item.id), ["bay:3"]);
+  // A bundle of more than 48 such bays lists only the numbers the payload has.
+  const many = JSON.parse(JSON.stringify(fabric));
+  const template = many.nodes.find((item) => item.id === "bay:0");
+  const linkTemplate = many.links.find((item) => item.kind === "ses-bay" && item.target === "bay:0");
+  for (let index = 0; index < 60; index += 1) {
+    const id = `bay:${100 + index}`;
+    const label = index < 30 ? `Bay ${"\u0661".repeat(1 + (index % 3))}${index}` : `Bay ${10 + index}`;
+    many.nodes.push({ ...JSON.parse(JSON.stringify(template)), id, slot: 100 + index, label });
+    many.links.push({ ...JSON.parse(JSON.stringify(linkTemplate)), id: `ses-bay:${id}`, target: id });
+  }
+  const big = T.buildTopologyModel(many);
+  const bundle = [...big.links].find((item) => item.bundle && item.count > 48);
+  assert.ok(bundle, "one bundle carries the 64 bays");
+  const detail = T.linkDetail(big, bundle.id).html.replace(/<[^>]+>/g, " ");
+  const listed = /numbers ([0-9–, ]+)/.exec(detail);
+  assert.ok(listed, detail);
+  assert.equal(listed[1].trim(), "4, 40–69", "only the numbers the labels carry");
+  assert.doesNotMatch(detail, /\b0, 0\b/);
+  assert.match(detail, /33 bays? whose labels? carr(?:y|ies) no number/);
+});
+
+// ---- titles stay distinct after every generated suffix ---------------------------
+
+test("no two boxes with different ids show the same title, also where a generated title equals an existing alias", () => {
+  const T = H.loadTopology();
+  const visibleTitle = (item) => item.lines.slice(0, item.titleLines).join(" ");
+  const distinct = (name, model) => {
+    const seen = new Map();
+    for (const item of model.nodes) {
+      const title = `${item.tier}: ${visibleTitle(item)}`;
+      assert.ok(!seen.has(title) || seen.get(title) === item.id, `${name}: ${item.id} and ${seen.get(title)} both read "${title}"`);
+      seen.set(title, item.id);
+    }
+  };
+  // Three boxes: two named X and one already named "X (<id of the first>)".
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const first = H.addEnclosure(fabric, "mpr0", "000a", "X", null);
+  H.addEnclosure(fabric, "mpr0", "000b", "X", null);
+  H.addEnclosure(fabric, "mpr0", "000c", `X (${first.id})`, null);
+  for (const item of fabric.nodes.filter((node) => node.kind === "mpr-enclosure")) {
+    delete item.controller_id;
+    fabric.links.push(H.link(hba.id, item.id, "controller-enclosure"));
+  }
+  distinct("three boxes", T.buildTopologyModel(fabric));
+  // The real cascade: both mpr0 enclosure views and the first mpr1 view
+  // carry aliases, the last one equal to what the passes generate.
+  const cascade = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  for (const item of cascade.nodes) {
+    if (item.id.startsWith("mpr-enclosure:controller:mpr0:")) item.alias = "X";
+    if (item.id === "mpr-enclosure:controller:mpr1:0002") item.alias = "X via mpr0 (mpr-enclosure:controller:mpr0:0002)";
+  }
+  distinct("real cascade with aliases", T.buildTopologyModel(cascade));
+});
+
+// ---- a storage kind is accepted only on a platform that produces it ------------
+
+test("a named storage kind is accepted only on a platform that produces it; every other pair makes no collection claim and draws every record", () => {
+  const T = H.loadTopology();
+  const producers = {
+    "": ["core"],
+    core_mpr: ["core", null],
+    linux_ses: ["scale", "linux", null],
+    storage_scale: ["scale", null],
+    storage_linux: ["linux", null],
+    storage_quantastor: ["quantastor", null],
+    storage_esxi: ["esxi", null],
+    storage_bmc: ["ipmi", null],
+    storage_generic: ["something-else", "unknown", null],
+  };
+  const platforms = ["core", "scale", "linux", "quantastor", "esxi", "ipmi", "unknown", "something-else", null];
+  const claims = /not collected on this platform|not read|read not reported|read complete|no HBAs reported/;
+  for (const [kind, accepted] of Object.entries(producers)) {
+    for (const platform of platforms) {
+      // A storage payload from the real builder, plus four supplied
+      // expander records a storage drawing would leave out.
+      const fabric = JSON.parse(JSON.stringify(cases.linux_virtual.fabric));
+      if (kind) fabric.raw.fabric_kind = kind;
+      else delete fabric.raw.fabric_kind;
+      if (platform === null) delete fabric.platform;
+      else fabric.platform = platform;
+      const source = fabric.nodes.find((item) => item.kind === "controller");
+      for (let index = 0; index < 4; index += 1) {
+        const id = `expander:synthetic:${index}`;
+        fabric.nodes.push(H.node(id, "expander", { metrics: { sas_level: "1" } }));
+        fabric.links.push(H.link(source.id, id, "controller-expander"));
+      }
+      const model = T.buildTopologyModel(fabric);
+      const html = T.renderTopology(model, {});
+      const name = `${kind || "no kind"} on ${platform ?? "no platform"}`;
+      if (accepted.includes(platform)) {
+        assert.notEqual(model.contract, "unknown", `${name} is accepted`);
+        assert.deepEqual([...model.notices].filter((text) => /fabric kind/.test(text)), [], name);
+        continue;
+      }
+      assert.equal(model.contract, "unknown", `${name} takes the unknown-contract path`);
+      const notices = [...model.notices].join(" ");
+      assert.match(notices, /makes no claim about what was or was not collected/, name);
+      assert.doesNotMatch(html.replace(notices.replace(/&/g, "&amp;").replace(/"/g, "&quot;"), ""), claims, `${name}: no collection claim`);
+      for (let index = 0; index < 4; index += 1) assert.ok(html.includes(`data-topo-node="expander:synthetic:${index}"`), `${name}: expander ${index} is drawn`);
+      for (const item of fabric.nodes.filter((node) => node.kind === "path")) assert.ok(html.includes(`data-topo-node="${item.id}"`), `${name}: ${item.id} is drawn`);
+      assert.equal(cellsOf(html).size, fabric.nodes.filter((node) => node.kind === "bay").length, `${name}: every bay is drawn`);
+    }
+  }
+});
+
+// ---- an all-digit query is a bay number and an identity --------------------------
+
+test("an all-digit query finds bay numbers first, then serials, SAS addresses and node identities that contain it", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const exp = H.addExpander(fabric, "mpr0", 0xa1, 1, hba.id);
+  fabric.nodes.find((item) => item.id === exp.id).label = "700012340000";
+  fabric.nodes.find((item) => item.id === exp.id).raw_id = "700012340000";
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", exp.id);
+  H.addBays(fabric, H.range(0, 8), [enc.id]);
+  fabric.nodes.find((item) => item.id === "bay:2").metrics.serial = "800012340002";
+  fabric.nodes.find((item) => item.id === "bay:5").metrics.sas_address = "300012345005";
+  const model = T.buildTopologyModel(fabric);
+  const ids = (query) => [...T.searchTopology(model, query).matches].map((item) => item.id);
+  assert.deepEqual(ids("800012340002"), ["bay:2"], "a serial made of digits");
+  assert.deepEqual(ids("300012345005"), ["bay:5"], "a SAS address made of digits");
+  assert.deepEqual(ids("700012340000"), [exp.id], "an expander identity made of digits");
+  // Bay 05 by its number first, then every identity that contains the digits.
+  assert.equal(ids("5")[0], "bay:5");
+  assert.equal(ids("5").filter((id) => id === "bay:5").length, 1, "listed once");
+  assert.ok(ids("1234").includes("bay:2") && ids("1234").includes("bay:5") && ids("1234").includes(exp.id), ids("1234").join(" "));
+  assert.deepEqual(ids("bay 5"), ["bay:5"], "\"bay N\" stays a bay number");
+  // A logical-disk view has no bay numbers; an all-digit serial still finds its disk.
+  const { fabric: virtual, snapshot } = cases.linux_virtual;
+  const inventory = JSON.parse(JSON.stringify(snapshot));
+  inventory.slots[1].serial = "900000000011";
+  const logical = T.buildTopologyModel(virtual, { inventory });
+  assert.deepEqual([...T.searchTopology(logical, "900000000011").matches].map((item) => item.id), ["bay:1"]);
+});
+
+// ---- behaviour the tests did not hold -------------------------------------------
+
+test("a value shown in the inspector is escaped", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hostile = "<img src=x onerror=alert(1)>&\"'";
+  const hba = H.addController(fabric, "mpr0");
+  const exp = H.addExpander(fabric, "mpr0", 0xa1, 1, hba.id, { reported_lanes: H.lanes([0, 1], [4, 5]) });
+  fabric.nodes.find((item) => item.id === hba.id).label = hostile;
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", hostile, exp.id);
+  H.addBays(fabric, H.range(0, 60), [enc.id]);
+  for (const item of fabric.nodes.filter((node) => node.kind === "bay")) item.label = `${hostile} ${item.slot}`;
+  const model = T.buildTopologyModel(fabric);
+  for (const link of [...model.links].filter((item) => item.bundle || item.kind === "controller-expander")) {
+    const { html } = T.linkDetail(model, link.id);
+    assert.ok(!html.includes("<img"), `${link.id}: no raw markup`);
+    assert.ok(html.includes("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;"), `${link.id}: the value is escaped`);
+  }
+});
+
+test("an inventory of another enclosure gives no serials to this one", () => {
+  const T = H.loadTopology();
+  const { fabric, snapshot } = cases.core_cascade;
+  assert.deepEqual([...T.searchTopology(T.buildTopologyModel(fabric, { inventory: snapshot }), "SANITIZED-TOPO-3").matches].map((item) => item.id), ["bay:3"]);
+  const other = { ...snapshot, selected_enclosure_id: "another-enclosure" };
+  assert.equal(T.searchTopology(T.buildTopologyModel(fabric, { inventory: other }), "SANITIZED-TOPO-3").matches.length, 0);
+});
+
+test("a bay number or level written with a sign or a decimal point is not read as a number", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", null);
+  fabric.links.push(H.link(hba.id, enc.id, "controller-enclosure"));
+  H.addBays(fabric, H.range(0, 4), [enc.id]);
+  const labels = ["Bay +1", "Bay 1.0", "Bay -1", "Bay 1e0"];
+  labels.forEach((label, index) => { fabric.nodes.find((item) => item.id === `bay:${index}`).label = label; });
+  for (const [index, level] of ["+1", "1.0", "-1"].entries()) {
+    H.addExpander(fabric, "mpr0", 0xb0 + index, level, hba.id);
+  }
+  const inventory = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: H.range(0, 4).map((slot) => ({ slot, slot_label: ["+1", "1.0", "-1", "1e0"][slot] })) };
+  const model = T.buildTopologyModel(fabric, { inventory });
+  for (const bay of model.bays) assert.equal(bay.number, "", `${bay.label} has no number`);
+  assert.equal([...T.searchTopology(model, "1").matches].filter((item) => item.kind === "bay").length, 0);
+  for (const item of [...model.nodes].filter((node) => node.kind === "expander")) {
+    assert.equal(item.level, null, item.id);
+    assert.ok(item.facts.includes("level not reported"), item.id);
+  }
+});
+
+test("of two bay traces with one id the first is kept, and the notice says so", () => {
+  const T = H.loadTopology();
+  const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  const first = fabric.traces.find((trace) => trace.id === "bay:1");
+  const second = JSON.parse(JSON.stringify(first));
+  for (const state of second.metrics.path_states) state.state = "fail";
+  fabric.traces.push(second);
+  const model = T.buildTopologyModel(fabric);
+  assert.deepEqual(model.bayById.get("bay:1").pathStates.map((state) => state.state), first.metrics.path_states.map((state) => state.state));
+  assert.match([...model.notices].join(" "), /1 duplicate trace id \(bay:1\); the first trace of each id was kept/);
+  // In the other order the other trace is the first one.
+  const reversed = JSON.parse(JSON.stringify(fabric));
+  const index = reversed.traces.findIndex((trace) => trace.id === "bay:1");
+  const [kept] = reversed.traces.splice(index, 1);
+  reversed.traces.push(kept);
+  assert.deepEqual(T.buildTopologyModel(reversed).bayById.get("bay:1").pathStates.map((state) => state.state), second.metrics.path_states.map((state) => state.state));
 });

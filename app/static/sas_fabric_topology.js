@@ -151,14 +151,32 @@
     return values.length > NAME_LIMIT ? `${shown} and ${values.length - NAME_LIMIT} more` : shown;
   }
 
-  // The fabric kinds the producers emit. The real CORE builder names none and
-  // says platform "core"; the synthetic demo names core_mpr.
-  const CORE_KINDS = new Set(["core_mpr"]);
-  const STORAGE_KINDS = new Set(["linux_ses", "storage_scale", "storage_linux", "storage_quantastor", "storage_esxi", "storage_bmc", "storage_generic"]);
+  // The fabric kinds the producers emit, with the platforms that emit each
+  // (sas_fabric.py: _select_sas_fabric_builder_key and _storage_fabric_kind).
+  // The real CORE builder names no kind and says platform "core"; the
+  // synthetic demo names core_mpr. storage_generic is the builder's fallback
+  // for a platform it does not name.
+  const NAMED_PLATFORMS = new Set(["core", "scale", "linux", "quantastor", "esxi", "ipmi"]);
+  const KIND_PLATFORMS = {
+    core_mpr: ["core"],
+    linux_ses: ["scale", "linux"],
+    storage_scale: ["scale"],
+    storage_linux: ["linux"],
+    storage_quantastor: ["quantastor"],
+    storage_esxi: ["esxi"],
+    storage_bmc: ["ipmi"],
+  };
+  const GENERIC_KIND = "storage_generic";
+
+  function kindMatchesPlatform(kind, platform) {
+    if (!platform) return true;
+    if (kind === GENERIC_KIND) return !NAMED_PLATFORMS.has(platform);
+    return own(KIND_PLATFORMS, kind).includes(platform);
+  }
 
   // { kind, contract: "core" | "storage" | "unknown", notice }. Only an exact
-  // supported kind is recognised; an unknown or conflicting one makes no
-  // claim about what was or was not collected.
+  // supported kind on a platform that produces it is recognised; an unknown
+  // or conflicting one makes no claim about what was or was not collected.
   function fabricContract(fabric) {
     const named = typeof fabric?.raw?.fabric_kind === "string" ? fabric.raw.fabric_kind : "";
     const platform = typeof fabric?.platform === "string" ? fabric.platform : "";
@@ -167,12 +185,11 @@
       if (platform === "core") return { kind: "core_sas", contract: "core", notice: "" };
       return { kind: "unknown", contract: "unknown", notice: `The payload names no fabric kind${platform ? ` (platform "${platform}")` : ""}: ${noClaim}.` };
     }
-    const core = CORE_KINDS.has(named);
-    const storage = STORAGE_KINDS.has(named);
-    if (!core && !storage) {
+    const core = named === "core_mpr";
+    if (!core && named !== GENERIC_KIND && !own(KIND_PLATFORMS, named)) {
       return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" is not one this view knows: ${noClaim}.` };
     }
-    if (platform && (platform === "core") !== core) {
+    if (!kindMatchesPlatform(named, platform)) {
       return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" does not match platform "${platform}": ${noClaim}.` };
     }
     return { kind: named, contract: core ? "core" : "storage", notice: "" };
@@ -292,6 +309,29 @@
       multipath.device_name, ...list(multipath.members).map((member) => member?.device_name),
     ];
     return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
+  }
+
+  // A disk's own identities: serials, SAS addresses and logical unit ids, as
+  // an all-digit query matches them.
+  function identityTerms(item, trace, slot) {
+    const metrics = isRecord(item.metrics) ? item.metrics : {};
+    const raw = isRecord(item.raw) ? item.raw : {};
+    const values = [
+      metrics.serial, raw.serial, metrics.sas_address, raw.sas_address, metrics.logical_unit_id,
+      ...list(trace?.metrics?.mpr_devices).map((device) => device?.sas_address),
+      slot?.serial, slot?.sas_address, slot?.logical_unit_id,
+    ];
+    return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
+  }
+
+  // The bay number the producer labelled a bay with ("Bay 01" for slot 0
+  // where the chassis counts from 1): plain ASCII digits only, never the
+  // internal index. "" when no supported number can be read.
+  function bayNumberOf(label, inventoryLabel) {
+    const labelled = /^Bay\s+([0-9]+)$/.exec(String(label || ""));
+    if (labelled) return labelled[1];
+    const fallback = String(inventoryLabel ?? "");
+    return /^[0-9]+$/.test(fallback) ? fallback : "";
   }
 
   // ---- tiers and nodes -------------------------------------------------------
@@ -566,21 +606,18 @@
       const slot = Number.isInteger(item.slot) ? item.slot : null;
       const inventorySlot = slot === null ? null : inventory.get(slot);
       const located = locationKnown(metrics, item.raw, trace?.metrics, inventorySlot, inventorySlot?.raw_status);
-      // The bay number is the one the producer labelled it with ("Bay 01" for
-      // slot 0 where the chassis counts from 1), never the internal index.
-      const labelled = /^Bay\s+(\d+)$/.exec(String(item.label || ""));
-      const inventoryLabel = String(inventorySlot?.slot_label ?? "");
       const bay = {
         bayId: item.id,
         traceId: trace ? trace.id : "",
         slot,
-        number: labelled ? labelled[1] : /^\d+$/.test(inventoryLabel) ? inventoryLabel : "",
+        number: bayNumberOf(item.label, inventorySlot?.slot_label),
         label: nodeLabel(item),
         locationKnown: located,
         status: item.status || "",
         occupancy: bayOccupancy(metrics),
         deviceName: metrics.device_name || trace?.metrics?.device_name || "",
         terms: searchTerms(item, trace, inventorySlot),
+        identities: identityTerms(item, trace, inventorySlot),
         pathStates,
         sources: [...(baySources.get(item.id) || [])].sort(naturalCompare),
         x: 0,
@@ -613,9 +650,11 @@
           counts.set(state.state, (counts.get(state.state) || 0) + 1);
         }
       }
-      // A disk without a physical location is drawn with its own label, so
-      // its cell is as wide as the longest label in the group.
-      const cellWidth = raw.locationKnown ? CELL_BOX : Math.max(CELL_BOX, ...raw.bays.map((bay) => bay.label.length * CHAR_W + 12));
+      // A disk without a physical location, and a bay whose label carries no
+      // number, is drawn with its own label, so its cell is as wide as the
+      // longest such label in the group.
+      const labelled = raw.bays.filter((bay) => !raw.locationKnown || !bay.number);
+      const cellWidth = Math.max(CELL_BOX, ...labelled.map((bay) => bay.label.length * CHAR_W + 12));
       for (const bay of raw.bays) bay.w = cellWidth;
       const group = {
         id: raw.id,
@@ -826,7 +865,7 @@
     if (skipped.duplicateNodes.length) notDrawn.push(`${plural(skipped.duplicateNodes.length, "duplicate node id")} (${named(skipped.duplicateNodes)})`);
     const orphanTraces = [...traces.values()].filter((trace) => trace.kind === "bay" && !payloadNodeIds.has(trace.id)).map((trace) => trace.id);
     if (orphanTraces.length) notDrawn.push(`${plural(orphanTraces.length, "bay trace")} without a bay node (${named(orphanTraces)})`);
-    if (skipped.duplicateTraces.length) notDrawn.push(`${plural(skipped.duplicateTraces.length, "duplicate trace id")} (${named(skipped.duplicateTraces)})`);
+    if (skipped.duplicateTraces.length) notDrawn.push(`${plural(skipped.duplicateTraces.length, "duplicate trace id")} (${named(skipped.duplicateTraces)}); the first trace of each id was kept`);
     if (skipped.unsupportedTraces.length) notDrawn.push(`${plural(skipped.unsupportedTraces.length, "trace")} of a kind this view does not draw (${named(skipped.unsupportedTraces)})`);
     if (skipped.upward.length) notDrawn.push(`${plural(skipped.upward.length, "link")} that ${skipped.upward.length === 1 ? "points" : "point"} up the tiers (${named(skipped.upward)})`);
     if (skipped.duplicateLinks.length) notDrawn.push(`${plural(skipped.duplicateLinks.length, "duplicate link id")} (${named(skipped.duplicateLinks)})`);
@@ -944,6 +983,22 @@
         sizeNode(entry);
       }
     }
+    // A generated title can equal one a box already had: the first box in
+    // drawing order keeps it, every later one gets the next free number,
+    // checked against every title in its tier.
+    const taken = new Set();
+    for (const entry of model.nodes) {
+      const key = (item) => `${item.tier}\u0000${title(item)}`;
+      if (taken.has(key(entry))) {
+        const base = entry.label;
+        entry.wholeTitle = true;
+        for (let number = 2; taken.has(key(entry)); number += 1) {
+          entry.label = `${base} #${number}`;
+          sizeNode(entry);
+        }
+      }
+      taken.add(key(entry));
+    }
   }
 
   function groupText(group) {
@@ -968,7 +1023,7 @@
     }
     const count = group.cells.length;
     const pitch = group.cellWidth + (CELL - CELL_BOX);
-    const perRow = group.locationKnown ? CELLS_PER_ROW : Math.max(1, Math.floor((CELLS_PER_ROW * CELL) / pitch));
+    const perRow = pitch === CELL ? CELLS_PER_ROW : Math.max(1, Math.floor((CELLS_PER_ROW * CELL) / pitch));
     const columns = Math.max(1, Math.min(perRow, count));
     const rows = Math.max(1, Math.ceil(count / perRow));
     group.perRow = perRow;
@@ -1583,34 +1638,45 @@
     return path;
   }
 
-  // A number (or "bay N") is a bay number and matches only bays with a
-  // physical location; any other text matches labels, disk names, serials,
-  // disk and expander SAS addresses.
+  // "bay N" is a bay number and matches only bays with a physical location.
+  // A query of digits alone matches bay numbers first, then the serials and
+  // SAS addresses of disks and the identities of nodes that contain it. Any
+  // other text matches labels, disk names, serials, disk and expander SAS
+  // addresses.
   function searchTopology(model, query) {
     const text = String(query ?? "").trim().toLowerCase();
     const result = { query: text, matches: [], path: emptyPath() };
     if (!model || !text) return result;
-    const bayNumber = /^(?:bay\s*)?(\d+)$/.exec(text);
-    for (const bay of model.bays) {
+    const bayOnly = /^bay\s*([0-9]+)$/.exec(text);
+    const digits = /^[0-9]+$/.test(text) ? text : "";
+    const wanted = bayOnly ? bayOnly[1] : digits;
+    const found = new Set();
+    const addBay = (bay) => {
+      if (found.has(bay.bayId)) return;
+      found.add(bay.bayId);
       const group = model.groupByBay.get(bay.bayId);
-      let hit = false;
-      if (bayNumber) {
-        hit = bay.locationKnown && bay.number !== "" && Number(bay.number) === Number(bayNumber[1]);
-      } else {
-        hit = bay.label.toLowerCase().includes(text) || bay.terms.some((value) => value.includes(text));
-      }
-      if (hit) {
-        result.matches.push({ id: bay.bayId, kind: "bay", label: bay.label, groupId: group?.id || "", collapsed: Boolean(group?.collapsed) });
-        bayPath(model, bay.bayId, result.path);
+      result.matches.push({ id: bay.bayId, kind: "bay", label: bay.label, groupId: group?.id || "", collapsed: Boolean(group?.collapsed) });
+      bayPath(model, bay.bayId, result.path);
+    };
+    if (wanted) {
+      for (const bay of model.bays) {
+        if (bay.locationKnown && bay.number !== "" && Number(bay.number) === Number(wanted)) addBay(bay);
       }
     }
-    if (!bayNumber) {
-      for (const entry of model.nodes) {
-        if (entry.kind === "host") continue;
-        if ([entry.label, entry.rawId, entry.id].some((value) => value && String(value).toLowerCase().includes(text))) {
-          result.matches.push({ id: entry.id, kind: "node", label: entry.label, groupId: "", collapsed: false });
-          tracePath(model, { kind: "node", id: entry.id }, result.path);
-        }
+    if (bayOnly) return result;
+    for (const bay of model.bays) {
+      const hit = digits
+        ? bay.identities.some((value) => value.includes(text))
+        : bay.label.toLowerCase().includes(text) || bay.terms.some((value) => value.includes(text));
+      if (hit) addBay(bay);
+    }
+    for (const entry of model.nodes) {
+      if (entry.kind === "host") continue;
+      // Digits match what the payload names a node by, not the view's own ids.
+      const names = digits ? [entry.label, entry.rawId] : [entry.label, entry.rawId, entry.id];
+      if (names.some((value) => value && String(value).toLowerCase().includes(text))) {
+        result.matches.push({ id: entry.id, kind: "node", label: entry.label, groupId: "", collapsed: false });
+        tracePath(model, { kind: "node", id: entry.id }, result.path);
       }
     }
     return result;
@@ -1782,7 +1848,8 @@
       count = `<text class="topo-path-more" x="${bay.x + bay.w - 2}" y="${markY + 4}" text-anchor="end">+${more}</text>`;
     }
     const title = bayTitle(bay);
-    const shownLabel = bay.locationKnown ? bay.number : bay.label;
+    // A bay label with no supported number is shown as the producer wrote it.
+    const shownLabel = bay.locationKnown ? bay.number || bay.label : bay.label;
     const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
     return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number}${marks}${count}</g>`;
   }
@@ -1986,9 +2053,16 @@
       const group = model.groupById.get(link.target);
       const carried = list(group?.bays).filter((bay) => bay.sources.includes(link.source));
       const unit = group?.locationKnown ? "bay" : "disk";
-      const names = carried.length <= 48
-        ? carried.map((bay) => bay.label).join(", ")
-        : `${carried.length} ${unit}s${group?.locationKnown ? `, numbers ${phyRanges(carried.map((bay) => Number(bay.number)).filter((number) => Number.isInteger(number) && number >= 0).sort((a, b) => a - b))}` : ""}`;
+      // Only the numbers the payload's labels carry: a bay without one is
+      // counted, never read as 0.
+      const numbered = carried.filter((bay) => bay.number !== "").map((bay) => Number(bay.number)).sort((a, b) => a - b);
+      const unnumbered = carried.length - numbered.length;
+      const described = [`${carried.length} ${unit}s`];
+      if (group?.locationKnown && numbered.length) described.push(`numbers ${phyRanges(numbered)}`);
+      const counted = group?.locationKnown && unnumbered
+        ? `; ${plural(unnumbered, "bay")} whose ${unnumbered === 1 ? "label carries" : "labels carry"} no number`
+        : "";
+      const names = carried.length <= 48 ? carried.map((bay) => bay.label).join(", ") : `${described.join(", ")}${counted}`;
       return {
         title: `Selected ${unit} bundle`,
         html: `<div class="kv-grid">${row("Source enclosure", source ? `${source.label} (${source.id})` : link.source)}`

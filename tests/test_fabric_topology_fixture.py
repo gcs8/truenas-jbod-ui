@@ -212,7 +212,40 @@ def _health_case() -> tuple[SystemConfig, InventorySnapshot, dict[str, str]]:
     return SystemConfig(id="synthetic-health", label="Synthetic health", truenas=TrueNASConfig(platform="linux")), snapshot, {}
 
 
-CASES = {"core_cascade": _core_case, "linux_virtual": _virtual_case, "scale_ses": _ses_case, "linux_health": _health_case}
+def _non_ascii_label_case() -> tuple[SystemConfig, InventorySnapshot, dict[str, str]]:
+    """SCALE SES bays whose profile labels them with Arabic-Indic digits
+    (U+0661..U+0663), which the producer keeps as the bay label, beside one
+    ASCII label."""
+
+    labels = ["\u0661", "\u0662", "\u0663", "04"]
+    slots = [
+        SlotView(
+            slot=index,
+            slot_label=label,
+            row_index=0,
+            column_index=index,
+            present=True,
+            state=SlotState.healthy,
+            device_name=f"sd{chr(ord('a') + index)}",
+            serial=f"SANITIZED-LABEL-{index}",
+            ssh_ses_device="/dev/sg9",
+        )
+        for index, label in enumerate(labels)
+    ]
+    snapshot = InventorySnapshot(
+        slots=slots, refresh_interval_seconds=30, last_updated=SNAPSHOT_TIME, selected_system_id="synthetic-labels",
+        selected_system_platform="scale",
+    )
+    return SystemConfig(id="synthetic-labels", label="Synthetic labels", truenas=TrueNASConfig(platform="scale")), snapshot, {}
+
+
+CASES = {
+    "core_cascade": _core_case,
+    "linux_virtual": _virtual_case,
+    "scale_ses": _ses_case,
+    "linux_health": _health_case,
+    "ses_non_ascii_labels": _non_ascii_label_case,
+}
 
 
 def _case_payload(build) -> dict:
@@ -266,6 +299,11 @@ class FabricTopologyFixtureTests(unittest.TestCase):
 
         ses = build_fixture()["scale_ses"]["fabric"]
         self.assertEqual(ses["raw"]["fabric_kind"], "linux_ses")
+
+        # The producer keeps a label of non-ASCII digits as the bay label.
+        labelled = build_fixture()["ses_non_ascii_labels"]["fabric"]
+        bay_labels = sorted(node["label"] for node in labelled["nodes"] if node["kind"] == "bay")
+        self.assertEqual(bay_labels, ["Bay 04", "Bay \u0661", "Bay \u0662", "Bay \u0663"])
 
     def test_browser_crawl_draws_topology_bays_and_lines_from_this_fixture(self) -> None:
         # The CI browser crawl renders Topology from this fixture (in the demo

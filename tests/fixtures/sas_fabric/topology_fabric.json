@@ -12104,5 +12104,1318 @@
    "systems": [],
    "warnings": []
   }
+ },
+ "ses_non_ascii_labels": {
+  "fabric": {
+   "aliases": [],
+   "available": true,
+   "controllers": [
+    {
+     "board": "TrueNAS SCALE Linux SES",
+     "device": "lsscsi -g -t",
+     "fabric_kind": "linux_ses",
+     "id": "controller:linux-ses",
+     "name": "linux-ses",
+     "path_counts": {
+      "mapped": 4
+     },
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "source": "linux_ses"
+    }
+   ],
+   "enclosures": [
+    {
+     "alias": null,
+     "display_label": null,
+     "enclosure_id": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "fabric_domain": "storage_fabric",
+     "fabric_kind": "linux_ses",
+     "id": "ses:sg9",
+     "kind": "ses-enclosure",
+     "label": "/dev/sg9",
+     "raw_id": "/dev/sg9",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "ses_device": "/dev/sg9",
+     "source": "linux_ses",
+     "status": null
+    }
+   ],
+   "expanders": [],
+   "links": [
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:0->bay:0:0",
+     "kind": "backplane-bay",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": 0,
+     "source": "backplane:0",
+     "status": null,
+     "target": "bay:0"
+    },
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:1->bay:1:1",
+     "kind": "backplane-bay",
+     "related_slots": [
+      1
+     ],
+     "reported_lanes": null,
+     "slot": 1,
+     "source": "backplane:1",
+     "status": null,
+     "target": "bay:1"
+    },
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:2->bay:2:2",
+     "kind": "backplane-bay",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": 2,
+     "source": "backplane:2",
+     "status": null,
+     "target": "bay:2"
+    },
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:3->bay:3:3",
+     "kind": "backplane-bay",
+     "related_slots": [
+      3
+     ],
+     "reported_lanes": null,
+     "slot": 3,
+     "source": "backplane:3",
+     "status": null,
+     "target": "bay:3"
+    },
+    {
+     "evidence": [
+      "lsscsi -g",
+      "lsscsi -g -t"
+     ],
+     "id": "controller-path:controller:linux-ses->path:linux-ses:sg9",
+     "kind": "controller-path",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "controller:linux-ses",
+     "status": "mapped",
+     "target": "path:linux-ses:sg9"
+    },
+    {
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "host-controller:host->controller:linux-ses",
+     "kind": "host-controller",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "host",
+     "status": null,
+     "target": "controller:linux-ses"
+    },
+    {
+     "evidence": [
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "path-ses-enclosure:path:linux-ses:sg9->ses:sg9",
+     "kind": "path-ses-enclosure",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "path:linux-ses:sg9",
+     "status": "mapped",
+     "target": "ses:sg9"
+    },
+    {
+     "evidence": [
+      "sg_ses AES/EC"
+     ],
+     "id": "ses-bay:ses:sg9->bay:0:0",
+     "kind": "ses-bay",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": 0,
+     "source": "ses:sg9",
+     "status": null,
+     "target": "bay:0"
+    },
+    {
+     "evidence": [
+      "sg_ses AES/EC"
+     ],
+     "id": "ses-bay:ses:sg9->bay:1:1",
+     "kind": "ses-bay",
+     "related_slots": [
+      1
+     ],
+     "reported_lanes": null,
+     "slot": 1,
+     "source": "ses:sg9",
+     "status": null,
+     "target": "bay:1"
+    },
+    {
+     "evidence": [
+      "sg_ses AES/EC"
+     ],
+     "id": "ses-bay:ses:sg9->bay:2:2",
+     "kind": "ses-bay",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": 2,
+     "source": "ses:sg9",
+     "status": null,
+     "target": "bay:2"
+    },
+    {
+     "evidence": [
+      "sg_ses AES/EC"
+     ],
+     "id": "ses-bay:ses:sg9->bay:3:3",
+     "kind": "ses-bay",
+     "related_slots": [
+      3
+     ],
+     "reported_lanes": null,
+     "slot": 3,
+     "source": "ses:sg9",
+     "status": null,
+     "target": "bay:3"
+    }
+   ],
+   "nodes": [
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane:0",
+     "kind": "backplane",
+     "label": "Backplane Zone 1",
+     "metrics": {
+      "slot_count": 1,
+      "slot_range": "Bays \u0661-\u0661",
+      "zone": 1
+     },
+     "raw": {
+      "id": "backplane:0",
+      "index": 0,
+      "label": "Backplane Zone 1",
+      "range": "Bays \u0661-\u0661",
+      "slots": [
+       0
+      ]
+     },
+     "raw_id": null,
+     "related_slots": [
+      0
+     ],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane:1",
+     "kind": "backplane",
+     "label": "Backplane Zone 2",
+     "metrics": {
+      "slot_count": 1,
+      "slot_range": "Bays \u0662-\u0662",
+      "zone": 2
+     },
+     "raw": {
+      "id": "backplane:1",
+      "index": 1,
+      "label": "Backplane Zone 2",
+      "range": "Bays \u0662-\u0662",
+      "slots": [
+       1
+      ]
+     },
+     "raw_id": null,
+     "related_slots": [
+      1
+     ],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane:2",
+     "kind": "backplane",
+     "label": "Backplane Zone 3",
+     "metrics": {
+      "slot_count": 1,
+      "slot_range": "Bays \u0663-\u0663",
+      "zone": 3
+     },
+     "raw": {
+      "id": "backplane:2",
+      "index": 2,
+      "label": "Backplane Zone 3",
+      "range": "Bays \u0663-\u0663",
+      "slots": [
+       2
+      ]
+     },
+     "raw_id": null,
+     "related_slots": [
+      2
+     ],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane:3",
+     "kind": "backplane",
+     "label": "Backplane Zone 4",
+     "metrics": {
+      "slot_count": 1,
+      "slot_range": "Bays 04-04",
+      "zone": 4
+     },
+     "raw": {
+      "id": "backplane:3",
+      "index": 3,
+      "label": "Backplane Zone 4",
+      "range": "Bays 04-04",
+      "slots": [
+       3
+      ]
+     },
+     "raw_id": null,
+     "related_slots": [
+      3
+     ],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:0",
+     "kind": "bay",
+     "label": "Bay \u0661",
+     "metrics": {
+      "attached_sas_address": null,
+      "device_name": "sda",
+      "health": null,
+      "phy_identifier": null,
+      "pool_name": null,
+      "present": true,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-0",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "sg_device": null,
+      "target_port_protocol": null,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "attached_sas_address": null,
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "linux_blockdevice": null,
+      "linux_scsi_device": null,
+      "mapping_source": "unknown",
+      "phy_identifier": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-0",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "ses_targets": [],
+      "sg_device": null,
+      "source": "linux_ses",
+      "target_port_protocol": null,
+      "transport_protocol": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      0
+     ],
+     "slot": 0,
+     "status": "healthy"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:1",
+     "kind": "bay",
+     "label": "Bay \u0662",
+     "metrics": {
+      "attached_sas_address": null,
+      "device_name": "sdb",
+      "health": null,
+      "phy_identifier": null,
+      "pool_name": null,
+      "present": true,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-1",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "sg_device": null,
+      "target_port_protocol": null,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "attached_sas_address": null,
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "linux_blockdevice": null,
+      "linux_scsi_device": null,
+      "mapping_source": "unknown",
+      "phy_identifier": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-1",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "ses_targets": [],
+      "sg_device": null,
+      "source": "linux_ses",
+      "target_port_protocol": null,
+      "transport_protocol": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      1
+     ],
+     "slot": 1,
+     "status": "healthy"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:2",
+     "kind": "bay",
+     "label": "Bay \u0663",
+     "metrics": {
+      "attached_sas_address": null,
+      "device_name": "sdc",
+      "health": null,
+      "phy_identifier": null,
+      "pool_name": null,
+      "present": true,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-2",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "sg_device": null,
+      "target_port_protocol": null,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "attached_sas_address": null,
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "linux_blockdevice": null,
+      "linux_scsi_device": null,
+      "mapping_source": "unknown",
+      "phy_identifier": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-2",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "ses_targets": [],
+      "sg_device": null,
+      "source": "linux_ses",
+      "target_port_protocol": null,
+      "transport_protocol": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      2
+     ],
+     "slot": 2,
+     "status": "healthy"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:3",
+     "kind": "bay",
+     "label": "Bay 04",
+     "metrics": {
+      "attached_sas_address": null,
+      "device_name": "sdd",
+      "health": null,
+      "phy_identifier": null,
+      "pool_name": null,
+      "present": true,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-3",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "sg_device": null,
+      "target_port_protocol": null,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "attached_sas_address": null,
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "linux_blockdevice": null,
+      "linux_scsi_device": null,
+      "mapping_source": "unknown",
+      "phy_identifier": null,
+      "scsi_hctl": null,
+      "serial": "SANITIZED-LABEL-3",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "ses_targets": [],
+      "sg_device": null,
+      "source": "linux_ses",
+      "target_port_protocol": null,
+      "transport_protocol": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      3
+     ],
+     "slot": 3,
+     "status": "healthy"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "lsscsi -g",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "controller:linux-ses",
+     "kind": "controller",
+     "label": "Linux SES",
+     "metrics": {
+      "fabric_kind": "linux_ses",
+      "path_counts": {
+       "mapped": 4
+      },
+      "selected_bay_count": 4,
+      "selected_disk_count": 4,
+      "ses_device_count": 1
+     },
+     "raw": {
+      "board": "TrueNAS SCALE Linux SES",
+      "device": "lsscsi -g -t",
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "path_counts": {
+       "mapped": 4
+      },
+      "source": "linux_ses"
+     },
+     "raw_id": "lsscsi -g -t / sg_ses",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "slot": null,
+     "status": "online"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "host",
+     "kind": "host",
+     "label": "Synthetic labels",
+     "metrics": {
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "selected_disk_count": 4,
+      "slot_count": 4
+     },
+     "raw": {
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "platform": "scale"
+     },
+     "raw_id": "synthetic-labels",
+     "related_slots": [],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:linux-ses",
+     "display_label": null,
+     "evidence": [
+      "lsscsi -g",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "path:linux-ses:sg9",
+     "kind": "path",
+     "label": "/dev/sg9 mapped",
+     "metrics": {
+      "count": 4,
+      "ses_device": "/dev/sg9"
+     },
+     "raw": {
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "ses_device": "/dev/sg9",
+      "source": "linux_ses"
+     },
+     "raw_id": null,
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "slot": null,
+     "status": "mapped"
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:linux-ses",
+     "display_label": null,
+     "evidence": [
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "ses:sg9",
+     "kind": "ses-enclosure",
+     "label": "/dev/sg9",
+     "metrics": {
+      "selected_disk_count": 4,
+      "selected_enclosure": true,
+      "ses_device": "/dev/sg9",
+      "slot_count": 4
+     },
+     "raw": {
+      "enclosure_id": null,
+      "enclosure_label": null,
+      "enclosure_name": null,
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "linux_ses",
+      "id": "ses:sg9",
+      "ses_device": "/dev/sg9",
+      "source": "linux_ses"
+     },
+     "raw_id": "/dev/sg9",
+     "related_slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "slot": null,
+     "status": null
+    }
+   ],
+   "paths": [
+    {
+     "controller": "linux-ses",
+     "count": 4,
+     "fabric_kind": "linux_ses",
+     "id": "path:linux-ses:sg9",
+     "label": "/dev/sg9 mapped",
+     "ses_device": "/dev/sg9",
+     "slots": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "source": "linux_ses",
+     "state": "mapped"
+    }
+   ],
+   "platform": "scale",
+   "raw": {
+    "command_failures": [],
+    "fabric_domain": "storage_fabric",
+    "fabric_kind": "linux_ses",
+    "selected_bay_slots": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "selected_disk_slots": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "ses_devices": [
+     "/dev/sg9"
+    ]
+   },
+   "selected_enclosure_id": null,
+   "selected_enclosure_label": null,
+   "snapshot_cache_state": "miss",
+   "source_cache_state": "miss",
+   "sources": {},
+   "system_id": "synthetic-labels",
+   "system_label": "Synthetic labels",
+   "traces": [
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:0",
+     "kind": "bay",
+     "label": "Bay \u0661",
+     "link_ids": [
+      "host-controller:host->controller:linux-ses",
+      "controller-path:controller:linux-ses->path:linux-ses:sg9",
+      "path-ses-enclosure:path:linux-ses:sg9->ses:sg9",
+      "backplane-bay:backplane:0->bay:0:0",
+      "ses-bay:ses:sg9->bay:0:0"
+     ],
+     "metrics": {
+      "device_name": "sda",
+      "fabric_kind": "linux_ses",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "attached_sas_address": null,
+        "controller": "linux-ses",
+        "device_name": "sda",
+        "path_id": "path:linux-ses:sg9",
+        "phy_identifier": null,
+        "pool_name": null,
+        "scsi_hctl": null,
+        "serial": "SANITIZED-LABEL-0",
+        "ses_device": "/dev/sg9",
+        "sg_device": null,
+        "state": "mapped",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "vdev_name": null
+       }
+      ],
+      "pool_name": null,
+      "serial": "SANITIZED-LABEL-0",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:linux-ses",
+      "path:linux-ses:sg9",
+      "ses:sg9",
+      "bay:0",
+      "backplane:0"
+     ],
+     "slots": [
+      0
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:1",
+     "kind": "bay",
+     "label": "Bay \u0662",
+     "link_ids": [
+      "host-controller:host->controller:linux-ses",
+      "controller-path:controller:linux-ses->path:linux-ses:sg9",
+      "path-ses-enclosure:path:linux-ses:sg9->ses:sg9",
+      "backplane-bay:backplane:1->bay:1:1",
+      "ses-bay:ses:sg9->bay:1:1"
+     ],
+     "metrics": {
+      "device_name": "sdb",
+      "fabric_kind": "linux_ses",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "attached_sas_address": null,
+        "controller": "linux-ses",
+        "device_name": "sdb",
+        "path_id": "path:linux-ses:sg9",
+        "phy_identifier": null,
+        "pool_name": null,
+        "scsi_hctl": null,
+        "serial": "SANITIZED-LABEL-1",
+        "ses_device": "/dev/sg9",
+        "sg_device": null,
+        "state": "mapped",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "vdev_name": null
+       }
+      ],
+      "pool_name": null,
+      "serial": "SANITIZED-LABEL-1",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:linux-ses",
+      "path:linux-ses:sg9",
+      "ses:sg9",
+      "bay:1",
+      "backplane:1"
+     ],
+     "slots": [
+      1
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:2",
+     "kind": "bay",
+     "label": "Bay \u0663",
+     "link_ids": [
+      "host-controller:host->controller:linux-ses",
+      "controller-path:controller:linux-ses->path:linux-ses:sg9",
+      "path-ses-enclosure:path:linux-ses:sg9->ses:sg9",
+      "backplane-bay:backplane:2->bay:2:2",
+      "ses-bay:ses:sg9->bay:2:2"
+     ],
+     "metrics": {
+      "device_name": "sdc",
+      "fabric_kind": "linux_ses",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "attached_sas_address": null,
+        "controller": "linux-ses",
+        "device_name": "sdc",
+        "path_id": "path:linux-ses:sg9",
+        "phy_identifier": null,
+        "pool_name": null,
+        "scsi_hctl": null,
+        "serial": "SANITIZED-LABEL-2",
+        "ses_device": "/dev/sg9",
+        "sg_device": null,
+        "state": "mapped",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "vdev_name": null
+       }
+      ],
+      "pool_name": null,
+      "serial": "SANITIZED-LABEL-2",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:linux-ses",
+      "path:linux-ses:sg9",
+      "ses:sg9",
+      "bay:2",
+      "backplane:2"
+     ],
+     "slots": [
+      2
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "lsblk --json",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "bay:3",
+     "kind": "bay",
+     "label": "Bay 04",
+     "link_ids": [
+      "host-controller:host->controller:linux-ses",
+      "controller-path:controller:linux-ses->path:linux-ses:sg9",
+      "path-ses-enclosure:path:linux-ses:sg9->ses:sg9",
+      "backplane-bay:backplane:3->bay:3:3",
+      "ses-bay:ses:sg9->bay:3:3"
+     ],
+     "metrics": {
+      "device_name": "sdd",
+      "fabric_kind": "linux_ses",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "attached_sas_address": null,
+        "controller": "linux-ses",
+        "device_name": "sdd",
+        "path_id": "path:linux-ses:sg9",
+        "phy_identifier": null,
+        "pool_name": null,
+        "scsi_hctl": null,
+        "serial": "SANITIZED-LABEL-3",
+        "ses_device": "/dev/sg9",
+        "sg_device": null,
+        "state": "mapped",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "vdev_name": null
+       }
+      ],
+      "pool_name": null,
+      "serial": "SANITIZED-LABEL-3",
+      "ses_device": "/dev/sg9",
+      "ses_element_id": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:linux-ses",
+      "path:linux-ses:sg9",
+      "ses:sg9",
+      "bay:3",
+      "backplane:3"
+     ],
+     "slots": [
+      3
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "lsscsi -g",
+      "lsscsi -g -t",
+      "sg_ses AES/EC",
+      "sg_ses --join --filter"
+     ],
+     "id": "path:linux-ses:sg9",
+     "kind": "path",
+     "label": "/dev/sg9 mapped",
+     "link_ids": [
+      "host-controller:host->controller:linux-ses",
+      "controller-path:controller:linux-ses->path:linux-ses:sg9",
+      "path-ses-enclosure:path:linux-ses:sg9->ses:sg9"
+     ],
+     "metrics": {
+      "count": 4,
+      "ses_device": "/dev/sg9",
+      "state": "mapped"
+     },
+     "node_ids": [
+      "host",
+      "controller:linux-ses",
+      "path:linux-ses:sg9",
+      "ses:sg9"
+     ],
+     "slots": [
+      0,
+      1,
+      2,
+      3
+     ]
+    }
+   ],
+   "warnings": [
+    "TrueNAS SCALE Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. HBA and expander hop detail is not exposed by this Linux SES evidence."
+   ]
+  },
+  "snapshot": {
+   "capabilities": {},
+   "enclosures": [],
+   "last_updated": "2026-01-01T00:00:00Z",
+   "layout_columns": 0,
+   "layout_rows": [],
+   "layout_slot_count": 0,
+   "platform_context": {},
+   "refresh_interval_seconds": 30,
+   "selected_enclosure_id": null,
+   "selected_enclosure_label": null,
+   "selected_enclosure_name": null,
+   "selected_profile": null,
+   "selected_system_id": "synthetic-labels",
+   "selected_system_label": null,
+   "selected_system_platform": "scale",
+   "slots": [
+    {
+     "attached_sas_address": null,
+     "column_index": 0,
+     "device_name": "sda",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-LABEL-0",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 0,
+     "slot_label": "\u0661",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": "/dev/sg9",
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "healthy",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    },
+    {
+     "attached_sas_address": null,
+     "column_index": 1,
+     "device_name": "sdb",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-LABEL-1",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 1,
+     "slot_label": "\u0662",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": "/dev/sg9",
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "healthy",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    },
+    {
+     "attached_sas_address": null,
+     "column_index": 2,
+     "device_name": "sdc",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-LABEL-2",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 2,
+     "slot_label": "\u0663",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": "/dev/sg9",
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "healthy",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    },
+    {
+     "attached_sas_address": null,
+     "column_index": 3,
+     "device_name": "sdd",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-LABEL-3",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 3,
+     "slot_label": "04",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": "/dev/sg9",
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "healthy",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    }
+   ],
+   "sources": {},
+   "summary": {
+    "disk_count": 0,
+    "duplicate_disk_view_count": 0,
+    "enclosure_count": 0,
+    "enclosure_source": "truenas",
+    "manual_mapping_count": 0,
+    "mapped_slot_count": 0,
+    "pool_count": 0,
+    "rendered_unique_disk_count": 0,
+    "source_disk_count": 0,
+    "ssh_slot_hint_count": 0,
+    "unplaced_disk_count": 0
+   },
+   "systems": [],
+   "warnings": []
+  }
  }
 }

@@ -573,6 +573,7 @@ test("where two lines cross, the horizontal one has a gap the vertical runs thro
     assert.equal(gaps.length, G.crossings(model), `${name}: one gap per crossing`);
     assert.equal(overs.length, gaps.length, name);
     assert.doesNotMatch(group[1], /<circle/, `${name}: no dot`);
+    for (const [, x1, y1, x2, y2] of gaps) assert.ok(Math.hypot(Number(x2) - Number(x1), Number(y2) - Number(y1)) > 0, `${name}: the gap at ${x1},${y1} has a length`);
     for (const [, x1, y1, x2] of gaps) {
       const x = (Number(x1) + Number(x2)) / 2;
       const y = Number(y1);

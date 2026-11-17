@@ -428,7 +428,10 @@ test("search finds a bay, a disk identifier or an expander and returns its path"
   const { fabric, ids: parts } = dualPathCascade();
   const model = T.buildTopologyModel(fabric);
   assert.deepEqual([...T.searchTopology(model, "bay 5").matches].map((item) => item.id), ["bay:5"]);
-  assert.deepEqual([...T.searchTopology(model, "5").matches].map((item) => item.id), ["bay:5"], "a number is a bay number, not a substring");
+  // A number is a bay number first; identities that contain it follow.
+  const numbered = [...T.searchTopology(model, "5").matches];
+  assert.equal(numbered[0].id, "bay:5", "a number finds its bay first");
+  assert.ok(numbered.slice(1).every((item) => item.kind === "node" || item.id !== "bay:5"));
   assert.deepEqual([...T.searchTopology(model, "SANITIZED-SER-6").matches].map((item) => item.id), ["bay:6"]);
   assert.deepEqual([...T.searchTopology(model, "da7").matches].map((item) => item.id), ["bay:7"]);
   const found = T.searchTopology(model, parts.mpr1.level2.raw_id);
