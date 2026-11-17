@@ -2417,7 +2417,9 @@
       live.scroll = { left: 0, top: 0 };
       live.firstView = "open";
     } else {
-      if (box) live.scroll = { left: (Number(box.scrollLeft) || 0) - live.room.left, top: (Number(box.scrollTop) || 0) - live.room.top };
+      // With the box's settled height, which a redraw that keeps the view
+      // keeps too.
+      if (box) live.scroll = { left: (Number(box.scrollLeft) || 0) - live.room.left, top: (Number(box.scrollTop) || 0) - live.room.top, height: Number(box.clientHeight) || 0 };
       // Back from Fit: the offsets the drawing had before it was fitted.
       if (live.restoreScroll) live.scroll = live.restoreScroll;
       // A shelf expanded or collapsed: keep its control where the operator
@@ -2488,14 +2490,15 @@
   // Room around the drawing so the view at drawing offsets (left, top) is
   // reachable: before its left or top edge where they are negative, after
   // its right or bottom edge where the view reaches past them. Mount sizes
-  // it every time, so room no later view needs is given back.
-  function sizeRoom(box, left, top) {
+  // it every time, so room no later view needs is given back. boxHeight:
+  // the box's height to size for, else its height as it is.
+  function sizeRoom(box, left, top, boxHeight = null) {
     const svg = box.querySelector?.(".fabric-topology-svg");
     const model = live.model;
     if (!svg || typeof svg.setAttribute !== "function" || !model || live.fit) return { left: 0, top: 0 };
     const room = { left: Math.max(0, Math.ceil(-left)), top: Math.max(0, Math.ceil(-top)) };
     const right = Math.max(Math.ceil(model.width), Math.ceil(left + (Number(box.clientWidth) || 0)));
-    const bottom = Math.max(Math.ceil(model.height), Math.ceil(top + (Number(box.clientHeight) || 0)));
+    const bottom = Math.max(Math.ceil(model.height), Math.ceil(top + (boxHeight ?? (Number(box.clientHeight) || 0))));
     const width = right + room.left;
     const height = bottom + room.top;
     svg.setAttribute("width", String(width));
@@ -2504,58 +2507,105 @@
     return room;
   }
 
+  // A redraw that keeps the view at drawing offsets (left, top) of a box that
+  // was `kept` px tall, where that view needs room after the new drawing:
+  // the room for the box as tall as it was (its own limit wins where the
+  // window got smaller), then the page put back where it was. Returns the
+  // box height the room is then sized for: the box gets shorter only by what
+  // the page can lose below its scroll position, and only for a view at or
+  // above the drawing's top edge. A view below it needs the box at its
+  // height for the offset to stay reachable.
+  function keepView(box, left, top, kept, page) {
+    sizeRoom(box, left, top, kept);
+    const settled = Number(box.clientHeight) || 0;
+    if (!page) return settled;
+    if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
+      window.scrollTo(page.x, page.y);
+    }
+    if (top > 0) return settled;
+    // At its top nothing holds the page back; else what its scroll range
+    // has beyond its scroll position, nothing where the page cannot say.
+    const y = Number(window.scrollY) || 0;
+    if (y <= 0) return 0;
+    const root = typeof document !== "undefined" ? document.documentElement : null;
+    const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
+    const slack = Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
+    return Math.max(0, settled - slack);
+  }
+
   // After the page has put the drawing in place: set its scroll position,
   // and give focus back to Fit after a Fit click. pageScroll: the page's own
   // scroll position ({ x, y }) from before this redraw, when the caller keeps
-  // one to put back; without it a kept control is aimed at the page as it is.
+  // one to put back; without it a kept control is aimed at the page as it
+  // is, and a kept view keeps its offsets and the box's height.
   function mount(container, pageScroll = null) {
     const box = scrollBox(container);
     if (box) {
       const reason = live.firstView;
       live.firstView = null;
       const width = Number(box.clientWidth) || live.model?.box?.width || 0;
+      const page = pageScroll && Number.isFinite(pageScroll.x) && Number.isFinite(pageScroll.y) ? pageScroll : null;
       // Offsets in drawing coordinates: negative ones lie before its edge.
       let left = live.scroll.left;
       let top = live.scroll.top;
+      // The box height the room is sized for at the end; null: as it is then.
+      let height = null;
       const group = reason?.expand ? live.model?.groupById.get(reason.expand) : null;
-      if (reason?.control && group && !live.fit) {
-        // The shelf's expand control where it was on the screen: both
-        // offsets, and the box's own move on the page, taken into account.
-        // The room changes the drawing's height, so the box's own height
-        // (up to its limit) and the page around it can still change: aim
-        // again from where the box settled, and size the room for that.
-        const control = toggleBox(group);
-        const aim = () => {
-          const rect = boxRect(box);
-          left = rect.left + control.x - reason.control.x;
-          top = rect.top + control.y - reason.control.y;
-        };
-        const page = pageScroll && Number.isFinite(pageScroll.x) && Number.isFinite(pageScroll.y) ? pageScroll : null;
-        aim();
-        if (page) {
-          // The box is never taller than the window, so room of one window
-          // height after the aimed view lets it reach its height limit. While
-          // that room is there the page is as long as it gets, and its own
-          // scroll position, lost while the shorter drawing was in place,
-          // can be put back before the control is aimed at for good.
-          const roomToHeightLimit = Number(window.innerHeight) || 0;
-          sizeRoom(box, left, top + roomToHeightLimit);
-          if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
-            window.scrollTo(page.x, page.y);
+      // The room is sized exactly for the view at the end, also when putting
+      // the page back throws, so no room sized on the way outlives an error.
+      try {
+        if (reason?.control && group && !live.fit) {
+          // The shelf's expand control where it was on the screen: both
+          // offsets, and the box's own move on the page, taken into account.
+          // The room changes the drawing's height, so the box's own height
+          // (up to its limit) and the page around it can still change: aim
+          // again from where the box settled, and size the room for that.
+          const control = toggleBox(group);
+          const aim = () => {
+            const rect = boxRect(box);
+            left = rect.left + control.x - reason.control.x;
+            top = rect.top + control.y - reason.control.y;
+          };
+          aim();
+          if (page) {
+            // The box is never taller than the window, so room of one window
+            // height after the aimed view lets it reach its height limit. While
+            // that room is there the page is as long as it gets, and its own
+            // scroll position, lost while the shorter drawing was in place,
+            // can be put back before the control is aimed at for good.
+            const roomToHeightLimit = Number(window.innerHeight) || 0;
+            sizeRoom(box, left, top + roomToHeightLimit);
+            if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
+              window.scrollTo(page.x, page.y);
+            }
+          } else {
+            sizeRoom(box, left, top);
           }
+          aim();
         } else {
-          sizeRoom(box, left, top);
+          if (reason && live.model && !live.fit && width) {
+            left = firstViewLeft(live.model, reason, width, live.scroll.left);
+            if (reason === "open") top = 0;
+          }
+          // A redraw that keeps the view (a pin, a selection, a search, a
+          // refresh, a shelf whose control was out of view) moves neither the
+          // page nor the drawing. The new drawing is in place at its own size,
+          // so the box is for now only as tall as that drawing: where the kept
+          // view, with the box as tall as it was, reaches past the drawing's
+          // bottom edge, the room is first sized for that box. Any other
+          // redraw sizes the room once and reads nothing of the page.
+          const kept = reason === "open" ? 0 : Number(live.scroll.height) || 0;
+          if (kept > 0 && live.model && !live.fit && Math.ceil(top + kept) > Math.ceil(live.model.height)) {
+            height = keepView(box, left, top, kept, page);
+          }
         }
-        aim();
-      } else if (reason && live.model && !live.fit && width) {
-        left = firstViewLeft(live.model, reason, width, live.scroll.left);
-        if (reason === "open") top = 0;
+      } finally {
+        live.room = sizeRoom(box, left, top, height);
+        left += live.room.left;
+        top += live.room.top;
+        if (box.scrollLeft !== left) box.scrollLeft = left;
+        if (box.scrollTop !== top) box.scrollTop = top;
       }
-      live.room = sizeRoom(box, left, top);
-      left += live.room.left;
-      top += live.room.top;
-      if (box.scrollLeft !== left) box.scrollLeft = left;
-      if (box.scrollTop !== top) box.scrollTop = top;
       // The box's inner width differs from the width the drawing was laid
       // out for (a scroll bar came or went): lay it out once more.
       // Once per inner width while Topology is shown, so a scroll bar that comes and goes cannot loop.
