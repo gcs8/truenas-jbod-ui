@@ -802,6 +802,35 @@ test("leaving Topology through the mode buttons clears its pin, trace and search
   }
 });
 
+test("a pinned link's facts leave the inspector when the selected scope has no fabric to draw", () => {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  const { page, elements } = loadFullPage(T, dom.document, fabric, cases.core_cascade.snapshot);
+  const panel = elements.get("fabric-map-panel");
+  const title = elements.get("fabric-inspector-title");
+  const body = elements.get("fabric-inspector-body");
+  page.state.mode = "topology";
+  page.render();
+  const bundle = [...T.buildTopologyModel(fabric).links].find((item) => item.bundle);
+  panel.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
+  const pinned = T.inspectorDetail();
+  assert.ok(pinned, "the bundle is pinned");
+  assert.equal(body.innerHTML, pinned.html, "the inspector shows the pinned link");
+  // The operator stays in Topology and selects a system whose fabric is not available.
+  page.state.fabric = { ...fabric, system_id: "synthetic-other", available: false };
+  page.render();
+  assert.equal(T.inspectorDetail(), null, "the pin is gone with the scope it belonged to");
+  assert.notEqual(title.textContent, pinned.title);
+  assert.notEqual(body.innerHTML, pinned.html, "the other scope's link facts are not shown");
+  assert.equal(T.view().pin, null);
+  // Back on the first system nothing is pinned.
+  page.state.fabric = fabric;
+  page.render();
+  assert.equal(T.inspectorDetail(), null, "no pin comes back");
+  assert.doesNotMatch(panel.innerHTML, /is-pinned/);
+});
+
 test("the Path Focus and Disk Path strip is hidden in Topology and returns in the older modes", () => {
   const dom = fakeDom();
   const T = H.loadTopology({ document: dom.document });

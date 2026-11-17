@@ -4206,6 +4206,8 @@
       return;
     }
     if (fabric.available === false) {
+      // Nothing is drawn for this scope, so a pin from the scope before it must not stay.
+      window.SasFabricTopology?.release();
       const copy = fabricViewCopy(fabric);
       elements.mapPanel.innerHTML = `<div class="warning-item muted compact">${escapeHtml(copy.unavailableMap)}</div>`;
       renderFocusStrip(fabric);
