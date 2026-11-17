@@ -60,6 +60,7 @@ const UI_SOURCES = {
     "admin_service/static/admin.js",
     "admin_service/static/admin_backup_model.js",
     "admin_service/static/admin_backups.js",
+    "admin_service/static/admin_profile_model.js",
     "history_service/static/dashboard.js",
   ],
 };
