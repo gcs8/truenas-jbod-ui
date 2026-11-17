@@ -306,26 +306,6 @@ textarea {
   margin-top: 8px;
 }
 
-.snapshot-banner-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.snapshot-banner-fact {
-  display: inline-flex;
-  align-items: center;
-  min-height: 30px;
-  padding: 6px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.2;
-}
-
 .snapshot-banner-meta {
   flex: 1 1 360px;
   display: grid;
