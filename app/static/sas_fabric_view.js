@@ -1760,24 +1760,32 @@
 
   // A count is a measurement only when its read was whole. The producer says
   // which controller-side counts were not read (CORE `raw.controller_read`).
-  // Payloads without that field keep their counts as before.
+  // complete | partial | not_read, or unknown when a CORE payload does not
+  // say (same rule as the Topology status chips). Payloads outside the CORE
+  // controller-read contract never carry the field and keep their counts.
   function fabricCountState(fabric, domain) {
     const counts = fabric?.raw?.controller_read?.counts;
-    if (!counts || typeof counts !== "object") return "complete";
+    const core = fabric?.platform === "core" || fabric?.raw?.fabric_kind === "core_mpr";
+    if (!counts || typeof counts !== "object") return core ? "unknown" : "complete";
     const value = counts[domain];
+    if (value === undefined || value === null) return "unknown";
     return value === "complete" || value === "partial" ? value : "not_read";
   }
 
+  // Unknown completeness is not a missed read: the page status keeps its
+  // existing reading of it, and only the counts themselves say so.
   function fabricCountsIncomplete(fabric) {
-    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete")
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => !["complete", "unknown"].includes(fabricCountState(fabric, domain)))
       || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
   }
 
-  // "3", "at least 3" (some reads missing) or "not read". Never a bare 0
-  // for a count whose read did not happen.
+  // "3", "at least 3" (some reads missing), "not read", or for a count whose
+  // completeness was not reported "3, completeness not reported" or "not
+  // reported". Never a bare number for a count nobody vouched for.
   function fabricCountText(fabric, domain, count) {
     const readState = fabricCountState(fabric, domain);
     if (readState === "complete") return String(count);
+    if (readState === "unknown") return count > 0 ? `${count}, completeness not reported` : "not reported";
     return readState === "partial" && count > 0 ? `at least ${count}` : "not read";
   }
 
@@ -1785,6 +1793,7 @@
     const readState = fabricCountState(fabric, domain);
     const plural = `${noun}s`;
     if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    if (readState === "unknown") return count > 0 ? `${count} ${count === 1 ? noun : plural}, completeness not reported` : `${plural} not reported`;
     return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
   }
 
