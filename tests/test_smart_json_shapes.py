@@ -6,6 +6,7 @@ raise through the typed summary boundary and must never become a reading.
 Valid payloads are the controls: they still produce the same readings.
 """
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from unittest.mock import AsyncMock
 
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
-from app.services.inventory import InventoryService, slot_detail_collection_binding
+from app.services.inventory import InventoryService, SmartDetailBatch, slot_detail_collection_binding
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     parse_nvme_id_ctrl_summary,
@@ -1180,7 +1181,13 @@ class RefusedPowerOnStoreTests(unittest.TestCase):
         summary = service._merge_smart_summary(slot, service._build_quantastor_smart_summary(slot))
         entry = service._build_slot_detail_entry(slot, smart_summary=summary)
         self.assertIsNotNone(entry)
-        service._persist_slot_detail_entries([entry])
+        # Save it the way a SMART read does: one request batch, one flush.
+        async def flush() -> None:
+            batch = SmartDetailBatch(service.slot_detail_store)
+            batch.pending.append(entry)
+            await batch.flush()
+
+        asyncio.run(flush())
         return entry
 
     def _store(self, smart_fields: dict) -> None:
