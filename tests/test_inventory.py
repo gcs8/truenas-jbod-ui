@@ -23494,7 +23494,6 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
 
             service._run_ssh_commands = AsyncMock(side_effect=inventory_commands)
             build_hints = service._build_quantastor_cli_disk_hints
-            resolve_hint = service._resolve_quantastor_cli_disk_hint
             resolver_comparisons = []
 
             def observe_hints(parsed_rows):
@@ -23503,16 +23502,6 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                 hint_comparisons.append(comparisons - before)
                 hint_sizes.append(len(parsed_rows))
                 return result
-
-            def observe_resolver(row, hints):
-                nonlocal in_resolver
-                before = comparisons
-                in_resolver = True
-                try:
-                    return resolve_hint(row, hints)
-                finally:
-                    in_resolver = False
-                    resolver_comparisons.append(comparisons - before)
 
             normalize = InventoryService._quantastor_cli_identity
 
@@ -23524,21 +23513,19 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                 return normalize(row)
 
             service._build_quantastor_cli_disk_hints = observe_hints
-            service._resolve_quantastor_cli_disk_hint = observe_resolver
-            if hasattr(service, "_resolve_quantastor_cli_disk_hints"):
-                resolve_batch = service._resolve_quantastor_cli_disk_hints
+            resolve_batch = service._resolve_quantastor_cli_disk_hints
 
-                def observe_batch(disks, hints):
-                    nonlocal in_resolver
-                    before = comparisons
-                    in_resolver = True
-                    try:
-                        return resolve_batch(disks, hints)
-                    finally:
-                        in_resolver = False
-                        resolver_comparisons.extend([comparisons - before] + [0] * (len(disks) - 1))
+            def observe_batch(disks, hints):
+                nonlocal in_resolver
+                before = comparisons
+                in_resolver = True
+                try:
+                    return resolve_batch(disks, hints)
+                finally:
+                    in_resolver = False
+                    resolver_comparisons.extend([comparisons - before] + [0] * (len(disks) - 1))
 
-                service._resolve_quantastor_cli_disk_hints = observe_batch
+            service._resolve_quantastor_cli_disk_hints = observe_batch
             with patch.object(InventoryService, "_quantastor_cli_identity", side_effect=observe_identity):
                 snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
             snapshot_comparisons = comparisons

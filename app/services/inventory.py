@@ -10582,15 +10582,6 @@ class InventoryService(InventorySourceCollectionMixin):
         return hints
 
     @classmethod
-    def _resolve_quantastor_cli_disk_hint(
-        cls,
-        disk: dict[str, Any],
-        hints: _QuantastorCliDiskHints,
-    ) -> dict[str, Any] | None:
-        # Compatibility for single-query callers. Inventory uses one batch.
-        return cls._resolve_quantastor_cli_disk_hints([disk], hints)[0]
-
-    @classmethod
     def _resolve_quantastor_cli_disk_hints(
         cls,
         disks: list[dict[str, Any]],
