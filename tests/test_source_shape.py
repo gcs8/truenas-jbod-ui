@@ -34,7 +34,7 @@ MAX_CEILING_ROOM = 750
 SIZE_CEILINGS: dict[str, int] = {
     "admin_service/static/admin.js": 9750,
 
-    "app/services/inventory.py": 18250,
+    "app/services/inventory.py": 18000,
 
     "app/services/parsers.py": 4500,
 

@@ -23532,7 +23532,11 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
             return values
 
         root = Path(__file__).resolve().parents[1]
-        backend = emitted(root / "app/services/inventory.py") | emitted(root / "app/services/public_demo_fixture.py")
+        backend = (
+            emitted(root / "app/services/inventory.py")
+            | emitted(root / "app/services/inventory_projection.py")
+            | emitted(root / "app/services/public_demo_fixture.py")
+        )
         backend.add(ManualMapping.model_fields["source"].default)
         backend |= set(typing.get_args(StorageViewRuntimeSlot.model_fields["source"].annotation))
         # The walk must keep finding the values the issue names.
