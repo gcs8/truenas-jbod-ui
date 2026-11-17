@@ -157,6 +157,36 @@ class PlacementIndexBasicsTests(unittest.TestCase):
             with self.subTest(keys=keys), self.assertRaises(TypeError):
                 index.resolve("enc-a", keys)
 
+    def test_none_is_a_valid_key(self):
+        index = build([
+            ("enc-a", None, "disk-1", "record-1"),
+            ("enc-a", "sda", "disk-1", "record-1"),
+            ("enc-b", None, "disk-2", "record-2"),
+            ("enc-b", None, "disk-3", "record-3"),
+        ])
+        expected = Resolution(UNIQUE, "record-1", 1, frozenset({"disk-1"}))
+        self.assertEqual(index.resolve("enc-a", [None]), expected)
+        self.assertEqual(index.resolve("enc-a", [None, "sda"]), expected)
+        self.assertEqual(index.keys("enc-a"), frozenset({None, "sda"}))
+        self.assertEqual(index.unique("enc-a"), {None: "record-1", "sda": "record-1"})
+        self.assertEqual(
+            index.resolve("enc-b", [None]),
+            Resolution(AMBIGUOUS, None, 2, frozenset({"disk-2", "disk-3"})),
+        )
+        self.assertEqual(index.keys("enc-b"), frozenset({None}))
+        self.assertEqual(index.unique("enc-b"), {})
+
+    def test_unique_keeps_an_admitted_none_value(self):
+        index = build([
+            ("enc-a", "bay-0", "disk-1", None),
+            ("enc-a", "sda", "disk-1", None),
+            ("enc-a", "bay-1", "disk-2", None),
+            ("enc-a", "bay-1", "disk-3", None),
+        ])
+        self.assertEqual(index.resolve("enc-a", ["bay-0"]), Resolution(UNIQUE, None, 1, frozenset({"disk-1"})))
+        self.assertEqual(index.unique("enc-a"), {"bay-0": None, "sda": None})
+        self.assertEqual(index.keys("enc-a"), frozenset({"bay-0", "sda", "bay-1"}))
+
     def test_rank_must_be_an_integer(self):
         index = PlacementIndex()
         for rank in (1.5, "1", None, True):
@@ -185,6 +215,36 @@ class PlacementIndexRankTests(unittest.TestCase):
         calls.append(("sas", "sas-alias-2", "disk-2", "record-2", 1))
         for order in itertools.permutations(calls):
             self.assertEqual(build(order).resolve("sas", ["sas-alias-2"]).value, "record-2")
+
+    def test_higher_rank_replaces_a_key_saturated_at_a_lower_rank(self):
+        low = []
+        for n in range(3 * CLAIMANT_LIMIT):
+            low.append(("sas", "sas-alias-4", f"disk-{n}", f"record-{n}", 0))
+            low.append(("sas", "sas-alias-4", f"disk-{n}", f"record-{n}", 0))
+            low.append(("sas", f"bay-{n}", f"disk-{n}", f"record-{n}", 0))
+        self.assertEqual(
+            build(low).resolve("sas", ["sas-alias-4"]),
+            Resolution(AMBIGUOUS, None, CLAIMANT_LIMIT + 1, None),
+        )
+        half = len(low) // 2
+        for claimant, value, alias in (("disk-x", "record-x", "wwn-x"), ("disk-0", "record-0", "bay-0")):
+            high = [
+                ("sas", "sas-alias-4", claimant, value, 1),
+                ("sas", "sas-alias-4", claimant, value, 1),
+                ("sas", alias, claimant, value, 1),
+            ]
+            expected = Resolution(UNIQUE, value, 1, frozenset({claimant}))
+            for order, calls in (("high first", high + low), ("high last", low + high),
+                                 ("high between", low[:half] + high + low[half:])):
+                with self.subTest(claimant=claimant, order=order):
+                    index = build(calls)
+                    self.assertEqual(index.resolve("sas", ["sas-alias-4"]), expected)
+                    self.assertEqual(index.resolve("sas", ["sas-alias-4", alias]), expected)
+                    self.assertEqual(index.resolve("sas", [alias, "sas-alias-4", alias]), expected)
+                    self.assertEqual(index.unique("sas")["sas-alias-4"], value)
+                    self.assertEqual(
+                        index.resolve("sas", ["bay-1"]), Resolution(UNIQUE, "record-1", 1, frozenset({"disk-1"})),
+                    )
 
     def test_equal_top_ranks_tie_to_ambiguous_even_with_lower_rank_support(self):
         calls = [

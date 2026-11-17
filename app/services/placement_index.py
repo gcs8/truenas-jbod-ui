@@ -12,6 +12,9 @@ index answers instead with one of three states:
   values). The value is withheld. The caller decides what that means; the
   index never turns it into ``missing``.
 
+Callers read ``state``, never ``claimant_count``: an ambiguous answer can
+carry a count of 1 when one claimant named two different values.
+
 Rules, all independent of the order of ``add`` calls:
 
 - A claimant identifies one observation. Several keys (aliases) of one
