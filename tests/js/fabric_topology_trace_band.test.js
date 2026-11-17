@@ -1,12 +1,14 @@
 "use strict";
 
-// Storage Fabric Topology mode (#937, #1361, #1369): the trace band under the
-// drawing keeps one height for any sentence its drawing can show. The band is
-// a one-cell grid: the visible sentence and one hidden sizer for every
-// distinct sentence the drawing can show share the cell, so the band takes
-// the tallest height and reflows with the width by itself. The only sentences
-// without a sizer are exact duplicates and a trace that is the start of its
-// own held-pin trace. There is no limit on the number of sizers.
+// Storage Fabric Topology mode (#937, #1369): the trace band under the
+// drawing keeps one height for any sentence its drawing can show. The band
+// holds the visible sentence and one empty, hidden measurer. When a drawing
+// is put in place, every distinct sentence that drawing can show is laid out
+// once in the measurer at the band's width, the tallest is read, rounded up
+// and held as the band's height, and the measurer is emptied again. Hover,
+// focus and a pin that keeps the same sentences change only the visible text.
+// The only sentences left out of the measure are exact duplicates and a
+// trace that is the start of its own held-pin trace. There is no limit.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -17,6 +19,7 @@ const H = require("./helpers/fabric_topology");
 
 const SOURCE_PATH = path.join(H.ROOT, "app/static/sas_fabric_topology.js");
 const CSS_PATH = path.join(H.ROOT, "app/static/sas_fabric_topology.css");
+const BUILDER = "function traceSentences(model, view = {}) {";
 
 function loadSource(source, context = {}) {
   const sandbox = vm.createContext({ window: {}, document: { addEventListener() {} }, ...context });
@@ -26,10 +29,6 @@ function loadSource(source, context = {}) {
 
 function unescape(text) {
   return text.replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
-}
-
-function sizersOf(html) {
-  return [...html.matchAll(/data-topology-sizer="([^"]*)"/g)].map((match) => unescape(match[1]));
 }
 
 // The drawn items a pointer or keyboard can reach, from the markup.
@@ -43,50 +42,235 @@ function drawnRefs(html) {
   return [...seen.values()];
 }
 
-// The page around the drawing, as far as hover, focus, a pin and Esc reach it.
-function page(T, keys) {
-  const handlers = new Map();
-  const pin = { textContent: "" };
-  const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
-  const container = {
-    dataset: {},
-    querySelector: (selector) => (selector === ".fabric-topology" ? root : null),
-    addEventListener: (name, handler) => handlers.set(name, handler),
-  };
-  T.attach(container, null, null, {});
-  const element = (ref) => ({
-    dataset: { [ref.key]: ref.id },
-    closest(selector) {
-      if (selector === ".fabric-topology") return root;
-      return /\[data-topo-/.test(selector) ? this : null;
-    },
-  });
-  const escape = () => keys?.get("keydown")?.({ key: "Escape", target: null });
-  return { handlers, pin, element, escape };
-}
-
-// A topology view whose document keydown handler (Esc) the test can call.
-function loadWithKeys(T = null) {
-  const keys = new Map();
-  const view = T || H.loadTopology({ document: { addEventListener: (name, handler) => keys.set(name, handler) } });
-  return { T: view, keys };
-}
-
 function visibleOf(html) {
   return unescape(/data-topology-pin>([^<]*)</.exec(html)[1]);
+}
+
+function band(html) {
+  const found = /<div class="fabric-topology-trace" data-topology-trace>([\s\S]*?)<\/div><p class="fabric-topology-not-shown/.exec(html);
+  assert.ok(found, "the band is one element");
+  return found[1];
+}
+
+// Glyph advances of a fake layout, in px: a wide W, a narrow i, 7 px for the
+// rest. A sentence takes whole lines of 20.2 px at the measurer's width.
+function advance(text) {
+  let sum = 0;
+  for (const glyph of text) sum += glyph === "W" ? 14 : glyph === "i" ? 3.5 : 7;
+  return sum;
+}
+
+function lineLayout(text, width) {
+  return Math.max(1, Math.ceil(advance(text) / width)) * 20.2;
+}
+
+const LAYOUT_KEYS = ["clientWidth", "clientHeight", "offsetWidth", "offsetHeight", "scrollWidth", "scrollHeight"];
+
+// A page around the drawing. Each draw puts a new band in place, as the page
+// does when it replaces the map's markup: the visible paragraph, the
+// measurer and a fake layout that lays out what the measurer holds. Every
+// layout read, computed-style read, measure and held-height write is counted.
+function fakePage(T0 = null, settings = {}) {
+  const env = { width: 340, font: "16px sans-serif", lineHeight: "20px", dpr: 1, layout: lineLayout, ...settings };
+  const counts = { measures: 0, reads: 0, styleReads: 0, holds: 0, markupWrites: 0 };
+  const log = [];
+  const fills = [];
+  const handlers = new Map();
+  const docHandlers = new Map();
+  const fontHandlers = new Map();
+  const media = [];
+  const observers = [];
+  const read = (name) => {
+    counts.reads += 1;
+    log.push(`read ${name}`);
+  };
+  const countReads = (target, name) => {
+    for (const key of LAYOUT_KEYS) Object.defineProperty(target, key, { get() { read(`${name}.${key}`); return env.width; } });
+  };
+  const element = (tag) => ({ tagName: tag.toUpperCase(), className: "", textContent: "" });
+  const doc = {
+    createElement: (tag) => element(tag),
+    createDocumentFragment() {
+      const fragment = { fragment: true, children: [] };
+      fragment.appendChild = (child) => { fragment.children.push(child); return child; };
+      fragment.append = (...nodes) => { fragment.children.push(...nodes); };
+      return fragment;
+    },
+  };
+  const rootStyle = new Map();
+  const root = {
+    style: { setProperty: (name, value) => rootStyle.set(name, value) },
+    querySelector: (selector) => (selector === "[data-topology-trace]" ? current : current.querySelector(selector)),
+    querySelectorAll: () => [],
+  };
+  let current = null;
+  function newBand(visible) {
+    const measurer = { ownerDocument: doc, children: [] };
+    const add = (nodes) => {
+      for (const node of nodes) {
+        if (typeof node === "string") throw new Error("text, not an element, given to the measurer");
+        measurer.children.push(...(node.fragment ? node.children : [node]));
+      }
+    };
+    measurer.appendChild = (child) => { add([child]); return child; };
+    measurer.append = (...nodes) => add(nodes);
+    measurer.replaceChildren = (...nodes) => { measurer.children = []; add(nodes); };
+    Object.defineProperty(measurer, "textContent", {
+      get: () => measurer.children.map((child) => child.textContent).join(""),
+      set(value) {
+        assert.equal(value, "", "the measurer is only emptied through its text");
+        measurer.children = [];
+      },
+    });
+    Object.defineProperty(measurer, "innerHTML", { get: () => "", set() { counts.markupWrites += 1; } });
+    measurer.getBoundingClientRect = () => {
+      read("measurer.rect");
+      const texts = measurer.children.map((child) => child.textContent);
+      if (texts.length) {
+        counts.measures += 1;
+        fills.push({ texts, elements: measurer.children.map((child) => ({ tag: child.tagName, className: child.className })), width: env.width });
+      }
+      const height = texts.length ? Math.max(...texts.map((text) => env.layout(text, env.width))) : 0;
+      return { width: env.width, height, left: 0, top: 0, right: env.width, bottom: height };
+    };
+    countReads(measurer, "measurer");
+    const para = { textContent: visible, className: "fabric-topology-pin subtle", getBoundingClientRect() { read("pin.rect"); return { width: env.width, height: 20 }; } };
+    countReads(para, "pin");
+    const style = new Map();
+    const item = {
+      measurer,
+      para,
+      style: {
+        setProperty(name, value) {
+          style.set(name, value);
+          if (name === "--topology-trace-held") {
+            counts.holds += 1;
+            log.push(`hold ${value}`);
+          }
+        },
+        getPropertyValue: (name) => style.get(name) || "",
+      },
+      held: () => style.get("--topology-trace-held") || null,
+      querySelector: (selector) => ({ "[data-topology-measure]": measurer, "[data-topology-pin]": para })[selector] || null,
+      closest: (selector) => (selector === ".fabric-topology" ? root : null),
+      getBoundingClientRect() {
+        read("band.rect");
+        return { width: env.width, height: 0, left: 0, top: 0, right: env.width, bottom: 0 };
+      },
+    };
+    countReads(item, "band");
+    return item;
+  }
+  current = newBand("");
+  const container = {
+    dataset: {},
+    box: null,
+    querySelector(selector) {
+      if (selector === ".fabric-topology") return root;
+      if (selector === ".fabric-topology-scroll") return container.box;
+      return root.querySelector(selector);
+    },
+    addEventListener: (name, handler) => handlers.set(name, handler),
+  };
+  class FakeResizeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.targets = [];
+      observers.push(this);
+    }
+    observe(target, options) { this.targets.push({ target, options }); }
+    disconnect() { this.targets = []; }
+  }
+  const window = {
+    get devicePixelRatio() { return env.dpr; },
+    getComputedStyle(target) {
+      counts.styleReads += 1;
+      log.push("style");
+      return { font: target === current.para ? env.font : "", lineHeight: target === current.para ? env.lineHeight : "" };
+    },
+    matchMedia(query) {
+      const entry = { query, listeners: [] };
+      entry.addEventListener = (type, listener) => { if (type === "change") entry.listeners.push(listener); };
+      entry.removeEventListener = (type, listener) => { entry.listeners = entry.listeners.filter((item) => item !== listener); };
+      media.push(entry);
+      return entry;
+    },
+    ResizeObserver: FakeResizeObserver,
+  };
+  const document = {
+    addEventListener: (name, handler) => docHandlers.set(name, handler),
+    removeEventListener: (name) => docHandlers.delete(name),
+    fonts: {
+      addEventListener: (name, handler) => fontHandlers.set(name, handler),
+      removeEventListener: (name) => fontHandlers.delete(name),
+    },
+  };
+  const T = T0 ? T0({ window, document }) : loadSource(fs.readFileSync(SOURCE_PATH, "utf8"), { window, document });
+  T.attach(container, null, null, {});
+  const page = {
+    T,
+    env,
+    counts,
+    log,
+    fills,
+    handlers,
+    docHandlers,
+    fontHandlers,
+    media,
+    observers,
+    container,
+    rootStyle,
+    get band() { return current; },
+    get pin() { return current.para; },
+    // The page's redraw: new markup in place, then mount.
+    draw(fabric, options = {}, placed = null) {
+      const html = T.render(fabric, options);
+      current = newBand(visibleOf(html));
+      placed?.();
+      T.mount(container);
+      return html;
+    },
+    // The band's observer reports a size.
+    resize(inline, block = 49) {
+      for (const observer of observers) {
+        for (const { target } of observer.targets) observer.callback([{ target, borderBoxSize: [{ inlineSize: inline, blockSize: block }] }]);
+      }
+    },
+    element: (ref) => ({
+      dataset: { [ref.key]: ref.id },
+      closest(selector) {
+        if (selector === ".fabric-topology") return root;
+        return /\[data-topo-/.test(selector) ? this : null;
+      },
+    }),
+    escape: () => docHandlers.get("keydown")?.({ key: "Escape", target: null }),
+    lastFill() {
+      assert.ok(fills.length, "the band was measured");
+      return fills[fills.length - 1].texts;
+    },
+  };
+  return page;
+}
+
+// A topology view whose sentence builder records every list it returns.
+function recorded(calls) {
+  const source = fs.readFileSync(SOURCE_PATH, "utf8");
+  assert.equal(source.split(BUILDER).length - 1, 1, "the sentence builder is one function");
+  const wrapped = source.replace(BUILDER, "function traceSentences(model, view = {}) { const made = traceSentencesBuilt(model, view); calls.lists.push(made); return made; }\n  function traceSentencesBuilt(model, view = {}) {");
+  return (context) => loadSource(wrapped, { ...context, calls });
 }
 
 // Every sentence the band shows in one drawing, through the real handlers:
 // the sentence the drawing starts with; every drawn item hovered and focused
 // with no pin and with a pin held (also the pin the drawing starts with);
 // every item that can be pinned, pinned.
-function producible(T, fabric, options, keys = null) {
-  const { handlers, pin, element, escape } = page(T, keys);
-  const html = T.render(fabric, options);
+function producible(page, fabric, options) {
+  const { handlers, element } = page;
+  const html = page.draw(fabric, options);
   const sentences = new Set([visibleOf(html)]);
   const refs = drawnRefs(html);
   const pinnable = refs.filter((ref) => ref.kind !== "group");
-  const see = () => sentences.add(pin.textContent);
+  const see = () => sentences.add(page.pin.textContent);
   const visit = () => {
     for (const ref of refs) {
       handlers.get("mouseover")({ target: element(ref) });
@@ -99,25 +283,21 @@ function producible(T, fabric, options, keys = null) {
       see();
     }
   };
-  // With the drawing's own pin, if it starts with one.
   visit();
-  if (keys) {
-    escape();
-    see();
-    visit();
-  }
+  page.escape();
+  see();
+  visit();
   for (const ref of pinnable) {
     handlers.get("click")({ target: element(ref) });
     see();
   }
-  // A pin held: hover and focus each item.
   if (pinnable.length) handlers.get("click")({ target: element(pinnable[0]) });
   visit();
   sentences.delete("");
   return { html, sentences: [...sentences] };
 }
 
-// The sentences that need a sizer: every distinct one that is not the start
+// The sentences the measure needs: every distinct one that is not the start
 // of another the drawing can show (sorted, a string's longer continuations
 // follow it directly).
 function needed(sentences) {
@@ -125,16 +305,14 @@ function needed(sentences) {
   return sorted.filter((text, index) => !(index + 1 < sorted.length && sorted[index + 1].startsWith(text)));
 }
 
-// Every sentence the band shows is a sizer or the start of one; every sizer
-// is a sentence the band can show; one sizer each, no limit.
-function assertCovered(name, html, sentences) {
-  const sizers = sizersOf(html);
-  assert.equal(new Set(sizers).size, sizers.length, `${name}: no sentence twice`);
-  const kept = new Set(sizers);
+// Every sentence the band shows is measured, or is the start of one that is;
+// every measured sentence is one the band can show; each once, no limit.
+function assertCovered(name, measured, sentences) {
+  assert.equal(new Set(measured).size, measured.length, `${name}: no sentence twice`);
+  const kept = new Set(measured);
   const sorted = [...kept].sort();
   const covered = (text) => {
     if (kept.has(text)) return true;
-    // The first sizer at or after the text in sorted order starts with it if any does.
     let low = 0;
     let high = sorted.length;
     while (low < high) {
@@ -145,11 +323,10 @@ function assertCovered(name, html, sentences) {
     return low < sorted.length && sorted[low].startsWith(text);
   };
   const missing = sentences.filter((text) => !covered(text));
-  assert.deepEqual(missing.slice(0, 3), [], `${name}: ${missing.length} sentences the band can show have no sizer`);
+  assert.deepEqual(missing.slice(0, 3), [], `${name}: ${missing.length} sentences the band can show are not measured`);
   const shown = new Set(sentences);
-  for (const sizer of sizers) assert.ok(shown.has(sizer), `${name}: a sizer the band can show: ${sizer}`);
-  assert.equal(sizers.length, needed(sentences).length, `${name}: one sizer for each distinct sentence, no limit`);
-  return sizers;
+  for (const text of measured) assert.ok(shown.has(text), `${name}: a measured sentence the band can show: ${text}`);
+  assert.equal(measured.length, needed(sentences).length, `${name}: each distinct sentence measured, no limit`);
 }
 
 function longest(sentences) {
@@ -195,7 +372,17 @@ function bayCount(html) {
   return drawnRefs(html).filter((ref) => ref.kind === "bay").length;
 }
 
-test("every sentence the band shows, through hover, focus, a pin and a held pin, has a sizer, from small drawings to 1,696 bays drawn in full", () => {
+// Round 1's adversarial labels: bays 00-07 long runs of narrow letters, bay
+// 08 fewer, wide ones. A sample by character count misses bay 08.
+function adversarial() {
+  const fabric = H.twoHbaCascade().fabric;
+  const bay = (slot) => fabric.nodes.find((item) => item.id === `bay:${slot}`);
+  for (let index = 0; index < 8; index += 1) bay(index).label = `Bay ${String(index).padStart(2, "0")} ${"i ".repeat(80 + (index % 2))}`;
+  bay(8).label = `Bay 08 ${"W".repeat(140)}`;
+  return fabric;
+}
+
+test("every sentence the band shows, through hover, focus, a pin and a held pin, is measured, from small drawings to 1,696 bays drawn in full", () => {
   const shelf = bigShelf();
   const sixteen = H.eightHbaSixteenShelves().fabric;
   const plan = H.loadTopology({ document: { addEventListener() {} } });
@@ -212,109 +399,61 @@ test("every sentence the band shows, through hover, focus, a pin and a held pin,
     ["sixteen shelves, 1,696 bays drawn in full", sixteen, { width: 1100, expanded: expandedAll(plan, sixteen) }, 1696],
   ];
   for (const [name, fabric, options, bays] of cases) {
-    const { T, keys } = loadWithKeys();
-    const { html, sentences } = producible(T, fabric, options, keys);
+    const calls = { lists: [] };
+    const page = fakePage(recorded(calls));
+    const { html, sentences } = producible(page, fabric, options);
     if (bays !== null) assert.equal(bayCount(html), bays, `${name}: bays drawn`);
-    const sizers = assertCovered(name, html, sentences);
-    assert.ok(sizers.includes(longest(sentences)), `${name}: the longest sentence is a sizer`);
-    if (options.selection) assert.ok(sizers.includes(visibleOf(html)) && /^Pinned: Bay 999,/.test(visibleOf(html)), `${name}: the hidden pin's sentence is a sizer`);
+    assert.equal(page.fills.length, 1, `${name}: one measure for the drawing`);
+    const measured = page.lastFill();
+    // What the measurer holds is the builder's whole list, in its order.
+    assert.equal(calls.lists.length, 1, `${name}: one build`);
+    assert.deepEqual(measured, [...calls.lists[0]], `${name}: the builder's list, not a part of it`);
+    assertCovered(name, measured, sentences);
+    assert.ok(measured.includes(longest(sentences)), `${name}: the longest sentence is measured`);
+    if (options.selection) assert.ok(measured.includes(visibleOf(html)) && /^Pinned: Bay 999,/.test(visibleOf(html)), `${name}: the hidden pin's sentence is measured`);
+    if (bays === 1696) assert.ok(measured.length > 2 * 1696, `${measured.length} sentences`);
   }
-  const T = H.loadTopology({ document: { addEventListener() {} } });
-  const wide = sizersOf(T.render(widePort(), { width: 1100 }));
-  assert.ok(wide.some((text) => text.includes("PHYs 24, 25, 26, 27, 28, 29, 30, 31 to PHYs 0, 1, 2, 3, 4, 5, 6, 7. Pinned item kept; Esc clears.")),
-    "the wide port's whole PHY list is in a sizer");
+  const page = fakePage();
+  page.draw(widePort(), { width: 1100 });
+  assert.ok(page.lastFill().some((text) => text.includes("PHYs 24, 25, 26, 27, 28, 29, 30, 31 to PHYs 0, 1, 2, 3, 4, 5, 6, 7. Pinned item kept; Esc clears.")),
+    "the wide port's whole PHY list is measured");
 });
 
-test("labels of near-equal length do not crowd out a shorter sentence of wide letters: every bay's held-pin sentence is a sizer", () => {
-  const fabric = H.twoHbaCascade().fabric;
-  const bay = (slot) => fabric.nodes.find((item) => item.id === `bay:${slot}`);
-  for (let index = 0; index < 8; index += 1) bay(index).label = `Bay ${String(index).padStart(2, "0")} ${"i ".repeat(80 + (index % 2))}`;
-  bay(8).label = `Bay 08 ${"W".repeat(140)}`;
-  const T = H.loadTopology({ document: { addEventListener() {} } });
-  const { handlers, pin, element } = page(T);
-  const html = T.render(fabric, { width: 1100 });
-  const ref = (slot) => ({ kind: "bay", id: `bay:${slot}`, key: "topoBay" });
-  handlers.get("click")({ target: element(ref(0)) });
-  handlers.get("focusin")({ target: element(ref(8)) });
-  const wide = pin.textContent;
-  assert.match(wide, /^Tracing: Bay 08 W{140}, .*\. Pinned item kept; Esc clears\.$/);
-  const sizers = sizersOf(html);
-  const longer = sizers.filter((text) => text.length > wide.length).length;
-  assert.ok(sizers.includes(wide), `bay 08's held-pin sentence (${wide.length} characters, ${longer} sizers longer) is a sizer`);
-});
-
-test("sizers follow the drawing, not a limit: 1,696 bays drawn in full carry one for each distinct sentence", () => {
-  const sixteen = H.eightHbaSixteenShelves().fabric;
-  const { T, keys } = loadWithKeys();
-  const { html, sentences } = producible(T, sixteen, { width: 1100, expanded: expandedAll(T, sixteen) }, keys);
-  assert.equal(bayCount(html), 1696);
-  const sizers = assertCovered("1,696 bays", html, sentences);
-  // Each drawn bay: its held-pin trace and its pinned sentence.
-  for (const slot of [0, 847, 1695]) {
-    for (const pattern of [new RegExp(`^Tracing: Bay ${String(slot).padStart(2, "0")}, .*\\. Pinned item kept; Esc clears\\.$`), new RegExp(`^Pinned: Bay ${String(slot).padStart(2, "0")}, .*\\. Esc clears\\.$`)]) {
-      assert.equal(sizers.filter((text) => pattern.test(text)).length, 1, `bay ${slot}: ${pattern}`);
-    }
-  }
-  assert.ok(sizers.length > 2 * 1696, `${sizers.length} sizers`);
-});
-
-test("a name with quotes, markup, an ampersand and a backslash stays one escaped attribute; sizers carry no text", () => {
-  const name = "Bay 03 \"front\" 'left' <mark>x</mark> & rack\\shelf";
-  const fabric = H.twoHbaCascade().fabric;
-  fabric.nodes.find((item) => item.id === "bay:3").label = name;
-  const T = H.loadTopology({ document: { addEventListener() {} } });
-  const { handlers, pin, element } = page(T);
-  const html = T.render(fabric, { width: 1100 });
-  const ref = { kind: "bay", id: "bay:3", key: "topoBay" };
-  handlers.get("click")({ target: element(ref) });
-  handlers.get("mouseout")({ target: element(ref), relatedTarget: null });
-  const pinned = pin.textContent;
-  handlers.get("focusin")({ target: element(ref) });
-  const held = pin.textContent;
-  assert.ok(held.includes(name) && pinned.includes(name));
-  const inner = band(html);
-  const rest = inner.replace(/^<p class="fabric-topology-pin subtle" data-topology-pin>[^<]*<\/p>/, "");
-  assert.doesNotMatch(inner, /<mark/, "no markup from the name in the band");
-  // Read each sizer element strictly: exactly three double-quoted attributes
-  // whose values hold no quote or angle bracket, and no content.
-  const strict = /<span class="([^"<>]*)" aria-hidden="([^"<>]*)" data-topology-sizer="([^"<>']*)"><\/span>/g;
-  const elements = [...rest.matchAll(strict)];
-  assert.equal(elements.map((match) => match[0]).join(""), rest, "every sizer is one intact element with no text inside");
-  const own = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  for (const sentence of [held, pinned]) {
-    const matches = elements.filter((match) => match[3] === own(sentence));
-    assert.equal(matches.length, 1, `one escaped attribute for: ${sentence}`);
-    assert.equal(unescape(matches[0][3]), sentence, "it reads back intact");
+test("the held height is the tallest laid-out sentence the drawing can show, rounded up: a sample by length would miss it", () => {
+  for (const width of [322, 390]) {
+    const page = fakePage(null, { width });
+    const { sentences } = producible(page, adversarial(), { width: 1100 });
+    const heights = sentences.map((text) => lineLayout(text, width));
+    const tallest = Math.max(...heights);
+    const winner = sentences[heights.indexOf(tallest)];
+    // The tallest is bay 08's wide sentence, which is not among the eight longest.
+    assert.match(winner, /Bay 08 W{140}/);
+    const byLength = [...sentences].sort((a, b) => b.length - a.length);
+    assert.ok(byLength.indexOf(winner) >= 8, `${width} px: bay 08 is ${byLength.indexOf(winner) + 1}th by length`);
+    assert.equal(page.band.held(), `${Math.ceil(tallest)}px`, `${width} px: the held height is the tallest sentence's`);
+    assert.equal(page.fills.length, 1);
+    assert.equal(page.fills[0].width, width);
   }
 });
 
-test("a host-only fabric with a long host label: the host's held-pin focus sentence is a sizer", () => {
-  const fabric = H.coreFabric();
-  fabric.nodes[0].label = `synthetic-host-${"segment-".repeat(30)}end`;
-  const { T, keys } = loadWithKeys();
-  const { handlers, pin, element } = page(T);
-  const html = T.render(fabric, { width: 1100 });
-  const host = drawnRefs(html).find((ref) => ref.kind === "node" && ref.id === "host");
-  assert.ok(host, "the host is drawn");
-  handlers.get("click")({ target: element(host) });
-  handlers.get("focusin")({ target: element(host) });
-  assert.match(pin.textContent, /^Tracing: synthetic-host-(?:segment-){30}end.*\. Pinned item kept; Esc clears\.$/);
-  assert.ok(sizersOf(html).includes(pin.textContent), `${pin.textContent} is a sizer: ${JSON.stringify(sizersOf(html))}`);
-  const { html: again, sentences } = producible(loadWithKeys().T, fabric, { width: 1100 }, keys);
-  assertCovered("host only", again, sentences);
+test("the held height is rounded up, never down", () => {
+  for (const [measured, held] of [[88.4, "89px"], [88.6, "89px"], [88, "88px"], [20.01, "21px"]]) {
+    const page = fakePage(null, { layout: () => measured });
+    page.draw(H.twoHbaCascade().fabric, { width: 1100 });
+    assert.equal(page.band.held(), held, `${measured} px measured`);
+  }
 });
 
-test("sizers are built on render only: hover, focus, a pin without a redraw, a pointer leaving and Esc build none", () => {
-  const marker = "function traceSizers(model, view = {}) {";
-  const source = fs.readFileSync(SOURCE_PATH, "utf8");
-  assert.equal(source.split(marker).length - 1, 1, "the sizer builder is one function");
-  const calls = { count: 0 };
-  const keys = new Map();
-  const T = loadSource(source.replace(marker, `${marker} calls.count += 1;`), { calls, document: { addEventListener: (name, handler) => keys.set(name, handler) } });
-  const { handlers, element, escape } = page(T, keys);
-  const html = T.render(H.twoHbaCascade().fabric, { width: 1100 });
-  assert.equal(calls.count, 1, "one build per render");
+test("hover, focus, a pin without a redraw, a pointer leaving and Esc measure nothing, read no layout or style and write no height", () => {
+  const calls = { lists: [] };
+  const page = fakePage(recorded(calls));
+  const html = page.draw(H.twoHbaCascade().fabric, { width: 1100 });
+  assert.equal(page.counts.measures, 1);
+  assert.equal(calls.lists.length, 1, "one build per drawing");
+  const before = { ...page.counts };
+  page.log.length = 0;
   const refs = drawnRefs(html);
+  const { handlers, element } = page;
   for (const ref of refs) {
     handlers.get("mouseover")({ target: element(ref) });
     handlers.get("focusin")({ target: element(ref) });
@@ -324,68 +463,200 @@ test("sizers are built on render only: hover, focus, a pin without a redraw, a p
   // Pins that do not redraw (a link pin asks the page to redraw; this page has no hook).
   for (const ref of refs.filter((item) => item.kind !== "group")) handlers.get("click")({ target: element(ref) });
   for (const ref of refs) handlers.get("mouseover")({ target: element(ref) });
-  escape();
-  assert.equal(calls.count, 1, "no sizer is built outside render");
-  T.render(H.twoHbaCascade().fabric, { width: 1100 });
-  assert.equal(calls.count, 2);
+  page.escape();
+  assert.match(page.pin.textContent, /^Hover or focus/);
+  assert.deepEqual(page.log, [], "nothing read or written but the visible text");
+  assert.deepEqual({ ...page.counts }, before);
+  assert.equal(calls.lists.length, 1, "no sentence list is built outside a drawing");
+  assert.equal(page.band.measurer.children.length, 0);
 });
 
-test("the band's sentences are written once: a change to the wording changes the visible sentence and every sizer alike", () => {
+test("the band is measured once per drawing, width, font and resolution, and not again for the same", () => {
+  const page = fakePage();
+  const fabric = H.twoHbaCascade().fabric;
+  const html = page.draw(fabric, { width: 1100 });
+  const step = (name, expected, action) => {
+    const before = page.counts.measures;
+    action();
+    assert.equal(page.counts.measures - before, expected, `${name}: ${expected} measure(s)`);
+    assert.ok(page.band.held(), `${name}: the band in place holds a height`);
+    assert.equal(page.band.measurer.children.length, 0, `${name}: the measurer is empty`);
+  };
+  assert.equal(page.counts.measures, 1, "the first drawing");
+  const first = page.band.held();
+  const link = drawnRefs(html).find((ref) => ref.kind === "link");
+  step("a link pin redraw", 0, () => {
+    page.handlers.get("click")({ target: page.element(link) });
+    page.draw(fabric, { width: 1100 });
+  });
+  assert.match(page.pin.textContent, /^Pinned: /);
+  assert.equal(page.band.held(), first, "the same height, written on the new band without a measure");
+  step("a refresh with the same labels", 0, () => page.draw(H.twoHbaCascade().fabric, { width: 1100 }));
+  step("Fit", 0, () => {
+    page.handlers.get("click")({ target: { closest: (selector) => (selector === "[data-topology-fit]" ? {} : null) } });
+    page.draw(fabric, { width: 1100 });
+  });
+  step("Esc and its redraw", 0, () => {
+    page.escape();
+    page.draw(fabric, { width: 1100 });
+  });
+  step("the band's own block size only", 0, () => page.resize(340, 71));
+  step("a new band width", 1, () => {
+    page.env.width = 300;
+    page.resize(300);
+  });
+  step("back to a width already measured", 0, () => {
+    page.env.width = 340;
+    page.resize(340);
+  });
+  assert.equal(page.band.held(), first);
+  step("a redraw at that width", 0, () => page.draw(fabric, { width: 1100 }));
+  step("a new font", 1, () => {
+    page.env.font = "18px sans-serif";
+    page.resize(340, 49);
+  });
+  step("a redraw with that font", 0, () => page.draw(fabric, { width: 1100 }));
+  step("a new line height, seen at a redraw", 1, () => {
+    page.env.lineHeight = "24px";
+    page.draw(fabric, { width: 1100 });
+  });
+  assert.equal(typeof page.fontHandlers.get("loadingdone"), "function", "a font load is listened for");
+  step("a web font loaded", 1, () => page.fontHandlers.get("loadingdone")());
+  step("a new resolution", 1, () => {
+    page.env.dpr = 2;
+    for (const entry of [...page.media]) for (const listener of entry.listeners) listener({ matches: false });
+  });
+  step("a redraw at that resolution", 0, () => page.draw(fabric, { width: 1100 }));
+  // A new drawing: other sentences.
+  const shelves = H.fourShelves().fabric;
+  const keys = expandedAll(page.T, shelves);
+  step("another system", 1, () => page.draw(shelves, { width: 1100 }));
+  step("the shelves expanded", 1, () => page.draw(shelves, { width: 1100, expanded: keys }));
+  assert.ok(bayCount(page.T.renderTopology(page.T.drawnModel(), {})) > 0, "bays drawn");
+  step("the same expansion redrawn", 0, () => page.draw(shelves, { width: 1100, expanded: keys }));
+  step("collapsed again", 1, () => page.draw(shelves, { width: 1100 }));
+});
+
+test("a pin the drawing does not show adds its sentence and is measured with the drawing", () => {
+  const shelf = bigShelf();
+  const page = fakePage();
+  page.draw(shelf, { width: 1100 });
+  assert.equal(page.counts.measures, 1);
+  assert.ok(!page.lastFill().some((text) => text.startsWith("Pinned: Bay 999,")));
+  page.draw(shelf, { width: 1100, selection: { kind: "node", id: "bay:999" } });
+  assert.equal(page.counts.measures, 2, "another sentence: measured again");
+  assert.match(page.pin.textContent, /^Pinned: Bay 999,/);
+  assert.ok(page.lastFill().includes(page.pin.textContent));
+  page.draw(shelf, { width: 1100, selection: { kind: "node", id: "bay:999" } });
+  assert.equal(page.counts.measures, 2, "the same pin redrawn: no measure");
+});
+
+test("the band holds one visible sentence and an empty measurer: no sentence is in its markup, at 1,696 bays drawn in full", () => {
+  const sixteen = H.eightHbaSixteenShelves().fabric;
+  const page = fakePage();
+  const html = page.draw(sixteen, { width: 1100, expanded: expandedAll(page.T, sixteen) });
+  assert.equal(bayCount(html), 1696);
+  assert.equal((html.match(/data-topology-trace>/g) || []).length, 1, "one band");
+  const inner = band(html);
+  const visible = visibleOf(html);
+  assert.equal(inner, `<p class="fabric-topology-pin subtle" data-topology-pin>${visible}</p><div class="fabric-topology-trace-measure" data-topology-measure aria-hidden="true"></div>`);
+  assert.ok(inner.length - visible.length < 200, `band markup: ${inner.length} characters`);
+  assert.doesNotMatch(html, /data-topology-sizer|fabric-topology-trace-sizer/);
+  assert.ok(page.lastFill().length > 2 * 1696, "every sentence measured");
+  assert.equal(page.band.measurer.children.length, 0, "the measurer is emptied after the measure");
+  // Its elements are the visible sentence's own kind.
+  assert.ok(page.fills[0].elements.every((item) => item.tag === "P" && item.className === "fabric-topology-pin subtle"));
+  // A pin redraw changes only the visible text.
+  const link = drawnRefs(html).find((ref) => ref.kind === "link");
+  page.handlers.get("click")({ target: page.element(link) });
+  const pinned = page.draw(sixteen, { width: 1100, expanded: expandedAll(page.T, sixteen) });
+  const blank = (text) => text.replace(/data-topology-pin>[^<]*</, "data-topology-pin><");
+  assert.equal(blank(band(pinned)), blank(inner));
+});
+
+test("the held height is in place before mount puts the view and the page back", () => {
+  const page = fakePage();
+  const box = {
+    scrollLeftValue: 0,
+    scrollTopValue: 0,
+    querySelector: (selector) => (selector === ".fabric-topology-svg" ? { setAttribute: (name) => page.log.push(`room ${name}`) } : null),
+    getBoundingClientRect: () => ({ left: 0, top: 0 }),
+  };
+  for (const key of ["clientWidth", "clientHeight"]) Object.defineProperty(box, key, { get() { page.log.push(`box ${key}`); return 1000; } });
+  for (const key of ["scrollLeft", "scrollTop"]) {
+    Object.defineProperty(box, key, { get() { return box[`${key}Value`]; }, set(value) { page.log.push(`scroll ${key}`); box[`${key}Value`] = value; } });
+  }
+  page.container.box = box;
+  const fabric = H.twoHbaCascade().fabric;
+  for (const name of ["the first drawing (a measure)", "a redraw (held from the measure)"]) {
+    page.draw(fabric, { width: 1100 }, () => { page.log.length = 0; });
+    const mountWork = page.log.findIndex((entry) => /^(room|scroll|box) /.test(entry));
+    const hold = page.log.findIndex((entry) => entry.startsWith("hold "));
+    assert.ok(mountWork >= 0, `${name}: mount sized the room: ${page.log.join(", ")}`);
+    assert.ok(hold >= 0 && hold < mountWork, `${name}: held before mount's work: ${page.log.join(", ")}`);
+  }
+});
+
+test("a band with no width yet is not measured and nothing is kept; the first width it gets is", () => {
+  const page = fakePage(null, { width: 0 });
+  const fabric = H.twoHbaCascade().fabric;
+  page.draw(fabric, { width: 1100 });
+  assert.equal(page.counts.measures, 0);
+  assert.equal(page.band.held(), null);
+  page.draw(fabric, { width: 1100 });
+  assert.equal(page.counts.measures, 0, "a zero width is not kept as measured");
+  page.env.width = 340;
+  page.resize(340);
+  assert.equal(page.counts.measures, 1);
+  assert.ok(page.band.held());
+  assert.equal(page.band.measurer.children.length, 0);
+});
+
+test("a name with quotes, markup, an ampersand and a backslash reaches the measurer only as text", () => {
+  const name = "Bay 03 \"front\" 'left' <mark>x</mark> & rack\\shelf";
+  const fabric = H.twoHbaCascade().fabric;
+  fabric.nodes.find((item) => item.id === "bay:3").label = name;
+  const page = fakePage();
+  const html = page.draw(fabric, { width: 1100 });
+  assert.doesNotMatch(band(html), /<mark|rack/, "no name in the band's markup");
+  assert.equal(page.counts.markupWrites, 0, "no markup written into the measurer");
+  const ref = { kind: "bay", id: "bay:3", key: "topoBay" };
+  page.handlers.get("click")({ target: page.element(ref) });
+  page.handlers.get("mouseout")({ target: page.element(ref), relatedTarget: null });
+  const pinned = page.pin.textContent;
+  page.handlers.get("focusin")({ target: page.element(ref) });
+  const held = page.pin.textContent;
+  assert.ok(held.includes(name) && pinned.includes(name));
+  for (const sentence of [held, pinned]) assert.equal(page.lastFill().filter((text) => text === sentence).length, 1, `measured as text: ${sentence}`);
+  assert.ok(page.fills[0].elements.every((item) => item.tag === "P"));
+});
+
+test("a host-only fabric with a long host label: the host's held-pin focus sentence is measured", () => {
+  const fabric = H.coreFabric();
+  fabric.nodes[0].label = `synthetic-host-${"segment-".repeat(30)}end`;
+  const page = fakePage();
+  const { sentences } = producible(page, fabric, { width: 1100 });
+  const host = { kind: "node", id: "host", key: "topoNode" };
+  page.handlers.get("click")({ target: page.element(host) });
+  page.handlers.get("focusin")({ target: page.element(host) });
+  assert.match(page.pin.textContent, /^Tracing: synthetic-host-(?:segment-){30}end.*\. Pinned item kept; Esc clears\.$/);
+  assert.ok(page.lastFill().includes(page.pin.textContent));
+  assertCovered("host only", page.lastFill(), sentences);
+});
+
+test("the band's sentences are written once: a change to the wording changes the visible sentence and the measured ones alike", () => {
   const source = fs.readFileSync(SOURCE_PATH, "utf8");
-  // Each piece of wording is in the source once, so there is no second copy to drift.
   for (const words of ["Tracing: ", "Pinned: ", " Pinned item kept; Esc clears.", ". Esc clears."]) {
     assert.equal(source.split(words).length - 1, 1, `${JSON.stringify(words)} is written once`);
   }
   const changed = source.replace("Tracing: ", "Following: ").replace(" Pinned item kept; Esc clears.", " The pin stays; Esc clears it.");
-  const T = loadSource(changed);
-  const fabric = H.twoHbaCascade().fabric;
-  const { html, sentences } = producible(T, fabric, { width: 1100 });
-  const sizers = sizersOf(html);
-  assert.ok(sizers.length, "sizers are drawn");
-  assert.ok(sizers.some((text) => /^Following: .* The pin stays; Esc clears it\.$/.test(text)), JSON.stringify(sizers));
-  assert.ok(sizers.every((text) => !text.includes("Pinned item kept")), "no sizer keeps the old words");
+  const page = fakePage((context) => loadSource(changed, context));
+  const { sentences } = producible(page, H.twoHbaCascade().fabric, { width: 1100 });
+  const measured = page.lastFill();
+  assert.ok(measured.some((text) => /^Following: .* The pin stays; Esc clears it\.$/.test(text)), JSON.stringify(measured.slice(0, 5)));
+  assert.ok(measured.every((text) => !text.includes("Pinned item kept")));
   assert.ok(sentences.some((text) => /^Following: .* The pin stays; Esc clears it\.$/.test(text)), "the visible sentence has the new words too");
-  assert.ok(sizers.includes(longest(sentences)));
-});
-
-function band(html) {
-  const found = /<div class="fabric-topology-trace" data-topology-trace>([\s\S]*?)<\/div>/.exec(html);
-  assert.ok(found, "the band is one element");
-  return found[1];
-}
-
-test("the band holds the visible sentence first and then only hidden, empty sizer elements; a pin redraw changes only the visible text", () => {
-  const T = H.loadTopology({ document: { addEventListener() {} } });
-  const { handlers, pin, element } = page(T);
-  const fabric = H.twoHbaCascade().fabric;
-  const idle = T.render(fabric, { width: 1100 });
-  assert.equal((idle.match(/data-topology-trace>/g) || []).length, 1, "one band");
-  const inner = band(idle);
-  const visible = /^<p class="fabric-topology-pin subtle" data-topology-pin>[^<]*<\/p>/.exec(inner);
-  assert.ok(visible, "the visible sentence comes first, as before");
-  const rest = inner.slice(visible[0].length);
-  const sizers = [...rest.matchAll(/<span ([^>]*)><\/span>/g)];
-  assert.equal(sizers.map((match) => match[0]).join(""), rest, "nothing but sizers after it");
-  assert.ok(sizers.length >= 2);
-  for (const [, attributes] of sizers) {
-    assert.match(attributes, /^class="fabric-topology-trace-sizer subtle" aria-hidden="true" data-topology-sizer="[^"]*"$/, attributes);
-  }
-  assert.doesNotMatch(rest, /tabindex|role=|data-topology-pin/, "no sizer is focusable, a control or the live sentence");
-  // A link pin redraws the drawing: the band differs only in the visible
-  // text, also for the link with the longest sentence, whose pinned form is
-  // longer than most sizers but shorter than its own held-pin trace.
-  let link = null;
-  let most = -1;
-  for (const ref of drawnRefs(idle).filter((item) => item.kind === "link")) {
-    handlers.get("mouseover")({ target: element(ref) });
-    if (pin.textContent.length > most) [link, most] = [ref, pin.textContent.length];
-  }
-  handlers.get("click")({ target: element(link) });
-  const pinned = T.render(fabric, { width: 1100 });
-  const after = band(pinned);
-  assert.match(after, /data-topology-pin>Pinned: /);
-  const blank = (text) => text.replace(/data-topology-pin>[^<]*</, "data-topology-pin><");
-  assert.equal(blank(after), blank(inner), "the same sizers and the same visible element");
+  assert.ok(measured.includes(longest(sentences)));
 });
 
 test("hover, focus, a pin and Esc write only the visible sentence's text and read no layout", () => {
@@ -414,12 +685,13 @@ test("hover, focus, a pin and Esc write only the visible sentence's text and rea
   const docHandlers = new Map();
   const container = {
     dataset: {},
-    querySelector: (selector) => (selector === ".fabric-topology" ? root : null),
+    querySelector: (selector) => { if (selector !== ".fabric-topology") log.push(`container query ${selector}`); return selector === ".fabric-topology" ? root : null; },
     addEventListener: (name, handler) => handlers.set(name, handler),
   };
   const T = H.loadTopology({ document: { addEventListener: (name, handler) => docHandlers.set(name, handler) } });
   T.attach(container, null, null, {});
   const html = T.render(H.twoHbaCascade().fabric, { width: 1100 });
+  log.length = 0;
   const element = (ref) => ({
     dataset: { [ref.key]: ref.id },
     closest(selector) {
@@ -444,19 +716,31 @@ function cssRule(css, selector) {
   return new RegExp(`(?:^|\\n|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
 }
 
-test("the band is one grid cell its sentences share; sizers are invisible, unselectable and drawn from their attribute; nothing is clipped", () => {
+test("the measurer is an out-of-flow box on the band's one cell that lays sentences out as the visible one; the band holds the height over its floor", () => {
   const css = fs.readFileSync(CSS_PATH, "utf8");
   const bandRule = cssRule(css, ".fabric-topology .fabric-topology-trace");
   assert.match(bandRule, /display:\s*grid;/);
   assert.match(bandRule, /grid-template-columns:\s*minmax\(0, 1fr\);/);
-  assert.match(bandRule, /min-height:\s*var\(--topology-trace-band\);/, "the reserved heights stay as the floor");
-  assert.match(cssRule(css, ".fabric-topology-trace > *"), /grid-area:\s*1 \/ 1;/, "every sentence in the one cell");
-  const sizer = cssRule(css, ".fabric-topology-trace-sizer");
-  assert.match(sizer, /visibility:\s*hidden;/);
-  assert.match(sizer, /user-select:\s*none;/);
-  assert.match(sizer, /pointer-events:\s*none;/);
-  assert.match(cssRule(css, ".fabric-topology-trace-sizer::before"), /content:\s*attr\(data-topology-sizer\);/, "its text is generated, not in the document");
-  for (const rule of [bandRule, cssRule(css, ".fabric-topology-trace > *"), sizer, cssRule(css, ".fabric-topology .fabric-topology-pin")]) {
+  // The floor stays, and the held height is the measured text plus the band's
+  // own padding and border.
+  const minHeight = /min-height:\s*([^;]+);/.exec(bandRule)?.[1];
+  assert.equal(minHeight, "max(var(--topology-trace-band), calc(var(--topology-trace-held, 0px) + 9px))");
+  const padding = /padding:\s*(\d+)px 0;/.exec(bandRule);
+  const border = /border-top:\s*(\d+)px /.exec(bandRule);
+  assert.equal(2 * Number(padding[1]) + Number(border[1]), 9, "9 px: the band's padding and border");
+  assert.match(cssRule(css, ".fabric-topology-trace > *,\n.fabric-topology-trace-measure > *"), /grid-area:\s*1 \/ 1;\s*min-width:\s*0;\s*margin:\s*0;/, "the measured sentences sit as the visible one does");
+  const measure = cssRule(css, ".fabric-topology-trace-measure");
+  for (const rule of [/position:\s*absolute;/, /grid-area:\s*1 \/ 1;/, /inset-inline:\s*0;/, /display:\s*grid;/, /grid-template-columns:\s*minmax\(0, 1fr\);/,
+    /visibility:\s*hidden;/, /user-select:\s*none;/, /pointer-events:\s*none;/, /contain:\s*layout paint style;/]) {
+    assert.match(measure, rule);
+  }
+  // No property of its own changes how text is laid out, and nothing keeps it from layout.
+  for (const body of [measure, cssRule(css, ".fabric-topology-trace > *,\n.fabric-topology-trace-measure > *")]) {
+    assert.doesNotMatch(body, /(?:^|[\s;])(?:font[\w-]*|line-height|letter-spacing|word-[\w-]+|white-space|overflow-wrap|text-[\w-]+|hyphens|tab-size)\s*:/, body);
+    assert.doesNotMatch(body, /contain:\s*[^;]*\b(?:strict|size|content)\b|display:\s*none|content-visibility/, body);
+  }
+  assert.doesNotMatch(css, /fabric-topology-trace-sizer/);
+  for (const rule of [bandRule, cssRule(css, ".fabric-topology .fabric-topology-pin")]) {
     assert.doesNotMatch(rule, /(?:^|[\s;])(?:height|max-height|overflow|text-overflow|white-space|-webkit-line-clamp|line-clamp)\s*:/, rule);
   }
 });
@@ -497,7 +781,6 @@ test("a focused item keeps clear of the band at its measured height, with the re
   assert.deepEqual({ ...observers[0].targets[0].options }, { box: "border-box" });
   observers[0].callback([{ target: current.trace, borderBoxSize: [{ blockSize: 88.4, inlineSize: 340 }] }]);
   assert.equal(current.style.get("--topology-trace-height"), "89px", "the band's whole height, rounded up, on the topology root");
-  // A redraw puts a new band in place: it is observed instead of the old one.
   const first = current;
   current = make();
   T.render(H.twoHbaCascade().fabric, { width: 1100 });
@@ -507,16 +790,13 @@ test("a focused item keeps clear of the band at its measured height, with the re
   observers[0].callback([{ target: current.trace, borderBoxSize: [{ blockSize: 69, inlineSize: 340 }] }]);
   assert.equal(current.style.get("--topology-trace-height"), "69px");
   assert.equal(first.style.get("--topology-trace-height"), "89px");
-  // The same band again: nothing to change.
   const disconnects = observers[0].disconnects;
   T.mount(container);
   assert.equal(observers[0].disconnects, disconnects);
-  // An entry without a size leaves the reserved height in force.
   observers[0].callback([{ target: current.trace }]);
   assert.equal(current.style.get("--topology-trace-height"), "69px");
   T.release();
   assert.deepEqual(observers[0].targets, [], "leaving the mode stops observing");
-  // A browser without ResizeObserver: the reserved height is the margin.
   const bare = make();
   const plain = { dataset: {}, querySelector: (selector) => (selector === "[data-topology-trace]" ? bare.trace : null), addEventListener() {} };
   const U = H.loadTopology({ document: { addEventListener() {} } });

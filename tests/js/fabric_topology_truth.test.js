@@ -449,7 +449,7 @@ test("the page's inspector shows a pinned bundle's facts, and Topology selects n
   assert.equal(cleared.length, 2);
   assert.equal(T.view().pin, null);
   assert.equal(api.state.selectedTraceId, null);
-  // The visible sentence (the band's hidden sizers hold every pinned sentence).
+  // The visible sentence.
   assert.doesNotMatch(elements.get("fabric-map-panel").innerHTML, /data-topology-pin>Pinned:/);
 });
 

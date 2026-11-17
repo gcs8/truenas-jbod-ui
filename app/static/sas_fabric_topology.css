@@ -180,15 +180,14 @@ body.fabric-topology-mode .fabric-page-shell {
 
 /* The trace line sits below the drawing, so its wrapping never moves it,
    and sticks to the window's bottom edge so it is read without scrolling.
-   The band is one grid cell: the visible sentence and a hidden sizer for
-   every sentence this drawing can show share it, so the band is as tall as
-   the tallest of them at any width, and the idle hint, "Tracing" and
-   "Pinned" take the same band, which never grows over the item under the
-   pointer. The column's minimum is fixed, so the sizers do not size the
-   column: each is laid out at the band's width and the row takes the
-   tallest. Its reserved lines are the floor. The
-   page sizes boxes by their border, so the reserved height is the whole
-   band, padding and border included. Every sentence wraps in full. */
+   The band is held as tall as the tallest sentence this drawing can show
+   at its width (measured once by the script, below), so the idle hint,
+   "Tracing" and "Pinned" take the same band, which never grows over the
+   item under the pointer. Its reserved lines are the floor. The page sizes
+   boxes by their border, so the reserved height is the whole band, padding
+   and border included, and the held height is the measured text plus the
+   band's 4 px padding each side and 1 px border. Every sentence wraps in
+   full. */
 .fabric-topology .fabric-topology-trace {
   position: sticky;
   bottom: 0;
@@ -196,7 +195,7 @@ body.fabric-topology-mode .fabric-page-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   min-width: 0;
-  min-height: var(--topology-trace-band);
+  min-height: max(var(--topology-trace-band), calc(var(--topology-trace-held, 0px) + 9px));
   margin: 0;
   padding: 4px 0;
   border-top: 1px solid var(--panel-border);
@@ -204,23 +203,30 @@ body.fabric-topology-mode .fabric-page-shell {
   line-height: var(--topology-trace-line);
 }
 
-.fabric-topology-trace > * {
+.fabric-topology-trace > *,
+.fabric-topology-trace-measure > * {
   grid-area: 1 / 1;
   min-width: 0;
   margin: 0;
 }
 
-/* Sizers take room and nothing else: not seen, read out, selected, found
-   or pointed at. Their text is generated from an attribute, so it is not in
-   the document's text either. */
-.fabric-topology-trace-sizer {
+/* The measurer: out of flow on the band's one cell, so it is exactly the
+   visible sentence's width and never adds to the band's height. It lays
+   every sentence out in one cell of its own, as the visible one is, and is
+   as tall as the tallest. It sets nothing about text, so the sentences
+   inherit the band's rules. It is empty except during the measure, and is
+   not seen, read out, selected or pointed at. Containment keeps its layout
+   from the page's; its own size still follows its content. */
+.fabric-topology-trace-measure {
+  position: absolute;
+  grid-area: 1 / 1;
+  inset-inline: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   visibility: hidden;
   user-select: none;
   pointer-events: none;
-}
-
-.fabric-topology-trace-sizer::before {
-  content: attr(data-topology-sizer);
+  contain: layout paint style;
 }
 
 .fabric-topology-scroll {
