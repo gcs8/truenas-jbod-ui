@@ -51,7 +51,7 @@ function loadPage(fabric, mode, slots) {
   const end = FABRIC_SOURCE.indexOf("  elements.modeButtons.forEach((button) => {", FABRIC_SOURCE.indexOf("  function render()"));
   assert.ok(end > 0);
   vm.runInContext(`${FABRIC_SOURCE.slice(0, end)}
-    window.renderTest = { renderMap, renderSummary, state, fabricCountText, fabricCountPhrase };
+    window.renderTest = { renderMap, renderStatus, renderSummary, state, fabricCountText, fabricCountPhrase };
   })();`, sandbox);
   const api = sandbox.window.renderTest;
   api.state.fabric = fabric;
@@ -60,10 +60,14 @@ function loadPage(fabric, mode, slots) {
   api.state.error = null;
   api.state.mode = mode;
   api.renderMap();
+  api.renderStatus();
   api.renderSummary();
   const read = (id) => elements.get(id) || { innerHTML: "", textContent: "" };
   return {
     api,
+    html: read("fabric-map-panel").innerHTML,
+    chip: read("fabric-api-chip").textContent,
+    status: read("fabric-status-text").textContent,
     map: textOf(read("fabric-map-panel").innerHTML),
     summary: Object.fromEntries(Object.entries(SUMMARY_IDS).map(([key, id]) => [key, read(id).textContent])),
   };
@@ -79,6 +83,8 @@ function fabricWith(caseName, completeness) {
   else if (completeness === "counts-absent") delete read.counts;
   else if (completeness === "domain-absent") COUNTED.forEach((domain) => delete read.counts[domain]);
   else if (completeness === "domain-null") COUNTED.forEach((domain) => { read.counts[domain] = null; });
+  else if (completeness === "one-domain-absent") delete read.counts.expanders;
+  else if (completeness === "one-domain-null") read.counts.expanders = null;
   else Object.assign(read.counts, completeness);
   return fabric;
 }
@@ -186,4 +192,60 @@ test("payloads outside the CORE controller-read contract keep their counts as be
   assert.equal(api.fabricCountText(fabric, "expanders", 0), "0");
   assert.equal(api.fabricCountText(fabric, "enclosures", 2), "2");
   assert.equal(api.fabricCountPhrase(fabric, "paths", 0, "path"), "0 paths");
+});
+
+// Storage Lanes and the page status. A bay the inventory knows and no read
+// controller lane claims is drawn whenever the counts are not reported
+// complete, including when their completeness was not reported at all, and
+// the page status is then never OK.
+const UNREPORTED_STATUS = "Completeness of some controller data was not reported.";
+const UNREPORTED_BAYS_NOTICE = "Not attached to a read controller. Whether the controller data was read whole was not reported, so these bays come from the inventory.";
+const UNREAD_BAYS_NOTICE = "Not attached to a read controller. Some controller data was not read, so these bays come from the inventory.";
+const BAY = 'data-fabric-trace="bay:0"';
+
+for (const completeness of ["one-domain-absent", "one-domain-null", "domain-absent", "domain-null", "counts-absent", "absent"]) {
+  test(`unreported completeness (${completeness}): the known bay stays drawn and the status is not OK`, () => {
+    const page = render("complete", completeness, "lanes");
+    assert.ok(page.html.includes(BAY), "inventory bay is drawn");
+    assert.match(page.map, new RegExp(UNREPORTED_BAYS_NOTICE.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")));
+    assert.doesNotMatch(page.map, /Some controller data was not read/);
+    assert.match(page.map, /1 bay\b/);
+    assert.notEqual(page.chip, "STORAGE OK");
+    assert.equal(page.chip, "STORAGE PARTIAL");
+    assert.ok(page.status.includes(UNREPORTED_STATUS), page.status);
+    assert.doesNotMatch(page.status, /was not read/);
+  });
+}
+
+test("control: counts reported complete stay OK and draw no inventory group", () => {
+  const page = render("complete", {}, "lanes");
+  assert.equal(page.chip, "STORAGE OK");
+  assert.ok(!page.html.includes(BAY));
+  assert.doesNotMatch(page.status, /not reported|not read/);
+});
+
+test("control: a count reported not read keeps the not-read status and notice", () => {
+  for (const value of ["not_read", "partial"]) {
+    const page = render("complete", { expanders: value }, "lanes");
+    assert.equal(page.chip, "STORAGE PARTIAL", value);
+    assert.ok(page.html.includes(BAY), value);
+    assert.ok(page.map.includes(UNREAD_BAYS_NOTICE), value);
+    assert.ok(page.status.includes("Some controller data was not read."), value);
+    assert.ok(!page.status.includes(UNREPORTED_STATUS), value);
+  }
+});
+
+test("a count not read beside one not reported says not read, the stronger fact", () => {
+  const page = render("complete", { expanders: "not_read", enclosures: null }, "lanes");
+  assert.equal(page.chip, "STORAGE PARTIAL");
+  assert.ok(page.map.includes(UNREAD_BAYS_NOTICE));
+  assert.ok(page.status.includes("Some controller data was not read."));
+});
+
+test("payloads outside the CORE controller-read contract keep their OK status", () => {
+  const fabric = fabricWith("complete", "absent");
+  fabric.platform = "linux";
+  delete fabric.raw.fabric_kind;
+  const page = loadPage(fabric, "lanes", CASES.complete.slots);
+  assert.equal(page.chip.endsWith(" OK"), true, page.chip);
 });

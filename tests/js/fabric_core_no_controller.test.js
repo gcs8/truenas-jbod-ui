@@ -177,7 +177,10 @@ test("control: a whole read keeps its counts, including known zeroes, and stays 
 test("a CORE payload without read facts says its counts were not reported, not 0", () => {
   const { controller_read: _ignored, ...raw } = CASES.complete.fabric.raw;
   const page = loadPage({ ...CASES.complete.fabric, raw }, "lanes", CASES.complete.slots);
-  assert.equal(page.chip, "STORAGE OK");
+  // Counts nobody vouched for do not leave the page OK, and the known bay stays drawn.
+  assert.equal(page.chip, "STORAGE PARTIAL");
+  assert.match(page.status, /Completeness of some controller data was not reported\./);
+  assert.match(page.map, /data-fabric-trace="bay:0"/);
   assert.deepEqual(page.summary, {
     controllers: "1, completeness not reported",
     paths: "not reported",

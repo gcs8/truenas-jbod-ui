@@ -1772,11 +1772,18 @@
     return value === "complete" || value === "partial" ? value : "not_read";
   }
 
-  // Unknown completeness is not a missed read: the page status keeps its
-  // existing reading of it, and only the counts themselves say so.
+  // A count the producer marks partial or not read: "not read" wording.
   function fabricCountsIncomplete(fabric) {
     return ["controllers", "paths", "expanders", "enclosures"].some((domain) => !["complete", "unknown"].includes(fabricCountState(fabric, domain)))
       || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
+  }
+
+  // Any count not reported complete, including one whose completeness was
+  // not reported. Keeps the page off OK and keeps unclaimed inventory bays
+  // drawn: a known bay never disappears because nobody vouched for a count.
+  function fabricCountsUnvouched(fabric) {
+    return fabricCountsIncomplete(fabric)
+      || ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) === "unknown");
   }
 
   // "3", "at least 3" (some reads missing), "not read", or for a count whose
@@ -1954,13 +1961,17 @@
     return renderInventoryBayGroup(copy, slots, (noun) => `Controller data could not be read. The ${noun} below come from the inventory.`);
   }
 
-  // On a partial CORE read, bays no controller lane claims are still drawn,
-  // without guessing which controller or path they hang off.
+  // On a CORE read not reported whole (partial, not read, or completeness
+  // not reported), bays no controller lane claims are still drawn, without
+  // guessing which controller or path they hang off.
   function renderUnattachedInventory(fabric, copy, claimedSlots) {
-    if (fabric.platform !== "core" || !fabricCountsIncomplete(fabric)) return "";
+    if (fabric.platform !== "core" || !fabricCountsUnvouched(fabric)) return "";
     const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
     if (!slots.length) return "";
-    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. Some controller data was not read, so these ${noun} come from the inventory.`);
+    const reason = fabricCountsIncomplete(fabric)
+      ? "Some controller data was not read"
+      : "Whether the controller data was read whole was not reported";
+    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. ${reason}, so these ${noun} come from the inventory.`);
   }
 
   function renderInventoryBayGroup(copy, slots, notice) {
@@ -3974,9 +3985,11 @@
       .map(([name]) => String(name).toUpperCase());
     const actionableWarnings = (Array.isArray(fabric?.warnings) ? fabric.warnings : [])
       .filter((warning) => !isSasFabricEnrichmentWarning(warning));
-    // A count the producer marks as not read whole never leaves the page OK.
+    // A count the producer marks as not read whole, or does not say was read
+    // whole, never leaves the page OK.
     const unreadCounts = fabricCountsIncomplete(fabric);
-    if (failedSources.length || actionableWarnings.length || unreadCounts) {
+    const unvouchedCounts = fabricCountsUnvouched(fabric);
+    if (failedSources.length || actionableWarnings.length || unvouchedCounts) {
       const details = [];
       if (failedSources.length) {
         details.push(`Failed sources: ${failedSources.join(", ")}.`);
@@ -3985,6 +3998,8 @@
         details.push(String(actionableWarnings[0]));
       } else if (unreadCounts) {
         details.push("Some controller data was not read.");
+      } else if (unvouchedCounts) {
+        details.push("Completeness of some controller data was not reported.");
       }
       return {
         chipTone: "partial",
