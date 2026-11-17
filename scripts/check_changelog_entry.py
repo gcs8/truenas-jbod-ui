@@ -27,7 +27,15 @@ Usage from a checkout that has both refs::
     python scripts/check_changelog_entry.py --base origin/main --head HEAD \\
         --pr 123 --labels bug,breaking
 
-In GitHub Actions ``--event "$GITHUB_EVENT_PATH"`` supplies the pull request
+In GitHub Actions the job checks out the merge commit of the pull request and
+passes ``--merged-head <pull request head commit>`` instead of ``--base``. The
+base is then the first parent of that merge commit: the base branch exactly as
+it was merged. The base commit recorded in the event payload is not used,
+because it stays where the pull request opened; once another pull request
+merges, it would charge this one with that pull request's fragments, and it
+would hide a change to a fragment that reached the base branch later.
+
+``--event "$GITHUB_EVENT_PATH"`` supplies the pull request
 number and labels from the event payload; ``--pr`` and ``--labels`` override
 those values when given. ``--advisory`` is passed for pull requests whose
 author has no write access and so cannot apply the ``no-changelog`` label.
@@ -151,6 +159,28 @@ def _git(repo: Path, *args: str) -> str:
     if completed.returncode != 0:
         raise GateError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
     return completed.stdout
+
+
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def merge_commit_base(repo: Path, *, head: str, pull_request_head: str) -> str:
+    """Return the base commit that ``head`` merged the pull request into.
+
+    ``head`` must be the merge commit built for the pull request: exactly two
+    parents, the base branch first and ``pull_request_head`` second. Anything
+    else is refused, so the gate never guesses a base.
+    """
+
+    if not _COMMIT_ID.fullmatch(pull_request_head):
+        raise GateError("the pull request head must be a full lowercase commit id")
+    commits = _git(repo, "rev-list", "--parents", "--max-count=1", "--end-of-options", head, "--").split()
+    if len(commits) != 3 or commits[2] != pull_request_head:
+        raise GateError(
+            f"the checked-out commit is not the merge of pull request head {pull_request_head} into its base "
+            "branch, so there is no base to compare against"
+        )
+    return commits[1]
 
 
 def is_relevant_path(path: str) -> bool:
@@ -547,7 +577,15 @@ def parse_labels(raw: str | None) -> set[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--base", required=True, help="Base ref or SHA (the pull request target).")
+    base_source = parser.add_mutually_exclusive_group(required=True)
+    base_source.add_argument("--base", help="Base ref or SHA (the pull request target).")
+    base_source.add_argument(
+        "--merged-head",
+        help=(
+            "Pull request head commit id. --head must then be the merge commit of that head "
+            "into the base branch; its first parent is used as the base."
+        ),
+    )
     parser.add_argument("--head", default="HEAD", help="Head ref or SHA (default: HEAD).")
     parser.add_argument("--pr", type=int, help="Pull request number; overrides --event.")
     parser.add_argument(
@@ -593,9 +631,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        base = args.base
+        if base is None:
+            base = merge_commit_base(args.repo, head=args.head, pull_request_head=args.merged_head)
         result = evaluate(
             args.repo,
-            base=args.base,
+            base=base,
             head=args.head,
             pr_number=pr_number,
             labels=labels,
