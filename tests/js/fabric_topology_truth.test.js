@@ -1154,7 +1154,7 @@ function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
     };
     const above = markup.slice(0, markup.indexOf("fabric-topology-scroll"));
     const notices = [...above.matchAll(/<div class="warning-item[^"]*">([^<]*)<\/div>/g)].map((match) => match[1]);
-    const bar = /<div class="fabric-topology-bar">([\s\S]*?)<\/div>/.exec(above)?.[1].replace(/<[^>]+>/g, "") || "";
+    const bar = /<div class="fabric-topology-bar">([\s\S]*?)<\/div>/.exec(above)?.[1].replace(/<[^>]+>/g, " ") || "";
     const top = 100 + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
     let left = 0;
     let down = 0;
