@@ -864,6 +864,21 @@ test("a bay label with no supported number is drawn as the producer wrote it, an
   assert.match(detail, /33 bays? whose labels? carr(?:y|ies) no number/);
 });
 
+test("a bay group where only some labels carry a number says how many are numbered, not a range over all of them", () => {
+  const T = H.loadTopology();
+  const heading = (model) => [...model.groups].map((group) => group.lines[0].text);
+  // The real builder's labels: three of Arabic-Indic digits, one "04".
+  const { fabric, snapshot } = cases.ses_non_ascii_labels;
+  const model = T.buildTopologyModel(fabric, { inventory: snapshot });
+  assert.deepEqual(heading(model), ["4 bays, 1 numbered: 04"]);
+  const html = T.renderTopology(model, {});
+  assert.doesNotMatch(html, /Bays 04–04/);
+  assert.match(html, /aria-label="4 bays, 1 numbered: 04"/);
+  // Every bay numbered: the range, as before.
+  const full = T.buildTopologyModel(cases.core_cascade.fabric, { inventory: cases.core_cascade.snapshot });
+  for (const text of heading(full)) assert.match(text, /^Bays \d+–\d+ · \d+ bays$/, text);
+});
+
 // ---- titles stay distinct after every generated suffix ---------------------------
 
 test("no two boxes with different ids show the same title, also where a generated title equals an existing alias", () => {
@@ -896,6 +911,27 @@ test("no two boxes with different ids show the same title, also where a generate
     if (item.id === "mpr-enclosure:controller:mpr1:0002") item.alias = "X via mpr0 (mpr-enclosure:controller:mpr0:0002)";
   }
   distinct("real cascade with aliases", T.buildTopologyModel(cascade));
+  // A fourth view already carries the number a generated title would get:
+  // the payload's titles are kept as they are, the generated one takes the
+  // next free number, and the order of the payload's nodes changes nothing.
+  const numbered = JSON.parse(JSON.stringify(cascade));
+  const real = "X via mpr0 (mpr-enclosure:controller:mpr0:0002) #2";
+  numbered.nodes.find((item) => item.id === "mpr-enclosure:controller:mpr1:0003").alias = real;
+  const titles = (fabric) => Object.fromEntries([...T.buildTopologyModel(fabric).nodes].filter((item) => item.tier === "enclosures").map((item) => [item.id, item.label]));
+  const forward = titles(numbered);
+  const reversed = JSON.parse(JSON.stringify(numbered));
+  reversed.nodes.reverse();
+  assert.deepEqual(titles(reversed), forward, "the same nodes in reversed order give the same titles");
+  assert.equal(forward["mpr-enclosure:controller:mpr1:0003"], real, "a title from the payload is kept");
+  assert.equal(forward["mpr-enclosure:controller:mpr1:0002"], "X via mpr0 (mpr-enclosure:controller:mpr0:0002)", "a title from the payload is kept");
+  assert.equal(forward["mpr-enclosure:controller:mpr0:0002"], "X via mpr0 (mpr-enclosure:controller:mpr0:0002) #3", "the generated title takes the next free number");
+  assert.ok(Object.values(forward).every((title) => !/#\d+ #\d+$/.test(title)), Object.values(forward).join(" | "));
+  distinct("real numbered alias", T.buildTopologyModel(numbered));
+  distinct("real numbered alias, reversed", T.buildTopologyModel(reversed));
+  // Without the payload's numbered title, the reversed cascade numbers the same box too.
+  const plain = JSON.parse(JSON.stringify(cascade));
+  plain.nodes.reverse();
+  assert.deepEqual(titles(plain), titles(cascade));
 });
 
 // ---- a storage kind is accepted only on a platform that produces it ------------
@@ -949,6 +985,26 @@ test("a named storage kind is accepted only on a platform that produces it; ever
   }
 });
 
+test("the unknown-contract notice names what it does not draw, and every other record is drawn", () => {
+  const T = H.loadTopology();
+  // The real builder's SES payload on a platform that does not produce it.
+  const fabric = JSON.parse(JSON.stringify(cases.ses_non_ascii_labels.fabric));
+  fabric.platform = "esxi";
+  fabric.nodes.push(H.node("pool:synthetic", "pool"), H.node("vdev:synthetic", "vdev"));
+  const model = T.buildTopologyModel(fabric);
+  assert.equal(model.contract, "unknown");
+  const notice = [...model.notices].find((text) => /does not match platform/.test(text));
+  assert.equal(notice, "The fabric kind \"linux_ses\" does not match platform \"esxi\": it draws the records the payload carries "
+    + "except pools, vdevs and backplane zones, which this view does not draw, and makes no claim about what was or was not collected.");
+  const html = T.renderTopology(model, {});
+  const hidden = new Set(["pool", "vdev", "backplane"]);
+  assert.ok(fabric.nodes.some((item) => item.kind === "backplane"), "the payload has backplane zones");
+  for (const item of fabric.nodes) {
+    const drawn = html.includes(`data-topo-node="${item.id}"`) || html.includes(`data-topo-bay="${item.id}"`);
+    assert.equal(drawn, !hidden.has(item.kind), `${item.kind} ${item.id}`);
+  }
+});
+
 // ---- an all-digit query is a bay number and an identity --------------------------
 
 test("an all-digit query finds bay numbers first, then serials, SAS addresses and node identities that contain it", () => {
@@ -978,6 +1034,35 @@ test("an all-digit query finds bay numbers first, then serials, SAS addresses an
   inventory.slots[1].serial = "900000000011";
   const logical = T.buildTopologyModel(virtual, { inventory });
   assert.deepEqual([...T.searchTopology(logical, "900000000011").matches].map((item) => item.id), ["bay:1"]);
+});
+
+test("an all-digit query finds an inventory logical unit id and a trace SAS address, and nothing for other digits", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", null);
+  fabric.links.push(H.link(hba.id, enc.id, "controller-enclosure"));
+  H.addBays(fabric, H.range(0, 8), [enc.id]);
+  // The SAS address only the bay's trace carries.
+  fabric.traces.find((trace) => trace.id === "bay:3").metrics.mpr_devices = [{ sas_address: "310012340003" }];
+  // The logical unit id only the inventory carries.
+  const inventory = {
+    selected_system_id: fabric.system_id,
+    selected_enclosure_id: fabric.selected_enclosure_id,
+    slots: [{ slot: 7, logical_unit_id: "600012340007" }],
+  };
+  const model = T.buildTopologyModel(fabric, { inventory });
+  const ids = (query) => [...T.searchTopology(model, query).matches].map((item) => item.id);
+  assert.deepEqual(ids("600012340007"), ["bay:7"], "the inventory's logical unit id");
+  assert.deepEqual(ids("600012349999"), [], "other digits find nothing");
+  assert.deepEqual(ids("310012340003"), ["bay:3"], "the trace's SAS address");
+  assert.deepEqual(ids("310012349999"), [], "other digits find nothing");
+  // Without the inventory and the trace's device, the same digits find nothing.
+  const bare = JSON.parse(JSON.stringify(fabric));
+  bare.traces.find((trace) => trace.id === "bay:3").metrics.mpr_devices = [];
+  const plain = T.buildTopologyModel(bare);
+  assert.deepEqual([...T.searchTopology(plain, "600012340007").matches], []);
+  assert.deepEqual([...T.searchTopology(plain, "310012340003").matches], []);
 });
 
 // ---- behaviour the tests did not hold -------------------------------------------
@@ -1051,30 +1136,42 @@ test("of two bay traces with one id the first is kept, and the notice says so", 
 // ---- the drawing's scroll position across the page's own redraws ----------------
 
 // The page's map panel with a real-shaped scroll box: replacing the panel's
-// HTML makes a new box at offset 0 that clamps its offsets to its content,
-// and sits lower on the page for every notice above it.
-function scrollingPanel(item) {
+// HTML makes a new box at offset 0 that clamps its offsets to its drawing's
+// current size (the drawing's attributes may be changed after it is put in
+// place), and sits lower on the page for every notice above it, more so when
+// a notice wraps onto more lines in a narrow panel.
+function scrollingPanel(item, { inner = 1100, height = 600 } = {}) {
   let html = "";
   const pin = { textContent: "" };
   const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
+  const lines = (text) => Math.max(1, Math.ceil((text.length * 7) / Math.max(1, inner - 20)));
   const box = (markup) => {
-    const svg = /<svg class="fabric-topology-svg[^"]*"[^>]*width="(\d+)" height="(\d+)"/.exec(markup);
-    const [width, height] = svg ? [Number(svg[1]), Number(svg[2])] : [0, 0];
+    const tag = /<svg class="fabric-topology-svg[^"]*"[^>]*>/.exec(markup)?.[0] || "";
+    const attributes = Object.fromEntries([...tag.matchAll(/ (width|height|viewBox)="([^"]*)"/g)].map((match) => [match[1], match[2]]));
+    const svg = {
+      getAttribute: (name) => attributes[name] ?? null,
+      setAttribute: (name, value) => { attributes[name] = String(value); },
+    };
     const above = markup.slice(0, markup.indexOf("fabric-topology-scroll"));
-    const top = 100 + 44 * (above.match(/class="warning-item/g) || []).length + (above.includes("data-topology-wide-notice") ? 30 : 0);
+    const notices = [...above.matchAll(/<div class="warning-item[^"]*">([^<]*)<\/div>/g)].map((match) => match[1]);
+    const bar = /<div class="fabric-topology-bar">([\s\S]*?)<\/div>/.exec(above)?.[1].replace(/<[^>]+>/g, "") || "";
+    const top = 100 + notices.reduce((sum, text) => sum + 26 + 18 * lines(text), 0) + 12 + 18 * lines(bar);
     let left = 0;
     let down = 0;
+    const extent = (name, client) => Math.max(0, (Number(attributes[name]) || 0) - client);
     return {
-      clientWidth: 1100,
-      clientHeight: 600,
+      clientWidth: inner,
+      clientHeight: height,
+      svg,
+      querySelector: (selector) => (selector === ".fabric-topology-svg" || selector === "svg" ? svg : null),
       get scrollLeft() { return left; },
-      set scrollLeft(value) { left = Math.max(0, Math.min(Math.max(0, width - 1100), Number(value) || 0)); },
+      set scrollLeft(value) { left = Math.max(0, Math.min(extent("width", inner), Number(value) || 0)); },
       get scrollTop() { return down; },
-      set scrollTop(value) { down = Math.max(0, Math.min(Math.max(0, height - 600), Number(value) || 0)); },
-      getBoundingClientRect: () => ({ left: 20, top, right: 1120, bottom: top + 600, width: 1100, height: 600 }),
+      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", height), Number(value) || 0)); },
+      getBoundingClientRect: () => ({ left: 20, top, right: 20 + inner, bottom: top + height, width: inner, height }),
     };
   };
-  item.clientWidth = 1102;
+  item.clientWidth = inner + 2;
   item.box = null;
   Object.defineProperty(item, "innerHTML", {
     get: () => html,
@@ -1108,6 +1205,44 @@ function pageTarget(attributes, root) {
   };
   element.parentElement = element;
   return element;
+}
+
+// Where a point of the drawing is on the screen: the box's place on the page,
+// the drawing's own origin (its viewBox) and both scroll offsets.
+function screenPoint(panel, item) {
+  const rect = panel.box.getBoundingClientRect();
+  const [originX, originY] = String(panel.box.svg.getAttribute("viewBox") || "0 0").split(/\s+/).map(Number);
+  return [rect.left + item.x - originX - panel.box.scrollLeft, rect.top + item.y - originY - panel.box.scrollTop];
+}
+
+function expandControls(panel) {
+  const match = /<g class="topo-expand"[^>]*data-fabric-expand-slots="([^"]+)"[^>]*aria-expanded="(true|false)"[^>]*><rect x="(-?[\d.]+)" y="(-?[\d.]+)"/g;
+  return [...panel.innerHTML.matchAll(match)].map((item) => ({ key: item[1], expanded: item[2], x: Number(item[3]), y: Number(item[4]) }));
+}
+
+// The whole page script on a panel of the given inner width and height,
+// in Topology, with clicks sent through the panel's and the document's
+// real handlers.
+function topologyPage(fabric, size) {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
+  let panel = null;
+  const { page, elements } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+    if (id === "fabric-map-panel") {
+      panel = item;
+      scrollingPanel(item, size);
+    }
+  });
+  Object.assign(page.state, { fabricScopeReady: true, loading: false, selectedSystemId: fabric.system_id, selectedEnclosureId: fabric.selected_enclosure_id, mode: "topology", fabric });
+  page.render();
+  const documentClick = dom.documentHandlers.find((item) => item.name === "click").handler;
+  const click = (attributes) => {
+    const target = pageTarget(attributes, panel.querySelector(".fabric-topology"));
+    panel.handlers.get("click")({ type: "click", target });
+    documentClick({ type: "click", target });
+  };
+  return { T, page, elements, panel, click };
 }
 
 test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both scroll offsets, and an expanded or collapsed shelf keeps its control in place", () => {
@@ -1161,10 +1296,7 @@ test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both
     const match = /<g class="topo-expand"[^>]*data-fabric-expand-slots="([^"]+)"[^>]*aria-expanded="(true|false)"[^>]*><rect x="(-?[\d.]+)" y="(-?[\d.]+)"/g;
     return [...panel.innerHTML.matchAll(match)].map((item) => ({ key: item[1], expanded: item[2], x: Number(item[3]), y: Number(item[4]) }));
   };
-  const onScreen = (item) => {
-    const rect = panel.box.getBoundingClientRect();
-    return [rect.left + item.x - panel.box.scrollLeft, rect.top + item.y - panel.box.scrollTop];
-  };
+  const onScreen = (item) => screenPoint(panel, item);
   const [first] = control();
   assert.ok(first, "a collapsed shelf has a control");
   for (const step of ["expand", "collapse"]) {
@@ -1181,4 +1313,80 @@ test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both
     const now = onScreen(after);
     assert.ok(Math.abs(now[0] - was[0]) <= 1 && Math.abs(now[1] - was[1]) <= 1, `${step}: the control moved from ${was} to ${now}`);
   }
+});
+
+// One dual-pathed shelf of 1,024 bays behind two HBAs.
+function bigShelf() {
+  const fabric = H.coreFabric();
+  const enclosures = [];
+  for (const [side, name] of ["mpr0", "mpr1"].entries()) {
+    const hba = H.addController(fabric, name);
+    const exp = H.addExpander(fabric, name, 0xf100 + side, 1, hba.id, { reported_lanes: H.lanes([0, 1, 2, 3], [32, 33, 34, 35]) });
+    enclosures.push(H.addEnclosure(fabric, name, "0x0001", `SYNTH-JBOD-${side ? "B" : "A"}`, exp.id).id);
+  }
+  H.addBays(fabric, H.range(0, 1024), enclosures, [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }]);
+  return fabric;
+}
+
+test("a visible expand control stays at its place on the screen also next to the drawing's left or top edge", () => {
+  const cases = [
+    // A 1,100 px box that clamps its offsets; the shelf's control starts near the left edge.
+    { name: "1,024-bay shelf, 1,100 px", fabric: bigShelf(), size: { inner: 1100, height: 600 } },
+    // The four-shelf system at 390 and at 3,840 px pages: the boxes' inner sizes there.
+    { name: "four shelves, 390 px", fabric: H.fourShelves().fabric, size: { inner: 322, height: 658 } },
+    { name: "four shelves, 3,840 px", fabric: H.fourShelves().fabric, size: { inner: 3372, height: 1684 } },
+  ];
+  const moved = [];
+  const checked = new Map();
+  for (const { name, fabric, size } of cases) {
+    const keys = expandControls(topologyPage(fabric, size).panel).map((item) => item.key);
+    assert.ok(keys.length, `${name}: a collapsed shelf has a control`);
+    for (const key of keys) {
+      // Each shelf from two starting views: the drawing's origin, where the
+      // control is in view there, and the control at the box's top left corner.
+      for (const start of ["origin", "corner"]) {
+        const { panel, click } = topologyPage(fabric, size);
+        const first = expandControls(panel).find((item) => item.key === key);
+        if (start === "origin") {
+          panel.box.scrollLeft = 0;
+          panel.box.scrollTop = 0;
+          if (first.x + 160 > size.inner || first.y + 22 > size.height) continue;
+        } else {
+          panel.box.scrollLeft = first.x - 4;
+          panel.box.scrollTop = first.y - 4;
+        }
+        for (const step of ["expand", "collapse"]) {
+          const before = expandControls(panel).find((item) => item.key === key);
+          const was = screenPoint(panel, before);
+          const rect = panel.box.getBoundingClientRect();
+          assert.ok(was[0] >= rect.left && was[0] + 160 <= rect.left + size.inner && was[1] >= rect.top && was[1] + 22 <= rect.top + size.height,
+            `${name}, ${key}, ${start}, ${step}: the control is in view at ${was}`);
+          click({ "data-fabric-expand-slots": key });
+          checked.set(name, (checked.get(name) || 0) + 1);
+          const after = expandControls(panel).find((item) => item.key === key);
+          assert.equal(after.expanded, step === "expand" ? "true" : "false");
+          const now = screenPoint(panel, after);
+          if (Math.abs(now[0] - was[0]) > 1 || Math.abs(now[1] - was[1]) > 1) moved.push(`${name}, ${key}, ${start}, ${step}: from ${was} to ${now}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual([...checked.keys()], cases.map((item) => item.name), "every case expands and collapses a visible control");
+  assert.deepEqual(moved, [], "every control stays in place");
+  // The room added before the drawing's left edge goes on the first redraw
+  // whose view no longer needs it, and nothing on the screen moves then.
+  const { panel, click } = topologyPage(bigShelf(), { inner: 1100, height: 600 });
+  const [shelf] = expandControls(panel);
+  panel.box.scrollLeft = 0;
+  panel.box.scrollTop = 0;
+  click({ "data-fabric-expand-slots": shelf.key });
+  const origin = () => String(panel.box.svg.getAttribute("viewBox")).split(" ").slice(0, 2).map(Number);
+  assert.ok(origin()[0] < 0, `room before the left edge: ${origin()}`);
+  panel.box.scrollLeft += 400;
+  const held = screenPoint(panel, expandControls(panel)[0]);
+  click({ "data-topo-bay": "bay:1", "data-fabric-trace": "bay:1" });
+  assert.deepEqual(origin(), [0, 0], "no room once the view does not need it");
+  assert.deepEqual(screenPoint(panel, expandControls(panel)[0]), held, "the redraw moves nothing");
+  click({ "data-fabric-expand-slots": shelf.key });
+  assert.deepEqual(origin(), [0, 0]);
 });

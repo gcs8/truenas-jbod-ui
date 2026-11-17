@@ -187,7 +187,7 @@
   function fabricContract(fabric) {
     const named = typeof fabric?.raw?.fabric_kind === "string" ? fabric.raw.fabric_kind : "";
     const platform = typeof fabric?.platform === "string" ? fabric.platform : "";
-    const noClaim = "it draws the records the payload carries and makes no claim about what was or was not collected";
+    const noClaim = "it draws the records the payload carries except pools, vdevs and backplane zones, which this view does not draw, and makes no claim about what was or was not collected";
     if (!named) {
       if (platform === "core") return { kind: "core_sas", contract: "core", notice: "" };
       return { kind: "unknown", contract: "unknown", notice: `The payload names no fabric kind${platform ? ` (platform "${platform}")` : ""}: ${noClaim}.` };
@@ -980,6 +980,7 @@
   // item: first the whole name, then the HBA it hangs off, then its id.
   function distinctTitles(model) {
     const title = (entry) => entry.lines.slice(0, entry.titleLines).join(" ");
+    const generated = new Set();
     for (let pass = 0; pass < 3; pass += 1) {
       const byTitle = new Map();
       for (const entry of model.nodes) {
@@ -994,15 +995,19 @@
         if (pass === 0) entry.wholeTitle = true;
         else if (pass === 1 && via && via !== entry.label) entry.label = `${entry.label} via ${via}`;
         else if (pass === 2) entry.label = `${entry.label} (${entry.id})`;
+        generated.add(entry);
         sizeNode(entry);
       }
     }
-    // A generated title can equal one a box already had: the first box in
-    // drawing order keeps it, every later one gets the next free number,
-    // checked against every title in its tier.
+    // A generated title can equal another box's title. Titles the payload
+    // gave are taken first, then every box in identifier order keeps its
+    // title or gets the next free number, checked against every title in
+    // its tier: the payload's order changes nothing, and a real " #2" stays.
+    const key = (item) => `${item.tier}\u0000${title(item)}`;
+    const byId = (left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+    const order = [...model.nodes.filter((entry) => !generated.has(entry)).sort(byId), ...[...generated].sort(byId)];
     const taken = new Set();
-    for (const entry of model.nodes) {
-      const key = (item) => `${item.tier}\u0000${title(item)}`;
+    for (const entry of order) {
       if (taken.has(key(entry))) {
         const base = entry.label;
         entry.wholeTitle = true;
@@ -1606,9 +1611,9 @@
       });
       const shared = [...byLook.values()].filter((names) => names.length > 1)
         .map((names) => (names.length > 2 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names.join(" and ")));
-      const more = shared.length > NAME_LIMIT ? `; and ${plural(shared.length - NAME_LIMIT, "more group")}` : "";
+      // Every group is named: at most one per look, so the list stays short.
       model.notices.push(`${model.chains.length} chains are drawn and there are ${CHAIN_LOOKS} line looks, so these chains share a colour and line pattern: `
-        + `${shared.slice(0, NAME_LIMIT).join("; ")}${more}. Every chain is drawn and in the legend; hover or focus a line to trace its chain.`);
+        + `${shared.join("; ")}. Every chain is drawn and in the legend; hover or focus a line to trace its chain.`);
     }
   }
 
@@ -2056,6 +2061,9 @@
     const count = plural(group.bayIds.length, "bay");
     if (!group.enclosureIds.length) return `No enclosure link · ${count}`;
     const numbers = group.bays.map((bay) => bay.number).filter(Boolean).sort((left, right) => Number(left) - Number(right));
+    const span = numbers.length > 1 && numbers[0] !== numbers[numbers.length - 1] ? `${numbers[0]}–${numbers[numbers.length - 1]}` : numbers[0];
+    // Only some labels carry a number: say how many, never a range for all.
+    if (numbers.length && numbers.length < group.bayIds.length) return `${count}, ${numbers.length} numbered: ${span}`;
     const range = numbers.length ? `Bays ${numbers[0]}–${numbers[numbers.length - 1]}` : "Bays";
     return `${range} · ${count}`;
   }
@@ -2201,10 +2209,10 @@
     const nodes = model.nodes.map((entry) => renderNode(entry, path, used)).join("");
     const groups = model.groups.map((group) => renderGroup(model, group, path, used)).join("");
     const svgLabel = `Storage Fabric topology: ${model.tiers.map((tier) => `${tier.label} ${tier.note}`).join("; ")}`;
-    // view.pad: room kept so the offsets in view stay reachable (render).
-    const pad = view.fit ? null : view.pad;
-    const fullW = Math.ceil(Math.max(model.width, Number(pad?.width) || 0));
-    const fullH = Math.ceil(Math.max(model.height, Number(pad?.height) || 0));
+    // The drawing at its own size; mount adds room around it when the view
+    // kept on the screen needs it.
+    const fullW = Math.ceil(model.width);
+    const fullH = Math.ceil(model.height);
     // Fit: the whole drawing scaled into the box it was laid out for, never enlarged.
     const box = model.box || {};
     const scale = view.fit ? Math.min(1, box.width ? box.width / fullW : 1, box.height ? box.height / fullH : 1) : 1;
@@ -2287,9 +2295,14 @@
     // { expand: group id, anchor: its centre on screen, control: where its
     // expand control was on the page, when it was in view } or null (keep).
     firstView: null, expandedKeys: null, refocusFit: false, quiet: null,
-    // The offsets held before Fit, and those to restore on Actual size; the
-    // inner width last measured after a mount.
-    actualScroll: null, restoreScroll: null, measuredWidth: null, pad: null,
+    // scroll, actualScroll and restoreScroll are in drawing coordinates: the
+    // offsets held before Fit, and those to restore on Actual size. room: the
+    // space mount added before the drawing's left and top edges, so a view
+    // kept in place there stays reachable. The inner width last measured
+    // after a mount.
+    actualScroll: null, restoreScroll: null, measuredWidths: new Set(), room: { left: 0, top: 0 },
+    // The drawing's root that the last mount put in place, until release.
+    mounted: null,
   };
   const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
 
@@ -2352,7 +2365,6 @@
     // The page replaces the map on every render: keep the drawing's scroll
     // position for the same scope, and start a new scope at the origin.
     const keys = expandedKeys(options);
-    live.pad = null;
     if (live.scope === null || model.scope !== live.scope) {
       if (live.scope !== null) {
         live.pin = null;
@@ -2361,7 +2373,7 @@
       live.scroll = { left: 0, top: 0 };
       live.firstView = "open";
     } else {
-      if (box) live.scroll = { left: Number(box.scrollLeft) || 0, top: Number(box.scrollTop) || 0 };
+      if (box) live.scroll = { left: (Number(box.scrollLeft) || 0) - live.room.left, top: (Number(box.scrollTop) || 0) - live.room.top };
       // Back from Fit: the offsets the drawing had before it was fitted.
       if (live.restoreScroll) live.scroll = live.restoreScroll;
       // A shelf expanded or collapsed: keep its control where the operator
@@ -2369,7 +2381,6 @@
       const toggled = [...model.groups].find((group) => keys.has(group.expandKey) !== Boolean(live.expandedKeys?.has(group.expandKey)));
       const before = toggled && previous?.groupById.get(toggled.id);
       const clientHeight = Number(box?.clientHeight) || 0;
-      let target = live.scroll;
       if (toggled && before && live.firstView === null) {
         const control = toggleBox(before);
         const visible = Boolean(box) && measured > 0 && clientHeight > 0
@@ -2381,15 +2392,7 @@
           anchor: centreOf(before) - live.scroll.left,
           control: visible ? { x: rect.left + control.x - live.scroll.left, y: rect.top + control.y - live.scroll.top } : null,
         };
-        if (visible) {
-          const moved = toggleBox(model.groupById.get(toggled.id));
-          target = { left: live.scroll.left + moved.x - control.x, top: live.scroll.top + moved.y - control.y };
-        }
       }
-      // A redraw never makes the drawing smaller than the part of it in view,
-      // so the offsets it keeps (or a shelf control kept in place) stay
-      // reachable; the extra room goes when a later redraw no longer needs it.
-      if (box && measured > 0 && clientHeight > 0) live.pad = { width: target.left + measured, height: target.top + clientHeight };
     }
     live.restoreScroll = null;
     live.expandedKeys = keys;
@@ -2409,7 +2412,7 @@
       const label = live.input.labels?.[0];
       if (label) label.textContent = help.label;
     }
-    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit, pad: live.pad });
+    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
   }
 
   // Where the scroll box starts: with the host and every HBA inside it when
@@ -2438,6 +2441,25 @@
     return Math.round(Math.min(range[1], Math.max(range[0], wanted)));
   }
 
+  // Room around the drawing so the view at drawing offsets (left, top) is
+  // reachable: before its left or top edge where they are negative, after
+  // its right or bottom edge where the view reaches past them. Mount sizes
+  // it every time, so room no later view needs is given back.
+  function sizeRoom(box, left, top) {
+    const svg = box.querySelector?.(".fabric-topology-svg");
+    const model = live.model;
+    if (!svg || typeof svg.setAttribute !== "function" || !model || live.fit) return { left: 0, top: 0 };
+    const room = { left: Math.max(0, Math.ceil(-left)), top: Math.max(0, Math.ceil(-top)) };
+    const right = Math.max(Math.ceil(model.width), Math.ceil(left + (Number(box.clientWidth) || 0)));
+    const bottom = Math.max(Math.ceil(model.height), Math.ceil(top + (Number(box.clientHeight) || 0)));
+    const width = right + room.left;
+    const height = bottom + room.top;
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    svg.setAttribute("viewBox", `${-room.left} ${-room.top} ${width} ${height}`);
+    return room;
+  }
+
   // After the page has put the drawing in place: set its scroll position,
   // and give focus back to Fit after a Fit click.
   function mount(container) {
@@ -2446,6 +2468,7 @@
       const reason = live.firstView;
       live.firstView = null;
       const width = Number(box.clientWidth) || live.model?.box?.width || 0;
+      // Offsets in drawing coordinates: negative ones lie before its edge.
       let left = live.scroll.left;
       let top = live.scroll.top;
       const group = reason?.expand ? live.model?.groupById.get(reason.expand) : null;
@@ -2460,16 +2483,25 @@
         left = firstViewLeft(live.model, reason, width, live.scroll.left);
         if (reason === "open") top = 0;
       }
+      live.room = sizeRoom(box, left, top);
+      left += live.room.left;
+      top += live.room.top;
       if (box.scrollLeft !== left) box.scrollLeft = left;
       if (box.scrollTop !== top) box.scrollTop = top;
       // The box's inner width differs from the width the drawing was laid
       // out for (a scroll bar came or went): lay it out once more.
+      // Once per inner width while Topology is shown, so a scroll bar that comes and goes cannot loop.
       const inner = Number(box.clientWidth) || 0;
-      if (inner > 0 && live.model && Math.abs(inner - (live.model.box?.width || 0)) >= 1 && live.measuredWidth !== inner
+      const root = container.querySelector?.(".fabric-topology") || null;
+      live.mounted = root;
+      if (inner > 0 && root && live.model && Math.abs(inner - (live.model.box?.width || 0)) >= 1 && !live.measuredWidths.has(inner)
         && typeof window.setTimeout === "function") {
-        live.measuredWidth = inner;
-        window.setTimeout(() => {
-          if (live.container?.querySelector?.(".fabric-topology")) live.hooks.requestRender?.();
+        live.measuredWidths.add(inner);
+        cancelWidthTimer();
+        globals.widthTimer = window.setTimeout(() => {
+          globals.widthTimer = null;
+          // Only for the root still in place: a later redraw measured its own.
+          if (live.mounted === root && live.container?.querySelector?.(".fabric-topology") === root) live.hooks.requestRender?.();
         }, 0);
       }
     }
@@ -2490,8 +2522,10 @@
     live.scroll = { left: 0, top: 0 };
     live.actualScroll = null;
     live.restoreScroll = null;
-    live.measuredWidth = null;
-    live.pad = null;
+    live.measuredWidths = new Set();
+    live.mounted = null;
+    live.room = { left: 0, top: 0 };
+    cancelWidthTimer();
     clearInput();
     unlisten();
   }
@@ -2564,7 +2598,12 @@
   // One document Esc handler and one window resize handler for the page,
   // however often the view is attached; added while Topology is shown and
   // removed when it is left.
-  const globals = { listening: false, timer: null };
+  const globals = { listening: false, timer: null, widthTimer: null };
+
+  function cancelWidthTimer() {
+    if (globals.widthTimer !== null && typeof window.clearTimeout === "function") window.clearTimeout(globals.widthTimer);
+    globals.widthTimer = null;
+  }
 
   function onEscape(event) {
     if (event.key !== "Escape" || !live.container?.querySelector?.(".fabric-topology")) return;
@@ -2638,7 +2677,7 @@
         // Fit keeps the offsets the fitted drawing allows; Actual size goes
         // back to the offsets held before Fit.
         const box = scrollBox(container);
-        if (!live.fit) live.actualScroll = { left: Number(box?.scrollLeft) || 0, top: Number(box?.scrollTop) || 0 };
+        if (!live.fit) live.actualScroll = { left: (Number(box?.scrollLeft) || 0) - live.room.left, top: (Number(box?.scrollTop) || 0) - live.room.top };
         else live.restoreScroll = live.actualScroll;
         live.fit = !live.fit;
         live.refocusFit = true;

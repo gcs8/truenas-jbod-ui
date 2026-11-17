@@ -532,6 +532,73 @@ test("leaving the view removes its document and window listeners; one Esc handle
   assert.deepEqual(counts(), { keydown: 1, resize: 1 }, "entering Topology again listens again, once");
 });
 
+test("the deferred width measurement runs once per inner width while Topology is shown, and never after it is left or redrawn", () => {
+  // A fake timer queue: nothing runs until the test says so.
+  const queue = new Map();
+  let next = 1;
+  const sandboxWindow = {
+    addEventListener() {}, removeEventListener() {},
+    setTimeout(callback) { queue.set(next, callback); next += 1; return next - 1; },
+    clearTimeout(id) { queue.delete(id); },
+  };
+  // A timer that runs leaves the queue, as in a browser.
+  const take = () => {
+    const [id, callback] = [...queue.entries()].pop();
+    queue.delete(id);
+    return callback;
+  };
+  const T = H.loadTopology({ document: { addEventListener() {}, removeEventListener() {} }, window: sandboxWindow });
+  let requested = 0;
+  // The page's panel: each redraw puts a new root and a new scroll box in it.
+  let root = { querySelector: () => null, querySelectorAll: () => [] };
+  let box = { scrollLeft: 0, scrollTop: 0, clientWidth: 400 };
+  const container = {
+    dataset: {},
+    querySelector: (selector) => (selector === ".fabric-topology-scroll" ? box : selector === ".fabric-topology" ? root : null),
+    addEventListener() {},
+  };
+  T.attach(container, null, null, { requestRender() { requested += 1; } });
+  const { fabric } = H.twoHbaCascade();
+  // The drawing is laid out for a 400 px box; the box put in place measures `inner`.
+  const draw = (inner) => {
+    box = { scrollLeft: 0, scrollTop: 0, clientWidth: 400 };
+    T.render(fabric, {});
+    root = { querySelector: () => null, querySelectorAll: () => [] };
+    box = { scrollLeft: 0, scrollTop: 0, clientWidth: inner };
+    T.mount(container);
+  };
+  const scheduled = [];
+  let total = 0;
+  const counting = sandboxWindow.setTimeout;
+  sandboxWindow.setTimeout = (callback, delay) => { total += 1; return counting(callback, delay); };
+  for (const inner of [373, 373, 372, 373]) {
+    draw(inner);
+    scheduled.push(total);
+  }
+  assert.deepEqual(scheduled, [1, 1, 2, 2], "373 and 372 are each measured once");
+  assert.equal(queue.size, 1, "only the latest measurement is pending");
+  // A measurement for a root the page has since replaced does nothing.
+  draw(371);
+  const stale = take();
+  root = { querySelector: () => null, querySelectorAll: () => [] };
+  stale();
+  assert.equal(requested, 0, "a replaced root is not laid out again");
+  // The one for the root in place lays it out once more.
+  draw(370);
+  take()();
+  assert.equal(requested, 1);
+  // Leaving Topology cancels what is pending; a new visit measures afresh.
+  draw(369);
+  assert.equal(queue.size, 1);
+  const left = [...queue.values()].pop();
+  T.release();
+  assert.equal(queue.size, 0, "nothing pending after release");
+  left();
+  assert.equal(requested, 1, "a callback that ran anyway does nothing after release");
+  draw(373);
+  assert.equal(queue.size, 1, "a width measured on an earlier visit is measured again");
+});
+
 // ---- Esc, and the strip Topology does not use -------------------------------
 
 test("Esc clears pin, trace and inspector, and they stay cleared while focus stays on the same item", () => {
@@ -862,6 +929,28 @@ test("when more chains are drawn than there are looks, a notice names the chains
     H.addExpander(fewer, `mpr${index}`, 0x9000 + index, 1, hba.id);
   }
   assert.ok(![...T.buildTopologyModel(fewer, { width: 1920 }).notices].some((text) => /share/.test(text)));
+});
+
+test("the shared-look notice names every group of chains that share a look, however many there are", () => {
+  const T = H.loadTopology();
+  const chains = (count) => {
+    const fabric = H.coreFabric();
+    for (let index = 0; index < count; index += 1) {
+      const hba = H.addController(fabric, `mpr${index}`);
+      H.addExpander(fabric, `mpr${index}`, 0x9000 + index, 1, hba.id);
+    }
+    return [...T.buildTopologyModel(fabric, { width: 1920 }).notices].find((text) => /share/.test(text));
+  };
+  // 37 chains: five pairs share a look, and all five are named.
+  const notice = chains(37);
+  const named = /share a colour and line pattern: ([^.]*)\./.exec(notice)?.[1];
+  assert.equal(named, "mpr0 and mpr32; mpr1 and mpr33; mpr2 and mpr34; mpr3 and mpr35; mpr4 and mpr36", notice);
+  assert.doesNotMatch(notice, /more/);
+  // 70 chains: every one of the 32 looks is shared, some by three chains.
+  const many = chains(70);
+  assert.doesNotMatch(many, /more/);
+  for (let index = 0; index < 32; index += 1) assert.match(many, new RegExp(`\\bmpr${index}\\b`), `mpr${index}`);
+  assert.match(many, /mpr5, mpr37 and mpr69/);
 });
 
 // ---- width: the scroll box's inner width -----------------------------------------
