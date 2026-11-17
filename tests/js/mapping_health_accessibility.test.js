@@ -7,7 +7,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
-const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
+const APP_SOURCE = require("./helpers/main_page_source").mainPageSource();
 const FABRIC_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 const FABRIC_TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/sas_fabric.html"), "utf8");

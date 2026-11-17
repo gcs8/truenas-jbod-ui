@@ -11,7 +11,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const ROOT = path.resolve(__dirname, "../..");
-const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
+const APP_SOURCE = require("./helpers/main_page_source").mainPageSource();
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 
 const INTERNAL_WORDS = /\b(enrichment|evidence|calibrat\w*|scope|scoped|artifact|sanitized?|rollups?|payload|middleware|gmultipath)\b/i;
