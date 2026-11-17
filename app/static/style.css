@@ -491,6 +491,9 @@ textarea {
   color: var(--text);
   padding: 10px 12px;
   font-family: var(--mono);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .meta-select:disabled {
@@ -1664,7 +1667,9 @@ textarea {
 
 .fabric-page-topbar .topbar-meta {
   display: grid;
-  grid-template-columns: minmax(170px, 1.15fr) minmax(170px, 1.15fr) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
+  /* The System track grows to fit the longest system name before the others
+     share the rest; a name that still does not fit ends in an ellipsis. */
+  grid-template-columns: minmax(170px, max-content) minmax(170px, 1.15fr) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
   min-width: 0;
 }
 

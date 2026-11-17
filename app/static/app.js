@@ -10939,6 +10939,16 @@
 
   // A saved copy shows a selector that cannot change as plain text instead of
   // a disabled control (#439). Live pages keep the disabled select.
+  // A name too long for the select ends in an ellipsis; the title keeps the
+  // full selected name readable on hover.
+  function syncSelectTitle(select) {
+    if (!select) {
+      return;
+    }
+    const selectedOption = select.options?.[select.selectedIndex];
+    select.title = (selectedOption?.textContent || "").trim();
+  }
+
   function showSelectAsTextInSnapshot(select, staticText) {
     if (!select || !staticText) {
       return;
@@ -10998,6 +11008,7 @@
         systemSelect.value = state.selectedSystemId;
       }
       systemSelect.disabled = state.snapshotMode || systems.length <= 1;
+      syncSelectTitle(systemSelect);
       showSelectAsTextInSnapshot(systemSelect, systemSelectStatic);
     }
 
@@ -12373,6 +12384,7 @@
   });
   if (systemSelect) {
     systemSelect.addEventListener("change", async (event) => {
+      syncSelectTitle(systemSelect);
       const nextSystemId = event.target.value || null;
       if (nextSystemId !== state.selectedSystemId && !confirmMappingDraftDiscard()) {
         renderSelectors();

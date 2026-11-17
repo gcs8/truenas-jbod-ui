@@ -3836,6 +3836,16 @@
     elements.inspectorBody.innerHTML = "Select a controller, path, expander, enclosure, or bay trace.";
   }
 
+  // A name too long for the select ends in an ellipsis; the title keeps the
+  // full selected name readable on hover.
+  function syncSelectTitle(select) {
+    if (!select) {
+      return;
+    }
+    const selectedOption = select.options?.[select.selectedIndex];
+    select.title = (selectedOption?.textContent || "").trim();
+  }
+
   function renderSelectors() {
     const systems = list(state.snapshot.systems);
     const enclosures = list(state.snapshot.enclosures);
@@ -3846,6 +3856,7 @@
     setSelectOptionsIfChanged(elements.systemSelect, systemOptions);
     elements.systemSelect.value = state.selectedSystemId || "";
     elements.systemSelect.disabled = systems.length <= 1 || state.loading;
+    syncSelectTitle(elements.systemSelect);
 
     const enclosureOptions = enclosures.length
       ? enclosures.map((enclosure) => {
@@ -4470,6 +4481,7 @@
   });
 
   elements.systemSelect.addEventListener("change", () => {
+    syncSelectTitle(elements.systemSelect);
     state.smartRequests = {};
     state.smartSummaries = {};
     state.smartSummaryTimes = {};
