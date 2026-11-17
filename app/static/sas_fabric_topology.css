@@ -38,8 +38,21 @@ body.fabric-topology-mode .fabric-page-shell {
 
 .fabric-topology {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
+}
+
+/* Narrow pages: the parts, legend and notices wrap inside the panel, long
+   ids included; only the drawing scrolls sideways, inside its own box. */
+.fabric-topology > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology .warning-item {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .fabric-topology-parts,
@@ -52,6 +65,8 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 .fabric-topology-part {
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: 2px 8px;
   border: 1px solid var(--panel-border);
   border-radius: 999px;
@@ -75,6 +90,8 @@ body.fabric-topology-mode .fabric-page-shell {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .fabric-topology-swatch {
@@ -99,7 +116,7 @@ body.fabric-topology-mode .fabric-page-shell {
 
 .fabric-topology-swatch.is-bundle {
   border-top-width: 6px;
-  opacity: 0.6;
+  opacity: 0.7;
 }
 
 .fabric-topology-swatch.is-on-path {
@@ -162,6 +179,7 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 .fabric-topology-scroll {
+  max-width: 100%;
   max-height: 78vh;
   overflow: auto;
   border: 1px solid var(--panel-border);
@@ -221,7 +239,8 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 /* Lines: the colour says which HBA a line hangs off; width and dash say what
-   kind of link it is. */
+   kind of link it is. A bay bundle at 0.7 opacity keeps at least 3:1 against
+   the drawing's surface in every chain colour. */
 .fabric-topology-svg .topo-link {
   fill: none;
   stroke: var(--muted);
@@ -242,7 +261,7 @@ body.fabric-topology-mode .fabric-page-shell {
 
 .fabric-topology-svg .topo-link.is-bundle {
   stroke-width: 6;
-  stroke-opacity: 0.6;
+  stroke-opacity: 0.7;
 }
 
 /* Each HBA chain: a palette colour and a line pattern (chainStyle in

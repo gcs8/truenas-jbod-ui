@@ -53,6 +53,10 @@
   const MARGIN = 16;
   const CHAR_W = 7;
   const SUMMARY_W = 300;
+  // An expandable bay group's control row: a 22 px control and its gap.
+  const TOGGLE_H = 26;
+  // The scroll box's border on each side (sas_fabric_topology.css).
+  const SCROLL_BORDER = 1;
   // Gaps between rows: a 10 px track per link, then its label, 8 px clear of
   // the tracks above and of the box below.
   const TRACK = 10;
@@ -61,6 +65,9 @@
   const LABEL_CLEAR = 8;
   const JUNCTION = 14;
   const NAME_LIMIT = 4;
+  // Above this many lines (links that are not bay bundles) the layout skips
+  // its polish steps; see layoutModel. Real systems stay far below it.
+  const SIMPLIFY_ABOVE = 512;
   const LANE_LINKS = new Set(["controller-expander", "expander-expander"]);
   const HIDDEN_KINDS = new Set(["pool", "vdev", "backplane"]);
   const MEMBER_HEALTH = "member-health-not-transport";
@@ -875,12 +882,15 @@
     if (notDrawn.length) {
       model.notices.push(`Not drawn: ${notDrawn.join("; ")}.`);
     }
+    // One notice per large bay group, collapsed or drawn in full, so that
+    // expanding or collapsing a shelf does not move the drawing on the page.
     for (const group of groups) {
-      if (group.collapsed) {
-        const names = group.enclosureIds.map((id) => nodeById.get(id)?.label || id).join(" and ");
-        const what = group.locationKnown ? "bays" : "disks";
-        model.notices.push(`${group.bayIds.length} ${what}${names ? ` behind ${names}` : ""} are shown as a summary block; expand it to draw each one.`);
-      }
+      if (!group.expandable) continue;
+      const names = group.enclosureIds.map((id) => nodeById.get(id)?.label || id).join(" and ");
+      const what = `${group.bayIds.length} ${group.locationKnown ? "bays" : "disks"}${names ? ` behind ${names}` : ""}`;
+      model.notices.push(group.collapsed
+        ? `${what} are shown as a summary block; expand it to draw each one.`
+        : `${what} are drawn in full; collapse them to a summary block to shorten the drawing.`);
     }
     layoutModel(model, options);
     model.box = { width: Number(options.width) || 0, height: Number(options.height) || 0 };
@@ -933,8 +943,12 @@
   // longer than that is shortened (its whole text stays in the item's name).
   // With `whole`, a long word is broken over lines instead of shortened.
   function wrap(text, max, whole = false) {
-    const words = String(text ?? "").split(/\s+/).filter(Boolean)
-      .flatMap((word) => (whole && word.length > max ? word.match(new RegExp(`.{1,${max}}`, "g")) : [word]));
+    return wrapWords(String(text ?? "").split(/\s+/).filter(Boolean), max, whole);
+  }
+
+  // The same, for words already split; a word may hold a space it keeps.
+  function wrapWords(given, max, whole = false) {
+    const words = given.flatMap((word) => (whole && word.length > max ? word.match(new RegExp(`.{1,${max}}`, "g")) : [word]));
     const lines = [];
     let line = "";
     for (const word of words) {
@@ -1015,11 +1029,14 @@
 
   function groupSize(group) {
     const texts = groupText(group);
+    // An expandable group's control sits at its top left in both states,
+    // its text below the control.
+    group.textTop = group.expandable ? TOGGLE_H : 0;
     if (group.collapsed) {
       const width = Math.max(SUMMARY_W, ...texts.map((line) => line.text.length * TEXT_W + 20));
       group.lines = texts.flatMap((line) => wrap(line.text, Math.floor((width - 20) / TEXT_W)).map((text) => ({ ...line, text })));
-      group.headH = 10 + group.lines.length * LINE_H;
-      return [width, group.headH + 40];
+      group.headH = 10 + group.textTop + group.lines.length * LINE_H;
+      return [width, group.headH + 10];
     }
     const count = group.cells.length;
     const pitch = group.cellWidth + (CELL - CELL_BOX);
@@ -1029,11 +1046,10 @@
     group.perRow = perRow;
     group.pitch = pitch;
     // An unlinked or logical group is wide enough to say so in full.
-    const toggle = group.expandable ? 180 : 0;
-    const minimum = Math.max(NODE_W, texts[0].text.length * TEXT_W + 20 + toggle);
+    const minimum = Math.max(NODE_W, texts[0].text.length * TEXT_W + 20);
     const width = Math.max(minimum, columns * pitch + 16);
-    group.lines = texts.flatMap((line, index) => wrap(line.text, Math.floor((width - 20 - (index ? 0 : toggle)) / TEXT_W)).map((text) => ({ ...line, text })));
-    group.headH = 12 + group.lines.length * LINE_H;
+    group.lines = texts.flatMap((line) => wrap(line.text, Math.floor((width - 20) / TEXT_W)).map((text) => ({ ...line, text })));
+    group.headH = 12 + group.textTop + group.lines.length * LINE_H;
     return [width, group.headH + rows * CELL + 10];
   }
 
@@ -1087,17 +1103,98 @@
     return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99;
   }
 
-  // Proper crossings between the drawn segments of different links.
-  function countCrossings(links) {
-    const segments = [];
+  // Work counters: every loop of the layout adds what it did, so a test can
+  // bound the cost by counting, not timing.
+  function tick(work, key, count = 1) {
+    work[key] = (work[key] || 0) + count;
+    work.total += count;
+  }
+
+  function lowerBound(values, value, key = (item) => item) {
+    let lo = 0;
+    let hi = values.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (key(values[mid]) < value) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  // The drawn segments of the links, split into horizontal, vertical and
+  // other pieces, each with its order in the drawing.
+  function segmentsOf(links) {
+    const horizontals = [];
+    const verticals = [];
+    const others = [];
+    let order = 0;
     for (const link of links) {
       const points = link.points || [];
-      for (let index = 0; index + 1 < points.length; index += 1) segments.push([link, points[index], points[index + 1]]);
+      for (let index = 0; index + 1 < points.length; index += 1) {
+        const [a, b] = [points[index], points[index + 1]];
+        const segment = { link, a, b, order: order += 1 };
+        if (a[1] === b[1] && a[0] !== b[0]) horizontals.push(segment);
+        else if (a[0] === b[0] && a[1] !== b[1]) verticals.push(segment);
+        else if (a[0] !== b[0] || a[1] !== b[1]) others.push(segment);
+      }
     }
+    return { horizontals, verticals, others };
+  }
+
+  // Every horizontal and vertical piece of different links whose closed
+  // extents meet, found by one sweep down the drawing (the work is the
+  // pieces, their sorting and the pairs found, not every pair of pieces).
+  function meetingPairs(segments, work) {
+    const events = [];
+    for (const segment of segments.verticals) {
+      const [top, bottom] = [Math.min(segment.a[1], segment.b[1]), Math.max(segment.a[1], segment.b[1])];
+      events.push({ y: top, kind: 0, segment }, { y: bottom, kind: 2, segment });
+    }
+    for (const segment of segments.horizontals) events.push({ y: segment.a[1], kind: 1, segment });
+    events.sort((left, right) => left.y - right.y || left.kind - right.kind);
+    tick(work, "crossingWork", events.length * Math.max(1, Math.ceil(Math.log2(events.length + 1))));
+    const active = [];
+    const pairs = [];
+    const xOf = (segment) => segment.a[0];
+    for (const event of events) {
+      const { segment } = event;
+      if (event.kind === 0) {
+        active.splice(lowerBound(active, xOf(segment), xOf), 0, segment);
+      } else if (event.kind === 2) {
+        for (let index = lowerBound(active, xOf(segment), xOf); index < active.length; index += 1) {
+          if (active[index] === segment) {
+            active.splice(index, 1);
+            break;
+          }
+        }
+      } else {
+        const [left, right] = [Math.min(segment.a[0], segment.b[0]), Math.max(segment.a[0], segment.b[0])];
+        for (let index = lowerBound(active, left, xOf); index < active.length && xOf(active[index]) <= right; index += 1) {
+          tick(work, "crossingWork");
+          if (active[index].link !== segment.link) pairs.push([segment, active[index]]);
+        }
+      }
+    }
+    return pairs;
+  }
+
+  // Proper crossings between the drawn segments of different links.
+  function countCrossings(links, work) {
+    const segments = segmentsOf(links);
     let count = 0;
-    for (let i = 0; i < segments.length; i += 1) {
-      for (let j = i + 1; j < segments.length; j += 1) {
-        if (segments[i][0] !== segments[j][0] && properCross(segments[i][1], segments[i][2], segments[j][1], segments[j][2])) count += 1;
+    for (const [horizontal, vertical] of meetingPairs(segments, work)) {
+      const [first, second] = horizontal.order < vertical.order ? [horizontal, vertical] : [vertical, horizontal];
+      if (properCross(first.a, first.b, second.a, second.b)) count += 1;
+    }
+    // A piece that is neither horizontal nor vertical (routes never make
+    // one) is checked against every other piece.
+    const all = [...segments.horizontals, ...segments.verticals, ...segments.others].sort((left, right) => left.order - right.order);
+    for (const other of segments.others) {
+      tick(work, "crossingWork", all.length);
+      for (const segment of all) {
+        if (segment.link === other.link || (segments.others.includes(segment) && segment.order <= other.order)) continue;
+        const [first, second] = segment.order < other.order ? [segment, other] : [other, segment];
+        if (properCross(first.a, first.b, second.a, second.b)) count += 1;
       }
     }
     return count;
@@ -1105,24 +1202,19 @@
 
   // Where a vertical piece of one link crosses a horizontal piece of another:
   // the vertical continues, the horizontal is drawn with a small gap.
-  function crossingMarks(links) {
-    const pieces = (vertical) => links.flatMap((link) => (link.points || []).slice(1).map((point, index) => [link, link.points[index], point])
-      .filter(([, a, b]) => (vertical ? a[0] === b[0] && a[1] !== b[1] : a[1] === b[1] && a[0] !== b[0])));
-    const verticals = pieces(true);
+  function crossingMarks(links, work) {
     const marks = [];
-    for (const [under, a, b] of pieces(false)) {
+    const pairs = meetingPairs(segmentsOf(links), work).sort(([h1, v1], [h2, v2]) => h1.order - h2.order || v1.order - v2.order);
+    for (const [{ link: under, a, b }, { link: over, a: c, b: d }] of pairs) {
       const [left, right] = [Math.min(a[0], b[0]), Math.max(a[0], b[0])];
-      for (const [over, c, d] of verticals) {
-        if (over === under) continue;
-        const [top, bottom] = [Math.min(c[1], d[1]), Math.max(c[1], d[1])];
-        if (c[0] > left + 1 && c[0] < right - 1 && a[1] > top + 1 && a[1] < bottom - 1) marks.push({ x: c[0], y: a[1], over: over.id, under: under.id });
-      }
+      const [top, bottom] = [Math.min(c[1], d[1]), Math.max(c[1], d[1])];
+      if (c[0] > left + 1 && c[0] < right - 1 && a[1] > top + 1 && a[1] < bottom - 1) marks.push({ x: c[0], y: a[1], over: over.id, under: under.id });
     }
     return marks;
   }
 
   // Row orders to try: the starting order and every barycentre sweep after it.
-  function orderCandidates(rows, links, rowIndex) {
+  function orderCandidates(rows, links, rowIndex, work, sweeps = 8) {
     const parents = new Map();
     const children = new Map();
     for (const link of links) {
@@ -1134,12 +1226,14 @@
     let order = rows.map((row) => row.items.slice());
     const snapshot = () => order.map((items) => items.slice());
     const candidates = [snapshot()];
+    tick(work, "orderWork", links.length);
     const position = () => {
       const result = new Map();
       for (const items of order) items.forEach((item, index) => result.set(item.id, (index + 0.5) / items.length));
+      tick(work, "orderWork", result.size);
       return result;
     };
-    for (let iteration = 0; iteration < 8; iteration += 1) {
+    for (let iteration = 0; iteration < sweeps; iteration += 1) {
       const down = iteration % 2 === 0;
       const sequence = down ? order.map((_, index) => index).slice(1) : order.map((_, index) => index).reverse().slice(1);
       for (const r of sequence) {
@@ -1147,8 +1241,10 @@
         const neighbours = down ? parents : children;
         const key = new Map(order[r].map((item) => {
           const ids = list(neighbours.get(item.id)).filter((id) => (down ? rowIndex.get(id) < r : rowIndex.get(id) > r));
+          tick(work, "orderWork", 1 + list(neighbours.get(item.id)).length);
           return [item.id, ids.length ? ids.reduce((sum, id) => sum + at.get(id), 0) / ids.length : at.get(item.id)];
         }));
+        tick(work, "orderWork", order[r].length * Math.max(1, Math.ceil(Math.log2(order[r].length + 1))));
         order[r] = order[r].slice().sort((left, right) => key.get(left.id) - key.get(right.id));
       }
       candidates.push(snapshot());
@@ -1160,8 +1256,10 @@
   // width; the rows under it are placed under their parents; then, from the
   // bottom row up, every parent is centred over the span of all its direct
   // children (in any row below), as near that span's midpoint as the order
-  // and the gaps between boxes allow.
-  function placeRows(rows, links, rowIndex, available) {
+  // and the gaps between boxes allow. Where the drawing's edges keep a parent
+  // outside its children's span, that pass runs again without the edges and
+  // the drawing grows (it scrolls) instead.
+  function placeRows(rows, links, rowIndex, available, work) {
     const parents = new Map();
     const children = new Map();
     for (const link of links) {
@@ -1192,10 +1290,11 @@
       });
     };
     for (const row of rows) spread(row).forEach((x, index) => { row.items[index].x = x; });
-    const place = (r, wanted) => {
+    const place = (r, wanted, bounds = [lo, hi]) => {
       const row = rows[r];
       if (!row.items.length) return;
-      placeRow(row.items, row.items.map((item) => wanted(item) ?? item.x), H_GAP, lo, hi);
+      tick(work, "placeWork", row.items.length);
+      placeRow(row.items, row.items.map((item) => wanted(item) ?? item.x), H_GAP, bounds[0], bounds[1]);
     };
     for (let r = anchor + 1; r < rows.length; r += 1) {
       place(r, (item) => {
@@ -1203,16 +1302,22 @@
         return ids.length ? ids.reduce((sum, id) => sum + centreOf(byId.get(id)), 0) / ids.length - item.w / 2 : null;
       });
     }
-    for (let r = rows.length - 2; r >= 0; r -= 1) {
-      place(r, (item) => {
-        const ids = list(children.get(item.id)).filter((id) => byId.has(id));
-        if (!ids.length) return null;
-        const left = Math.min(...ids.map((id) => byId.get(id).x));
-        const right = Math.max(...ids.map((id) => byId.get(id).x + byId.get(id).w));
-        return (left + right) / 2 - item.w / 2;
-      });
-    }
-    return width;
+    const overChildren = (item) => {
+      const ids = list(children.get(item.id)).filter((id) => byId.has(id));
+      if (!ids.length) return null;
+      const left = Math.min(...ids.map((id) => byId.get(id).x));
+      const right = Math.max(...ids.map((id) => byId.get(id).x + byId.get(id).w));
+      return (left + right) / 2 - item.w / 2;
+    };
+    for (let r = rows.length - 2; r >= 0; r -= 1) place(r, overChildren);
+    tick(work, "placeWork", links.length);
+    if (!spanViolations(links, byId, rowIndex)) return width;
+    tick(work, "placeWork", links.length);
+    for (let r = rows.length - 2; r >= 0; r -= 1) place(r, overChildren, [-Infinity, Infinity]);
+    const items = [...byId.values()];
+    const shift = Math.max(0, lo - Math.min(...items.map((item) => item.x)));
+    for (const item of items) item.x += shift;
+    return Math.max(width, Math.max(...items.map((item) => item.x + item.w)) + MARGIN);
   }
 
   // Parents whose centre is outside the span of their direct children.
@@ -1234,42 +1339,74 @@
 
   // Routes, tracks and labels for one placement. Returns the drawing height.
   function routeLinks(model, rows, links, rowIndex, width) {
-    model.work.routePasses += 1;
+    const { work } = model;
+    tick(work, "routePasses");
     const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
     const gaps = rows.map(() => ({ horizontals: [], labels: [], verticals: [] }));
+    // Each item's links out and in, collected once.
+    const outOf = new Map();
+    const inTo = new Map();
+    for (const link of links) {
+      if (!outOf.has(link.source)) outOf.set(link.source, []);
+      if (!inTo.has(link.target)) inTo.set(link.target, []);
+      outOf.get(link.source).push(link);
+      inTo.get(link.target).push(link);
+    }
+    tick(work, "routeWork", links.length + byId.size);
     // Exits: spread on the parent's bottom edge in the order of their targets.
     const exits = new Map();
     const arrivals = new Map();
     for (const item of byId.values()) {
-      const out = links.filter((link) => link.source === item.id).sort((a, b) => centreOf(byId.get(a.target)) - centreOf(byId.get(b.target)));
+      const out = list(outOf.get(item.id)).sort((a, b) => centreOf(byId.get(a.target)) - centreOf(byId.get(b.target)));
       out.forEach((link, index) => exits.set(link, item.x + item.w * (index + 1) / (out.length + 1)));
-      const into = links.filter((link) => link.target === item.id).sort((a, b) => centreOf(byId.get(a.source)) - centreOf(byId.get(b.source)));
+      const into = list(inTo.get(item.id)).sort((a, b) => centreOf(byId.get(a.source)) - centreOf(byId.get(b.source)));
       arrivals.set(item.id, into);
+      tick(work, "routeWork", (out.length + into.length) * Math.max(1, Math.ceil(Math.log2(out.length + into.length + 1))));
     }
+    // The exits that leave into each gap, sorted, for the drop and corridor searches.
+    const exitsInto = rows.map(() => []);
+    for (const link of links) {
+      const below = rowIndex.get(link.source) + 1;
+      if (below < rows.length) exitsInto[below].push(exits.get(link));
+    }
+    for (const xs of exitsInto) xs.sort((a, b) => a - b);
     // Drops: spread on the child's top edge, kept 10 px from every exit in the
     // same gap and from the labels of other drops.
     const drops = new Map();
     rows.forEach((row, r) => {
-      const exitXs = links.filter((link) => rowIndex.get(link.source) === r - 1).map((link) => exits.get(link));
+      const exitXs = exitsInto[r];
+      // The drops placed so far in this gap, sorted by x, and the widest half label.
       const taken = [];
+      let widest = 0;
+      const clear = (x, half) => {
+        const at = lowerBound(exitXs, x);
+        tick(work, "dropWork", 1 + Math.ceil(Math.log2(exitXs.length + taken.length + 2)));
+        if ((at < exitXs.length && exitXs[at] - x < TRACK) || (at > 0 && x - exitXs[at - 1] < TRACK)) return false;
+        const reach = Math.max(TRACK, widest + 4, half + 4);
+        for (let index = lowerBound(taken, x - reach, (other) => other.x); index < taken.length && taken[index].x <= x + reach; index += 1) {
+          tick(work, "dropWork");
+          const other = taken[index];
+          if (Math.abs(other.x - x) < Math.max(TRACK, other.half + 4, half + 4)) return false;
+        }
+        return true;
+      };
       for (const item of row.items) {
         const into = arrivals.get(item.id) || [];
         into.forEach((link, index) => {
           const ideal = item.x + item.w * (index + 1) / (into.length + 1);
           const half = link.labelLines.length ? linkWidth(link) / 2 : JUNCTION / 2;
-          const clear = (x) => exitXs.every((exit) => Math.abs(exit - x) >= TRACK)
-            && taken.every((other) => Math.abs(other.x - x) >= Math.max(TRACK, other.half + 4, half + 4));
           let best = ideal;
           for (let step = 0; step <= item.w; step += 2) {
             const options = [ideal - step, ideal + step].filter((x) => x >= item.x + 10 && x <= item.x + item.w - 10);
-            const found = options.find(clear);
+            const found = options.find((x) => clear(x, half));
             if (found !== undefined) {
               best = found;
               break;
             }
           }
           drops.set(link, best);
-          taken.push({ x: best, half });
+          taken.splice(lowerBound(taken, best, (other) => other.x), 0, { x: best, half });
+          widest = Math.max(widest, half);
         });
       }
     });
@@ -1319,10 +1456,9 @@
     // Corridors for links that skip rows: a free x through every row and label
     // band in between, 10 px from every other vertical there.
     const corridors = [];
-    const verticalsIn = (r) => [
-      ...links.filter((link) => rowIndex.get(link.source) === r - 1).map((link) => exits.get(link)),
-      ...links.filter((link) => rowIndex.get(link.target) === r).map((link) => drops.get(link)),
-    ];
+    const dropsInto = rows.map(() => []);
+    for (const link of links) dropsInto[rowIndex.get(link.target)]?.push(drops.get(link));
+    const verticalsIn = (r) => [...(exitsInto[r] || []), ...(dropsInto[r] || [])];
     for (const span of spans) {
       if (!span.skip && !span.up) continue;
       const exit = exits.get(span.link);
@@ -1345,7 +1481,10 @@
       for (const other of corridors) if (other.top <= bottom && other.bottom >= top) blocked.push([other.x - TRACK, other.x + TRACK]);
       const target = span.up ? width - MARGIN - 4 : (exit + drop) / 2;
       // Never through the tier label column on the left.
-      const free = (candidate) => candidate >= LEFT + 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
+      const free = (candidate) => {
+        tick(work, "corridorWork", 1 + blocked.length);
+        return candidate >= LEFT + 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
+      };
       // Straight down under the drop or the exit when that is free: one bend fewer.
       let x = span.up ? null : [drop, exit].find(free) ?? null;
       for (let step = 0; step <= width && x === null; step += 2) {
@@ -1373,7 +1512,7 @@
       // end at each position in turn changes the total by one pair, so each
       // insertion is linear and a gap is quadratic in its lines.
       const cost = (a, b) => {
-        model.work.trackCosts += 1;
+        tick(model.work, "trackCosts");
         return (b.into > a.lo && b.into < a.hi ? 1 : 0) + (a.out > b.lo && a.out < b.hi ? 1 : 0);
       };
       const ordered = [];
@@ -1424,7 +1563,14 @@
   }
 
   function tierLines(tier) {
-    tier.labelLines = wrap(tier.label, TIER_LABEL_CHARS);
+    // "level 1" stays on one line: a number never sits alone on a line.
+    const words = String(tier.label ?? "").split(/\s+/).filter(Boolean);
+    const joined = words.reduce((all, word) => {
+      if (/^[0-9]+$/.test(word) && all.length) all[all.length - 1] = `${all[all.length - 1]} ${word}`;
+      else all.push(word);
+      return all;
+    }, []);
+    tier.labelLines = wrapWords(joined, TIER_LABEL_CHARS);
     tier.noteLines = wrap(tier.note, TIER_NOTE_CHARS);
     return 10 + (tier.labelLines.length + tier.noteLines.length) * 17;
   }
@@ -1447,13 +1593,29 @@
     for (const link of model.links) {
       link.chain = model.nodeById.get(link.target)?.kind === "controller" ? link.target : chainOf.get(link.source) || null;
     }
-    model.chains = controllers.map((entry) => entry.id).filter((id) => model.links.some((link) => link.chain === id));
+    const drawn = new Set(model.links.map((link) => link.chain));
+    model.chains = controllers.map((entry) => entry.id).filter((id) => drawn.has(id));
+    // More chains than looks: every chain is still drawn and in the legend,
+    // and the page names the chains that share a colour and line pattern.
+    if (model.chains.length > CHAIN_LOOKS) {
+      const byLook = new Map();
+      model.chains.forEach((id, index) => {
+        const look = index % CHAIN_LOOKS;
+        if (!byLook.has(look)) byLook.set(look, []);
+        byLook.get(look).push(model.nodeById.get(id)?.label || id);
+      });
+      const shared = [...byLook.values()].filter((names) => names.length > 1)
+        .map((names) => (names.length > 2 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names.join(" and ")));
+      const more = shared.length > NAME_LIMIT ? `; and ${plural(shared.length - NAME_LIMIT, "more group")}` : "";
+      model.notices.push(`${model.chains.length} chains are drawn and there are ${CHAIN_LOOKS} line looks, so these chains share a colour and line pattern: `
+        + `${shared.slice(0, NAME_LIMIT).join("; ")}${more}. Every chain is drawn and in the legend; hover or focus a line to trace its chain.`);
+    }
   }
 
   function layoutModel(model, options = {}) {
     const available = Math.max(0, Number(options.width) || 0);
     // Work counters, so a test can bound the cost by counting, not timing.
-    model.work = { trackCosts: 0, routePasses: 0 };
+    model.work = { total: 0, trackCosts: 0, routePasses: 0, candidates: 0 };
     for (const entry of model.nodes) sizeNode(entry);
     distinctTitles(model);
     const rows = model.tiers.map((tier) => ({
@@ -1488,27 +1650,45 @@
     // The order that keeps every parent over its children wins; then the one
     // with the fewest crossings; then the shortest sideways runs.
     const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
+    // A drawing with more lines than SIMPLIFY_ABOVE skips the polish: one
+    // ordering pass instead of the candidate-order search, and no crossing
+    // gaps. Every device and every line is still drawn, and the page says so.
+    const lines = links.filter((link) => !link.bundle).length;
+    model.simplified = lines > SIMPLIFY_ABOVE;
     // The order drawn last time for this scope is tried first and kept on a
     // tie, so expanding a shelf does not reorder the drawing under the operator.
-    const candidates = orderCandidates(rows, links, rowIndex);
+    // Its ranks are read once per tier.
     const previous = isRecord(options.previousOrder) ? options.previousOrder : null;
-    if (previous) {
-      candidates.unshift(rows.map((row) => {
-        const known = list(own(previous, row.tier.id));
-        const rank = (item) => (known.includes(item.id) ? known.indexOf(item.id) : known.length);
-        return row.items.slice().sort((left, right) => rank(left) - rank(right));
-      }));
+    const previousCandidate = () => rows.map((row) => {
+      const known = list(own(previous, row.tier.id));
+      const ranks = new Map(known.map((id, index) => [id, index]));
+      tick(model.work, "orderWork", known.length + row.items.length * Math.max(1, Math.ceil(Math.log2(row.items.length + 1))));
+      const rank = (item) => ranks.get(item.id) ?? known.length;
+      return row.items.slice().sort((left, right) => rank(left) - rank(right));
+    });
+    let candidates;
+    if (model.simplified) {
+      candidates = [previous ? previousCandidate() : orderCandidates(rows, links, rowIndex, model.work, 1).pop()];
+    } else {
+      candidates = orderCandidates(rows, links, rowIndex, model.work);
+      if (previous) candidates.unshift(previousCandidate());
     }
+    model.work.candidates = candidates.length;
     let best = null;
     for (const [number, candidate] of candidates.entries()) {
+      if (candidates.length === 1) {
+        best = { candidate };
+        break;
+      }
       rows.forEach((row, index) => {
         row.items = candidate[index];
       });
-      const width = placeRows(rows, links, rowIndex, available);
+      const width = placeRows(rows, links, rowIndex, available, model.work);
       routeLinks(model, rows, links, rowIndex, width);
       const violations = spanViolations(links, byId, rowIndex);
-      const score = countCrossings(links);
+      const score = countCrossings(links, model.work);
       const length = links.reduce((sum, link) => sum + link.points.reduce((total, point, index, all) => total + (index ? Math.abs(point[0] - all[index - 1][0]) : 0), 0), 0);
+      tick(model.work, "scoreWork", links.length);
       const kept = previous && number === 0 ? 0 : 1;
       const better = !best || violations < best.violations
         || (violations === best.violations && (score < best.score
@@ -1518,7 +1698,7 @@
     rows.forEach((row, index) => {
       row.items = best ? best.candidate[index] : row.items;
     });
-    model.width = placeRows(rows, links, rowIndex, available);
+    model.width = placeRows(rows, links, rowIndex, available, model.work);
     model.height = routeLinks(model, rows, links, rowIndex, model.width);
     // No coordinate is ever NaN: a link that could not be routed is named.
     for (const link of links) {
@@ -1528,8 +1708,15 @@
         model.notices.push(`Not drawn: ${linkName(model, link)} could not be routed.`);
       }
     }
-    model.crossings = countCrossings(links);
-    model.crossingMarks = crossingMarks(links);
+    if (model.simplified) {
+      model.crossings = null;
+      model.crossingMarks = [];
+      model.notices.push(`The drawing was simplified because of its size (${lines} lines, more than ${SIMPLIFY_ABOVE}): every device and every line is drawn, `
+        + "but two steps were skipped: the search for the row order with the fewest crossings (the rows keep one ordering pass) and the crossing gaps.");
+    } else {
+      model.crossings = countCrossings(links, model.work);
+      model.crossingMarks = crossingMarks(links, model.work);
+    }
     model.bands = [];
     model.tiers.forEach((tier, index) => {
       tier.order = rows[index].items.map((item) => item.id);
@@ -1770,6 +1957,7 @@
   // colour, pattern or both.
   const CHAIN_COLOURS = 4;
   const CHAIN_DASHES = 8;
+  const CHAIN_LOOKS = CHAIN_COLOURS * CHAIN_DASHES;
   function chainStyle(index) {
     return { colour: (index + Math.floor(index / CHAIN_DASHES)) % CHAIN_COLOURS, dash: index % CHAIN_DASHES };
   }
@@ -1872,18 +2060,23 @@
     return `${range} · ${count}`;
   }
 
+  // Where a bay group's expand or collapse control is drawn: the same place
+  // on the group in both states.
+  function toggleBox(group) {
+    return { x: group.x + 10, y: group.y + 4, w: 160, h: 22 };
+  }
+
   function renderGroup(model, group, path, used) {
     const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
     if (!group.enclosureIds.length) used.add("mark-not-read");
     const parts = [`<rect class="topo-group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="8"></rect>`,
-      ...group.lines.map((line, index) => `<text class="topo-node-${line.title ? "title" : "fact"}" x="${group.x + 10}" y="${group.y + 18 + index * LINE_H}">${escapeHtml(line.text)}</text>`)];
+      ...group.lines.map((line, index) => `<text class="topo-node-${line.title ? "title" : "fact"}" x="${group.x + 10}" y="${group.y + (group.textTop || 0) + 18 + index * LINE_H}">${escapeHtml(line.text)}</text>`)];
     const summaryText = pathSummary(group.summary);
     const cells = group.cells.map((bay) => renderBayCell(bay, path, used)).join("");
     let toggle = "";
     if (group.expandable) {
       const label = group.collapsed ? `Draw all ${group.bayIds.length} ${group.locationKnown ? "bays" : "disks"}` : "Collapse to a summary";
-      const y = group.collapsed ? group.y + group.h - 30 : group.y + 4;
-      const x = group.collapsed ? group.x + 10 : group.x + group.w - 170;
+      const { x, y } = toggleBox(group);
       toggle = `<g class="topo-expand" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(group.expandKey)}" aria-expanded="${group.collapsed ? "false" : "true"}" aria-label="${escapeHtml(label)}"><rect x="${x}" y="${y}" width="160" height="22" rx="6"></rect><text class="topo-label-text" x="${x + 80}" y="${y + 15}" text-anchor="middle">${escapeHtml(label)}</text></g>`;
     }
     const name = `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`;
@@ -1990,23 +2183,28 @@
     }
     const tiers = model.tiers.map((tier) => renderTier(tier, model)).join("");
     // At a crossing the horizontal line has a small gap and the vertical one
-    // runs through it: a short background stroke, then the vertical again.
+    // runs through it: a short background stroke, then the vertical again as
+    // two pieces that both start at the crossing centre, so every line pattern
+    // (each starts with a dash) is painted through the centre.
+    const chainIndex = new Map(model.chains.map((id, index) => [id, index]));
     const crossings = list(model.crossingMarks).map((mark) => {
       const over = model.linkById.get(mark.over);
       if (!over) return "";
       const cross = onPathClass(path, "links", over.id);
-      const chain = chainClass(over.chain ? model.chains.indexOf(over.chain) : -1);
+      const chain = chainClass(over.chain ? chainIndex.get(over.chain) ?? -1 : -1);
       const x = Math.round(mark.x);
       const y = Math.round(mark.y);
-      return `<line class="topo-cross-gap" x1="${x - 7}" y1="${y}" x2="${x + 7}" y2="${y}"></line>`
-        + `<line class="topo-link topo-cross-over ${linkStyle(over)}${chain}${cross}" data-topo-cross="${escapeHtml(over.id)}" x1="${x}" y1="${y - 9}" x2="${x}" y2="${y + 9}"></line>`;
+      const piece = (end) => `<line class="topo-link topo-cross-over ${linkStyle(over)}${chain}${cross}" data-topo-cross="${escapeHtml(over.id)}" x1="${x}" y1="${y}" x2="${x}" y2="${end}"></line>`;
+      return `<line class="topo-cross-gap" x1="${x - 7}" y1="${y}" x2="${x + 7}" y2="${y}"></line>${piece(y - 9)}${piece(y + 9)}`;
     }).join("");
     if (model.tiers.some((tier) => tier.state === "not_read" || tier.state === "not_collected")) used.add("mark-not-read");
     const nodes = model.nodes.map((entry) => renderNode(entry, path, used)).join("");
     const groups = model.groups.map((group) => renderGroup(model, group, path, used)).join("");
     const svgLabel = `Storage Fabric topology: ${model.tiers.map((tier) => `${tier.label} ${tier.note}`).join("; ")}`;
-    const fullW = Math.ceil(model.width);
-    const fullH = Math.ceil(model.height);
+    // view.pad: room kept so the offsets in view stay reachable (render).
+    const pad = view.fit ? null : view.pad;
+    const fullW = Math.ceil(Math.max(model.width, Number(pad?.width) || 0));
+    const fullH = Math.ceil(Math.max(model.height, Number(pad?.height) || 0));
     // Fit: the whole drawing scaled into the box it was laid out for, never enlarged.
     const box = model.box || {};
     const scale = view.fit ? Math.min(1, box.width ? box.width / fullW : 1, box.height ? box.height / fullH : 1) : 1;
@@ -2085,9 +2283,13 @@
   const live = {
     model: null, pin: null, hover: null, query: "", scope: null, fit: false, scroll: { left: 0, top: 0 },
     container: null, input: null, status: null, hooks: {},
-    // Why the next mount chooses the scroll position: "open", "actual",
-    // { expand: group id, anchor: its centre on screen } or null (keep).
+    // Why the next mount chooses the scroll position: "open",
+    // { expand: group id, anchor: its centre on screen, control: where its
+    // expand control was on the page, when it was in view } or null (keep).
     firstView: null, expandedKeys: null, refocusFit: false, quiet: null,
+    // The offsets held before Fit, and those to restore on Actual size; the
+    // inner width last measured after a mount.
+    actualScroll: null, restoreScroll: null, measuredWidth: null, pad: null,
   };
   const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
 
@@ -2129,16 +2331,28 @@
     return new Set(Object.keys(expanded).filter((key) => key.startsWith("topology:") && expanded[key]));
   }
 
+  // The box's place on the page, where the browser can say.
+  function boxRect(box) {
+    const rect = typeof box?.getBoundingClientRect === "function" ? box.getBoundingClientRect() : null;
+    return rect && Number.isFinite(rect.left) && Number.isFinite(rect.top) ? { left: rect.left, top: rect.top } : { left: 0, top: 0 };
+  }
+
   function render(fabric, options = {}) {
     listen();
     const previous = live.model;
     const sameScope = live.scope !== null && previous?.scope === scopeOf(fabric);
     const previousOrder = sameScope ? Object.fromEntries(previous.tiers.map((tier) => [tier.id, tier.order || []])) : null;
-    const model = buildTopologyModel(fabric, { ...options, previousOrder });
+    // The layout takes the scroll box's inner width: the box drawn last time
+    // (scroll bar and borders already taken off), or before there is one,
+    // the page's width for it less the box's two borders.
+    const box = scrollBox(live.container);
+    const measured = Number(box?.clientWidth) || 0;
+    const width = measured > 0 ? measured : Math.max(0, (Number(options.width) || 0) - 2 * SCROLL_BORDER);
+    const model = buildTopologyModel(fabric, { ...options, width, previousOrder });
     // The page replaces the map on every render: keep the drawing's scroll
     // position for the same scope, and start a new scope at the origin.
-    const box = scrollBox(live.container);
     const keys = expandedKeys(options);
+    live.pad = null;
     if (live.scope === null || model.scope !== live.scope) {
       if (live.scope !== null) {
         live.pin = null;
@@ -2148,13 +2362,36 @@
       live.firstView = "open";
     } else {
       if (box) live.scroll = { left: Number(box.scrollLeft) || 0, top: Number(box.scrollTop) || 0 };
-      // A shelf expanded or collapsed: keep it where the operator saw it.
+      // Back from Fit: the offsets the drawing had before it was fitted.
+      if (live.restoreScroll) live.scroll = live.restoreScroll;
+      // A shelf expanded or collapsed: keep its control where the operator
+      // saw it on the screen when it was in view, else keep the shelf in view.
       const toggled = [...model.groups].find((group) => keys.has(group.expandKey) !== Boolean(live.expandedKeys?.has(group.expandKey)));
       const before = toggled && previous?.groupById.get(toggled.id);
+      const clientHeight = Number(box?.clientHeight) || 0;
+      let target = live.scroll;
       if (toggled && before && live.firstView === null) {
-        live.firstView = { expand: toggled.id, anchor: centreOf(before) - live.scroll.left };
+        const control = toggleBox(before);
+        const visible = Boolean(box) && measured > 0 && clientHeight > 0
+          && control.x >= live.scroll.left && control.x + control.w <= live.scroll.left + measured
+          && control.y >= live.scroll.top && control.y + control.h <= live.scroll.top + clientHeight;
+        const rect = boxRect(box);
+        live.firstView = {
+          expand: toggled.id,
+          anchor: centreOf(before) - live.scroll.left,
+          control: visible ? { x: rect.left + control.x - live.scroll.left, y: rect.top + control.y - live.scroll.top } : null,
+        };
+        if (visible) {
+          const moved = toggleBox(model.groupById.get(toggled.id));
+          target = { left: live.scroll.left + moved.x - control.x, top: live.scroll.top + moved.y - control.y };
+        }
       }
+      // A redraw never makes the drawing smaller than the part of it in view,
+      // so the offsets it keeps (or a shelf control kept in place) stay
+      // reachable; the extra room goes when a later redraw no longer needs it.
+      if (box && measured > 0 && clientHeight > 0) live.pad = { width: target.left + measured, height: target.top + clientHeight };
     }
+    live.restoreScroll = null;
     live.expandedKeys = keys;
     live.scope = model.scope;
     live.model = model;
@@ -2172,7 +2409,7 @@
       const label = live.input.labels?.[0];
       if (label) label.textContent = help.label;
     }
-    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
+    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit, pad: live.pad });
   }
 
   // Where the scroll box starts: with the host and every HBA inside it when
@@ -2185,7 +2422,7 @@
     let wanted = current;
     let range = [0, Math.max(0, model.width - width)];
     if (fits) range = [Math.max(range[0], span[1] - width), Math.min(range[1], span[0])];
-    if (reason === "open" || reason === "actual") {
+    if (reason === "open") {
       wanted = span ? (span[0] + span[1]) / 2 - width / 2 : 0;
     } else if (reason?.expand) {
       const group = model.groupById.get(reason.expand);
@@ -2211,12 +2448,30 @@
       const width = Number(box.clientWidth) || live.model?.box?.width || 0;
       let left = live.scroll.left;
       let top = live.scroll.top;
-      if (reason && live.model && !live.fit && width) {
+      const group = reason?.expand ? live.model?.groupById.get(reason.expand) : null;
+      if (reason?.control && group && !live.fit) {
+        // The shelf's expand control where it was on the screen: both
+        // offsets, and the box's own move on the page, taken into account.
+        const control = toggleBox(group);
+        const rect = boxRect(box);
+        left = rect.left + control.x - reason.control.x;
+        top = rect.top + control.y - reason.control.y;
+      } else if (reason && live.model && !live.fit && width) {
         left = firstViewLeft(live.model, reason, width, live.scroll.left);
-        if (reason === "open" || reason === "actual") top = 0;
+        if (reason === "open") top = 0;
       }
       if (box.scrollLeft !== left) box.scrollLeft = left;
       if (box.scrollTop !== top) box.scrollTop = top;
+      // The box's inner width differs from the width the drawing was laid
+      // out for (a scroll bar came or went): lay it out once more.
+      const inner = Number(box.clientWidth) || 0;
+      if (inner > 0 && live.model && Math.abs(inner - (live.model.box?.width || 0)) >= 1 && live.measuredWidth !== inner
+        && typeof window.setTimeout === "function") {
+        live.measuredWidth = inner;
+        window.setTimeout(() => {
+          if (live.container?.querySelector?.(".fabric-topology")) live.hooks.requestRender?.();
+        }, 0);
+      }
     }
     if (live.refocusFit) {
       live.refocusFit = false;
@@ -2233,6 +2488,10 @@
     live.scope = null;
     live.firstView = null;
     live.scroll = { left: 0, top: 0 };
+    live.actualScroll = null;
+    live.restoreScroll = null;
+    live.measuredWidth = null;
+    live.pad = null;
     clearInput();
     unlisten();
   }
@@ -2376,9 +2635,13 @@
     container.addEventListener("click", (event) => {
       if (live.container !== container) return;
       if (event.target?.closest?.("[data-topology-fit]")) {
+        // Fit keeps the offsets the fitted drawing allows; Actual size goes
+        // back to the offsets held before Fit.
+        const box = scrollBox(container);
+        if (!live.fit) live.actualScroll = { left: Number(box?.scrollLeft) || 0, top: Number(box?.scrollTop) || 0 };
+        else live.restoreScroll = live.actualScroll;
         live.fit = !live.fit;
         live.refocusFit = true;
-        if (!live.fit) live.firstView = "actual";
         live.hooks.requestRender?.();
         return;
       }

@@ -710,7 +710,7 @@ test("occupancy that is not a boolean is drawn unknown, never empty", () => {
 
 // ---- leaving Topology through the page's mode buttons ------------------------
 
-function loadFullPage(T, sharedDocument, fabric, snapshot) {
+function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {}) {
   const fs = require("node:fs");
   const path = require("node:path");
   const vm = require("node:vm");
@@ -737,6 +737,7 @@ function loadFullPage(T, sharedDocument, fabric, snapshot) {
       handlers: new Map(),
       addEventListener(type, handler) { item.handlers.set(type, handler); },
     };
+    customize(id, item);
     return item;
   };
   Object.assign(sharedDocument, {
@@ -1045,4 +1046,139 @@ test("of two bay traces with one id the first is kept, and the notice says so", 
   const [kept] = reversed.traces.splice(index, 1);
   reversed.traces.push(kept);
   assert.deepEqual(T.buildTopologyModel(reversed).bayById.get("bay:1").pathStates.map((state) => state.state), second.metrics.path_states.map((state) => state.state));
+});
+
+// ---- the drawing's scroll position across the page's own redraws ----------------
+
+// The page's map panel with a real-shaped scroll box: replacing the panel's
+// HTML makes a new box at offset 0 that clamps its offsets to its content,
+// and sits lower on the page for every notice above it.
+function scrollingPanel(item) {
+  let html = "";
+  const pin = { textContent: "" };
+  const root = { querySelector: (selector) => (selector === "[data-topology-pin]" ? pin : null), querySelectorAll: () => [] };
+  const box = (markup) => {
+    const svg = /<svg class="fabric-topology-svg[^"]*"[^>]*width="(\d+)" height="(\d+)"/.exec(markup);
+    const [width, height] = svg ? [Number(svg[1]), Number(svg[2])] : [0, 0];
+    const above = markup.slice(0, markup.indexOf("fabric-topology-scroll"));
+    const top = 100 + 44 * (above.match(/class="warning-item/g) || []).length + (above.includes("data-topology-wide-notice") ? 30 : 0);
+    let left = 0;
+    let down = 0;
+    return {
+      clientWidth: 1100,
+      clientHeight: 600,
+      get scrollLeft() { return left; },
+      set scrollLeft(value) { left = Math.max(0, Math.min(Math.max(0, width - 1100), Number(value) || 0)); },
+      get scrollTop() { return down; },
+      set scrollTop(value) { down = Math.max(0, Math.min(Math.max(0, height - 600), Number(value) || 0)); },
+      getBoundingClientRect: () => ({ left: 20, top, right: 1120, bottom: top + 600, width: 1100, height: 600 }),
+    };
+  };
+  item.clientWidth = 1102;
+  item.box = null;
+  Object.defineProperty(item, "innerHTML", {
+    get: () => html,
+    set(value) {
+      html = value;
+      item.box = value.includes("fabric-topology-scroll") ? box(value) : null;
+    },
+  });
+  item.querySelector = (selector) => {
+    if (selector === ".fabric-topology-scroll") return item.box;
+    if (selector === ".fabric-topology") return item.box ? root : null;
+    if (selector === "[data-topology-fit]") return { focus() {} };
+    return null;
+  };
+}
+
+// An element that answers closest() for the attributes it carries.
+function pageTarget(attributes, root) {
+  const element = {
+    dataset: Object.fromEntries(Object.entries(attributes).map(([name, value]) => [name.replace(/^data-/, "").replace(/-([a-z])/g, (_, c) => c.toUpperCase()), value])),
+    getAttribute: (name) => attributes[name] ?? null,
+    hasAttribute: (name) => name in attributes,
+    closest(selector) {
+      for (const part of selector.split(",").map((item) => item.trim())) {
+        if (part === ".fabric-topology") return root;
+        const match = /^\[([a-z-]+)(?:="([^"]*)")?\]$/.exec(part);
+        if (match && match[1] in attributes && (match[2] === undefined || attributes[match[1]] === match[2])) return element;
+      }
+      return null;
+    },
+  };
+  element.parentElement = element;
+  return element;
+}
+
+test("a redraw from pinning, selecting, searching, Fit or Actual size keeps both scroll offsets, and an expanded or collapsed shelf keeps its control in place", () => {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  const { fabric } = H.fourShelves();
+  const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
+  let panel = null;
+  const { page, elements } = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+    if (id === "fabric-map-panel") {
+      panel = item;
+      scrollingPanel(item);
+    }
+  });
+  Object.assign(page.state, { fabricScopeReady: true, loading: false, selectedSystemId: fabric.system_id, selectedEnclosureId: fabric.selected_enclosure_id, mode: "topology", fabric });
+  page.render();
+  const root = panel.querySelector(".fabric-topology");
+  const documentClick = dom.documentHandlers.find((item) => item.name === "click").handler;
+  const click = (attributes) => {
+    const target = pageTarget(attributes, root);
+    panel.handlers.get("click")({ type: "click", target });
+    documentClick({ type: "click", target });
+  };
+  const offsets = () => [panel.box.scrollLeft, panel.box.scrollTop];
+  panel.box.scrollLeft = 700;
+  panel.box.scrollTop = 150;
+  assert.deepEqual(offsets(), [700, 150], "the drawing scrolls both ways");
+  // Selecting a bay: the page selects it and redraws.
+  click({ "data-topo-bay": "bay:10", "data-fabric-trace": "bay:10" });
+  assert.equal(page.state.selectedTraceId, "bay:10");
+  assert.deepEqual(offsets(), [700, 150], "selecting a bay");
+  // Pinning a link: the inspector shows it and the page redraws.
+  const link = [...T.drawnModel().links].find((item) => item.kind === "controller-expander");
+  click({ "data-topo-link": link.id, "data-fabric-topology-link": link.id });
+  assert.ok(T.inspectorDetail(), "the link is pinned");
+  assert.deepEqual(offsets(), [700, 150], "pinning a link");
+  // Searching clears the pin and redraws.
+  const search = elements.get("fabric-topology-search");
+  search.value = "bay 3";
+  search.handlers.get("input")();
+  assert.equal(T.inspectorDetail(), null);
+  assert.deepEqual(offsets(), [700, 150], "searching");
+  // Fit keeps the offsets the fitted drawing allows; Actual size returns to them.
+  click({ "data-topology-fit": "fit" });
+  assert.match(panel.innerHTML, /is-fitted/);
+  click({ "data-topology-fit": "actual" });
+  assert.doesNotMatch(panel.innerHTML, /is-fitted/);
+  assert.deepEqual(offsets(), [700, 150], "Fit, then Actual size");
+  // Expanding, then collapsing, a shelf: its control stays where it was on screen.
+  const control = () => {
+    const match = /<g class="topo-expand"[^>]*data-fabric-expand-slots="([^"]+)"[^>]*aria-expanded="(true|false)"[^>]*><rect x="(-?[\d.]+)" y="(-?[\d.]+)"/g;
+    return [...panel.innerHTML.matchAll(match)].map((item) => ({ key: item[1], expanded: item[2], x: Number(item[3]), y: Number(item[4]) }));
+  };
+  const onScreen = (item) => {
+    const rect = panel.box.getBoundingClientRect();
+    return [rect.left + item.x - panel.box.scrollLeft, rect.top + item.y - panel.box.scrollTop];
+  };
+  const [first] = control();
+  assert.ok(first, "a collapsed shelf has a control");
+  for (const step of ["expand", "collapse"]) {
+    const before = control().find((item) => item.key === first.key);
+    panel.box.scrollLeft = before.x - 400;
+    panel.box.scrollTop = before.y - 300;
+    const [left, top] = offsets();
+    assert.ok(left > 0 && top > 0, `${step}: both offsets are not zero (${left}, ${top})`);
+    assert.ok(before.x >= left && before.x + 160 <= left + 1100 && before.y >= top && before.y + 22 <= top + 600, `${step}: the control is in view`);
+    const was = onScreen(before);
+    click({ "data-fabric-expand-slots": first.key });
+    const after = control().find((item) => item.key === first.key);
+    assert.equal(after.expanded, step === "expand" ? "true" : "false");
+    const now = onScreen(after);
+    assert.ok(Math.abs(now[0] - was[0]) <= 1 && Math.abs(now[1] - was[1]) <= 1, `${step}: the control moved from ${was} to ${now}`);
+  }
 });

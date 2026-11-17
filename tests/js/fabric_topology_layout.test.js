@@ -116,7 +116,12 @@ function parentOffsets(model) {
     const middle = centre(item);
     const outside = middle < left ? left - middle : middle > right ? middle - right : 0;
     const sole = out.every((link) => [...(model.incoming.get(link.target) || [])].filter((other) => other.points).length === 1);
-    result.push({ id: item.id, outside, offset: Math.abs(middle - (left + right) / 2), sole });
+    // Parents that share a child sit side by side over it: the farthest one
+    // is half their row's width, less its own half, from the middle.
+    const coParents = new Set(out.flatMap((link) => [...(model.incoming.get(link.target) || [])].filter((other) => other.points).map((other) => other.source)));
+    const row = [...coParents].map((id) => model.nodeById.get(id)).filter(Boolean);
+    const rowWidth = row.reduce((sum, other) => sum + other.w, 0) + 48 * Math.max(0, row.length - 1);
+    result.push({ id: item.id, outside, offset: Math.abs(middle - (left + right) / 2), sole, sideBySide: (rowWidth - item.w) / 2 });
   }
   return result;
 }
@@ -130,6 +135,7 @@ function denseFixtures(T, width) {
     "eight HBAs, sixteen shelves, expanded": T.buildTopologyModel(eight, { width, expanded: eightExpanded }),
     "three-level cascade": T.buildTopologyModel(H.threeLevelCascade().fabric, { width }),
     "producer logical disks": T.buildTopologyModel(H.producerCases().linux_virtual.fabric, { width }),
+    "producer member health": T.buildTopologyModel(H.producerCases().linux_health.fabric, { width }),
   };
 }
 
@@ -137,14 +143,14 @@ test("every parent sits over the span of its direct children, near its midpoint,
   const T = H.loadTopology();
   // Crossings measured the same way on the layout this pull request first drew.
   const before = { "two HBAs, level-2 cascade": 3, "four shelves, collapsed": 6, "four shelves, expanded": 8 };
-  for (const width of [390, 1600, 3840]) {
+  for (const width of [390, 1600, 1920, 2560, 3840]) {
     for (const [name, model] of Object.entries(denseFixtures(T, width))) {
       for (const parent of parentOffsets(model)) {
         assert.equal(parent.outside, 0, `${name} at ${width}: ${parent.id} is over its children`);
         // A parent whose children have no other parent sits at their midpoint
         // unless its neighbours' boxes are in the way; parents that share a
         // child sit side by side over it.
-        assert.ok(parent.offset <= (parent.sole ? 40 : 200), `${name} at ${width}: ${parent.id} is ${parent.offset} px from its children's midpoint`);
+        assert.ok(parent.offset <= (parent.sole ? 40 : Math.max(200, parent.sideBySide + 24)), `${name} at ${width}: ${parent.id} is ${parent.offset} px from its children's midpoint`);
       }
       const host = model.nodeById.get("host");
       const hbas = [...model.nodes].filter((item) => item.kind === "controller");
@@ -454,7 +460,8 @@ test("the host and every HBA are in view when Topology opens, after a shelf is e
   assert.ok(visible(dom, opened, top(opened)), `scrolled to ${dom.box.scrollLeft}`);
   // The page says the drawing is wider than its box, next to Fit.
   assert.match(html, /<div class="fabric-topology-bar">[\s\S]*data-topology-fit[\s\S]*data-topology-wide-notice[^>]*>[^<]*wider than its box/);
-  // Expanding a shelf: the shelf the operator expanded stays in view, and so do the host and HBAs.
+  // Expanding a shelf: the shelf the operator expanded stays in view (its
+  // control keeps its place on screen: the page-level scroll test).
   const group = opened.groups.find((item) => item.expandable);
   dom.box.scrollLeft = Math.max(0, group.x - 200);
   T.render(fabric, { width: 1100 });
@@ -465,20 +472,20 @@ test("the host and every HBA are in view when Topology opens, after a shelf is e
   const after = T.drawnModel();
   const shown = after.groupById.get(group.id);
   assert.ok(shown.x < dom.box.scrollLeft + dom.box.clientWidth && shown.x + shown.w > dom.box.scrollLeft, "the expanded shelf is in view");
-  assert.ok(visible(dom, after, top(after)), `host and HBAs in view at ${dom.box.scrollLeft}`);
-  // Fit, then Actual size: back to a view with the host and HBAs.
+  // Fit, then Actual size: back to the offsets held before Fit.
+  dom.box.scrollLeft = 640;
+  const held = dom.box.scrollLeft;
   dom.handlers.get("click")({ target: { closest: (selector) => (selector === "[data-topology-fit]" ? dom.fit : null) } });
   T.render(fabric, { width: 1100, expanded });
   dom.replace();
   T.mount(dom.container);
-  dom.box.scrollLeft = 5000;
   dom.handlers.get("click")({ target: { closest: (selector) => (selector === "[data-topology-fit]" ? dom.fit : null) } });
   html = T.render(fabric, { width: 1100, expanded });
   dom.replace();
   T.mount(dom.container);
-  assert.ok(visible(dom, T.drawnModel(), top(T.drawnModel())), `Actual size scrolled to ${dom.box.scrollLeft}`);
+  assert.equal(dom.box.scrollLeft, held, "Actual size returns to where the drawing was");
   // A drawing that fits its box says nothing about scrolling.
-  assert.doesNotMatch(T.render(H.twoHbaCascade().fabric, { width: 4000 }), /data-topology-wide-notice/);
+  assert.doesNotMatch(H.loadTopology({ document }).render(H.twoHbaCascade().fabric, { width: 4000 }), /data-topology-wide-notice/);
 });
 
 test("Fit keeps keyboard focus on the Fit control after the redraw", () => {
@@ -571,7 +578,7 @@ test("where two lines cross, the horizontal one has a gap the vertical runs thro
     const gaps = [...group[1].matchAll(/<line class="topo-cross-gap" x1="(-?\d+)" y1="(-?\d+)" x2="(-?\d+)" y2="(-?\d+)"/g)];
     const overs = [...group[1].matchAll(/<line class="topo-link topo-cross-over[^"]*" data-topo-cross="([^"]+)" x1="(-?\d+)" y1="(-?\d+)" x2="(-?\d+)" y2="(-?\d+)"/g)];
     assert.equal(gaps.length, G.crossings(model), `${name}: one gap per crossing`);
-    assert.equal(overs.length, gaps.length, name);
+    assert.equal(overs.length, 2 * gaps.length, `${name}: two pieces from each crossing centre`);
     assert.doesNotMatch(group[1], /<circle/, `${name}: no dot`);
     for (const [, x1, y1, x2, y2] of gaps) assert.ok(Math.hypot(Number(x2) - Number(x1), Number(y2) - Number(y1)) > 0, `${name}: the gap at ${x1},${y1} has a length`);
     for (const [, x1, y1, x2] of gaps) {
@@ -701,4 +708,214 @@ test("at 390 px the search label sits above an input at least 240 px wide", () =
   assert.match(input, /min-width:\s*15rem/);
   // The header only wraps while the Topology search row is shown.
   assert.match(media[1], /\.panel-header:has\(> \.fabric-topology-search-row:not\(\[hidden\]\)\)\s*\{[^}]*flex-wrap:\s*wrap/);
+});
+
+// ---- layout cost ------------------------------------------------------------------
+
+// `lines` links that are not bay bundles: host to each of `hbas` HBAs, and
+// each HBA to its share of level-1 expanders.
+function manyLines(lines, hbas) {
+  const fabric = H.coreFabric();
+  const names = H.range(0, hbas).map((index) => `mpr${index}`);
+  for (const name of names) H.addController(fabric, name, { phys: Math.ceil(lines / hbas) * 4, linked: 0 });
+  for (let index = 0; index < lines - hbas; index += 1) H.addExpander(fabric, names[index % hbas], 0x100000 + index, 1, `controller:${names[index % hbas]}`);
+  return fabric;
+}
+
+test("the previous order is read through a rank map built once per tier", () => {
+  const T = H.loadTopology();
+  const fabric = manyLines(384, 1);
+  const first = T.buildTopologyModel(fabric, { width: 1920 });
+  let reads = 0;
+  const counted = (values) => new Proxy(values, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const previousOrder = Object.fromEntries([...first.tiers].map((tier) => [tier.id, counted([...tier.order].reverse())]));
+  const items = [...first.tiers].reduce((sum, tier) => sum + tier.order.length, 0);
+  const again = T.buildTopologyModel(fabric, { width: 1920, previousOrder });
+  assert.ok(reads <= 2 * items, `${reads} reads of the previous order for ${items} items`);
+  // The previous order is still the one drawn on a tie.
+  const row = [...again.tiers].find((tier) => tier.id === "expanders:1");
+  assert.equal(row.order.length, 383);
+});
+
+test("layout work is counted and bounded: above the threshold the polish steps are skipped, the page says so, and nothing is dropped", () => {
+  const T = H.loadTopology();
+  // Below the threshold: the whole search runs and no notice is shown.
+  const small = T.buildTopologyModel(manyLines(256, 16), { width: 1920 });
+  assert.ok(Number.isFinite(small.work.total), "the layout counts its work");
+  assert.equal(small.simplified, false);
+  assert.ok(small.work.candidates > 1, "the candidate-order search ran");
+  assert.ok(![...small.notices].some((text) => /simplified/.test(text)));
+  for (const hbas of [1, 16]) {
+    const model = T.buildTopologyModel(manyLines(4096, hbas), { width: 1920 });
+    const lines = [...model.links].filter((link) => !link.bundle);
+    assert.equal(lines.length, 4096, `${hbas} HBAs: every line is in the model`);
+    for (const link of lines) assert.ok(link.points && link.points.length >= 2 && link.points.every((point) => point.every(Number.isFinite)), `${link.id} is drawn`);
+    assert.equal(model.nodes.length, 4097, `${hbas} HBAs: every device is drawn`);
+    for (const item of model.nodes) assert.ok([item.x, item.y, item.w, item.h].every(Number.isFinite), item.id);
+    assert.equal(model.simplified, true, `${hbas} HBAs: simplified`);
+    assert.equal(model.work.candidates, 1, "one ordering pass");
+    assert.deepEqual([...model.crossingMarks], [], "no crossing gaps");
+    const notice = [...model.notices].find((text) => /simplified/.test(text));
+    assert.ok(notice, "the page says the drawing was simplified");
+    assert.match(notice, /4096 lines/);
+    assert.match(notice, /crossing gaps/);
+    assert.match(notice, /order/);
+    assert.match(notice, /every device and every line is drawn/i);
+    // The stated bound: 30 million counted steps at 4096 lines (one ordering
+    // pass and one routing pass; the full polish would count about 257 million).
+    assert.ok(model.work.total <= 30e6, `${hbas} HBAs: ${model.work.total} work units at 4096 lines`);
+    const html = T.renderTopology(model, {});
+    assert.equal((html.match(/<polyline class="topo-link /g) || []).length, 4096);
+  }
+});
+
+// ---- crossings: the redrawn piece runs through the centre for every pattern ---
+
+function dashOf(css, index) {
+  const rule = new RegExp(`\\.topo-link\\.chain-dash-${index}\\s*\\{([^}]*)\\}`).exec(css);
+  if (!rule) return [];
+  return /stroke-dasharray:\s*([^;]+);/.exec(rule[1])[1].trim().split(/[\s,]+/).map(Number);
+}
+
+test("the piece redrawn across a crossing gap is continuous through the crossing centre for each of the eight chain patterns", () => {
+  const T = H.loadTopology();
+  const css = topologyCss();
+  const gapWidth = Number(/\.topo-cross-gap\s*\{[^}]*stroke-width:\s*([\d.]+)/.exec(css)[1]);
+  const model = T.buildTopologyModel(H.eightHbaSixteenShelves().fabric, { width: 1600 });
+  assert.ok(model.crossingMarks.length > 0);
+  for (let pattern = 0; pattern < 8; pattern += 1) {
+    // Every crossing drawn as if its continuing line were chain `pattern`.
+    for (const mark of model.crossingMarks) model.linkById.get(mark.over).chain = model.chains[pattern];
+    const html = T.renderTopology(model, {});
+    const group = /<g class="topo-crossings">([\s\S]*?)<\/g>/.exec(html)[1];
+    const gaps = [...group.matchAll(/<line class="topo-cross-gap" x1="(-?\d+)" y1="(-?\d+)" x2="(-?\d+)" y2="(-?\d+)"/g)];
+    const pieces = [...group.matchAll(/<line class="topo-link topo-cross-over([^"]*)" data-topo-cross="[^"]+" x1="(-?\d+)" y1="(-?\d+)" x2="(-?\d+)" y2="(-?\d+)"/g)]
+      .map((item) => ({ classes: item[1], x1: Number(item[2]), y1: Number(item[3]), x2: Number(item[4]), y2: Number(item[5]) }));
+    assert.equal(gaps.length, model.crossingMarks.length);
+    const dash = dashOf(css, pattern);
+    // A pattern starts with a dash: a piece painted from its first point.
+    const firstDash = dash.length ? dash[0] : Infinity;
+    assert.ok(firstDash > 0, `pattern ${pattern} starts with a dash`);
+    for (const [, gx1, gy1, gx2] of gaps) {
+      const cx = (Number(gx1) + Number(gx2)) / 2;
+      const cy = Number(gy1);
+      const here = pieces.filter((piece) => piece.x1 === cx && piece.x2 === cx && (piece.y1 === cy));
+      assert.equal(here.length, 2, `pattern ${pattern}: two pieces start at the centre ${cx},${cy}`);
+      for (const piece of here) {
+        assert.match(piece.classes, new RegExp(`\\bchain-dash-${pattern}\\b`), `pattern ${pattern}`);
+        assert.ok(Math.abs(piece.y2 - piece.y1) > gapWidth / 2, `pattern ${pattern}: the piece reaches past the gap`);
+      }
+      assert.ok(here.some((piece) => piece.y2 < cy) && here.some((piece) => piece.y2 > cy), `pattern ${pattern}: one piece up, one down`);
+      // Painted on both sides of the centre: [cy - firstDash, cy + firstDash].
+      assert.ok(Math.min(firstDash, 9) >= 2, `pattern ${pattern}: ${firstDash} px painted each side of the centre`);
+    }
+  }
+});
+
+// ---- bay bundles keep 3:1 against the drawing's surface -------------------------
+
+test("every chain colour's bay bundle has at least 3:1 contrast against the scroll surface after its opacity", () => {
+  const css = topologyCss();
+  const vars = Object.fromEntries([...ROOT_CSS.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-f]{6});/g)].map((match) => [match[1], match[2]]));
+  const resolve = (value) => vars[/var\(--([a-z0-9-]+)\)/.exec(value)[1]];
+  const surface = resolve(/\.fabric-topology-scroll\s*\{[^}]*background:\s*([^;]+);/.exec(css)[1]);
+  const bundle = /\.fabric-topology-svg \.topo-link\.is-bundle\s*\{([^}]*)\}/.exec(css)[1];
+  const opacity = Number(/stroke-opacity:\s*([\d.]+)/.exec(bundle)?.[1] ?? 1);
+  for (let colour = 0; colour < 4; colour += 1) {
+    const stroke = new RegExp(`\\.topo-link\\.chain-colour-${colour}\\s*\\{[^}]*stroke:\\s*([^;]+);`).exec(css)[1];
+    const ratio = contrast(blend(resolve(stroke), opacity, surface), surface);
+    assert.ok(ratio >= 3, `chain colour ${colour} bundle at opacity ${opacity}: ${ratio.toFixed(2)}:1`);
+  }
+  // The legend's bundle swatch is drawn the same way.
+  const swatch = /\.fabric-topology-swatch\.is-bundle\s*\{([^}]*)\}/.exec(css)[1];
+  assert.equal(Number(/opacity:\s*([\d.]+)/.exec(swatch)?.[1] ?? 1), opacity);
+});
+
+// ---- more chains than looks ------------------------------------------------------
+
+test("when more chains are drawn than there are looks, a notice names the chains that share one, and none is dropped", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  for (let index = 0; index < 34; index += 1) {
+    const hba = H.addController(fabric, `mpr${index}`);
+    H.addExpander(fabric, `mpr${index}`, 0x9000 + index, 1, hba.id);
+  }
+  const model = T.buildTopologyModel(fabric, { width: 1920 });
+  assert.equal(model.chains.length, 34);
+  const looks = model.chains.map((_, index) => T.chainStyle(index)).map((look) => `${look.colour}/${look.dash}`);
+  assert.equal(new Set(looks.slice(0, 32)).size, 32, "the first 32 chains differ in colour or pattern");
+  const notice = [...model.notices].find((text) => /share/.test(text));
+  assert.ok(notice, "a notice names the shared looks");
+  assert.match(notice, /mpr0 and mpr32/);
+  assert.match(notice, /mpr1 and mpr33/);
+  const html = T.renderTopology(model, {});
+  for (let index = 0; index < 34; index += 1) assert.ok(html.includes(`data-topology-legend="chain-${index}"`), `chain ${index} is in the legend`);
+  // Thirty-two chains need no notice.
+  const fewer = H.coreFabric();
+  for (let index = 0; index < 32; index += 1) {
+    const hba = H.addController(fewer, `mpr${index}`);
+    H.addExpander(fewer, `mpr${index}`, 0x9000 + index, 1, hba.id);
+  }
+  assert.ok(![...T.buildTopologyModel(fewer, { width: 1920 }).notices].some((text) => /share/.test(text)));
+});
+
+// ---- width: the scroll box's inner width -----------------------------------------
+
+test("the width notice and the width-limited Fit use the scroll box's inner width", () => {
+  const css = topologyCss();
+  const border = Number(/\.fabric-topology-scroll\s*\{[^}]*border:\s*([\d.]+)px/.exec(css)[1]);
+  const { fabric } = H.fourShelves();
+  // Before the box exists: the panel's width less the box's two borders.
+  const T = H.loadTopology({ document: { addEventListener() {}, removeEventListener() {} } });
+  const dom = viewDom(0);
+  T.attach(dom.container, null, null, {});
+  dom.replace();
+  const panelWidth = 390;
+  let html = T.render(fabric, { width: panelWidth, height: 700 });
+  assert.match(html, new RegExp(`wider than its box \\(${panelWidth - 2 * border} px\\)`));
+  // With the box drawn, its own client width (here less a 15 px scroll bar).
+  T.mount(dom.container);
+  const box = dom.box;
+  box.clientWidth = panelWidth - 2 * border - 15;
+  html = T.render(fabric, { width: panelWidth, height: 700 });
+  assert.match(html, new RegExp(`wider than its box \\(${box.clientWidth} px\\)`));
+  assert.equal(T.drawnModel().box.width, box.clientWidth);
+  const fitted = T.renderTopology(T.drawnModel(), { fit: true });
+  const svg = /<svg class="fabric-topology-svg[^"]*"[^>]*width="(\d+)"/.exec(fitted);
+  assert.ok(Number(svg[1]) <= box.clientWidth, `fitted to ${svg[1]} px in a ${box.clientWidth} px box`);
+});
+
+// ---- a narrow page does not scroll sideways ------------------------------------
+
+test("at 390 px the legend and the notices wrap inside the panel", () => {
+  const css = topologyCss();
+  const rule = (selector) => new RegExp(`(?:^|\\n|,\\s*)${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:,[^{]*)?\\{([^}]*)\\}`).exec(css)?.[1] || "";
+  assert.match(rule(".fabric-topology"), /grid-template-columns:\s*minmax\(0,\s*1fr\)/, "the view's one column never grows past the panel");
+  for (const selector of [".fabric-topology > *", ".fabric-topology-legend-item", ".fabric-topology .warning-item"]) {
+    assert.match(rule(selector), /min-width:\s*0/, selector);
+    assert.match(rule(selector), /overflow-wrap:\s*anywhere/, selector);
+  }
+  // The drawing alone scrolls sideways, inside its own box.
+  assert.match(rule(".fabric-topology-scroll"), /overflow:\s*auto/);
+  assert.match(rule(".fabric-topology-scroll"), /max-width:\s*100%/);
+});
+
+// ---- tier labels -----------------------------------------------------------------
+
+test("an expander tier label never leaves its level number alone on a line", () => {
+  const T = H.loadTopology();
+  for (const fixture of [H.twoHbaCascade().fabric, H.threeLevelCascade().fabric]) {
+    const model = T.buildTopologyModel(fixture);
+    const rows = [...model.tiers].filter((tier) => tier.id.startsWith("expanders:"));
+    assert.ok(rows.length >= 2);
+    for (const tier of rows) {
+      assert.ok(tier.labelLines.every((line) => !/^\d+$/.test(line.trim())), JSON.stringify(tier.labelLines));
+      assert.match(tier.labelLines[tier.labelLines.length - 1], /level \d+$/);
+    }
+  }
 });
