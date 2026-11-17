@@ -17,7 +17,7 @@ const INDEX_TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html
 function templateScripts() {
   const block = BASE_TEMPLATE.match(/\{% block scripts %\}([\s\S]*?)\{% endblock %\}/);
   assert.ok(block, "base.html has a scripts block");
-  const tags = block[1].match(/<script\b[^>]*>/g) || [];
+  const tags = block[1].match(/<script\b[^>]*>/gi) || [];
   return tags.map((tag) => {
     const source = tag.match(/\bsrc="\{\{ url_for\('static', path='([^']+)'\) \}\}[^"]*"/);
     assert.ok(source, `every script in the scripts block is a static file: ${tag}`);
@@ -40,7 +40,7 @@ test("the helper lists exactly the scripts base.html loads, app.js first", () =>
 });
 
 test("index.html loads no script file of its own", () => {
-  assert.doesNotMatch(INDEX_TEMPLATE, /<script\b[^>]*\bsrc=/);
+  assert.doesNotMatch(INDEX_TEMPLATE, /<script\b[^>]*\bsrc=/i);
 });
 
 test("the joined source starts with app.js and holds each other script once", () => {
