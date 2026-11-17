@@ -36,7 +36,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "app/services/inventory.py": 18000,
 
-    "app/services/parsers.py": 5000,
+    "app/services/parsers.py": 4500,
 
     "app/services/sas_fabric.py": 3500,
 
@@ -50,17 +50,17 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "history_service/store.py": 5500,
 
-    "history_service/system_backup.py": 8000,
+    "history_service/system_backup.py": 7500,
 
     "tests/test_admin_service.py": 6500,
 
     "tests/test_backup_integration.py": 4250,
 
-    "tests/test_history_service.py": 13000,
+    "tests/test_history_service.py": 11750,
 
     "tests/test_image_upgrade_contract.py": 3750,
 
-    "tests/test_inventory.py": 27250,
+    "tests/test_inventory.py": 24750,
 
     "tests/test_mapping_store.py": 4500,
 
@@ -92,6 +92,7 @@ CROSS_PACKAGE_IMPORTS: dict[tuple[str, str], tuple[str, ...]] = {
         "admin_service/services/maintenance.py",
         "admin_service/services/runtime_control.py",
         "admin_service/services/tls_trust.py",
+        "admin_service/transport_routes.py",
     ),
     ("admin_service", "history_service"): (
         "admin_service/route_support.py",
