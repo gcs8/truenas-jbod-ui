@@ -1033,6 +1033,154 @@ class MprLinkReportedLaneTests(unittest.TestCase):
         self.assertEqual(hba_link.reported_lanes.lane_count, 4)
 
 
+class SasFabricCoreModuleTests(unittest.TestCase):
+    MOVED_NAMES = (
+        "_MPR_EXPANDER_ATTACHED_DEVICES",
+        "_MPR_INITIATOR_ATTACHED_DEVICES",
+        "_MPR_REPORTED_LANE_BASIS",
+        "_MprReportedLaneContext",
+        "_SMP_COUNTER_EVIDENCE",
+        "_add_mpr_infrastructure",
+        "_add_mpr_member_trace_context",
+        "_attach_expander_phy_error_counters",
+        "_build_mpr_trace_index",
+        "_cam_member_target",
+        "_counter_read_stop",
+        "_device_name_candidates",
+        "_diagnostic_metric_summary",
+        "_diagnostics_for_member_device",
+        "_diagnostics_for_mpr_device",
+        "_identifier_lookup_key",
+        "_is_mpr_disk_target",
+        "_kept_counter_reads",
+        "_looks_like_disk_device",
+        "_lookup_mpr_device_context",
+        "_merged_phy_error_log_rows",
+        "_mpr_endpoint_rows",
+        "_mpr_evidence",
+        "_mpr_expander_parent_context",
+        "_mpr_handle",
+        "_mpr_phy_number",
+        "_mpr_rate",
+        "_mpr_rows_by_peer",
+        "_mpr_sas_address",
+        "_parse_mpr_slot_number",
+        "_parse_mpr_target",
+        "_scope_mpr_infrastructure",
+        "_slot_enclosure_candidates",
+        "_slot_location_number_candidates",
+        "_smp_output_span",
+    )
+    FACADE_HELPERS = (
+        "add_node",
+        "add_link",
+        "_mpr_controller_name_for_unit",
+        "_mpr_controller_ids_by_unit",
+        "slots_overlap",
+        "_snapshot_slot_numbers",
+        "_snapshot_disk_slot_numbers",
+        "_dedupe_strings",
+        "_dedupe_ints",
+    )
+
+    @staticmethod
+    def _expander_nodes(core_module):
+        nodes, links = {}, {}
+        core_module._add_mpr_infrastructure(
+            nodes=nodes, links=links,
+            controllers=[{"unit": 0, "id": "controller:mpr0"}],
+            unit_data={0: {"expanders": [{
+                "dev_handle": "000a", "parent": "0001", "sas_level": "1",
+                "sas_address": "SANITIZED-EXPANDER-A", "enc_handle": "0002",
+                "num_phys": "36", "linked_phys": 0, "phys": [],
+            }]}},
+        )
+        return nodes, links
+
+    def test_core_projection_module_imports_without_the_fabric_module(self) -> None:
+        code = (
+            "import sys\n"
+            "import app.services.sas_fabric_core as core\n"
+            "assert 'app.services.sas_fabric' not in sys.modules, sorted(sys.modules)\n"
+            "assert callable(core._scope_mpr_infrastructure)\n"
+        )
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fabric_module_reexports_every_moved_name_as_the_same_object(self) -> None:
+        core_module = importlib.import_module("app.services.sas_fabric_core")
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        for name in self.MOVED_NAMES:
+            with self.subTest(name=name):
+                moved = getattr(core_module, name)
+                self.assertIs(getattr(fabric_module, name), moved)
+                if callable(moved):
+                    self.assertEqual(moved.__module__, "app.services.sas_fabric_core")
+        for name in self.FACADE_HELPERS:
+            with self.subTest(helper=name):
+                self.assertEqual(getattr(fabric_module, name).__module__, "app.services.sas_fabric")
+                self.assertIsNot(getattr(core_module, name), getattr(fabric_module, name))
+
+    def test_replaced_fabric_helper_reaches_moved_code_at_call_time(self) -> None:
+        core_module = importlib.import_module("app.services.sas_fabric_core")
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        with (
+            patch.object(fabric_module, "add_node", wraps=fabric_module.add_node) as add_node,
+            patch.object(fabric_module, "add_link", wraps=fabric_module.add_link) as add_link,
+            patch.object(
+                fabric_module,
+                "_mpr_controller_ids_by_unit",
+                wraps=fabric_module._mpr_controller_ids_by_unit,
+            ) as controller_ids,
+        ):
+            nodes, links = self._expander_nodes(core_module)
+
+        self.assertIn("expander:controller:mpr0:SANITIZED-EXPANDER-A", nodes)
+        self.assertEqual(add_node.call_count, 1)
+        self.assertEqual(add_link.call_count, 1)
+        controller_ids.assert_called_once_with([{"unit": 0, "id": "controller:mpr0"}])
+
+    def test_replaced_fabric_limit_reaches_moved_code_at_call_time(self) -> None:
+        core_module = importlib.import_module("app.services.sas_fabric_core")
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+        for node_limit, limited in ((1, False), (0, True)):
+            with self.subTest(node_limit=node_limit):
+                nodes, links = self._expander_nodes(core_module)
+                expander = nodes["expander:controller:mpr0:SANITIZED-EXPANDER-A"]
+                with patch.object(fabric_module, "_MAX_MPR_ANCESTRY_NODES", node_limit):
+                    warnings = core_module._scope_mpr_infrastructure(
+                        nodes=nodes, links=links, traces={}, snapshot=snapshot,
+                    )
+                self.assertEqual(bool(warnings), limited)
+                self.assertEqual(expander.raw.get("parent_link_reason") == "resource_limit", limited)
+
+    def test_replaced_moved_name_on_fabric_module_reaches_the_core_builder(self) -> None:
+        core_module = importlib.import_module("app.services.sas_fabric_core")
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        self.assertIs(fabric_module._scope_mpr_infrastructure, core_module._scope_mpr_infrastructure)
+        with patch.object(
+            fabric_module,
+            "_scope_mpr_infrastructure",
+            wraps=core_module._scope_mpr_infrastructure,
+        ) as scope:
+            build_sas_fabric_snapshot(
+                system=SystemConfig(id="synthetic-core", truenas=TrueNASConfig(platform="core")),
+                snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+                ssh_outputs={"mprutil -u 0 show expanders": f"36 {1:016x} 0001 ffff 0000 1"},
+            )
+        self.assertEqual(scope.call_count, 1)
+
+
 class SasFabricParserTests(unittest.TestCase):
     def test_focused_parser_module_owns_public_text_parsers_and_fabric_reexports_them(self) -> None:
         parser_module = importlib.import_module("app.services.sas_fabric_parsers")
