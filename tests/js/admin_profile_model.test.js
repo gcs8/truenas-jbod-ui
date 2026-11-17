@@ -106,3 +106,28 @@ test("slot label, size and list text keep their coercion and order", () => {
   assert.equal(api.serializeSlotSizesText({ 3: "2242", 1: "2230", 2: "9999" }), "1=2230\n3=2242");
   assert.deepEqual([...api.ALLOWED_M2_SIZES], ["2230", "2242", "2260", "2280", "22110"]);
 });
+
+// The same unreferenced-function sweep admin_reference_count.test.js applies to
+// the other admin scripts, with a floor sized for this module.
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function referenceCount(code, name) {
+  return (code.match(new RegExp(`(?<![\\w$])${escapeRegExp(name)}(?![\\w$])`, "g")) || []).length;
+}
+
+test("the profile model has no unreferenced functions", () => {
+  const code = stripComments(fs.readFileSync(MODEL_PATH, "utf8"));
+  const names = [...code.matchAll(/^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map((match) => match[1]);
+  assert.ok(names.length >= 19, "the scan must find at least the 19 moved functions");
+  const exported = Object.entries(browserModel()).filter(([, value]) => typeof value === "function").map(([name]) => name);
+  assert.equal(exported.length, 19);
+  assert.deepEqual(exported.filter((name) => !names.includes(name)), [], "the scan must find every exported function");
+  const unreferenced = names.filter((name) => referenceCount(code, name) < 2);
+  assert.deepEqual(unreferenced, []);
+});
