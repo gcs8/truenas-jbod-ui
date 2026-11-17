@@ -3198,10 +3198,51 @@ class HistoryStore:
 
     @staticmethod
     def _newer_last_sample(new: str, old: str) -> str:
+        """SQL: whether the sample at time text `new` gives a bucket's last value over `old`.
+
+        One total order, the same as the raw-sample rank in
+        _roll_up_metric_rows: SQLite's own reading, which also names the
+        bucket, then the stored text as before #1204; a later arrival wins
+        where both are equal, as the higher row id does in the rank. So the
+        last value does not depend on how the samples were batched.
+
+        SQLite's reading rounds to about a millisecond, which can tie two
+        samples but never puts an earlier one after a later one. Inside one
+        such millisecond the text decides, even between two times that each
+        name an exact instant, so a sample a fraction of a millisecond older
+        can give the last value when its text sorts last. The service writes
+        one timestamp format, whose text sorts in time order, and never
+        samples one counter twice in a millisecond: only restored or imported
+        text can meet this.
+
+        Text SQLite does not read (a NULL reading) is older than any text it
+        reads, as NULL sorts in the rank; two such texts compare as text. A
+        raw sample with one has no bucket, so only the last time of a kept
+        or restored bucket can be one, and the first readable sample merged
+        into that bucket replaces it.
+        """
+
         return store_retention._newer_last_sample(_STORE_MODULE, new, old)
 
     @staticmethod
     def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
+        """Return (cutoff, settled bound, cutoff instant) for a retention predicate.
+
+        Stored timestamps may carry any UTC offset, so their text order is not
+        their time order (#1204). A row is expired when its text sorts before
+        the cutoff AND either its text sorts before the settled bound or its
+        exact UTC instant is before the cutoff's.
+
+        The settled bound is the date one day before the cutoff. A UTC offset
+        is less than 24 hours, so a row whose text starts with an earlier date
+        is older than the cutoff whatever its offset; those rows need no parse,
+        exactly as before. Only rows in the last day or so before the cutoff
+        are parsed, so a batch never reads the rows newer than the cutoff, and
+        a row whose time cannot be read is kept only until it ages past the
+        settled bound. A row stored with a positive offset whose text still
+        sorts after the cutoff is expired on a later pass, never early.
+        """
+
         return store_retention._retention_bounds(_STORE_MODULE, cutoff)
 
     @staticmethod
@@ -3232,6 +3273,8 @@ class HistoryStore:
 
     @staticmethod
     def _deleted_floor_text(timestamp_column: str) -> str:
+        """RETURNING expression: the deleted row's timestamp text, or NULL when too long."""
+
         return store_retention._deleted_floor_text(_STORE_MODULE, timestamp_column)
 
     @staticmethod
@@ -3276,6 +3319,12 @@ class HistoryStore:
         floor: tuple[bytes | str, int] | None,
         rollup_cutoff: str | None = None,
     ) -> list[int]:
+        """Roll the selected raw rows up; return the written rollups already expired.
+
+        Expiry is the rollup table's own predicate, evaluated on each row the
+        statement inserted or updated.
+        """
+
         return store_retention._roll_up_metric_rows(
             _STORE_MODULE,
             cls,
