@@ -237,6 +237,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_admin_ttl",
         "test_atomic_write",
         "test_bash_ci_contract",
+        "test_browser_write_origin_policy",
         "test_disk_inventory_sync",
         "test_disk_inventory_sync_grants",
         "test_esxi_host_prep",
