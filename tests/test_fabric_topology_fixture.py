@@ -267,6 +267,27 @@ class FabricTopologyFixtureTests(unittest.TestCase):
         ses = build_fixture()["scale_ses"]["fabric"]
         self.assertEqual(ses["raw"]["fabric_kind"], "linux_ses")
 
+    def test_browser_crawl_draws_topology_bays_and_lines_from_this_fixture(self) -> None:
+        # The CI browser crawl renders Topology from this fixture (in the demo
+        # scope), so its bay cells and lines are drawn there, not excused.
+        from app.services.public_demo_fixture import build_public_demo_snapshot_bundle
+        from scripts.build_ui_crawl_fixture import topology_fabric
+
+        bundle = build_public_demo_snapshot_bundle()
+        fabric = topology_fabric(bundle)
+        demo = bundle.sas_fabric.model_dump(mode="json")
+        self.assertEqual(fabric["system_id"], demo["system_id"])
+        self.assertEqual(fabric["selected_enclosure_id"], demo["selected_enclosure_id"])
+        self.assertTrue([node for node in fabric["nodes"] if node["kind"] == "bay"])
+        self.assertTrue({"controller-expander", "expander-expander", "mpr-enclosure-bay"} <= {link["kind"] for link in fabric["links"]})
+        inventory = json.loads((Path(__file__).resolve().parents[1] / "qa" / "ui-states.json").read_text(encoding="utf-8"))
+        gaps = {gap["key"] for gap in inventory["render_gaps"]}
+        drawn = {"[data-topo-bay]", "[data-topo-link]", "[data-fabric-topology-link]"}
+        self.assertFalse(drawn & gaps)
+        states = [state for state in inventory["states"] if state.get("variant") == "fabric-topology" and state.get("ci")]
+        self.assertTrue(states)
+        self.assertTrue(drawn <= {key for state in states for key in state["covers"]})
+
 
 if __name__ == "__main__":
     import sys

@@ -223,9 +223,25 @@ def fabric_with_diagnostics(fabric) -> dict:
     return data
 
 
-def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY) -> str:
+# The real builder's output for a synthetic two-HBA CORE cascade, checked in
+# and kept current by tests/test_fabric_topology_fixture.py.
+TOPOLOGY_FABRIC = ROOT / "tests" / "fixtures" / "sas_fabric" / "topology_fabric.json"
+
+
+def topology_fabric(bundle) -> dict:
+    """That cascade in the demo's system and enclosure scope, so the Topology
+    mode draws bay cells, lines and link labels in CI (the demo fabric has no
+    links and no bay nodes)."""
+    fabric = json.loads(TOPOLOGY_FABRIC.read_text(encoding="utf-8"))["core_cascade"]["fabric"]
+    demo = _dump(bundle.sas_fabric)
+    for field in ("system_id", "system_label", "selected_enclosure_id", "selected_enclosure_label", "generated_at"):
+        fabric[field] = demo.get(field)
+    return fabric
+
+
+def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY, fabric: dict | None = None) -> str:
     snapshot = bundle.primary_snapshot
-    fabric = fabric_with_diagnostics(bundle.sas_fabric)
+    fabric = fabric or fabric_with_diagnostics(bundle.sas_fabric)
     bootstrap = {
         "snapshot": _dump(snapshot),
         "fabric": _dump(fabric),
@@ -410,6 +426,7 @@ async def build() -> dict:
         "ui-ha-view:/api/storage-views": _dump(partner_backed_runtime(bundle.storage_view_runtime)),
         "ui-ssh:/api/inventory": _dump(live_snapshot(bundle, ssh=True)),
         "ui:/api/sas-fabric": fabric_with_diagnostics(bundle.sas_fabric),
+        "ui-fabric-topology:/api/sas-fabric": topology_fabric(bundle),
         "ui:/api/history/status": await history.get_status(),
         "ui:/api/release-status": {"status": "disabled"},
         "ui:/api/system-locator": {"available": False, "supported": False},
@@ -474,6 +491,8 @@ async def build() -> dict:
             # the crawler's fixture handler fails its /api/storage-views.
             "ui-write-sign-in:/": render_main(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
+            # Topology drawn from the real builder's synthetic cascade.
+            "ui-fabric-topology:/sas-fabric": render_fabric(bundle, fabric=topology_fabric(bundle)),
             "ui-quantastor:/": render_main(bundle, platform="quantastor"),
             "ui-slow-prefetch:/": render_main(bundle, settings=slow_prefetch_settings()),
             "ui-dense-sleds:/": render_main(bundle, snapshot=dense_sled_snapshot(bundle)),
