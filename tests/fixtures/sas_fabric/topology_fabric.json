@@ -9133,6 +9133,1154 @@
    "warnings": []
   }
  },
+ "linux_health": {
+  "fabric": {
+   "aliases": [],
+   "available": true,
+   "controllers": [
+    {
+     "board": "Linux block",
+     "device": "sda",
+     "fabric_kind": "storage_linux",
+     "id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "label": "Linux block",
+     "name": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "path_counts": {
+      "fault": 1,
+      "optimal": 1,
+      "unmapped": 1
+     },
+     "related_slots": [
+      0,
+      1,
+      2
+     ],
+     "source": "linux_block"
+    }
+   ],
+   "enclosures": [
+    {
+     "alias": null,
+     "display_label": null,
+     "enclosure_id": null,
+     "enclosure_label": "Storage view",
+     "fabric_kind": "storage_linux",
+     "id": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "kind": "storage-enclosure",
+     "label": "Storage view",
+     "legacy_alias_ids": [
+      "storage-enclosure:linux-block:storage-view"
+     ],
+     "raw_id": null,
+     "related_slots": [
+      0,
+      1,
+      2
+     ],
+     "source": "linux_block",
+     "status": null
+    }
+   ],
+   "expanders": [],
+   "links": [
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:0->bay:0:0",
+     "kind": "backplane-bay",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": 0,
+     "source": "backplane:0",
+     "status": null,
+     "target": "bay:0"
+    },
+    {
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane-bay:backplane:0->bay:2:2",
+     "kind": "backplane-bay",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": 2,
+     "source": "backplane:0",
+     "status": null,
+     "target": "bay:2"
+    },
+    {
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+     "kind": "controller-path",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "status": "optimal",
+     "target": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67"
+    },
+    {
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+     "kind": "controller-path",
+     "related_slots": [
+      1
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "status": "unmapped",
+     "target": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9"
+    },
+    {
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+     "kind": "controller-path",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "status": "fault",
+     "target": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4"
+    },
+    {
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "kind": "host-controller",
+     "related_slots": [
+      0,
+      1,
+      2
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "host",
+     "status": null,
+     "target": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102"
+    },
+    {
+     "evidence": [
+      "profile/storage view"
+     ],
+     "id": "path-storage-enclosure:path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "kind": "path-storage-enclosure",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+     "status": "optimal",
+     "target": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view"
+    },
+    {
+     "evidence": [
+      "inventory snapshot",
+      "virtual inventory",
+      "physical location unavailable"
+     ],
+     "id": "path-storage-enclosure:path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "kind": "path-storage-enclosure",
+     "related_slots": [
+      1
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+     "status": "unmapped",
+     "target": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view"
+    },
+    {
+     "evidence": [
+      "profile/storage view"
+     ],
+     "id": "path-storage-enclosure:path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "kind": "path-storage-enclosure",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": null,
+     "source": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+     "status": "fault",
+     "target": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view"
+    },
+    {
+     "evidence": [
+      "profile/storage view"
+     ],
+     "id": "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:0:0",
+     "kind": "storage-enclosure-bay",
+     "related_slots": [
+      0
+     ],
+     "reported_lanes": null,
+     "slot": 0,
+     "source": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "status": null,
+     "target": "bay:0"
+    },
+    {
+     "evidence": [
+      "inventory snapshot",
+      "virtual inventory",
+      "physical location unavailable"
+     ],
+     "id": "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:1:1",
+     "kind": "storage-enclosure-bay",
+     "related_slots": [
+      1
+     ],
+     "reported_lanes": null,
+     "slot": 1,
+     "source": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "status": null,
+     "target": "bay:1"
+    },
+    {
+     "evidence": [
+      "profile/storage view"
+     ],
+     "id": "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:2:2",
+     "kind": "storage-enclosure-bay",
+     "related_slots": [
+      2
+     ],
+     "reported_lanes": null,
+     "slot": 2,
+     "source": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "status": null,
+     "target": "bay:2"
+    }
+   ],
+   "nodes": [
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "profile slot layout"
+     ],
+     "id": "backplane:0",
+     "kind": "backplane",
+     "label": "Backplane Zone 1",
+     "metrics": {
+      "slot_count": 2,
+      "slot_range": "Bays 01-03",
+      "zone": 1
+     },
+     "raw": {
+      "id": "backplane:0",
+      "index": 0,
+      "label": "Backplane Zone 1",
+      "range": "Bays 01-03",
+      "slots": [
+       0,
+       2
+      ]
+     },
+     "raw_id": null,
+     "related_slots": [
+      0,
+      2
+     ],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "bay:0",
+     "kind": "bay",
+     "label": "Bay 01",
+     "metrics": {
+      "device_name": "sda",
+      "fabric_kind": "storage_linux",
+      "health": null,
+      "pool_name": null,
+      "present": true,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "fabric_kind": "storage_linux",
+      "operator_context": {},
+      "source": "linux_block"
+     },
+     "raw_id": null,
+     "related_slots": [
+      0
+     ],
+     "slot": 0,
+     "status": "fault"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot",
+      "physical location unavailable"
+     ],
+     "id": "bay:1",
+     "kind": "bay",
+     "label": "Disk 2",
+     "metrics": {
+      "device_name": "sdb",
+      "fabric_kind": "storage_linux",
+      "health": null,
+      "physical_location_known": false,
+      "pool_name": null,
+      "present": true,
+      "transport_protocol": null,
+      "vdev_name": null,
+      "virtual_enclosure": true
+     },
+     "raw": {
+      "fabric_kind": "storage_linux",
+      "operator_context": {},
+      "physical_location_known": false,
+      "source": "linux_block",
+      "virtual_enclosure": true
+     },
+     "raw_id": null,
+     "related_slots": [
+      1
+     ],
+     "slot": 1,
+     "status": "unmapped"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "bay:2",
+     "kind": "bay",
+     "label": "Bay 03",
+     "metrics": {
+      "device_name": "sdc",
+      "fabric_kind": "storage_linux",
+      "health": "OPTIMAL",
+      "pool_name": null,
+      "present": true,
+      "transport_protocol": null,
+      "vdev_name": null
+     },
+     "raw": {
+      "fabric_kind": "storage_linux",
+      "operator_context": {},
+      "source": "linux_block"
+     },
+     "raw_id": null,
+     "related_slots": [
+      2
+     ],
+     "slot": 2,
+     "status": "optimal"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "kind": "controller",
+     "label": "Linux block",
+     "metrics": {
+      "fabric_kind": "storage_linux",
+      "path_counts": {
+       "fault": 1,
+       "optimal": 1,
+       "unmapped": 1
+      },
+      "source": "linux_block"
+     },
+     "raw": {
+      "board": "Linux block",
+      "device": "sdc",
+      "devices": [
+       "sdc"
+      ],
+      "fabric_kind": "storage_linux",
+      "legacy_alias_ids": [
+       "controller:linux-block"
+      ],
+      "source": "linux_block"
+     },
+     "raw_id": "sda",
+     "related_slots": [
+      0,
+      1,
+      2
+     ],
+     "slot": null,
+     "status": "online"
+    },
+    {
+     "alias": null,
+     "controller_id": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "host",
+     "kind": "host",
+     "label": "Synthetic health",
+     "metrics": {
+      "fabric_domain": "storage_fabric",
+      "fabric_kind": "storage_linux",
+      "selected_disk_count": 3,
+      "slot_count": 3
+     },
+     "raw": {
+      "fabric_kind": "storage_linux",
+      "platform": "linux"
+     },
+     "raw_id": "synthetic-health",
+     "related_slots": [],
+     "slot": null,
+     "status": null
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+     "kind": "path",
+     "label": "sdc",
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "optimal": 1
+      },
+      "path_type": "block",
+      "state_basis": "member-health-not-transport"
+     },
+     "raw": {
+      "devices": [
+       "sdc"
+      ],
+      "fabric_kind": "storage_linux",
+      "legacy_alias_ids": [
+       "path:linux-block:sdc"
+      ],
+      "source": "linux_block",
+      "topology_label": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      2
+     ],
+     "slot": null,
+     "status": "optimal"
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+     "kind": "path",
+     "label": "sdb",
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "unmapped": 1
+      },
+      "path_type": "block",
+      "state_basis": "member-health-not-transport"
+     },
+     "raw": {
+      "devices": [
+       "sdb"
+      ],
+      "fabric_kind": "storage_linux",
+      "legacy_alias_ids": [
+       "path:linux-block:sdb"
+      ],
+      "source": "linux_block",
+      "topology_label": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      1
+     ],
+     "slot": null,
+     "status": "unmapped"
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+     "kind": "path",
+     "label": "sda",
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "fault": 1
+      },
+      "path_type": "block",
+      "state_basis": "member-health-not-transport"
+     },
+     "raw": {
+      "devices": [
+       "sda"
+      ],
+      "fabric_kind": "storage_linux",
+      "legacy_alias_ids": [
+       "path:linux-block:sda"
+      ],
+      "source": "linux_block",
+      "topology_label": null
+     },
+     "raw_id": null,
+     "related_slots": [
+      0
+     ],
+     "slot": null,
+     "status": "fault"
+    },
+    {
+     "alias": null,
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "display_label": null,
+     "evidence": [
+      "profile/storage view",
+      "inventory snapshot",
+      "virtual inventory",
+      "physical location unavailable"
+     ],
+     "id": "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+     "kind": "storage-enclosure",
+     "label": "Storage view",
+     "metrics": {
+      "fabric_kind": "storage_linux",
+      "selected_enclosure": true,
+      "slot_count": 3,
+      "source": "linux_block"
+     },
+     "raw": {
+      "enclosure_id": null,
+      "enclosure_label": "Storage view",
+      "fabric_kind": "storage_linux",
+      "legacy_alias_ids": [
+       "storage-enclosure:linux-block:storage-view"
+      ],
+      "source": "linux_block"
+     },
+     "raw_id": null,
+     "related_slots": [
+      0,
+      1,
+      2
+     ],
+     "slot": null,
+     "status": null
+    }
+   ],
+   "paths": [
+    {
+     "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_label": "Linux block",
+     "count": 1,
+     "fabric_kind": "storage_linux",
+     "id": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+     "label": "sda",
+     "member_state_counts": {
+      "fault": 1
+     },
+     "path_type": "block",
+     "slots": [
+      0
+     ],
+     "source": "linux_block",
+     "state": "fault",
+     "state_basis": "member-health-not-transport"
+    },
+    {
+     "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_label": "Linux block",
+     "count": 1,
+     "fabric_kind": "storage_linux",
+     "id": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+     "label": "sdb",
+     "member_state_counts": {
+      "unmapped": 1
+     },
+     "path_type": "block",
+     "slots": [
+      1
+     ],
+     "source": "linux_block",
+     "state": "unmapped",
+     "state_basis": "member-health-not-transport"
+    },
+    {
+     "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_id": "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+     "controller_label": "Linux block",
+     "count": 1,
+     "fabric_kind": "storage_linux",
+     "id": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+     "label": "sdc",
+     "member_state_counts": {
+      "optimal": 1
+     },
+     "path_type": "block",
+     "slots": [
+      2
+     ],
+     "source": "linux_block",
+     "state": "optimal",
+     "state_basis": "member-health-not-transport"
+    }
+   ],
+   "platform": "linux",
+   "raw": {
+    "command_failures": [],
+    "fabric_domain": "storage_fabric",
+    "fabric_kind": "storage_linux",
+    "selected_bay_slots": [
+     0,
+     1,
+     2
+    ],
+    "selected_disk_slots": [
+     0,
+     1,
+     2
+    ]
+   },
+   "selected_enclosure_id": null,
+   "selected_enclosure_label": null,
+   "snapshot_cache_state": "miss",
+   "source_cache_state": "miss",
+   "sources": {},
+   "system_id": "synthetic-health",
+   "system_label": "Synthetic health",
+   "traces": [
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "bay:0",
+     "kind": "bay",
+     "label": "Bay 01",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+      "path-storage-enclosure:path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "backplane-bay:backplane:0->bay:0:0",
+      "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:0:0"
+     ],
+     "metrics": {
+      "device_name": "sda",
+      "fabric_kind": "storage_linux",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+        "controller_label": "Linux block",
+        "device_name": "sda",
+        "member_state": "fault",
+        "path_id": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+        "path_type": "block",
+        "source": "linux_block",
+        "state": "fault",
+        "state_basis": "member-health-not-transport"
+       }
+      ],
+      "pool_name": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+      "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "backplane:0",
+      "bay:0"
+     ],
+     "slots": [
+      0
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot",
+      "physical location unavailable"
+     ],
+     "id": "bay:1",
+     "kind": "bay",
+     "label": "Disk 2",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+      "path-storage-enclosure:path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:1:1"
+     ],
+     "metrics": {
+      "device_name": "sdb",
+      "fabric_kind": "storage_linux",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+        "controller_label": "Linux block",
+        "device_name": "sdb",
+        "member_state": "unmapped",
+        "path_id": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+        "path_type": "block",
+        "source": "linux_block",
+        "state": "unmapped",
+        "state_basis": "member-health-not-transport"
+       }
+      ],
+      "physical_location_known": false,
+      "pool_name": null,
+      "vdev_name": null,
+      "virtual_enclosure": true
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+      "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "bay:1"
+     ],
+     "slots": [
+      1
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "lsblk",
+      "smartctl",
+      "inventory snapshot"
+     ],
+     "id": "bay:2",
+     "kind": "bay",
+     "label": "Bay 03",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+      "path-storage-enclosure:path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67->storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "backplane-bay:backplane:0->bay:2:2",
+      "storage-enclosure-bay:storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view->bay:2:2"
+     ],
+     "metrics": {
+      "device_name": "sdc",
+      "fabric_kind": "storage_linux",
+      "mpr_devices": [],
+      "path_states": [
+       {
+        "controller": "storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+        "controller_label": "Linux block",
+        "device_name": "sdc",
+        "member_state": "optimal",
+        "path_id": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+        "path_type": "block",
+        "source": "linux_block",
+        "state": "optimal",
+        "state_basis": "member-health-not-transport"
+       }
+      ],
+      "pool_name": null,
+      "vdev_name": null
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+      "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:storage-view",
+      "backplane:0",
+      "bay:2"
+     ],
+     "slots": [
+      2
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67",
+     "kind": "path",
+     "label": "sdc",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67"
+     ],
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "optimal": 1
+      },
+      "source": "linux_block",
+      "state": "optimal",
+      "state_basis": "member-health-not-transport"
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:050c4d12e1aa1e9373bc164e9087c826a0d1181549f2c611d5d478525b88fe67"
+     ],
+     "slots": [
+      2
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9",
+     "kind": "path",
+     "label": "sdb",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9"
+     ],
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "unmapped": 1
+      },
+      "source": "linux_block",
+      "state": "unmapped",
+      "state_basis": "member-health-not-transport"
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:7c1a181c0f61b998b6414116ee42dfa9280a8ce43cd35f968eea8206f025dcb9"
+     ],
+     "slots": [
+      1
+     ]
+    },
+    {
+     "alias": null,
+     "display_label": null,
+     "evidence": [
+      "inventory snapshot"
+     ],
+     "id": "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4",
+     "kind": "path",
+     "label": "sda",
+     "link_ids": [
+      "host-controller:host->controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "controller-path:controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102->path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4"
+     ],
+     "metrics": {
+      "count": 1,
+      "fabric_kind": "storage_linux",
+      "member_state_counts": {
+       "fault": 1
+      },
+      "source": "linux_block",
+      "state": "fault",
+      "state_basis": "member-health-not-transport"
+     },
+     "node_ids": [
+      "host",
+      "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102",
+      "path:storage-v2:7f37a632588234ba19411c614dad7e3a4e6e4b88c8b0f48e661fd80fdbf4adb4"
+     ],
+     "slots": [
+      0
+     ]
+    }
+   ],
+   "warnings": [
+    "Linux Storage Fabric is built from Linux block, pool, profile, SMART and optional SES data; HBA and expander hops are not shown.",
+    "Logical disk inventory (virtual): physical location unavailable for unmapped disks. Disk numbers are inventory ordinals, not physical bays."
+   ]
+  },
+  "snapshot": {
+   "capabilities": {},
+   "enclosures": [],
+   "last_updated": "2026-01-01T00:00:00Z",
+   "layout_columns": 0,
+   "layout_rows": [],
+   "layout_slot_count": 0,
+   "platform_context": {},
+   "refresh_interval_seconds": 30,
+   "selected_enclosure_id": null,
+   "selected_enclosure_label": null,
+   "selected_enclosure_name": null,
+   "selected_profile": null,
+   "selected_system_id": "synthetic-health",
+   "selected_system_label": null,
+   "selected_system_platform": null,
+   "slots": [
+    {
+     "attached_sas_address": null,
+     "column_index": 0,
+     "device_name": "sda",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-HEALTH-0",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 0,
+     "slot_label": "01",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": null,
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "fault",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    },
+    {
+     "attached_sas_address": null,
+     "column_index": 1,
+     "device_name": "sdb",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": null,
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": false,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {
+      "virtual_enclosure": true
+     },
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-HEALTH-1",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 1,
+     "slot_label": "02",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": null,
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "unmapped",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    },
+    {
+     "attached_sas_address": null,
+     "column_index": 2,
+     "device_name": "sdc",
+     "enclosure_id": null,
+     "enclosure_identifier": null,
+     "enclosure_label": null,
+     "enclosure_name": null,
+     "gptid": null,
+     "health": "OPTIMAL",
+     "identify_active": false,
+     "identity_state": "known",
+     "last_smart_test_lifetime_hours": null,
+     "last_smart_test_status": null,
+     "last_smart_test_type": null,
+     "led_backend": null,
+     "led_reason": null,
+     "led_supported": false,
+     "logical_block_size": null,
+     "logical_unit_id": null,
+     "mapping_clear_revision": null,
+     "mapping_reason": null,
+     "mapping_revision": null,
+     "mapping_source": "unknown",
+     "mapping_supported": true,
+     "model": null,
+     "multipath": null,
+     "notes": null,
+     "operator_context": {},
+     "persistent_id_label": null,
+     "phy_identifier": null,
+     "physical_block_size": null,
+     "physical_location_known": true,
+     "pool_name": null,
+     "present": true,
+     "raw_status": {},
+     "row_index": 0,
+     "sas_address": null,
+     "scsi_hctl": null,
+     "search_text": "",
+     "serial": "SANITIZED-HEALTH-2",
+     "sg_device": null,
+     "size_bytes": null,
+     "size_human": null,
+     "slot": 2,
+     "slot_label": "03",
+     "smart_device_names": [],
+     "smart_device_type": null,
+     "ssh_ses_device": null,
+     "ssh_ses_element_id": null,
+     "ssh_ses_targets": [],
+     "state": "healthy",
+     "target_port_protocol": null,
+     "temperature_c": null,
+     "topology_label": null,
+     "transport_protocol": null,
+     "vdev_class": null,
+     "vdev_name": null
+    }
+   ],
+   "sources": {},
+   "summary": {
+    "disk_count": 0,
+    "duplicate_disk_view_count": 0,
+    "enclosure_count": 0,
+    "enclosure_source": "truenas",
+    "manual_mapping_count": 0,
+    "mapped_slot_count": 0,
+    "pool_count": 0,
+    "rendered_unique_disk_count": 0,
+    "source_disk_count": 0,
+    "ssh_slot_hint_count": 0,
+    "unplaced_disk_count": 0
+   },
+   "systems": [],
+   "warnings": []
+  }
+ },
  "linux_virtual": {
   "fabric": {
    "aliases": [],

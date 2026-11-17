@@ -354,3 +354,21 @@ test("at 390 px the search box stays inside its panel", () => {
   assert.match(row, /min-width:\s*0/);
   assert.match(row, /max-width:\s*100%/);
 });
+
+// ---- the synthetic inputs agree with themselves ---------------------------
+
+test("every test builder gives each HBA a linked-PHY count equal to the lanes its links report", () => {
+  const builders = { "two HBAs, level-2 cascade": H.twoHbaCascade().fabric, "four shelves": H.fourShelves().fabric };
+  if (H.eightHbaSixteenShelves) builders["eight HBAs, sixteen shelves"] = H.eightHbaSixteenShelves().fabric;
+  if (H.threeLevelCascade) builders["three-level cascade"] = H.threeLevelCascade().fabric;
+  for (const [name, fabric] of Object.entries(builders)) {
+    for (const hba of fabric.nodes.filter((item) => item.kind === "controller")) {
+      const lanes = fabric.links
+        .filter((item) => item.source === hba.id && item.kind === "controller-expander" && item.reported_lanes)
+        .flatMap((item) => item.reported_lanes.source_phys);
+      assert.equal(hba.metrics.linked_phy_count, lanes.length, `${name}: ${hba.id} linked PHYs`);
+      assert.equal(new Set(lanes).size, lanes.length, `${name}: ${hba.id} uses each PHY once`);
+      assert.ok(lanes.every((phy) => phy < hba.metrics.phy_count), `${name}: ${hba.id} PHYs within its count`);
+    }
+  }
+});

@@ -310,11 +310,11 @@ test("Linux SES payload: draws what it has, states the hops are not collected, i
   assert.equal([...model.tiers].find((tier) => tier.id === "controllers").label, "Source");
   assert.equal(model.counts.baysPlaced, 3);
   assert.ok(T.renderTopology(model, {}).includes(NOT_COLLECTED));
-  // A platform the view does not know gets the same statement.
+  // A fabric kind the view does not know makes no claim about collection.
   const other = linuxSesFabric();
   other.raw = { fabric_domain: "storage_fabric", fabric_kind: "storage_example" };
   const otherModel = T.buildTopologyModel(other);
-  assert.equal([...otherModel.tiers].find((tier) => tier.id === "not-collected").note, NOT_COLLECTED);
+  assert.equal([...otherModel.tiers].find((tier) => tier.id === "not-collected"), undefined);
 });
 
 test("a 1024-bay expander keeps every bay: a summary block that expands, and the page says so", () => {

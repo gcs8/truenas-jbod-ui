@@ -4191,6 +4191,10 @@
     elements.inspectorBody.inert = inert;
     elements.focusStrip.inert = inert;
     state.diagnosticPayloads = {};
+    // Leaving Topology clears its pin, trace and search, with or without a payload.
+    if (state.mode !== "topology") {
+      window.SasFabricTopology?.release();
+    }
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       renderFocusStrip(null);
@@ -4214,9 +4218,6 @@
     ensureSelectionForMode(fabric);
     pruneSelectionTrail(fabric);
     renderFocusStrip(fabric);
-    if (state.mode !== "topology") {
-      window.SasFabricTopology?.release();
-    }
     if (state.mode === "impact") {
       elements.mapPanel.innerHTML = renderImpactMode(fabric);
     } else if (state.mode === "trace") {

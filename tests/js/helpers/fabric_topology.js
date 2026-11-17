@@ -71,8 +71,9 @@ function coreFabric() {
   };
 }
 
-function addController(fabric, name) {
-  const item = node(`controller:${name}`, "controller", { label: name, raw: { board: "SYNTH-HBA" }, metrics: { phy_count: 8, linked_phy_count: 4 } });
+// PHY counts agree with the lanes the builder gives the HBA's links.
+function addController(fabric, name, { phys = 8, linked = 4 } = {}) {
+  const item = node(`controller:${name}`, "controller", { label: name, raw: { board: "SYNTH-HBA" }, metrics: { phy_count: phys, linked_phy_count: linked } });
   fabric.nodes.push(item);
   fabric.links.push(link("host", item.id, "host-controller"));
   return item;
@@ -156,7 +157,8 @@ function fourShelves() {
   const fabric = coreFabric();
   const shelves = [["A", 60], ["B", 84], ["C", 102], ["D", 106]];
   const expanders = { mpr0: {}, mpr1: {} };
-  for (const name of ["mpr0", "mpr1"]) addController(fabric, name);
+  // Shelves A, B and C each take four lanes of each HBA: 12 of 16 PHYs.
+  for (const name of ["mpr0", "mpr1"]) addController(fabric, name, { phys: 16, linked: 12 });
   let start = 0;
   shelves.forEach(([shelf, count], index) => {
     const enclosures = [];

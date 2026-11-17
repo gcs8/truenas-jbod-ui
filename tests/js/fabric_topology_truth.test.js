@@ -91,8 +91,8 @@ test("disks without a physical location are never called bays or numbered as bay
   assert.deepEqual([...T.searchTopology(model, "Disk 2").matches].map((item) => item.label), ["Disk 2"]);
   // Control: the CORE producer's bays have a location and keep bay wording.
   const core = T.renderTopology(T.buildTopologyModel(cases.core_cascade.fabric), {});
-  assert.match(core, /Bays 0–3 · 4 bays/);
-  assert.deepEqual(cellsOf(core).get("bay:3").text, ["3"]);
+  assert.match(core, /Bays 00–03 · 4 bays/);
+  assert.deepEqual(cellsOf(core).get("bay:3").text, ["03"]);
 });
 
 // ---- canonical path states, two marks per dual-path bay --------------
@@ -474,4 +474,327 @@ test("bay traces without a bay node are named, not silently left out", () => {
   const model = T.buildTopologyModel(fabric);
   assert.equal(model.counts.baysPlaced, 2);
   assert.match([...model.notices].join(" "), /2 bay traces without a bay node \(bay:2, bay:3\)/);
+});
+
+// ---- member health is never drawn as a transport or SES state ---------------
+
+test("a bay state whose basis is member health is drawn and named as member health, whatever its word", () => {
+  const T = H.loadTopology();
+  const { fabric } = cases.linux_health;
+  const html = T.renderTopology(T.buildTopologyModel(fabric), {});
+  const cells = cellsOf(html);
+  // The real builder: a faulted disk, an unmapped logical disk, an optimal disk.
+  assert.deepEqual(cells.get("bay:0").marks, ["fault"]);
+  assert.deepEqual(cells.get("bay:1").marks, ["unmapped"]);
+  assert.deepEqual(cells.get("bay:2").marks, ["optimal"]);
+  for (const id of ["bay:0", "bay:1", "bay:2"]) {
+    assert.deepEqual(cells.get(id).tones, ["member"], `${id} is a member-health mark`);
+    assert.match(cells.get(id).name, /member health (fault|unmapped|optimal)/, `${id} says member health`);
+  }
+  for (const tone of ["path-fault", "path-unmapped", "path-active", "path-mapped"]) {
+    assert.ok(!html.includes(`data-topology-legend="${tone}"`), `no ${tone} legend for member health`);
+  }
+  assert.ok(html.includes('data-topology-legend="path-member"'));
+  // Control: the CORE transport states keep their own marks.
+  assert.deepEqual(cellsOf(T.renderTopology(T.buildTopologyModel(cases.core_cascade.fabric), {})).get("bay:2").tones, ["active", "fault"]);
+});
+
+// ---- state words cannot reach the prototype ---------------------------------
+
+test("state, kind and controller words such as __proto__ or constructor cannot stop the drawing", () => {
+  const T = H.loadTopology();
+  for (const word of ["__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"]) {
+    const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+    for (const trace of fabric.traces) {
+      for (const state of trace.metrics.path_states || []) {
+        state.state = word;
+        state.controller_label = word;
+      }
+    }
+    for (const item of fabric.nodes) if (item.kind === "path") item.metrics = { ...item.metrics, path_type: word };
+    const model = T.buildTopologyModel(fabric);
+    const html = T.renderTopology(model, {});
+    const cell = cellsOf(html).get("bay:0");
+    assert.deepEqual(cell.tones, ["other", "other"], word);
+    assert.equal(Object.getPrototypeOf({}).polluted, undefined);
+    const collapsed = T.buildTopologyModel(fabric, { expanded: JSON.parse(`{"${word}": true}`) });
+    assert.ok(T.renderTopology(collapsed, {}).includes("<svg"), word);
+  }
+  // Every tone a lookup can give has a drawn mark and a legend entry.
+  const words = ["active", "online", "optimal", "passive", "standby", "fail", "failed", "fault", "missing", "unknown", "mapped", "unmapped", "present", "mixed", "anything", "__proto__", "constructor"];
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", null);
+  fabric.links.push(H.link(hba.id, enc.id, "controller-enclosure"));
+  H.addBays(fabric, H.range(0, words.length * 2), [enc.id]);
+  for (const trace of fabric.traces) {
+    const word = words[trace.slots[0] % words.length];
+    trace.metrics.path_states = [{ controller: "mpr0", state: word, state_basis: trace.slots[0] < words.length ? "" : "member-health-not-transport" }];
+  }
+  const html = T.renderTopology(T.buildTopologyModel(fabric), {});
+  const cells = cellsOf(html);
+  assert.equal(cells.size, words.length * 2);
+  for (const [id, cell] of cells) {
+    assert.equal(cell.tones.length, 1, id);
+    assert.ok(html.includes(`data-topology-legend="path-${cell.tones[0]}"`), `${id}: ${cell.tones[0]} is in the legend`);
+  }
+});
+
+// ---- every input record is accounted for -------------------------------------
+
+test("a duplicate bay trace, a trace of an unsupported kind and a duplicate bay link each get a notice", () => {
+  const T = H.loadTopology();
+  const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  const first = fabric.traces.find((trace) => trace.id === "bay:1");
+  fabric.traces.push({ ...JSON.parse(JSON.stringify(first)), label: "a second trace for the same bay" });
+  fabric.traces.push({ id: "trace:alien", kind: "alien", label: "alien", metrics: {} });
+  const pathBay = fabric.links.find((item) => item.kind === "path-bay" && item.target === "bay:6");
+  fabric.links.push({ ...pathBay, status: "fail" });
+  const model = T.buildTopologyModel(fabric);
+  const text = [...model.notices].join(" ");
+  assert.match(text, /1 duplicate trace id \(bay:1\)/);
+  assert.match(text, /1 trace of a kind this view does not draw \(alien: trace:alien\)/);
+  assert.match(text, /1 duplicate link id \(path-bay:/);
+  // The first trace wins: its own label and path states are drawn.
+  assert.equal(model.bayById.get("bay:1").traceId, "bay:1");
+  // A rejected duplicate bay link cannot come back through the path-state fallback.
+  const bare = JSON.parse(JSON.stringify(fabric));
+  bare.traces = bare.traces.filter((trace) => trace.id !== "bay:6");
+  const states = T.buildTopologyModel(bare).bayById.get("bay:6").pathStates.map((state) => state.state);
+  assert.equal(states.filter((state) => state === "fail").length, 0, JSON.stringify(states));
+  assert.equal(states.length, bare.links.filter((item) => item.kind === "path-bay" && item.target === "bay:6").length - 1);
+  // Control: the real producer's payload needs no notice.
+  assert.deepEqual([...T.buildTopologyModel(cases.core_cascade.fabric).notices], []);
+});
+
+// ---- only the exact supported fabric kinds are recognised --------------------
+
+test("an unknown or conflicting fabric kind gets its own notice and makes no claim about collection", () => {
+  const T = H.loadTopology();
+  const base = () => {
+    const fabric = H.coreFabric();
+    const hba = H.addController(fabric, "mpr0");
+    const exp = H.addExpander(fabric, "mpr0", 0xa1, 1, hba.id);
+    const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", exp.id);
+    H.addBays(fabric, [0, 1], [enc.id]);
+    return fabric;
+  };
+  const claims = /not collected on this platform|not read|read not reported|read complete|no HBAs reported/;
+  for (const [platform, kind, words] of [
+    ["unknown", "core_alien", /fabric kind "core_alien" is not one this view knows/],
+    ["unknown", "alien", /fabric kind "alien" is not one this view knows/],
+    ["core", "linux_ses", /fabric kind "linux_ses" does not match platform "core"/],
+    ["scale", "core_mpr", /fabric kind "core_mpr" does not match platform "scale"/],
+    [undefined, undefined, /names no fabric kind/],
+  ]) {
+    const fabric = base();
+    if (platform === undefined) delete fabric.platform;
+    else fabric.platform = platform;
+    if (kind !== undefined) fabric.raw.fabric_kind = kind;
+    const model = T.buildTopologyModel(fabric);
+    const html = T.renderTopology(model, {});
+    const notices = [...model.notices].join(" ");
+    assert.match(notices, words, `${platform}/${kind}`);
+    assert.match(notices, /makes no claim about what was or was not collected/);
+    assert.doesNotMatch(html.replace(notices.replace(/&/g, "&amp;").replace(/"/g, "&quot;"), ""), claims, `${platform}/${kind}: no collection claim`);
+    // Nothing is dropped: the expander and the bays are still drawn.
+    assert.ok(html.includes("data-topo-node=\"expander:controller:mpr0:"), `${platform}/${kind}`);
+    assert.equal(cellsOf(html).size, 2);
+  }
+  // The real CORE payload that names no kind keeps its CORE drawing.
+  const core = T.buildTopologyModel(cases.core_cascade.fabric);
+  assert.equal(core.core, true);
+  assert.deepEqual([...core.notices], []);
+  // A CORE builder kind is CORE even where the platform field is absent.
+  const named = base();
+  delete named.platform;
+  named.raw.fabric_kind = "core_mpr";
+  const namedModel = T.buildTopologyModel(named);
+  assert.equal(namedModel.core, true);
+  assert.deepEqual([...namedModel.notices], []);
+  assert.deepEqual([...namedModel.tiers].map((tier) => tier.id), ["host", "controllers", "expanders:1", "enclosures", "bays"]);
+  // Every storage kind the producers emit is a non-CORE platform drawing.
+  for (const kind of ["linux_ses", "storage_scale", "storage_linux", "storage_quantastor", "storage_esxi", "storage_bmc", "storage_generic"]) {
+    const fabric = JSON.parse(JSON.stringify(cases.linux_virtual.fabric));
+    fabric.raw.fabric_kind = kind;
+    const model = T.buildTopologyModel(fabric);
+    assert.equal(model.core, false, kind);
+    assert.deepEqual([...model.notices], [], kind);
+    assert.match(T.renderTopology(model, {}), /not collected on this platform/, kind);
+  }
+});
+
+// ---- bay numbers are the producer's labels -----------------------------------
+
+test("a profile that counts bays from 1 shows the producer's label in the cell, heading and search", () => {
+  const T = H.loadTopology();
+  const model = T.buildTopologyModel(cases.linux_health.fabric);
+  const html = T.renderTopology(model, {});
+  const cells = cellsOf(html);
+  assert.deepEqual(cells.get("bay:0").text, ["01"]);
+  assert.deepEqual(cells.get("bay:2").text, ["03"]);
+  assert.match(cells.get("bay:0").name, /^Bay 01,/);
+  assert.doesNotMatch(html, /Bays 0–/);
+  assert.deepEqual([...T.searchTopology(model, "1").matches].map((item) => item.id), ["bay:0"]);
+  assert.deepEqual([...T.searchTopology(model, "bay 3").matches].map((item) => item.id), ["bay:2"]);
+  assert.equal(T.searchTopology(model, "0").matches.length, 0, "the internal index is not a bay number");
+  // Control: a profile that counts from 0 keeps "00".
+  assert.deepEqual(cellsOf(T.renderTopology(T.buildTopologyModel(cases.core_cascade.fabric), {})).get("bay:0").text, ["00"]);
+});
+
+// ---- wording in a logical-disk state, and on a source that is not an HBA ----
+
+test("in a logical-disk state the legend, footer and search help say disk, and a source is not called an HBA", () => {
+  const T = H.loadTopology({ document: { addEventListener() {}, removeEventListener() {} } });
+  const model = T.buildTopologyModel(cases.linux_virtual.fabric);
+  const html = T.renderTopology(model, {});
+  const legend = /<div class="fabric-topology-legend"[^>]*>([\s\S]*?)<\/div>/.exec(html)[1];
+  const footer = /<p class="fabric-topology-not-shown[^"]*">([^<]*)<\/p>/.exec(html)[1];
+  assert.doesNotMatch(legend.replace(/<[^>]+>/g, " "), /\bbays?\b/i, legend);
+  assert.doesNotMatch(footer, /\bbays?\b/i, footer);
+  assert.doesNotMatch(legend, /\bHBA\b/, "the source card says it is not an HBA");
+  const help = T.searchHelp(model);
+  assert.doesNotMatch(`${help.label} ${help.placeholder}`, /\bbay\b/i);
+  assert.match(help.label, /disk/);
+  // The page's search row takes the help text.
+  const label = { textContent: "Find a bay, disk or expander" };
+  const input = { value: "", placeholder: "Bay number", labels: [label], addEventListener() {} };
+  T.attach({ dataset: {}, querySelector: () => null, addEventListener() {} }, input, { textContent: "" }, {});
+  T.render(cases.linux_virtual.fabric, {});
+  assert.doesNotMatch(`${label.textContent} ${input.placeholder}`, /\bbay\b/i);
+  // The dashed band explains both "not read" and "read, not reported".
+  const core = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  delete core.raw.controller_read;
+  core.nodes = core.nodes.filter((item) => item.kind !== "expander");
+  const band = T.renderTopology(T.buildTopologyModel(core), {});
+  const item = /data-topology-legend="mark-not-read"[^>]*>(?:<[^>]+>)*([^<]*)/.exec(band)[1];
+  assert.match(item, /not read/);
+  assert.match(item, /read, (?:but )?(?:its completeness )?not reported/);
+  // Control: CORE bays keep bay wording and HBAs keep their name.
+  const coreHtml = T.renderTopology(T.buildTopologyModel(cases.core_cascade.fabric), {});
+  assert.match(coreHtml, /every line from this HBA down/);
+  assert.match(T.searchHelp(T.buildTopologyModel(cases.core_cascade.fabric)).label, /bay/);
+});
+
+// ---- occupancy that is not a boolean stays unknown -------------------------
+
+test("occupancy that is not a boolean is drawn unknown, never empty", () => {
+  const T = H.loadTopology();
+  const fabric = H.coreFabric();
+  const hba = H.addController(fabric, "mpr0");
+  const enc = H.addEnclosure(fabric, "mpr0", "0001", "SYNTH-ENC", null);
+  fabric.links.push(H.link(hba.id, enc.id, "controller-enclosure"));
+  const values = ["unknown", null, 0, 1, "false", "true", {}, []];
+  H.addBays(fabric, H.range(0, values.length + 2), [enc.id]);
+  values.forEach((value, index) => {
+    fabric.nodes.find((item) => item.id === `bay:${index}`).metrics.present = value;
+  });
+  fabric.nodes.find((item) => item.id === `bay:${values.length}`).metrics.present = false;
+  delete fabric.nodes.find((item) => item.id === `bay:${values.length + 1}`).metrics.present;
+  const html = T.renderTopology(T.buildTopologyModel(fabric), {});
+  const classes = new Map([...html.matchAll(/<g class="topo-bay (bay-[a-z]+)[^"]*"[^>]*data-topo-bay="([^"]+)"/g)].map((match) => [match[2], match[1]]));
+  values.forEach((value, index) => assert.equal(classes.get(`bay:${index}`), "bay-unknown", JSON.stringify(value)));
+  assert.equal(classes.get(`bay:${values.length}`), "bay-no", "control: false is empty");
+  assert.equal(classes.get(`bay:${values.length + 1}`), "bay-unknown", "absent is unknown");
+  const big = H.coreFabric();
+  const hba2 = H.addController(big, "mpr0");
+  const enc2 = H.addEnclosure(big, "mpr0", "0001", "SYNTH-ENC", null);
+  big.links.push(H.link(hba2.id, enc2.id, "controller-enclosure"));
+  H.addBays(big, H.range(0, 120), [enc2.id]);
+  for (const item of big.nodes) if (item.kind === "bay") item.metrics.present = item.slot < 100 ? "unknown" : false;
+  const summary = T.buildTopologyModel(big).groups[0].summary;
+  assert.deepEqual([summary.withDisk, summary.empty, summary.unknown], [0, 20, 100]);
+});
+
+// ---- leaving Topology through the page's mode buttons ------------------------
+
+function loadFullPage(T, sharedDocument, fabric, snapshot) {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const vm = require("node:vm");
+  const source = fs.readFileSync(path.join(H.ROOT, "app/static/sas_fabric_view.js"), "utf8");
+  const elements = new Map();
+  const buttons = ["lanes", "impact", "trace", "disk", "topology"].map((mode) => {
+    const handlers = new Map();
+    return {
+      dataset: { fabricMode: mode },
+      handlers,
+      textContent: mode,
+      classList: { toggle() {} },
+      setAttribute() {},
+      addEventListener(type, handler) { handlers.set(type, handler); },
+    };
+  });
+  const element = (id) => {
+    const item = {
+      id, innerHTML: "", textContent: "", value: "", dataset: {}, className: "", hidden: false,
+      clientWidth: 1200, scrollLeft: 0, scrollTop: 0, options: [],
+      classList: { toggle() {}, add() {}, remove() {} },
+      closest: () => null, querySelector: () => null, querySelectorAll: () => [],
+      setAttribute() {}, removeAttribute() {}, appendChild() {},
+      handlers: new Map(),
+      addEventListener(type, handler) { item.handlers.set(type, handler); },
+    };
+    return item;
+  };
+  Object.assign(sharedDocument, {
+    activeElement: null,
+    body: { classList: { toggle() {} } },
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, element(id));
+      return elements.get(id);
+    },
+    querySelectorAll: (selector) => (selector === "[data-fabric-mode]" ? buttons : []),
+    querySelector: () => null,
+  });
+  const sandbox = vm.createContext({
+    URLSearchParams, URL, console, setTimeout, clearTimeout, AbortSignal, AbortController,
+    HTMLInputElement: class {}, HTMLFormElement: class {}, HTMLSelectElement: class {}, HTMLDetailsElement: class {}, Element: class {},
+    fetch: () => new Promise(() => {}),
+    window: {
+      location: { search: "?mode=topology", pathname: "/sas-fabric", href: "http://example.test/sas-fabric", origin: "http://example.test" },
+      history: { replaceState() {} },
+      requestAnimationFrame(callback) { callback(); },
+      scrollX: 0,
+      scrollY: 0,
+      innerHeight: 900,
+      SAS_FABRIC_BOOTSTRAP: { snapshot, fabric },
+      SasFabricTopology: T,
+    },
+    document: sharedDocument,
+  });
+  vm.runInContext(source.replace(/\}\)\(\);\s*$/, "  window.__page = { state, render };\n})();"), sandbox);
+  const click = (mode) => buttons.find((button) => button.dataset.fabricMode === mode).handlers.get("click")();
+  return { page: sandbox.window.__page, elements, click };
+}
+
+test("leaving Topology through the mode buttons clears its pin, trace and search, also with no payload", () => {
+  for (const variant of ["unavailable", "absent"]) {
+    const dom = fakeDom();
+    const T = H.loadTopology({ document: dom.document });
+    const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+    const { page, elements, click } = loadFullPage(T, dom.document, fabric, cases.core_cascade.snapshot);
+    const panel = elements.get("fabric-map-panel");
+    const search = elements.get("fabric-topology-search");
+    page.state.mode = "topology";
+    page.render();
+    const bundle = [...T.buildTopologyModel(fabric).links].find((item) => item.bundle);
+    panel.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
+    assert.ok(T.inspectorDetail(), `${variant}: the bundle is pinned`);
+    search.value = "bay 3";
+    search.handlers.get("input")();
+    panel.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
+    // The payload goes away, the operator leaves Topology and comes back.
+    if (variant === "unavailable") page.state.fabric = { ...fabric, available: false };
+    else page.state.fabric = null;
+    click("lanes");
+    click("topology");
+    page.state.fabric = fabric;
+    page.render();
+    assert.equal(T.inspectorDetail(), null, `${variant}: no pin comes back`);
+    assert.equal(T.view().pin, null, variant);
+    assert.equal(T.view().query, "", variant);
+    assert.equal(search.value, "", variant);
+    assert.doesNotMatch(panel.innerHTML, /is-on-path|is-pinned/, variant);
+  }
 });

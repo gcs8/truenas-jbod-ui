@@ -25,6 +25,8 @@
   const NOT_SHOWN = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
     + "Backplane zones, the CORE multipath groupings (shown instead as path marks on each bay) "
     + "and PHY error counters (Disk Path) are not drawn either.";
+  const NOT_SHOWN_STORAGE = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
+    + "Backplane zones are not drawn either.";
   const LOCATION_UNKNOWN = "physical location unavailable";
   // A bay group larger than this is drawn as a summary block until expanded.
   const BAY_DETAIL_LIMIT = 96;
@@ -102,6 +104,12 @@
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
+  // A table keyed by text from the payload answers for its own keys only, so
+  // a word such as "__proto__" or "constructor" is just an unknown word.
+  function own(table, key) {
+    return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+  }
+
   function escapeHtml(value) {
     return String(value ?? "")
       .replace(/&/g, "&amp;")
@@ -142,11 +150,31 @@
     return values.length > NAME_LIMIT ? `${shown} and ${values.length - NAME_LIMIT} more` : shown;
   }
 
-  function fabricKind(fabric) {
-    if (typeof fabric?.raw?.fabric_kind === "string" && fabric.raw.fabric_kind) {
-      return fabric.raw.fabric_kind;
+  // The fabric kinds the producers emit. The real CORE builder names none and
+  // says platform "core"; the synthetic demo names core_mpr.
+  const CORE_KINDS = new Set(["core_mpr"]);
+  const STORAGE_KINDS = new Set(["linux_ses", "storage_scale", "storage_linux", "storage_quantastor", "storage_esxi", "storage_bmc", "storage_generic"]);
+
+  // { kind, contract: "core" | "storage" | "unknown", notice }. Only an exact
+  // supported kind is recognised; an unknown or conflicting one makes no
+  // claim about what was or was not collected.
+  function fabricContract(fabric) {
+    const named = typeof fabric?.raw?.fabric_kind === "string" ? fabric.raw.fabric_kind : "";
+    const platform = typeof fabric?.platform === "string" ? fabric.platform : "";
+    const noClaim = "it draws the records the payload carries and makes no claim about what was or was not collected";
+    if (!named) {
+      if (platform === "core") return { kind: "core_sas", contract: "core", notice: "" };
+      return { kind: "unknown", contract: "unknown", notice: `The payload names no fabric kind${platform ? ` (platform "${platform}")` : ""}: ${noClaim}.` };
     }
-    return fabric?.platform === "core" ? "core_sas" : "unknown";
+    const core = CORE_KINDS.has(named);
+    const storage = STORAGE_KINDS.has(named);
+    if (!core && !storage) {
+      return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" is not one this view knows: ${noClaim}.` };
+    }
+    if (platform && (platform === "core") !== core) {
+      return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" does not match platform "${platform}": ${noClaim}.` };
+    }
+    return { kind: named, contract: core ? "core" : "storage", notice: "" };
   }
 
   // complete | partial | not_read, or unknown when the payload does not say.
@@ -267,20 +295,21 @@
 
   // ---- tiers and nodes -------------------------------------------------------
 
-  function tierForNode(item, core) {
+  // mode: "core", "storage" or "unknown" (fabricContract).
+  function tierForNode(item, mode) {
     const kind = String(item.kind || "");
     if (kind === "host") return "host";
     if (kind === "controller") return "controllers";
-    if (kind === "expander") return core ? "expanders" : null;
-    if (kind === "path") return core ? null : "devices";
+    if (kind === "expander") return mode === "storage" ? null : "expanders";
+    if (kind === "path") return mode === "core" ? null : "devices";
     if (kind === "bay") return "bays";
     if (kind.endsWith("enclosure")) return "enclosures";
     return null;
   }
 
   // Kinds the view leaves out on purpose; anything else it cannot draw is named.
-  function hiddenByDesign(item, core) {
-    return HIDDEN_KINDS.has(String(item.kind || "")) || (core && item.kind === "path");
+  function hiddenByDesign(item, mode) {
+    return HIDDEN_KINDS.has(String(item.kind || "")) || (mode === "core" && item.kind === "path");
   }
 
   function expanderLevel(item) {
@@ -306,12 +335,13 @@
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const raw = isRecord(item.raw) ? item.raw : {};
     const ses = kind === "linux_ses" || raw.source === "linux_ses" || raw.fabric_kind === "linux_ses" || Boolean(metrics.ses_device);
-    const caption = ses ? "SES device" : PATH_CAPTIONS[metrics.path_type] || "storage path";
+    const caption = ses ? "SES device" : own(PATH_CAPTIONS, metrics.path_type) || "storage path";
     if (!item.status) return caption;
     return metrics.state_basis === MEMBER_HEALTH ? `${caption} · member health ${item.status}` : `${caption} · ${item.status}`;
   }
 
-  function nodeFacts(item, core, kind) {
+  function nodeFacts(item, mode, kind) {
+    const core = mode === "core";
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const notRead = new Set(list(metrics.not_read));
     const facts = [];
@@ -326,8 +356,10 @@
           const linked = decimal(metrics.linked_phy_count);
           facts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
         }
-      } else {
+      } else if (mode === "storage") {
         facts.push("storage source, not an HBA");
+      } else {
+        facts.push("controller or source");
       }
     } else if (item.kind === "expander") {
       const level = expanderLevel(item);
@@ -353,13 +385,23 @@
 
   function buildTopologyModel(fabric, options = {}) {
     const expanded = isRecord(options.expanded) ? options.expanded : {};
-    const kind = fabricKind(fabric);
-    // The CORE builder's payload may name its kind (core_mpr) or not; either way it is CORE.
-    const core = fabric?.platform === "core" || /^core_/.test(kind);
+    const contract = fabricContract(fabric);
+    const { kind } = contract;
+    const mode = contract.contract;
+    const core = mode === "core";
     const payload = readPayload(fabric);
-    const traces = new Map(payload.traces.map((trace) => [trace.id, trace]));
+    const skipped = {
+      unsupported: [], duplicateNodes: [], missingEnd: [], duplicateLinks: [], unjoined: [], duplicateTraces: [], unsupportedTraces: [], upward: [],
+    };
+    // Every trace record: the first of an id is read, a repeat is named, and a
+    // kind the view does not read is named.
+    const traces = new Map();
+    for (const trace of payload.traces) {
+      if (traces.has(trace.id)) skipped.duplicateTraces.push(trace.id);
+      else if (trace.kind === "bay" || trace.kind === "path") traces.set(trace.id, trace);
+      else skipped.unsupportedTraces.push(`${trace.kind || "no kind"}: ${trace.id}`);
+    }
     const inventory = inventoryBySlot(fabric, options.inventory);
-    const skipped = { unsupported: [], duplicateNodes: [], missingEnd: [], duplicateLinks: [], unjoined: [] };
 
     const nodes = [];
     const nodeById = new Map();
@@ -372,9 +414,9 @@
         continue;
       }
       payloadNodeIds.set(item.id, item);
-      const tier = tierForNode(item, core);
+      const tier = tierForNode(item, mode);
       if (!tier) {
-        if (!hiddenByDesign(item, core)) skipped.unsupported.push(`${item.kind || "no kind"}: ${item.id}`);
+        if (!hiddenByDesign(item, mode)) skipped.unsupported.push(`${item.kind || "no kind"}: ${item.id}`);
         continue;
       }
       if (tier === "bays") {
@@ -389,7 +431,7 @@
         rawId: item.raw_id || "",
         status: item.status || "",
         level: item.kind === "expander" ? expanderLevel(item) : null,
-        facts: nodeFacts(item, core, kind),
+        facts: nodeFacts(item, mode, kind),
         phyGroups: [],
         parentUnknown: false,
         x: 0,
@@ -408,6 +450,7 @@
     const links = [];
     const linkById = new Map();
     const bayLinks = [];
+    const pathBayLinks = [];
     const seenLinks = new Set();
     for (const item of payload.links) {
       if (seenLinks.has(item.id)) {
@@ -423,13 +466,14 @@
       }
       const source = nodeById.get(item.source);
       const target = nodeById.get(item.target);
-      const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, core) && !hiddenByDesign(end, core));
+      if (item.kind === "path-bay") pathBayLinks.push(item);
+      const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, mode) && !hiddenByDesign(end, mode));
       if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices"))) {
         bayLinks.push(item);
         continue;
       }
       if (!source || !target || item.source === item.target) {
-        const hiddenEnd = [sourceItem, targetItem].some((end) => hiddenByDesign(end, core) || (end.kind === "bay" && !source));
+        const hiddenEnd = [sourceItem, targetItem].some((end) => hiddenByDesign(end, mode) || (end.kind === "bay" && !source));
         if (!hiddenEnd && !unsupportedEnd) skipped.unjoined.push(item.id);
         continue;
       }
@@ -498,9 +542,10 @@
       if (!bayLinkIds.has(key)) bayLinkIds.set(key, []);
       bayLinkIds.get(key).push(item.id);
     }
+    // Path states from path-bay links, only from links admitted above (one per
+    // id, both ends present), for bays whose trace carries none.
     const pathStatesByBay = new Map();
-    for (const item of payload.links) {
-      if (item.kind !== "path-bay") continue;
+    for (const item of pathBayLinks) {
       const controller = String(item.source || "").split(":")[1] || "";
       if (!pathStatesByBay.has(item.target)) pathStatesByBay.set(item.target, []);
       pathStatesByBay.get(item.target).push({ controller, state: String(item.status || "unknown"), basis: "" });
@@ -510,7 +555,8 @@
     const bays = [];
     for (const item of bayRows) {
       if (payloadNodeIds.get(item.id) !== item) continue;
-      const trace = traces.get(item.id);
+      const found = traces.get(item.id);
+      const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
       const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
         controller: String(state.controller_label || state.controller || ""),
@@ -521,10 +567,15 @@
       const slot = Number.isInteger(item.slot) ? item.slot : null;
       const inventorySlot = slot === null ? null : inventory.get(slot);
       const located = locationKnown(metrics, item.raw, trace?.metrics, inventorySlot, inventorySlot?.raw_status);
+      // The bay number is the one the producer labelled it with ("Bay 01" for
+      // slot 0 where the chassis counts from 1), never the internal index.
+      const labelled = /^Bay\s+(\d+)$/.exec(String(item.label || ""));
+      const inventoryLabel = String(inventorySlot?.slot_label ?? "");
       const bay = {
         bayId: item.id,
         traceId: trace ? trace.id : "",
         slot,
+        number: labelled ? labelled[1] : /^\d+$/.test(inventoryLabel) ? inventoryLabel : "",
         label: nodeLabel(item),
         locationKnown: located,
         status: item.status || "",
@@ -549,16 +600,18 @@
     for (const raw of groupsByKey.values()) {
       raw.bays.sort((left, right) => (left.slot ?? Infinity) - (right.slot ?? Infinity) || naturalCompare(left.label, right.label));
       const expandKey = `topology:${raw.id}`;
-      const collapsed = raw.bays.length > BAY_DETAIL_LIMIT && !expanded[expandKey];
-      const summary = { bays: raw.bays.length, withDisk: 0, empty: 0, unknown: 0, pathStates: {} };
+      const collapsed = raw.bays.length > BAY_DETAIL_LIMIT && !own(expanded, expandKey);
+      // Path state counts per controller, keyed by payload text: Maps.
+      const summary = { bays: raw.bays.length, withDisk: 0, empty: 0, unknown: 0, pathStates: new Map() };
       for (const bay of raw.bays) {
         if (bay.occupancy === "yes") summary.withDisk += 1;
         else if (bay.occupancy === "no") summary.empty += 1;
         else summary.unknown += 1;
         for (const state of bay.pathStates) {
           const name = state.controller || "path";
-          summary.pathStates[name] = summary.pathStates[name] || {};
-          summary.pathStates[name][state.state] = (summary.pathStates[name][state.state] || 0) + 1;
+          if (!summary.pathStates.has(name)) summary.pathStates.set(name, new Map());
+          const counts = summary.pathStates.get(name);
+          counts.set(state.state, (counts.get(state.state) || 0) + 1);
         }
       }
       // A disk without a physical location is drawn with its own label, so
@@ -651,6 +704,21 @@
       const enclosures = tierNodes("enclosures");
       const enclosureStatus = countTier(fabric, "enclosures", enclosures.length, { one: "enclosure", many: "enclosures", none: "no enclosures reported (read complete)" });
       tiers.push({ id: "enclosures", label: "Enclosures", ...enclosureStatus, nodeIds: enclosures.map((entry) => entry.id) });
+    } else if (mode === "unknown") {
+      // No contract: draw the rows the payload has, say nothing about the rest.
+      const rowOf = (id, label, members) => {
+        if (members.length) tiers.push({ id, label, state: "drawn", note: plural(members.length, "item"), nodeIds: members.map((entry) => entry.id) });
+      };
+      rowOf("controllers", "Controllers or sources", controllers);
+      const expanders = tierNodes("expanders");
+      const levels = [...new Set(expanders.map((entry) => entry.level))].sort((left, right) => (left ?? Infinity) - (right ?? Infinity));
+      for (const level of levels) {
+        const members = expanders.filter((entry) => entry.level === level);
+        rowOf(`expanders:${level ?? "unknown"}`, level === null ? "Expanders, level not reported" : `Expanders, level ${level}`, members);
+        for (const entry of members) entry.tier = `expanders:${level ?? "unknown"}`;
+      }
+      rowOf("devices", "Storage paths", tierNodes("devices"));
+      rowOf("enclosures", "Enclosures", tierNodes("enclosures"));
     } else {
       tiers.push({
         id: "controllers",
@@ -720,12 +788,14 @@
       incoming,
       outgoing,
       parts: modelParts(fabric, core),
+      contract: mode,
       notices: [],
       counts: { bayNodes: bayRows.length, baysPlaced: groups.reduce((total, group) => total + group.bayIds.length, 0) },
       scope: isRecord(fabric) ? `${fabric.system_id ?? ""}\u0000${fabric.selected_enclosure_id ?? ""}` : "",
       width: 0,
       height: 0,
     };
+    if (contract.notice) model.notices.push(contract.notice);
     if (payload.problems.length) {
       model.notices.push(`Payload not readable: ${payload.problems.join("; ")}. What could not be read is not drawn.`);
     }
@@ -734,8 +804,10 @@
     if (skipped.missingEnd.length) notDrawn.push(`${plural(skipped.missingEnd.length, "link")} with an end the payload does not carry (${named(skipped.missingEnd)})`);
     if (skipped.unjoined.length) notDrawn.push(`${plural(skipped.unjoined.length, "link")} between items this view does not join (${named(skipped.unjoined)})`);
     if (skipped.duplicateNodes.length) notDrawn.push(`${plural(skipped.duplicateNodes.length, "duplicate node id")} (${named(skipped.duplicateNodes)})`);
-    const orphanTraces = payload.traces.filter((trace) => trace.kind === "bay" && !payloadNodeIds.has(trace.id)).map((trace) => trace.id);
+    const orphanTraces = [...traces.values()].filter((trace) => trace.kind === "bay" && !payloadNodeIds.has(trace.id)).map((trace) => trace.id);
     if (orphanTraces.length) notDrawn.push(`${plural(orphanTraces.length, "bay trace")} without a bay node (${named(orphanTraces)})`);
+    if (skipped.duplicateTraces.length) notDrawn.push(`${plural(skipped.duplicateTraces.length, "duplicate trace id")} (${named(skipped.duplicateTraces)})`);
+    if (skipped.unsupportedTraces.length) notDrawn.push(`${plural(skipped.unsupportedTraces.length, "trace")} of a kind this view does not draw (${named(skipped.unsupportedTraces)})`);
     if (skipped.duplicateLinks.length) notDrawn.push(`${plural(skipped.duplicateLinks.length, "duplicate link id")} (${named(skipped.duplicateLinks)})`);
     if (model.counts.bayNodes !== model.counts.baysPlaced) {
       notDrawn.push(`${plural(model.counts.bayNodes, "bay row")} in the payload, ${plural(model.counts.baysPlaced, "bay")} drawn`);
@@ -1376,7 +1448,7 @@
       const group = model.groupByBay.get(bay.bayId);
       let hit = false;
       if (bayNumber) {
-        hit = bay.locationKnown && bay.slot !== null && bay.slot === Number(bayNumber[1]);
+        hit = bay.locationKnown && bay.number !== "" && Number(bay.number) === Number(bayNumber[1]);
       } else {
         hit = bay.label.toLowerCase().includes(text) || bay.terms.some((value) => value.includes(text));
       }
@@ -1420,7 +1492,7 @@
     "is-bundle": ["line", "bay bundle: the count of enclosure-to-bay links it carries"],
     "is-on-path": ["line", "traced path (hover, focus, search or pin)"],
     "mark-parent-unknown": ["mark", "parent link not reported"],
-    "mark-not-read": ["mark", "not read: the tier was not collected or could not be read"],
+    "mark-not-read": ["mark", "dashed band: not read (not collected, or the read failed), or read, but its completeness not reported"],
     "bay-yes": ["bay", "bay with a disk"],
     "bay-no": ["bay", "empty bay"],
     "bay-unknown": ["bay", "occupancy not read"],
@@ -1436,10 +1508,11 @@
     "path-more": ["text", "+N: more paths than the cell can draw; the cell's name lists every path"],
   };
 
+  // The basis is read before the word: member health is never a transport
+  // or SES state, whatever word it uses.
   function pathTone(state, basis = "") {
-    const tone = PATH_STATE_TONES[String(state || "").toLowerCase()];
-    if (tone) return tone;
-    return basis === MEMBER_HEALTH ? "member" : "other";
+    if (basis === MEMBER_HEALTH) return "member";
+    return own(PATH_STATE_TONES, String(state || "").toLowerCase()) || "other";
   }
 
   function markShape(tone, cx, cy, state) {
@@ -1516,7 +1589,7 @@
   function bayTitle(bay) {
     const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
-      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.state}`).join(", ")}`
+      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}`).join(", ")}`
       : "no path state in payload";
     return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
   }
@@ -1546,15 +1619,15 @@
       count = `<text class="topo-path-more" x="${bay.x + bay.w - 2}" y="${markY + 4}" text-anchor="end">+${more}</text>`;
     }
     const title = bayTitle(bay);
-    const shownLabel = bay.locationKnown ? (bay.slot === null ? "" : String(bay.slot)) : bay.label;
+    const shownLabel = bay.locationKnown ? bay.number : bay.label;
     const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
     return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number}${marks}${count}</g>`;
   }
 
   function pathSummary(summary) {
-    return Object.entries(summary.pathStates)
+    return [...summary.pathStates.entries()]
       .sort(([left], [right]) => naturalCompare(left, right))
-      .map(([name, states]) => `${name}: ${Object.entries(states).map(([state, count]) => `${count} ${state}`).join(", ")}`)
+      .map(([name, states]) => `${name}: ${[...states.entries()].map(([state, count]) => `${count} ${state}`).join(", ")}`)
       .join(" · ");
   }
 
@@ -1564,8 +1637,8 @@
     }
     const count = plural(group.bayIds.length, "bay");
     if (!group.enclosureIds.length) return `No enclosure link · ${count}`;
-    const slots = group.bays.map((bay) => bay.slot).filter((slot) => slot !== null);
-    const range = slots.length ? `Bays ${Math.min(...slots)}–${Math.max(...slots)}` : "Bays";
+    const numbers = group.bays.map((bay) => bay.number).filter(Boolean).sort((left, right) => Number(left) - Number(right));
+    const range = numbers.length ? `Bays ${numbers[0]}–${numbers[numbers.length - 1]}` : "Bays";
     return `${range} · ${count}`;
   }
 
@@ -1641,6 +1714,28 @@
     return group ? groupHeading(group) : "";
   }
 
+  // Legend words for what this payload has: bays, disks without a physical
+  // location, or both.
+  function legendText(model, style, text) {
+    const located = model.bays.some((bay) => bay.locationKnown);
+    const logical = model.bays.some((bay) => !bay.locationKnown);
+    if (!logical) return text;
+    const words = located
+      ? { "is-bundle": "bundle: the count of links to bays or disks it carries", "bay-yes": "bay with a disk, or a disk", "bay-no": "empty bay" }
+      : { "is-bundle": "disk bundle: the count of links to disks it carries", "bay-yes": "disk present", "bay-no": "no disk" };
+    return own(words, style) || text;
+  }
+
+  // The search row's label and placeholder for what this payload has.
+  function searchHelp(model) {
+    const located = Boolean(model?.bays.some((bay) => bay.locationKnown));
+    const expanders = Boolean(model?.nodes.some((entry) => entry.kind === "expander"));
+    const things = [located ? "bay" : "", "disk", expanders ? "expander" : ""].filter(Boolean);
+    const label = `Find a ${things.length > 1 ? `${things.slice(0, -1).join(", ")} or ${things[things.length - 1]}` : things[0]}`;
+    const placeholder = located ? "Bay number, disk name, serial or SAS address" : "Disk name, serial or SAS address";
+    return { label, placeholder };
+  }
+
   function legendSwatch(style, shape) {
     if (shape === "shape") {
       const tone = style.replace(/^path-/, "");
@@ -1678,10 +1773,11 @@
     const svg = `<svg class="fabric-topology-svg${view.fit ? " is-fitted" : ""}" role="group" aria-label="${escapeHtml(svgLabel)}" width="${shownW}" height="${shownH}" viewBox="0 0 ${fullW} ${fullH}">`
       + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
     const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${token(part.state)}"${part.title ? ` title="${escapeHtml(part.title)}"` : ""}>${escapeHtml(part.label)}: ${escapeHtml(part.state)}</span>`).join("");
-    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><span class="fabric-topology-swatch swatch-line chain-${index}" aria-hidden="true"></span>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this HBA down`)}</span>`).join("");
+    const source = model.core ? "HBA" : model.contract === "storage" ? "source" : "controller or source";
+    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><span class="fabric-topology-swatch swatch-line chain-${index}" aria-hidden="true"></span>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this ${source} down`)}</span>`).join("");
     const legend = chains + Object.entries(LEGEND)
       .filter(([style]) => used.has(style))
-      .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(text)}</span>`)
+      .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(legendText(model, style, text))}</span>`)
       .join("");
     const fitControl = `<button class="button secondary small fabric-topology-fit" type="button" data-topology-fit="${view.fit ? "actual" : "fit"}" aria-pressed="${view.fit ? "true" : "false"}">${view.fit ? "Actual size" : "Fit"}</button>`;
     const smallest = 12 * scale;
@@ -1697,7 +1793,7 @@
       + `<div class="fabric-topology-bar">${fitControl}<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p></div>`
       + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
-      + `<p class="fabric-topology-not-shown subtle">${escapeHtml(NOT_SHOWN)}</p>`
+      + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
   }
 
@@ -1714,7 +1810,7 @@
       const unit = group?.locationKnown ? "bay" : "disk";
       const names = carried.length <= 48
         ? carried.map((bay) => bay.label).join(", ")
-        : `${carried.length} ${unit}s, slots ${phyRanges(carried.map((bay) => bay.slot).filter((slot) => slot !== null).sort((a, b) => a - b))}`;
+        : `${carried.length} ${unit}s${group?.locationKnown ? `, numbers ${phyRanges(carried.map((bay) => Number(bay.number)).filter((number) => Number.isInteger(number) && number >= 0).sort((a, b) => a - b))}` : ""}`;
       return {
         title: `Selected ${unit} bundle`,
         html: `<div class="kv-grid">${row("Source enclosure", source ? `${source.label} (${source.id})` : link.source)}`
@@ -1790,6 +1886,12 @@
     if (!refExists(model, live.pin)) live.pin = null;
     live.hover = null;
     updateSearchStatus();
+    const help = searchHelp(model);
+    if (live.input) {
+      live.input.placeholder = help.placeholder;
+      const label = live.input.labels?.[0];
+      if (label) label.textContent = help.label;
+    }
     return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
   }
 
@@ -1958,6 +2060,7 @@
     searchTopology,
     renderTopology,
     pathTone,
+    searchHelp,
     linkDetail,
     render,
     mount,

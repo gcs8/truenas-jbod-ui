@@ -186,7 +186,33 @@ def _ses_case() -> tuple[SystemConfig, InventorySnapshot, dict[str, str]]:
     return SystemConfig(id="synthetic-scale", label="Synthetic SCALE", truenas=TrueNASConfig(platform="scale")), snapshot, {}
 
 
-CASES = {"core_cascade": _core_case, "linux_virtual": _virtual_case, "scale_ses": _ses_case}
+def _health_case() -> tuple[SystemConfig, InventorySnapshot, dict[str, str]]:
+    """Linux block disks whose path state is member health: a faulted disk,
+    an unmapped logical disk and an optimal one, in a profile that labels
+    slot 0 "01"."""
+
+    slots = [
+        SlotView(
+            slot=0, slot_label="01", row_index=0, column_index=0, present=True, state=SlotState.fault,
+            device_name="sda", serial="SANITIZED-HEALTH-0",
+        ),
+        SlotView(
+            slot=1, slot_label="02", row_index=0, column_index=1, present=True, state=SlotState.unmapped,
+            device_name="sdb", serial="SANITIZED-HEALTH-1", physical_location_known=False,
+            raw_status={"virtual_enclosure": True},
+        ),
+        SlotView(
+            slot=2, slot_label="03", row_index=0, column_index=2, present=True, state=SlotState.healthy,
+            health="OPTIMAL", device_name="sdc", serial="SANITIZED-HEALTH-2",
+        ),
+    ]
+    snapshot = InventorySnapshot(
+        slots=slots, refresh_interval_seconds=30, last_updated=SNAPSHOT_TIME, selected_system_id="synthetic-health",
+    )
+    return SystemConfig(id="synthetic-health", label="Synthetic health", truenas=TrueNASConfig(platform="linux")), snapshot, {}
+
+
+CASES = {"core_cascade": _core_case, "linux_virtual": _virtual_case, "scale_ses": _ses_case, "linux_health": _health_case}
 
 
 def _case_payload(build) -> dict:
