@@ -35,7 +35,7 @@ function points(html, linkId) {
   return match[1].split(" ").map((pair) => pair.split(",").map(Number));
 }
 
-// ---- T01: decimal strings from the real producer --------------------------
+// ---- decimal strings from the real producer --------------------------
 
 test("levels and PHY counts the producer sends as decimal strings draw the cascade top to bottom", () => {
   const T = H.loadTopology();
@@ -64,7 +64,7 @@ test("levels and PHY counts the producer sends as decimal strings draw the casca
   }
 });
 
-// ---- T02: a logical inventory is not a bay ---------------------------------
+// ---- a logical inventory is not a bay ---------------------------------
 
 test("disks without a physical location are never called bays or numbered as bays", () => {
   const T = H.loadTopology();
@@ -95,7 +95,7 @@ test("disks without a physical location are never called bays or numbered as bay
   assert.deepEqual(cellsOf(core).get("bay:3").text, ["3"]);
 });
 
-// ---- T04: canonical path states, two marks per dual-path bay --------------
+// ---- canonical path states, two marks per dual-path bay --------------
 
 test("the producer's canonical path states each get their own mark, two independent marks per bay", () => {
   const T = H.loadTopology();
@@ -121,7 +121,7 @@ test("the producer's canonical path states each get their own mark, two independ
   });
 });
 
-// ---- T05: missing evidence is unknown; malformed payloads say so ----------
+// ---- missing evidence is unknown; malformed payloads say so ----------
 
 test("missing completeness or cache evidence is unknown, never a complete read or ok", () => {
   const T = H.loadTopology();
@@ -175,7 +175,7 @@ test("wrong collection types and null members give a payload-not-readable notice
   assert.match([...T.buildTopologyModel(variants["null trace"]).notices].join(" "), /2 trace entries/);
 });
 
-// ---- T06: search finds what its label promises -----------------------------
+// ---- search finds what its label promises -----------------------------
 
 test("search finds a disk by serial from the inventory and by the SAS address the fabric carries", () => {
   const T = H.loadTopology();
@@ -195,7 +195,7 @@ test("search finds a disk by serial from the inventory and by the SAS address th
   assert.deepEqual([...T.searchTopology(ses, "SANITIZED-SES-2").matches].map((item) => item.id), ["bay:2"]);
 });
 
-// ---- T07, T09: one pin and search per scope; bundle facts ------------------
+// ---- one pin and search per scope; bundle facts ------------------
 
 function fakeDom() {
   const handlers = new Map();
@@ -282,7 +282,7 @@ test("a pinned bay bundle fills the inspector with its source enclosure, bay cou
   assert.equal(T.inspectorDetail(), null);
 });
 
-// ---- T10: every input record is accounted for ------------------------------
+// ---- every input record is accounted for ------------------------------
 
 test("unsupported kinds, links with a missing end and duplicate ids are counted and named on the page", () => {
   const T = H.loadTopology();
@@ -327,7 +327,7 @@ test("a bay with more paths than its cell can draw shows the count of the rest, 
   assert.deepEqual(cells.get("bay:1").more, [], "no count when every path is drawn");
 });
 
-// ---- T11: a path node is captioned from what the payload says it is --------
+// ---- a path node is captioned from what the payload says it is --------
 
 test("path nodes are captioned from the fabric kind and path type, SES only where the payload says SES", () => {
   const T = H.loadTopology();
