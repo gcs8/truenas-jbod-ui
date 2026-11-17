@@ -172,8 +172,8 @@ body.fabric-topology-mode .fabric-page-shell {
   gap: 6px 12px;
 }
 
-.fabric-topology-bar .fabric-topology-pin {
-  flex: 1 1 20rem;
+/* The trace line sits below the drawing, so its wrapping never moves it. */
+.fabric-topology .fabric-topology-pin {
   min-width: 0;
   margin: 0;
 }

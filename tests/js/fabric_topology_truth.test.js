@@ -1390,3 +1390,22 @@ test("a visible expand control stays at its place on the screen also next to the
   click({ "data-fabric-expand-slots": shelf.key });
   assert.deepEqual(origin(), [0, 0]);
 });
+
+test("the trace line sits below the drawing, so hover text that wraps cannot move a lane label from under the pointer", () => {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  T.attach(dom.container, dom.search, dom.status, {});
+  const fabric = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
+  const link = [...T.buildTopologyModel(fabric, { width: 322 }).links].find((item) => !item.bundle);
+  const unpinned = T.render(fabric, { width: 324 });
+  dom.handlers.get("click")({ target: dom.element({ topoLink: link.id }) });
+  assert.ok(T.inspectorDetail(), "the lane is pinned");
+  const pinned = T.render(fabric, { width: 324 });
+  for (const [name, html] of [["unpinned", unpinned], ["pinned", pinned]]) {
+    assert.equal((html.match(/data-topology-pin/g) || []).length, 1, `${name}: one trace line`);
+    const bar = /<div class="fabric-topology-bar">[\s\S]*?<\/div>/.exec(html)[0];
+    assert.doesNotMatch(bar, /data-topology-pin/, `${name}: not in the bar above the drawing`);
+    assert.ok(html.indexOf("data-topology-pin") > html.indexOf("fabric-topology-scroll"), `${name}: after the drawing's scroll box`);
+  }
+  assert.match(pinned, /data-topology-pin>Pinned: /);
+});

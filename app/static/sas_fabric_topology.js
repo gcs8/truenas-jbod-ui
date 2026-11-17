@@ -2241,9 +2241,12 @@
       + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
       + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
       + notices
-      + `<div class="fabric-topology-bar">${fitControl}${wide}<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p></div>`
+      + `<div class="fabric-topology-bar">${fitControl}${wide}</div>`
       + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
+      // Below the drawing: hover text that wraps to more lines never moves
+      // the drawing, and a label, from under the pointer.
+      + `<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
   }
