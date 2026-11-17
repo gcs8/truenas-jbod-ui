@@ -942,7 +942,8 @@ fragments. A pull request does not edit `CHANGELOG.md`. The rules:
   of one bullet as one inline paragraph: past tense, no leading `- `, no
   heading, no HTML comment, no raw HTML (`<` followed by a letter, `/`, `!`
   or `?`, in backticks too; write a placeholder as `NAME` or `{name}` and
-  describe a tag in words), no link reference definition, at most 4096 bytes,
+  describe a tag in words), no link reference definition, no control or
+  formatting character such as a tab, at most 4096 bytes,
   wrapped at about 80 columns. `changelog.d/README.md` has the format and two
   examples. A pull request may add more than one fragment (for example `fixed`
   and `upgrade`).
@@ -1033,7 +1034,8 @@ Three scripts enforce this:
   at least one valid fragment named for this pull request, and a `breaking`
   or `upgrade` fragment when `breaking` is set. An invalid fragment (bad name,
   unknown section, empty, longer than 4096 bytes, a heading, an HTML comment,
-  raw HTML, a link reference definition, a `#N` inside parentheses) fails with
+  raw HTML, a link reference definition, a control or formatting character, a
+  `#N` inside parentheses) fails with
   the file and the reason. An edit to `CHANGELOG.md` alone does not count;
   the failure names the fragment to add. The one exception is a release cut: a
   pull request that introduces the first release heading and adds a bullet
