@@ -364,6 +364,11 @@
       "covers": ["[data-fabric-breadcrumb]", "[data-fabric-trace-home]"]
     },
     {
+      "id": "fabric.topology", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-topology"}, {"wait": 1000}],
+      "covers": ["#fabric-mode-topology", "#fabric-topology-search", "[data-fabric-topology-link]"]
+    },
+    {
       "id": "fabric.disk", "page": "fabric", "safety": "read", "ci": true,
       "steps": [{"click": "#fabric-mode-disk"}, {"wait": 1000}],
       "covers": ["#fabric-mode-disk"]
