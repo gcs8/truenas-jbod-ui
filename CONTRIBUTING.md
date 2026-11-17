@@ -284,6 +284,22 @@ python -m unittest tests.test_history_service tests.test_perf tests.test_perf_ha
 python -m unittest tests.test_release_status tests.test_release_wrap_validator -v
 ```
 
+#### Source-shape checks
+
+`tests.test_source_shape` holds two lists that only move down:
+
+- `SIZE_CEILINGS`: no `.py`, `.js`, `.css` or `.html` file under `app`,
+  `admin_service`, `history_service`, `scripts`, `tests` or `qa` may exceed
+  3,000 lines, except the listed files, each held to its own ceiling.
+- `CROSS_PACKAGE_IMPORTS`: per pair of packages among `app`, `admin_service`
+  and `history_service`, the files that import the other package today.
+
+When a file goes over its limit, move code into a new module. When an import
+crosses packages, keep the code inside its own package. Raising a ceiling or
+recording a new import is a maintainer decision made in the diff. When the
+test says an entry is stale (the file shrank, was removed, or no longer
+imports the other package), lower or remove that entry as the message says.
+
 If browser QA dependencies are needed:
 
 ```bash

@@ -180,6 +180,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_ses_unknown_occupancy_consumers",
         "test_ses_unknown_presence",
         "test_ses_zero_address_identity",
+        "test_source_shape",
         "test_unittest_identities",
         "test_unittest_shards",
         "test_upgrade_notice",
