@@ -41,7 +41,7 @@ TOKEN = "synthetic-token"
 class Row:
     label: str
     expected: str
-    host: tuple[str, ...] = ("192.0.2.10:8080",)
+    host_headers: tuple[str, ...] = ("192.0.2.10:8080",)
     origin: tuple[str, ...] = ()
     referer: tuple[str, ...] = ()
     scheme: str = "http"
@@ -54,7 +54,7 @@ class Row:
 
 def build_request(row: Row, *, app: object | None = None, authorization: str | None = None) -> Request:
     headers: list[tuple[bytes, bytes]] = [(b"content-type", b"application/json")]
-    headers.extend((b"host", value.encode("latin-1")) for value in row.host)
+    headers.extend((b"host", value.encode("latin-1")) for value in row.host_headers)
     headers.extend((b"origin", value.encode("latin-1")) for value in row.origin)
     headers.extend((b"referer", value.encode("latin-1")) for value in row.referer)
     headers.extend(row.extra)
@@ -86,8 +86,8 @@ def basic_header() -> str:
 # no part, so an unlisted or malformed Host behind a proxy is irrelevant.
 CONFIGURED_ROWS = (
     Row("configured: no origin headers", ALLOW),
-    Row("configured: no origin headers, unlisted proxy host", ALLOW, host=("backend.example.invalid:8000",)),
-    Row("configured: no origin headers, duplicate host", ALLOW, host=("192.0.2.10", "192.0.2.11")),
+    Row("configured: no origin headers, unlisted proxy host", ALLOW, host_headers=("backend.example.invalid:8000",)),
+    Row("configured: no origin headers, duplicate host", ALLOW, host_headers=("192.0.2.10", "192.0.2.11")),
     Row("configured: matching origin", ALLOW, origin=(PUBLIC_ORIGIN,)),
     Row("configured: matching origin with explicit default port", ALLOW, origin=("https://ui.example.invalid:443",)),
     Row("configured: matching origin in another case", ALLOW, origin=("HTTPS://UI.Example.Invalid",)),
@@ -97,13 +97,13 @@ CONFIGURED_ROWS = (
     Row(
         "configured: proxy host with matching origin",
         ALLOW,
-        host=("backend.example.invalid:8000",),
+        host_headers=("backend.example.invalid:8000",),
         origin=(PUBLIC_ORIGIN,),
     ),
     Row(
         "configured: proxy host with origin equal to that host",
         CROSS,
-        host=("backend.example.invalid:8000",),
+        host_headers=("backend.example.invalid:8000",),
         origin=("http://backend.example.invalid:8000",),
     ),
     Row("configured: other origin", CROSS, origin=("https://other.example.invalid",)),
@@ -142,23 +142,23 @@ FALLBACK_ROWS = (
         ALLOW,
         origin=("http://192.0.2.10:8080", "http://192.0.2.10:8080"),
     ),
-    Row("fallback: IPv4 host on default port, origin names the port", ALLOW, host=("192.0.2.10",), origin=("http://192.0.2.10:80",)),
+    Row("fallback: IPv4 host on default port, origin names the port", ALLOW, host_headers=("192.0.2.10",), origin=("http://192.0.2.10:80",)),
     Row(
         "fallback: IPv4 host on https default port",
         ALLOW,
-        host=("192.0.2.10",),
+        host_headers=("192.0.2.10",),
         origin=("https://192.0.2.10:443",),
         scheme="https",
     ),
-    Row("fallback: localhost host, matching origin", ALLOW, host=("localhost:8080",), origin=("http://localhost:8080",)),
-    Row("fallback: localhost in another case", ALLOW, host=("LocalHost:8080",), origin=("http://localhost:8080",)),
+    Row("fallback: localhost host, matching origin", ALLOW, host_headers=("localhost:8080",), origin=("http://localhost:8080",)),
+    Row("fallback: localhost in another case", ALLOW, host_headers=("LocalHost:8080",), origin=("http://localhost:8080",)),
     Row(
         "fallback: IPv6 host, matching origin",
         ALLOW,
-        host=("[2001:db8::1]:8080",),
+        host_headers=("[2001:db8::1]:8080",),
         origin=("http://[2001:db8::1]:8080",),
     ),
-    Row("fallback: IPv6 loopback, default port", ALLOW, host=("[::1]",), origin=("http://[::1]",)),
+    Row("fallback: IPv6 loopback, default port", ALLOW, host_headers=("[::1]",), origin=("http://[::1]",)),
     Row("fallback: IPv4 host, other origin", CROSS, origin=("http://192.0.2.11:8080",)),
     Row("fallback: IPv4 host, other port", CROSS, origin=("http://192.0.2.10:8081",)),
     Row("fallback: IPv4 host, other scheme", CROSS, origin=("https://192.0.2.10:8080",)),
@@ -175,59 +175,59 @@ FALLBACK_ROWS = (
         CROSS,
         origin=("http://192.0.2.10:8080", "http://other.example.invalid"),
     ),
-    Row("fallback: unlisted name, no origin headers", UNLISTED, host=("unlisted.example.invalid:8080",)),
+    Row("fallback: unlisted name, no origin headers", UNLISTED, host_headers=("unlisted.example.invalid:8080",)),
     Row(
         "fallback: unlisted name, origin agrees with host",
         UNLISTED,
-        host=("unlisted.example.invalid:8080",),
+        host_headers=("unlisted.example.invalid:8080",),
         origin=("http://unlisted.example.invalid:8080",),
     ),
     Row(
         "fallback: unlisted name, referer agrees with host",
         UNLISTED,
-        host=("unlisted.example.invalid:8080",),
+        host_headers=("unlisted.example.invalid:8080",),
         referer=("http://unlisted.example.invalid:8080/page",),
     ),
     Row(
         "fallback: unlisted name, other origin",
         UNLISTED,
-        host=("unlisted.example.invalid:8080",),
+        host_headers=("unlisted.example.invalid:8080",),
         origin=("http://192.0.2.10:8080",),
     ),
     Row(
         "fallback: name listed elsewhere is not listed here",
         UNLISTED,
-        host=(LISTED + ":8080",),
+        host_headers=(LISTED + ":8080",),
         origin=(f"http://{LISTED}:8080",),
     ),
-    Row("fallback: missing host, no origin headers", UNLISTED, host=()),
-    Row("fallback: missing host, origin", UNLISTED, host=(), origin=("http://192.0.2.1:8000",)),
+    Row("fallback: missing host, no origin headers", UNLISTED, host_headers=()),
+    Row("fallback: missing host, origin", UNLISTED, host_headers=(), origin=("http://192.0.2.1:8000",)),
     Row(
         "fallback: duplicate host, origin agrees with the first",
         UNLISTED,
-        host=("192.0.2.10:8080", "192.0.2.10:8080"),
+        host_headers=("192.0.2.10:8080", "192.0.2.10:8080"),
         origin=("http://192.0.2.10:8080",),
     ),
-    Row("fallback: duplicate host, no origin headers", UNLISTED, host=("192.0.2.10:8080", "192.0.2.11:8080")),
-    Row("fallback: empty host, origin", UNLISTED, host=("",), origin=("http://192.0.2.10:8080",)),
-    Row("fallback: host with space, origin", UNLISTED, host=("bad host.invalid",), origin=("http://bad host.invalid",)),
-    Row("fallback: host with port out of range", UNLISTED, host=("192.0.2.10:99999",), origin=("http://192.0.2.10",)),
+    Row("fallback: duplicate host, no origin headers", UNLISTED, host_headers=("192.0.2.10:8080", "192.0.2.11:8080")),
+    Row("fallback: empty host, origin", UNLISTED, host_headers=("",), origin=("http://192.0.2.10:8080",)),
+    Row("fallback: host with space, origin", UNLISTED, host_headers=("bad host.invalid",), origin=("http://bad host.invalid",)),
+    Row("fallback: host with port out of range", UNLISTED, host_headers=("192.0.2.10:99999",), origin=("http://192.0.2.10",)),
     Row(
         "fallback: host with userinfo",
         UNLISTED,
-        host=("user@192.0.2.10:8080",),
+        host_headers=("user@192.0.2.10:8080",),
         origin=("http://192.0.2.10:8080",),
     ),
     Row(
         "fallback: unbracketed IPv6 host",
         UNLISTED,
-        host=("2001:db8::1",),
+        host_headers=("2001:db8::1",),
         origin=("http://[2001:db8::1]",),
     ),
     Row(
         "fallback: host with path",
         UNLISTED,
-        host=("192.0.2.10:8080/x",),
+        host_headers=("192.0.2.10:8080/x",),
         origin=("http://192.0.2.10:8080",),
     ),
 )
@@ -236,42 +236,42 @@ FALLBACK_ROWS = (
 # allowed name. History has no list of extra names, so these rows apply to
 # main and admin only.
 LISTED_ROWS = (
-    Row("listed: listed name, matching origin", ALLOW, host=(LISTED + ":8080",), origin=(f"http://{LISTED}:8080",)),
-    Row("listed: listed name, no origin headers", ALLOW, host=(LISTED,)),
+    Row("listed: listed name, matching origin", ALLOW, host_headers=(LISTED + ":8080",), origin=(f"http://{LISTED}:8080",)),
+    Row("listed: listed name, no origin headers", ALLOW, host_headers=(LISTED,)),
     Row(
         "listed: listed name in another case",
         ALLOW,
-        host=("Listed.Example.Invalid:8080",),
+        host_headers=("Listed.Example.Invalid:8080",),
         origin=(f"http://{LISTED}:8080",),
     ),
-    Row("listed: listed name, other origin", CROSS, host=(LISTED + ":8080",), origin=("http://192.0.2.10:8080",)),
+    Row("listed: listed name, other origin", CROSS, host_headers=(LISTED + ":8080",), origin=("http://192.0.2.10:8080",)),
     Row(
         "listed: listed name, mismatching referer",
         CROSS,
-        host=(LISTED + ":8080",),
+        host_headers=(LISTED + ":8080",),
         origin=(f"http://{LISTED}:8080",),
         referer=("http://other.example.invalid/",),
     ),
     Row(
         "listed: unlisted name",
         UNLISTED,
-        host=("unlisted.example.invalid:8080",),
+        host_headers=("unlisted.example.invalid:8080",),
         origin=("http://unlisted.example.invalid:8080",),
     ),
-    Row("listed: subdomain of a listed name", UNLISTED, host=("sub." + LISTED,), origin=("http://sub." + LISTED,)),
+    Row("listed: subdomain of a listed name", UNLISTED, host_headers=("sub." + LISTED,), origin=("http://sub." + LISTED,)),
 )
 
 # Rows evaluated with no public origin and the Host fallback off (main basic
 # mode): no origin can be trusted, so only a request without one is accepted.
 NO_FALLBACK_ROWS = (
     Row("no fallback: no origin headers", ALLOW),
-    Row("no fallback: no origin headers, unlisted host", ALLOW, host=("unlisted.example.invalid",)),
+    Row("no fallback: no origin headers, unlisted host", ALLOW, host_headers=("unlisted.example.invalid",)),
     Row("no fallback: origin agrees with an IP host", CROSS, origin=("http://192.0.2.10:8080",)),
     Row("no fallback: referer agrees with an IP host", CROSS, referer=("http://192.0.2.10:8080/",)),
     Row(
         "no fallback: origin agrees with an unlisted host",
         CROSS,
-        host=("unlisted.example.invalid",),
+        host_headers=("unlisted.example.invalid",),
         origin=("http://unlisted.example.invalid",),
     ),
 )
@@ -507,7 +507,7 @@ class ServiceWrapperParityTests(unittest.TestCase):
                     self.assertEqual(history == ALLOW, main == ALLOW)
 
     def test_history_leaves_requests_without_origin_or_referer_to_its_refresh_authentication(self) -> None:
-        server_call = Row("server-side call", ALLOW, host=("history.example.invalid:8001",))
+        server_call = Row("server-side call", ALLOW, host_headers=("history.example.invalid:8001",))
         self.assertEqual(self.history_outcome(server_call, auth_mode="network", public_origin=None), ALLOW)
         self.assertEqual(self.history_outcome(server_call, auth_mode="token", public_origin=None), ALLOW)
         settings = HistorySettings(refresh_auth_mode="token", refresh_token=SecretStr(TOKEN))
@@ -522,10 +522,10 @@ class ServiceWrapperParityTests(unittest.TestCase):
         unlisted = Row(
             "unlisted",
             UNLISTED,
-            host=("unlisted.example.invalid:8081",),
+            host_headers=("unlisted.example.invalid:8081",),
             origin=("http://unlisted.example.invalid:8081",),
         )
-        known = Row("known", ALLOW, host=("127.0.0.1:8081",), origin=("http://127.0.0.1:8081",))
+        known = Row("known", ALLOW, host_headers=("127.0.0.1:8081",), origin=("http://127.0.0.1:8081",))
         for row, authorization, status in (
             (unlisted, None, 403),
             (unlisted, "Bearer wrong", 403),
