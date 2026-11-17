@@ -266,6 +266,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_atomic_write",
             "tests.test_backup_archive_lifecycle",
             "tests.test_backup_archive_transport",
+            "tests.test_changelog_gate_output",
             "tests.test_ci_contract",
             "tests.test_compose_runtime_matrix",
             "tests.test_container_contract",
