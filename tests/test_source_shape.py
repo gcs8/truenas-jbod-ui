@@ -50,7 +50,7 @@ SIZE_CEILINGS: dict[str, int] = {
 
     "history_service/store.py": 5500,
 
-    "history_service/system_backup.py": 8500,
+    "history_service/system_backup.py": 8000,
 
     "tests/test_admin_service.py": 6500,
 
