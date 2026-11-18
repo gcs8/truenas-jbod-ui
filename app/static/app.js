@@ -2343,20 +2343,39 @@
 
   // A count is a measurement only when its read was whole; the CORE payload
   // says which controller-side counts were not read (`raw.controller_read`).
-  // Same rule as fabricCountPhrase on the Storage Fabric page.
-  function sasFabricCountPhrase(fabric, domain, count, noun) {
+  // fabricCountState and the body of sasFabricCountPhrase are textual twins
+  // of fabricCountState and fabricCountPhrase on the Storage Fabric page
+  // (sas_fabric_view.js); tests/js/main_fabric_unreported_counts.test.js
+  // keeps them identical. A CORE count whose completeness is not reported
+  // says so instead of reading as a plain number.
+  function fabricCountState(fabric, domain) {
     const counts = fabric?.raw?.controller_read?.counts;
-    const value = counts && typeof counts === "object" ? counts[domain] : "complete";
-    const readState = value === "complete" || value === "partial" ? value : "not_read";
+    const core = fabric?.platform === "core" || fabric?.raw?.fabric_kind === "core_mpr";
+    if (!counts || typeof counts !== "object") return core ? "unknown" : "complete";
+    const value = counts[domain];
+    if (value === undefined || value === null) return "unknown";
+    return value === "complete" || value === "partial" ? value : "not_read";
+  }
+
+  function sasFabricCountPhrase(fabric, domain, count, noun) {
+    const readState = fabricCountState(fabric, domain);
     const plural = `${noun}s`;
     if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    if (readState === "unknown") return count > 0 ? `${count} ${count === 1 ? noun : plural}, completeness not reported` : `${plural} not reported`;
     return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
   }
 
-  // Unread controller data is not a report of no controllers.
+  // Unread controller data is not a report of no controllers, and neither is
+  // a CORE read that does not report whether its controller count is whole.
   function sasFabricNoControllerText(fabric, storagePayload) {
     if (storagePayload) {
       return { meta: "No storage sources reported", message: "No storage source rows are available yet." };
+    }
+    if (fabricCountState(fabric, "controllers") === "unknown") {
+      return {
+        meta: "HBA controllers not reported",
+        message: "Controller data did not say whether it was read whole. Check the SSH setup for this system in the admin console.",
+      };
     }
     if (sasFabricCountPhrase(fabric, "controllers", 0, "controller") !== "0 controllers") {
       return {

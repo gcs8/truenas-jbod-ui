@@ -114,7 +114,7 @@ function appFunctionSource(name) {
 
 function loadAppCountHelpers() {
   const sandbox = vm.createContext({});
-  const names = ["sasFabricList", "sasFabricCountPhrase", "sasFabricCountSummary", "sasFabricNoControllerText"];
+  const names = ["sasFabricList", "fabricCountState", "sasFabricCountPhrase", "sasFabricCountSummary", "sasFabricNoControllerText"];
   vm.runInContext(`${names.map(appFunctionSource).join("\n")}\nthis.helpers = { sasFabricCountSummary, sasFabricNoControllerText };`, sandbox);
   return sandbox.helpers;
 }
@@ -253,7 +253,11 @@ test("main page topology summary uses the same not-read rule", () => {
     message: "Controller data could not be read. Check the SSH setup for this system in the admin console.",
   });
   const { controller_read: _ignored, ...raw } = CASES.no_controller_bays.fabric.raw;
-  assert.equal(noController({ ...CASES.no_controller_bays.fabric, raw }, false).meta, "No HBA controllers reported");
+  // A CORE read that does not report its controller completeness is not a
+  // report of no controllers (same rule as the Storage Fabric page).
+  assert.equal(noController({ ...CASES.no_controller_bays.fabric, raw }, false).meta, "HBA controllers not reported");
+  const reportedZero = { ...raw, controller_read: { counts: { controllers: "complete" } } };
+  assert.equal(noController({ ...CASES.no_controller_bays.fabric, raw: reportedZero }, false).meta, "No HBA controllers reported");
   assert.equal(noController(CASES.no_controller_bays.fabric, true).meta, "No storage sources reported");
 });
 
