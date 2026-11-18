@@ -1804,12 +1804,20 @@
     return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
   }
 
-  // A disk is in a row only when the inventory says one is present and that
-  // presence was decided; unknown or empty occupancy is not a disk.
+  // The Storage Fabric page's reader of a row's occupancy: "present", "empty"
+  // or "unknown" (`presence_known: false` means nobody read the bay). Same
+  // rule as slotOccupancy in app.js.
+  function slotOccupancy(slot) {
+    if (!slot || slot.presence_known === false) return "unknown";
+    const flag = typeof slot.present === "boolean" ? slot.present : slot.occupied;
+    if (typeof flag !== "boolean") return "unknown";
+    return flag ? "present" : "empty";
+  }
+
+  // A disk is in a row only when the inventory says one is present; unknown
+  // or empty occupancy is not a disk.
   function slotHoldsDisk(slotNumber) {
-    const slot = slotByNumber(slotNumber);
-    return slot?.present === true && slot.presence_known !== false
-      && String(slot.state || "").toLowerCase() !== "empty";
+    return slotOccupancy(slotByNumber(slotNumber)) === "present";
   }
 
   // Inventory rows: bays when every row has a physical location (a bay is a
