@@ -123,6 +123,26 @@ test("partial controller read: unattached inventory bays are drawn beside the la
   assert.doesNotMatch(lane, /data-sas-fabric-slot=/);
 });
 
+test("partial controller read: a claimed bay stays in its lane and is drawn once", () => {
+  // The read controller claims bay 0; the inventory knows bays 0 and 1.
+  const fabric = structuredClone(CASES.unreadable_second_unit.fabric);
+  fabric.nodes.push(structuredClone(CASES.no_controller_mixed.fabric.nodes.find((node) => node.id === "bay:1")));
+  fabric.controllers[0].related_slots = [0];
+  fabric.nodes.find((node) => node.id === "controller:mpr0").related_slots = [0];
+  const slots = [structuredClone(CASES.unreadable_second_unit.slots[0]), structuredClone(CASES.no_controller_mixed.slots[1])];
+  const page = render(fabric, slots);
+  assert.deepEqual(inventorySlots(fabric), [0, 1]);
+  assert.deepEqual(page.chips, [0, 1], page.text);
+  const sections = page.html.split('<section class="sas-fabric-lane').slice(1);
+  assert.equal(sections.length, 2, page.text);
+  const chipsOf = (html) => [...html.matchAll(/data-sas-fabric-slot="(\d+)"/g)].map((match) => Number(match[1]));
+  assert.doesNotMatch(sections[0], /sas-fabric-inventory-lane/);
+  assert.deepEqual(chipsOf(sections[0]), [0], textOf(sections[0]));
+  assert.match(sections[1], /sas-fabric-inventory-lane/);
+  assert.deepEqual(chipsOf(sections[1]), [1], textOf(sections[1]));
+  assert.match(textOf(sections[1]), /Not attached to a read controller\. Some controller data was not read/);
+});
+
 test("controller read whose completeness was not reported keeps unattached bays drawn", () => {
   const { controller_read: _ignored, ...raw } = CASES.unreadable_second_unit.fabric.raw;
   const fabric = { ...CASES.unreadable_second_unit.fabric, raw };

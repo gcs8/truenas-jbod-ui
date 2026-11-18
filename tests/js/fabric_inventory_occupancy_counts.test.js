@@ -55,6 +55,9 @@ const OCCUPANCY = {
   present: { present: true, state: "healthy" },
   unknown: { present: false, presence_known: false, state: "unknown", device_name: null },
   empty: { present: false, state: "empty", device_name: null },
+  // Nobody read the bay, yet the row still carries a positive flag: only
+  // `presence_known: false` keeps it from being counted as a disk.
+  unread_flagged_present: { present: true, presence_known: false, state: "unknown" },
 };
 
 // Two inventory rows, the first one holding a disk. `located` marks both
@@ -87,7 +90,7 @@ function partialReadCase(occupancy, located = false) {
   return { fabric, slots };
 }
 
-for (const occupancy of ["unknown", "empty"]) {
+for (const occupancy of ["unknown", "empty", "unread_flagged_present"]) {
   test(`host line does not call an unlocated row with ${occupancy} occupancy a disk`, () => {
     const { fabric, slots } = inventoryCase("no_controller_mixed", occupancy);
     const map = renderLanes(fabric, slots);
@@ -120,6 +123,38 @@ test("control: unlocated rows that all hold a disk stay disks", () => {
   assert.doesNotMatch(map, /entries|entry/, map);
   const partial = renderLanes(...Object.values(partialReadCase("present")));
   assert.match(partial, /so these disks come from the inventory\./, partial);
+});
+
+// `count` unlocated inventory rows with no controller data; only the first
+// holds a confirmed disk unless `allPresent`.
+function manyRowsCase(count, allPresent = false) {
+  const { fabric, slots } = inventoryCase("no_controller_mixed", allPresent ? "present" : "unknown");
+  const node = fabric.nodes.find((item) => item.id === "bay:1");
+  const trace = fabric.traces.find((item) => item.id === "bay:1");
+  for (let slot = 2; slot < count; slot += 1) {
+    fabric.nodes.push({ ...structuredClone(node), id: `bay:${slot}`, slot, related_slots: [slot] });
+    fabric.traces.push({ ...structuredClone(trace), id: `bay:${slot}`, slots: [slot] });
+    slots.push({ ...structuredClone(slots[1]), slot, slot_label: String(slot).padStart(2, "0") });
+  }
+  return { fabric, slots };
+}
+
+test("inventory group overflow does not call unknown occupants disks (120/121 boundary)", () => {
+  const atLimit = renderLanes(...Object.values(manyRowsCase(120)));
+  assert.match(atLimit, /120 inventory entries, 1 confirmed disk\b/, atLimit);
+  assert.doesNotMatch(atLimit, /\+\d+ (?:disks?|entr(?:y|ies)|bays?)\b/, atLimit);
+  const over = renderLanes(...Object.values(manyRowsCase(121)));
+  assert.match(over, /121 inventory entries, 1 confirmed disk\b/, over);
+  assert.match(over, /Impacted Entries/, over);
+  assert.match(over, /\+1 entry\b/, over);
+  assert.doesNotMatch(over, /\+1 disks?\b/, over);
+});
+
+test("control: inventory group overflow of confirmed disks still says disk", () => {
+  const over = renderLanes(...Object.values(manyRowsCase(121, true)));
+  assert.match(over, /121 disks\b/, over);
+  assert.match(over, /\+1 disk\b/, over);
+  assert.doesNotMatch(over, /entries|entry/, over);
 });
 
 for (const occupancy of ["unknown", "empty", "present"]) {

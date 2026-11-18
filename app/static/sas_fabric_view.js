@@ -1866,7 +1866,9 @@
     return `${visible.map((node) => renderNodeButton(node, { extra: "compact" })).join("")}${overflow}`;
   }
 
-  function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
+  // `rowNoun` (bays, disks or entries) names the overflow of an inventory
+  // group; other callers keep the location-aware bay/disk noun.
+  function renderBayChips(slots, limit = 96, { modeTarget = "", rowNoun = null } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
       return '<span class="fabric-empty-note">No mapped disks</span>';
@@ -1885,7 +1887,10 @@
         </button>
       `;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} ${aggregateDiskNoun(sorted)}s</span>` : "";
+    const hidden = sorted.length - limit;
+    const hiddenNoun = !rowNoun ? `${aggregateDiskNoun(sorted)}s`
+      : hidden !== 1 ? rowNoun : rowNoun === "entries" ? "entry" : rowNoun.slice(0, -1);
+    const overflow = hidden > 0 ? `<span class="fabric-empty-note">+${hidden} ${hiddenNoun}</span>` : "";
     return `${chips}${overflow}`;
   }
 
@@ -2013,7 +2018,7 @@
         <div class="warning-item muted compact">${escapeHtml(`${notice(noun)}${caveat}`)}</div>
         <div class="fabric-stage">
           <span class="fabric-stage-title">${escapeHtml(title)}</span>
-          <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
+          <div class="fabric-bay-grid">${renderBayChips(slots, 120, { rowNoun: noun })}</div>
         </div>
       </section>
     `;
