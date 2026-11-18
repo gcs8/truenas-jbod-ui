@@ -2520,9 +2520,17 @@
     const y = Number(window.scrollY) || 0;
     if (y <= 0) return 0;
     const root = typeof document !== "undefined" ? document.documentElement : null;
-    const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
-    const slack = Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
-    return Math.max(0, settled - slack);
+    const slackOf = () => {
+      const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
+      return Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
+    };
+    const slack = slackOf();
+    // A box at a limit that is not a whole pixel gives back the fraction less than the slack (its
+    // clientHeight is rounded up), and below the limit it is whole: give back the rest in this redraw.
+    const tall = Number(typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect()?.height : NaN);
+    if (!slack || !Number.isFinite(tall) || tall === Math.round(tall)) return Math.max(0, settled - slack);
+    sizeRoom(box, left, top, settled - slack);
+    return Math.max(0, (Number(box.clientHeight) || 0) - slackOf());
   }
 
   // After the page has put the drawing in place: set its scroll position,

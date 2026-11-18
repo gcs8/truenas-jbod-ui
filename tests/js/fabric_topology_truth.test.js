@@ -2407,3 +2407,47 @@ test("Fit with a shelf drawn in full lands at offsets 0/0 for a fractional box h
   }
   assert.deepEqual(missed, [], "Fit lands at 0/0 with the drawing inside the box");
 });
+
+// A browser measured five pins after a collapse from the bottom at 3840x2160
+// leaving the box 1547, 1546, 1546, 1546 and 1546 px tall: the box's limit
+// is fractional, so the first release left the page with a pixel of slack
+// that only the second pin gave back. With fractional limits and pages, the
+// room after the drawing settles in the first redraw: later pins change
+// nothing, the page and the drawing never move (giving back more than the
+// page can lose would hold the page back), and the box never grows.
+test("after a collapse with a fractional box height and page position the room after the drawing settles in one redraw and never releases too much", () => {
+  const unsettled = [];
+  const windows = [MEASURED_WINDOWS[4], MEASURED_WINDOWS[6], MEASURED_WINDOWS[7]];
+  for (const base of windows) {
+    const limit = cssLimit(base.viewport);
+    for (const below of [base.below, base.below + 0.25, base.below + 0.5, base.below + 0.75]) {
+      for (const collapseY of [base.collapseY, base.collapseY + 0.5]) {
+        const size = { ...base, limit, below, collapseY };
+        const label = `${size.name}, limit ${limit.toFixed(2)}, below ${below}, page ${collapseY}`;
+        const view = collapsedFrom(size, "bottom");
+        const start = { ...heldView(view), ...sized(view) };
+        const sizes = [];
+        // The box's height on the page, fractional at its limit.
+        const tall = () => view.panel.box.getBoundingClientRect().height;
+        for (let pin = 1; pin <= 5; pin += 1) {
+          const before = tall();
+          pinLink(view);
+          const after = { ...heldView(view), ...sized(view) };
+          sizes.push(after.box);
+          // Released too much, the page is held back: it moves.
+          if (JSON.stringify(heldView(view)) !== JSON.stringify({ control: start.control, pageY: start.pageY, offsets: start.offsets })) {
+            unsettled.push(`${label}, pin ${pin}: moved ${JSON.stringify(start)} > ${JSON.stringify(after)}`);
+          }
+          if (tall() > before) unsettled.push(`${label}, pin ${pin}: the box grew from ${before} to ${tall()}`);
+          // The first pin gives back all it may: the room, or the page's last whole pixel of slack.
+          const origin = String(view.panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+          const room = after.drawing + origin[1] - Math.ceil(view.T.drawnModel().height);
+          const slack = Math.floor(view.page.range() - view.page.scrollY);
+          if (pin === 1 && room > 0 && slack > 0) unsettled.push(`${label}, pin 1: ${room} px of room kept with ${slack} px of slack`);
+        }
+        if (sizes.some((value) => value !== sizes[0])) unsettled.push(`${label}: box heights ${sizes.join(", ")}`);
+      }
+    }
+  }
+  assert.deepEqual(unsettled, [], "settled after the first pin, nothing moved, the box never grew");
+});
