@@ -205,6 +205,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_backup_retention_keeper_budget",
         "test_container_contract",
         "test_core_fabric_legacy_controller",
+        "test_core_reply_completeness",
         "test_enclosure_aliases",
         "test_fabric_topology_fixture",
         "test_history_activation_marker_startup",

@@ -117,6 +117,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_config_example",
     "tests.test_core_counter_markers",
     "tests.test_core_fabric_legacy_controller",
+    "tests.test_core_reply_completeness",
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
     "tests.test_esxi_topology_alias_scope",
