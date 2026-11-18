@@ -269,6 +269,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_snapshot_export",
             "tests.test_ssh_diagnostic_safety",
             "tests.test_storage_view_smart_batch",
+            "tests.test_storcli_row_admission",
             "tests.test_system_backup",
             "tests.test_system_setup_field_ownership",
             "tests.test_system_setup_legacy_add",

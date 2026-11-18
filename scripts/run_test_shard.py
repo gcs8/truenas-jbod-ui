@@ -186,6 +186,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_ses_unknown_presence",
         "test_ses_zero_address_identity",
         "test_source_shape",
+        "test_storcli_row_admission",
         "test_storcli_split",
         "test_unittest_identities",
         "test_unittest_shards",
