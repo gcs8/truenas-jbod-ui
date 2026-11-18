@@ -1039,7 +1039,8 @@ Three scripts enforce this:
   at least one valid fragment named for this pull request, and a `breaking`
   or `upgrade` fragment when `breaking` is set. An invalid fragment (bad name,
   unknown section, empty, longer than 4096 bytes, a heading, an HTML comment,
-  raw HTML, a link reference definition, a control or formatting character, a
+  raw HTML, a link reference definition, a line that starts an ordered list
+  item or a blockquote, a control or formatting character, a
   `#N` inside parentheses) fails with
   the file and the reason. An edit to `CHANGELOG.md` alone does not count;
   the failure names the fragment to add. The one exception is a release cut: a

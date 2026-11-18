@@ -987,9 +987,15 @@ class StorcliPerDriveCensusTests(unittest.TestCase):
     def test_a_failed_partial_or_contradicting_reply_leaves_the_unlisted_bay_unknown(self) -> None:
         listing = STORCLI_LIST.format(controller=0)
         one = [_storcli_drive(0)]
-        # A table that names bay 0 and a per-drive entry for bay 1 in the same reply.
+        # A table that names bay 0 and a detailed entry for bay 1 in the same
+        # reply. With bay 1's drive row as well, the drive is kept and the bay
+        # is present (#1305, tests.test_storcli_row_admission); the census
+        # still refuses that reply.
         contradicting = _storcli_block(one)
-        contradicting["Response Data"].update(_storcli_block([_storcli_drive(1)], form="per-drive")["Response Data"])
+        contradicting["Response Data"].update({
+            key: value for key, value in _storcli_block([_storcli_drive(1)], form="per-drive")["Response Data"].items()
+            if key.endswith("Detailed Information")
+        })
         # A per-drive entry whose row names another slot than its entry.
         mislabelled = _storcli_block(one, form="per-drive")
         mislabelled["Response Data"]["Drive /c0/e13/s1"] = mislabelled["Response Data"].pop("Drive /c0/e13/s0")
@@ -1006,7 +1012,7 @@ class StorcliPerDriveCensusTests(unittest.TestCase):
             ))}, (0,)),
             "a table row that is not an object": ({listing: _storcli_drives_reply(
                 _storcli_block([_storcli_drive(0), "13:1 garbled"]))}, (0,)),
-            "a table and a per-drive entry name different drives": (
+            "a table and a detailed entry name different drives": (
                 {listing: _storcli_drives_reply(contradicting)}, (0,)),
             "a per-drive entry names another slot than its row": (
                 {listing: _storcli_drives_reply(mislabelled)}, (0,)),
