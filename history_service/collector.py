@@ -608,7 +608,11 @@ class HistoryCollector:
                 smart_evidence_unread.add(self._smart_evidence_disk_key(recorded))
             present_slots = [record.slot for record in slot_records if slot_occupancy(record) == "present"]
             if not present_slots:
-                self._pending_smart_metric_scopes.pop(scope_key, None)
+                # Only bays read as empty settle a retry debt. A bay whose
+                # occupancy was not read hides a disk that still owes the
+                # failed read, so the debt and its degradation stay (#1295).
+                if not any(slot_occupancy(record) == "unknown" for record in slot_records):
+                    self._pending_smart_metric_scopes.pop(scope_key, None)
                 continue
             records_by_slot = {record.slot: record for record in slot_records if slot_occupancy(record) == "present"}
             for record in records_by_slot.values():
