@@ -40,7 +40,8 @@ from app.services.sas_fabric_parsers import (
     parse_dmidecode_slots,
     parse_mpr_adapter_detail,
     parse_mpr_adapter_summary,
-    parse_mpr_devices,
+    parse_mpr_device_list,
+    parse_mpr_devices as parse_mpr_devices,
     parse_mpr_dmesg_events,
     parse_mpr_enclosures,
     parse_mpr_expanders,
@@ -1887,9 +1888,10 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
         subcommand: outputs[f"{prefix} {subcommand}"] if f"{prefix} {subcommand}" in outputs else sections.get(subcommand)
         for subcommand in ("adapter", "devices", "enclosures", "expanders", "iocfacts")
     }
+    devices, rejected_device_rows = parse_mpr_device_list(replies["devices"] or "")
     payload: dict[str, Any] = {
         "adapter_detail": parse_mpr_adapter_detail(replies["adapter"] or ""),
-        "devices": parse_mpr_devices(replies["devices"] or ""),
+        "devices": devices,
         "enclosures": parse_mpr_enclosures(replies["enclosures"] or ""),
         "expanders": parse_mpr_expanders(replies["expanders"] or ""),
         "iocfacts": parse_mpr_iocfacts(replies["iocfacts"] or ""),
@@ -1901,6 +1903,9 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
         subcommand: _mpr_list_state(replies[subcommand], subcommand, payload[subcommand])
         for subcommand in _MPR_LIST_HEADINGS
     }
+    if rejected_device_rows:
+        # A device row that was not understood: the rows kept are not the whole list.
+        payload["lists"]["devices"] = "unreadable"
     return payload
 
 
