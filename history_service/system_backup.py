@@ -1205,6 +1205,19 @@ class _ImportActivationTransaction:
                 "candidate": record_restore_tree(staged_segments_path),
             },
         }
+        # Rollback retires the unconsumed staged copies by an authenticated
+        # rename before deleting them, as it does journaled configuration
+        # (#1273): an interrupted delete leaves either the intact staged copy
+        # under its recorded name or a retired remainder, never a part-deleted
+        # tree under the name the journal records.
+        self._recorded_artifacts[staged_hot_path] = (
+            journal_payload["hot"]["candidate"],
+            "file",
+        )
+        self._recorded_artifacts[staged_segments_path] = (
+            journal_payload["segments"]["candidate"],
+            "directory",
+        )
         self._prepared_segmented_restore = _PreparedSegmentedRestore(
             store=store,
             hot_member_key=hot_member_key,
