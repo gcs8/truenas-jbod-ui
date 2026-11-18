@@ -1,4 +1,4 @@
-"""Restore refusal and cleanup (#1273, #1287).
+"""Restore refusal and cleanup (#1273, #1287, #1292).
 
 Every fixture is synthetic and lives in a temporary directory.
 """
@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
@@ -18,12 +20,13 @@ from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
 from history_service.segmented_restore import record_file as record_restore_file
 from history_service.segmented_restore import record_tree as record_restore_tree
-from history_service.store import HistoryStore
+from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     HISTORY_DB_KEY,
     MAPPING_FILE_KEY,
     RUNTIME_OVERRIDES_FILE_KEY,
     TLS_TRUST_KEY,
+    SystemBackupService,
     _ImportActivationTransaction,
 )
 from tests.test_interrupted_restore_recovery import (
@@ -347,6 +350,106 @@ class MalformedJournalDiscriminatorTests(_ImportRootCleanup):
                         )
                     self.assertEqual(str(refused.exception), message)
                     self.assertEqual(_tree_snapshot(root), before)
+
+
+def _history_database(path: Path, timestamps: list[str]) -> Path:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(SCHEMA)
+        for index, observed_at in enumerate(timestamps):
+            connection.execute(
+                """
+                INSERT INTO metric_samples (
+                    observed_at, system_id, enclosure_key, slot, slot_label,
+                    metric_name, value_integer
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observed_at,
+                    "synthetic-system",
+                    "synthetic-enclosure",
+                    index,
+                    f"slot-{index}",
+                    "temperature_c",
+                    30 + index,
+                ),
+            )
+    connection.close()
+    return path
+
+
+class RestoreTimestampSizeTests(_ImportRootCleanup):
+    """#1292: restore admission refuses runaway timestamp text."""
+
+    ORDINARY = "2025-01-01T00:00:00+00:00"
+    MEGABYTE = 1024 * 1024
+    PADDED = ORDINARY + " " * MEGABYTE
+    LONG_FRACTION = "2025-01-01T00:00:00." + "1" * MEGABYTE + "+00:00"
+    NANOSECONDS = "2025-01-01T00:00:00.123456789+00:00"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self._directory.name)
+
+    def test_long_fraction_fixture_is_a_parseable_timestamp(self) -> None:
+        from datetime import datetime
+
+        self.assertIsNotNone(datetime.fromisoformat(self.LONG_FRACTION).tzinfo)
+
+    def test_history_member_validation_refuses_oversized_timestamps(self) -> None:
+        control = _history_database(
+            self.root / "control.sqlite3", [self.ORDINARY, self.NANOSECONDS]
+        )
+        SystemBackupService._validate_history_member(control)
+        for label, value in (("padded", self.PADDED), ("fraction", self.LONG_FRACTION)):
+            with self.subTest(label=label):
+                candidate = _history_database(
+                    self.root / f"{label}.sqlite3", [self.ORDINARY, value]
+                )
+                with self.assertRaises(ValueError) as refused:
+                    SystemBackupService._validate_history_member(candidate)
+                self.assertIn("metric_samples.observed_at", str(refused.exception))
+                self.assertIn("Nothing was restored", str(refused.exception))
+
+    def test_slot_event_timestamp_is_bounded_too(self) -> None:
+        candidate = _history_database(self.root / "events.sqlite3", [self.ORDINARY])
+        with sqlite3.connect(candidate) as connection:
+            connection.execute(
+                """
+                INSERT INTO slot_events (
+                    observed_at, system_id, enclosure_key, slot,
+                    slot_label, event_type, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (self.PADDED, "synthetic-system", "synthetic-enclosure", 1, "slot-1", "x", "{}"),
+            )
+        connection.close()
+        with self.assertRaises(ValueError) as refused:
+            SystemBackupService._validate_history_member(candidate)
+        self.assertIn("slot_events.observed_at", str(refused.exception))
+
+    def test_direct_restore_refuses_and_leaves_live_history_byte_identical(self) -> None:
+        live = self.root / "live" / "history.sqlite3"
+        live.parent.mkdir()
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        control = _history_database(
+            self.root / "control.sqlite3", [self.ORDINARY, self.NANOSECONDS]
+        )
+        store.restore_backup(control)
+        with closing(sqlite3.connect(f"{live.as_uri()}?mode=ro", uri=True)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM metric_samples").fetchone()[0],
+                2,
+            )
+        for label, value in (("padded", self.PADDED), ("fraction", self.LONG_FRACTION)):
+            with self.subTest(label=label):
+                candidate = _history_database(
+                    self.root / f"{label}.sqlite3", [self.ORDINARY, value]
+                )
+                before = _tree_snapshot(live.parent)
+                with self.assertRaises(ValueError) as refused:
+                    store.restore_backup(candidate)
+                self.assertIn("metric_samples.observed_at", str(refused.exception))
+                self.assertEqual(_tree_snapshot(live.parent), before)
 
 
 if __name__ == "__main__":

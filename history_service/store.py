@@ -204,6 +204,48 @@ def require_restorable_schema_version(found_version: int) -> None:
     )
 
 
+# Restore admission bound for timestamp text (#1292). A timestamp this service
+# writes is 32 characters, at most 64 bytes in a UTF-16 database; the bound is
+# per field and limits runaway text, not how many rows or devices a restored
+# database holds.
+MAX_RESTORED_TIMESTAMP_BYTES = 256
+RESTORED_TIMESTAMP_COLUMNS = (
+    ("slot_state_current", "last_seen_at"),
+    ("slot_events", "observed_at"),
+    ("metric_samples", "observed_at"),
+    ("metric_rollups", "bucket_start"),
+    ("metric_rollups", "last_observed_at"),
+    ("history_maintenance_state", "backup_at"),
+)
+
+
+def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
+    """Refuse a database with a timestamp field longer than the restore bound.
+
+    Nothing is truncated or dropped: one oversized field refuses the whole
+    database with a reason the operator can act on. A table or column an
+    older supported schema lacks is skipped.
+    """
+    for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
+        present = connection.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            (table_name, column_name),
+        ).fetchone()
+        if present is None:
+            continue
+        oversized = connection.execute(
+            f'SELECT 1 FROM "{table_name}" '
+            f'WHERE length(CAST("{column_name}" AS BLOB)) > ? LIMIT 1',
+            (MAX_RESTORED_TIMESTAMP_BYTES,),
+        ).fetchone()
+        if oversized is not None:
+            raise ValueError(
+                f"The history database in this backup has a {table_name}.{column_name} "
+                f"timestamp longer than {MAX_RESTORED_TIMESTAMP_BYTES} bytes. Nothing was "
+                "restored and the current history was not changed."
+            )
+
+
 def history_write_lock(file_path: Path, *, blocking: bool):
     from history_service.migration_lock import history_write_lock as posix_history_write_lock
 
@@ -2619,6 +2661,7 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    require_bounded_restored_timestamps(restore_connection)
                     # The backup's counters are outside input that sizes
                     # index builds; replace them with real counts (#1093).
                     self._recount_restored_table_counts(restore_connection)

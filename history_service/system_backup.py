@@ -105,6 +105,7 @@ from history_service.startup import HistorySchemaVersionError
 from history_service.store import (
     SQLITE_CONNECT_TIMEOUT_SECONDS,
     HistoryStore,
+    require_bounded_restored_timestamps,
     require_restorable_schema_version,
 )
 
@@ -4425,6 +4426,8 @@ class SystemBackupService:
                         raise ValueError(
                             f"History database table {table_name} is missing required columns."
                         )
+                if rows == [("ok",)]:
+                    require_bounded_restored_timestamps(connection)
             if rows != [("ok",)]:
                 raise ValueError("History database integrity check failed.")
 
