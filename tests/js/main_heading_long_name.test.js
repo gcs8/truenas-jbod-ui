@@ -22,7 +22,11 @@
 // heading column and its three lines, built from the templates' own markup,
 // so removing the class, the rule, or a later rule that turns it off fails
 // here. The rendered check is in qa/fixture-suites/header-select-width.js
-// (main page, 14- and 60-character names, 390x844 and wider).
+// (main page, 14- and 60-character names, 390x844 and wider). The UI is a
+// desktop application and narrow widths are not a supported layout
+// (CONTRIBUTING.md); they are in the width list because the stylesheet's
+// narrow media rules apply there and the finding was reported at 390 px, not
+// as a product capability.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

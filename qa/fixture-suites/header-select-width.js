@@ -326,7 +326,11 @@ for (const width of WIDTHS) {
 // #1381: the line above the main page's title shows the selected system
 // name. A 60-character name with no space ran past the header, so at 390x844
 // the document was 549 px wide. The name now wraps inside the header; the
-// header never runs past the page because of it.
+// header never runs past the page because of it. The UI is a desktop
+// application and 390 px is not a supported layout (CONTRIBUTING.md): the
+// 390x844 run only keeps this reported finding fixed, as the narrow-layout
+// spec does for its own; the desktop widths check the same invariants so the
+// fix cannot move them.
 const HEADING_WIDTHS = [390, 600, 820, 821, 1024, 1240, 1280, 1600, 1920, 2560];
 // Between 821 and about 965 px the toolbar's refresh strip, not the header,
 // is wider than the window with any name. At those widths the header and
