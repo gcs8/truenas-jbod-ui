@@ -14,6 +14,8 @@ from app.services.sas_fabric_parsers import parse_mpr_devices
 from tests.test_core_fabric_legacy_controller import (
     DEVICE_ADDRESS,
     DEVICES_HEADING,
+    LISTS_MISSING_WARNING,
+    PHY_TABLE_WARNING,
     SELECTED_ENCLOSURE,
     _core_fabric,
     _healthy_unit,
@@ -110,6 +112,51 @@ class CoreDeviceTypeCompletenessTests(unittest.TestCase):
         fabric = _fabric({**_healthy_unit(), "mprutil -u 0 show devices": listing})
         self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["devices"], "read")
         self.assertEqual([metrics["device_count"] for metrics in _enclosure_metrics(fabric)], [1])
+        self.assertEqual(fabric.warnings, [])
+
+
+class CoreDedicatedReplyUtilityErrorTests(unittest.TestCase):
+    """#1281: a utility error leaves a dedicated reply not read, as it does a `show all` section."""
+
+    def test_dedicated_list_reply_with_a_utility_error_is_not_read(self) -> None:
+        healthy = _healthy_unit()
+        for subcommand, error in (("enclosures", ENCLOSURE_ERROR), ("expanders", EXPANDER_ERROR), ("devices", DEVICE_ERROR)):
+            label = subcommand.capitalize()
+            dedicated = {**healthy, f"mprutil -u 0 show {subcommand}": healthy[f"mprutil -u 0 show {subcommand}"] + error}
+            composite = {"mprutil -u 0 show all": _show_all().replace(
+                f"{label}:\n{healthy[f'mprutil -u 0 show {subcommand}']}",
+                f"{label}:\n{healthy[f'mprutil -u 0 show {subcommand}']}{error}",
+            )}
+            states = {}
+            for source, outputs in {"dedicated": dedicated, "show all": composite}.items():
+                with self.subTest(subcommand, source=source):
+                    fabric = _fabric(outputs)
+                    read = fabric.raw["controller_read"]
+                    states[source] = (read["lists"], read["counts"], fabric.warnings)
+                    self.assertEqual(read["lists"]["mpr0"][subcommand], "not_read")
+                    if subcommand == "devices":
+                        # An unread device list alone leaves overall status unchanged.
+                        [enclosure] = _enclosure_metrics(fabric)
+                        self.assertEqual((enclosure["device_count"], enclosure.get("not_read")), (None, ["device_count"]))
+                    else:
+                        self.assertEqual(read["counts"][subcommand], "partial")
+                        self.assertIn(LISTS_MISSING_WARNING, fabric.warnings)
+            with self.subTest(subcommand, source="dedicated equals show all"):
+                self.assertEqual(states["dedicated"], states["show all"])
+
+    def test_dedicated_adapter_reply_with_a_utility_error_leaves_its_phy_table_not_read(self) -> None:
+        adapter = _printed_adapter([True, False]) + ADAPTER_ERROR
+        fabric = _fabric({**_healthy_unit(), "mprutil -u 0 show adapter": adapter})
+        [controller] = [node.metrics for node in fabric.nodes if node.kind == "controller"]
+        self.assertEqual((controller["phy_count"], controller.get("not_read")), (None, ["phy_count", "linked_phy_count"]))
+        self.assertIn(PHY_TABLE_WARNING, fabric.warnings)
+
+    def test_dedicated_replies_without_an_error_stay_read(self) -> None:
+        # Control: the same replies without the error line read whole.
+        fabric = _fabric(_healthy_unit())
+        read = fabric.raw["controller_read"]
+        self.assertEqual(read["lists"]["mpr0"], {"expanders": "read", "enclosures": "read", "devices": "read"})
+        self.assertEqual(read["counts"], {count: "complete" for count in ("controllers", "paths", "expanders", "enclosures")})
         self.assertEqual(fabric.warnings, [])
 
 
