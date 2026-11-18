@@ -1221,11 +1221,13 @@ function fakePage({ viewport, above, below, anchoring = true }) {
   const page = { innerHeight: viewport, above, below, scrollX: 0, scrollY: 0, panelHeight: () => 0, scrolls: [], windows: [], reads: 0 };
   let wanted = 0;
   page.height = () => Math.max(page.innerHeight, page.above + page.panelHeight() + page.below);
-  page.range = () => Math.max(0, page.height() - page.innerHeight);
+  // The browser's scroll extents are whole pixels: the document's length is
+  // rounded where a part of it (the box at a fractional height limit) is not.
+  page.range = () => Math.max(0, Math.round(page.height()) - page.innerHeight);
   // The document's root element, as a script reads the page's length; every
   // read is counted.
   page.root = {
-    get scrollHeight() { page.reads += 1; return page.height(); },
+    get scrollHeight() { page.reads += 1; return Math.round(page.height()); },
     get clientHeight() { page.reads += 1; return page.innerHeight; },
   };
   page.layout = () => {
@@ -1261,7 +1263,10 @@ function fakePage({ viewport, above, below, anchoring = true }) {
 // Like the page's box, which has only a maximum height, the box is as tall as
 // its drawing up to `height`: growing the drawing after it is in place grows
 // the box. With `page` (a fakePage), the page around the box scrolls too.
-// `height` may be a function, for a window whose height changes.
+// `height` may be a function, for a window whose height changes, and may be
+// fractional, as the stylesheet's 78vh less two borders is: the box is then
+// that tall on the page, while clientHeight and its scroll extent are whole
+// pixels, as a browser reports them.
 function scrollingPanel(item, { inner = 1100, height: limit = 600, page = null } = {}) {
   let html = "";
   const pin = { textContent: "" };
@@ -1308,14 +1313,14 @@ function scrollingPanel(item, { inner = 1100, height: limit = 600, page = null }
     };
     return {
       clientWidth: inner,
-      get clientHeight() { return client(); },
+      get clientHeight() { return Math.round(client()); },
       svg,
       querySelector: (selector) => (selector === ".fabric-topology-svg" || selector === "svg" ? svg : null),
       // A drawing made smaller after an offset was set clamps it, as the browser does.
       get scrollLeft() { return Math.min(left, extent("width", inner)); },
       set scrollLeft(value) { left = Math.max(0, Math.min(extent("width", inner), Number(value) || 0)); },
-      get scrollTop() { return Math.min(down, extent("height", client())); },
-      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", client()), Number(value) || 0)); },
+      get scrollTop() { return Math.min(down, extent("height", Math.round(client()))); },
+      set scrollTop(value) { down = Math.max(0, Math.min(extent("height", Math.round(client())), Number(value) || 0)); },
       getBoundingClientRect: rect,
     };
   };
@@ -2104,6 +2109,68 @@ test("a pin after the first view leaves the box at the drawing's natural height,
   }
 });
 
+// The page as its own startup render leaves it, before any other render:
+// topologyPage renders once more, which can give back room the startup
+// render padded. Every mount's writes of the drawing's height are counted
+// from the start.
+function startupPage(fabric, size) {
+  const page = fakePage({ viewport: size.viewport, above: 0, below: size.below });
+  const dom = fakeDom();
+  dom.document.documentElement = page.root;
+  const T = H.loadTopology({ document: dom.document, window: page.bind({}) });
+  const sizings = [];
+  const mount = T.mount;
+  T.mount = (container, ...rest) => {
+    const svg = container?.box?.svg;
+    let count = 0;
+    if (svg) {
+      const write = svg.setAttribute;
+      svg.setAttribute = (name, value) => {
+        if (name === "height") count += 1;
+        write(name, value);
+      };
+    }
+    mount(container, ...rest);
+    sizings.push(count);
+  };
+  const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
+  let panel = null;
+  const loaded = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+    if (id === "fabric-map-panel") {
+      panel = item;
+      scrollingPanel(item, { inner: size.inner, height: () => size.limit, page });
+    }
+  }, page);
+  const documentClick = dom.documentHandlers.find((item) => item.name === "click").handler;
+  const click = (attributes) => {
+    const target = pageTarget(attributes, panel.querySelector(".fabric-topology"));
+    panel.handlers.get("click")({ type: "click", target });
+    documentClick({ type: "click", target });
+  };
+  return { T, panel, page, sizings, click, app: loaded.page };
+}
+
+// The startup render itself draws the drawing at its natural height, sized
+// once and without reading the page's length; a pin right after it keeps
+// that. A startup render that took the kept-height path, or padded the
+// drawing to the window, would size twice or draw it taller.
+test("the page's startup render draws the drawing at its natural height, sized once, and a pin right after it keeps that", () => {
+  for (const size of [MEASURED_WINDOWS[0], MEASURED_WINDOWS[4], MEASURED_WINDOWS[7]]) {
+    const view = startupPage(bigShelf(), size);
+    assert.ok(view.panel?.box, `${size.name}: the startup render drew the topology`);
+    const natural = Math.ceil(view.T.drawnModel().height);
+    assert.equal(natural, 681, `${size.name}: the drawing's natural height`);
+    const first = sized(view);
+    assert.deepEqual(first, { box: Math.min(natural, size.limit), drawing: natural }, `${size.name}: the startup view`);
+    assert.deepEqual(view.sizings, [1], `${size.name}: the startup render mounted once and sized once`);
+    assert.equal(view.page.reads, 0, `${size.name}: the startup render does not read the page's length`);
+    pinLink(view);
+    assert.deepEqual(sized(view), first, `${size.name}: a pin right after startup keeps the box's height`);
+    assert.deepEqual(view.sizings, [1, 1], `${size.name}: the pin sized once`);
+    assert.equal(view.page.reads, 0, `${size.name}: the pin does not read the page's length`);
+  }
+});
+
 // The loss a browser measured repeated on each further redraw: five pins in
 // a row leave every number where the first left it.
 test("five pins in a row after a collapse leave every number where the first pin left it", () => {
@@ -2206,6 +2273,40 @@ test("a toggle whose control is out of view keeps the horizontal offset, room be
       assert.equal(before.offsets[0], scrolled - 208, `${label}: the view begins before the drawing's left edge`);
       view.click({ "data-fabric-expand-slots": key });
       assert.match(panel.innerHTML, /aria-expanded="false"/, `${label}: collapsed`);
+      const after = held();
+      if (JSON.stringify(after) !== JSON.stringify(before)) moved.push(`${label}: ${JSON.stringify(before)} > ${JSON.stringify(after)}`);
+    }
+  }
+  assert.deepEqual(moved, [], "nothing moves sideways");
+});
+
+// The same for an expansion: after the off-view collapse above, the shelf
+// is expanded again with its control still out of view. The view still
+// begins in the room before the drawing's left edge, and the growing
+// drawing keeps that horizontal offset, the vertical one and the page.
+test("an expansion whose control is out of view keeps the horizontal offset, room before the left edge included", () => {
+  const moved = [];
+  for (const size of [MEASURED_WINDOWS[1], MEASURED_WINDOWS[2], MEASURED_WINDOWS[4]]) {
+    for (const scrolled of [0, 150]) {
+      const view = measuredPage(bigShelf(), size);
+      const { panel, page } = view;
+      const key = expandControls(panel)[0].key;
+      toggleFrom(view, size, key, "top", size.expandY);
+      const control = () => expandControls(panel).find((item) => item.key === key);
+      panel.box.scrollLeft = scrolled;
+      panel.box.scrollTop = control().y + 1000;
+      page.scrollTo(0, size.collapseY);
+      const label = `${size.name}, ${scrolled}`;
+      const host = () => screenPoint(panel, view.T.drawnModel().nodes.find((item) => item.kind === "host"));
+      const held = () => ({ offsets: heldView({ ...view, key }).offsets, host: host(), pageY: page.scrollY });
+      assert.ok(screenPoint(panel, control())[1] + 22 < panel.box.getBoundingClientRect().top, `${label}: the control is out of view before the collapse`);
+      view.click({ "data-fabric-expand-slots": key });
+      assert.equal(control().expanded, "false", `${label}: collapsed`);
+      const before = held();
+      assert.equal(before.offsets[0], scrolled - 208, `${label}: the view begins before the drawing's left edge`);
+      assert.ok(screenPoint(panel, control())[1] + 22 < panel.box.getBoundingClientRect().top, `${label}: the control is out of view before the expansion`);
+      view.click({ "data-fabric-expand-slots": key });
+      assert.equal(control().expanded, "true", `${label}: expanded`);
       const after = held();
       if (JSON.stringify(after) !== JSON.stringify(before)) moved.push(`${label}: ${JSON.stringify(before)} > ${JSON.stringify(after)}`);
     }
@@ -2528,4 +2629,90 @@ test("a search status line that is cut short is readable in full on hover, and c
   dom.searchHandlers.get("input")();
   T.release();
   assert.deepEqual([dom.status.textContent, dom.status.title], ["", ""], "leaving the mode clears both");
+});
+
+// ---- fractional box heights and page positions ---------------------------------
+
+// The box's height limit as the stylesheet sets it: 78% of the window, less
+// its two 1 px borders. At 1920x1080 and 3840x2160 that is not a whole pixel.
+function cssLimit(viewport) {
+  return viewport * 0.78 - 2;
+}
+
+// A browser measured Fit with the shelf drawn in full leaving the box 2 px
+// down at 1600x900, 1920x1080 and 3840x2160. Fit scales the drawing into the
+// box's inner height, so nothing is left to scroll and both offsets are 0;
+// Actual size gives the earlier offsets back.
+test("Fit with a shelf drawn in full lands at offsets 0/0 for a fractional box height, and Actual size gives the offsets back", () => {
+  const missed = [];
+  for (const base of [MEASURED_WINDOWS[0], MEASURED_WINDOWS[4], MEASURED_WINDOWS[7]]) {
+    const size = { ...base, limit: cssLimit(base.viewport) };
+    const view = measuredPage(bigShelf(), size);
+    const { panel, page, click } = view;
+    click({ "data-fabric-expand-slots": expandControls(panel)[0].key });
+    panel.box.scrollLeft = 300;
+    panel.box.scrollTop = 400;
+    page.scrollTo(0, size.collapseY);
+    const origin = () => String(panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+    const held = [panel.box.scrollLeft + origin()[0], panel.box.scrollTop + origin()[1]];
+    assert.ok(held[1] > 0, `${size.name}: the drawing is scrolled (${held})`);
+    const pageY = page.scrollY;
+    click({ "data-topology-fit": "fit" });
+    assert.match(panel.innerHTML, /is-fitted/, `${size.name}: fitted`);
+    const fitted = {
+      offsets: [panel.box.scrollLeft, panel.box.scrollTop],
+      overflow: [Number(panel.box.svg.getAttribute("width")) - panel.box.clientWidth, Number(panel.box.svg.getAttribute("height")) - size.limit],
+      pageY: page.scrollY,
+    };
+    if (fitted.offsets.some(Boolean) || fitted.overflow.some((value) => value > 0) || fitted.pageY !== pageY) {
+      missed.push(`${size.name}: offsets ${fitted.offsets}, drawing past the box by ${fitted.overflow.map((value) => value.toFixed(1))}, page ${pageY}>${fitted.pageY}`);
+    }
+    click({ "data-topology-fit": "actual" });
+    assert.deepEqual([panel.box.scrollLeft + origin()[0], panel.box.scrollTop + origin()[1]], held, `${size.name}: Actual size gives the offsets back`);
+  }
+  assert.deepEqual(missed, [], "Fit lands at 0/0 with the drawing inside the box");
+});
+
+// A browser measured five pins after a collapse from the bottom at 3840x2160
+// leaving the box 1547, 1546, 1546, 1546 and 1546 px tall: the box's limit
+// is fractional, so the first release left the page with a pixel of slack
+// that only the second pin gave back. With fractional limits and pages, the
+// room after the drawing settles in the first redraw: later pins change
+// nothing, the page and the drawing never move (giving back more than the
+// page can lose would hold the page back), and the box never grows.
+test("after a collapse with a fractional box height and page position the room after the drawing settles in one redraw and never releases too much", () => {
+  const unsettled = [];
+  const windows = [MEASURED_WINDOWS[4], MEASURED_WINDOWS[6], MEASURED_WINDOWS[7]];
+  for (const base of windows) {
+    const limit = cssLimit(base.viewport);
+    for (const below of [base.below, base.below + 0.25, base.below + 0.5, base.below + 0.75]) {
+      for (const collapseY of [base.collapseY, base.collapseY + 0.5]) {
+        const size = { ...base, limit, below, collapseY };
+        const label = `${size.name}, limit ${limit.toFixed(2)}, below ${below}, page ${collapseY}`;
+        const view = collapsedFrom(size, "bottom");
+        const start = { ...heldView(view), ...sized(view) };
+        const sizes = [];
+        // The box's height on the page, fractional at its limit.
+        const tall = () => view.panel.box.getBoundingClientRect().height;
+        for (let pin = 1; pin <= 5; pin += 1) {
+          const before = tall();
+          pinLink(view);
+          const after = { ...heldView(view), ...sized(view) };
+          sizes.push(after.box);
+          // Released too much, the page is held back: it moves.
+          if (JSON.stringify(heldView(view)) !== JSON.stringify({ control: start.control, pageY: start.pageY, offsets: start.offsets })) {
+            unsettled.push(`${label}, pin ${pin}: moved ${JSON.stringify(start)} > ${JSON.stringify(after)}`);
+          }
+          if (tall() > before) unsettled.push(`${label}, pin ${pin}: the box grew from ${before} to ${tall()}`);
+          // The first pin gives back all it may: the room, or the page's last whole pixel of slack.
+          const origin = String(view.panel.box.svg.getAttribute("viewBox")).split(" ").map(Number);
+          const room = after.drawing + origin[1] - Math.ceil(view.T.drawnModel().height);
+          const slack = Math.floor(view.page.range() - view.page.scrollY);
+          if (pin === 1 && room > 0 && slack > 0) unsettled.push(`${label}, pin 1: ${room} px of room kept with ${slack} px of slack`);
+        }
+        if (sizes.some((value) => value !== sizes[0])) unsettled.push(`${label}: box heights ${sizes.join(", ")}`);
+      }
+    }
+  }
+  assert.deepEqual(unsettled, [], "settled after the first pin, nothing moved, the box never grew");
 });
