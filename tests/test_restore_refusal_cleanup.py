@@ -546,10 +546,79 @@ class RollbackSnapshotTimestampBoundTests(_ImportRootCleanup):
         self.assertEqual(activated, [True])
         self.assertIn("injected settings reload failure", str(failed.exception))
         self.assertNotIn("Rollback failed", str(failed.exception))
+        # The rollback restores the original SQL contents (rows and full
+        # dump), not identical file bytes: the SQLite copy rewrites header
+        # fields such as the change counter, as it always has.
         self.assertEqual(_metric_rows(live), original_rows)
         self.assertEqual(_dump(live), original_dump)
         # The imported history was published and is now gone again.
         self.assertNotIn((self.ORDINARY, 0, 30), _metric_rows(live))
+
+    def test_public_restore_refuses_an_oversized_backup_however_it_is_called(
+        self,
+    ) -> None:
+        (self.root / "live").mkdir()
+        live = _history_database(self.root / "live" / "history.sqlite3", [self.ORDINARY])
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        candidate = _history_database(
+            self.root / "candidate.sqlite3", [self.ORDINARY, self.OVERSIZED]
+        )
+        original_dump = _dump(live)
+        attempts: list[Callable[[], None]] = [
+            lambda: store.restore_backup(candidate),
+            lambda: store.restore_backup(source_path=candidate),
+            lambda: store.restore_backup(candidate, rollback_snapshot=True),  # type: ignore[call-arg]
+            lambda: store.restore_backup(candidate, True),  # type: ignore[call-arg]
+        ]
+        for index, attempt in enumerate(attempts):
+            with self.subTest(attempt=index):
+                with self.assertRaises((ValueError, TypeError)):
+                    attempt()
+                self.assertEqual(_dump(live), original_dump)
+                self.assertNotIn((self.OVERSIZED, 0, 30), _metric_rows(live))
+
+    def test_rollback_restore_only_accepts_the_snapshot_the_store_created(self) -> None:
+        (self.root / "live").mkdir()
+        live = _history_database(self.root / "live" / "history.sqlite3", [self.ORDINARY])
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        candidate = _history_database(
+            self.root / "candidate.sqlite3", [self.ORDINARY, self.OVERSIZED]
+        )
+        original_dump = _dump(live)
+        restore_snapshot: Callable[[Path], None] | None = getattr(
+            store, "_restore_rollback_snapshot", None
+        )
+        assert restore_snapshot is not None, "the store has no private rollback restore"
+        create_snapshot: Callable[[Path], Path] = getattr(store, "_create_rollback_snapshot")
+
+        # A backup the store did not create as a rollback snapshot is refused.
+        with self.assertRaises(ValueError):
+            restore_snapshot(candidate)
+        self.assertEqual(_dump(live), original_dump)
+
+        # An ordinary store backup is not a rollback snapshot either.
+        plain_backup = store.create_backup(self.root / "plain", retention_count=1)
+        assert plain_backup is not None
+        with self.assertRaises(ValueError):
+            restore_snapshot(plain_backup)
+
+        # A registered snapshot whose file was replaced is refused.
+        snapshot = create_snapshot(self.root / "rollback-a")
+        os.replace(candidate, snapshot)
+        with self.assertRaises(ValueError):
+            restore_snapshot(snapshot)
+        self.assertEqual(_dump(live), original_dump)
+        self.assertNotIn((self.OVERSIZED, 0, 30), _metric_rows(live))
+
+        # The store's own snapshot restores once, with its original contents.
+        snapshot = create_snapshot(self.root / "rollback-b")
+        replacement = _history_database(self.root / "replacement.sqlite3", [self.ORDINARY] * 3)
+        store.restore_backup(replacement)
+        self.assertEqual(len(_metric_rows(live)), 3)
+        restore_snapshot(snapshot)
+        self.assertEqual(_dump(live), original_dump)
+        with self.assertRaises(ValueError):
+            restore_snapshot(snapshot)
 
     def test_incoming_backup_with_an_oversized_timestamp_is_still_refused(self) -> None:
         live = self.root / "live" / "history.sqlite3"

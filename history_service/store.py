@@ -735,6 +735,9 @@ class HistoryStore:
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         # Exact per-system hot counts, kept current without full rescans (#664).
         self._hot_summary_counts = HotSystemSummaryCounts()
+        # Rollback snapshots this store wrote for an import, by path and file
+        # identity; only these restore without the timestamp bound (#1292).
+        self._rollback_snapshots: dict[Path, tuple[int, int, int, int]] = {}
         # Deferred index builds and exact-count scans do not overlap (#1092).
         self._index_maintenance_condition = threading.Condition()
         self._index_maintenance_depth = 0
@@ -2633,6 +2636,59 @@ class HistoryStore:
         latest = max(snapshots, key=lambda candidate: candidate.stat().st_mtime)
         return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
 
+    @staticmethod
+    def _snapshot_identity(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+    def _create_rollback_snapshot(self, backup_dir: str | Path) -> Path | None:
+        """Write an import rollback snapshot and remember exactly that file."""
+        snapshot = self.create_backup(
+            backup_dir,
+            retention_count=1,
+            long_term_backup_dir=None,
+            weekly_retention_count=0,
+            monthly_retention_count=0,
+        )
+        if snapshot is None:
+            return None
+        snapshot = Path(snapshot)
+        identity = self._snapshot_identity(snapshot)
+        if identity is None:
+            raise ValueError("The rollback snapshot is not a regular file.")
+        with self._lock:
+            self._rollback_snapshots = {
+                path: known
+                for path, known in self._rollback_snapshots.items()
+                if self._snapshot_identity(path) == known
+            }
+            self._rollback_snapshots[snapshot] = identity
+        return snapshot
+
+    def _restore_rollback_snapshot(self, snapshot_path: str | Path) -> None:
+        """Restore a snapshot from ``_create_rollback_snapshot``, once.
+
+        The live history can already hold timestamp text that earlier versions
+        admitted, so this is the one restore that skips the bound; it refuses
+        any file this store did not write as a rollback snapshot (#1292).
+        """
+        snapshot = Path(snapshot_path)
+        with self._lock:
+            known = self._rollback_snapshots.pop(snapshot, None)
+        if known is None or self._snapshot_identity(snapshot) != known:
+            raise ValueError(f"{snapshot} is not a rollback snapshot this history store wrote.")
+        self._require_unsegmented_operation("v1 restore")
+        try:
+            with history_write_lock(self.file_path, blocking=False):
+                self._restore_backup_locked(snapshot, rollback_snapshot=True)
+        finally:
+            self._hot_summary_counts.clear()
+
     def _restore_backup_locked(
         self, source_path: str | Path, *, rollback_snapshot: bool = False
     ) -> None:
@@ -2663,10 +2719,9 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
-                    # The bound guards incoming backups only. An import's own
-                    # rollback snapshot holds the live history as it was,
-                    # including text earlier versions admitted, and must
-                    # always restore (#1292).
+                    # The bound guards incoming backups only. Only
+                    # _restore_rollback_snapshot, after checking the file is
+                    # the store's own snapshot, skips it (#1292).
                     if not rollback_snapshot:
                         require_bounded_restored_timestamps(restore_connection)
                     # The backup's counters are outside input that sizes
@@ -2693,13 +2748,11 @@ class HistoryStore:
                 os.close(temp_fd)
             self._discard_owned_path(temp_path, temp_metadata)
 
-    def restore_backup(
-        self, source_path: str | Path, *, rollback_snapshot: bool = False
-    ) -> None:
+    def restore_backup(self, source_path: str | Path) -> None:
         self._require_unsegmented_operation("v1 restore")
         try:
             with history_write_lock(self.file_path, blocking=False):
-                self._restore_backup_locked(source_path, rollback_snapshot=rollback_snapshot)
+                self._restore_backup_locked(source_path)
         finally:
             self._hot_summary_counts.clear()
 
