@@ -8,7 +8,7 @@
 {% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label == "Synthetic IDs") %}
 <div class="app-shell">
   <header class="topbar">
-    <div>
+    <div class="topbar-copy">
       <p class="eyebrow" id="header-eyebrow">
         {{ profile.eyebrow if profile and profile.eyebrow else (snapshot.selected_system_label or "TrueNAS JBOD Enclosure UI") }}
       </p>

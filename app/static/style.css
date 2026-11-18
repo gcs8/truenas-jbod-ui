@@ -79,6 +79,15 @@ textarea {
   margin-bottom: 18px;
 }
 
+/* The heading column: the line above the title holds the selected system
+   name, which may be one long word. Let the column shrink below it and break
+   the word anywhere, so a name wraps inside the header instead of widening
+   the page (#1381). */
+.topbar-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .topbar h1,
 .panel h2,
 .detail-slot-head h3 {
