@@ -150,6 +150,36 @@ def _redfish_error_message(body: bytes) -> str | None:
     return normalize_text(error_block.get("message"))
 
 
+def _redfish_unusable(path: str) -> TrueNASAPIError:
+    return TrueNASAPIError(
+        "Redfish returned an unusable response.",
+        category="response_invalid",
+        method=path,
+    )
+
+
+def _redfish_text(payload: dict[str, Any], key: str, path: str) -> str | None:
+    """A Redfish text member: absent or null is unknown; a non-string is unusable (#1312)."""
+
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _redfish_unusable(path)
+    return normalize_text(value)
+
+
+def _redfish_members(payload: dict[str, Any], key: str, path: str) -> list[Any]:
+    """A Redfish collection member: absent or null is empty; a non-array is unusable (#1312)."""
+
+    value = payload.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise _redfish_unusable(path)
+    return value
+
+
 def _bmc_warning(exc: TrueNASAPIError, operation: str, fixed_text: str) -> str:
     """This service's own sentence as it is; anything from the BMC as fixed text."""
 
@@ -238,10 +268,15 @@ class SupermicroBMCService:
             raise LocalServiceError("Supermicro BMC drive identify request did not return success.", category="response_invalid")
 
     def _populate_redfish_inventory(self, inventory: BMCInventory) -> None:
-        system_payload = self._redfish_get_json("/redfish/v1/Systems/1")
-        inventory.system_model = normalize_text(system_payload.get("Model")) or inventory.system_model
-        inventory.system_serial = normalize_text(system_payload.get("SerialNumber")) or inventory.system_serial
-        inventory.system_indicator_led = normalize_text(system_payload.get("IndicatorLED")) or inventory.system_indicator_led
+        system_path = "/redfish/v1/Systems/1"
+        system_payload = self._redfish_get_json(system_path)
+        # Every consumed member is checked before any is applied.
+        model = _redfish_text(system_payload, "Model", system_path)
+        serial = _redfish_text(system_payload, "SerialNumber", system_path)
+        indicator_led = _redfish_text(system_payload, "IndicatorLED", system_path)
+        inventory.system_model = model or inventory.system_model
+        inventory.system_serial = serial or inventory.system_serial
+        inventory.system_indicator_led = indicator_led or inventory.system_indicator_led
         inventory.source_details["redfish_ok"] = True
 
         try:
@@ -260,35 +295,50 @@ class SupermicroBMCService:
     def _populate_redfish_simple_storage_fallback(self, inventory: BMCInventory) -> None:
         for path in ("/redfish/v1/Systems/1/SimpleStorage/1", "/redfish/v1/Systems/1/SimpleStorage/2"):
             try:
-                payload = self._redfish_get_json(path)
-            except TrueNASAPIError:
+                drives = self._read_redfish_simple_storage(path)
+            except TrueNASAPIError as exc:
+                if exc.category == "response_invalid":
+                    # An unusable resource adds no drives, and says so (#1312).
+                    _log_bmc_failure("BMC Redfish storage fallback", exc)
+                    warning = "BMC Redfish storage fallback returned an unusable response."
+                    if warning not in inventory.warnings:
+                        inventory.warnings.append(warning)
                 continue
-            devices = payload.get("Devices") or []
-            for index, device in enumerate(devices):
-                if not isinstance(device, dict):
-                    continue
-                name = normalize_text(device.get("Name"))
-                slot_number = None
-                if name:
-                    match = re.search(r"Physical Drive\s+(\d+)", name)
-                    if match:
-                        slot_number = int(match.group(1))
-                inventory.drives.append(
-                    BMCDriveRecord(
-                        controller_id=0,
-                        physical_index=index,
-                        slot_number=slot_number,
-                        enclosure_id=None,
-                        vendor=normalize_text(device.get("Manufacturer")),
-                        model=normalize_text(device.get("Model")) or name,
-                        serial=None,
-                        size_bytes=None,
-                        health=normalize_text(device.get("Status", {}).get("Health")) if isinstance(device.get("Status"), dict) else None,
-                        interface_type=normalize_text(payload.get("Description")),
-                        identify_active=False,
-                        raw={"redfish_simple_storage": device},
-                    )
+            inventory.drives.extend(drives)
+
+    def _read_redfish_simple_storage(self, path: str) -> list[BMCDriveRecord]:
+        """One SimpleStorage resource's drives, all or none: a wrong-typed member is unusable."""
+
+        payload = self._redfish_get_json(path)
+        interface_type = _redfish_text(payload, "Description", path)
+        drives: list[BMCDriveRecord] = []
+        for index, device in enumerate(_redfish_members(payload, "Devices", path)):
+            if not isinstance(device, dict):
+                continue
+            name = _redfish_text(device, "Name", path)
+            slot_number = None
+            if name:
+                match = re.search(r"Physical Drive\s+(\d+)", name)
+                if match:
+                    slot_number = int(match.group(1))
+            status = device.get("Status")
+            drives.append(
+                BMCDriveRecord(
+                    controller_id=0,
+                    physical_index=index,
+                    slot_number=slot_number,
+                    enclosure_id=None,
+                    vendor=_redfish_text(device, "Manufacturer", path),
+                    model=_redfish_text(device, "Model", path) or name,
+                    serial=None,
+                    size_bytes=None,
+                    health=_redfish_text(status, "Health", path) if isinstance(status, dict) else None,
+                    interface_type=interface_type,
+                    identify_active=False,
+                    raw={"redfish_simple_storage": device},
                 )
+            )
+        return drives
 
     def _populate_web_inventory(self, inventory: BMCInventory) -> None:
         opener, csrf = self._open_web_session()

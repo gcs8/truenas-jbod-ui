@@ -110,6 +110,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_command_state",
     "tests.test_admin_config",
     "tests.test_admin_secret_models",
+    "tests.test_bmc_response_shapes",
     "tests.test_bounded_parser_work",
     "tests.test_changelog_entry_gate",
     "tests.test_changelog_fragments",
