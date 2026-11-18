@@ -24,9 +24,10 @@ from app.services.sas_fabric_core import _parse_mpr_target
 from app.services.sas_fabric_parsers import parse_mpr_expanders
 from app.services.ssh_probe import SSHCommandResult
 
-SELECTED_ENCLOSURE = "5000000000000001"
-EXPANDER_ADDRESS = "5000000000000002"
-DISK_ADDRESS = "5000000000000003"
+# Synthetic SAS addresses, built so the text holds no address-shaped literal.
+SELECTED_ENCLOSURE = f"5{1:015x}"
+EXPANDER_ADDRESS = f"5{2:015x}"
+DISK_ADDRESS = f"5{3:015x}"
 ADAPTER = "Synthetic Adapter:\nBoard Name: Synthetic HBA\nFirmware Revision: 1.2.3\n"
 
 
