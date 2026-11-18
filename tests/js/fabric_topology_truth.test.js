@@ -2154,7 +2154,7 @@ test("a redraw after the window got shorter keeps the view and sizes the room fo
 });
 
 // An expand or collapse whose control was not in view keeps the drawing's
-// vertical offset (its horizontal one keeps the shelf in view, as before):
+// vertical offset (and its horizontal one, tested below):
 // the page and the box's height stay as they would for a pin. At the 1,920 px
 // widths the legend above the box keeps its rows, so the box stays put too.
 test("a collapse whose control is out of view keeps the vertical offset, the page and the box's height", () => {
@@ -2179,6 +2179,38 @@ test("a collapse whose control is out of view keeps the vertical offset, the pag
     if (JSON.stringify(after) !== JSON.stringify(before) || sized(view).box !== box) moved.push(`${size.name}: ${JSON.stringify(before)} > ${JSON.stringify(after)}, box ${box} > ${sized(view).box}`);
   }
   assert.deepEqual(moved, [], "nothing moves");
+});
+
+// A browser measured the kept left offset going from -208 to 0 at 1920x900,
+// 1920x700 and 1920x1080 on a collapse whose control was out of view: the
+// view began in the room before the drawing's left edge, and a host moved
+// 208 px in the window. Such a redraw keeps the horizontal offset too,
+// room before the left edge included, and the drawing does not move.
+test("a toggle whose control is out of view keeps the horizontal offset, room before the left edge included", () => {
+  const moved = [];
+  for (const size of [MEASURED_WINDOWS[1], MEASURED_WINDOWS[2], MEASURED_WINDOWS[4]]) {
+    for (const scrolled of [0, 150]) {
+      const view = measuredPage(bigShelf(), size);
+      const { panel, page } = view;
+      const key = expandControls(panel)[0].key;
+      toggleFrom(view, size, key, "top", size.expandY);
+      const control = expandControls(panel).find((item) => item.key === key);
+      panel.box.scrollLeft = scrolled;
+      panel.box.scrollTop = control.y + 1000;
+      page.scrollTo(0, size.collapseY);
+      const label = `${size.name}, ${scrolled}`;
+      assert.ok(screenPoint(panel, control)[1] + 22 < panel.box.getBoundingClientRect().top, `${label}: the control is out of view`);
+      const host = () => screenPoint(panel, view.T.drawnModel().nodes.find((item) => item.kind === "host"));
+      const held = () => ({ offsets: heldView({ ...view, key }).offsets, host: host(), pageY: page.scrollY });
+      const before = held();
+      assert.equal(before.offsets[0], scrolled - 208, `${label}: the view begins before the drawing's left edge`);
+      view.click({ "data-fabric-expand-slots": key });
+      assert.match(panel.innerHTML, /aria-expanded="false"/, `${label}: collapsed`);
+      const after = held();
+      if (JSON.stringify(after) !== JSON.stringify(before)) moved.push(`${label}: ${JSON.stringify(before)} > ${JSON.stringify(after)}`);
+    }
+  }
+  assert.deepEqual(moved, [], "nothing moves sideways");
 });
 
 // Only a redraw whose kept view needs room after the drawing for the box's
