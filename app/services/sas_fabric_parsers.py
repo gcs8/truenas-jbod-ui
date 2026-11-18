@@ -833,6 +833,11 @@ def _parse_mpr_sense_message(message: str) -> dict[str, str]:
     return parsed
 
 
+# A failed unit read whose unit was not admitted carries this fixed reason in
+# place of a controller name.
+MPR_REJECTED_CONTROLLER_REASON = "not_a_unit_number"
+
+
 def admit_mpr_unit_number(token: str | None) -> int | None:
     """A controller unit number is 1 to 4 ASCII digits; anything else is rejected."""
     return int(token) if token is not None and _MPR_UNIT_NUMBER.fullmatch(token) else None

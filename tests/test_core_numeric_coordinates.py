@@ -1,22 +1,28 @@
 """CORE numeric coordinates: MPR target numbers, enclosure handles and failed-read controller units.
 
-Two numbers the CORE fabric reads from mprutil text must be admitted by one
+Three numbers the CORE fabric reads from mprutil text must be admitted by one
 bounded ASCII grammar and compared as numbers:
 
 - an MPR or CAM target number is 1 to 9 ASCII digits; anything else is no
   target, never an exception (#1276);
 - the expander list prints its enclosure handle in decimal ("%04d") while the
   device and enclosure lists print the same handle in hexadecimal ("%04x"), so
-  the expander's field is read as decimal before it is compared (#1280).
+  the expander's field is read as decimal before it is compared (#1280);
+- a failed numbered mprutil read names its controller only when the unit is a
+  unit number the fabric admits; a rejected unit is fixed metadata and a count,
+  not a copy of the token (#1317).
 """
 
+import json
 import unittest
 
 from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, SlotView
+from app.services.inventory import InventoryService
 from app.services.sas_fabric import build_sas_fabric_snapshot
 from app.services.sas_fabric_core import _parse_mpr_target
 from app.services.sas_fabric_parsers import parse_mpr_expanders
+from app.services.ssh_probe import SSHCommandResult
 
 SELECTED_ENCLOSURE = "5000000000000001"
 EXPANDER_ADDRESS = "5000000000000002"
@@ -147,6 +153,60 @@ class MprEnclosureHandleBaseTests(unittest.TestCase):
         _fabric, _expanders, selected, links = self._selected_links(10, "000a")
         self.assertEqual(selected, [])
         self.assertEqual(links, [])
+
+
+def _failure_records(*commands: str) -> list[dict]:
+    results = [SSHCommandResult(command=command, ok=False, exit_code=1) for command in commands]
+    return InventoryService._ssh_failure_details(results)
+
+
+class FailedReadControllerUnitTests(unittest.TestCase):
+    """#1317: a failed read's controller uses the fabric's unit grammar."""
+
+    REJECTED_UNITS = {
+        "2000 ASCII digits": "9" * 2000,
+        "five ASCII digits": "12345",
+        "non-ASCII decimal digit": "\u0663",
+    }
+
+    def test_admitted_unit_keeps_its_controller(self) -> None:
+        # Control: an ordinary bounded unit stays associated with its controller.
+        for unit in ("0", "7", "9999"):
+            with self.subTest(unit=unit):
+                [record] = _failure_records(f"sudo -n /usr/sbin/mprutil -u {unit} show adapter")
+                self.assertEqual(record["controller"], f"mpr{unit}")
+                self.assertNotIn("controller_rejected", record)
+
+        fabric = _core_fabric({}, command_failures=_failure_records("sudo -n /usr/sbin/mprutil -u 7 show adapter"))
+        self.assertEqual(fabric.raw["controller_read"]["units"], [{"controller": "mpr7", "result": "command_failed"}])
+        self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 0)
+
+    def test_rejected_unit_is_fixed_metadata_not_a_copy_of_the_token(self) -> None:
+        for name, unit in self.REJECTED_UNITS.items():
+            with self.subTest(name):
+                [record] = _failure_records(f"sudo -n /usr/sbin/mprutil -u {unit} show adapter")
+
+                self.assertFalse("controller" in record, sorted(record))
+                self.assertEqual(record.get("controller_rejected"), "not_a_unit_number")
+                self.assertEqual(record["context"], "sas_fabric_mprutil_adapter")
+                self.assertFalse(unit in json.dumps(record, ensure_ascii=False), "the unit token was published")
+
+    def test_rejected_unit_is_counted_and_not_published_by_the_fabric(self) -> None:
+        for name, unit in self.REJECTED_UNITS.items():
+            with self.subTest(name):
+                failures = _failure_records(
+                    f"sudo -n /usr/sbin/mprutil -u {unit} show adapter",
+                    f"sudo -n /usr/sbin/mprutil -u {unit} show devices",
+                )
+                fabric = _core_fabric({"mprutil -u 0 show adapter": ADAPTER}, command_failures=failures)
+
+                self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 1)
+                self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "partial")
+                serialized = json.dumps(fabric.model_dump(mode="json"), ensure_ascii=False)
+                self.assertFalse(f"mpr{unit}" in serialized, "the unit token was published")
+                for record in fabric.raw["command_failures"]:
+                    self.assertFalse("controller" in record, sorted(record))
+                    self.assertTrue(all(len(str(value)) < 100 for value in record.values()), sorted(record))
 
 
 if __name__ == "__main__":

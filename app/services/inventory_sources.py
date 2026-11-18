@@ -63,6 +63,7 @@ from app.services.sas_fabric import (
     CORE_PCICONF_LV_OPTIONAL_COMMAND,
     build_core_mprutil_unit_commands,
 )
+from app.services.sas_fabric_parsers import MPR_REJECTED_CONTROLLER_REASON, admit_mpr_unit_number
 from app.services.ssh_probe import (
     SSH_INTERNAL_ERROR_REASON,
     SSHCommandResult,
@@ -234,8 +235,10 @@ SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
     ),
 )
 
+# Any unit token: the failure context names the controller only for a unit
+# number the fabric admits (1 to 4 ASCII digits, `admit_mpr_unit_number`).
 MPRUTIL_UNIT_COMMAND_PATTERN = re.compile(
-    r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$"
+    r"^mprutil -u (?P<unit>\S+) show (?P<subcommand>[a-z]+)$"
 )
 
 # The unnumbered form reads the one controller of a host that has no unit
@@ -532,12 +535,20 @@ class InventorySourceCollectionMixin:
         unit_match = MPRUTIL_UNIT_COMMAND_PATTERN.match(canonical_command)
         if unit_match:
             subcommand = unit_match.group("subcommand")
+            unit = unit_match.group("unit")
+            # A unit the fabric does not admit is a fixed reason, never a
+            # copy of the token: it may be any length or script.
+            controller = (
+                {"controller": f"mpr{unit}"}
+                if admit_mpr_unit_number(unit) is not None
+                else {"controller_rejected": MPR_REJECTED_CONTROLLER_REASON}
+            )
             return {
                 "context": f"sas_fabric_mprutil_{subcommand}",
                 "context_label": MPRUTIL_SUBCOMMAND_LABELS.get(
                     subcommand, f"mprutil {subcommand}"
                 ),
-                "controller": f"mpr{unit_match.group('unit')}",
+                **controller,
                 "criticality": "enrichment",
             }
 

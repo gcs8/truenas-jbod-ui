@@ -25,6 +25,7 @@ from app.services.core_expander_counters import KeptCounterRead
 from app.services.parsers import canonicalize_ssh_command, normalize_text, parse_camcontrol_devlist
 from app.services.sas_fabric_parsers import (
     CORE_MPRUTIL_UNIT_SUBCOMMANDS as CORE_MPRUTIL_UNIT_SUBCOMMANDS,
+    MPR_REJECTED_CONTROLLER_REASON,
     _freebsd_pci_location_to_address as _freebsd_pci_location_to_address,
     _mpr_dmesg_event_type as _mpr_dmesg_event_type,
     _mpr_dmesg_severity as _mpr_dmesg_severity,
@@ -2008,6 +2009,9 @@ _MPR_UNIT_READ_FAILURE_CONTEXT = re.compile(r"sas_fabric_mprutil_(?:adapter|all|
 _MPR_UNNUMBERED_READ_FAILURE_CONTEXT = "sas_fabric_mprutil"
 _MPR_FAILURE_CONTROLLER = re.compile(r"mpr(?P<unit>\d+)")
 _MPR_READ_NAME_LIMIT = 8
+# Stands for the unit tokens of failed reads whose unit was not admitted; no
+# unit token contains a space, so it cannot equal one.
+_REJECTED_FAILED_READ_UNIT = "rejected failed read"
 
 
 def _bounded_name_list(names: list[str]) -> str:
@@ -2049,6 +2053,16 @@ def _mpr_unit_read_results(
             note(match.group("unit"), text=bool(value.strip()), failed=False)
     for failure in command_failures or []:
         context, controller = failure.get("context"), failure.get("controller")
+        if (
+            isinstance(context, str)
+            and _MPR_UNIT_READ_FAILURE_CONTEXT.fullmatch(context)
+            and controller is None
+            and failure.get("controller_rejected") == MPR_REJECTED_CONTROLLER_REASON
+        ):
+            # The record keeps no token, so every such record is one rejected
+            # unit between them: a lower bound, never zero.
+            rejected.add(_REJECTED_FAILED_READ_UNIT)
+            continue
         if not isinstance(context, str) or not isinstance(controller, str):
             continue
         if context == _MPR_UNNUMBERED_READ_FAILURE_CONTEXT and controller == _LEGACY_MPR_CONTROLLER_NAME:
