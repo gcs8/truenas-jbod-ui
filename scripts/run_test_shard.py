@@ -96,6 +96,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_account_bootstrap",
         "test_admin_config",
         "test_backup_7z_split",
+        "test_bmc_response_shapes",
         "test_bounded_parser_work",
         "test_changelog_entry_gate",
         "test_changelog_fragments",
@@ -141,6 +142,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_system_setup_field_ownership",
         "test_system_setup_legacy_add",
         "test_truenas_ws",
+        "test_truenas_ws_envelope_members",
     ),
     "2": (
         "test_admin_runtime_behavior_request_shape",
