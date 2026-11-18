@@ -2275,6 +2275,40 @@ test("a toggle whose control is out of view keeps the horizontal offset, room be
   assert.deepEqual(moved, [], "nothing moves sideways");
 });
 
+// The same for an expansion: after the off-view collapse above, the shelf
+// is expanded again with its control still out of view. The view still
+// begins in the room before the drawing's left edge, and the growing
+// drawing keeps that horizontal offset, the vertical one and the page.
+test("an expansion whose control is out of view keeps the horizontal offset, room before the left edge included", () => {
+  const moved = [];
+  for (const size of [MEASURED_WINDOWS[1], MEASURED_WINDOWS[2], MEASURED_WINDOWS[4]]) {
+    for (const scrolled of [0, 150]) {
+      const view = measuredPage(bigShelf(), size);
+      const { panel, page } = view;
+      const key = expandControls(panel)[0].key;
+      toggleFrom(view, size, key, "top", size.expandY);
+      const control = () => expandControls(panel).find((item) => item.key === key);
+      panel.box.scrollLeft = scrolled;
+      panel.box.scrollTop = control().y + 1000;
+      page.scrollTo(0, size.collapseY);
+      const label = `${size.name}, ${scrolled}`;
+      const host = () => screenPoint(panel, view.T.drawnModel().nodes.find((item) => item.kind === "host"));
+      const held = () => ({ offsets: heldView({ ...view, key }).offsets, host: host(), pageY: page.scrollY });
+      assert.ok(screenPoint(panel, control())[1] + 22 < panel.box.getBoundingClientRect().top, `${label}: the control is out of view before the collapse`);
+      view.click({ "data-fabric-expand-slots": key });
+      assert.equal(control().expanded, "false", `${label}: collapsed`);
+      const before = held();
+      assert.equal(before.offsets[0], scrolled - 208, `${label}: the view begins before the drawing's left edge`);
+      assert.ok(screenPoint(panel, control())[1] + 22 < panel.box.getBoundingClientRect().top, `${label}: the control is out of view before the expansion`);
+      view.click({ "data-fabric-expand-slots": key });
+      assert.equal(control().expanded, "true", `${label}: expanded`);
+      const after = held();
+      if (JSON.stringify(after) !== JSON.stringify(before)) moved.push(`${label}: ${JSON.stringify(before)} > ${JSON.stringify(after)}`);
+    }
+  }
+  assert.deepEqual(moved, [], "nothing moves sideways");
+});
+
 // Only a redraw whose kept view needs room after the drawing for the box's
 // recorded height sizes twice; one with no room that needs none sizes once
 // and reads nothing of the page.
