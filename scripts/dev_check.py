@@ -166,6 +166,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_truenas_ws_envelope_members",
     "tests.test_unittest_identities",
     "tests.test_unittest_shards",
+    "tests.test_unknown_speed_columns",
     "tests.test_wiki_drift_verifier",
 )
 
