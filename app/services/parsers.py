@@ -917,7 +917,10 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         existing.slot_number_degraded = slot.slot_number_degraded
         existing.description = slot.description or existing.description
         if slot.element_id is not None:
+            # Path and element are one coordinate: take both from the record
+            # that supplied the element, never one from each (#1319).
             existing.element_id = slot.element_id
+            existing.ses_device = slot.ses_device
         existing.control_targets = _merge_control_targets(
             slot.control_targets,
             existing.control_targets,
@@ -960,8 +963,11 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     existing.identify_active = existing.identify_active or slot.identify_active
     existing.status = existing.status or slot.status
     existing.description = existing.description or slot.description
-    existing.element_id = existing.element_id if existing.element_id is not None else slot.element_id
-    existing.ses_device = existing.ses_device or slot.ses_device
+    if existing.element_id is None and slot.element_id is not None:
+        existing.element_id = slot.element_id
+        existing.ses_device = slot.ses_device
+    elif existing.element_id is None and existing.ses_device is None:
+        existing.ses_device = slot.ses_device
     existing.serial = existing.serial or slot.serial
     existing.model = existing.model or slot.model
     existing.size_text = existing.size_text or slot.size_text

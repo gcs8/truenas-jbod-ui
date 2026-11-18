@@ -1900,30 +1900,25 @@ class SesOverlayMergeWorkTests(LinearGrowthAssertions):
         return overlay
 
     def test_redundant_paths_with_an_empty_bay_keep_the_previous_answer(self) -> None:
-        # The answer pinned here is inherited and kept on purpose: this change
-        # bounds the work, not the answer. Path B's stronger evidence for empty
-        # bay 3 brings its element number to a record that keeps path A's
-        # device, which names path A's bay 2. The earlier loop merged bay 3 into
-        # bay 2 when it merged the next device, so a later shelf decides
-        # whether bay 3 is shown. Tracked in the follow-up "SES merge: a bay
-        # keeps its own enclosure device and element together on every path".
-        for later_shelf, bays, score in ((True, [1, 2, 4], 7), (False, [1, 2, 4, 3], 4)):
+        # Path B's stronger evidence for empty bay 3 brings its element number
+        # together with path B's device (#1319). Before, the record kept path
+        # A's device, which names path A's bay 2, so merging the next device
+        # folded bay 3 into bay 2 and a later shelf decided whether bay 3 was
+        # shown. Now bay 3 is shown either way and bay 2 keeps only its own
+        # two targets.
+        for later_shelf, bays, score in ((True, [1, 2, 4, 3], 8), (False, [1, 2, 4, 3], 4)):
             with self.subTest(later_shelf=later_shelf):
                 overlay = self.assert_previous_overlay(_empty_bay_redundant_paths(later_shelf=later_shelf), 4)
                 shelf = overlay.ses_enclosures[0]
                 self.assertEqual(list(shelf.slots), bays)
                 self.assertEqual(InventoryService._score_sg_ses_overlay(overlay), score)
                 targets = [(item["ses_device"], item["ses_element_id"]) for item in shelf.slots[2].control_targets]
-                if later_shelf:
-                    # Bay 2 also carries bay 3's two targets, as before.
-                    self.assertEqual(targets, [("/dev/sg100", 1), ("/dev/sg101", 2), ("/dev/sg101", 1), ("/dev/sg100", 2)])
-                else:
-                    self.assertEqual(targets, [("/dev/sg100", 1), ("/dev/sg101", 2)])
+                self.assertEqual(targets, [("/dev/sg100", 1), ("/dev/sg101", 2)])
 
     def test_two_hosts_choose_the_host_the_previous_overlay_chose(self) -> None:
         # Two hosts read the same shelves; one enumerates the paths the other
-        # way round, so only that host's overlay keeps bay 3. The host with more
-        # bays is chosen, as it was before.
+        # way round. Path order no longer changes the bays (#1319): both
+        # overlays keep bay 3 and score the same, so the first host is chosen.
         for first_host_path_b_first in (False, True):
             with self.subTest(first_host_path_b_first=first_host_path_b_first):
                 host_pages = {
@@ -1934,10 +1929,9 @@ class SesOverlayMergeWorkTests(LinearGrowthAssertions):
                 overlay, failures, best_host = asyncio.run(
                     InventoryService._fetch_sg_ses_overlay(service, ["node-a", "node-b"], failure_prefix="SES")
                 )
-                chosen = "node-a" if first_host_path_b_first else "node-b"
+                chosen = "node-a"
                 self.assertEqual(failures, [])
-                self.assertEqual(service.scores, {"node-a": 8 if first_host_path_b_first else 7,
-                                                  "node-b": 7 if first_host_path_b_first else 8})
+                self.assertEqual(service.scores, {"node-a": 8, "node-b": 8})
                 self.assertEqual(best_host, chosen)
                 devices, results = _host_results(host_pages[chosen])
                 expected, _ = _reference_host_overlay(4, chosen, devices, results)
