@@ -2104,6 +2104,68 @@ test("a pin after the first view leaves the box at the drawing's natural height,
   }
 });
 
+// The page as its own startup render leaves it, before any other render:
+// topologyPage renders once more, which can give back room the startup
+// render padded. Every mount's writes of the drawing's height are counted
+// from the start.
+function startupPage(fabric, size) {
+  const page = fakePage({ viewport: size.viewport, above: 0, below: size.below });
+  const dom = fakeDom();
+  dom.document.documentElement = page.root;
+  const T = H.loadTopology({ document: dom.document, window: page.bind({}) });
+  const sizings = [];
+  const mount = T.mount;
+  T.mount = (container, ...rest) => {
+    const svg = container?.box?.svg;
+    let count = 0;
+    if (svg) {
+      const write = svg.setAttribute;
+      svg.setAttribute = (name, value) => {
+        if (name === "height") count += 1;
+        write(name, value);
+      };
+    }
+    mount(container, ...rest);
+    sizings.push(count);
+  };
+  const snapshot = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, slots: [] };
+  let panel = null;
+  const loaded = loadFullPage(T, dom.document, fabric, snapshot, (id, item) => {
+    if (id === "fabric-map-panel") {
+      panel = item;
+      scrollingPanel(item, { inner: size.inner, height: () => size.limit, page });
+    }
+  }, page);
+  const documentClick = dom.documentHandlers.find((item) => item.name === "click").handler;
+  const click = (attributes) => {
+    const target = pageTarget(attributes, panel.querySelector(".fabric-topology"));
+    panel.handlers.get("click")({ type: "click", target });
+    documentClick({ type: "click", target });
+  };
+  return { T, panel, page, sizings, click, app: loaded.page };
+}
+
+// The startup render itself draws the drawing at its natural height, sized
+// once and without reading the page's length; a pin right after it keeps
+// that. A startup render that took the kept-height path, or padded the
+// drawing to the window, would size twice or draw it taller.
+test("the page's startup render draws the drawing at its natural height, sized once, and a pin right after it keeps that", () => {
+  for (const size of [MEASURED_WINDOWS[0], MEASURED_WINDOWS[4], MEASURED_WINDOWS[7]]) {
+    const view = startupPage(bigShelf(), size);
+    assert.ok(view.panel?.box, `${size.name}: the startup render drew the topology`);
+    const natural = Math.ceil(view.T.drawnModel().height);
+    assert.equal(natural, 681, `${size.name}: the drawing's natural height`);
+    const first = sized(view);
+    assert.deepEqual(first, { box: Math.min(natural, size.limit), drawing: natural }, `${size.name}: the startup view`);
+    assert.deepEqual(view.sizings, [1], `${size.name}: the startup render mounted once and sized once`);
+    assert.equal(view.page.reads, 0, `${size.name}: the startup render does not read the page's length`);
+    pinLink(view);
+    assert.deepEqual(sized(view), first, `${size.name}: a pin right after startup keeps the box's height`);
+    assert.deepEqual(view.sizings, [1, 1], `${size.name}: the pin sized once`);
+    assert.equal(view.page.reads, 0, `${size.name}: the pin does not read the page's length`);
+  }
+});
+
 // The loss a browser measured repeated on each further redraw: five pins in
 // a row leave every number where the first left it.
 test("five pins in a row after a collapse leave every number where the first pin left it", () => {
