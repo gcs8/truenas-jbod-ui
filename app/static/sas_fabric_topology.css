@@ -561,9 +561,13 @@ body.fabric-topology-mode .fabric-page-shell {
     flex-wrap: wrap;
   }
 
+  /* One flex line, as wide as the row: a column that may wrap sizes its
+     line to the widest item's text, so a long status line would widen the
+     page instead of ending in an ellipsis (#1374). */
   .fabric-topology-search-row {
     flex: 1 1 100%;
     flex-direction: column;
+    flex-wrap: nowrap;
     align-items: stretch;
   }
 

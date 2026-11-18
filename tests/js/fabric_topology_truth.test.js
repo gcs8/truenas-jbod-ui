@@ -2363,13 +2363,17 @@ test("a refresh with unchanged data keeps the drawing, its offsets and the page 
 
 // ---- the search status line never moves the page (#1374) -----------------
 
-// The panel header above the drawing as its stylesheet lays it out, for the
-// status line's text at a window width: the heading column beside the search
-// row, which wraps its label, input and status line. A browser measured a
-// search for "bay 3" on the 1,024-bay shelf moving the page 12 px at 1600 px
-// and nothing at 1920 px and wider: the widths per character and the heights
-// below are chosen so the stylesheet before #1374, which has no rule for the
-// status line, gives exactly that.
+// A calibrated stand-in for the panel header above the drawing, not a layout
+// engine: for the status line's text at a window width, the heading column
+// beside the search row, which wraps its label, input and status line. A
+// browser measured a search for "bay 3" on the 1,024-bay shelf moving the page
+// 12 px at 1600 px and nothing at 1920 px and wider. The widths per character
+// and the heights below were chosen so the stylesheet before #1374, which has
+// no rule for the status line, gives exactly those numbers: the model is
+// calibrated to the browser's measurement and does not reproduce it
+// independently. It does not model the narrow-screen column layout either;
+// the browser spec qa/header-and-disk-path-layout.spec.js measures the real
+// header at 390 px.
 const STATUS_RULE = "#fabric-topology-search-status";
 function searchHeader(css, windowWidth) {
   const rule = (selector) => new RegExp(`(?:^|\\n|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
@@ -2392,6 +2396,7 @@ function searchHeader(css, windowWidth) {
 }
 
 test("the header model gives the browser's 12 px at 1600 px and nothing at 1920 px for the stylesheet without a status line rule", () => {
+  // A calibration check: the constants were chosen to give these numbers.
   // The status for "bay 3" with the shelf drawn in full and collapsed.
   for (const text of ["1 match: Bay 03.", "1 match: Bay 03 (inside a collapsed block)."]) {
     assert.equal(searchHeader("", 1600)(text) - searchHeader("", 1600)(""), 12, text);
@@ -2480,6 +2485,28 @@ test("the search status line holds one line of its own in the search row at ever
       assert.equal(header(text), header(""), `${width} px: "${text.slice(0, 20)}"`);
     }
   }
+});
+
+test("on narrow screens the stacked search row is one flex line, so a long status line is as wide as the row and ends in an ellipsis", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const css = fs.readFileSync(path.join(H.ROOT, "app/static/sas_fabric_topology.css"), "utf8");
+  // The row wraps beside the heading on wider screens.
+  const base = /(?:^|\n|\})\s*\.fabric-topology-search-row\s*\{([^}]*)\}/.exec(css)?.[1] || "";
+  assert.match(base, /flex-wrap:\s*wrap/);
+  // At 640 px and below it is a column. A column that may wrap is a
+  // multi-line flex container: its line is as wide as the widest item's own
+  // width, which for a status line that never wraps is its whole text, and
+  // the stretched status line then pushes the page wider than the window
+  // (a search for "bay" at 390 px made the page 542 px wide). One flex line
+  // is as wide as the row, so the status line fits it and is cut short.
+  const media = /@media \(max-width: 640px\)\s*\{([\s\S]*?)\n\}/.exec(css)?.[1] || "";
+  const narrow = /(?:^|\n|\})\s*\.fabric-topology-search-row\s*\{([^}]*)\}/.exec(media)?.[1] || "";
+  assert.match(narrow, /flex-direction:\s*column/, "the narrow row is a column");
+  assert.match(narrow, /flex-wrap:\s*nowrap/, "the narrow column is one flex line, as wide as the row");
+  assert.match(narrow, /align-items:\s*stretch/, "its items, the status line too, are as wide as the row");
+  assert.match(media, /\.fabric-topology-search-row #fabric-topology-search-status\s*\{[^}]*flex:\s*none/);
+  assert.doesNotMatch(media, /#fabric-topology-search-status\s*\{[^}]*(?:width|align-self)\s*:/, "nothing sizes the status line to its text");
 });
 
 test("a search status line that is cut short is readable in full on hover, and cleared with it", () => {
