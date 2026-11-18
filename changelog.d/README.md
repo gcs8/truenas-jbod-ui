@@ -50,6 +50,8 @@ tense:
 
 - no leading `- `, no heading, no blank line, no code fence, no HTML comment,
   no link reference definition (`[label]: target`; use an inline link);
+- no line that starts an ordered list item (a number followed by `.` or `)`)
+  or a blockquote (`>`); rewrap the text so no line starts with one;
 - no raw HTML: `<` followed by a letter, `/`, `!` or `?` is refused, in
   backticks too. Write a placeholder as `NAME` or `{name}` and describe a tag
   in words; `a < b` is fine;
@@ -61,6 +63,8 @@ tense:
 - no control or formatting character: no tab, no lone carriage return, no
   line or paragraph separator, no bidi control or zero-width character. The
   check names the file and shows the character escaped, for example `\t`.
+  For a tab it says to replace it with spaces; for a soft hyphen, a
+  zero-width character or a direction mark it says to remove it.
   Ordinary line ends, LF or CRLF, are fine;
 - it may wrap over several lines; at most 4096 bytes.
 
