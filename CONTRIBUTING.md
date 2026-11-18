@@ -526,7 +526,12 @@ declare it in `query_classes`. Forced refreshes pass only when a state that
 sends them declares them (`appliance_load` states, `--appliance-load`), or
 when the page declares them as `load_requests` for the target's platform (the
 QuantaStor startup re-check of locate lights): admitted only while the page
-loads, once per load, bound to the target. A refresh state may declare
+loads, once per load, bound to the target. A state whose steps click a saved
+system (the admin page's `[data-existing-system-id]`) declares it as
+`selects_system`: before its steps run, the crawler picks the run's
+`--write-system` (not-applicable when the page does not list it) or else the
+first listed system, pins the click to it and binds the state's reads to it,
+so reads for any other system stay refused. A refresh state may declare
 `follow_up_ms` (at most 60 s) for the requests its refresh chain sends after
 the steps end: only its declared forced reads with budget left, bound to the
 target, until that time passes or the next page load starts; a later
