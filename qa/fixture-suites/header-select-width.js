@@ -139,8 +139,8 @@ const PAGES = {
   main: { system: "#system-select", enclosure: "#enclosure-select" },
 };
 
-async function openPage(page, kind, caseName, width) {
-  await page.setViewportSize({ width, height: 1000 });
+async function openPage(page, kind, caseName, width, height = 1000) {
+  await page.setViewportSize({ width, height });
   const fixturePage = fixture[caseName];
   const errors = await routeSynthetic(page, fixturePage, kind === "fabric" ? fixturePage.fabricHtml : fixturePage.mainHtml);
   await page.goto(`${ORIGIN}/`);
@@ -321,6 +321,75 @@ for (const width of WIDTHS) {
       expect(errors).toEqual([]);
     });
   }
+}
+
+// #1381: the line above the main page's title shows the selected system
+// name. A 60-character name with no space made that heading column as wide
+// as the whole name, so at 390x844 the document was 549 px wide. The name now
+// wraps inside the header; the page never scrolls sideways because of it.
+const HEADING_WIDTHS = [390, 600, 820, 821, 1024, 1240, 1280, 1600, 1920, 2560];
+
+async function headingGeometry(page) {
+  return page.evaluate(() => {
+    const header = document.querySelector("header.topbar");
+    const box = header.getBoundingClientRect();
+    const lines = ["#header-eyebrow", "h1", "#header-summary"].map((selector) => {
+      const line = header.querySelector(selector);
+      const rect = line.getBoundingClientRect();
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      const lineCount = new Set(Array.from(range.getClientRects()).filter((part) => part.width > 0).map((part) => Math.round(part.top))).size;
+      return {
+        selector,
+        text: line.textContent.trim(),
+        left: rect.left,
+        right: rect.right,
+        lineCount,
+        scrollWidth: line.scrollWidth,
+        clientWidth: line.clientWidth,
+      };
+    });
+    const root = document.documentElement;
+    const wide = Array.from(document.body.querySelectorAll("*"))
+      .filter((element) => element.getBoundingClientRect().right > root.clientWidth + 0.5)
+      .slice(0, 5)
+      .map((element) => `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ""}.${Array.from(element.classList).join(".")}`);
+    return {
+      viewport: window.innerWidth,
+      header: { left: box.left, right: box.right },
+      lines,
+      page: { scrollWidth: root.scrollWidth, clientWidth: root.clientWidth },
+      wide,
+    };
+  });
+}
+
+for (const caseName of ["short", "long"]) {
+  const name = SYSTEMS[CASES[caseName].system];
+  test(`main page heading with a ${name.length}-character system name stays inside the page from 390x844 to 2560 px`, async ({ page }) => {
+    const errors = await openPage(page, "main", caseName, 390, 844);
+    for (const width of HEADING_WIDTHS) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const geometry = await headingGeometry(page);
+      const detail = `${width}px ${JSON.stringify(geometry)}`;
+      expect(geometry.viewport, "actual viewport width").toBe(width);
+      expect(geometry.lines[0].text, `${detail}: the heading shows the selected system name`).toBe(name);
+      expect(geometry.page.scrollWidth, `${detail}: no sideways page scroll`).toBeLessThanOrEqual(geometry.page.clientWidth);
+      expect(geometry.header.right, `${detail}: header inside the page`).toBeLessThanOrEqual(geometry.page.clientWidth + 0.5);
+      for (const line of geometry.lines) {
+        expect(line.left, `${detail}: ${line.selector} inside the header`).toBeGreaterThanOrEqual(geometry.header.left - 0.5);
+        expect(line.right, `${detail}: ${line.selector} inside the header`).toBeLessThanOrEqual(geometry.header.right + 0.5);
+        expect(line.scrollWidth, `${detail}: ${line.selector} text is not cut off`).toBeLessThanOrEqual(line.clientWidth);
+      }
+      if (caseName === "long" && width === 390) {
+        // The whole name is on the page: it wraps onto more lines.
+        expect(geometry.lines[0].lineCount, `${detail}: the long name wraps`).toBeGreaterThan(1);
+      }
+      if (width === 390) await capture(page, `main-heading-${caseName}-390`);
+    }
+    expect(errors).toEqual([]);
+  });
 }
 
 test("Storage Fabric re-measures and re-titles the enclosure select after a selection change", async ({ page }) => {
