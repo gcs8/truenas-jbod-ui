@@ -10,7 +10,8 @@ request number, instead of editing ``CHANGELOG.md``::
 leading zeros. ``<section>`` is one of ``breaking``, ``upgrade``,
 ``security``, ``added``, ``changed``, ``fixed``, ``performance``, ``docs`` or
 ``internal``. The file holds the text of one bullet as one inline paragraph:
-past tense, no leading ``- ``, no heading, no HTML comment, no raw HTML (not
+past tense, no leading ``- ``, no heading, no line that starts an ordered
+list item or a blockquote, no HTML comment, no raw HTML (not
 even in backticks), no link reference definition, no control or formatting
 character (a tab, a lone carriage return, a bidi control) other than its line
 breaks, at most 4096 bytes, and no ``#N``
@@ -81,6 +82,10 @@ COMMENT_DELIMITER = ("<!--", "-->")
 RAW_HTML = re.compile(r"<[A-Za-z/!?]")
 FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
 LIST_MARKER = re.compile(r"^\s*[-*+]\s")
+# Checked on the stripped lines: a line that starts an ordered list item or a
+# blockquote would render as a nested list or a quotation inside the bullet.
+ORDERED_LIST_MARKER = re.compile(r"^[0-9]{1,9}[.)](?:\s|$)")
+BLOCKQUOTE_MARKER = re.compile(r"^>")
 PARENTHETICAL = re.compile(r"\(([^()]*)\)")
 PR_TOKEN = re.compile(r"(?<![\w#])#(\d+)(?!\d)")
 SEMVER_CORE = r"(?:0|[1-9][0-9]*)"
@@ -138,6 +143,19 @@ def section_names() -> str:
 # zero-width characters), line and paragraph separators, and the lone
 # surrogates that stand for undecodable bytes in a file name.
 _UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+# What to do about the characters a person can type or paste by accident.
+_CHARACTER_REMEDIES = {
+    "\t": "replace the tab with spaces",
+    "\u00ad": "remove the soft hyphen",
+    "\u200b": "remove the zero-width space",
+    "\u200c": "remove the zero-width non-joiner",
+    "\u200d": "remove the zero-width joiner",
+    "\u200e": "remove the direction mark",
+    "\u200f": "remove the direction mark",
+    "\u061c": "remove the direction mark",
+    "\ufeff": "remove the byte order mark or zero-width no-break space",
+}
 
 
 def printable(text: str) -> str:
@@ -215,7 +233,8 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
     # Preview and collect write the text as it is, so it holds nothing printable() would escape.
     escaped = next((char for char in text.replace("\r\n", "\n") if char != "\n" and printable(char) != char), None)
     if escaped is not None:
-        return (), f"contains a control or formatting character ({printable(escaped)}); write plain text on ordinary lines"
+        remedy = _CHARACTER_REMEDIES.get(escaped, "write plain text on ordinary lines")
+        return (), f"contains a control or formatting character ({printable(escaped)}); {remedy}"
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
     while lines and not lines[0]:
         lines.pop(0)
@@ -248,6 +267,16 @@ def text_lines(data: bytes) -> tuple[tuple[str, ...], str | None]:
         return (), "starts with a list marker such as '- '; write the text without it"
     if any(LIST_MARKER.match(line) for line in lines[1:]):
         return (), "holds more than one bullet; write one bullet per fragment"
+    if any(ORDERED_LIST_MARKER.match(line) for line in normalized):
+        return (), (
+            "contains a line that starts an ordered list item (a number followed by '.' or ')'); write one "
+            "paragraph and rewrap so no line starts with one"
+        )
+    if any(BLOCKQUOTE_MARKER.match(line) for line in normalized):
+        return (), (
+            "contains a blockquote line (a line starting with '>'); write one paragraph and rewrap so no "
+            "line starts with '>'"
+        )
     if any(not line for line in lines):
         return (), "contains a blank line; a fragment is one paragraph"
     joined = " ".join(line.strip() for line in lines)

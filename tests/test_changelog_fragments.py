@@ -1417,6 +1417,12 @@ class FragmentContentTests(unittest.TestCase):
             ("Fixed a thing\n---\nand more.\n", "setext"),
             ("Fixed a thing\n===\nand more.\n", "setext"),
             ("Fixed a thing\n  ---\n", "setext"),
+            ("Fixed this.\n1. Extra item\n", "ordered list"),
+            ("Fixed this.\n  2) Extra item\n", "ordered list"),
+            ("1. Fixed this.\n", "ordered list"),
+            ("Fixed this.\n> Extra quotation\n", "blockquote"),
+            ("Fixed this.\n   >Extra quotation\n", "blockquote"),
+            ("> Fixed this.\n", "blockquote"),
         )
         for text, reason in cases:
             with self.subTest(text=text):
@@ -1432,6 +1438,9 @@ class FragmentContentTests(unittest.TestCase):
             'Answered "`{action}` stopped on an internal error" for a local fault.\n',
             "Kept the value - and its unit - visible when the count is >= 2.\n",
             "Fixed a thing\nwhose wrapped line starts with -- two dashes.\n",
+            "Raised the limit to\n1024 disks per expander.\n",
+            "Fixed step 1. Then step 2) ran, and a > b held.\n",
+            "Kept version\n0.25 visible.\n",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(self._problem(text))
@@ -1468,6 +1477,27 @@ class FragmentContentTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(self._problem(text))
+
+    def test_control_character_refusal_names_the_remedy(self) -> None:
+        cases = (
+            ("\t", "\\t", "replace the tab with spaces"),
+            ("\u00ad", "\\xad", "remove the soft hyphen"),
+            ("\u200d", "\\u200d", "remove the zero-width joiner"),
+            ("\u200c", "\\u200c", "remove the zero-width non-joiner"),
+            ("\u200e", "\\u200e", "remove the direction mark"),
+            ("\u200f", "\\u200f", "remove the direction mark"),
+        )
+        for character, escaped, remedy in cases:
+            with self.subTest(character=escaped):
+                problem = self._problem(f"Fixed a{character}thing.\n")
+                self.assertIsNotNone(problem)
+                self.assertIn(f"control or formatting character ({escaped})", problem)
+                self.assertIn(remedy, problem)
+        # A character nobody types by accident keeps the general advice.
+        problem = self._problem("Fixed a\x1bthing.\n")
+        self.assertIsNotNone(problem)
+        self.assertIn("control or formatting character (\\x1b)", problem)
+        self.assertIn("write plain text on ordinary lines", problem)
 
     def test_unreleased_bullets_pass_the_content_rules_except_raw_html(self) -> None:
         # The bullets already under Unreleased, without their (#N) suffix, are
