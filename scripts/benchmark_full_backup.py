@@ -130,6 +130,21 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Every module that defines the benchmarked export, inspect, verify and extract
+# paths. `source_file_sha256` keeps its original meaning (system_backup.py
+# only) so older reports stay comparable; `source_files_sha256` covers them all.
+SOURCE_MODULES = (
+    "history_service/system_backup.py",
+    "history_service/backup_7z.py",
+    "history_service/backup_json.py",
+    "history_service/backup_archive/stream_envelope.py",
+)
+
+
+def source_file_digests() -> dict:
+    return {name: file_digest(ROOT / name) for name in SOURCE_MODULES}
+
+
 def fixture_limits() -> dict:
     from history_service.system_backup import MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES
 
@@ -500,6 +515,7 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     report = {"schema_version": 1, "synthetic_only": True, "release_acceptance": False,
               "source_sha": source_sha, "source_file_sha256": file_digest(ROOT / "history_service/system_backup.py"),
+              "source_files_sha256": source_file_digests(),
               "runner_sha256": file_digest(Path(__file__)), "python": sys.version.split()[0],
               "sqlite": sqlite3.sqlite_version, "profile": PROFILES[archive_format],
               "worker_cap": PROFILES[archive_format]["workers"],

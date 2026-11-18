@@ -2462,6 +2462,175 @@ test("a refresh with unchanged data keeps the drawing, its offsets and the page 
   }
 });
 
+// ---- the search status line never moves the page (#1374) -----------------
+
+// A calibrated stand-in for the panel header above the drawing, not a layout
+// engine: for the status line's text at a window width, the heading column
+// beside the search row, which wraps its label, input and status line. A
+// browser measured a search for "bay 3" on the 1,024-bay shelf moving the page
+// 12 px at 1600 px and nothing at 1920 px and wider. The widths per character
+// and the heights below were chosen so the stylesheet before #1374, which has
+// no rule for the status line, gives exactly those numbers: the model is
+// calibrated to the browser's measurement and does not reproduce it
+// independently. It does not model the narrow-screen column layout either;
+// the browser spec qa/header-and-disk-path-layout.spec.js measures the real
+// header at 390 px.
+const STATUS_RULE = "#fabric-topology-search-status";
+function searchHeader(css, windowWidth) {
+  const rule = (selector) => new RegExp(`(?:^|\\n|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
+  const status = rule(STATUS_RULE);
+  const ownLine = /flex(?:-basis)?:[^;]*\b100%/.test(status);
+  const oneLine = /white-space:\s*nowrap/.test(status) && /overflow:\s*hidden/.test(status) && /(?:^|[\s;])(?:block-size|height):\s*1lh/.test(status);
+  const heading = { width: 7 * 128, height: 50 };
+  const row = windowWidth - 89 - heading.width - 14;
+  const first = 9 * 28 + 10 + 224;
+  const input = 35;
+  const line = 21;
+  return (text) => {
+    const width = 7 * String(text || "").length;
+    let lines = 0;
+    if (oneLine) lines = 1;
+    else if (ownLine) lines = Math.ceil(width / row);
+    else if (width && first + 10 + width > row) lines = Math.ceil(width / row);
+    return Math.max(heading.height, input + (lines ? 6 + lines * line : 0));
+  };
+}
+
+test("the header model gives the browser's 12 px at 1600 px and nothing at 1920 px for the stylesheet without a status line rule", () => {
+  // A calibration check: the constants were chosen to give these numbers.
+  // The status for "bay 3" with the shelf drawn in full and collapsed.
+  for (const text of ["1 match: Bay 03.", "1 match: Bay 03 (inside a collapsed block)."]) {
+    assert.equal(searchHeader("", 1600)(text) - searchHeader("", 1600)(""), 12, text);
+    assert.equal(searchHeader("", 1920)(text) - searchHeader("", 1920)(""), 0, text);
+    assert.equal(searchHeader("", 3840)(text) - searchHeader("", 3840)(""), 0, text);
+  }
+});
+
+// The page with that header above the drawing; the status line's text lays
+// it out again, and the browser's scroll anchoring keeps what is in view in
+// its place by scrolling the page by the header's change, except at the top.
+function searchStatusPage(size, windowWidth) {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const css = fs.readFileSync(path.join(H.ROOT, "app/static/sas_fabric_topology.css"), "utf8");
+  const header = searchHeader(css, windowWidth);
+  const view = measuredPage(bigShelf(), size);
+  const { page } = view;
+  const status = view.elements.get("fabric-topology-search-status");
+  let text = String(status.textContent || "");
+  const base = page.above - header(text);
+  let above = page.above;
+  Object.defineProperty(page, "above", { get: () => above, set: (value) => { above = value; }, configurable: true });
+  Object.defineProperty(status, "textContent", {
+    get: () => text,
+    set(value) {
+      const before = above;
+      text = String(value);
+      above = base + header(text);
+      const anchored = page.scrollY > 0 ? page.scrollY + above - before : 0;
+      page.layout();
+      if (anchored) page.scrollTo(0, anchored);
+    },
+    configurable: true,
+  });
+  return { ...view, status };
+}
+
+test("a search leaves the page and the drawing where they were at 1600 px and 1920 px, from the top and the bottom", () => {
+  const moved = [];
+  const sizes = MEASURED_WINDOWS.filter((size) => /^(1600|1920)x/.test(size.name));
+  for (const size of sizes) {
+    const windowWidth = Number(size.name.split("x")[0]);
+    for (const start of ["top", "bottom"]) {
+      for (const [shelf, pageY] of [["collapsed", 0], ["collapsed", size.collapseY], ["in full", 0], ["in full", size.expandY]]) {
+        const view = searchStatusPage(size, windowWidth);
+        const { panel, page } = view;
+        if (shelf === "in full") view.click({ "data-fabric-expand-slots": expandControls(panel)[0].key });
+        panel.box.scrollTop = start === "top" ? 0 : Number(panel.box.svg.getAttribute("height"));
+        page.scrollTo(0, pageY);
+        const where = () => ({ pageY: page.scrollY, boxTop: panel.box.getBoundingClientRect().top, offsets: [panel.box.scrollLeft, panel.box.scrollTop] });
+        const before = where();
+        const search = view.elements.get("fabric-topology-search");
+        search.value = "bay 3";
+        search.handlers.get("input")();
+        assert.match(view.status.textContent, /^1 match: Bay 03/, `${size.name}: the search found the bay`);
+        const after = where();
+        if (JSON.stringify(after) !== JSON.stringify(before)) {
+          moved.push(`${size.name}, ${shelf}, ${start}, page at ${pageY}: page ${before.pageY}>${after.pageY}, box top ${before.boxTop}>${after.boxTop}, offsets ${before.offsets}>${after.offsets}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(moved, [], "nothing moves");
+});
+
+test("the search status line holds one line of its own in the search row at every width", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const css = fs.readFileSync(path.join(H.ROOT, "app/static/sas_fabric_topology.css"), "utf8");
+  const template = fs.readFileSync(path.join(H.ROOT, "app/templates/sas_fabric.html"), "utf8");
+  assert.match(template, /<span[^>]*id="fabric-topology-search-status"[^>]*role="status"/, "the status line is the page's search status");
+  const rule = new RegExp(`(?:^|\\n|\\})\\s*${STATUS_RULE}\\s*\\{([^}]*)\\}`).exec(css)?.[1] || "";
+  assert.match(rule, /flex:\s*1 1 100%/, "a line of its own, so its text never wraps the row");
+  assert.match(rule, /min-width:\s*0/);
+  assert.match(rule, /block-size:\s*1lh/, "one line high, empty or not");
+  assert.match(rule, /white-space:\s*nowrap/);
+  assert.match(rule, /overflow:\s*hidden/);
+  assert.match(rule, /text-overflow:\s*ellipsis/, "a longer status ends in an ellipsis");
+  // Narrow screens stack the row: the status keeps its one line there too.
+  const media = /@media \(max-width: 640px\)\s*\{([\s\S]*?)\n\}/.exec(css)?.[1] || "";
+  assert.doesNotMatch(media, /#fabric-topology-search-status\s*\{[^}]*(?:block-size|height|white-space|overflow)\s*:/, "the narrow rule does not undo the held line");
+  for (const width of [390, 1240, 1480, 1600, 1920, 2560, 3840]) {
+    const header = searchHeader(css, width);
+    for (const text of ["", "1 match: Bay 3.", `No match for "${"x".repeat(300)}".`]) {
+      assert.equal(header(text), header(""), `${width} px: "${text.slice(0, 20)}"`);
+    }
+  }
+});
+
+test("on narrow screens the stacked search row is one flex line, so a long status line is as wide as the row and ends in an ellipsis", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const css = fs.readFileSync(path.join(H.ROOT, "app/static/sas_fabric_topology.css"), "utf8");
+  // The row wraps beside the heading on wider screens.
+  const base = /(?:^|\n|\})\s*\.fabric-topology-search-row\s*\{([^}]*)\}/.exec(css)?.[1] || "";
+  assert.match(base, /flex-wrap:\s*wrap/);
+  // At 640 px and below it is a column. A column that may wrap is a
+  // multi-line flex container: its line is as wide as the widest item's own
+  // width, which for a status line that never wraps is its whole text, and
+  // the stretched status line then pushes the page wider than the window
+  // (a search for "bay" at 390 px made the page 542 px wide). One flex line
+  // is as wide as the row, so the status line fits it and is cut short.
+  const media = /@media \(max-width: 640px\)\s*\{([\s\S]*?)\n\}/.exec(css)?.[1] || "";
+  const narrow = /(?:^|\n|\})\s*\.fabric-topology-search-row\s*\{([^}]*)\}/.exec(media)?.[1] || "";
+  assert.match(narrow, /flex-direction:\s*column/, "the narrow row is a column");
+  assert.match(narrow, /flex-wrap:\s*nowrap/, "the narrow column is one flex line, as wide as the row");
+  assert.match(narrow, /align-items:\s*stretch/, "its items, the status line too, are as wide as the row");
+  assert.match(media, /\.fabric-topology-search-row #fabric-topology-search-status\s*\{[^}]*flex:\s*none/);
+  assert.doesNotMatch(media, /#fabric-topology-search-status\s*\{[^}]*(?:width|align-self)\s*:/, "nothing sizes the status line to its text");
+});
+
+test("a search status line that is cut short is readable in full on hover, and cleared with it", () => {
+  const dom = fakeDom();
+  const T = H.loadTopology({ document: dom.document });
+  dom.status.title = "";
+  T.attach(dom.container, dom.search, dom.status, {});
+  T.render(cases.core_cascade.fabric, {});
+  for (const query of ["bay 3", "bay", "nothing-like-this"]) {
+    dom.search.value = query;
+    dom.searchHandlers.get("input")();
+    assert.ok(dom.status.textContent, query);
+    assert.equal(dom.status.title, dom.status.textContent, `${query}: the whole status on hover`);
+  }
+  dom.search.value = "";
+  dom.searchHandlers.get("input")();
+  assert.deepEqual([dom.status.textContent, dom.status.title], ["", ""]);
+  dom.search.value = "bay 4";
+  dom.searchHandlers.get("input")();
+  T.release();
+  assert.deepEqual([dom.status.textContent, dom.status.title], ["", ""], "leaving the mode clears both");
+});
+
 // ---- fractional box heights and page positions ---------------------------------
 
 // The box's height limit as the stylesheet sets it: 78% of the window, less

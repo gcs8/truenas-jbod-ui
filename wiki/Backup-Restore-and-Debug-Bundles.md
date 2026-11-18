@@ -451,7 +451,7 @@ journal. Restart the scheduler to apply a save:
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. With `trust_on_first_use`, a new host key is saved in the scheduler's own state folder and `known_hosts_path` is only read. Use SFTP for "SCP" |
 | `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted. Uploads check the remote size only; the target test and the backup's details say so until **Verify** downloads it and matches size and SHA-256 |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
-| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url`. When the store's checksum (ETag) matches the bytes sent, nothing is read back and the backup's details say "Checked by the provider's checksum at upload"; otherwise the upload is read back and hashed. Earlier versions recorded both cases the same way, so an S3 copy recorded as read back says "by the provider's checksum or by read-back". Each says so until **Verify** downloads it and matches size and SHA-256 |
+| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url`. When the store's checksum (ETag) matches the bytes sent, nothing is read back and the backup's details say "Checked by the provider's checksum at upload"; otherwise the upload is read back and hashed. Earlier versions recorded both cases the same way, so an S3 copy recorded as read back says "by the provider's checksum or by read-back". So does any remote copy recorded as read back whose record does not name the provider that took the upload (copies made by earlier versions): the target's current provider does not decide it. Each says so until **Verify** downloads it and matches size and SHA-256 |
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
 
@@ -650,7 +650,10 @@ and did not match, or a local copy is gone; it stops counting as verified), or
 `not_read` (the copy could not be opened or read, so nothing was checked and
 its verified status, restore and clean-up treatment are unchanged). The page
 words the last case as "could not read the copy, nothing checked". Results
-saved by earlier versions have no outcome.
+saved by earlier versions have no outcome. A saved result that reports success
+beside any outcome other than `matched`, or beside a malformed outcome,
+contradicts itself: the list and the details show it as not passed, with no
+outcome.
 
 ## Create a debug bundle
 

@@ -390,3 +390,48 @@ for (const width of DESKTOP_WIDTHS) {
     expect(errors).toEqual([]);
   });
 }
+
+// #1374: the Topology search status line is one line high and ends in an
+// ellipsis at every width. On a narrow window an ordinary search must not
+// make the status line wider than its row, or the page wider than the window
+// (a search for "bay" once widened a 390 px page to 542 px). This guards the
+// page against overflow; it does not make phone layout a tested capability.
+test("a Topology search keeps the page inside a 390 px window and cuts the status line short", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const errors = await routeSynthetic(page, fixture.fabricHtml);
+  await page.goto(`${ORIGIN}/?mode=topology`);
+  const search = page.locator("#fabric-topology-search");
+  await expect(search).toBeVisible();
+  const status = page.locator("#fabric-topology-search-status");
+  const before = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth }));
+  expect(before.innerWidth, "actual viewport width").toBe(390);
+  expect(before.scrollWidth, `page width before the search ${JSON.stringify(before)}`).toBeLessThanOrEqual(before.innerWidth);
+  await search.fill("bay");
+  await expect(status).toHaveText(/^\d+ matches: Bay \d+, .*, and \d+ more\.$/);
+  const geometry = await status.evaluate((element) => {
+    const row = document.getElementById("fabric-topology-search-row").getBoundingClientRect();
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return {
+      page: document.documentElement.scrollWidth,
+      window: window.innerWidth,
+      row: { left: row.left, right: row.right },
+      status: { left: rect.left, right: rect.right, height: rect.height },
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+      textOverflow: style.textOverflow,
+      whiteSpace: style.whiteSpace,
+      text: element.textContent,
+      title: element.title,
+    };
+  });
+  const detail = JSON.stringify(geometry);
+  expect(geometry.page, `page width after the search ${detail}`).toBeLessThanOrEqual(geometry.window);
+  expect(geometry.status.right, `status line inside its row ${detail}`).toBeLessThanOrEqual(geometry.row.right + 0.5);
+  expect(geometry.scrollWidth, `the status text is longer than its line ${detail}`).toBeGreaterThan(geometry.clientWidth);
+  expect(geometry.textOverflow, "cut short with an ellipsis").toBe("ellipsis");
+  expect(geometry.whiteSpace).toBe("nowrap");
+  expect(geometry.title, "the whole status on hover").toBe(geometry.text);
+  await capture(page, page.locator(".fabric-view-panel .panel-header"), "topology-search-status-390");
+  expect(errors).toEqual([]);
+});

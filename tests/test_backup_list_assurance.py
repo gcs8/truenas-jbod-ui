@@ -1373,5 +1373,160 @@ class RejectedCopyStaysRejectedTests(backup_fixtures.SchedulerTestBase):
         self.assertIsNone(rejected_copy_error(OSError("alone")))
 
 
+class UploadCheckIsReadFromTheCopyTests(backup_fixtures.SchedulerTestBase):
+    """How a copy was checked at upload comes from that copy's record (#1288).
+
+    Earlier releases stored "readback" for an S3 upload whose ETag matched, and
+    recorded nothing about the provider. Changing the target's provider later
+    must not turn that stored word into a readback nobody performed: only the
+    copy's own successful Verify does that. The real S3 target over the
+    maintained in-memory client; filesystem targets in the temporary directory.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = archive_transport_fixtures.FakeS3Client()
+
+    open_target = ProviderChecksumIsNotAReadbackTests.open_target
+    _views = ProviderChecksumIsNotAReadbackTests._views
+    _assert_presented = ProviderChecksumIsNotAReadbackTests._assert_presented
+    _copies = ProviderChecksumIsNotAReadbackTests._copies
+
+    def _config(self, *, cloud_provider: str = "s3", nas_provider: str = "filesystem"):
+        config = ProviderChecksumIsNotAReadbackTests._config(self)
+        s3, nas = config["targets"]
+        cloud = s3
+        if cloud_provider != "s3":
+            cloud = {**backup_fixtures.TARGET, "target_id": "cloud", "label": "Cloud bucket", "provider": cloud_provider,
+                     "root": "/unused-cloud"}
+        if nas_provider == "s3":
+            nas = {**s3, "target_id": "nas", "label": "Office NAS"}
+        config["targets"] = [cloud, nas]
+        return config
+
+    def _earlier_release_copy(self):
+        """An S3 copy as an earlier release left it: "readback" for a matching ETag, no provider."""
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        cloud = self._copies(scheduler)["cloud"]
+        self.assertEqual(self.client.get_calls, 0)  # the ETag matched; nothing was read back
+        with scheduler._state_lock:
+            meta = scheduler._meta[cloud.artifact_id]
+            meta["upload_check"] = "readback"
+            meta.pop("upload_provider", None)
+            scheduler._save_meta()
+        scheduler.close()
+        return cloud
+
+    def test_changing_the_targets_provider_does_not_relabel_an_old_upload_as_read_back(self) -> None:
+        cloud = self._earlier_release_copy()
+        scheduler = self.make(self._config())
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+        scheduler.close()
+
+        # Only the target's current provider changes; the copy and its record do not.
+        scheduler = self.make(self._config(cloud_provider="filesystem"))
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+        self.assertEqual(self.client.get_calls, 0)  # presenting the copy read nothing back
+
+    def test_a_new_copy_records_the_provider_it_was_uploaded_with(self) -> None:
+        self.client.etag_override = "kms-opaque"  # the S3 copy is read back at upload
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        copies = self._copies(scheduler)
+        self.assertEqual(scheduler._metadata_snapshot(copies["cloud"].artifact_id).get("upload_provider"), "s3")
+        self.assertEqual(scheduler._metadata_snapshot(copies["nas"].artifact_id).get("upload_provider"), "filesystem")
+        self.assertIsNone(scheduler._metadata_snapshot(copies["local"].artifact_id).get("upload_provider"))
+        scheduler.close()
+
+        # Swapping both targets' providers changes neither copy's presentation.
+        scheduler = self.make(self._config(cloud_provider="filesystem", nas_provider="s3"))
+        self._assert_presented(scheduler, copies["cloud"].artifact_id, EITHER, passed=False)
+        self._assert_presented(scheduler, copies["nas"].artifact_id, "readback", passed=False)
+
+    def test_an_earlier_filesystem_readback_record_is_presented_as_either_until_verified(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        self._assert_presented(scheduler, nas.artifact_id, "readback", passed=False)  # control: recorded provider
+        with scheduler._state_lock:
+            scheduler._meta[nas.artifact_id].pop("upload_provider", None)
+            scheduler._save_meta()
+        scheduler.close()
+
+        # The record no longer says which provider took the upload, so the
+        # current filesystem target cannot vouch for it.
+        scheduler = self.make(self._config())
+        self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=False)
+        self.assertTrue(scheduler.verify(nas.artifact_id)["ok"])
+        self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=True)
+
+    def test_a_malformed_recorded_provider_is_unknown(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        for value in ("", "tape", ["filesystem"], {"provider": "filesystem"}, None, 1):
+            with self.subTest(value=value):
+                with scheduler._state_lock:
+                    scheduler._meta[nas.artifact_id]["upload_provider"] = value
+                self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=False)
+
+
+class ContradictoryVerifyResultIsNotAPassTests(backup_fixtures.SchedulerTestBase):
+    """A saved Verify result passes only when it says it read the copy and matched (#1289).
+
+    ``ok: true`` beside an outcome other than "matched", or beside a malformed
+    outcome, is contradictory: the list and the details both present it as not
+    passed, with no outcome. A result from an earlier release carries no
+    outcome and keeps its boolean. The metadata is saved and reloaded through
+    the scheduler's own loader before it is presented.
+    """
+
+    open_target = BackupListAssuranceTests.open_target
+    _scheduler_with_size_only_copy = BackupListAssuranceTests._scheduler_with_size_only_copy
+    _row = BackupListAssuranceTests._row
+
+    def _present_after_reload(self, stored):
+        scheduler, _local, remote = self._scheduler_with_size_only_copy()
+        with scheduler._state_lock:
+            scheduler._meta[remote.artifact_id]["last_verify"] = {
+                "at": "2026-09-24T12:00:00+00:00", "artifact_id": remote.artifact_id, "detail": "x", **stored,
+            }
+            scheduler._save_meta()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        try:
+            row = self._row(scheduler, remote.artifact_id)
+            detail = scheduler.detail(remote.artifact_id)
+        finally:
+            scheduler.close()
+        self.assertEqual(row["upload_check"], "size")
+        self.assertIs(row["verified"], True)  # the catalogue flag keeps its restore and retention meaning
+        return row["last_verify"], detail["last_verify"]
+
+    def test_a_contradictory_or_malformed_outcome_is_not_a_passed_verify(self) -> None:
+        for outcome in ("not_read", "mismatch", {}, {"outcome": "matched"}, ["matched"], None, "unread", 1):
+            with self.subTest(outcome=outcome):
+                listed, detailed = self._present_after_reload({"ok": True, "outcome": outcome})
+                self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": False})
+                self.assertEqual(
+                    detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": False, "outcome": None, "detail": "x"}
+                )
+
+    def test_a_matched_outcome_and_an_earlier_release_result_still_pass(self) -> None:
+        listed, detailed = self._present_after_reload({"ok": True, "outcome": "matched"})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": True})
+        self.assertEqual(detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": True, "outcome": "matched", "detail": "x"})
+        # Earlier releases wrote no outcome at all.
+        listed, detailed = self._present_after_reload({"ok": True})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": True})
+        self.assertEqual(detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": True, "outcome": None, "detail": "x"})
+        # A failed result keeps its own outcome.
+        listed, detailed = self._present_after_reload({"ok": False, "outcome": "not_read"})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": False})
+        self.assertEqual(detailed["outcome"], "not_read")
+
+
 if __name__ == "__main__":
     unittest.main()
