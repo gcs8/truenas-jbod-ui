@@ -71,6 +71,7 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
+from history_service.backup_archive.settings import PROVIDERS
 from history_service.backup_archive.transport import (
     ArchiveDownloadTooLargeError,
     ArchivePublicationUncertainError,
@@ -1174,6 +1175,7 @@ class BackupScheduler:
         remote_record: ArtifactRecord,
         *,
         upload_check: str = "readback",
+        upload_provider: str | None = None,
     ) -> None:
         self.catalog.add(remote_record)
         with self._state_lock:
@@ -1185,6 +1187,10 @@ class BackupScheduler:
             # #722: remember how the upload was checked, so the detail view can
             # say "size only" until an explicit verify re-reads and hashes it.
             meta["upload_check"] = upload_check
+            # #1288: and which provider took the upload, so the check is read
+            # from this copy's record and never from the target's current settings.
+            if upload_provider is not None:
+                meta["upload_provider"] = upload_provider
             self._meta[remote_record.artifact_id] = meta
             self._save_meta()
 
@@ -1205,14 +1211,21 @@ class BackupScheduler:
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
                 remote_record = self._remote_record(record, target, stored)
-                self._catalog_remote(record, remote_record, upload_check=stored.upload_check)
+                self._catalog_remote(
+                    record, remote_record, upload_check=stored.upload_check, upload_provider=target.settings.provider
+                )
                 self._record_target(target.target_id, RunRecord(at=at, ok=True, artifact_id=remote_record.artifact_id))
             except ArchivePublicationUncertainError as exc:
                 remote_record = self._remote_record(record, target, exc.stored, preserved=True)
                 try:
                     if remote_record.size != record.size or remote_record.sha256 != record.sha256:
                         raise RuntimeError("uncertain remote copy does not match the local archive")
-                    self._catalog_remote(record, remote_record, upload_check=exc.stored.upload_check)
+                    self._catalog_remote(
+                        record,
+                        remote_record,
+                        upload_check=exc.stored.upload_check,
+                        upload_provider=target.settings.provider,
+                    )
                 except Exception as catalog_exc:  # noqa: BLE001 - keep target failure isolated
                     logger.warning(
                         "Uncertain remote backup copy to %s could not be catalogued (%s).",
@@ -1487,14 +1500,17 @@ class BackupScheduler:
 
         Earlier releases stored "readback" for an S3 upload whose ETag matched,
         which read nothing back, and the stored record cannot tell that apart
-        from a real readback (#1202). Such a record, and one whose target is no
-        longer configured, is presented as either until its own Verify passes.
+        from a real readback (#1202). Such a record is presented as either until
+        its own Verify passes. The provider is the one this copy recorded at
+        upload, never the target's current one: a target's provider can change
+        after the copy was made, so a record that names no known provider is
+        presented as either too (#1288).
         """
 
         value = _upload_check(meta)
         if value == "readback" and record.location != LOCAL_LOCATION:
-            target = self.policy.target(record.location)
-            if target is None or target.settings.provider == "s3":
+            provider = meta.get("upload_provider")
+            if not (isinstance(provider, str) and provider in PROVIDERS) or provider == "s3":
                 return "provider_checksum_or_readback"
         return value
 
@@ -1772,7 +1788,7 @@ def _list_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[s
     if value is None:
         return None
     at = value.get("at")
-    return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
+    return {"at": at if isinstance(at, str) else None, "ok": _verify_result(value)[0]}
 
 
 def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1783,11 +1799,27 @@ def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict
         return None
     detail = value.get("detail")
     summary = _list_last_verify(record, meta)
-    # Absent in results from earlier releases; shown only when it agrees with ``ok``.
-    outcome = value.get("outcome")
-    if not (isinstance(outcome, str) and (outcome == "matched") is summary["ok"] and outcome in _VERIFY_OUTCOMES):
-        outcome = None
-    return {**summary, "outcome": outcome, "detail": detail if isinstance(detail, str) else None}
+    return {**summary, "outcome": _verify_result(value)[1], "detail": detail if isinstance(detail, str) else None}
+
+
+def _verify_result(value: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Whether a saved Verify result passed, and its outcome, for the list and the details alike.
+
+    Only a boolean ``True`` counts as passed, so a malformed record never
+    upgrades a size-only copy. Results from earlier releases carry no outcome
+    and keep their boolean. A result that carries an outcome passes only with
+    "matched": ``ok: true`` beside "not_read", "mismatch" or a malformed
+    outcome contradicts itself, so it has not passed and claims no outcome
+    (#1289). An outcome is shown only when it agrees with ``ok``.
+    """
+
+    ok = value.get("ok") is True
+    if "outcome" not in value:
+        return ok, None
+    outcome = value["outcome"]
+    if not (isinstance(outcome, str) and outcome in _VERIFY_OUTCOMES and (outcome == "matched") is ok):
+        return False, None
+    return ok, outcome
 
 
 _VERIFY_OUTCOMES = frozenset({"matched", "mismatch", "not_read"})
