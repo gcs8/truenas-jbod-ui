@@ -42,7 +42,8 @@ body.fabric-topology-mode .fabric-page-shell {
   gap: 8px;
   min-width: 0;
   /* The trace band's reserved lines (more on narrow pages, below), its line
-     height, and its whole height: lines, 4 px padding each side, 1 px border. */
+     height, and its whole height: lines, 4 px padding each side, 1 px border.
+     The reserved height is the band's floor; its sentences may make it taller. */
   --topology-trace-lines: 1;
   --topology-trace-line: 1.25rem;
   --topology-trace-band: calc(var(--topology-trace-lines) * var(--topology-trace-line) + 9px);
@@ -179,21 +180,63 @@ body.fabric-topology-mode .fabric-page-shell {
 
 /* The trace line sits below the drawing, so its wrapping never moves it,
    and sticks to the window's bottom edge so it is read without scrolling.
-   Its lines are reserved: the idle hint, "Tracing" and "Pinned" take the
-   same band, which never grows over the item under the pointer. The page
-   sizes boxes by their border, so the reserved height is the whole band,
-   padding and border included. A longer sentence still wraps in full. */
-.fabric-topology .fabric-topology-pin {
+   The band is held as tall as the tallest sentence this drawing can show
+   at its width (measured once by the script, below), so the idle hint,
+   "Tracing" and "Pinned" take the same band, which never grows over the
+   item under the pointer. Its reserved lines are the floor. The page sizes
+   boxes by their border, so the reserved height is the whole band, padding
+   and border included, and the held height is the measured text plus the
+   band's 4 px padding each side and 1 px border. Every sentence wraps in
+   full. */
+.fabric-topology .fabric-topology-trace {
   position: sticky;
   bottom: 0;
   z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
-  min-height: var(--topology-trace-band);
+  min-height: max(var(--topology-trace-band), calc(var(--topology-trace-held, 0px) + 9px));
   margin: 0;
   padding: 4px 0;
   border-top: 1px solid var(--panel-border);
   background: var(--surface);
   line-height: var(--topology-trace-line);
+}
+
+.fabric-topology-trace > *,
+.fabric-topology-trace-measure > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+  margin: 0;
+}
+
+/* The measurer: out of flow on the band's one cell, so it is exactly the
+   visible sentence's width and never adds to the band's height. It lays
+   every sentence out in one cell of its own, as the visible one is, and is
+   as tall as the tallest. It sets nothing about text, so the sentences
+   inherit the band's rules. It is empty except during the measure, and is
+   not seen, read out, selected or pointed at. Containment keeps its layout
+   from the page's; its own size still follows its content. */
+.fabric-topology-trace-measure {
+  position: absolute;
+  grid-area: 1 / 1;
+  inset-inline: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  visibility: hidden;
+  user-select: none;
+  pointer-events: none;
+  contain: layout paint style;
+}
+
+/* Empty, which it is except during the measure, the measurer is one em
+   wide and one line high, so the band's observer sees a new font size or
+   line height (a browser's default font size, text zoom) even when the
+   band keeps its size. It stays inside the band, which is at least a line
+   high. While it holds sentences this rule does not apply. */
+.fabric-topology-trace-measure:empty {
+  inline-size: 1em;
+  block-size: 1lh;
 }
 
 .fabric-topology-scroll {
@@ -436,10 +479,11 @@ body.fabric-topology-mode .fabric-page-shell {
   stroke: var(--text);
 }
 
-/* A focused item scrolls clear of the trace band. */
+/* A focused item scrolls clear of the trace band: at its measured height
+   once the band is in place, at its reserved height before that. */
 .fabric-topology-svg [role="button"] {
   cursor: pointer;
-  scroll-margin-bottom: var(--topology-trace-band);
+  scroll-margin-bottom: var(--topology-trace-height, var(--topology-trace-band));
 }
 
 .fabric-topology-svg [role="button"]:focus {
@@ -476,8 +520,8 @@ body.fabric-topology-mode .fabric-page-shell {
   opacity: 0.3;
 }
 
-/* Beside the inspector, up to 1480 px, the band is too narrow for the
-   longest trace sentence on one line: two lines are reserved there too. */
+/* Beside the inspector, up to 1480 px, the band is too narrow for a
+   127-character trace sentence on one line: two lines are its floor there too. */
 @media (max-width: 1480px) {
   .fabric-topology {
     --topology-trace-lines: 2;
@@ -485,7 +529,7 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 /* One-column pages, where the inspector moves below the drawing: the
-   longest trace sentence takes two lines. */
+   band's floor is two lines. */
 @media (max-width: 1240px) {
   .fabric-topology {
     --topology-trace-lines: 2;
@@ -493,8 +537,8 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 /* Narrow screens: the search label sits above an input at least 240 px wide;
-   the header wraps only while the Topology search row is shown. The longest
-   trace sentence takes three lines. */
+   the header wraps only while the Topology search row is shown. The band's
+   floor is three lines. */
 @media (max-width: 640px) {
   .fabric-topology {
     --topology-trace-lines: 3;

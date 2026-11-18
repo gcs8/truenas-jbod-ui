@@ -1021,7 +1021,7 @@ function mediaBlock(css, width) {
 
 test("the trace sentence sticks to the window's bottom in an opaque band whose reserved height a focused item is kept clear of", () => {
   const css = topologyCss();
-  const band = cssRule(css, ".fabric-topology .fabric-topology-pin");
+  const band = cssRule(css, ".fabric-topology .fabric-topology-trace");
   assert.match(band, /position:\s*sticky;/);
   assert.match(band, /bottom:\s*0;/);
   // Opaque: the page's surface colour, a six-digit colour with no alpha.
@@ -1029,10 +1029,11 @@ test("the trace sentence sticks to the window's bottom in an opaque band whose r
   assert.match(ROOT_CSS, /--surface:\s*#[0-9a-f]{6};/i);
   assert.match(band, /border-top:\s*1px solid var\(--panel-border\);/);
   assert.ok(Number(/z-index:\s*(\d+);/.exec(band)?.[1]) >= 1, "painted above the drawing");
-  // Its height is reserved in lines, the same for the hint, a trace and a pin;
-  // a longer sentence may grow it and is never clipped. The reserved height
-  // itself is checked by the next test.
-  assert.match(band, /min-height:\s*var\(--topology-trace-band\);/);
+  // Its height is reserved in lines, the same for the hint, a trace and a pin,
+  // and held at the tallest sentence the drawing can show where that is more;
+  // nothing is clipped. The reserved height itself is checked by the next
+  // test, the held one in fabric_topology_trace_band.test.js.
+  assert.match(band, /min-height:\s*max\(var\(--topology-trace-band\), calc\(var\(--topology-trace-held, 0px\) \+ 9px\)\);/);
   assert.match(band, /line-height:\s*var\(--topology-trace-line\);/);
   assert.doesNotMatch(band, /(?:^|[\s;])(?:height|max-height|overflow|text-overflow|-webkit-line-clamp|line-clamp)\s*:/);
   const view = cssRule(css, ".fabric-topology");
@@ -1052,7 +1053,7 @@ test("the trace sentence sticks to the window's bottom in an opaque band whose r
   const whole = 2 * Number(padding[1]) + 1;
   assert.match(view, new RegExp(`--topology-trace-band:\\s*calc\\(var\\(--topology-trace-lines\\) \\* var\\(--topology-trace-line\\) \\+ ${whole}px\\);`));
   // Every item that takes keyboard focus scrolls clear of the band.
-  assert.match(cssRule(css, `.fabric-topology-svg [role="button"]`), /scroll-margin-bottom:\s*var\(--topology-trace-band\);/);
+  assert.match(cssRule(css, `.fabric-topology-svg [role="button"]`), /scroll-margin-bottom:\s*var\(--topology-trace-height, var\(--topology-trace-band\)\);/);
   const T = H.loadTopology();
   for (const [name, model] of Object.entries(fixtures(T, { width: 1100 }))) {
     const html = T.renderTopology(model, {});
@@ -1108,8 +1109,8 @@ test("the trace sentence is one element after the drawing's scroll box, the same
 // `box-sizing: border-box` it is the whole box, padding and border included,
 // so the reserved height must be the whole band or the band still grows when
 // its lines fill. Which box-sizing reaches the sentence is read from both
-// stylesheets, in their load order, for the sentence's own element.
-const PIN_ELEMENT = { tag: "p", classes: new Set(["fabric-topology-pin", "subtle"]), attributes: new Set(["data-topology-pin"]) };
+// stylesheets, in their load order, for the band's own element.
+const PIN_ELEMENT = { tag: "div", classes: new Set(["fabric-topology-trace"]), attributes: new Set(["data-topology-trace"]) };
 const PIN_ANCESTOR_CLASSES = new Set(["fabric-topology", "fabric-map-panel", "fabric-view-layout", "fabric-view-panel", "panel", "app-shell", "fabric-page-shell"]);
 
 function cssRules(css) {
@@ -1195,9 +1196,10 @@ function cssPixels(expression, properties) {
 test("the trace band's reserved height is the whole band at every breakpoint, under the box sizing that reaches it", () => {
   const css = topologyCss();
   const sizing = pinBoxSizing([ROOT_CSS, css]);
-  const band = cssRule(css, ".fabric-topology .fabric-topology-pin");
-  assert.equal(cssRules(css).filter((rule) => rule.selectors.some((selector) => /fabric-topology-pin/.test(selector))).length, 1, "one rule sizes the band, at every width");
-  const [minHeight] = declared(band, "min-height");
+  const band = cssRule(css, ".fabric-topology .fabric-topology-trace");
+  assert.equal(cssRules(css).filter((rule) => rule.selectors.some((selector) => /\.fabric-topology-trace$/.test(selector))).length, 1, "one rule sizes the band, at every width");
+  // The reserved height is the floor under the held one.
+  const minHeight = /^max\((var\(--[\w-]+\)), /.exec(declared(band, "min-height")[0] || "")?.[1];
   assert.ok(minHeight, "the band reserves a height");
   const padding = declared(band, "padding")[0].split(/\s+/).map((value) => Number.parseFloat(value));
   const vertical = padding[0] + (padding.length > 2 ? padding[2] : padding[0]);

@@ -2145,6 +2145,44 @@
     return group ? groupHeading(group) : "";
   }
 
+  // The sentence under the drawing for what is hovered or focused and what is
+  // pinned. The sentences the band is measured with are written by this
+  // function too, so the wording is in one place.
+  function traceSentence(model, view = {}) {
+    if (view.hover) return `Tracing: ${refLabel(model, view.hover)}.${view.pin ? " Pinned item kept; Esc clears." : ""}`;
+    if (view.pin) return `Pinned: ${refLabel(model, view.pin)}. Esc clears.`;
+    return DEFAULT_HINT;
+  }
+
+  // Every sentence the band can show in this drawing, which the band is
+  // measured with: it is as tall as the tallest of them at any width. No
+  // count or length stands in for drawn height, so none is left out and there
+  // is no limit: the count follows the drawing. The only sentence left out is
+  // a plain trace, which is the start of its own held-pin trace.
+  function traceSentences(model, view = {}) {
+    // What a pointer or keyboard can reach in this drawing: bays inside a
+    // collapsed shelf are not drawn, so their sentences belong to the drawing
+    // that shows the shelf in full.
+    const reachable = [];
+    for (const link of model.links) if (link.points) reachable.push({ kind: "link", id: link.id });
+    for (const entry of model.nodes) reachable.push({ kind: "node", id: entry.id });
+    for (const group of model.groups) {
+      reachable.push({ kind: "group", id: group.id });
+      for (const bay of group.cells) reachable.push({ kind: "bay", id: bay.bayId });
+    }
+    // Any item that can be pinned gives every trace its held-pin form.
+    const pin = reachable.find((ref) => ref.kind !== "group") || view.pin || null;
+    const kept = new Set([traceSentence(model)]);
+    // A pin this drawing does not show (a bay inside a collapsed shelf).
+    if (view.pin && !reachable.some((ref) => sameRef(ref, view.pin))) kept.add(traceSentence(model, { pin: view.pin }));
+    for (const ref of reachable) {
+      kept.add(traceSentence(model, { hover: ref, pin }));
+      // A group is not pinned: a click on it pins nothing.
+      if (ref.kind !== "group") kept.add(traceSentence(model, { pin: ref }));
+    }
+    return [...kept];
+  }
+
   // Legend words for what this payload has: bays, disks without a physical
   // location, or both.
   function legendText(model, style, text) {
@@ -2237,7 +2275,6 @@
       ? `<p class="fabric-topology-fit-notice warning-item muted compact" data-topology-fit-notice>Fitted to ${Math.round(scale * 100)}% of its size: its smallest text is ${smallest.toFixed(1)} px, under 12 px. Choose Actual size to read it.</p>`
       : "";
     const notices = model.notices.map((text) => `<div class="warning-item muted compact">${escapeHtml(text)}</div>`).join("");
-    const pinned = view.pin ? `Pinned: ${refLabel(model, view.pin)}. Esc clears.` : DEFAULT_HINT;
     return `<div class="fabric-topology" data-topology-kind="${escapeHtml(model.kind)}">`
       + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
       + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
@@ -2246,8 +2283,11 @@
       + fitNotice
       + `<div class="fabric-topology-scroll">${svg}</div>`
       // Below the drawing: hover text that wraps to more lines never moves
-      // the drawing, and a label, from under the pointer.
-      + `<p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(pinned)}</p>`
+      // the drawing, and a label, from under the pointer. The band is held as
+      // tall as the tallest sentence the drawing can show, measured in the
+      // empty box after the sentence, so its height stays the same.
+      + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>`
+      + `<div class="fabric-topology-trace-measure" data-topology-measure aria-hidden="true"></div></div>`
       + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
       + "</div>";
   }
@@ -2307,6 +2347,8 @@
     actualScroll: null, restoreScroll: null, measuredWidths: new Set(), room: { left: 0, top: 0 },
     // The drawing's root that the last mount put in place, until release.
     mounted: null,
+    // The sentences the last render's band can show: { sentences, key }.
+    trace: null,
   };
   const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
 
@@ -2411,6 +2453,9 @@
     }
     if (!refExists(model, live.pin)) live.pin = null;
     live.hover = null;
+    // The sentences this drawing's band can show, for its one measure.
+    const sentences = traceSentences(model, { pin: live.pin });
+    live.trace = { sentences, key: JSON.stringify(sentences) };
     updateSearchStatus();
     const help = searchHelp(model);
     if (live.input) {
@@ -2589,9 +2634,139 @@
     }
   }
 
+  // A focused item scrolls clear of the band at the band's own height: one
+  // observer follows the band in place and writes its whole height to the
+  // topology root, where the items' scroll margin reads it. Until then, and
+  // in a browser without ResizeObserver, the reserved height is the margin.
+  const bandWatch = { observer: null, band: null, measurer: null };
+
+  function onBandResize(entries) {
+    for (const entry of entries) {
+      // The empty measurer is 1em by 1lh (stylesheet): a new font resizes it, also when the band keeps its size.
+      if (entry?.target && entry.target === bandWatch.measurer) { holdBand(bandWatch.band); continue; }
+      const height = Number(entry?.borderBoxSize?.[0]?.blockSize);
+      const root = entry?.target?.closest?.(".fabric-topology");
+      if (root?.style && Number.isFinite(height) && height > 0) root.style.setProperty("--topology-trace-height", `${Math.ceil(height)}px`);
+      // A new width, or a font that changed without one, is measured here;
+      // the band's own height changing is not.
+      if (entry?.target !== bandWatch.band) continue;
+      const inline = Number(entry?.borderBoxSize?.[0]?.inlineSize);
+      holdBand(entry.target, Number.isFinite(inline) && inline > 0 ? inline : hold.width);
+    }
+  }
+
+  // The band's height, held: every sentence the drawing can show is laid out
+  // once in the band's own measurer, at the band's width with the visible
+  // sentence's rules, the tallest is read, rounded up (never down, so no
+  // sentence is taller than the band) and held, and the measurer is emptied.
+  // A measure is kept per band width, font, line height, resolution and font
+  // load for the same sentences; hover, focus and a pin that keeps the same
+  // sentences change only the visible text and measure nothing. The cache
+  // holds a few widths, not sentences: every sentence is measured.
+  const hold = { key: null, width: null, gen: 0, cache: new Map(), band: null, px: null, resolution: null };
+  const HOLD_WIDTHS = 8;
+
+  function holdKey(band, width) {
+    const para = band.querySelector?.("[data-topology-pin]");
+    const style = para && typeof window.getComputedStyle === "function" ? window.getComputedStyle(para) : null;
+    return `${width}|${style?.font || ""}|${style?.lineHeight || ""}|${Number(window.devicePixelRatio) || 1}|${hold.gen}`;
+  }
+
+  // width: the band's own from its observer, else read once (a new band's may differ).
+  function holdBand(band, width = 0) {
+    const measurer = band?.querySelector?.("[data-topology-measure]");
+    if (!measurer || !band.style || !live.trace) return;
+    if (hold.key !== live.trace.key) hold.cache.clear();
+    hold.key = live.trace.key;
+    if (!(width > 0)) {
+      // A new band first takes the page's height, so the read lays the page
+      // out as long as it was; a wrong one is replaced below, before mount.
+      if (hold.band !== band && hold.px !== null) putHold(band, hold.px);
+      width = Number(band.getBoundingClientRect?.()?.width) || 0;
+    }
+    hold.width = width > 0 ? width : null;
+    if (!hold.width) return;
+    const key = holdKey(band, width);
+    let px = hold.cache.get(key);
+    if (px === undefined) {
+      px = measureBand(measurer, live.trace.sentences);
+      if (px === null) return;
+      hold.cache.set(key, px);
+      if (hold.cache.size > HOLD_WIDTHS) hold.cache.delete(hold.cache.keys().next().value);
+    }
+    putHold(band, px);
+  }
+
+  function putHold(band, px) {
+    if (hold.band === band && hold.px === px) return;
+    Object.assign(hold, { band, px });
+    band.style.setProperty("--topology-trace-held", `${px}px`);
+  }
+
+  // Lays the sentences out as text, reads the tallest once and empties the
+  // measurer in the same task, so they are never painted, found or read out.
+  function measureBand(measurer, sentences) {
+    const doc = measurer.ownerDocument || (typeof document !== "undefined" ? document : null);
+    if (typeof doc?.createElement !== "function") return null;
+    const items = typeof doc.createDocumentFragment === "function" ? doc.createDocumentFragment() : null;
+    for (const text of sentences) {
+      const line = doc.createElement("p");
+      line.className = "fabric-topology-pin subtle";
+      line.textContent = text;
+      if (items) items.appendChild(line);
+      else measurer.appendChild(line);
+    }
+    if (items) measurer.appendChild(items);
+    const height = Number(measurer.getBoundingClientRect?.()?.height);
+    measurer.textContent = "";
+    return Number.isFinite(height) && height > 0 ? Math.ceil(height) : null;
+  }
+
+  // A font that loads, or a new resolution, can change every sentence's
+  // height: measure the band in place again.
+  function remeasure() {
+    hold.gen += 1;
+    const band = live.container?.querySelector?.("[data-topology-trace]");
+    if (band) holdBand(band);
+  }
+
+  function onResolution() {
+    watchResolution();
+    remeasure();
+  }
+
+  function watchResolution() {
+    hold.resolution?.removeEventListener?.("change", onResolution);
+    hold.resolution = null;
+    if (typeof window.matchMedia !== "function") return;
+    hold.resolution = window.matchMedia(`(resolution: ${Number(window.devicePixelRatio) || 1}dppx)`);
+    hold.resolution?.addEventListener?.("change", onResolution);
+  }
+
+  function watchBand(container) {
+    if (typeof window.ResizeObserver !== "function") return;
+    const band = container?.querySelector?.("[data-topology-trace]") || null;
+    if (band === bandWatch.band) return;
+    unwatchBand();
+    if (!band) return;
+    if (!bandWatch.observer) bandWatch.observer = new window.ResizeObserver(onBandResize);
+    bandWatch.observer.observe(band, { box: "border-box" });
+    bandWatch.band = band;
+    bandWatch.measurer = band.querySelector?.("[data-topology-measure]") || null;
+    if (bandWatch.measurer) bandWatch.observer.observe(bandWatch.measurer);
+  }
+
+  function unwatchBand() {
+    bandWatch.observer?.disconnect();
+    Object.assign(bandWatch, { band: null, measurer: null });
+  }
+
   // Leaving the mode: no pin, hover or search carries over, and the view's
   // document and window listeners are removed.
   function release() {
+    unwatchBand();
+    Object.assign(hold, { key: null, width: null, band: null, px: null });
+    hold.cache.clear();
     live.pin = null;
     live.hover = null;
     live.quiet = null;
@@ -2649,11 +2824,7 @@
     // The line under the legend names what is traced in full, so text a box
     // had to shorten is readable on hover and on keyboard focus alike.
     const pin = root.querySelector("[data-topology-pin]");
-    if (pin) {
-      if (live.hover) pin.textContent = `Tracing: ${refLabel(live.model, live.hover)}.${live.pin ? " Pinned item kept; Esc clears." : ""}`;
-      else if (live.pin) pin.textContent = `Pinned: ${refLabel(live.model, live.pin)}. Esc clears.`;
-      else pin.textContent = DEFAULT_HINT;
-    }
+    if (pin) pin.textContent = traceSentence(live.model, { hover: live.hover, pin: live.pin });
   }
 
   function updateSearchStatus() {
@@ -2711,6 +2882,8 @@
     if (globals.listening) return;
     if (typeof document !== "undefined" && typeof document.addEventListener === "function") document.addEventListener("keydown", onEscape);
     if (typeof window.addEventListener === "function") window.addEventListener("resize", onResize);
+    if (typeof document !== "undefined") document.fonts?.addEventListener?.("loadingdone", remeasure);
+    watchResolution();
     globals.listening = true;
   }
 
@@ -2718,6 +2891,9 @@
     if (!globals.listening) return;
     if (typeof document !== "undefined" && typeof document.removeEventListener === "function") document.removeEventListener("keydown", onEscape);
     if (typeof window.removeEventListener === "function") window.removeEventListener("resize", onResize);
+    if (typeof document !== "undefined") document.fonts?.removeEventListener?.("loadingdone", remeasure);
+    hold.resolution?.removeEventListener?.("change", onResolution);
+    hold.resolution = null;
     if (globals.timer !== null && typeof window.clearTimeout === "function") window.clearTimeout(globals.timer);
     globals.timer = null;
     globals.listening = false;
@@ -2807,7 +2983,14 @@
     searchHelp,
     linkDetail,
     render,
-    mount,
+    // After the drawing is in place: the band's height is held first, so
+    // the page is as long as it stays when mount puts the view and the page
+    // back; then the band is followed.
+    mount: (container, ...rest) => {
+      holdBand(container?.querySelector?.("[data-topology-trace]"));
+      mount(container, ...rest);
+      watchBand(container);
+    },
     release,
     view,
     drawnModel,
