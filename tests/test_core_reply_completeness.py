@@ -10,13 +10,14 @@ position, counting the positions that discovery messages hold (#1282).
 
 import unittest
 
-from app.services.sas_fabric_parsers import parse_mpr_devices
+from app.services.sas_fabric_parsers import parse_mpr_adapter_detail, parse_mpr_devices
 from tests.test_core_fabric_legacy_controller import (
     DEVICE_ADDRESS,
     DEVICES_HEADING,
     LISTS_MISSING_WARNING,
     PHY_TABLE_WARNING,
     SELECTED_ENCLOSURE,
+    _adapter_phy_row,
     _core_fabric,
     _healthy_unit,
     _inventory_slot,
@@ -158,6 +159,42 @@ class CoreDedicatedReplyUtilityErrorTests(unittest.TestCase):
         self.assertEqual(read["lists"]["mpr0"], {"expanders": "read", "enclosures": "read", "devices": "read"})
         self.assertEqual(read["counts"], {count: "complete" for count in ("controllers", "paths", "expanders", "enclosures")})
         self.assertEqual(fabric.warnings, [])
+
+
+class CoreAdapterPhyOrderTests(unittest.TestCase):
+    """#1282: each printed PHY number must be its own position, discovery lines included."""
+
+    def test_rows_out_of_printed_order_are_not_read_whole(self) -> None:
+        row = _adapter_phy_row
+        for name, rows in {
+            "discovery then 2 then 1": DISCOVERY + row(2, attached=True) + row(1, attached=True),
+            "1 then 0": row(1, attached=True) + row(0, attached=True),
+            "0, 2, 1": row(0, attached=True) + row(2, attached=True) + row(1, attached=True),
+            "1, discovery then 0": row(1, attached=True) + DISCOVERY + row(0, attached=True),
+        }.items():
+            with self.subTest(name):
+                detail = parse_mpr_adapter_detail(_adapter(rows))
+                self.assertEqual(
+                    (detail["phy_table"], detail["phy_count"], detail["linked_phy_count"]), ("rejected", None, None)
+                )
+                fabric = _fabric({**_healthy_unit(), "mprutil -u 0 show adapter": _adapter(rows)})
+                [controller] = [node.metrics for node in fabric.nodes if node.kind == "controller"]
+                self.assertEqual(controller.get("not_read"), ["phy_count", "linked_phy_count"])
+                self.assertIn(PHY_TABLE_WARNING, fabric.warnings)
+
+    def test_rows_in_printed_order_with_discovery_positions_are_read(self) -> None:
+        # Controls: legal orderings keep their printed rows and add no warning.
+        row = _adapter_phy_row
+        for name, (rows, counts) in {
+            "0, discovery, 2": (row(0, attached=True) + DISCOVERY + row(2, attached=True), (2, 2)),
+            "discovery, 1, 2": (DISCOVERY + row(1, attached=True) + row(2, attached=False), (2, 1)),
+            "0, 1": (row(0, attached=True) + row(1, attached=True), (2, 2)),
+        }.items():
+            with self.subTest(name):
+                detail = parse_mpr_adapter_detail(_adapter(rows))
+                self.assertEqual((detail["phy_table"], detail["phy_count"], detail["linked_phy_count"]), ("read", *counts))
+                fabric = _fabric({**_healthy_unit(), "mprutil -u 0 show adapter": _adapter(rows)})
+                self.assertEqual(fabric.warnings, [])
 
 
 if __name__ == "__main__":

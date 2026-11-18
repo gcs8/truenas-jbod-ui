@@ -41,6 +41,8 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
     malformed_phy_rows = 0
     discovering_phys: list[int] = []
+    # mprutil prints PHY i at position i, a discovery line holding its own.
+    out_of_order_phy_rows = 0
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -59,6 +61,9 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
             continue
         if re.match(r"^\d+\s+", stripped):
             parts = stripped.split()
+            # The length bound keeps int() off an unbounded digit run.
+            if len(parts[0]) > 6 or int(parts[0]) != len(detail["phy_rows"]) + len(discovering_phys):
+                out_of_order_phy_rows += 1
             unattached = _MPR_UNATTACHED_ADAPTER_PHY.match(stripped)
             if unattached:
                 # mprutil leaves both handles and the speed blank for a PHY
@@ -92,17 +97,11 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
                 malformed_phy_rows += 1
     rows = detail["phy_rows"]
     # Counts come only from a PHY table that was read whole. No table, a
-    # malformed row, a repeated PHY number or a gap in the PHY numbers
-    # (0 to n-1, as mprutil lists them) leaves both counts unknown. A PHY
-    # still in discovery fills only its own position; printed rows are counted.
-    phy_numbers = [int(row["phy"]) for row in rows] + discovering_phys
-    table_size = len(phy_numbers)
-    if (
-        table_size
-        and not malformed_phy_rows
-        and len(set(phy_numbers)) == len(phy_numbers)
-        and all(number < table_size for number in phy_numbers)
-    ):
+    # malformed row, or a PHY number that is not its printed position (0 to
+    # n-1 in order, as mprutil lists them: a repeat, a gap or a reordering)
+    # leaves both counts unknown. A PHY still in discovery fills only its own
+    # position; printed rows are counted.
+    if (rows or discovering_phys) and not malformed_phy_rows and not out_of_order_phy_rows:
         detail["phy_count"] = len(rows)
         detail["linked_phy_count"] = sum(
             1 for row in rows if row.get("device_handle") and row.get("device") and row.get("device") != "No Device"
