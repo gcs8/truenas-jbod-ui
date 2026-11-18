@@ -164,11 +164,20 @@ def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
         target = parts[1] if sas_index >= 2 and re.fullmatch(r"\d+", parts[1]) else None
         device_words: list[str] = []
         index = sas_index + 3
-        while index < len(parts) and not re.fullmatch(r"\d+(?:\.\d+)?", parts[index]):
+        # The speed column ends the device column: a number, or the `Unk` or
+        # `???` mprutil prints for a rate it has no name for.
+        while index < len(parts) and not re.fullmatch(r"\d+(?:\.\d+)?|\?\?\?|Unk", parts[index]):
             device_words.append(parts[index])
             index += 1
-        # The device column starts with its type; a provider may name the disk after it.
-        if index + 2 >= len(parts) or " ".join(device_words[:2]) not in MPR_DEVICE_TYPES:
+        # The device column starts with its type; a provider may name the disk
+        # after it. After the speed come the enclosure handle and the slot; a
+        # row whose columns do not read so is not understood, never shifted.
+        if (
+            index + 2 >= len(parts)
+            or " ".join(device_words[:2]) not in MPR_DEVICE_TYPES
+            or not re.fullmatch(r"[0-9a-fA-F]{4}", parts[index + 1])
+            or not re.fullmatch(r"\d+", parts[index + 2])
+        ):
             rejected += 1
             continue
         rows.append(
