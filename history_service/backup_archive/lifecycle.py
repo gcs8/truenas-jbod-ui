@@ -8,18 +8,21 @@ candidate, oldest first. The guarantees, in order:
   a catalog record are reported by :func:`reconcile` and never touched.
 * Preserved (pinned) artifacts are never deleted and do not count toward
   ``keep_count``.
-* The newest verified copy of a class at a location is never deleted, even when
-  a limit says it should be (it is listed in ``GroomingPlan.guarded``).
+* The newest copy of a class at a location that passed its last completed
+  check is never deleted, even when a limit says it should be (it is listed in
+  ``GroomingPlan.guarded``). That check is what the catalogue's ``verified``
+  flag records: the upload check, which for some targets compares the size
+  only, or a later Verify. It is not by itself a readback of the content.
 * Unverified copies (partial or failed readback) do not count toward
   ``keep_count``; once older than the grace period they become candidates of
   kind ``"unverified"``, listed separately from retention deletions.
 * A (class, location) pair without a rule is left alone entirely.
 * A retention deletion never relies on a kept copy that was not just checked
   (#1188). Before the first retention deletion of a (class, location) pair,
-  ``apply`` reads back the newest verified kept copy and compares size and
-  SHA-256 with the catalog. One matching copy is enough. A missing or
-  mismatching one is marked unverified, the pair is replanned (only planned
-  items that are still due stay) and the next newest verified copy is tried,
+  ``apply`` reads back the newest kept copy with the ``verified`` flag set and
+  compares size and SHA-256 with the catalog. One matching copy is enough. A
+  missing or mismatching one is marked unverified, the pair is replanned (only
+  planned items that are still due stay) and the next newest flagged copy is tried,
   at most ``KEEPER_READS_PER_GROUP`` reads per pair, stopping as soon as no
   deletion remains. A keeper that cannot be checked, or a read budget spent
   without a match, refuses the location with a named reason.
@@ -289,7 +292,12 @@ class LifecycleManager:
     # -- keeper checks -------------------------------------------------------
 
     def _newest_keeper(self, records: list[ArtifactRecord], pending: set[str]) -> ArtifactRecord | None:
-        """The newest verified copy that stays after ``pending`` is deleted."""
+        """The newest flagged copy that stays after ``pending`` is deleted.
+
+        Flagged means the ``verified`` catalogue flag is set. It records the
+        last completed check, which can be a size-only upload check, so this
+        copy has not necessarily been read back yet.
+        """
 
         return max(
             (
@@ -322,7 +330,7 @@ class LifecycleManager:
     ) -> set[str]:
         """Find one kept copy that matches; return the planned ids still safe to delete.
 
-        The newest verified copy that stays is read first. If it matches, the
+        The newest flagged copy that stays is read first. If it matches, the
         check ends and ``pending`` may be deleted. If it is missing or does not
         match, it is marked unverified (and appended to ``downgraded``), the
         pair is replanned (which can only shrink ``pending``) and the next
@@ -371,7 +379,8 @@ class LifecycleManager:
 
         Before each deletion the catalog atomically claims the record: it must
         still equal the planned record (so a copy pinned after planning is not
-        deleted) and must not have become the newest verified copy, and while
+        deleted) and must not have become the newest copy with the ``verified``
+        flag (the last completed check passed), and while
         the claim is held it cannot be pinned. An object already gone from its
         location is tombstoned as missing. When a location's target cannot be
         resolved, or deletion reports a connection/timeout failure, that
