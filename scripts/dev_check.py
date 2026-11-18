@@ -257,6 +257,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_segmented_history",
             "tests.test_segmented_history_reader",
             "tests.test_segmented_restore_recovery",
+            "tests.test_ses_flag_whole_values",
             "tests.test_ses_unknown_occupancy_consumers",
             "tests.test_ses_unknown_presence",
             "tests.test_ses_zero_address_identity",

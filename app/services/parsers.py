@@ -1783,9 +1783,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             ("Fault sensed", "fault_sensed"),
             ("Fault reqstd", "fault_requested"),
         ):
-            match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
-            if match:
-                setattr(current_slot, attribute, match.group("value") == "1")
+            value = _sg_ses_flag_value(stripped, field_name)
+            if value is not _SG_SES_FLAG_ABSENT:
+                setattr(current_slot, attribute, value)
 
     if not enclosure.slots:
         return None
@@ -2011,6 +2011,30 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     return enclosure
 
 
+_SG_SES_FLAG_ABSENT = object()
+
+
+def _sg_ses_flag_value(line: str, field_name: str) -> object:
+    """Read one comma-separated ``Field=value`` flag from an sg_ses line.
+
+    Only a whole value of ``0`` or ``1`` is a flag (#1275). Any other value of
+    a present field (``10``, ``1x``, ``1.``, empty) is unknown, ``None``. A
+    field the line does not carry returns ``_SG_SES_FLAG_ABSENT`` so the caller
+    leaves what an earlier line recorded.
+    """
+    match = re.search(
+        rf"(?:^|,)\s*{re.escape(field_name)}=(?P<value>[^,]*)", line
+    )
+    if match is None:
+        return _SG_SES_FLAG_ABSENT
+    value = match.group("value").strip()
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
 def _apply_sg_ses_status_line(
     slot: SESMapSlot,
     line: str,
@@ -2037,9 +2061,9 @@ def _apply_sg_ses_status_line(
         ("Swap", "swapped"),
         ("Hot spare", "hot_spare"),
     ):
-        match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", line)
-        if match:
-            setattr(slot, attribute, match.group("value") == "1")
+        value = _sg_ses_flag_value(line, field_name)
+        if value is not _SG_SES_FLAG_ABSENT:
+            setattr(slot, attribute, value)
     if apply_presence:
         _apply_ses_presence_evidence(slot, presence, source)
     return presence
