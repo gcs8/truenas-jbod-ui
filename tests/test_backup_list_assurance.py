@@ -1373,5 +1373,105 @@ class RejectedCopyStaysRejectedTests(backup_fixtures.SchedulerTestBase):
         self.assertIsNone(rejected_copy_error(OSError("alone")))
 
 
+class UploadCheckIsReadFromTheCopyTests(backup_fixtures.SchedulerTestBase):
+    """How a copy was checked at upload comes from that copy's record (#1288).
+
+    Earlier releases stored "readback" for an S3 upload whose ETag matched, and
+    recorded nothing about the provider. Changing the target's provider later
+    must not turn that stored word into a readback nobody performed: only the
+    copy's own successful Verify does that. The real S3 target over the
+    maintained in-memory client; filesystem targets in the temporary directory.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = archive_transport_fixtures.FakeS3Client()
+
+    open_target = ProviderChecksumIsNotAReadbackTests.open_target
+    _views = ProviderChecksumIsNotAReadbackTests._views
+    _assert_presented = ProviderChecksumIsNotAReadbackTests._assert_presented
+    _copies = ProviderChecksumIsNotAReadbackTests._copies
+
+    def _config(self, *, cloud_provider: str = "s3", nas_provider: str = "filesystem"):
+        config = ProviderChecksumIsNotAReadbackTests._config(self)
+        s3, nas = config["targets"]
+        cloud = s3
+        if cloud_provider != "s3":
+            cloud = {**backup_fixtures.TARGET, "target_id": "cloud", "label": "Cloud bucket", "provider": cloud_provider,
+                     "root": "/unused-cloud"}
+        if nas_provider == "s3":
+            nas = {**s3, "target_id": "nas", "label": "Office NAS"}
+        config["targets"] = [cloud, nas]
+        return config
+
+    def _earlier_release_copy(self):
+        """An S3 copy as an earlier release left it: "readback" for a matching ETag, no provider."""
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        cloud = self._copies(scheduler)["cloud"]
+        self.assertEqual(self.client.get_calls, 0)  # the ETag matched; nothing was read back
+        with scheduler._state_lock:
+            meta = scheduler._meta[cloud.artifact_id]
+            meta["upload_check"] = "readback"
+            meta.pop("upload_provider", None)
+            scheduler._save_meta()
+        scheduler.close()
+        return cloud
+
+    def test_changing_the_targets_provider_does_not_relabel_an_old_upload_as_read_back(self) -> None:
+        cloud = self._earlier_release_copy()
+        scheduler = self.make(self._config())
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+        scheduler.close()
+
+        # Only the target's current provider changes; the copy and its record do not.
+        scheduler = self.make(self._config(cloud_provider="filesystem"))
+        self._assert_presented(scheduler, cloud.artifact_id, EITHER, passed=False)
+        self.assertEqual(self.client.get_calls, 0)  # presenting the copy read nothing back
+
+    def test_a_new_copy_records_the_provider_it_was_uploaded_with(self) -> None:
+        self.client.etag_override = "kms-opaque"  # the S3 copy is read back at upload
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        copies = self._copies(scheduler)
+        self.assertEqual(scheduler._metadata_snapshot(copies["cloud"].artifact_id).get("upload_provider"), "s3")
+        self.assertEqual(scheduler._metadata_snapshot(copies["nas"].artifact_id).get("upload_provider"), "filesystem")
+        self.assertIsNone(scheduler._metadata_snapshot(copies["local"].artifact_id).get("upload_provider"))
+        scheduler.close()
+
+        # Swapping both targets' providers changes neither copy's presentation.
+        scheduler = self.make(self._config(cloud_provider="filesystem", nas_provider="s3"))
+        self._assert_presented(scheduler, copies["cloud"].artifact_id, EITHER, passed=False)
+        self._assert_presented(scheduler, copies["nas"].artifact_id, "readback", passed=False)
+
+    def test_an_earlier_filesystem_readback_record_is_presented_as_either_until_verified(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        self._assert_presented(scheduler, nas.artifact_id, "readback", passed=False)  # control: recorded provider
+        with scheduler._state_lock:
+            scheduler._meta[nas.artifact_id].pop("upload_provider", None)
+            scheduler._save_meta()
+        scheduler.close()
+
+        # The record no longer says which provider took the upload, so the
+        # current filesystem target cannot vouch for it.
+        scheduler = self.make(self._config())
+        self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=False)
+        self.assertTrue(scheduler.verify(nas.artifact_id)["ok"])
+        self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=True)
+
+    def test_a_malformed_recorded_provider_is_unknown(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        for value in ("", "tape", ["filesystem"], {"provider": "filesystem"}, None, 1):
+            with self.subTest(value=value):
+                with scheduler._state_lock:
+                    scheduler._meta[nas.artifact_id]["upload_provider"] = value
+                self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=False)
+
+
 if __name__ == "__main__":
     unittest.main()
