@@ -2407,7 +2407,9 @@
     const box = scrollBox(live.container);
     const measured = Number(box?.clientWidth) || 0;
     const width = measured > 0 ? measured : Math.max(0, (Number(options.width) || 0) - 2 * SCROLL_BORDER);
-    const model = buildTopologyModel(fabric, { ...options, width, previousOrder });
+    // Fit takes the box's inner height (its limit less both borders, floored): nothing left to scroll.
+    const height = Math.max(0, Math.floor((Number(options.height) || 0) - 2 * SCROLL_BORDER));
+    const model = buildTopologyModel(fabric, { ...options, width, height, previousOrder });
     // The page replaces the map on every render: keep the drawing's scroll
     // position for the same scope, and start a new scope at the origin.
     const keys = expandedKeys(options);
@@ -2518,9 +2520,17 @@
     const y = Number(window.scrollY) || 0;
     if (y <= 0) return 0;
     const root = typeof document !== "undefined" ? document.documentElement : null;
-    const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
-    const slack = Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
-    return Math.max(0, settled - slack);
+    const slackOf = () => {
+      const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
+      return Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
+    };
+    const slack = slackOf();
+    // A box at a limit that is not a whole pixel gives back the fraction less than the slack (its
+    // clientHeight is rounded up), and below the limit it is whole: give back the rest in this redraw.
+    const tall = Number(typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect()?.height : NaN);
+    if (!slack || !Number.isFinite(tall) || tall === Math.round(tall)) return Math.max(0, settled - slack);
+    sizeRoom(box, left, top, settled - slack);
+    return Math.max(0, (Number(box.clientHeight) || 0) - slackOf());
   }
 
   // After the page has put the drawing in place: set its scroll position,
@@ -2913,8 +2923,8 @@
     container.addEventListener("click", (event) => {
       if (live.container !== container) return;
       if (event.target?.closest?.("[data-topology-fit]")) {
-        // Fit keeps the offsets the fitted drawing allows; Actual size goes
-        // back to the offsets held before Fit.
+        // Fit puts the fitted drawing at offsets 0/0; Actual size goes back
+        // to the offsets held before Fit.
         const box = scrollBox(container);
         if (!live.fit) live.actualScroll = { left: (Number(box?.scrollLeft) || 0) - live.room.left, top: (Number(box?.scrollTop) || 0) - live.room.top };
         else live.restoreScroll = live.actualScroll;

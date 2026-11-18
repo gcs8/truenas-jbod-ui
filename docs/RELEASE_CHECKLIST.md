@@ -513,8 +513,11 @@ owner-approved `workflow_dispatch`.
   still the ones it read; a fragment that changed, or that it cannot delete,
   is left in place and listed, the other fragments are still deleted, and the
   run exits non-zero. A second run for the same version is refused and lists
-  the fragments still present; compare them with the written section, or
-  restore `CHANGELOG.md` from Git and collect again. It keeps the text of the
+  the fragments still present. Either compare them with the written section,
+  delete the ones already in it and commit, or restore `CHANGELOG.md` and
+  `changelog.d/` together, `git restore CHANGELOG.md changelog.d`, and collect
+  again; restoring `CHANGELOG.md` alone loses the fragments that were already
+  deleted. It keeps the text of the
   older sections and writes LF line endings, which `.gitattributes` requires.
   Review the diff; only `changelog.d/README.md` may remain, and the release
   wrap validator refuses a release tree with any other fragment. The release

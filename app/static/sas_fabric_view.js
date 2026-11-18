@@ -4336,7 +4336,8 @@
           selection: currentSelectionRef(),
           inventory: state.snapshot,
           width: elements.mapPanel.clientWidth,
-          height: Math.round((window.innerHeight || 0) * 0.78),
+          // The box's height limit (78vh in the stylesheet), not rounded.
+          height: (window.innerHeight || 0) * 0.78,
         })
         : '<div class="warning-item muted compact">The Topology view did not load. Reload the page.</div>';
       window.SasFabricTopology?.mount(elements.mapPanel, pageScroll);
