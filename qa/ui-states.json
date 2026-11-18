@@ -434,14 +434,14 @@
     },
     {
       "id": "admin.system-form", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"openAll": "details"}, {"wait": 400}],
       "covers": ["#setup-system-label", "#setup-system-id", "#setup-platform", "#setup-profile", "#setup-make-default", "#setup-truenas-host", "#setup-verify-ssl", "#setup-tls-ca-bundle-path", "#setup-tls-server-name", "[data-tls-server-name]", "#setup-enclosure-filter", "#setup-api-key", "#setup-api-user", "#setup-api-password", "#setup-bmc-enabled", "#setup-bmc-host", "#setup-bmc-username", "#setup-bmc-password", "#setup-bmc-verify-ssl", "#setup-bmc-timeout-seconds", "#setup-ssh-enabled", "#setup-ha-enabled", "#setup-ssh-host", "#setup-ssh-user", "#setup-ssh-port", "#setup-ssh-key-mode", "#setup-ssh-key-path", "#setup-ssh-password", "#setup-ssh-sudo-password", "#setup-ssh-strict-host-key", "#setup-ssh-existing-key", "#setup-generate-key-name", "#setup-bootstrap-details", "#setup-bootstrap-enabled", "#setup-bootstrap-host", "#setup-bootstrap-user", "#setup-bootstrap-password", "#setup-bootstrap-key-path", "#setup-bootstrap-service-home", "#setup-bootstrap-install-sudo", "#setup-ssh-commands-details", "#setup-ssh-commands", "#setup-load-recommended-button", "#setup-tls-ca-file", "#setup-tls-ca-pick-button"]
     },
     {
       "id": "admin.system-form.quantastor-ha", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: QuantaStor with SSH and HA on reveals the HA node rows. Nothing is saved.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "quantastor"}, {"check": "#setup-ssh-enabled"}, {"check": "#setup-ha-enabled"}, {"requireVisible": "[data-ha-node-host]"}, {"wait": 400}],
@@ -449,7 +449,7 @@
     },
     {
       "id": "admin.system-form.esxi", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: ESXi with SSH on reveals the StorCLI host-preparation panel. Nothing is uploaded or installed.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "esxi"}, {"check": "#setup-ssh-enabled"}, {"requireVisible": "#setup-esxi-host-prep-pick-button"}, {"wait": 400}],
@@ -457,7 +457,7 @@
     },
     {
       "id": "admin.system-form.ssh-key", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: each SSH key source reveals its own fields. Generating or refreshing keys is never pressed here.",
       "matrix": {"mode": ["reuse", "generate", "manual", "none"]},
@@ -466,7 +466,7 @@
     },
     {
       "id": "admin.storage-views.binding", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved draft edit: each storage-view binding mode reveals its own fields. Nothing is saved.",
       "matrix": {"binding": ["auto", "pool", "serial", "hybrid"]},
@@ -475,7 +475,7 @@
     },
     {
       "id": "admin.storage-views", "page": "admin", "safety": "read", "ci": true,
-      "appliance_load": true,
+      "appliance_load": true, "selects_system": "[data-existing-system-id]",
       "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Storage-view and page-order editing in the setup draft. Nothing is saved until Save System, which is forbidden.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"clickIfPresent": "[data-storage-view-id]"}, {"wait": 600}],

@@ -13,7 +13,7 @@ const path = require("node:path");
 const { runState } = require("./actuation");
 const { CrawlDriver, NotApplicable, navigate } = require("./driver");
 const { pageChecks, axeFindings } = require("./checks");
-const { readsFor, loadRequestsFor } = require("./inventory");
+const { readsFor, loadRequestsFor, selectsSystemAttribute } = require("./inventory");
 const { scopeKindFor } = require("./reach");
 const png = require("./png");
 
@@ -312,6 +312,45 @@ class Crawler {
     return { system_id: system, enclosure_id: enclosure, storage_view_id: null };
   }
 
+  // #1135: a state that selects a saved system (`selects_system`, the admin
+  // page's `[data-existing-system-id]` buttons) sends that system's appliance
+  // reads, but the live admin target has no system, and a null binding
+  // refuses every system_id. Before the state's window opens, the system it
+  // will select is read from the page: the run's bound system (the
+  // `--write-system` one) when it has one, else the first listed. Its clicks
+  // are pinned to that system's button and, on a live target with no system,
+  // the state's binding names that system, so its reads for any other system
+  // stay refused. A bound system the page does not list is not-applicable.
+  // Nothing listed leaves the state and its null binding unchanged. Fixture
+  // runs bind nothing; only the click is pinned.
+  async selectSystem(driver, state) {
+    const selector = state.selects_system;
+    if (!selector) return state;
+    const attribute = selectsSystemAttribute(selector);
+    if (!attribute) throw new Error(`${state.id}: selects_system ${selector} is not one [attribute] selector`);
+    const listed = await this.page.locator(selector).filter({ visible: true })
+      .evaluateAll((nodes, name) => nodes.map((node) => node.getAttribute(name)), attribute);
+    const ids = listed.filter((id) => typeof id === "string" && id);
+    const bound = (driver.bind || {}).system_id;
+    let system = null;
+    if (typeof bound === "string" && bound) {
+      if (!ids.includes(bound)) throw new NotApplicable(`system ${bound} is not listed by ${selector}`);
+      system = bound;
+    } else {
+      system = ids[0] || null;
+    }
+    if (!system) return state;
+    if (bound === null) driver.bind = { ...driver.bind, system_id: system };
+    const pinned = `[${attribute}="${system.replace(/["\\]/g, "\\$&")}"]`;
+    const pin = (step) => {
+      if (!step) return step;
+      if (step.click === selector) return { ...step, click: pinned };
+      if (step.clickIfPresent === selector) return { ...step, clickIfPresent: pinned };
+      return step;
+    };
+    return { ...state, steps: (state.steps || []).map(pin) };
+  }
+
   // The scope kind whose generated reads a target's states get (an enclosure
   // or a storage view on the main page; one kind on the other pages).
   scopeFor(target) {
@@ -445,7 +484,8 @@ class Crawler {
       } else {
         driver = this.newDriver(target);
         driver.resetState();
-        const outcome = await runState(driver, state, { allow: this.allow, confirmPreview: this.confirmPreview });
+        const selected = await this.selectSystem(driver, state);
+        const outcome = await runState(driver, selected, { allow: this.allow, confirmPreview: this.confirmPreview });
         record.status = outcome.status;
         Object.assign(record, { outcome });
         if (state.safety !== "read" && state.safety !== "forbidden" || outcome.status === "previewed" || outcome.status === "preview-failed") this.actuations.push({ target: target.label, ...outcome, dialogs: driver.dialogTexts });

@@ -531,10 +531,10 @@ class ArtifactCatalog:
         return self.get(artifact_id)  # type: ignore[return-value]
 
     def mark_unverified(self, artifact_id: str) -> ArtifactRecord:
-        """Record a failed readback: the copy no longer counts as verified.
+        """Record a failed readback: clear the copy's ``verified`` catalogue flag.
 
-        It stops being the protected newest verified copy, and after the
-        unverified grace period grooming may delete it.
+        It stops being the protected newest copy that passed its last completed
+        check, and after the unverified grace period grooming may delete it.
         """
 
         with self._write() as connection:
@@ -556,8 +556,9 @@ class ArtifactCatalog:
         """Atomically check ``expected`` is still current and deletable, and claim it.
 
         Refused when the record changed (for example it was pinned), is
-        preserved, is already claimed, or (by default) is the newest verified
-        copy of its class at its location.
+        preserved, is already claimed, or (by default) is the newest copy of its
+        class at its location with the ``verified`` flag (its last completed
+        check, which can be the upload check, passed).
         """
 
         actor = _require_text(actor, label="Actor", required=True)
