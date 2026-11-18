@@ -40,7 +40,8 @@ from app.services.sas_fabric_parsers import (
     parse_dmidecode_slots,
     parse_mpr_adapter_detail,
     parse_mpr_adapter_summary,
-    parse_mpr_devices,
+    parse_mpr_device_list,
+    parse_mpr_devices as parse_mpr_devices,
     parse_mpr_dmesg_events,
     parse_mpr_enclosures,
     parse_mpr_expanders,
@@ -1887,20 +1888,31 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
         subcommand: outputs[f"{prefix} {subcommand}"] if f"{prefix} {subcommand}" in outputs else sections.get(subcommand)
         for subcommand in ("adapter", "devices", "enclosures", "expanders", "iocfacts")
     }
+    # Replies the utility reported an error in: a `show all` section that was
+    # used, and a dedicated reply, which gets the same qualification.
+    failed = {name for name, text in sections.items() if text is None and f"{prefix} {name}" not in outputs}
+    for subcommand in _MPR_SHOW_ALL_SECTIONS.values():
+        if f"{prefix} {subcommand}" in outputs and _mpr_reply_reports_error(outputs[f"{prefix} {subcommand}"]):
+            replies[subcommand] = None
+            failed.add(subcommand)
+    devices, rejected_device_rows = parse_mpr_device_list(replies["devices"] or "")
     payload: dict[str, Any] = {
         "adapter_detail": parse_mpr_adapter_detail(replies["adapter"] or ""),
-        "devices": parse_mpr_devices(replies["devices"] or ""),
+        "devices": devices,
         "enclosures": parse_mpr_enclosures(replies["enclosures"] or ""),
         "expanders": parse_mpr_expanders(replies["expanders"] or ""),
         "iocfacts": parse_mpr_iocfacts(replies["iocfacts"] or ""),
     }
-    if replies["adapter"] is None and "adapter" in sections:
-        # The utility reported an error in this section: its PHY table was not read.
+    if "adapter" in failed:
+        # The utility reported an error in this reply: its PHY table was not read.
         payload["adapter_detail"]["phy_table"] = "rejected"
     payload["lists"] = {
         subcommand: _mpr_list_state(replies[subcommand], subcommand, payload[subcommand])
         for subcommand in _MPR_LIST_HEADINGS
     }
+    if rejected_device_rows:
+        # A device row that was not understood: the rows kept are not the whole list.
+        payload["lists"]["devices"] = "unreadable"
     return payload
 
 
@@ -1913,6 +1925,10 @@ _MPR_SHOW_ALL_LABEL = re.compile(r"\S.*:")
 _MPR_ADAPTER_NAME_LINE = re.compile(r"\S+ Adapter:")
 # mprutil's warn() lines: "mprutil: Error retrieving enclosure page: ...".
 _MPR_UTILITY_ERROR = re.compile(r"mp[rs]util: ")
+
+
+def _mpr_reply_reports_error(text: str) -> bool:
+    return any(_MPR_UTILITY_ERROR.match(line.strip()) for line in text.splitlines())
 
 
 def _split_mpr_show_all(text: str) -> dict[str, str | None]:
