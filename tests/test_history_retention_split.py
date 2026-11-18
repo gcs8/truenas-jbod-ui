@@ -91,6 +91,10 @@ ROLLUP_CUTOFF = (BASE - timedelta(days=12)).isoformat()
 # sha256 of every SQL text the helpers build and send in _exercise(), joined
 # with NUL, as released before the move.
 RELEASED_SQL_SHA256 = "e04eb97dc4ffae3e5418f3103b68c31765c7749831bc503a4017bae342d9dcfb"
+# The same texts once rollup buckets are named from julianday() (#1320).
+CURRENT_SQL_SHA256 = "900efb193811ec34cd3bc706c65ffb8148b39afc38120252b4b33e40ce5f882a"
+# (released, current) end of each rollup bucket expression.
+BUCKET_READING = ("+00:00', observed_at)", "+00:00', julianday(observed_at))")
 
 
 def _store_retention():
@@ -344,7 +348,14 @@ class RetentionSqlTextTests(_StoreCase):
         texts = self._exercise()
         self.assertEqual(len(texts), 29)
         digest = hashlib.sha256("\0".join(texts).encode("utf-8")).hexdigest()
-        self.assertEqual(digest, RELEASED_SQL_SHA256)
+        self.assertEqual(digest, CURRENT_SQL_SHA256)
+        # The only change since the move: rollup buckets are named from
+        # julianday(), three uses in each of the three roll-up statements
+        # (#1320). Undoing it gives the released text back exactly.
+        self.assertEqual(sum(text.count(BUCKET_READING[1]) for text in texts), 9)
+        released = [text.replace(BUCKET_READING[1], BUCKET_READING[0]) for text in texts]
+        released_digest = hashlib.sha256("\0".join(released).encode("utf-8")).hexdigest()
+        self.assertEqual(released_digest, RELEASED_SQL_SHA256)
 
     def test_an_unsupported_rollup_interval_is_refused_with_the_released_message(self) -> None:
         with self.assertRaises(ValueError) as caught:
