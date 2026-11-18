@@ -188,7 +188,26 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
         controller_id, enclosure_id, slot, slot_key = _extract_storcli_drive_path(key)
         if not slot_key:
             continue
-        flattened = _flatten_storcli_detail(value)
+        row_entry = re.match(r"^Drive\s+/c\d+/e\d+/s\d+$", key, re.IGNORECASE) is not None
+        members = None
+        if row_entry and isinstance(value, list):
+            members = value
+        elif row_entry and isinstance(value, dict) and ("EID:Slt" in value or "EID:Slt " in value):
+            members = [value]
+        if members is None:
+            # A detail object: its nested sections are read as before.
+            flattened = _flatten_storcli_detail(value)
+        else:
+            # Drive rows (#1306): only a member that is this entry's own drive
+            # row supplies facts, and only its own top-level fields. The entry
+            # still names its slot for the census check.
+            flattened = {}
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                if _parse_storcli_eid_slot(member.get("EID:Slt") or member.get("EID:Slt "))[2] != slot_key:
+                    continue
+                flattened.update((str(k), v) for k, v in member.items() if not isinstance(v, dict | list))
         if controller_id:
             flattened["controller_id"] = controller_id
         if enclosure_id:
