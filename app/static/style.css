@@ -491,6 +491,9 @@ textarea {
   color: var(--text);
   padding: 10px 12px;
   font-family: var(--mono);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .meta-select:disabled {
@@ -1664,7 +1667,12 @@ textarea {
 
 .fabric-page-topbar .topbar-meta {
   display: grid;
-  grid-template-columns: minmax(170px, 1.15fr) minmax(170px, 1.15fr) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
+  /* sas_fabric_view.js publishes the card width each select needs for its
+     selected label. The two select tracks grow to that room when the row has
+     it and share any shortfall equally; Last Updated and Version take what is
+     left. A label that still does not fit ends in an ellipsis. Without the
+     measurement the selects keep their fixed shares. */
+  grid-template-columns: minmax(170px, var(--fabric-system-card-room, 1.15fr)) minmax(170px, var(--fabric-enclosure-card-room, 1.15fr)) minmax(135px, 0.85fr) minmax(135px, 0.85fr);
   min-width: 0;
 }
 
