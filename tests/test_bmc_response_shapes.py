@@ -7,10 +7,13 @@ BMC warning, never as an internal error. Synthetic in-memory replies only.
 
 from __future__ import annotations
 
+import io
 import json
 import unittest
+from email.message import Message
 from typing import Any
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from app.config import BMCConfig
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
@@ -149,6 +152,66 @@ class RedfishSimpleStorageFallbackTypeTests(unittest.TestCase):
         drive = inventory.drives[0]
         self.assertEqual((drive.slot_number, drive.vendor, drive.model, drive.health, drive.interface_type),
                          (1, "Synthetic", "SYN-DISK", None, "SATA"))
+
+
+class _HTTPErrorOpener:
+    """Fails every request through the real ``HTTPError`` branch with one synthetic JSON body."""
+
+    def __init__(self, code: int, body: Any) -> None:
+        self.code = code
+        self.body = json.dumps(body).encode("utf-8")
+
+    def open(self, request, timeout=None):  # noqa: ARG002 - opener signature
+        raise HTTPError(request.full_url, self.code, "synthetic", Message(), io.BytesIO(self.body))
+
+
+class RedfishHTTPErrorMessageTypeTests(unittest.TestCase):
+    MALFORMED_MESSAGES = ([], ["synthetic"], {}, {"text": "synthetic"}, 0, 7, 1.5, True, False)
+
+    def _service_with(self, body: Any, code: int = 500):
+        service = _service()
+        return service, _HTTPErrorOpener(code, body)
+
+    def test_wrong_typed_error_message_keeps_typed_http_failure(self) -> None:
+        for message in self.MALFORMED_MESSAGES:
+            with self.subTest(message=message):
+                service, opener = self._service_with({"error": {"message": message}})
+                with patch.object(service, "_build_https_opener", return_value=opener):
+                    with self.assertRaises(TrueNASAPIError) as caught:
+                        service._redfish_get_json(SYSTEM_PATH)
+                self.assertEqual(caught.exception.category, "remote_error")
+                self.assertEqual(caught.exception.code, 500)
+                self.assertIsNone(caught.exception.reason)
+
+    def test_wrong_typed_error_message_ends_as_fixed_inventory_warning(self) -> None:
+        for message in self.MALFORMED_MESSAGES:
+            with self.subTest(message=message):
+                service, opener = self._service_with({"error": {"message": message}})
+                with (
+                    patch.object(service, "_build_https_opener", return_value=opener),
+                    patch.object(service, "_populate_web_inventory"),
+                    self.assertLogs("app.services.supermicro_bmc", level="WARNING") as logs,
+                ):
+                    inventory = service.fetch_inventory()
+                self.assertEqual(inventory.warnings, [REDFISH_UNAVAILABLE])
+                self.assertIs(inventory.source_details["redfish_ok"], False)
+                self.assertTrue(any("category=remote_error" in line for line in logs.output), logs.output)
+
+    def test_string_error_message_is_still_the_reason(self) -> None:
+        service, opener = self._service_with({"error": {"message": " synthetic failure "}})
+        with patch.object(service, "_build_https_opener", return_value=opener):
+            with self.assertRaises(TrueNASAPIError) as caught:
+                service._redfish_get_json(SYSTEM_PATH)
+        self.assertEqual(caught.exception.category, "remote_error")
+        self.assertEqual(caught.exception.reason, "synthetic failure")
+        service, opener = self._service_with({"error": {"message": "synthetic failure"}})
+        with (
+            patch.object(service, "_build_https_opener", return_value=opener),
+            patch.object(service, "_populate_web_inventory"),
+            self.assertLogs("app.services.supermicro_bmc", level="WARNING"),
+        ):
+            inventory = service.fetch_inventory()
+        self.assertEqual(inventory.warnings, [REDFISH_UNAVAILABLE])
 
 
 if __name__ == "__main__":

@@ -147,7 +147,12 @@ def _redfish_error_message(body: bytes) -> str | None:
     error_block = payload.get("error")
     if not isinstance(error_block, dict):
         return None
-    return normalize_text(error_block.get("message"))
+    message = error_block.get("message")
+    # The reason is optional text; a non-string message is ignored so the
+    # typed HTTP failure stands (#1312).
+    if not isinstance(message, str):
+        return None
+    return normalize_text(message)
 
 
 def _redfish_unusable(path: str) -> TrueNASAPIError:
