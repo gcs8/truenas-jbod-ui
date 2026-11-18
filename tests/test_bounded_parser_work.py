@@ -1397,6 +1397,10 @@ def _reference_merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[S
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
         target.ses_device = target.ses_device or enclosure.ses_device
+        # A pathless slot stays on its own record's path, or on none (#1319).
+        # This is an answer change, not a work change, so the reference
+        # takes it too.
+        parsers._bind_ses_slot_paths(enclosure, target)
         for ses_device in [*enclosure.ses_devices, enclosure.ses_device]:
             if ses_device and ses_device not in target.ses_devices:
                 target.ses_devices.append(ses_device)
@@ -1422,7 +1426,7 @@ def _reference_merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[S
         slots_by_element: list[SESMapSlot] = []
         element_positions: dict[tuple[str | None, str, int], int] = {}
         for slot, ssh_host in slot_evidence[key]:
-            ses_device = slot.ses_device or target.ses_device or ""
+            ses_device = parsers._ses_slot_coordinate(slot, target)[0] or ""
             identity = (
                 (ssh_host, ses_device, slot.element_id)
                 if slot.element_id is not None

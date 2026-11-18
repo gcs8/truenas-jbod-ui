@@ -228,5 +228,115 @@ class CandidateAndLocateTargetTests(unittest.TestCase):
                     )
 
 
+def _pathless(slot: SESMapSlot) -> SESMapSlot:
+    """The same evidence with no device path on the slot or its targets."""
+
+    slot.ses_device = None
+    slot.control_targets = []
+    return slot
+
+
+class MissingPathCandidateTests(unittest.TestCase):
+    """A record that reported an element but no path never borrows one.
+
+    The candidate builder falls back to the enclosure's path for a slot with
+    none of its own. After a merge, that path can belong to another record,
+    so the fallback would offer a coordinate neither input reported.
+    """
+
+    def _targets(self, enclosures: list[SESMapEnclosure], **kwargs) -> set:
+        candidates, meta = build_slot_candidates_from_ses_enclosures(
+            enclosures, 8, None, SHELF_ID, **kwargs,
+        )
+        targets = set()
+        for candidate in candidates.values():
+            targets |= _target_coordinates(candidate["ses_targets"])
+            if candidate["ses_device"] is not None:
+                targets.add((candidate["ses_device"], candidate["ses_element_id"]))
+        for element in meta.get("unmapped_ses_elements", []):
+            targets |= _target_coordinates(element["ses_targets"])
+            if element["ses_device"] is not None:
+                targets.add((element["ses_device"], element["ses_element_id"]))
+        return targets
+
+    def _weak_bay(self) -> SESMapEnclosure:
+        return SESMapEnclosure(
+            ses_device=WEAK_PATH,
+            enclosure_id=SHELF_ID,
+            slots={3: _slot(3, 3, WEAK_PATH, "ses_element_id_fallback")},
+        )
+
+    def _pathless_strong_bay(self, record_path: str | None = None) -> SESMapEnclosure:
+        return SESMapEnclosure(
+            ses_device=record_path,
+            enclosure_id=SHELF_ID,
+            slots={3: _pathless(_slot(3, 4, STRONG_PATH, "ses_device_slot_number"))},
+        )
+
+    def test_pathless_stronger_element_never_takes_another_record_path(self) -> None:
+        for order in ("weak-first", "strong-first"):
+            shelves = [self._weak_bay(), self._pathless_strong_bay()]
+            if order == "strong-first":
+                shelves.reverse()
+            with self.subTest(order=order):
+                targets = self._targets(shelves)
+                # The weak path's own coordinate stays as the positive control.
+                self.assertIn((WEAK_PATH, 3), targets)
+                self.assertNotIn((WEAK_PATH, 4), targets)
+
+    def test_remerged_pathless_element_never_takes_another_record_path(self) -> None:
+        once = _merge_ses_enclosures([self._weak_bay(), self._pathless_strong_bay()])
+        for label, kwargs, enclosures in (
+            ("merged", {"enclosures_are_merged": True}, copy.deepcopy(once)),
+            ("remerged", {}, copy.deepcopy(once)),
+            ("reapplied", {}, [*copy.deepcopy(once), self._weak_bay()]),
+        ):
+            with self.subTest(label=label):
+                targets = self._targets(enclosures, **kwargs)
+                self.assertIn((WEAK_PATH, 3), targets)
+                self.assertNotIn((WEAK_PATH, 4), targets)
+
+    def test_pathless_element_keeps_its_own_record_path(self) -> None:
+        # The stronger slot carries no path, but its record does: that path,
+        # not the first record's, completes the coordinate.
+        targets = self._targets([self._weak_bay(), self._pathless_strong_bay(STRONG_PATH)])
+        self.assertIn((STRONG_PATH, 4), targets)
+        self.assertIn((WEAK_PATH, 3), targets)
+        self.assertNotIn((WEAK_PATH, 4), targets)
+
+    def test_single_record_pathless_slot_still_uses_its_record_path(self) -> None:
+        shelf = SESMapEnclosure(
+            ses_device=WEAK_PATH,
+            enclosure_id=SHELF_ID,
+            slots={3: _pathless(_slot(3, 3, WEAK_PATH, "ses_device_slot_number"))},
+        )
+        self.assertIn((WEAK_PATH, 3), self._targets([shelf]))
+
+    def test_pathless_unmapped_element_never_takes_another_record_path(self) -> None:
+        orphan = _pathless(_slot(-1, 9, STRONG_PATH, "ses_description"))
+        pathless = SESMapEnclosure(enclosure_id=SHELF_ID, unmapped_slots=[orphan])
+        targets = self._targets([self._weak_bay(), pathless])
+        self.assertIn((WEAK_PATH, 3), targets)
+        self.assertNotIn((WEAK_PATH, 9), targets)
+
+    def test_pathless_element_is_not_folded_into_the_same_element_on_another_path(self) -> None:
+        # Element 4 on the weak path is bay 4. The pathless record's element 4
+        # is bay 3; read with the weak path it would be bay 4's element and
+        # merge the two bays' evidence.
+        weak = SESMapEnclosure(
+            ses_device=WEAK_PATH,
+            enclosure_id=SHELF_ID,
+            slots={4: _slot(4, 4, WEAK_PATH, "ses_device_slot_number")},
+        )
+        weak.slots[4].serial = "SERIAL-BAY-4"
+        pathless = self._pathless_strong_bay()
+        pathless.slots[3].serial = "SERIAL-BAY-3"
+        (merged,) = _merge_ses_enclosures([weak, pathless])
+        self.assertEqual(sorted(merged.slots), [3, 4])
+        self.assertEqual(merged.slots[3].serial, "SERIAL-BAY-3")
+        self.assertEqual(merged.slots[4].serial, "SERIAL-BAY-4")
+        self.assertEqual(_coordinate(merged.slots[4]), (WEAK_PATH, 4))
+
+
 if __name__ == "__main__":
     unittest.main()
