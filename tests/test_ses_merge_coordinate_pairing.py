@@ -23,7 +23,7 @@ from app.services.parsers import (
     build_slot_candidates_from_ses_enclosures,
 )
 
-SHELF_ID = "5000ccab0000aa00"
+SHELF_ID = "synthetic-shelf-a"
 WEAK_PATH = "/dev/sg1"
 STRONG_PATH = "/dev/sg2"
 
