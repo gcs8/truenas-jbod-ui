@@ -1438,7 +1438,7 @@ class FragmentContentTests(unittest.TestCase):
             'Answered "`{action}` stopped on an internal error" for a local fault.\n',
             "Kept the value - and its unit - visible when the count is >= 2.\n",
             "Fixed a thing\nwhose wrapped line starts with -- two dashes.\n",
-            "Raised the limit to\n1024 disks per expander.\n",
+            "Raised the limit to\n1,024 disks per expander.\n",
             "Fixed step 1. Then step 2) ran, and a > b held.\n",
             "Kept version\n0.25 visible.\n",
         ):
