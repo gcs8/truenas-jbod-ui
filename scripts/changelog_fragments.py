@@ -92,7 +92,8 @@ VERSION = re.compile(
 
 RECOVERY_TEXT = (
     "Compare them with the section that was written, delete the ones already in it and commit, or restore "
-    "CHANGELOG.md from Git and collect again."
+    "CHANGELOG.md and changelog.d/ from Git together (git restore CHANGELOG.md changelog.d) and collect "
+    "again; restoring CHANGELOG.md alone loses the fragments that were already deleted."
 )
 
 

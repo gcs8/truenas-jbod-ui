@@ -15,6 +15,7 @@ import difflib
 import importlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -46,7 +47,8 @@ INTERNAL_SECTION = "inter" + "nal"
 OLD_REMOVAL_LABEL = "changelog-removal-ok"
 RECOVERY_TEXT = (
     "Compare them with the section that was written, delete the ones already in it and commit, or restore "
-    "CHANGELOG.md from Git and collect again."
+    "CHANGELOG.md and changelog.d/ from Git together (git restore CHANGELOG.md changelog.d) and collect "
+    "again; restoring CHANGELOG.md alone loses the fragments that were already deleted."
 )
 RELEASE_HEADING = "## v0.2.0 - 2026-02-01"
 
@@ -1147,6 +1149,74 @@ class ReleaseToolingTests(unittest.TestCase):
         code, output = self._validate_wrap("0.2.0-rc.1")
         self.assertEqual(code, 1, output)
 
+
+    def _collect_with_one_failed_delete(self) -> str:
+        """Collect while deleting changelog.d/100.fixed.md fails; the others are deleted."""
+
+        module = _fragments()
+        original_remove = module._remove_fragment
+
+        def remove(path: Path) -> None:
+            if path.name == "100.fixed.md":
+                raise PermissionError(13, "Permission denied", str(path))
+            original_remove(path)
+
+        with mock.patch.object(module, "_remove_fragment", side_effect=remove):
+            code, output = _cli(
+                module.main, "--repo", str(self.repo.root), "collect", "--version", "0.2.0-rc.1", "--date", "2026-02-01"
+            )
+        self.assertEqual(code, 1, output)
+        self.assertTrue((self.repo.root / "changelog.d/100.fixed.md").exists())
+        self.assertFalse((self.repo.root / "changelog.d/110.added.md").exists())
+        self.assertFalse((self.repo.root / "changelog.d/110.upgrade.md").exists())
+        return output
+
+    def test_failed_delete_recovery_by_comparing_and_deleting_completes_the_release(self) -> None:
+        header = "## v0.2.0-rc.1 - 2026-02-01"
+        output = self._collect_with_one_failed_delete()
+        listed = [line.strip().split(":", 1)[0] for line in output.splitlines() if line.startswith("  changelog.d/")]
+        self.assertEqual(listed, ["changelog.d/100.fixed.md"])
+
+        # First route: each listed file whose text is already in the written section is deleted.
+        section = _fragments().section_text(self.repo.read("CHANGELOG.md"), header)
+        for path in listed:
+            text = (self.repo.root / path).read_text(encoding="utf-8").strip().rstrip(".")
+            self.assertIn(text, section)
+            (self.repo.root / path).unlink()
+        self.repo.commit("chore: release v0.2.0-rc.1")
+
+        post = self._coverage(header)
+        self.assertTrue(post.ok, post.messages)
+        self.assertEqual(post.covered, {100, 110})
+        self.assertEqual(validate_release_wrap.unconsumed_fragment_issues(self.repo.root, "HEAD"), [])
+
+    def test_failed_delete_recovery_by_restoring_and_collecting_again_keeps_every_entry(self) -> None:
+        header = "## v0.2.0-rc.1 - 2026-02-01"
+        output = self._collect_with_one_failed_delete()
+
+        # Restoring CHANGELOG.md alone loses the fragments that were deleted:
+        # the second section holds only the entry left behind.
+        _git(self.repo.root, "restore", "CHANGELOG.md")
+        _fragments().collect(self.repo.root, version="0.2.0-rc.1", date="2026-02-01")
+        partial = self._coverage(header)
+        self.assertFalse(partial.ok, partial.messages)
+        self.assertIn("110", "\n".join(partial.messages))
+
+        # The guidance names every path to restore, so following it keeps every entry.
+        command = re.search(r"\(git restore ([^)]+)\)", output)
+        self.assertIsNotNone(command, f"the recovery text does not say to restore changelog.d/ as well:\n{output}")
+        paths = command.group(1).split()
+        self.assertIn("CHANGELOG.md", paths)
+        self.assertIn("changelog.d", paths)
+        _git(self.repo.root, "restore", *paths)
+        result = _fragments().collect(self.repo.root, version="0.2.0-rc.1", date="2026-02-01")
+        self.assertEqual(len(result.consumed), 3)
+        full = self._coverage(header)
+        self.assertTrue(full.ok, full.messages)
+        self.assertEqual(full.covered, {100, 110})
+
+        checklist = " ".join((REPOSITORY_ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"`git restore {command.group(1)}`", checklist)
 
 @unittest.skipIf(shutil.which("git") is None, "git executable is required")
 class FragmentProtectionGateTests(unittest.TestCase):
