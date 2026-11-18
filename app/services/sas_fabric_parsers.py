@@ -363,7 +363,7 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
                 "sas_address": header.group(2),
                 "dev_handle": header.group(3),
                 "parent": header.group(4).strip() or None,
-                "enc_handle": header.group(5).strip() or None,
+                "enc_handle": _mpr_expander_enclosure_handle(header.group(5)),
                 "sas_level": header.group(6),
                 "phys": [],
             }
@@ -400,6 +400,24 @@ _MPR_EXPANDER_HEADER = re.compile(
 _MPR_EXPANDER_HEADER_BLANK_HANDLES = re.compile(
     r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4}) {7}([0-9a-fA-F]{4}| {4}) {5}([0-9a-fA-F]{4}| {4}) {7}(\d+)\s*$"
 )
+
+
+def _mpr_expander_enclosure_handle(printed: str) -> str | None:
+    """The expander header's enclosure handle, written as the other lists write it.
+
+    mprutil prints this one field in decimal ("%04d") while `show devices` and
+    `show enclosures` print the same handle in hexadecimal ("%04x"), so 16 is
+    "0016" here and "0010" there. The decimal value is returned as "%04x" so
+    the three lists compare one number. A field that is not decimal digits
+    names no enclosure; it is not guessed to be hexadecimal.
+    """
+    text = printed.strip()
+    if not _MPR_EXPANDER_DECIMAL_HANDLE.fullmatch(text):
+        return None
+    return f"{int(text, 10):04x}"
+
+
+_MPR_EXPANDER_DECIMAL_HANDLE = re.compile(r"[0-9]{1,5}")
 
 
 def _match_mpr_expander_header(line: str) -> re.Match[str] | None:
@@ -844,6 +862,11 @@ def _parse_mpr_sense_message(message: str) -> dict[str, str]:
     if reason is not None:
         parsed["reason"] = reason
     return parsed
+
+
+# A failed unit read whose unit was not admitted carries this fixed reason in
+# place of a controller name.
+MPR_REJECTED_CONTROLLER_REASON = "not_a_unit_number"
 
 
 def admit_mpr_unit_number(token: str | None) -> int | None:

@@ -292,6 +292,9 @@ class SESMapSlot:
     fault_sensed: bool | None = None
     fault_requested: bool | None = None
     sas_address_degraded: bool = False
+    # Set when the record that supplied this slot reported no device path, so
+    # an enclosure path from another merged record cannot complete it.
+    ses_device_unreported: bool = field(default=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -917,7 +920,11 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         existing.slot_number_degraded = slot.slot_number_degraded
         existing.description = slot.description or existing.description
         if slot.element_id is not None:
+            # Path and element are one coordinate: take both from the record
+            # that supplied the element, never one from each (#1319).
             existing.element_id = slot.element_id
+            existing.ses_device = slot.ses_device
+            existing.ses_device_unreported = slot.ses_device_unreported
         existing.control_targets = _merge_control_targets(
             slot.control_targets,
             existing.control_targets,
@@ -960,8 +967,13 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     existing.identify_active = existing.identify_active or slot.identify_active
     existing.status = existing.status or slot.status
     existing.description = existing.description or slot.description
-    existing.element_id = existing.element_id if existing.element_id is not None else slot.element_id
-    existing.ses_device = existing.ses_device or slot.ses_device
+    if existing.element_id is None and slot.element_id is not None:
+        existing.element_id = slot.element_id
+        existing.ses_device = slot.ses_device
+        existing.ses_device_unreported = slot.ses_device_unreported
+    elif existing.element_id is None and existing.ses_device is None:
+        existing.ses_device = slot.ses_device
+        existing.ses_device_unreported = slot.ses_device_unreported
     existing.serial = existing.serial or slot.serial
     existing.model = existing.model or slot.model
     existing.size_text = existing.size_text or slot.size_text
@@ -995,7 +1007,7 @@ def _unmapped_slot_key(
 ) -> tuple[str, int] | None:
     if slot.element_id is None:
         return None
-    return slot.ses_device or enclosure.ses_device or "", slot.element_id
+    return _ses_slot_coordinate(slot, enclosure)[0] or "", slot.element_id
 
 
 def _ensure_unmapped_slot_index(enclosure: SESMapEnclosure) -> None:
@@ -1194,6 +1206,38 @@ def _ses_control_slot_number(slot: SESMapSlot, ses_device: str | None) -> int | 
     ):
         return None
     return slot.slot_number
+
+
+def _ses_slot_coordinate(
+    slot: SESMapSlot,
+    enclosure: SESMapEnclosure,
+) -> tuple[str | None, int | None]:
+    """Return the slot's (path, element) pair, or neither half.
+
+    A slot without its own path takes its enclosure's, unless the record that
+    supplied it reported none: then the enclosure's path belongs to another
+    record and the pair is withheld (#1319).
+    """
+    if slot.ses_device:
+        return slot.ses_device, slot.element_id
+    if slot.ses_device_unreported and enclosure.ses_device:
+        return None, None
+    return enclosure.ses_device, slot.element_id
+
+
+def _bind_ses_slot_paths(enclosure: SESMapEnclosure, target: SESMapEnclosure) -> None:
+    """Keep each pathless slot on its own record's path when merged into target.
+
+    A record with a path other than the target's pins it on the slot; a record
+    with no path marks the slot so the target's path never completes it.
+    """
+    for slot in [*enclosure.slots.values(), *enclosure.unmapped_slots]:
+        if slot.ses_device or slot.ses_device_unreported:
+            continue
+        if not enclosure.ses_device:
+            slot.ses_device_unreported = True
+        elif enclosure.ses_device != target.ses_device:
+            slot.ses_device = enclosure.ses_device
 
 
 def _ses_control_host(slot: SESMapSlot, enclosure: SESMapEnclosure) -> str | None:
@@ -1783,9 +1827,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             ("Fault sensed", "fault_sensed"),
             ("Fault reqstd", "fault_requested"),
         ):
-            match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
-            if match:
-                setattr(current_slot, attribute, match.group("value") == "1")
+            value = _sg_ses_flag_value(stripped, field_name)
+            if value is not _SG_SES_FLAG_ABSENT:
+                setattr(current_slot, attribute, value)
 
     if not enclosure.slots:
         return None
@@ -2011,6 +2055,30 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     return enclosure
 
 
+_SG_SES_FLAG_ABSENT = object()
+
+
+def _sg_ses_flag_value(line: str, field_name: str) -> object:
+    """Read one comma-separated ``Field=value`` flag from an sg_ses line.
+
+    Only a whole value of ``0`` or ``1`` is a flag (#1275). Any other value of
+    a present field (``10``, ``1x``, ``1.``, empty) is unknown, ``None``. A
+    field the line does not carry returns ``_SG_SES_FLAG_ABSENT`` so the caller
+    leaves what an earlier line recorded.
+    """
+    match = re.search(
+        rf"(?:^|,)\s*{re.escape(field_name)}=(?P<value>[^,]*)", line
+    )
+    if match is None:
+        return _SG_SES_FLAG_ABSENT
+    value = match.group("value").strip()
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
 def _apply_sg_ses_status_line(
     slot: SESMapSlot,
     line: str,
@@ -2037,9 +2105,9 @@ def _apply_sg_ses_status_line(
         ("Swap", "swapped"),
         ("Hot spare", "hot_spare"),
     ):
-        match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", line)
-        if match:
-            setattr(slot, attribute, match.group("value") == "1")
+        value = _sg_ses_flag_value(line, field_name)
+        if value is not _SG_SES_FLAG_ABSENT:
+            setattr(slot, attribute, value)
     if apply_presence:
         _apply_ses_presence_evidence(slot, presence, source)
     return presence
@@ -2305,6 +2373,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
         target.ses_device = target.ses_device or enclosure.ses_device
+        _bind_ses_slot_paths(enclosure, target)
         for ses_device in [*enclosure.ses_devices, enclosure.ses_device]:
             if ses_device and ses_device not in target.ses_devices:
                 target.ses_devices.append(ses_device)
@@ -2330,7 +2399,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         slots_by_element: list[SESMapSlot] = []
         element_positions: dict[tuple[str | None, str, int], int] = {}
         for slot, ssh_host in slot_evidence[key]:
-            ses_device = slot.ses_device or target.ses_device or ""
+            ses_device = _ses_slot_coordinate(slot, target)[0] or ""
             identity = (
                 (ssh_host, ses_device, slot.element_id)
                 if slot.element_id is not None
@@ -2929,9 +2998,8 @@ def build_slot_candidates_from_ses_enclosures(
 
                 # Keep display labels separate from control coordinates in
                 # both the target list and the inventory metadata fallback.
-                control_slot_number = _ses_control_slot_number(
-                    slot, slot.ses_device or enclosure.ses_device,
-                )
+                ses_device, ses_element_id = _ses_slot_coordinate(slot, enclosure)
+                control_slot_number = _ses_control_slot_number(slot, ses_device)
                 candidates[combined_slot] = {
                     "status": slot.status,
                     "descriptor": slot.description,
@@ -2951,8 +3019,8 @@ def build_slot_candidates_from_ses_enclosures(
                     "enclosure_id": enclosure.enclosure_id,
                     "enclosure_label": enclosure.enclosure_label,
                     "enclosure_name": enclosure.enclosure_name,
-                    "ses_device": slot.ses_device or enclosure.ses_device,
-                    "ses_element_id": slot.element_id,
+                    "ses_device": ses_device,
+                    "ses_element_id": ses_element_id,
                     "ses_slot_number": control_slot_number,
                     "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
                     "sas_address_source": slot.sas_address_source,
@@ -2975,8 +3043,8 @@ def build_slot_candidates_from_ses_enclosures(
                         slot.control_targets,
                         [
                             {
-                                "ses_device": slot.ses_device or enclosure.ses_device,
-                                "ses_element_id": slot.element_id,
+                                "ses_device": ses_device,
+                                "ses_element_id": ses_element_id,
                                 "ses_slot_number": control_slot_number,
                                 "ssh_host": _ses_control_host(slot, enclosure),
                             }
@@ -2990,6 +3058,7 @@ def build_slot_candidates_from_ses_enclosures(
                 f"SES element {slot.element_id} has no verified physical slot number."
             )
             unmapped_warnings.append(warning)
+            ses_device, ses_element_id = _ses_slot_coordinate(slot, enclosure)
             unmapped_ses_elements.append({
                 "status": slot.status,
                 "descriptor": slot.description,
@@ -3001,8 +3070,8 @@ def build_slot_candidates_from_ses_enclosures(
                 "enclosure_id": enclosure.enclosure_id,
                 "enclosure_label": enclosure.enclosure_label,
                 "enclosure_name": enclosure.enclosure_name,
-                "ses_device": enclosure.ses_device,
-                "ses_element_id": slot.element_id,
+                "ses_device": ses_device,
+                "ses_element_id": ses_element_id,
                 "ses_slot_number": None,
                 "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
                 "shared_sas_address": slot.sas_address if slot.sas_address_degraded else None,
@@ -3012,8 +3081,8 @@ def build_slot_candidates_from_ses_enclosures(
                     slot.control_targets,
                     [
                         {
-                            "ses_device": slot.ses_device or enclosure.ses_device,
-                            "ses_element_id": slot.element_id,
+                            "ses_device": ses_device,
+                            "ses_element_id": ses_element_id,
                             "ses_slot_number": None,
                             "ssh_host": _ses_control_host(slot, enclosure),
                         }

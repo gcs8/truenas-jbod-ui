@@ -340,10 +340,12 @@ class HistoryCollector:
         self._smart_temperature_by_disk: dict[str, tuple[float, str]] = {}
         self._scope_enumeration_complete = True
         self._scope_collection_degraded_reason: str | None = None
-        # Scopes whose SMART metric read failed, with the metric kinds ("fast",
-        # "slow") still owed. They are retried on the next pass even when the
-        # shared cadence is not due, and keep the collector degraded (#1205).
-        self._pending_smart_metric_scopes: dict[tuple[str, str | None], frozenset[str]] = {}
+        # Bays whose SMART metric read failed, by scope and then bay, with the
+        # metric kinds ("fast", "slow") each still owes. They are retried on
+        # the next pass even when the shared cadence is not due, and keep the
+        # collector degraded (#1205). Debt is per bay so that reading one bay
+        # never pays a sibling that was not read (#1401).
+        self._pending_smart_metric_bays: dict[tuple[str, str | None], dict[int, frozenset[str]]] = {}
         self._smart_metric_degraded_reason: str | None = None
         # Scopes the last scan read but did not record, with why (#927). None
         # until a scan has looked; a root-only scan updates only its own scope.
@@ -592,7 +594,20 @@ class HistoryCollector:
             )
 
             scope_key = (scope.system_id, scope.enclosure_id)
-            pending_kinds = self._pending_smart_metric_scopes.get(scope_key, frozenset())
+            occupancy_by_slot = {record.slot: slot_occupancy(record) for record in slot_records}
+            bay_debts = self._pending_smart_metric_bays.get(scope_key, {})
+            if bay_debts:
+                # Only a bay read as empty settles its own debt. A bay whose
+                # occupancy was not read hides a disk that still owes the
+                # failed read, so its debt and degradation stay (#1295, #1401).
+                bay_debts = {
+                    slot: kinds for slot, kinds in bay_debts.items() if occupancy_by_slot.get(slot) != "empty"
+                }
+                self._set_pending_smart_metric_bays(scope_key, bay_debts)
+            # A pass can pay only the debt of bays it reads: those read present.
+            pending_kinds: frozenset[str] = frozenset().union(
+                *(kinds for slot, kinds in bay_debts.items() if occupancy_by_slot.get(slot) == "present")
+            )
             # Only a scheduled pass pays a retry debt. A manual refresh reads
             # just what it asked for, so a Quick refresh never turns into a
             # fresh SMART read; an unpaid debt waits for the next scheduled pass.
@@ -608,11 +623,6 @@ class HistoryCollector:
                 smart_evidence_unread.add(self._smart_evidence_disk_key(recorded))
             present_slots = [record.slot for record in slot_records if slot_occupancy(record) == "present"]
             if not present_slots:
-                # Only bays read as empty settle a retry debt. A bay whose
-                # occupancy was not read hides a disk that still owes the
-                # failed read, so the debt and its degradation stay (#1295).
-                if not any(slot_occupancy(record) == "unknown" for record in slot_records):
-                    self._pending_smart_metric_scopes.pop(scope_key, None)
                 continue
             records_by_slot = {record.slot: record for record in slot_records if slot_occupancy(record) == "present"}
             for record in records_by_slot.values():
@@ -643,12 +653,15 @@ class HistoryCollector:
                     error=str(exc),
                 )
                 smart_scopes_failed += 1
-                owed_kinds = set(pending_kinds)
-                if scope_collect_fast:
-                    owed_kinds.add("fast")
-                if scope_collect_slow:
-                    owed_kinds.add("slow")
-                self._pending_smart_metric_scopes[scope_key] = frozenset(owed_kinds)
+                attempted_kinds = {
+                    kind
+                    for kind, attempted in (("fast", scope_collect_fast), ("slow", scope_collect_slow))
+                    if attempted
+                }
+                failed_debts = dict(bay_debts)
+                for slot in present_slots:
+                    failed_debts[slot] = bay_debts.get(slot, frozenset()) | attempted_kinds
+                self._set_pending_smart_metric_bays(scope_key, failed_debts)
                 continue
             self._raise_if_stopping()
             self._enter_failure_stage("metric_write", scope.system_id)
@@ -665,10 +678,15 @@ class HistoryCollector:
                 force_fresh=scope_collect_slow,
             )
             metric_samples: list[MetricSample] = []
+            # Only a bay whose own summary came back usable was read. A present
+            # bay the batch omitted or marked unavailable keeps its debt (#1401).
+            read_slots: set[int] = set()
             for record in slot_records:
                 summary = summaries.get(record.slot)
                 if not isinstance(summary, dict):
                     continue
+                if record.slot in records_by_slot and summary.get("available") is not False:
+                    read_slots.add(record.slot)
                 evidence_key = self._smart_evidence_disk_key(record)
                 if self._smart_summary_has_failure_health_evidence(summary):
                     smart_failure_health_observed.add(evidence_key)
@@ -708,18 +726,21 @@ class HistoryCollector:
                 for kind, collected in (("fast", scope_collect_fast), ("slow", scope_collect_slow))
                 if collected
             }
-            remaining_kinds = pending_kinds - collected_kinds
-            if remaining_kinds:
-                self._pending_smart_metric_scopes[scope_key] = frozenset(remaining_kinds)
-            else:
-                self._pending_smart_metric_scopes.pop(scope_key, None)
+            # The read paid only the bays it read; an unread sibling keeps its debt.
+            self._set_pending_smart_metric_bays(
+                scope_key,
+                {
+                    slot: kinds - collected_kinds if slot in read_slots else kinds
+                    for slot, kinds in bay_debts.items()
+                },
+            )
 
         if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
             # A complete census is authoritative: a scope that left it owes nothing.
             census_keys = {(scope.system_id, scope.enclosure_id) for scope in scopes}
-            for pending_key in list(self._pending_smart_metric_scopes):
+            for pending_key in list(self._pending_smart_metric_bays):
                 if pending_key not in census_keys:
-                    del self._pending_smart_metric_scopes[pending_key]
+                    del self._pending_smart_metric_bays[pending_key]
         if smart_scopes_failed and not smart_scopes_succeeded:
             # Every SMART read this pass attempted failed, whether a due cadence
             # or only a retry debt asked for it: nothing was collected, so the
@@ -727,7 +748,7 @@ class HistoryCollector:
             self._enter_failure_stage("smart_read")
             self._smart_metric_degraded_reason = SMART_METRICS_UNAVAILABLE_REASON
             raise HistorySourceError.error_reply(SMART_METRICS_UNAVAILABLE_REASON)
-        if not self._pending_smart_metric_scopes:
+        if not self._pending_smart_metric_bays:
             self._smart_metric_degraded_reason = None
         elif smart_scopes_succeeded or collect_fast or collect_slow:
             self._smart_metric_degraded_reason = SMART_METRICS_PARTIAL_REASON
@@ -878,6 +899,16 @@ class HistoryCollector:
         self.clear_failure_diagnostics()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
+
+    @property
+    def _pending_smart_metric_scopes(self) -> dict[tuple[str, str | None], frozenset[str]]:
+        """Read-only view: each indebted scope with every kind any of its bays owes."""
+
+        return {
+            scope_key: frozenset().union(*bays.values())
+            for scope_key, bays in self._pending_smart_metric_bays.items()
+            if bays
+        }
 
     def degraded_reason(self) -> str | None:
         """Why /healthz reports ``degraded``, or None when the service is healthy.
@@ -2227,6 +2258,17 @@ class HistoryCollector:
             if recorded is not None and slot_occupancy(recorded) == "present":
                 disks.append(recorded)
         return disks
+
+    def _set_pending_smart_metric_bays(
+        self, scope_key: tuple[str, str | None], bay_debts: dict[int, frozenset[str]]
+    ) -> None:
+        """Store a scope's per-bay SMART debt, dropping bays that owe nothing."""
+
+        owed = {slot: frozenset(kinds) for slot, kinds in bay_debts.items() if kinds}
+        if owed:
+            self._pending_smart_metric_bays[scope_key] = owed
+        else:
+            self._pending_smart_metric_bays.pop(scope_key, None)
 
     @staticmethod
     def _smart_evidence_disk_key(record: SlotStateRecord) -> str:
