@@ -80,11 +80,12 @@ textarea {
 }
 
 /* The heading column: the line above the title holds the selected system
-   name, which may be one long word. Let the column shrink below it and break
-   the word anywhere, so a name wraps inside the header instead of widening
-   the page (#1381). */
-.topbar-copy {
-  min-width: 0;
+   name and the summary can name an enclosure; either may be one long word.
+   Those two lines break a word anywhere, so a name wraps inside the header
+   and never sets the column's minimum width or widens the page (#1381). The
+   title keeps whole words and stays the column's floor. */
+.topbar-copy .eyebrow,
+.topbar-copy .subtle {
   overflow-wrap: anywhere;
 }
 

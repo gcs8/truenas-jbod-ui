@@ -2,26 +2,27 @@
 
 // Long system name in the page heading (#1381). The main page's heading puts
 // the selected system name in the line above the page title
-// (`#header-eyebrow`). That line sat in an unnamed column of the header's
-// flex row with nothing that lets a word break and the default automatic
-// minimum width (`min-width: auto`). A long name with no space in it was one
-// unbreakable word, so the column could not get narrower than the whole name:
-// at 390 px a 60-character name made the document 549 px wide and the page
-// scrolled sideways.
+// (`#header-eyebrow`); the summary line below the title can name an
+// enclosure. Both sat in an unnamed column of the header's flex row with
+// nothing that lets a word break. A long name with no space in it was one
+// unbreakable word, so it overflowed the header at a narrow width and set the
+// column's minimum width at a wider one: at 390 px a 60-character name made
+// the document 549 px wide and the page scrolled sideways.
 //
-// The heading column is now `.topbar-copy`: it may shrink below its content
-// (`min-width: 0`) and its text breaks anywhere when a word does not fit
-// (`overflow-wrap: anywhere`, which also lowers the column's min-content
-// width), so the full name wraps inside the header at every width. The
-// Storage Fabric page uses the same header column and class.
+// The heading column is now `.topbar-copy`, and its eyebrow and summary lines
+// break a word anywhere when it does not fit (`overflow-wrap: anywhere`,
+// which, unlike `break-word`, also drops the line's min-content width to one
+// character), so the full name wraps inside the header at every width. The
+// title keeps whole words and the column keeps its automatic minimum width,
+// so the title's longest word stays the column's floor and is never squeezed
+// out of it. The Storage Fabric page uses the same header column and class.
 //
 // These tests resolve the stylesheet cascade (selector matching, specificity,
 // source order, !important, media at each width, inheritance) for the
 // heading column and its three lines, built from the templates' own markup,
-// so removing the class, the rule, or a later rule that turns either off
-// fails here. The rendered check is in
-// qa/fixture-suites/header-select-width.js (main page, 60-character name,
-// 390x844 and wider).
+// so removing the class, the rule, or a later rule that turns it off fails
+// here. The rendered check is in qa/fixture-suites/header-select-width.js
+// (main page, 14- and 60-character names, 390x844 and wider).
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -393,22 +394,26 @@ for (const { page, template, eyebrow, rules } of PAGES) {
   for (const viewport of WIDTHS) {
     test(`${page} heading lets a long name wrap inside the header at ${viewport}px`, () => {
       const model = headingModel(template, eyebrow);
-      // The column may shrink below its content's width in the header's
-      // flex row (or grid track) instead of holding the whole name.
+      // The column keeps its automatic minimum width (the title's longest
+      // word) and no fixed width; the name lines must not set that minimum.
       const minWidth = computed(model.column, "min-width", rules, viewport);
-      assert.ok(["0", "0px"].includes(minWidth?.value), `heading column ${where(minWidth, "min-width", viewport)} is ${minWidth?.value ?? "auto"}`);
+      assert.ok([undefined, "auto"].includes(minWidth?.value), `heading column ${where(minWidth, "min-width", viewport)} is ${minWidth?.value}`);
       const width = computed(model.column, "width", rules, viewport);
       assert.ok([undefined, "auto", "100%"].includes(width?.value), `heading column ${where(width, "width", viewport)}`);
-      for (const line of model.lines) {
+      const [eyebrowLine, title, summary] = model.lines;
+      for (const line of [eyebrowLine, summary]) {
         const label = describe(line);
-        // A word longer than the line breaks; `anywhere` (unlike
-        // `break-word`) also lowers the min-content width the column reports.
+        // A word longer than the line breaks, and the line's min-content
+        // width is one character, so a name never widens the column.
         const overflowWrap = computed(line, "overflow-wrap", rules, viewport);
         const wordBreak = computed(line, "word-break", rules, viewport);
         assert.ok(
-          overflowWrap?.value === "anywhere" || ["break-all", "break-word"].includes(wordBreak?.value),
+          overflowWrap?.value === "anywhere" || wordBreak?.value === "break-all",
           `${label} ${where(overflowWrap, "overflow-wrap", viewport)} is ${overflowWrap?.value ?? "normal"}; ${where(wordBreak, "word-break", viewport)} is ${wordBreak?.value ?? "normal"}`,
         );
+      }
+      for (const line of [eyebrowLine, title, summary]) {
+        const label = describe(line);
         const wrapMode = computed(line, "text-wrap-mode", rules, viewport);
         assert.notEqual(wrapMode?.value, "nowrap", `${label} ${where(wrapMode, "text-wrap-mode", viewport)}`);
         for (const property of ["width", "min-width"]) {
@@ -432,9 +437,12 @@ test("the heading cascade model catches a removed rule and later overrides", () 
   const normal = parseRules(`${STYLE_SOURCE}\n@media (max-width: 820px) { #header-eyebrow { overflow-wrap: normal; } }\n`);
   assert.equal(computed(eyebrow, "overflow-wrap", normal, 390).value, "normal");
   assert.equal(computed(eyebrow, "overflow-wrap", normal, 1600).value, "anywhere");
-  const auto = parseRules(`${STYLE_SOURCE}\n.topbar > div { min-width: auto !important; }\n`);
-  assert.equal(computed(model.column, "min-width", auto, 390).value, "auto");
-  const removed = parseRules(STYLE_SOURCE.replace(/\.topbar-copy\s*\{[^}]*\}/, ""));
-  assert.equal(computed(model.column, "min-width", removed, 390), null);
+  const floor = parseRules(`${STYLE_SOURCE}\n.topbar > div { min-width: 600px !important; }\n`);
+  assert.equal(computed(model.column, "min-width", floor, 390).value, "600px");
+  const breakWord = parseRules(`${STYLE_SOURCE}\n.topbar .subtle { overflow-wrap: break-word; }\n`);
+  assert.equal(computed(model.lines[2], "overflow-wrap", breakWord, 1600).value, "break-word");
+  const removed = parseRules(STYLE_SOURCE.replace(/\.topbar-copy \.eyebrow,\s*\.topbar-copy \.subtle\s*\{[^}]*\}/, ""));
+  assert.equal(removed.length, RULES.length - 1);
   assert.equal(computed(eyebrow, "overflow-wrap", removed, 390), null);
+  assert.equal(computed(model.lines[2], "overflow-wrap", removed, 390), null);
 });
