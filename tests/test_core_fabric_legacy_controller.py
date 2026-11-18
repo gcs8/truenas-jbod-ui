@@ -42,13 +42,15 @@ LISTS_MISSING_WARNING = (
 )
 ALL_COUNTS = ("controllers", "paths", "expanders", "enclosures")
 
+# mprutil prints an expander's enclosure handle in decimal ("%04d") and the
+# enclosure list's in hexadecimal ("%04x"): 0016 and 0010 are one handle.
 LEGACY_OUTPUTS = {
     "mprutil show adapter": (
         "Synthetic Adapter:\n"
         "Board Name: Synthetic HBA\n"
         "Firmware Revision: 1.2.3\n"
     ),
-    "mprutil show expanders": f"1 {EXPANDER_ADDRESS} 000a 0001 0010 1\n",
+    "mprutil show expanders": f"1 {EXPANDER_ADDRESS} 000a 0001 0016 1\n",
     "mprutil show enclosures": f"1 {SELECTED_ENCLOSURE} 000b 0010 SES\n",
 }
 
@@ -435,7 +437,7 @@ class CoreFabricLegacyControllerTests(unittest.TestCase):
         )
 
     def test_expander_phy_table_counts_need_the_whole_table(self) -> None:
-        header = f"2 {EXPANDER_ADDRESS} 000a 0001 0010 1\n"
+        header = f"2 {EXPANDER_ADDRESS} 000a 0001 0016 1\n"
         phy0 = "  0 1 000b 6.0 1.5 6.0 SAS Target\n"
         phy1 = "  1 1.5 6.0 No Device\n"
         cases = {
@@ -444,7 +446,7 @@ class CoreFabricLegacyControllerTests(unittest.TestCase):
             "a repeated PHY": (header + phy0 + phy0, None),
             "a PHY number out of range": (header + phy0 + "  2 1.5 6.0 No Device\n", None),
             "every reported PHY": (header + phy0 + phy1, 1),
-            "one reported PHY with no device": (f"1 {EXPANDER_ADDRESS} 000a 0001 0010 1\n" + "  0 1.5 6.0 No Device\n", 0),
+            "one reported PHY with no device": (f"1 {EXPANDER_ADDRESS} 000a 0001 0016 1\n" + "  0 1.5 6.0 No Device\n", 0),
             "every reported PHY under a column heading": (
                 header + "    Phy  RemotePhy  DevHandle  Speed  Min  Max  Device\n" + phy0 + phy1, 1,
             ),
@@ -508,7 +510,7 @@ def _printed_adapter(phys: list[bool]) -> str:
 def _printed_expanders() -> str:
     return (
         EXPANDERS_HEADING
-        + f"  02    {EXPANDER_ADDRESS}    000a       0001     0010       1\n\n"
+        + f"  02    {EXPANDER_ADDRESS}    000a       0001     0016       1\n\n"
         + "     Phy  RemotePhy  DevHandle  Speed  Min   Max    Device\n"
         + "     00      01        000b      12    1.5   12    SAS Target    \n"
         + "     01                          1.5   12    No Device     \n\n"
@@ -525,7 +527,7 @@ BLANK_HANDLE = "    "
 def _printed_expanders_with_handles(parent: str, enclosure: str) -> str:
     # mprutil: "  %02d    %08x%08x    %04x       %s     %s       %d"; a zero parent
     # or enclosure handle is printed as four blanks.
-    return _printed_expanders().replace("000a       0001     0010       1", f"000a       {parent}     {enclosure}       1")
+    return _printed_expanders().replace("000a       0001     0016       1", f"000a       {parent}     {enclosure}       1")
 
 
 def _printed_enclosure(sep_handle: str = "000b", kind: str = "External SES-2") -> str:
@@ -573,7 +575,7 @@ def _healthy_reply_cases() -> dict[str, dict[str, str]]:
     unit = _healthy_unit()
     cases = {
         "healthy_lists": dict(unit),
-        "blank_expander_parent": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles(BLANK_HANDLE, "0010")},
+        "blank_expander_parent": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles(BLANK_HANDLE, "0016")},
         "blank_expander_enclosure": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles("0001", BLANK_HANDLE)},
         "blank_expander_handles": {**unit, "mprutil -u 0 show expanders": _printed_expanders_with_handles(BLANK_HANDLE, BLANK_HANDLE)},
         "blank_sep_unknown_enclosure": {**unit, "mprutil -u 0 show enclosures": _printed_enclosure(BLANK_HANDLE, "Unknown")},
@@ -767,17 +769,17 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
         self.assertIn("sudo -n /usr/sbin/mprutil -u 9999 show adapter", build_core_mprutil_unit_commands(summary))
 
     def test_zero_phy_expander_with_no_rows_is_a_measured_zero(self) -> None:
-        [parsed] = parse_mpr_expanders(f"0 {EXPANDER_ADDRESS} 000a 0001 0010 1\n")
+        [parsed] = parse_mpr_expanders(f"0 {EXPANDER_ADDRESS} 000a 0001 0016 1\n")
         self.assertEqual((parsed["linked_phys"], parsed["device_counts"]), (0, {}))
         # A positive header without its rows stays unknown.
-        [parsed] = parse_mpr_expanders(f"1 {EXPANDER_ADDRESS} 000a 0001 0010 1\n")
+        [parsed] = parse_mpr_expanders(f"1 {EXPANDER_ADDRESS} 000a 0001 0016 1\n")
         self.assertEqual((parsed["linked_phys"], parsed["device_counts"]), (None, None))
 
     def test_rejected_phy_tables_are_not_read_and_make_the_view_partial(self) -> None:
         adapter = LEGACY_OUTPUTS["mprutil show adapter"]
         cases = {
             "controller table": ({**NUMBERED_UNIT_OUTPUTS, "mprutil -u 0 show adapter": adapter + "0 malformed\n"}, "controller", ["phy_count", "linked_phy_count"], "1 controller"),
-            "expander table": ({**NUMBERED_UNIT_OUTPUTS, **SELECTED_UNIT_ENCLOSURE, "mprutil -u 0 show expanders": f"2 {EXPANDER_ADDRESS} 000a 0001 0010 1\n  0 1 000b 6.0 1.5 6.0 SAS Target\n"}, "expander", ["linked_phys"], "1 expander"),
+            "expander table": ({**NUMBERED_UNIT_OUTPUTS, **SELECTED_UNIT_ENCLOSURE, "mprutil -u 0 show expanders": f"2 {EXPANDER_ADDRESS} 000a 0001 0016 1\n  0 1 000b 6.0 1.5 6.0 SAS Target\n"}, "expander", ["linked_phys"], "1 expander"),
         }
         for name, (outputs, kind, keys, noun) in cases.items():
             with self.subTest(name):

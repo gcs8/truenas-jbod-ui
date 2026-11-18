@@ -1,10 +1,13 @@
 """CORE numeric coordinates: MPR target numbers, enclosure handles and failed-read controller units.
 
-A number the CORE fabric reads from mprutil text must be admitted by a
-bounded ASCII grammar:
+Two numbers the CORE fabric reads from mprutil text must be admitted by one
+bounded ASCII grammar and compared as numbers:
 
 - an MPR or CAM target number is 1 to 9 ASCII digits; anything else is no
-  target, never an exception (#1276).
+  target, never an exception (#1276);
+- the expander list prints its enclosure handle in decimal ("%04d") while the
+  device and enclosure lists print the same handle in hexadecimal ("%04x"), so
+  the expander's field is read as decimal before it is compared (#1280).
 """
 
 import unittest
@@ -13,6 +16,7 @@ from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, SlotView
 from app.services.sas_fabric import build_sas_fabric_snapshot
 from app.services.sas_fabric_core import _parse_mpr_target
+from app.services.sas_fabric_parsers import parse_mpr_expanders
 
 SELECTED_ENCLOSURE = "5000000000000001"
 EXPANDER_ADDRESS = "5000000000000002"
@@ -89,6 +93,60 @@ class MprTargetNumberAdmissionTests(unittest.TestCase):
 
         self.assertEqual([controller["id"] for controller in fabric.controllers], ["controller:mpr0"])
         self.assertEqual(len([node for node in fabric.nodes if node.kind == "expander"]), 1)
+
+
+class MprEnclosureHandleBaseTests(unittest.TestCase):
+    """#1280: the expander's decimal handle meets the hexadecimal lists as one number."""
+
+    def _selected_links(self, handle: int, expander_field: str):
+        fabric = _core_fabric(_handle_outputs(handle, expander_field), selected=SELECTED_ENCLOSURE)
+        expanders = [node for node in fabric.nodes if node.kind == "expander"]
+        selected = [node for node in expanders if node.raw.get("fabric_scope") == "selected_enclosure"]
+        links = [link for link in fabric.links if link.kind == "expander-enclosure"]
+        return fabric, expanders, selected, links
+
+    def test_handle_below_ten_associates(self) -> None:
+        # Control: 9 prints "0009" in both bases.
+        _fabric, expanders, selected, links = self._selected_links(9, "0009")
+
+        self.assertEqual(len(expanders), 1)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(links), 1)
+
+    def test_handles_from_ten_associate_across_the_two_print_bases(self) -> None:
+        for handle in (10, 16, 255, 9999):
+            with self.subTest(handle=handle):
+                fabric, expanders, selected, links = self._selected_links(handle, f"{handle:04d}")
+
+                self.assertEqual(len(expanders), 1)
+                self.assertEqual(len(selected), 1, [node.raw for node in expanders])
+                self.assertEqual(len(links), 1)
+                [enclosure] = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
+                self.assertEqual(links[0].source, expanders[0].id)
+                self.assertEqual(links[0].target, enclosure.id)
+
+    def test_same_digits_in_both_lists_are_different_handles(self) -> None:
+        # Decimal 16 and hexadecimal 0x16 (22) are different enclosures.
+        _fabric, _expanders, selected, links = self._selected_links(0x16, "0016")
+
+        self.assertEqual(selected, [])
+        self.assertEqual(links, [])
+
+    def test_expander_handle_is_read_as_decimal(self) -> None:
+        [parsed] = parse_mpr_expanders(_expander_header("0016"))
+        self.assertEqual(parsed["enc_handle"], "0010")
+
+        [parsed] = parse_mpr_expanders(_expander_header("0009"))
+        self.assertEqual(parsed["enc_handle"], "0009")
+
+    def test_expander_handle_that_is_not_decimal_names_no_enclosure(self) -> None:
+        # Not guessed as hexadecimal: the field is printed in decimal.
+        [parsed] = parse_mpr_expanders(_expander_header("000a"))
+        self.assertIsNone(parsed["enc_handle"])
+
+        _fabric, _expanders, selected, links = self._selected_links(10, "000a")
+        self.assertEqual(selected, [])
+        self.assertEqual(links, [])
 
 
 if __name__ == "__main__":
