@@ -17,7 +17,7 @@ import json
 import unittest
 
 from app.config import SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, SlotView
+from app.models.domain import InventorySnapshot, MultipathMember, MultipathView, SlotState, SlotView
 from app.services.inventory import InventoryService
 from app.services.sas_fabric import build_sas_fabric_snapshot
 from app.services.sas_fabric_core import _parse_mpr_target
@@ -102,6 +102,77 @@ class MprTargetNumberAdmissionTests(unittest.TestCase):
         self.assertEqual(len([node for node in fabric.nodes if node.kind == "expander"]), 1)
 
 
+def _bay_mpr_devices(row_target: str | None, cam_target: str | None) -> list[dict]:
+    """The MPR rows bay 0 takes: member da0 on mpr0, MPR location 0 of the bay's enclosure.
+
+    The device row is nameless, so only its CAM target or its position can
+    join it to the bay. `None` leaves the row's target column, or the CAM
+    list, out entirely.
+    """
+    slot = SlotView(
+        slot=0, slot_label="00", row_index=0, column_index=0, present=True, state=SlotState.healthy,
+        device_name="da0",
+        multipath=MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name="da0", controller_label="mpr0", state="ACTIVE")]),
+        raw_status={"enclosure_id": SELECTED_ENCLOSURE},
+    )
+    target_column = "" if row_target is None else f"{row_target}   "
+    outputs = {
+        "mprutil -u 0 show adapter": ADAPTER,
+        "mprutil -u 0 show enclosures": _enclosure_row(9),
+        "mprutil -u 0 show devices": f"00   {target_column}{DISK_ADDRESS} 000b 0009 SAS Target 12.0 0009 0\n",
+    }
+    if cam_target is not None:
+        outputs["camcontrol devlist -v"] = (
+            f"scbus0 on mpr0 bus 0:\n<Synthetic disk 0001>  at scbus0 target {cam_target} lun 0 (da0,pass0)"
+        )
+    fabric = build_sas_fabric_snapshot(
+        system=SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core")),
+        snapshot=InventorySnapshot(slots=[slot], refresh_interval_seconds=30, selected_enclosure_id=SELECTED_ENCLOSURE),
+        ssh_outputs=outputs,
+    )
+    return next(trace for trace in fabric.traces if trace.id == "bay:0").metrics.get("mpr_devices") or []
+
+
+class RejectedTargetRefusesPositionalMatchTests(unittest.TestCase):
+    """A target that is printed but not admitted is evidence, not absence.
+
+    Before the bounded grammar such a target either raised or was compared as
+    a number, so a row whose target differed from the member's CAM target was
+    refused. Admitting neither must not turn it into "no target" and let the
+    row join the bay by position: a rejected target refuses the positional
+    match. Only a genuinely absent target keeps the positional match.
+    """
+
+    REJECTED = {
+        "non-ASCII decimal digit": "\u0663",
+        "ten ASCII digits": "1000000000",
+    }
+
+    def test_admitted_targets_keep_todays_behaviour(self) -> None:
+        # Controls: the same target joins, a different ASCII target is another device.
+        self.assertEqual([item["mpr_slot"] for item in _bay_mpr_devices("7", "7")], ["0"])
+        self.assertEqual(_bay_mpr_devices("8", "7"), [])
+
+    def test_absent_targets_keep_the_positional_match(self) -> None:
+        # Controls: no CAM list, or a row without a target column, is no
+        # target evidence, so the row still joins by its exact position.
+        for row_target, cam_target in (("7", None), (None, "7"), (None, None)):
+            with self.subTest(row_target=row_target, cam_target=cam_target):
+                self.assertEqual([item["mpr_slot"] for item in _bay_mpr_devices(row_target, cam_target)], ["0"])
+
+    def test_rejected_device_row_target_refuses_the_positional_match(self) -> None:
+        for name, target in self.REJECTED.items():
+            for cam_target in ("7", None):
+                with self.subTest(name, cam_target=cam_target):
+                    self.assertEqual(_bay_mpr_devices(target, cam_target), [])
+
+    def test_rejected_cam_target_refuses_the_positional_match(self) -> None:
+        for name, target in {**self.REJECTED, "superscript two": "\u00b2"}.items():
+            with self.subTest(name):
+                self.assertEqual(_bay_mpr_devices("7", target), [])
+
+
 class MprEnclosureHandleBaseTests(unittest.TestCase):
     """#1280: the expander's decimal handle meets the hexadecimal lists as one number."""
 
@@ -169,6 +240,13 @@ class FailedReadControllerUnitTests(unittest.TestCase):
         "five ASCII digits": "12345",
         "non-ASCII decimal digit": "\u0663",
     }
+    # Tokens that are not digits at all; a unit pattern of digits alone would
+    # not see these commands as numbered reads.
+    NONNUMERIC_UNITS = {
+        "word": "bogus",
+        "signed": "-1",
+        "plus-signed": "+1",
+    }
 
     def test_admitted_unit_keeps_its_controller(self) -> None:
         # Control: an ordinary bounded unit stays associated with its controller.
@@ -208,6 +286,25 @@ class FailedReadControllerUnitTests(unittest.TestCase):
                 for record in fabric.raw["command_failures"]:
                     self.assertFalse("controller" in record, sorted(record))
                     self.assertTrue(all(len(str(value)) < 100 for value in record.values()), sorted(record))
+
+    def test_nonnumeric_unit_is_rejected_and_counted(self) -> None:
+        for name, unit in self.NONNUMERIC_UNITS.items():
+            with self.subTest(name):
+                [record] = _failure_records(f"sudo -n /usr/sbin/mprutil -u {unit} show adapter")
+                self.assertEqual(record.get("controller_rejected"), "not_a_unit_number")
+                self.assertEqual(record.get("context"), "sas_fabric_mprutil_adapter")
+                self.assertFalse("controller" in record, sorted(record))
+
+                failures = _failure_records(
+                    f"sudo -n /usr/sbin/mprutil -u {unit} show adapter",
+                    f"sudo -n /usr/sbin/mprutil -u {unit} show devices",
+                )
+                fabric = _core_fabric({"mprutil -u 0 show adapter": ADAPTER}, command_failures=failures)
+
+                self.assertEqual(fabric.raw["controller_read"]["rejected_units"], 1)
+                self.assertEqual(fabric.raw["controller_read"]["counts"]["controllers"], "partial")
+                serialized = json.dumps(fabric.model_dump(mode="json"), ensure_ascii=False)
+                self.assertFalse(f"mpr{unit}" in serialized, "the unit token was published")
 
 
 if __name__ == "__main__":
