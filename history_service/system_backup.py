@@ -1794,7 +1794,7 @@ class _ImportActivationTransaction:
             if failures:
                 raise RuntimeError(self._failure_summary(failures))
         else:
-            entry.history_store.restore_backup(entry.backup_path)
+            entry.history_store.restore_backup(entry.backup_path, rollback_snapshot=True)
             self._fsync_file(entry.target_path)
             self._fsync_directory(entry.target_path.parent)
         entry.mutated = False

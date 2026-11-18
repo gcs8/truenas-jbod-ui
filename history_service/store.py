@@ -2633,7 +2633,9 @@ class HistoryStore:
         latest = max(snapshots, key=lambda candidate: candidate.stat().st_mtime)
         return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
 
-    def _restore_backup_locked(self, source_path: str | Path) -> None:
+    def _restore_backup_locked(
+        self, source_path: str | Path, *, rollback_snapshot: bool = False
+    ) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
@@ -2661,7 +2663,12 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
-                    require_bounded_restored_timestamps(restore_connection)
+                    # The bound guards incoming backups only. An import's own
+                    # rollback snapshot holds the live history as it was,
+                    # including text earlier versions admitted, and must
+                    # always restore (#1292).
+                    if not rollback_snapshot:
+                        require_bounded_restored_timestamps(restore_connection)
                     # The backup's counters are outside input that sizes
                     # index builds; replace them with real counts (#1093).
                     self._recount_restored_table_counts(restore_connection)
@@ -2686,11 +2693,13 @@ class HistoryStore:
                 os.close(temp_fd)
             self._discard_owned_path(temp_path, temp_metadata)
 
-    def restore_backup(self, source_path: str | Path) -> None:
+    def restore_backup(
+        self, source_path: str | Path, *, rollback_snapshot: bool = False
+    ) -> None:
         self._require_unsegmented_operation("v1 restore")
         try:
             with history_write_lock(self.file_path, blocking=False):
-                self._restore_backup_locked(source_path)
+                self._restore_backup_locked(source_path, rollback_snapshot=rollback_snapshot)
         finally:
             self._hot_summary_counts.clear()
 

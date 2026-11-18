@@ -452,5 +452,120 @@ class RestoreTimestampSizeTests(_ImportRootCleanup):
                 self.assertEqual(_tree_snapshot(live.parent), before)
 
 
+def _metric_rows(path: Path) -> list[tuple[Any, ...]]:
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection:
+        return connection.execute(
+            "SELECT observed_at, slot, value_integer FROM metric_samples ORDER BY id"
+        ).fetchall()
+
+
+def _dump(path: Path) -> list[str]:
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection:
+        return list(connection.iterdump())
+
+
+class _UnsegmentedBackupService(SystemBackupService):
+    def _load_app_settings(self):  # type: ignore[override]
+        return self.app_settings
+
+
+class RollbackSnapshotTimestampBoundTests(_ImportRootCleanup):
+    """#1292: the bound guards incoming backups, never the import's own rollback.
+
+    Earlier versions admitted longer timestamp text, so a live history can
+    already hold some. A failed import must still return that history.
+    """
+
+    ORDINARY = RestoreTimestampSizeTests.ORDINARY
+    OVERSIZED = ORDINARY + " " * 300
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self._directory.name)
+
+    def _service(self, root: Path, history: Path) -> _UnsegmentedBackupService:
+        from history_service.config import HistorySettings
+        from tests.test_interrupted_restore_recovery import _settings
+
+        return _UnsegmentedBackupService(
+            HistorySettings(
+                sqlite_path=str(history),
+                backup_dir=str(root / "backups"),
+                startup_grace_seconds=0,
+            ),
+            HistoryStore(str(history), recover_unreadable_database=False),
+            _settings(root),
+        )
+
+    def _artifact(self) -> Any:
+        source_history = _history_database(
+            self.root / "source.sqlite3", [self.ORDINARY, self.ORDINARY]
+        )
+        source = self._service(self.root / "source", source_history)
+        artifact = source.export_bundle_to_file(
+            packaging="tar.zst",
+            encrypt=True,
+            passphrase=PASSPHRASE,
+            included_paths=[HISTORY_DB_KEY],
+        )
+        self.addCleanup(artifact.cleanup)
+        return artifact
+
+    def test_failed_import_restores_a_live_history_with_an_oversized_timestamp(
+        self,
+    ) -> None:
+        artifact = self._artifact()
+        live_dir = self.root / "live-history"
+        live_dir.mkdir()
+        live = _history_database(live_dir / "history.sqlite3", [self.OVERSIZED])
+        target = self._service(self.root / "target", live)
+        original_rows = _metric_rows(live)
+        self.assertEqual(original_rows, [(self.OVERSIZED, 0, 30)])
+        original_dump = _dump(live)
+
+        activated: list[bool] = []
+        real_activate = _ImportActivationTransaction.activate_history
+
+        def activate_then_mark(transaction, store, member_key):
+            real_activate(transaction, store, member_key)
+            activated.append(True)
+
+        def fail_after_history_activation():
+            if activated:
+                raise RuntimeError("injected settings reload failure")
+            return target.app_settings
+
+        with patch.object(
+            _ImportActivationTransaction, "activate_history", activate_then_mark
+        ), patch.object(
+            target, "_load_app_settings", side_effect=fail_after_history_activation
+        ):
+            with self.assertRaises(RuntimeError) as failed:
+                target.import_bundle_from_file(artifact.path, passphrase=PASSPHRASE)
+
+        self.assertEqual(activated, [True])
+        self.assertIn("injected settings reload failure", str(failed.exception))
+        self.assertNotIn("Rollback failed", str(failed.exception))
+        self.assertEqual(_metric_rows(live), original_rows)
+        self.assertEqual(_dump(live), original_dump)
+        # The imported history was published and is now gone again.
+        self.assertNotIn((self.ORDINARY, 0, 30), _metric_rows(live))
+
+    def test_incoming_backup_with_an_oversized_timestamp_is_still_refused(self) -> None:
+        live = self.root / "live" / "history.sqlite3"
+        live.parent.mkdir()
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        candidate = _history_database(
+            self.root / "candidate.sqlite3", [self.ORDINARY, self.OVERSIZED]
+        )
+        before = live.read_bytes()
+        with self.assertRaises(ValueError) as refused:
+            store.restore_backup(candidate)
+        self.assertIn("metric_samples.observed_at", str(refused.exception))
+        self.assertEqual(live.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            SystemBackupService._validate_history_member(candidate)
+
+
 if __name__ == "__main__":
     unittest.main()
