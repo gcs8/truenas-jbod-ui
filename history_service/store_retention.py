@@ -11,7 +11,8 @@ its class as `cls` for the class methods). Every store-module name, such as
 time, and sibling helpers are called through `cls`, so a replacement made on
 the store module or class still reaches this code. This module does not
 import the store module. Multi-line SQL keeps the indentation it had in the
-class, so every statement is byte-for-byte the released text.
+class, so every statement is byte-for-byte the released text, except that
+rollup buckets are named from julianday() (#1320).
 """
 
 from __future__ import annotations
@@ -215,10 +216,14 @@ def _roll_up_metric_rows(
             + cls._expired_timestamp_predicate("bucket_start", "rowid", floored=False)
         )
         returning_parameters = cls._retention_bounds(rollup_cutoff)
+    # The bucket is named from julianday(), the same reading that ranks the
+    # samples below. strftime() on the text can name the hour before the
+    # one julianday() reads for a time in the last half millisecond of an
+    # hour, depending on the SQLite build and the UTC offset spelling (#1320).
     if bucket_seconds == 3600:
-        bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', observed_at)"
+        bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', julianday(observed_at))"
     elif bucket_seconds == 86400:
-        bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', observed_at)"
+        bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', julianday(observed_at))"
     else:
         raise ValueError("Unsupported history rollup interval.")
     expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
