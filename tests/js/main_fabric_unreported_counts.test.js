@@ -167,6 +167,47 @@ function functionSource(source, name) {
   return source.slice(start, end + 4);
 }
 
+// The main page's own summary render, renderSasFabric, with the fabric
+// panel open: the count helpers it uses are the page's own, and the summary
+// element is the only element it is given, so the visible text is what the
+// caller writes, not what a helper returns.
+function renderMainSummary(fabric) {
+  const start = APP_SOURCE.indexOf("  function formatSasFabricKind(");
+  const end = APP_SOURCE.indexOf("  function isStorageFabricPayload(");
+  assert.ok(start > 0 && end > start, "main page fabric count helpers must exist");
+  const summary = { textContent: "Shows how disks connect to controllers." };
+  const sandbox = vm.createContext({
+    state: { snapshotMode: false, sasFabric: { open: true, loading: false, data: fabric, selectedNodeId: null, selectedTraceId: null } },
+    sasFabricPanel: { classList: { toggle() {} } },
+    sasFabricSummary: summary,
+    sasFabricToggleButton: null,
+    sasFabricRefreshButton: null,
+    sasFabricShowAllButton: null,
+    sasFabricStatus: null,
+    sasFabricLanes: null,
+    sasFabricTraceById: () => ({}),
+    resolveSasFabricTraceId: () => null,
+    renderSasFabricInspector: () => {},
+  });
+  vm.runInContext(`${functionSource(APP_SOURCE, "sasFabricList")}
+${APP_SOURCE.slice(start, end)}
+${functionSource(APP_SOURCE, "renderSasFabric")}
+renderSasFabric();`, sandbox);
+  return summary.textContent;
+}
+
+test("main page render: the visible summary of a CORE payload without reported completeness says not reported", () => {
+  const unreported = "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 traces";
+  assert.equal(renderMainSummary(fabricWith("complete", "absent")), unreported);
+  assert.equal(renderMainSummary(fabricWith("complete", "absent", { kindOnly: true })), unreported);
+  assert.equal(
+    renderMainSummary(fabricWith("healthy_lists", "counts-absent")),
+    "1 source, completeness not reported / paths not reported / 1 expander, completeness not reported / 1 enclosure, completeness not reported / 1 traces",
+  );
+  // Control: counts reported complete stay plain numbers, zero included.
+  assert.equal(renderMainSummary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 traces");
+});
+
 test("the main page reads counts through a textual twin of the Storage Fabric page reader", () => {
   assert.equal(functionSource(APP_SOURCE, "fabricCountState"), functionSource(FABRIC_SOURCE, "fabricCountState"));
   assert.equal(
