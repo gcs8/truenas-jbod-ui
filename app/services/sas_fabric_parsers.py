@@ -41,6 +41,8 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
     malformed_phy_rows = 0
     discovering_phys: list[int] = []
+    # mprutil prints PHY i at position i, a discovery line holding its own.
+    out_of_order_phy_rows = 0
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -59,6 +61,9 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
             continue
         if re.match(r"^\d+\s+", stripped):
             parts = stripped.split()
+            # The length bound keeps int() off an unbounded digit run.
+            if len(parts[0]) > 6 or int(parts[0]) != len(detail["phy_rows"]) + len(discovering_phys):
+                out_of_order_phy_rows += 1
             unattached = _MPR_UNATTACHED_ADAPTER_PHY.match(stripped)
             if unattached:
                 # mprutil leaves both handles and the speed blank for a PHY
@@ -92,17 +97,11 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
                 malformed_phy_rows += 1
     rows = detail["phy_rows"]
     # Counts come only from a PHY table that was read whole. No table, a
-    # malformed row, a repeated PHY number or a gap in the PHY numbers
-    # (0 to n-1, as mprutil lists them) leaves both counts unknown. A PHY
-    # still in discovery fills only its own position; printed rows are counted.
-    phy_numbers = [int(row["phy"]) for row in rows] + discovering_phys
-    table_size = len(phy_numbers)
-    if (
-        table_size
-        and not malformed_phy_rows
-        and len(set(phy_numbers)) == len(phy_numbers)
-        and all(number < table_size for number in phy_numbers)
-    ):
+    # malformed row, or a PHY number that is not its printed position (0 to
+    # n-1 in order, as mprutil lists them: a repeat, a gap or a reordering)
+    # leaves both counts unknown. A PHY still in discovery fills only its own
+    # position; printed rows are counted.
+    if (rows or discovering_phys) and not malformed_phy_rows and not out_of_order_phy_rows:
         detail["phy_count"] = len(rows)
         detail["linked_phy_count"] = sum(
             1 for row in rows if row.get("device_handle") and row.get("device") and row.get("device") != "No Device"
@@ -122,14 +121,44 @@ _MPR_UNATTACHED_ADAPTER_PHY = re.compile(rf"^\d+\s+[YN]\s+{_MPR_PHY_SPEED}\s+{_M
 
 
 def parse_mpr_devices(text: str) -> list[dict[str, str]]:
+    return parse_mpr_device_list(text)[0]
+
+
+# Every device type mprutil's get_device_type() prints, each two words.
+MPR_DEVICE_TYPES = frozenset(
+    {
+        "SEP Target",
+        "ATAPI Target",
+        "SAS Target",
+        "STP Target",
+        "SMP Target",
+        "SATA Target",
+        "SAS Initiator",
+        "SATA Initiator",
+        "No Device",
+        "Unknown Device",
+    }
+)
+
+
+def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
+    """The device rows of a `show devices` reply and how many rows were not understood.
+
+    A line carrying a SAS address is a device row. One whose device type is
+    not one mprutil prints, or whose columns cannot be read, is counted as
+    not understood, so the list is not read whole. Other text (a notice, the
+    heading) is not a device row.
+    """
     rows: list[dict[str, str]] = []
+    rejected = 0
     for line in text.splitlines():
         stripped = line.strip()
-        if not re.search(r"\b(SAS|SATA|SMP|SEP)\s+Target\b", stripped):
-            continue
         parts = stripped.split()
         sas_index = next((index for index, part in enumerate(parts) if re.fullmatch(r"[0-9a-fA-F]{16}", part)), None)
-        if sas_index is None or len(parts) <= sas_index + 6:
+        if sas_index is None:
+            continue
+        if len(parts) <= sas_index + 6:
+            rejected += 1
             continue
         bus = parts[0] if sas_index >= 2 and re.fullmatch(r"\d+", parts[0]) else None
         target = parts[1] if sas_index >= 2 and re.fullmatch(r"\d+", parts[1]) else None
@@ -138,7 +167,9 @@ def parse_mpr_devices(text: str) -> list[dict[str, str]]:
         while index < len(parts) and not re.fullmatch(r"\d+(?:\.\d+)?", parts[index]):
             device_words.append(parts[index])
             index += 1
-        if index + 2 >= len(parts):
+        # The device column starts with its type; a provider may name the disk after it.
+        if index + 2 >= len(parts) or " ".join(device_words[:2]) not in MPR_DEVICE_TYPES:
+            rejected += 1
             continue
         rows.append(
             {
@@ -153,7 +184,7 @@ def parse_mpr_devices(text: str) -> list[dict[str, str]]:
                 "target": target,
             }
         )
-    return rows
+    return rows, rejected
 
 
 def parse_mpr_enclosures(text: str) -> list[dict[str, str | None]]:

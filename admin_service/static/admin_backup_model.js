@@ -301,7 +301,9 @@
     const failed = grooming.failed_locations && typeof grooming.failed_locations === "object" ? grooming.failed_locations : {};
     const places = Object.keys(failed).map((location) => `${locationLabel(location, targets)}: ${scrubText(failed[location] || "no detail")}`);
     const reason = places.length ? places.join("; ") : scrubText(grooming.detail || "no detail");
-    return { tone: "is-bad", text: `Last clean-up${when ? ` ${when}` : ""} didn't finish: ${reason}.` };
+    // A refusal that already ends a sentence keeps its own stop (#1291).
+    const stop = /[.!?]$/.test(reason) ? "" : ".";
+    return { tone: "is-bad", text: `Last clean-up${when ? ` ${when}` : ""} didn't finish: ${reason}${stop}` };
   }
 
   function shortHash(value) {

@@ -1679,8 +1679,9 @@ class BackupScheduler:
             outcome = "matched"
             detail = "Readback matched the catalogued size and SHA-256."
         except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
-            # A copy that no longer matches must stop counting as verified, so it is
-            # neither offered for restore nor protected as the newest verified copy.
+            # A copy that no longer matches must lose its verified flag, so it is
+            # neither offered for restore nor protected as the newest copy that
+            # passed its last completed check.
             self.catalog.mark_unverified(artifact_id)
             outcome = "mismatch"
             detail = str(exc)
