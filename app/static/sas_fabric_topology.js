@@ -2407,7 +2407,9 @@
     const box = scrollBox(live.container);
     const measured = Number(box?.clientWidth) || 0;
     const width = measured > 0 ? measured : Math.max(0, (Number(options.width) || 0) - 2 * SCROLL_BORDER);
-    const model = buildTopologyModel(fabric, { ...options, width, previousOrder });
+    // Fit takes the box's inner height (its limit less both borders, floored): nothing left to scroll.
+    const height = Math.max(0, Math.floor((Number(options.height) || 0) - 2 * SCROLL_BORDER));
+    const model = buildTopologyModel(fabric, { ...options, width, height, previousOrder });
     // The page replaces the map on every render: keep the drawing's scroll
     // position for the same scope, and start a new scope at the origin.
     const keys = expandedKeys(options);
@@ -2913,8 +2915,8 @@
     container.addEventListener("click", (event) => {
       if (live.container !== container) return;
       if (event.target?.closest?.("[data-topology-fit]")) {
-        // Fit keeps the offsets the fitted drawing allows; Actual size goes
-        // back to the offsets held before Fit.
+        // Fit puts the fitted drawing at offsets 0/0; Actual size goes back
+        // to the offsets held before Fit.
         const box = scrollBox(container);
         if (!live.fit) live.actualScroll = { left: (Number(box?.scrollLeft) || 0) - live.room.left, top: (Number(box?.scrollTop) || 0) - live.room.top };
         else live.restoreScroll = live.actualScroll;
