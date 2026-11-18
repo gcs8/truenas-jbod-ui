@@ -79,6 +79,16 @@ textarea {
   margin-bottom: 18px;
 }
 
+/* The heading column: the line above the title holds the selected system
+   name and the summary can name an enclosure; either may be one long word.
+   Those two lines break a word anywhere, so a name wraps inside the header
+   and never sets the column's minimum width or widens the page (#1381). The
+   title keeps whole words and stays the column's floor. */
+.topbar-copy .eyebrow,
+.topbar-copy .subtle {
+  overflow-wrap: anywhere;
+}
+
 .topbar h1,
 .panel h2,
 .detail-slot-head h3 {
