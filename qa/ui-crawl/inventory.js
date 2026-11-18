@@ -208,6 +208,29 @@ function selectsBay(inventory, state) {
 // a delayed follow-up after it is a hard failure, not a reason to wait longer.
 const MAX_FOLLOW_UP_MS = 60_000;
 
+// #1135: controls that load a saved system. A state whose step clicks one
+// declares it as `selects_system`, so the crawler reads the system it selects
+// and binds that state's window to it before any step runs.
+const SYSTEM_SELECTORS = Object.freeze(["[data-existing-system-id]"]);
+
+// The attribute that carries the system id of a `selects_system` selector
+// (exactly one bare attribute selector), or null.
+function selectsSystemAttribute(selector) {
+  const hit = /^\[([a-z][a-z0-9-]*)\]$/.exec(typeof selector === "string" ? selector : "");
+  return hit ? hit[1] : null;
+}
+
+function validateSelectsSystem(errors, id, state) {
+  const clicked = (state.steps || []).filter((step) => step && typeof step === "object").map((step) => step.click || step.clickIfPresent).filter(Boolean);
+  if ("selects_system" in state) {
+    if (!selectsSystemAttribute(state.selects_system)) errors.push(`${id}: selects_system must be one [attribute] selector`);
+    else if (!clicked.includes(state.selects_system)) errors.push(`${id}: selects_system ${state.selects_system} but no step clicks it`);
+  }
+  for (const selector of SYSTEM_SELECTORS) {
+    if (clicked.includes(selector) && state.selects_system !== selector) errors.push(`${id}: a step clicks ${selector} (a saved system); declare it as selects_system`);
+  }
+}
+
 function validateFollowUp(errors, id, state) {
   if (state.follow_up_ms === undefined) return;
   const ms = state.follow_up_ms;
@@ -269,6 +292,7 @@ function validateInventory(inventory, { manifest = undefined, reach = undefined 
       }
     }
     validateFollowUp(errors, id, state);
+    validateSelectsSystem(errors, id, state);
     // #1143: `requires_enabled` makes a present-but-disabled `requires`
     // control not-applicable before any step runs. A confirm-preview state
     // that presses its required control must declare it, so a target that
@@ -419,5 +443,5 @@ function summarize(inventory) {
 
 module.exports = {
   INVENTORY_PATH, loadInventory, validateInventory, expandStates, selectStates, substitute, summarize, stepKind, deriveSafety, checkObserved,
-  readsFor, loadRequestsFor, selectsBay, FORCE_PARAMS, MAX_FOLLOW_UP_MS,
+  readsFor, loadRequestsFor, selectsBay, FORCE_PARAMS, MAX_FOLLOW_UP_MS, selectsSystemAttribute,
 };
