@@ -2381,7 +2381,7 @@
   function clearInput() {
     live.query = "";
     if (live.input) live.input.value = "";
-    if (live.status) live.status.textContent = "";
+    if (live.status) Object.assign(live.status, { textContent: "", title: "" });
   }
 
   // The bay groups drawn in full, from the page's expanded list.
@@ -2813,20 +2813,19 @@
   }
 
   function updateSearchStatus() {
-    const status = live.status;
-    if (!status) return;
-    if (!live.query) {
-      status.textContent = "";
-      return;
-    }
+    if (!live.status) return;
+    const text = searchStatusText();
+    Object.assign(live.status, { textContent: text, title: text });
+  }
+
+  // One line under the search (a longer one ends in an ellipsis; the title has it all).
+  function searchStatusText() {
+    if (!live.query) return "";
     const found = searchTopology(live.model, live.query);
-    if (!found.matches.length) {
-      status.textContent = `No match for "${live.query}".`;
-      return;
-    }
+    if (!found.matches.length) return `No match for "${live.query}".`;
     const names = found.matches.slice(0, 6).map((item) => `${item.label}${item.collapsed ? " (inside a collapsed block)" : ""}`);
     const more = found.matches.length > names.length ? `, and ${found.matches.length - names.length} more` : "";
-    status.textContent = `${found.matches.length} ${found.matches.length === 1 ? "match" : "matches"}: ${names.join(", ")}${more}.`;
+    return `${found.matches.length} ${found.matches.length === 1 ? "match" : "matches"}: ${names.join(", ")}${more}.`;
   }
 
   // One document Esc handler and one window resize handler for the page,
