@@ -1473,5 +1473,60 @@ class UploadCheckIsReadFromTheCopyTests(backup_fixtures.SchedulerTestBase):
                 self._assert_presented(scheduler, nas.artifact_id, EITHER, passed=False)
 
 
+class ContradictoryVerifyResultIsNotAPassTests(backup_fixtures.SchedulerTestBase):
+    """A saved Verify result passes only when it says it read the copy and matched (#1289).
+
+    ``ok: true`` beside an outcome other than "matched", or beside a malformed
+    outcome, is contradictory: the list and the details both present it as not
+    passed, with no outcome. A result from an earlier release carries no
+    outcome and keeps its boolean. The metadata is saved and reloaded through
+    the scheduler's own loader before it is presented.
+    """
+
+    open_target = BackupListAssuranceTests.open_target
+    _scheduler_with_size_only_copy = BackupListAssuranceTests._scheduler_with_size_only_copy
+    _row = BackupListAssuranceTests._row
+
+    def _present_after_reload(self, stored):
+        scheduler, _local, remote = self._scheduler_with_size_only_copy()
+        with scheduler._state_lock:
+            scheduler._meta[remote.artifact_id]["last_verify"] = {
+                "at": "2026-09-24T12:00:00+00:00", "artifact_id": remote.artifact_id, "detail": "x", **stored,
+            }
+            scheduler._save_meta()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        try:
+            row = self._row(scheduler, remote.artifact_id)
+            detail = scheduler.detail(remote.artifact_id)
+        finally:
+            scheduler.close()
+        self.assertEqual(row["upload_check"], "size")
+        self.assertIs(row["verified"], True)  # the catalogue flag keeps its restore and retention meaning
+        return row["last_verify"], detail["last_verify"]
+
+    def test_a_contradictory_or_malformed_outcome_is_not_a_passed_verify(self) -> None:
+        for outcome in ("not_read", "mismatch", {}, {"outcome": "matched"}, ["matched"], None, "unread", 1):
+            with self.subTest(outcome=outcome):
+                listed, detailed = self._present_after_reload({"ok": True, "outcome": outcome})
+                self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": False})
+                self.assertEqual(
+                    detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": False, "outcome": None, "detail": "x"}
+                )
+
+    def test_a_matched_outcome_and_an_earlier_release_result_still_pass(self) -> None:
+        listed, detailed = self._present_after_reload({"ok": True, "outcome": "matched"})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": True})
+        self.assertEqual(detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": True, "outcome": "matched", "detail": "x"})
+        # Earlier releases wrote no outcome at all.
+        listed, detailed = self._present_after_reload({"ok": True})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": True})
+        self.assertEqual(detailed, {"at": "2026-09-24T12:00:00+00:00", "ok": True, "outcome": None, "detail": "x"})
+        # A failed result keeps its own outcome.
+        listed, detailed = self._present_after_reload({"ok": False, "outcome": "not_read"})
+        self.assertEqual(listed, {"at": "2026-09-24T12:00:00+00:00", "ok": False})
+        self.assertEqual(detailed["outcome"], "not_read")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -650,7 +650,10 @@ and did not match, or a local copy is gone; it stops counting as verified), or
 `not_read` (the copy could not be opened or read, so nothing was checked and
 its verified status, restore and clean-up treatment are unchanged). The page
 words the last case as "could not read the copy, nothing checked". Results
-saved by earlier versions have no outcome.
+saved by earlier versions have no outcome. A saved result that reports success
+beside any outcome other than `matched`, or beside a malformed outcome,
+contradicts itself: the list and the details show it as not passed, with no
+outcome.
 
 ## Create a debug bundle
 

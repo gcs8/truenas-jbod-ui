@@ -1788,7 +1788,7 @@ def _list_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[s
     if value is None:
         return None
     at = value.get("at")
-    return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
+    return {"at": at if isinstance(at, str) else None, "ok": _verify_result(value)[0]}
 
 
 def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1799,11 +1799,27 @@ def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict
         return None
     detail = value.get("detail")
     summary = _list_last_verify(record, meta)
-    # Absent in results from earlier releases; shown only when it agrees with ``ok``.
-    outcome = value.get("outcome")
-    if not (isinstance(outcome, str) and (outcome == "matched") is summary["ok"] and outcome in _VERIFY_OUTCOMES):
-        outcome = None
-    return {**summary, "outcome": outcome, "detail": detail if isinstance(detail, str) else None}
+    return {**summary, "outcome": _verify_result(value)[1], "detail": detail if isinstance(detail, str) else None}
+
+
+def _verify_result(value: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Whether a saved Verify result passed, and its outcome, for the list and the details alike.
+
+    Only a boolean ``True`` counts as passed, so a malformed record never
+    upgrades a size-only copy. Results from earlier releases carry no outcome
+    and keep their boolean. A result that carries an outcome passes only with
+    "matched": ``ok: true`` beside "not_read", "mismatch" or a malformed
+    outcome contradicts itself, so it has not passed and claims no outcome
+    (#1289). An outcome is shown only when it agrees with ``ok``.
+    """
+
+    ok = value.get("ok") is True
+    if "outcome" not in value:
+        return ok, None
+    outcome = value["outcome"]
+    if not (isinstance(outcome, str) and outcome in _VERIFY_OUTCOMES and (outcome == "matched") is ok):
+        return False, None
+    return ok, outcome
 
 
 _VERIFY_OUTCOMES = frozenset({"matched", "mismatch", "not_read"})
