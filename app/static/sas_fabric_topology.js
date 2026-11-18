@@ -2336,8 +2336,8 @@
     model: null, pin: null, hover: null, query: "", scope: null, fit: false, scroll: { left: 0, top: 0 },
     container: null, input: null, status: null, hooks: {},
     // Why the next mount chooses the scroll position: "open",
-    // { expand: group id, anchor: its centre on screen, control: where its
-    // expand control was on the page, when it was in view } or null (keep).
+    // { expand: group id, control: where its expand control was on the page
+    // when it was in view, else null (keep) } or null (keep).
     firstView: null, expandedKeys: null, refocusFit: false, quiet: null,
     // scroll, actualScroll and restoreScroll are in drawing coordinates: the
     // offsets held before Fit, and those to restore on Actual size. room: the
@@ -2437,7 +2437,6 @@
         const rect = boxRect(box);
         live.firstView = {
           expand: toggled.id,
-          anchor: centreOf(before) - live.scroll.left,
           control: visible ? { x: rect.left + control.x - live.scroll.left, y: rect.top + control.y - live.scroll.top } : null,
         };
       }
@@ -2466,29 +2465,15 @@
     return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
   }
 
-  // Where the scroll box starts: with the host and every HBA inside it when
-  // they fit its width, and, after a shelf is expanded or collapsed, with
-  // that shelf still where the operator saw it if both can hold.
-  function firstViewLeft(model, reason, width, current) {
+  // Where the scroll box starts on the first view: with the host and every
+  // HBA inside it when they fit its width. Every later redraw keeps its view.
+  function firstViewLeft(model, width) {
     const top = model.nodes.filter((entry) => entry.kind === "host" || entry.kind === "controller");
     const span = top.length ? [Math.min(...top.map((entry) => entry.x)), Math.max(...top.map((entry) => entry.x + entry.w))] : null;
     const fits = span && span[1] - span[0] <= width;
-    let wanted = current;
     let range = [0, Math.max(0, model.width - width)];
     if (fits) range = [Math.max(range[0], span[1] - width), Math.min(range[1], span[0])];
-    if (reason === "open") {
-      wanted = span ? (span[0] + span[1]) / 2 - width / 2 : 0;
-    } else if (reason?.expand) {
-      const group = model.groupById.get(reason.expand);
-      if (group) {
-        wanted = centreOf(group) - reason.anchor;
-        // The shelf itself stays in view: at least 200 px of it, or all of it.
-        const keep = Math.min(group.w, width, 200);
-        const own = [group.x + keep - width, group.x + group.w - keep];
-        const both = [Math.max(range[0], own[0]), Math.min(range[1], own[1])];
-        range = both[0] <= both[1] ? both : [Math.max(0, own[0]), Math.max(0, own[1])];
-      }
-    }
+    const wanted = span ? (span[0] + span[1]) / 2 - width / 2 : 0;
     return Math.round(Math.min(range[1], Math.max(range[0], wanted)));
   }
 
@@ -2588,9 +2573,9 @@
           }
           aim();
         } else {
-          if (reason && live.model && !live.fit && width) {
-            left = firstViewLeft(live.model, reason, width, live.scroll.left);
-            if (reason === "open") top = 0;
+          if (reason === "open" && live.model && !live.fit && width) {
+            left = firstViewLeft(live.model, width);
+            top = 0;
           }
           // A redraw that keeps the view (a pin, a selection, a search, a
           // refresh, a shelf whose control was out of view) moves neither the
