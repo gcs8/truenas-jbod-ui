@@ -1,4 +1,4 @@
-"""Restore refusal and cleanup (#1273).
+"""Restore refusal and cleanup (#1273, #1287).
 
 Every fixture is synthetic and lives in a temporary directory.
 """
@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
+from history_service.segmented_restore import record_file as record_restore_file
+from history_service.segmented_restore import record_tree as record_restore_tree
 from history_service.store import HistoryStore
 from history_service.system_backup import (
     HISTORY_DB_KEY,
@@ -34,9 +36,11 @@ from tests.test_interrupted_restore_recovery import (
     PRIOR_RUNTIME,
     PRIOR_TLS,
     UNEXPECTED_EXIT,
+    _create_history,
     _Deployment,
     _deployment,
     _hot_events,
+    _tree_snapshot,
 )
 
 _ORIGINAL_RMTREE = shutil.rmtree
@@ -202,6 +206,147 @@ class InterruptedStagedTreeCleanupTests(_ImportRootCleanup):
             segment_catalog_path=target.segments / "catalog.json",
         )
         self.assertEqual(store._segmented_reader().counts()["event_count"], 2)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_malformed_configuration_target_kind_is_refused_and_changes_nothing(
+        self,
+    ) -> None:
+        # #1287, same class: a whole-import journal's target kind is also a
+        # discriminator tested for set membership.
+        target = self._target()
+
+        def hard_exit(*_args: Any, **_kwargs: Any) -> None:
+            os._exit(CRASH_EXIT)
+
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(
+                    _ImportActivationTransaction, "activate_segmented_history", hard_exit
+                )
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        marker = activation_pending_path(target.hot)
+        original = marker.read_bytes()
+        # Control: the journal as written reaches the prior-generation result.
+        dry_run = self._recover(target, apply=False)
+        self.assertEqual(dry_run["recovery_state"], "prior-generation-ready-to-restore")
+        for value in ("not-a-kind", [], {}):
+            journal = json.loads(original)
+            self.assertTrue(journal["targets"])
+            journal["targets"][0]["kind"] = value
+            marker.write_bytes(
+                json.dumps(journal, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
+            marker.chmod(0o600)
+            before = _tree_snapshot(target.root)
+            for apply in (False, True):
+                with self.subTest(value=value, apply=apply):
+                    with self.assertRaises(ValueError) as refused:
+                        self._recover(target, apply=apply)
+                    self.assertEqual(getattr(refused.exception, "reason", None), "journal-invalid")
+                    self.assertIn("a target kind is not recognised.", str(refused.exception))
+                    self.assertEqual(_tree_snapshot(target.root), before)
+
+
+class MalformedJournalDiscriminatorTests(_ImportRootCleanup):
+    """#1287: malformed phase and prior-kind fields refuse without a TypeError."""
+
+    def _history_only_journal(self) -> tuple[Path, Path, dict[str, Any]]:
+        root = Path(self._directory.name)
+        source, segments = _create_history(root / "live", "prior")
+        candidate_source, candidate_segments = _create_history(root / "candidate", "candidate")
+        transaction_id = "restore-test-0001"
+        staged_hot = source.parent / f".{source.name}.restore-{transaction_id}"
+        staged_segments = segments.parent / f".{segments.name}.restore-{transaction_id}"
+        shutil.copy2(candidate_source, staged_hot)
+        shutil.copytree(candidate_segments, staged_segments)
+        journal = {
+            "journal_version": 1,
+            "operation": "segmented-restore",
+            "transaction_id": transaction_id,
+            "phase": "prepared",
+            "generation_id": _catalog_generation(candidate_segments),
+            "hot": {
+                "target_name": source.name,
+                "staged_name": staged_hot.name,
+                "previous_name": f".{source.name}.previous-{transaction_id}",
+                "prior": record_restore_file(source),
+                "candidate": record_restore_file(staged_hot),
+            },
+            "segments": {
+                "target_name": segments.name,
+                "staged_name": staged_segments.name,
+                "previous_name": f".{segments.name}.previous-{transaction_id}",
+                "prior": record_restore_tree(segments),
+                "candidate": record_restore_tree(staged_segments),
+            },
+        }
+        shutil.rmtree(root / "candidate")
+        return source, segments, journal
+
+    @staticmethod
+    def _write_journal(source: Path, journal: dict[str, Any]) -> None:
+        marker = activation_pending_path(source)
+        marker.write_bytes(
+            json.dumps(journal, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        marker.chmod(0o600)
+
+    def test_malformed_discriminators_are_refused_and_change_nothing(self) -> None:
+        source, segments, journal = self._history_only_journal()
+        root = Path(self._directory.name)
+
+        # Control: the well-formed journal reaches the prior-generation result.
+        self._write_journal(source, journal)
+        control = recover_pending_rotation(
+            source=source, segments_directory=segments, apply=False
+        )
+        self.assertEqual(control["recovery_state"], "prior-generation-ready-to-restore")
+
+        cases: list[tuple[str, Callable[[dict[str, Any], Any], None], Any, str]] = []
+        phase_message = "Segmented restore phase is invalid."
+        record_message = "Segmented restore journal artifact record is invalid."
+
+        def set_phase(payload: dict[str, Any], value: Any) -> None:
+            payload["phase"] = value
+
+        def set_hot_kind(payload: dict[str, Any], value: Any) -> None:
+            payload["hot"]["prior"]["kind"] = value
+
+        def set_segments_kind(payload: dict[str, Any], value: Any) -> None:
+            payload["segments"]["prior"]["kind"] = value
+
+        def set_operation(payload: dict[str, Any], value: Any) -> None:
+            payload["operation"] = value
+
+        # Control: an unknown string already takes the validation-error path.
+        cases.append(("phase", set_phase, "not-a-phase", phase_message))
+        cases.append(
+            ("operation", set_operation, "not-an-operation", "History activation journal is invalid.")
+        )
+        for value in ([], {}):
+            cases.append(
+                ("operation", set_operation, value, "History activation journal is invalid.")
+            )
+            cases.append(("phase", set_phase, value, phase_message))
+            cases.append(("hot.prior.kind", set_hot_kind, value, record_message))
+            cases.append(("segments.prior.kind", set_segments_kind, value, record_message))
+
+        for field, mutate, value, message in cases:
+            malformed = json.loads(json.dumps(journal))
+            mutate(malformed, value)
+            self._write_journal(source, malformed)
+            before = _tree_snapshot(root)
+            for apply in (False, True):
+                with self.subTest(field=field, value=value, apply=apply):
+                    with self.assertRaises(ValueError) as refused:
+                        recover_pending_rotation(
+                            source=source, segments_directory=segments, apply=apply
+                        )
+                    self.assertEqual(str(refused.exception), message)
+                    self.assertEqual(_tree_snapshot(root), before)
 
 
 if __name__ == "__main__":

@@ -329,6 +329,7 @@ def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
     )
     if (
         not isinstance(payload, dict)
+        or not isinstance(payload.get("operation"), str)
         or payload.get("operation") not in {"rotate", "segmented-restore"}
         or type(payload.get("journal_version")) is not int
         or payload.get("journal_version")
@@ -515,7 +516,10 @@ def _restore_paths(
     transaction_id = journal.get("transaction_id")
     if not isinstance(transaction_id, str) or _TRANSACTION_ID.fullmatch(transaction_id) is None:
         raise ValueError("Segmented restore transaction ID is invalid.")
-    if journal.get("phase") not in RESTORE_PHASES:
+    # Type before membership: a JSON list or object is unhashable and would
+    # escape the validation-error path as a TypeError (#1287).
+    phase = journal.get("phase")
+    if not isinstance(phase, str) or phase not in RESTORE_PHASES:
         raise ValueError("Segmented restore phase is invalid.")
     generation_id = journal.get("generation_id")
     if not isinstance(generation_id, str) or not generation_id:
@@ -556,9 +560,11 @@ def _restore_paths(
     candidate_segments = segments.get("candidate")
     if not (
         isinstance(prior_hot, dict)
+        and isinstance(prior_hot.get("kind"), str)
         and prior_hot.get("kind") in {"file", "missing"}
         and _valid_file_record(candidate_hot)
         and isinstance(prior_segments, dict)
+        and isinstance(prior_segments.get("kind"), str)
         and prior_segments.get("kind") in {"directory", "missing"}
         and _valid_tree_record(candidate_segments)
     ):
@@ -770,7 +776,7 @@ def _parse_configuration_target(item: Any, *, transaction_id: str) -> dict[str, 
         raise ValueError("a target path is not a normalized absolute path.")
     path = Path(item["path"])
     kind = item.get("kind")
-    if kind not in {"file", "directory"}:
+    if not isinstance(kind, str) or kind not in {"file", "directory"}:
         raise ValueError("a target kind is not recognised.")
     validate = _valid_file_record if kind == "file" else _valid_tree_record
     prior = item.get("prior")
