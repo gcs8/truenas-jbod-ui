@@ -465,6 +465,9 @@ class BadInputTests(_Repository):
             "object number": {"pull_request": {"number": {"value": 42}}},
             "number labels": {"pull_request": {"number": 42, "labels": 7}},
             "null labels": {"pull_request": {"number": 42, "labels": None}},
+            "boolean number": {"pull_request": {"number": True, "labels": []}},
+            "float number": {"pull_request": {"number": 42.0, "labels": []}},
+            "non-finite number": {"pull_request": {"number": float("inf"), "labels": []}},
         }
         for name, payload in payloads.items():
             with self.subTest(payload=name):
