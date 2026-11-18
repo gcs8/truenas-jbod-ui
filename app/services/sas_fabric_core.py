@@ -518,10 +518,18 @@ def _slot_location_number_candidates(slot: SlotView) -> list[int]:
 
 
 def _parse_mpr_target(value: Any) -> int | None:
+    """A target number is 1 to 9 ASCII digits; anything else is no target.
+
+    `str.isdigit()` also admits other scripts' digits and characters such as
+    a superscript two, which `int()` rejects with an exception, and any length.
+    """
     text = normalize_text(str(value)) if value is not None else None
-    if not text or not text.isdigit():
+    if not text or not _MPR_TARGET_NUMBER.fullmatch(text):
         return None
     return int(text, 10)
+
+
+_MPR_TARGET_NUMBER = re.compile(r"[0-9]{1,9}")
 
 
 def _cam_member_target(cam_devices: Any, controller_name: str, device_name: str | None) -> int | None:
