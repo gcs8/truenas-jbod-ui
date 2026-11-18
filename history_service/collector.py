@@ -678,10 +678,15 @@ class HistoryCollector:
                 force_fresh=scope_collect_slow,
             )
             metric_samples: list[MetricSample] = []
+            # Only a bay whose own summary came back usable was read. A present
+            # bay the batch omitted or marked unavailable keeps its debt (#1401).
+            read_slots: set[int] = set()
             for record in slot_records:
                 summary = summaries.get(record.slot)
                 if not isinstance(summary, dict):
                     continue
+                if record.slot in records_by_slot and summary.get("available") is not False:
+                    read_slots.add(record.slot)
                 evidence_key = self._smart_evidence_disk_key(record)
                 if self._smart_summary_has_failure_health_evidence(summary):
                     smart_failure_health_observed.add(evidence_key)
@@ -722,7 +727,6 @@ class HistoryCollector:
                 if collected
             }
             # The read paid only the bays it read; an unread sibling keeps its debt.
-            read_slots = set(present_slots)
             self._set_pending_smart_metric_bays(
                 scope_key,
                 {

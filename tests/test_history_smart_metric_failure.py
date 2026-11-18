@@ -503,6 +503,183 @@ class SmartMetricFailureTests(unittest.TestCase):
         self.assertNotIn(("failing-system", "enc-b"), self.collector._pending_smart_metric_scopes)
         self.assertIsNone(self.collector.degraded_reason())
 
+    # Per-bay debt transitions (#1401). Each test checks the debt of every bay,
+    # not only the scope's union, and ends with the read that pays it.
+
+    BOTH_KINDS = frozenset({"fast", "slow"})
+    FAILING_KEY = ("failing-system", "enc-b")
+
+    def _bay_debts(self) -> dict[int, frozenset[str]] | None:
+        return self.collector._pending_smart_metric_bays.get(self.FAILING_KEY)
+
+    def _pass(self, scopes: list[ScopeSnapshot], seconds: int, *, incomplete: bool = False, **kwargs: Any) -> None:
+        async def enumerate_scopes(**_kwargs: Any) -> list[ScopeSnapshot]:
+            if incomplete:
+                self.collector._scope_enumeration_complete = False
+            return scopes
+
+        self.collector._enumerate_scopes = AsyncMock(side_effect=enumerate_scopes)  # type: ignore[method-assign]
+        self.collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=self._two_bay_smart_side_effect(set())
+        )
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=seconds)):
+            asyncio.run(self.collector.run_once(**kwargs))
+
+    def _batch_pass(self, summaries: list[dict[str, Any]], seconds: int) -> AsyncMock:
+        """One scheduled pass through the real batch reader; only the HTTP JSON is synthetic."""
+
+        both = self._two_bay_failing_scope(second_bay="present")
+        self.collector._enumerate_scopes = AsyncMock(return_value=[self.healthy, both])  # type: ignore[method-assign]
+        self.collector._fetch_smart_summaries = HistoryCollector._fetch_smart_summaries.__get__(  # type: ignore[method-assign]
+            self.collector
+        )
+        fetch_json = AsyncMock(return_value={"summaries": summaries})
+        self.collector._fetch_json = fetch_json  # type: ignore[method-assign]
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=seconds)):
+            asyncio.run(self.collector.run_once(include_due_intervals=True))
+        return fetch_json
+
+    def _assert_batch_retry_pays_both_bays(self, seconds: int) -> None:
+        fetch_json = self._batch_pass(
+            [{"slot": slot, "summary": _summary()[0]} for slot in (0, 1)], seconds
+        )
+        fetch_json.assert_awaited_once()
+        self.assertEqual(fetch_json.await_args.kwargs["body"], b'{"slots": [0, 1]}')  # type: ignore[union-attr]
+        self.assertEqual(fetch_json.await_args.kwargs["params"].get("fresh"), "true")  # type: ignore[union-attr]
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_successful_batch_that_omits_a_bays_summary_keeps_that_bays_debt(self) -> None:
+        # A present bay with no summary in a successful batch was not read.
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        fetch_json = self._batch_pass([{"slot": 0, "summary": _summary()[0]}], seconds=1)
+
+        fetch_json.assert_awaited_once()
+        self.assertEqual(fetch_json.await_args.kwargs["body"], b'{"slots": [0, 1]}')  # type: ignore[union-attr]
+        self.assertGreater(self._metric_rows("failing-system"), 0)
+        self.assertEqual(self._bay_debts(), {1: self.BOTH_KINDS})
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+        self._assert_batch_retry_pays_both_bays(seconds=2)
+
+    def test_successful_batch_with_an_unavailable_summary_keeps_that_bays_debt(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        fetch_json = self._batch_pass(
+            [
+                {"slot": 0, "summary": _summary()[0]},
+                {"slot": 1, "summary": {"available": False, "message": "Synthetic SMART read unavailable"}},
+            ],
+            seconds=1,
+        )
+
+        fetch_json.assert_awaited_once()
+        self.assertGreater(self._metric_rows("failing-system"), 0)
+        self.assertEqual(self._bay_debts(), {1: self.BOTH_KINDS})
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+        self._assert_batch_retry_pays_both_bays(seconds=2)
+
+    def test_control_successful_batch_with_every_summary_pays_every_bay(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+        self._assert_batch_retry_pays_both_bays(seconds=1)
+
+    def test_failed_retry_keeps_the_debt_of_an_unread_sibling(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+        unread = self._two_bay_failing_scope(second_bay="unread")
+        self.collector._enumerate_scopes = AsyncMock(return_value=[self.healthy, unread])  # type: ignore[method-assign]
+        self.collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=self._two_bay_smart_side_effect({"failing-system"})
+        )
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=1)):
+            asyncio.run(self.collector.run_once(force_fast=True, include_due_intervals=False))
+
+        self.assertEqual(self.collector._fetch_smart_summaries.await_args.args[1], [0])  # type: ignore[attr-defined]
+        self.assertEqual(self._bay_debts(), {0: self.BOTH_KINDS, 1: self.BOTH_KINDS})
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+
+        self._pass([self.healthy, self._two_bay_failing_scope(second_bay="present")], seconds=2)
+        self.assertTrue(self.collector._fetch_smart_summaries.await_args.kwargs["force_fresh"])  # type: ignore[attr-defined]
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_fast_only_read_pays_only_fast_and_only_read_bays(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        unread = self._two_bay_failing_scope(second_bay="unread")
+        self._pass([self.healthy, unread], seconds=1, force_fast=True, include_due_intervals=False)
+
+        self.assertEqual(self._bay_debts(), {0: frozenset({"slow"}), 1: self.BOTH_KINDS})
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+
+    def test_zero_slot_snapshot_keeps_every_bays_debt(self) -> None:
+        # An empty slot list reads no bay as empty; it is not a confirmed-empty scope.
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        no_slots = _scope("failing-system", "enc-b", "da1")
+        no_slots.snapshot["slots"] = []
+        self._pass([no_slots], seconds=1, force_fast=True, include_due_intervals=False)
+
+        self.collector._fetch_smart_summaries.assert_not_awaited()  # type: ignore[attr-defined]
+        self.assertEqual(self._bay_debts(), {0: self.BOTH_KINDS, 1: self.BOTH_KINDS})
+        self.assertIsNotNone(self.collector.degraded_reason())
+
+        self._pass([self.healthy, self._two_bay_failing_scope(second_bay="present")], seconds=2)
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_bay_missing_from_the_slot_list_keeps_its_debt_until_it_is_read(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        only_bay_0 = _scope("failing-system", "enc-b", "da1")
+        self._pass([self.healthy, only_bay_0], seconds=1)
+        self.collector._fetch_smart_summaries.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertEqual(self._bay_debts(), {1: self.BOTH_KINDS})
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+
+        self._pass([self.healthy, only_bay_0], seconds=2)
+        self.collector._fetch_smart_summaries.assert_not_awaited()  # type: ignore[attr-defined]
+        self.assertEqual(self._bay_debts(), {1: self.BOTH_KINDS})
+
+        self._pass([self.healthy, self._two_bay_failing_scope(second_bay="present")], seconds=3)
+        self.collector._fetch_smart_summaries.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_cached_root_pass_keeps_the_debt_of_an_absent_scope(self) -> None:
+        # A cached-root census is not authoritative about which scopes exist.
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        self._pass([self.healthy], seconds=1, cached_root_only=True, include_due_intervals=False)
+        self.assertEqual(self._bay_debts(), {0: self.BOTH_KINDS, 1: self.BOTH_KINDS})
+        self.assertIsNotNone(self.collector.degraded_reason())
+
+        # Control: a complete census without the scope settles its debt.
+        self._pass([self.healthy], seconds=2)
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_incomplete_census_keeps_the_debt_of_an_absent_scope(self) -> None:
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_both_bays_owing_a_retry(started)
+
+        self._pass([self.healthy], seconds=1, incomplete=True)
+        self.assertEqual(self._bay_debts(), {0: self.BOTH_KINDS, 1: self.BOTH_KINDS})
+        self.assertIsNotNone(self.collector.degraded_reason())
+
+        self._pass([self.healthy], seconds=2)
+        self.assertIsNone(self._bay_debts())
+        self.assertIsNone(self.collector.degraded_reason())
+
     def test_control_healthy_pass_advances_cadence_without_retry(self) -> None:
         self.collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
             return_value=[self.healthy, self.failing]
