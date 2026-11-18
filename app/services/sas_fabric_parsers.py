@@ -141,6 +141,15 @@ MPR_DEVICE_TYPES = frozenset(
 )
 
 
+# mprutil's `show devices` heading, which names the four columns after the
+# device type: `Speed Enc  Slot  Wdt`.
+_MPR_DEVICES_HEADING = re.compile(r"^\s*B_*T?\s+SAS Address\s+Handle\s+Parent\s+Device\s+Speed\s+Enc\s+Slot\s+Wdt\s*$")
+# A negotiated rate as mprutil prints it (`1.5`, `3.0`, `6.0`, `12`), and the
+# same or the `Unk` or `???` it prints for a rate it has no name for.
+_MPR_DEVICE_RATE = re.compile(r"\d{1,2}(?:\.\d+)?")
+_MPR_DEVICE_SPEED = re.compile(r"\d{1,2}(?:\.\d+)?|Unk|\?\?\?")
+
+
 def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
     """The device rows of a `show devices` reply and how many rows were not understood.
 
@@ -151,6 +160,7 @@ def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
     """
     rows: list[dict[str, str]] = []
     rejected = 0
+    printed_heading = any(_MPR_DEVICES_HEADING.match(line) for line in text.splitlines())
     for line in text.splitlines():
         stripped = line.strip()
         parts = stripped.split()
@@ -170,13 +180,20 @@ def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
             device_words.append(parts[index])
             index += 1
         # The device column starts with its type; a provider may name the disk
-        # after it. After the speed come the enclosure handle and the slot; a
-        # row whose columns do not read so is not understood, never shifted.
+        # after it. Under mprutil's heading a row then ends with exactly four
+        # columns: speed, enclosure handle, slot and width, so a row missing
+        # one is not understood, never shifted (a four-digit slot is not read
+        # as the enclosure handle). Bare rows without the heading may omit the
+        # width, so their layout cannot show a missing column; their speed
+        # must be a printed number, as before, never `Unk` or `???`.
+        trailing = parts[index:]
         if (
-            index + 2 >= len(parts)
+            len(trailing) not in ((4,) if printed_heading else (3, 4))
             or " ".join(device_words[:2]) not in MPR_DEVICE_TYPES
-            or not re.fullmatch(r"[0-9a-fA-F]{4}", parts[index + 1])
-            or not re.fullmatch(r"\d+", parts[index + 2])
+            or not (_MPR_DEVICE_SPEED if printed_heading else _MPR_DEVICE_RATE).fullmatch(trailing[0])
+            or not re.fullmatch(r"[0-9a-fA-F]{4}", trailing[1])
+            or not re.fullmatch(r"\d+", trailing[2])
+            or (len(trailing) == 4 and not re.fullmatch(r"\d+", trailing[3]))
         ):
             rejected += 1
             continue
