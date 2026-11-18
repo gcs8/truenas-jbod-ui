@@ -328,6 +328,69 @@ class SmartMetricFailureTests(unittest.TestCase):
         self.assertGreater(self._metric_rows("failing-system"), 0)
         self.assertIsNone(self.collector.degraded_reason())
 
+    def _failing_scope_with_bay(self, *, present: bool, presence_known: bool) -> ScopeSnapshot:
+        scope = _scope("failing-system", "enc-b", "da1")
+        slot = scope.snapshot["slots"][0]
+        slot["present"] = present
+        slot["presence_known"] = presence_known
+        if not presence_known:
+            slot["state"] = "unknown"
+        return scope
+
+    def test_unread_bay_occupancy_keeps_the_retry_debt_until_a_real_read(self) -> None:
+        # Refs #1295: a pass that could not read the bay's occupancy read no
+        # SMART either, so it must not pay or forget the scope's retry debt.
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_failing_scope_owing_a_retry(started)
+        self.assertEqual(
+            self.collector._pending_smart_metric_scopes.get(("failing-system", "enc-b")),
+            frozenset({"fast", "slow"}),
+        )
+
+        unread = self._failing_scope_with_bay(present=False, presence_known=False)
+        self.collector._enumerate_scopes = AsyncMock(return_value=[self.healthy, unread])  # type: ignore[method-assign]
+        self.collector._fetch_smart_summaries = AsyncMock(side_effect=self._smart_side_effect(set()))  # type: ignore[method-assign]
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=1)):
+            asyncio.run(self.collector.run_once(include_due_intervals=True))
+
+        self.collector._fetch_smart_summaries.assert_not_awaited()  # type: ignore[attr-defined]
+        self.assertEqual(
+            self.collector._pending_smart_metric_scopes.get(("failing-system", "enc-b")),
+            frozenset({"fast", "slow"}),
+        )
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+
+        # Occupancy is readable again before either cadence is due: the debt
+        # is paid by a fresh read, and only then does degradation clear.
+        self.collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self.healthy, self.failing]
+        )
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=2)):
+            asyncio.run(self.collector.run_once(include_due_intervals=True))
+
+        fetch = self.collector._fetch_smart_summaries
+        fetch.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertEqual(fetch.await_args.args[0].system_id, "failing-system")  # type: ignore[attr-defined]
+        self.assertTrue(fetch.await_args.kwargs["force_fresh"])  # type: ignore[attr-defined]
+        self.assertGreater(self._metric_rows("failing-system"), 0)
+        self.assertNotIn(("failing-system", "enc-b"), self.collector._pending_smart_metric_scopes)
+        self.assertIsNone(self.collector.degraded_reason())
+
+    def test_control_confirmed_empty_bay_settles_the_retry_debt(self) -> None:
+        # A bay read as empty is authoritative absence: nothing is left to read.
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self._leave_failing_scope_owing_a_retry(started)
+
+        empty = self._failing_scope_with_bay(present=False, presence_known=True)
+        self.collector._enumerate_scopes = AsyncMock(return_value=[self.healthy, empty])  # type: ignore[method-assign]
+        self.collector._fetch_smart_summaries = AsyncMock(side_effect=self._smart_side_effect(set()))  # type: ignore[method-assign]
+        with patch("history_service.collector.utcnow", return_value=started + timedelta(seconds=1)):
+            asyncio.run(self.collector.run_once(include_due_intervals=True))
+
+        self.collector._fetch_smart_summaries.assert_not_awaited()  # type: ignore[attr-defined]
+        self.assertNotIn(("failing-system", "enc-b"), self.collector._pending_smart_metric_scopes)
+        self.assertIsNone(self.collector.degraded_reason())
+
     def test_control_healthy_pass_advances_cadence_without_retry(self) -> None:
         self.collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
             return_value=[self.healthy, self.failing]
