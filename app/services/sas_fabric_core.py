@@ -193,6 +193,7 @@ def _add_mpr_member_trace_context(
     path_state: str,
     member_device_name: str | None,
     member_target: int | None = None,
+    member_target_rejected: bool = False,
     slot_enclosure_ids: list[str] | None = None,
     slot_location_numbers: list[int] | None = None,
     slot_ses_number: int | None = None,
@@ -203,6 +204,7 @@ def _add_mpr_member_trace_context(
         controller_name,
         member_device_name,
         member_target=member_target,
+        member_target_rejected=member_target_rejected,
         slot_enclosure_ids=slot_enclosure_ids,
         slot_location_numbers=slot_location_numbers,
         slot_ses_number=slot_ses_number,
@@ -336,6 +338,7 @@ def _lookup_mpr_device_context(
     device_name: str | None,
     *,
     member_target: int | None = None,
+    member_target_rejected: bool = False,
     slot_enclosure_ids: list[str] | None = None,
     slot_location_numbers: list[int] | None = None,
     slot_ses_number: int | None = None,
@@ -408,6 +411,10 @@ def _lookup_mpr_device_context(
                 if key in occupants and occupants[key] is None:
                     return None
             return context
+    if member_target_rejected:
+        # CAM printed a target for this member that is not a target number:
+        # that is evidence, not absence, so position alone cannot join a row.
+        return None
     devices_by_location = trace_index.get("devices_by_location", {})
     for enclosure_id in slot_enclosure_ids or []:
         enclosure_key = _identifier_lookup_key(enclosure_id)
@@ -426,6 +433,10 @@ def _lookup_mpr_device_context(
                 # device, whatever its position.
                 row_target = _parse_mpr_target(context.get("target"))
                 if member_target is not None and row_target is not None and row_target != member_target:
+                    return None
+                # A printed target that is not a target number cannot be
+                # compared, so it cannot be shown to be this member's.
+                if row_target is None and _mpr_target_rejected(context.get("target")):
                     return None
                 return context
     return None
@@ -518,10 +529,33 @@ def _slot_location_number_candidates(slot: SlotView) -> list[int]:
 
 
 def _parse_mpr_target(value: Any) -> int | None:
+    """A target number is 1 to 9 ASCII digits; anything else is no target.
+
+    `str.isdigit()` also admits other scripts' digits and characters such as
+    a superscript two, which `int()` rejects with an exception, and any length.
+    """
     text = normalize_text(str(value)) if value is not None else None
-    if not text or not text.isdigit():
+    if not text or not _MPR_TARGET_NUMBER.fullmatch(text):
         return None
     return int(text, 10)
+
+
+_MPR_TARGET_NUMBER = re.compile(r"[0-9]{1,9}")
+
+
+def _mpr_target_rejected(value: Any) -> bool:
+    """A target was printed but is not a target number (unlike an absent one)."""
+    text = normalize_text(str(value)) if value is not None else None
+    return bool(text) and _parse_mpr_target(text) is None
+
+
+def _cam_member_target_rejected(cam_devices: Any, controller_name: str, device_name: str | None) -> bool:
+    """CAM printed a target for the member on this controller that is not admitted."""
+    return any(
+        normalize_text(cam_devices.controllers.get(candidate.lower())) == controller_name
+        and _mpr_target_rejected(cam_devices.targets.get(candidate.lower()))
+        for candidate in _device_name_candidates(device_name)
+    )
 
 
 def _cam_member_target(cam_devices: Any, controller_name: str, device_name: str | None) -> int | None:

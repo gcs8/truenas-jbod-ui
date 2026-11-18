@@ -224,6 +224,8 @@ mpr1 Adapter:
 """.strip()
 
 
+# mprutil prints an expander's EncHandle in decimal ("%04d") and the enclosure
+# and device lists' in hexadecimal ("%04x"): 0018 below is 0012 in those lists.
 MPR0_EXPANDERS = """
 Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
 36       50030480090c4f7f 0009      0001   0002      1
@@ -234,7 +236,7 @@ Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
 
 MPR1_EXPANDERS = """
 Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
-36       50030480090c8f7f 0019      0001   0012      1
+36       50030480090c8f7f 0019      0001   0018      1
   0 1 000c 12.0 1.5 12.0 End Device
 """.strip()
 
@@ -346,9 +348,9 @@ Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
 
 MPR1_EXPANDERS_WITH_UNRELATED = """
 Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
-36       50030480090c4fff 0019      0001   0012      1
+36       50030480090c4fff 0019      0001   0018      1
   0 1 000c 6.0 1.5 12.0 End Device
-36       500304801f715fbf 001b      0001   0014      1
+36       500304801f715fbf 001b      0001   0020      1
   0 1 001d 12.0 1.5 12.0 End Device
 """.strip()
 
@@ -615,7 +617,7 @@ process.stdout.write(ui.renderTraceMode(data.fabric));
                     selected_enclosure_id=f"{10:016x}"),
                 ssh_outputs={
                     "mprutil -u 0 show expanders": "\n".join(
-                        f"36 {i + 1:016x} {i + 1:04x} ffff 000a 1" for i in range(3)),
+                        f"36 {i + 1:016x} {i + 1:04x} ffff 0010 1" for i in range(3)),
                     "mprutil -u 0 show enclosures": f"2 {10:016x} 000f 000a SES",
                 },
             )
@@ -668,7 +670,7 @@ process.stdout.write(ui.renderTraceMode(data.fabric));
                     leaf = depth + 2 + i
                     parent = i + 2 if branching else depth + 1
                     level = i + 3 if branching else depth + 2
-                    rows.append(f"36 {leaf:016x} {leaf:04x} {parent:04x} {leaf:04x} {level}")
+                    rows.append(f"36 {leaf:016x} {leaf:04x} {parent:04x} {leaf:04d} {level}")
                     devices.append(f"00 {i} {leaf + 10000:016x} {leaf + 20000:04x} {leaf:04x} SAS Target 12.0 {leaf:04x} {i}")
                     slots.append(SlotView(
                         slot=i, slot_label=str(i), row_index=0, column_index=i,
