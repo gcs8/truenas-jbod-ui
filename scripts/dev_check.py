@@ -161,6 +161,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_storcli_split",
     "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
+    "tests.test_truenas_ws_envelope_members",
     "tests.test_unittest_identities",
     "tests.test_unittest_shards",
     "tests.test_wiki_drift_verifier",
