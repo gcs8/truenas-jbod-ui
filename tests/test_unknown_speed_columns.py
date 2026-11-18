@@ -183,6 +183,76 @@ class MprUnknownSpeedRowTests(unittest.TestCase):
         self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["devices"], "read")
         self.assertEqual([metrics["device_count"] for metrics in _enclosure_metrics(fabric)], [2])
 
+    def test_every_numeric_speed_form_read_before_is_still_read_in_place(self) -> None:
+        # The numeric speed grammar is unchanged (`\d+(?:\.\d+)?`): any run of
+        # digits, with or without a fraction, including a leading zero and
+        # three or more digits. Each complete row keeps its own enclosure and slot.
+        speeds = ("1", "12", "100", "1000", "012.0", "100.0", "1.5", "22.5", "0.75")
+        bare = f"{SECOND_ADDRESS} 000c 000b SAS Target"
+        for speed in speeds:
+            with self.subTest(speed=speed, layout="heading"):
+                rows, rejected = parse_mpr_device_list(_listing(_row(speed, slot="1023")))
+                self.assertEqual(rejected, 0)
+                self.assertEqual((rows[1]["speed"], rows[1]["enclosure_handle"], rows[1]["slot"]), (speed, "0010", "1023"))
+            with self.subTest(speed=speed, layout="bare with width"):
+                rows, rejected = parse_mpr_device_list(f"00 7 {bare} {speed} 0010 1023 1\n")
+                self.assertEqual(rejected, 0)
+                self.assertEqual([(row["speed"], row["enclosure_handle"], row["slot"]) for row in rows], [(speed, "0010", "1023")])
+            for label, outputs in {
+                "dedicated": {**_healthy_unit(), "mprutil -u 0 show devices": _listing(_row(speed, slot="1023"))},
+                "show all": {
+                    "mprutil -u 0 show all": _show_all().replace(
+                        _printed_device_row(), _printed_device_row() + _row(speed, slot="1023")
+                    )
+                },
+            }.items():
+                with self.subTest(speed=speed, layer="fabric", source=label):
+                    fabric = _fabric(outputs)
+                    self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["devices"], "read")
+                    self.assertEqual([metrics["device_count"] for metrics in _enclosure_metrics(fabric)], [2])
+            # Bare without the width: every form but a four-digit whole number,
+            # which reads equally as handle, slot and width with the speed
+            # missing; that one row is refused, never guessed.
+            with self.subTest(speed=speed, layout="bare without width"):
+                parsed = parse_mpr_device_list(f"{bare} {speed} 0010 1023\n")
+                if speed == "1000":
+                    self.assertEqual(parsed, ([], 1))
+                else:
+                    self.assertEqual(parsed[1], 0)
+                    self.assertEqual([(r["speed"], r["enclosure_handle"], r["slot"]) for r in parsed[0]], [(speed, "0010", "1023")])
+        # The missing-enclosure row stays refused, under the heading and bare.
+        missing = f"00   7     {SECOND_ADDRESS} 000c    000b      SAS Target    Unk   1023  1\n"
+        self.assertEqual(parse_mpr_device_list(_listing(missing))[1], 1)
+        self.assertEqual(parse_mpr_device_list(f"00 7 {bare} Unk 1023 1\n"), ([], 1))
+
+    def test_a_complete_row_with_an_invalid_enclosure_handle_is_not_understood(self) -> None:
+        # Every column is present, but the enclosure handle is not four hex
+        # digits: the row is refused, not read under a handle no enclosure has.
+        for handle in ("zzzz", "00g0", "010", "00100"):
+            bad_row = f"00   11    {SECOND_ADDRESS} 000c    000a      SAS Target    12    {handle} 01    1\n"
+            with self.subTest(handle=handle, layer="parser"):
+                parsed, rejected = parse_mpr_device_list(_listing(bad_row))
+                self.assertEqual(rejected, 1)
+                self.assertEqual([row["sas_address"] for row in parsed], [DEVICE_ADDRESS])
+            with self.subTest(handle=handle, layer="bare"):
+                self.assertEqual(parse_mpr_device_list(f"{SECOND_ADDRESS} 000c 000b SAS Target 12 {handle} 01 1\n"), ([], 1))
+            for label, outputs in {
+                "dedicated": {**_healthy_unit(), "mprutil -u 0 show devices": _listing(bad_row)},
+                "show all": {"mprutil -u 0 show all": _show_all().replace(_printed_device_row(), _printed_device_row() + bad_row)},
+            }.items():
+                with self.subTest(handle=handle, layer="fabric", source=label):
+                    fabric = _fabric(outputs)
+                    self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["devices"], "unreadable")
+                    [enclosure] = _enclosure_metrics(fabric)
+                    self.assertEqual((enclosure["device_count"], enclosure.get("not_read")), (None, ["device_count"]))
+        # Control: the same row with a valid handle is read and counted.
+        good_row = f"00   11    {SECOND_ADDRESS} 000c    000a      SAS Target    12    0010 01    1\n"
+        rows, rejected = parse_mpr_device_list(_listing(good_row))
+        self.assertEqual((rejected, rows[1]["enclosure_handle"], rows[1]["slot"]), (0, "0010", "01"))
+        fabric = _fabric({**_healthy_unit(), "mprutil -u 0 show devices": _listing(good_row)})
+        self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["devices"], "read")
+        self.assertEqual([metrics["device_count"] for metrics in _enclosure_metrics(fabric)], [2])
+
 
 class StorcliUnknownSpeedControlTests(unittest.TestCase):
     """Control: a StorCLI row is keyed by column name, so `Unk` in `Sp` moves nothing."""
