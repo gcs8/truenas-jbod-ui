@@ -2620,7 +2620,42 @@
     return state === "read" || state === "empty" ? "No objects reported" : "Not read";
   }
 
-  function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
+  // Bays the CORE inventory knows, whether or not a controller read claims
+  // them (same source as inventoryBaySlots on the Storage Fabric page).
+  function sasFabricInventoryBaySlots(fabric) {
+    return sasFabricSortedSlots(sasFabricList(fabric?.nodes)
+      .filter((node) => node.kind === "bay")
+      .flatMap((node) => sasFabricList(node.related_slots)));
+  }
+
+  // Twins of fabricCountsIncomplete / fabricCountsUnvouched on the Storage
+  // Fabric page: some count marked partial or not read, or any count not
+  // reported complete.
+  function sasFabricCountsIncomplete(fabric) {
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => !["complete", "unknown"].includes(fabricCountState(fabric, domain)))
+      || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
+  }
+
+  function sasFabricCountsUnvouched(fabric) {
+    return sasFabricCountsIncomplete(fabric)
+      || ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) === "unknown");
+  }
+
+  // Inventory bays drawn in their own explained group, never inside a
+  // controller lane: inventory membership is not controller attachment.
+  function renderSasFabricInventoryGroup(slots, notice) {
+    return `
+      <section class="sas-fabric-lane sas-fabric-inventory-lane">
+        <div class="warning-item muted compact">${escapeHtml(notice)}</div>
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">From Inventory</div>
+          <div class="sas-fabric-bay-list">${renderSasFabricBayChips(slots, 72, "bays:inventory")}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderSasFabricLane(controllerRecord, fabric, nodeMap, claimedSlots = null) {
     const storagePayload = isStorageFabricPayload(fabric);
     const controllerId = controllerRecord.id || `controller:${controllerRecord.name}`;
     const controllerNode = nodeMap.get(controllerId) || {
@@ -2649,6 +2684,7 @@
     expanders.forEach((node) => sasFabricSortedSlots(node.related_slots).forEach((slot) => slotSet.add(slot)));
     enclosures.forEach((node) => sasFabricSortedSlots(node.related_slots).forEach((slot) => slotSet.add(slot)));
     const laneSlots = Array.from(slotSet).sort((left, right) => left - right);
+    laneSlots.forEach((slot) => claimedSlots?.add(slot));
     const laneRelated = sasFabricSelectionTouchesNode(controllerId) || sasFabricSelectionTouchesSlots(laneSlots);
     return `
       <section class="sas-fabric-lane${laneRelated ? " is-related" : ""}">
@@ -2700,13 +2736,29 @@
         alias: node.alias,
         related_slots: node.related_slots,
       }));
+    // CORE bays the inventory knows stay drawn when no controller read
+    // claims them (same rule as the Storage Fabric page).
+    const coreInventory = !storagePayload && fabric.platform === "core";
     if (!controllerRecords.length) {
       const { meta, message } = sasFabricNoControllerText(fabric, storagePayload);
+      const inventorySlots = coreInventory ? sasFabricInventoryBaySlots(fabric) : [];
       return `
         <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta })}</div>
         <div class="warning-item muted compact">${message}</div>
+        ${inventorySlots.length ? `<div class="sas-fabric-lane-grid">${renderSasFabricInventoryGroup(inventorySlots, "Not attached to a controller. Controller data could not be read, so these come from the inventory.")}</div>` : ""}
       `;
     }
+    const claimedSlots = new Set();
+    const lanes = controllerRecords.map((controller) => renderSasFabricLane(controller, fabric, nodeMap, claimedSlots)).join("");
+    const unattachedSlots = coreInventory && sasFabricCountsUnvouched(fabric)
+      ? sasFabricInventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot))
+      : [];
+    const unattachedReason = sasFabricCountsIncomplete(fabric)
+      ? "Some controller data was not read"
+      : "Whether the controller data was read whole was not reported";
+    const unattached = unattachedSlots.length
+      ? renderSasFabricInventoryGroup(unattachedSlots, `Not attached to a read controller. ${unattachedReason}, so these come from the inventory.`)
+      : "";
     return `
       <div class="sas-fabric-host-row">
         ${renderSasFabricNodeButton(hostNode, {
@@ -2716,7 +2768,7 @@
         })}
       </div>
       <div class="sas-fabric-lane-grid">
-        ${controllerRecords.map((controller) => renderSasFabricLane(controller, fabric, nodeMap)).join("")}
+        ${lanes}${unattached}
       </div>
     `;
   }
