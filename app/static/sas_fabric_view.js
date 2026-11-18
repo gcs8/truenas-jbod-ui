@@ -1804,10 +1804,37 @@
     return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
   }
 
+  // The Storage Fabric page's reader of a row's occupancy: "present", "empty"
+  // or "unknown" (`presence_known: false` means nobody read the bay). Same
+  // rule as slotOccupancy in app.js.
+  function slotOccupancy(slot) {
+    if (!slot || slot.presence_known === false) return "unknown";
+    const flag = typeof slot.present === "boolean" ? slot.present : slot.occupied;
+    if (typeof flag !== "boolean") return "unknown";
+    return flag ? "present" : "empty";
+  }
+
+  // A disk is in a row only when the inventory says one is present; unknown
+  // or empty occupancy is not a disk.
+  function slotHoldsDisk(slotNumber) {
+    return slotOccupancy(slotByNumber(slotNumber)) === "present";
+  }
+
+  // Inventory rows: bays when every row has a physical location (a bay is a
+  // bay whatever it holds), disks when every row holds a confirmed disk,
+  // otherwise entries.
+  function inventoryRowNoun(slots) {
+    if (aggregateDiskNoun(slots) === "bay") return "bays";
+    return slots.every(slotHoldsDisk) ? "disks" : "entries";
+  }
+
   function hostDiskSummary(fabric) {
     const slots = sortedSlots(list(fabric.traces).filter((trace) => trace.kind === "bay").flatMap((trace) => list(trace.slots)));
-    const noun = aggregateDiskNoun(slots);
-    return `${slots.length} ${noun}${slots.length === 1 ? "" : "s"}`;
+    const noun = inventoryRowNoun(slots);
+    const plural = slots.length === 1 ? "" : "s";
+    if (noun !== "entries") return `${slots.length} ${noun.slice(0, -1)}${plural}`;
+    const disks = slots.filter(slotHoldsDisk).length;
+    return `${slots.length} inventory ${slots.length === 1 ? "entry" : "entries"}, ${disks} confirmed disk${disks === 1 ? "" : "s"}`;
   }
 
   function renderPathButton(path, { compact = false } = {}) {
@@ -1839,7 +1866,9 @@
     return `${visible.map((node) => renderNodeButton(node, { extra: "compact" })).join("")}${overflow}`;
   }
 
-  function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
+  // `rowNoun` (bays, disks or entries) names the overflow of an inventory
+  // group; other callers keep the location-aware bay/disk noun.
+  function renderBayChips(slots, limit = 96, { modeTarget = "", rowNoun = null } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
       return '<span class="fabric-empty-note">No mapped disks</span>';
@@ -1858,7 +1887,10 @@
         </button>
       `;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} ${aggregateDiskNoun(sorted)}s</span>` : "";
+    const hidden = sorted.length - limit;
+    const hiddenNoun = !rowNoun ? `${aggregateDiskNoun(sorted)}s`
+      : hidden !== 1 ? rowNoun : rowNoun === "entries" ? "entry" : rowNoun.slice(0, -1);
+    const overflow = hidden > 0 ? `<span class="fabric-empty-note">+${hidden} ${hiddenNoun}</span>` : "";
     return `${chips}${overflow}`;
   }
 
@@ -1976,14 +2008,17 @@
 
   function renderInventoryBayGroup(copy, slots, notice) {
     // Same location-aware noun as the controller lanes: Bays only when every
-    // drawn member has an affirmative physical location.
-    const physical = aggregateDiskNoun(slots) === "bay";
+    // drawn member has an affirmative physical location. Unlocated rows are
+    // disks only when each holds a confirmed disk, otherwise entries.
+    const noun = inventoryRowNoun(slots);
+    const caveat = noun === "entries" ? " Not every entry is confirmed to hold a disk." : "";
+    const title = noun === "bays" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", noun === "disks" ? "Disks" : "Entries");
     return `
       <section class="fabric-dedicated-lane">
-        <div class="warning-item muted compact">${escapeHtml(notice(physical ? "bays" : "disks"))}</div>
+        <div class="warning-item muted compact">${escapeHtml(`${notice(noun)}${caveat}`)}</div>
         <div class="fabric-stage">
-          <span class="fabric-stage-title">${escapeHtml(physical ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
-          <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
+          <span class="fabric-stage-title">${escapeHtml(title)}</span>
+          <div class="fabric-bay-grid">${renderBayChips(slots, 120, { rowNoun: noun })}</div>
         </div>
       </section>
     `;

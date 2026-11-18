@@ -467,6 +467,10 @@ def _api_failure_message(method: str, category: str, errname: str | None, code: 
 
 
 def build_ddp_error(method: str, error: Any) -> TrueNASAPIError:
+    # A DDP error member is an object; any other value is an unusable reply,
+    # not a remote failure the appliance reported (#1313).
+    if not isinstance(error, dict):
+        return unusable_reply_error(method)
     busy = False
     code: int | None = None
     errname: str | None = None
@@ -722,21 +726,31 @@ def is_method_unavailable(exc: BaseException) -> bool:
     return isinstance(exc, TrueNASAPIError) and exc.errname == "ENOMETHOD"
 
 
-def ddp_reply_object(message: Any, method: str | None = None) -> dict[str, Any]:
-    """A decoded DDP message, which must be an object; anything else is unusable."""
+def unusable_reply_error(method: str | None = None) -> TrueNASAPIError:
+    """The fixed ``response_invalid`` failure for a reply this client cannot read."""
 
-    if isinstance(message, dict):
-        return message
-    raise TrueNASAPIError(
+    return TrueNASAPIError(
         f"{method} returned an unusable reply." if method else "The websocket returned an unusable reply.",
         category="response_invalid",
         method=method,
     )
 
 
+def ddp_reply_object(message: Any, method: str | None = None) -> dict[str, Any]:
+    """A decoded DDP message, which must be an object; anything else is unusable."""
+
+    if isinstance(message, dict):
+        return message
+    raise unusable_reply_error(method)
+
+
 def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
     """Map a JSON-RPC error object onto the app's typed API error."""
 
+    # JSON-RPC 2.0 requires the error member to be an object; any other value
+    # is an unusable reply, not a remote failure (#1313).
+    if not isinstance(error, dict):
+        return unusable_reply_error(method)
     code: int | None = None
     errname = reason = message_text = ""
     if isinstance(error, dict):
@@ -899,10 +913,16 @@ class _MiddlewareCallDispatcher:
                 pong["id"] = message["id"]
             await self.ws.send(json.dumps(pong))
             return
-        if message.get("msg") != "result":
-            return
         request_id = message.get("id")
         if not isinstance(request_id, str):
+            return
+        if message.get("msg") != "result":
+            # A reply that answers a pending call with any other message kind
+            # is unusable; settle the call now, as the single-call reader
+            # does, instead of leaving it pending (#1313).
+            pending = self._pending.get(request_id)
+            if pending is not None and not pending[1].done():
+                pending[1].set_exception(unusable_reply_error(pending[0]))
             return
         self._release_orphan(request_id)
         pending = self._pending.get(request_id)
@@ -911,7 +931,7 @@ class _MiddlewareCallDispatcher:
         method, future = pending
         if future.done():
             return
-        if message.get("error"):
+        if "error" in message:
             future.set_exception(build_ddp_error(method, message["error"]))
         else:
             future.set_result(message.get("result"))
