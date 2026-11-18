@@ -36,6 +36,19 @@ body.fabric-topology-mode .fabric-page-shell {
   font: inherit;
 }
 
+/* The search status: a line of its own under the label and input, one line
+   high whether empty or not, so a search never changes the header's height
+   and moves the page (#1374). A longer status ends in an ellipsis; its whole
+   text is the line's title and is read out in full. */
+#fabric-topology-search-status {
+  flex: 1 1 100%;
+  min-width: 0;
+  block-size: 1lh;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .fabric-topology {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -548,10 +561,18 @@ body.fabric-topology-mode .fabric-page-shell {
     flex-wrap: wrap;
   }
 
+  /* One flex line, as wide as the row: a column that may wrap sizes its
+     line to the widest item's text, so a long status line would widen the
+     page instead of ending in an ellipsis (#1374). */
   .fabric-topology-search-row {
     flex: 1 1 100%;
     flex-direction: column;
+    flex-wrap: nowrap;
     align-items: stretch;
+  }
+
+  .fabric-topology-search-row #fabric-topology-search-status {
+    flex: none;
   }
 
   .fabric-topology-search-row .fabric-topology-search {
