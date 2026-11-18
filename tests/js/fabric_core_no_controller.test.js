@@ -174,11 +174,19 @@ test("control: a whole read keeps its counts, including known zeroes, and stays 
   assert.match(textOf(loadCase("complete", "disk").map), /Controllers 1/);
 });
 
-test("control: a payload without read facts keeps its counts as before", () => {
+test("a CORE payload without read facts says its counts were not reported, not 0", () => {
   const { controller_read: _ignored, ...raw } = CASES.complete.fabric.raw;
   const page = loadPage({ ...CASES.complete.fabric, raw }, "lanes", CASES.complete.slots);
-  assert.equal(page.chip, "STORAGE OK");
-  assert.deepEqual(page.summary, { controllers: "1", paths: "0", expanders: "0", enclosures: "0" });
+  // Counts nobody vouched for do not leave the page OK, and the known bay stays drawn.
+  assert.equal(page.chip, "STORAGE PARTIAL");
+  assert.match(page.status, /Completeness of some controller data was not reported\./);
+  assert.match(page.map, /data-fabric-trace="bay:0"/);
+  assert.deepEqual(page.summary, {
+    controllers: "1, completeness not reported",
+    paths: "not reported",
+    expanders: "not reported",
+    enclosures: "not reported",
+  });
 });
 
 test("a count marked not read keeps the status partial even without a warning", () => {

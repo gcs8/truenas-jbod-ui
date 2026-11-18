@@ -1760,24 +1760,39 @@
 
   // A count is a measurement only when its read was whole. The producer says
   // which controller-side counts were not read (CORE `raw.controller_read`).
-  // Payloads without that field keep their counts as before.
+  // complete | partial | not_read, or unknown when a CORE payload does not
+  // say (same rule as the Topology status chips). Payloads outside the CORE
+  // controller-read contract never carry the field and keep their counts.
   function fabricCountState(fabric, domain) {
     const counts = fabric?.raw?.controller_read?.counts;
-    if (!counts || typeof counts !== "object") return "complete";
+    const core = fabric?.platform === "core" || fabric?.raw?.fabric_kind === "core_mpr";
+    if (!counts || typeof counts !== "object") return core ? "unknown" : "complete";
     const value = counts[domain];
+    if (value === undefined || value === null) return "unknown";
     return value === "complete" || value === "partial" ? value : "not_read";
   }
 
+  // A count the producer marks partial or not read: "not read" wording.
   function fabricCountsIncomplete(fabric) {
-    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) !== "complete")
+    return ["controllers", "paths", "expanders", "enclosures"].some((domain) => !["complete", "unknown"].includes(fabricCountState(fabric, domain)))
       || Number(fabric?.raw?.controller_read?.unread_phy_tables) > 0;
   }
 
-  // "3", "at least 3" (some reads missing) or "not read". Never a bare 0
-  // for a count whose read did not happen.
+  // Any count not reported complete, including one whose completeness was
+  // not reported. Keeps the page off OK and keeps unclaimed inventory bays
+  // drawn: a known bay never disappears because nobody vouched for a count.
+  function fabricCountsUnvouched(fabric) {
+    return fabricCountsIncomplete(fabric)
+      || ["controllers", "paths", "expanders", "enclosures"].some((domain) => fabricCountState(fabric, domain) === "unknown");
+  }
+
+  // "3", "at least 3" (some reads missing), "not read", or for a count whose
+  // completeness was not reported "3, completeness not reported" or "not
+  // reported". Never a bare number for a count nobody vouched for.
   function fabricCountText(fabric, domain, count) {
     const readState = fabricCountState(fabric, domain);
     if (readState === "complete") return String(count);
+    if (readState === "unknown") return count > 0 ? `${count}, completeness not reported` : "not reported";
     return readState === "partial" && count > 0 ? `at least ${count}` : "not read";
   }
 
@@ -1785,6 +1800,7 @@
     const readState = fabricCountState(fabric, domain);
     const plural = `${noun}s`;
     if (readState === "complete") return `${count} ${count === 1 ? noun : plural}`;
+    if (readState === "unknown") return count > 0 ? `${count} ${count === 1 ? noun : plural}, completeness not reported` : `${plural} not reported`;
     return readState === "partial" && count > 0 ? `at least ${count} ${count === 1 ? noun : plural}` : `${plural} not read`;
   }
 
@@ -1945,13 +1961,17 @@
     return renderInventoryBayGroup(copy, slots, (noun) => `Controller data could not be read. The ${noun} below come from the inventory.`);
   }
 
-  // On a partial CORE read, bays no controller lane claims are still drawn,
-  // without guessing which controller or path they hang off.
+  // On a CORE read not reported whole (partial, not read, or completeness
+  // not reported), bays no controller lane claims are still drawn, without
+  // guessing which controller or path they hang off.
   function renderUnattachedInventory(fabric, copy, claimedSlots) {
-    if (fabric.platform !== "core" || !fabricCountsIncomplete(fabric)) return "";
+    if (fabric.platform !== "core" || !fabricCountsUnvouched(fabric)) return "";
     const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
     if (!slots.length) return "";
-    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. Some controller data was not read, so these ${noun} come from the inventory.`);
+    const reason = fabricCountsIncomplete(fabric)
+      ? "Some controller data was not read"
+      : "Whether the controller data was read whole was not reported";
+    return renderInventoryBayGroup(copy, slots, (noun) => `Not attached to a read controller. ${reason}, so these ${noun} come from the inventory.`);
   }
 
   function renderInventoryBayGroup(copy, slots, notice) {
@@ -3836,6 +3856,73 @@
     elements.inspectorBody.innerHTML = "Select a controller, path, expander, enclosure, or bay trace.";
   }
 
+  // A name too long for the select ends in an ellipsis; the title keeps the
+  // full selected name readable on hover.
+  function syncSelectTitle(select) {
+    if (!select) {
+      return;
+    }
+    const selectedOption = select.options?.[select.selectedIndex];
+    select.title = (selectedOption?.textContent || "").trim();
+  }
+
+  // The header grid gives each select card the room its SELECTED label needs
+  // when the row has it and shares any shortfall (style.css). A select's own
+  // intrinsic width follows its longest option, so the room is measured from a
+  // hidden copy that holds only the selected label: the browser's own font,
+  // padding and arrow. A measurement is reused while the label is unchanged.
+  const selectCardRoomCache = new WeakMap();
+
+  function selectCardRoom(select) {
+    const card = select?.closest?.(".meta-card");
+    const label = (select?.options?.[select.selectedIndex]?.textContent || "").trim();
+    if (!card || !label) {
+      return null;
+    }
+    const cached = selectCardRoomCache.get(select);
+    if (cached && cached.label === label) {
+      return cached.room;
+    }
+    const probe = document.createElement("select");
+    probe.className = select.className;
+    probe.tabIndex = -1;
+    probe.setAttribute("aria-hidden", "true");
+    probe.style.cssText = "position: absolute; left: 0; top: 0; visibility: hidden; width: auto; min-width: 0; max-width: none;";
+    const option = document.createElement("option");
+    option.textContent = label;
+    probe.append(option);
+    card.append(probe);
+    const selectWidth = probe.getBoundingClientRect().width;
+    probe.remove();
+    if (!(selectWidth > 0)) {
+      return null;
+    }
+    const style = getComputedStyle(card);
+    const chrome = ["paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth"]
+      .reduce((sum, key) => sum + (Number.parseFloat(style[key]) || 0), 0);
+    const room = Math.ceil(selectWidth + chrome);
+    selectCardRoomCache.set(select, { label, room });
+    return room;
+  }
+
+  function syncHeaderSelectRoom() {
+    const row = elements.systemSelect?.closest?.(".topbar-meta");
+    if (!row) {
+      return;
+    }
+    [
+      [elements.systemSelect, "--fabric-system-card-room"],
+      [elements.enclosureSelect, "--fabric-enclosure-card-room"],
+    ].forEach(([select, property]) => {
+      const room = selectCardRoom(select);
+      if (room) {
+        row.style.setProperty(property, `${room}px`);
+      } else {
+        row.style.removeProperty(property);
+      }
+    });
+  }
+
   function renderSelectors() {
     const systems = list(state.snapshot.systems);
     const enclosures = list(state.snapshot.enclosures);
@@ -3846,6 +3933,7 @@
     setSelectOptionsIfChanged(elements.systemSelect, systemOptions);
     elements.systemSelect.value = state.selectedSystemId || "";
     elements.systemSelect.disabled = systems.length <= 1 || state.loading;
+    syncSelectTitle(elements.systemSelect);
 
     const enclosureOptions = enclosures.length
       ? enclosures.map((enclosure) => {
@@ -3856,6 +3944,8 @@
     setSelectOptionsIfChanged(elements.enclosureSelect, enclosureOptions);
     elements.enclosureSelect.value = state.selectedEnclosureId || "";
     elements.enclosureSelect.disabled = enclosures.length <= 1 || state.loading;
+    syncSelectTitle(elements.enclosureSelect);
+    syncHeaderSelectRoom();
   }
 
   function renderSummary() {
@@ -3965,9 +4055,11 @@
       .map(([name]) => String(name).toUpperCase());
     const actionableWarnings = (Array.isArray(fabric?.warnings) ? fabric.warnings : [])
       .filter((warning) => !isSasFabricEnrichmentWarning(warning));
-    // A count the producer marks as not read whole never leaves the page OK.
+    // A count the producer marks as not read whole, or does not say was read
+    // whole, never leaves the page OK.
     const unreadCounts = fabricCountsIncomplete(fabric);
-    if (failedSources.length || actionableWarnings.length || unreadCounts) {
+    const unvouchedCounts = fabricCountsUnvouched(fabric);
+    if (failedSources.length || actionableWarnings.length || unvouchedCounts) {
       const details = [];
       if (failedSources.length) {
         details.push(`Failed sources: ${failedSources.join(", ")}.`);
@@ -3976,6 +4068,8 @@
         details.push(String(actionableWarnings[0]));
       } else if (unreadCounts) {
         details.push("Some controller data was not read.");
+      } else if (unvouchedCounts) {
+        details.push("Completeness of some controller data was not reported.");
       }
       return {
         chipTone: "partial",
@@ -4470,6 +4564,8 @@
   });
 
   elements.systemSelect.addEventListener("change", () => {
+    syncSelectTitle(elements.systemSelect);
+    syncHeaderSelectRoom();
     state.smartRequests = {};
     state.smartSummaries = {};
     state.smartSummaryTimes = {};
@@ -4486,6 +4582,8 @@
   });
 
   elements.enclosureSelect.addEventListener("change", () => {
+    syncSelectTitle(elements.enclosureSelect);
+    syncHeaderSelectRoom();
     state.smartRequests = {};
     state.smartSummaries = {};
     state.smartSummaryTimes = {};

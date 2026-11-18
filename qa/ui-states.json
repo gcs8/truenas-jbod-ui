@@ -576,7 +576,8 @@
     }
   ],
   "ignored_controls": [
-    {"key": "textarea\"\"@app/static/app.js", "reason": "Off-screen clipboard helper created and removed inside the Copy handler; covered through [data-copy]."}
+    {"key": "textarea\"\"@app/static/app.js", "reason": "Off-screen clipboard helper created and removed inside the Copy handler; covered through [data-copy]."},
+    {"key": "select\"\"@app/static/sas_fabric_view.js", "reason": "Hidden, inert measuring copy of a Storage Fabric header select (aria-hidden, tabindex -1, visibility hidden), created and removed inside selectCardRoom to size the header grid; the real selects are covered as #fabric-system-select and #fabric-enclosure-select."}
   ],
   "runtime_controls": [],
   "render_gaps": [

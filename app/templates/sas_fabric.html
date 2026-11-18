@@ -89,13 +89,20 @@
     aria-live="polite"
   ></p>
 
-  {#- A count whose read did not happen says "not read", never 0 (same rule as fabricCountText). -#}
+  {#- A count whose read did not happen says "not read", never 0; a CORE count whose
+      completeness was not reported says "not reported" (same rule as fabricCountText). -#}
   {%- macro fabric_count(items, domain) -%}
-    {%- set fabric_read_counts = ((fabric.raw or {}).get("controller_read") or {}).get("counts") -%}
+    {%- set fabric_raw = fabric.raw or {} -%}
+    {%- set fabric_read_counts = (fabric_raw.get("controller_read") or {}).get("counts") -%}
+    {%- set fabric_core = fabric.platform == "core" or fabric_raw.get("fabric_kind") == "core_mpr" -%}
     {%- set count = items | length -%}
-    {%- if fabric_read_counts is not mapping -%}{{ count }}
-    {%- elif fabric_read_counts.get(domain) == "complete" -%}{{ count }}
-    {%- elif fabric_read_counts.get(domain) == "partial" and count > 0 -%}at least {{ count }}
+    {%- if fabric_read_counts is not mapping -%}{%- set read_state = "unknown" if fabric_core else "complete" -%}
+    {%- elif fabric_read_counts.get(domain) is none -%}{%- set read_state = "unknown" -%}
+    {%- else -%}{%- set read_state = fabric_read_counts.get(domain) -%}
+    {%- endif -%}
+    {%- if read_state == "complete" -%}{{ count }}
+    {%- elif read_state == "unknown" -%}{% if count > 0 %}{{ count }}, completeness not reported{% else %}not reported{% endif %}
+    {%- elif read_state == "partial" and count > 0 -%}at least {{ count }}
     {%- else -%}not read
     {%- endif -%}
   {%- endmacro %}
