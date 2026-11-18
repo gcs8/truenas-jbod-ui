@@ -2638,10 +2638,12 @@
   // observer follows the band in place and writes its whole height to the
   // topology root, where the items' scroll margin reads it. Until then, and
   // in a browser without ResizeObserver, the reserved height is the margin.
-  const bandWatch = { observer: null, band: null };
+  const bandWatch = { observer: null, band: null, measurer: null };
 
   function onBandResize(entries) {
     for (const entry of entries) {
+      // The empty measurer is 1em by 1lh (stylesheet): a new font resizes it, also when the band keeps its size.
+      if (entry?.target && entry.target === bandWatch.measurer) { holdBand(bandWatch.band); continue; }
       const height = Number(entry?.borderBoxSize?.[0]?.blockSize);
       const root = entry?.target?.closest?.(".fabric-topology");
       if (root?.style && Number.isFinite(height) && height > 0) root.style.setProperty("--topology-trace-height", `${Math.ceil(height)}px`);
@@ -2649,8 +2651,7 @@
       // the band's own height changing is not.
       if (entry?.target !== bandWatch.band) continue;
       const inline = Number(entry?.borderBoxSize?.[0]?.inlineSize);
-      if (Number.isFinite(inline) && inline > 0) hold.width = inline;
-      holdBand(entry.target);
+      holdBand(entry.target, Number.isFinite(inline) && inline > 0 ? inline : hold.width);
     }
   }
 
@@ -2671,32 +2672,34 @@
     return `${width}|${style?.font || ""}|${style?.lineHeight || ""}|${Number(window.devicePixelRatio) || 1}|${hold.gen}`;
   }
 
-  function holdBand(band) {
+  // width: the band's own from its observer, else read once (a new band's may differ).
+  function holdBand(band, width = 0) {
     const measurer = band?.querySelector?.("[data-topology-measure]");
     if (!measurer || !band.style || !live.trace) return;
-    if (hold.key !== live.trace.key) {
-      hold.key = live.trace.key;
-      hold.cache.clear();
+    if (hold.key !== live.trace.key) hold.cache.clear();
+    hold.key = live.trace.key;
+    if (!(width > 0)) {
+      // A new band first takes the page's height, so the read lays the page
+      // out as long as it was; a wrong one is replaced below, before mount.
+      if (hold.band !== band && hold.px !== null) putHold(band, hold.px);
+      width = Number(band.getBoundingClientRect?.()?.width) || 0;
     }
-    let px = hold.width > 0 ? hold.cache.get(holdKey(band, hold.width)) : undefined;
+    hold.width = width > 0 ? width : null;
+    if (!hold.width) return;
+    const key = holdKey(band, width);
+    let px = hold.cache.get(key);
     if (px === undefined) {
-      // One read of the band's width; a band with none (not shown) is
-      // measured when it gets one.
-      const width = Number(band.getBoundingClientRect?.()?.width) || 0;
-      hold.width = width > 0 ? width : null;
-      if (!hold.width) return;
-      const key = holdKey(band, width);
-      px = hold.cache.get(key);
-      if (px === undefined) {
-        px = measureBand(measurer, live.trace.sentences);
-        if (px === null) return;
-        hold.cache.set(key, px);
-        if (hold.cache.size > HOLD_WIDTHS) hold.cache.delete(hold.cache.keys().next().value);
-      }
+      px = measureBand(measurer, live.trace.sentences);
+      if (px === null) return;
+      hold.cache.set(key, px);
+      if (hold.cache.size > HOLD_WIDTHS) hold.cache.delete(hold.cache.keys().next().value);
     }
+    putHold(band, px);
+  }
+
+  function putHold(band, px) {
     if (hold.band === band && hold.px === px) return;
-    hold.band = band;
-    hold.px = px;
+    Object.assign(hold, { band, px });
     band.style.setProperty("--topology-trace-held", `${px}px`);
   }
 
@@ -2749,11 +2752,13 @@
     if (!bandWatch.observer) bandWatch.observer = new window.ResizeObserver(onBandResize);
     bandWatch.observer.observe(band, { box: "border-box" });
     bandWatch.band = band;
+    bandWatch.measurer = band.querySelector?.("[data-topology-measure]") || null;
+    if (bandWatch.measurer) bandWatch.observer.observe(bandWatch.measurer);
   }
 
   function unwatchBand() {
     bandWatch.observer?.disconnect();
-    bandWatch.band = null;
+    Object.assign(bandWatch, { band: null, measurer: null });
   }
 
   // Leaving the mode: no pin, hover or search carries over, and the view's

@@ -229,6 +229,16 @@ body.fabric-topology-mode .fabric-page-shell {
   contain: layout paint style;
 }
 
+/* Empty, which it is except during the measure, the measurer is one em
+   wide and one line high, so the band's observer sees a new font size or
+   line height (a browser's default font size, text zoom) even when the
+   band keeps its size. It stays inside the band, which is at least a line
+   high. While it holds sentences this rule does not apply. */
+.fabric-topology-trace-measure:empty {
+  inline-size: 1em;
+  block-size: 1lh;
+}
+
 .fabric-topology-scroll {
   max-width: 100%;
   max-height: 78vh;

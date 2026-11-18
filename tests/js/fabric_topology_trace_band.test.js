@@ -230,10 +230,22 @@ function fakePage(T0 = null, settings = {}) {
       T.mount(container);
       return html;
     },
-    // The band's observer reports a size.
+    // The band's observer reports the band's size (the empty measurer, one
+    // em by one line, keeps its own).
     resize(inline, block = 49) {
       for (const observer of observers) {
-        for (const { target } of observer.targets) observer.callback([{ target, borderBoxSize: [{ inlineSize: inline, blockSize: block }] }]);
+        for (const { target } of observer.targets) {
+          if (target !== current.measurer) observer.callback([{ target, borderBoxSize: [{ inlineSize: inline, blockSize: block }] }]);
+        }
+      }
+    },
+    // A new font size or line height: the browser reports the empty
+    // measurer's own new size, and only where it is observed.
+    textResized() {
+      for (const observer of observers) {
+        for (const { target } of observer.targets) {
+          if (target === current.measurer) observer.callback([{ target, borderBoxSize: [{ inlineSize: 17, blockSize: 21.25 }] }]);
+        }
       }
     },
     element: (ref) => ({
@@ -511,9 +523,9 @@ test("the band is measured once per drawing, width, font and resolution, and not
   });
   assert.equal(page.band.held(), first);
   step("a redraw at that width", 0, () => page.draw(fabric, { width: 1100 }));
-  step("a new font", 1, () => {
+  step("a new font, the band keeping its size", 1, () => {
     page.env.font = "18px sans-serif";
-    page.resize(340, 49);
+    page.textResized();
   });
   step("a redraw with that font", 0, () => page.draw(fabric, { width: 1100 }));
   step("a new line height, seen at a redraw", 1, () => {
@@ -804,4 +816,112 @@ test("a focused item keeps clear of the band at its measured height, with the re
   U.render(H.twoHbaCascade().fabric, { width: 1100 });
   U.mount(plain);
   assert.equal(bare.style.size, 0);
+});
+
+test("a redraw at a new band width holds that width's height before mount reads the box; a width already measured measures nothing", () => {
+  const page = fakePage();
+  const box = {
+    scrollLeft: 0,
+    scrollTop: 0,
+    clientHeight: 600,
+    querySelector: () => ({ setAttribute() {} }),
+    getBoundingClientRect: () => ({ left: 0, top: 0 }),
+  };
+  const seen = [];
+  Object.defineProperty(box, "clientWidth", { get() { seen.push(page.band.held()); return 1000; } });
+  page.container.box = box;
+  const fabric = H.twoHbaCascade().fabric;
+  page.draw(fabric, { width: 1100 });
+  const sentences = page.lastFill();
+  const exact = (width) => `${Math.ceil(Math.max(...sentences.map((text) => lineLayout(text, width))))}px`;
+  assert.notEqual(exact(170), exact(340), "the two widths need different heights");
+  assert.equal(page.band.held(), exact(340));
+  const redraw = (width, name) => {
+    // The redraw itself changes the band's width; no observer report has come for the new band.
+    page.env.width = width;
+    const before = page.counts.measures;
+    page.draw(fabric, { width: 1100 }, () => { seen.length = 0; });
+    assert.ok(seen.length > 0, `${name}: mount read the box`);
+    assert.equal(seen[0], exact(width), `${name}: mount's first box read sees the height for ${width} px`);
+    return page.counts.measures - before;
+  };
+  assert.equal(redraw(170, "narrower"), 1, "a new width is measured, before mount");
+  assert.equal(page.band.measurer.children.length, 0);
+  assert.equal(redraw(170, "the same width again"), 0, "the same width: nothing measured");
+  assert.equal(redraw(340, "back to the first width"), 0, "a width already measured: nothing measured");
+  page.env.width = 340;
+  const reads = page.counts.reads;
+  page.draw(fabric, { width: 1100 }, () => { page.log.length = 0; });
+  assert.equal(page.counts.reads - reads, 1, "one read of the band's width per redraw");
+  // The new band holds the page's height before that read, so the page is
+  // laid out as long as it was; the same width writes nothing more.
+  assert.deepEqual(page.log.filter((entry) => /^(hold |read )/.test(entry)), [`hold ${exact(340)}`, "read band.rect"]);
+});
+
+test("a new font size or line height is seen while the band keeps its size: the empty measurer is one em by one line and observed", () => {
+  const page = fakePage();
+  page.draw(adversarial(), { width: 1100 });
+  const texts = page.lastFill();
+  const held = Number.parseFloat(page.band.held());
+  const beforeIdle = lineLayout(page.pin.textContent, page.env.width);
+  // A larger default font size: every sentence is taller, but the idle
+  // sentence and the floor still fit the held height, so the band itself
+  // does not change size and no band size is reported.
+  page.env.font = "17px sans-serif";
+  page.env.lineHeight = "21.25px";
+  page.env.layout = (text, width) => lineLayout(text, width) * 17 / 16;
+  const newIdle = page.env.layout(page.pin.textContent, page.env.width);
+  assert.ok(beforeIdle < held && newIdle < held && 3 * 21.25 < held, "the band keeps its size");
+  const expected = `${Math.ceil(Math.max(...texts.map((text) => page.env.layout(text, page.env.width))))}px`;
+  assert.notEqual(expected, page.band.held());
+  const measures = page.counts.measures;
+  const rootBefore = new Map(page.rootStyle);
+  page.textResized();
+  assert.equal(page.counts.measures - measures, 1, "measured again for the new font");
+  assert.equal(page.band.held(), expected, "the held height is the new font's tallest sentence, before any hover");
+  assert.deepEqual(page.rootStyle, rootBefore, "the measurer's size is not the band's height");
+  assert.equal(page.band.measurer.children.length, 0);
+  page.textResized();
+  assert.equal(page.counts.measures - measures, 1, "the same font again: nothing measured");
+  // Hover, focus and a pin of the tallest sentence then change only the text.
+  const after = { ...page.counts };
+  const wide = { kind: "bay", id: "bay:8", key: "topoBay" };
+  page.handlers.get("click")({ target: page.element(wide) });
+  page.handlers.get("focusin")({ target: page.element(wide) });
+  page.handlers.get("mouseover")({ target: page.element(wide) });
+  assert.deepEqual({ ...page.counts }, after);
+  assert.equal(page.band.held(), expected);
+  // What makes the browser report it: the measurer, observed, is one em by
+  // one line whenever it is empty, which is always outside the measure.
+  assert.ok(page.observers.some((observer) => observer.targets.some((item) => item.target === page.band.measurer)), "the measurer is observed");
+  const css = fs.readFileSync(CSS_PATH, "utf8");
+  const empty = cssRule(css, ".fabric-topology-trace-measure:empty");
+  assert.match(empty, /inline-size:\s*1em;/, "one em wide while empty: follows the font size");
+  assert.match(empty, /block-size:\s*1lh;/, "one line high while empty: follows the line height");
+});
+
+test("the held height of a width kept for each of eight widths; a ninth puts out the oldest, which is measured again on its return", () => {
+  const page = fakePage();
+  const fabric = H.twoHbaCascade().fabric;
+  page.draw(fabric, { width: 1100 });
+  const at = (width) => {
+    page.env.width = width;
+    page.resize(width);
+    return page.counts.measures;
+  };
+  const heights = new Map([[340, page.band.held()]]);
+  for (let width = 341; width <= 348; width += 1) {
+    at(width);
+    heights.set(width, page.band.held());
+  }
+  assert.equal(page.counts.measures, 9, "nine widths, nine measures");
+  assert.equal(at(348), 9, "the newest width is kept");
+  assert.equal(at(342), 9, "a width in the middle is kept");
+  assert.equal(at(341), 9, "the second oldest is kept");
+  assert.equal(at(340), 10, "the oldest of nine widths was put out and is measured again");
+  assert.equal(page.band.held(), heights.get(340));
+  assert.equal(at(341), 11, "returning to 340 put out the next oldest, 341");
+  assert.equal(at(348), 11, "the newest is still kept");
+  assert.equal(page.band.held(), heights.get(348));
+  assert.equal(page.band.measurer.children.length, 0);
 });
