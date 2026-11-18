@@ -201,12 +201,13 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
     return details
 
 
-def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[Any]:
+def _collect_storcli_physical_drive_rows(response_data: dict[str, Any], *, with_entries: bool = False) -> list[Any]:
     # Every entry, objects or not: the parser skips the others, and the census
     # check refuses a reply that has any (#1218).
     rows = response_data.get("Drive Information") or response_data.get("PD LIST") or []
-    if isinstance(rows, list) and rows:
-        return list(rows)
+    table = list(rows) if isinstance(rows, list) and rows else []
+    if table and not with_entries:
+        return table
 
     fallback_rows: list[Any] = []
     for key, value in response_data.items():
@@ -216,7 +217,21 @@ def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[
             fallback_rows.extend(value)
         elif isinstance(value, dict):
             fallback_rows.append(value)
-    return fallback_rows
+    if not table:
+        return fallback_rows
+    # With a table, the drive parser also reads a drive that only a
+    # `Drive /cN/eM/sK` entry reports (#1305); the table row wins for a drive
+    # both name. The census check reads the table alone and refuses the reply.
+    table_rows = [row for row in table if isinstance(row, dict)]
+    listed = {_parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2] for row in table_rows}
+    entry_rows: list[Any] = []
+    for row in fallback_rows:
+        if not isinstance(row, dict):
+            continue
+        slot_key = _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))[2]
+        if slot_key is not None and slot_key not in listed:
+            entry_rows.append(row)
+    return table + entry_rows
 
 
 def _parse_storcli_physical_drive_response(
@@ -225,7 +240,7 @@ def _parse_storcli_physical_drive_response(
     controller_id: str,
     controller_index: int,
 ) -> list[dict[str, Any]]:
-    rows = _collect_storcli_physical_drive_rows(response_data)
+    rows = _collect_storcli_physical_drive_rows(response_data, with_entries=True)
     details_by_slot = _collect_storcli_drive_details(response_data)
     drives: list[dict[str, Any]] = []
     for row in rows:
@@ -351,7 +366,9 @@ def storcli_physical_drive_list_complete(output: str) -> bool:
     with no drive record, a record without its enclosure and slot, or a
     `Drive /cN/eM/sK` entry for a drive the records do not list proves no
     absence. The check runs one way only (the records may list drives no such
-    entry names), and nothing compares the records with the controller's own
+    entry names). With a table, the records are the table's rows: a drive only
+    a `Drive /cN/eM/sK` entry reports is still parsed (#1305), but the reply is
+    not a census. Nothing compares the records with the controller's own
     drive count or enclosure list: a well-formed reply that leaves drives out
     is taken as the census, as before #1218.
     """

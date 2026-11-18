@@ -188,7 +188,9 @@ class StorcliWorkIsStillMeteredTests(unittest.TestCase):
     """The bounded-work meters and the regex sweep still reach the moved code."""
 
     # (call through a name kept on parsers, result, regex calls, regex work,
-    # Python lines), as measured before the StorCLI readers moved to parsers_storcli.
+    # Python lines), as measured before the StorCLI readers moved to parsers_storcli,
+    # then remeasured when the drive parser also read per-drive entries beside a
+    # table (#1305).
     @staticmethod
     def _cases() -> tuple:
         from app.services import parsers
@@ -196,9 +198,9 @@ class StorcliWorkIsStillMeteredTests(unittest.TestCase):
         physical = _response({"PD LIST": [{"EID:Slt": "252:1"}], "Drive /c0/e252/s1": {"SN": "a"}})
         virtual = _response({"VD LIST": [{"DG/VD": "0/1"}], "PDs for VD 1": [{"EID:Slt": "252:3"}], "/c0/v1": {}})
         return (
-            ("parse_storcli_physical_drives", lambda: len(parsers.parse_storcli_physical_drives(physical)), 1, 4, 628, 459),
+            ("parse_storcli_physical_drives", lambda: len(parsers.parse_storcli_physical_drives(physical)), 1, 7, 967, 505),
             ("storcli_physical_drive_list_complete",
-             lambda: parsers.storcli_physical_drive_list_complete(physical), True, 2, 290, 92),
+             lambda: parsers.storcli_physical_drive_list_complete(physical), True, 2, 290, 93),
             ("parse_storcli_virtual_drives", lambda: len(parsers.parse_storcli_virtual_drives(virtual)), 1, 13, 882, 214),
             ("_coerce_int_like", lambda: parsers._coerce_int_like("12 C"), 12, 1, 16, 10),
         )
