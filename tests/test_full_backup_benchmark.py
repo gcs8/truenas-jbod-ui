@@ -597,5 +597,85 @@ raise SystemExit(b.main())
                 self.b.operation("verify", request)
 
 
+class BenchmarkSourceProvenanceTests(unittest.TestCase):
+    """The report fingerprints every module that defines the benchmarked export."""
+
+    MODULES = (
+        "history_service/system_backup.py",
+        "history_service/backup_7z.py",
+        "history_service/backup_json.py",
+        "history_service/backup_archive/stream_envelope.py",
+    )
+
+    def setUp(self):
+        from scripts import benchmark_full_backup
+        self.b = benchmark_full_backup
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tree = Path(tmp.name) / "tree"
+        for name in self.MODULES:
+            target = self.tree / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / name, target)
+        self.scratch = Path(tmp.name) / "scratch"
+        self.scratch.mkdir(mode=0o700)
+
+    def report_provenance(self) -> dict:
+        # Synthetic copy of the source tree; no phase runs and no git read.
+        with patch.object(self.b, "ROOT", self.tree), patch.object(self.b, "PHASES", ()), \
+                patch.object(self.b.subprocess, "check_output", return_value="0" * 40 + "\n"):
+            report = self.b.benchmark(self.scratch, self.b.MIB, seed=1, timeout=5)
+        self.assertEqual(report["phases"], [])
+        return {key: value for key, value in report.items() if key.startswith("source_")}
+
+    def flip_one_byte(self, name: str) -> None:
+        path = self.tree / name
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 0x01
+        path.write_bytes(bytes(data))
+
+    def test_one_byte_change_in_backup_7z_changes_the_report_fingerprint(self):
+        before = self.report_provenance()
+        self.flip_one_byte("history_service/backup_7z.py")
+        after = self.report_provenance()
+        self.assertNotEqual(before, after, "a backup_7z.py change left every report source digest unchanged")
+        # The original field keeps its meaning: system_backup.py only.
+        self.assertEqual(before["source_file_sha256"], after["source_file_sha256"])
+        changed = {k for k in after["source_files_sha256"] if before["source_files_sha256"][k] != after["source_files_sha256"][k]}
+        self.assertEqual(changed, {"history_service/backup_7z.py"})
+
+    def test_every_module_change_is_visible_and_old_field_is_unchanged_in_meaning(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                before = self.report_provenance()
+                self.assertEqual(set(before["source_files_sha256"]), set(self.MODULES))
+                self.assertEqual(before["source_file_sha256"],
+                                 before["source_files_sha256"]["history_service/system_backup.py"])
+                self.flip_one_byte(name)
+                after = self.report_provenance()
+                changed = {k for k in after["source_files_sha256"]
+                           if before["source_files_sha256"][k] != after["source_files_sha256"][k]}
+                self.assertEqual(changed, {name})
+                self.assertEqual(before["source_file_sha256"] != after["source_file_sha256"],
+                                 name == "history_service/system_backup.py")
+
+    def test_fingerprinted_modules_cover_backup_modules_imported_by_system_backup(self):
+        import ast
+        tree = ast.parse((ROOT / "history_service/system_backup.py").read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("history_service"):
+                for alias in node.names:
+                    for dotted in (f"{node.module}.{alias.name}", node.module):
+                        path = Path(*dotted.split("."))
+                        if path.name.startswith("backup") or path.parent.name.startswith("backup"):
+                            if (ROOT / path.with_suffix(".py")).is_file():
+                                imported.add(path.with_suffix(".py").as_posix())
+                                break
+        self.assertTrue(imported)
+        self.assertLessEqual(imported, set(self.b.SOURCE_MODULES))
+        self.assertEqual(set(self.b.SOURCE_MODULES), set(self.MODULES))
+
+
 if __name__ == "__main__":
     unittest.main()
