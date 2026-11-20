@@ -1499,6 +1499,22 @@ class FragmentContentTests(unittest.TestCase):
         self.assertIn("control or formatting character (\\x1b)", problem)
         self.assertIn("write plain text on ordinary lines", problem)
 
+    def test_invisible_character_refusal_names_its_own_remedy(self) -> None:
+        # Each of these is invisible in an editor, so the refusal must say what
+        # to remove rather than fall back to the general advice.
+        cases = (
+            ("\u200b", "\\u200b", "remove the zero-width space"),
+            ("\u061c", "\\u061c", "remove the direction mark"),
+            ("\ufeff", "\\ufeff", "remove the byte order mark or zero-width no-break space"),
+        )
+        for character, escaped, remedy in cases:
+            with self.subTest(character=escaped):
+                problem = self._problem(f"Fixed a{character}thing.\n")
+                self.assertIsNotNone(problem)
+                self.assertIn(f"control or formatting character ({escaped})", problem)
+                self.assertIn(remedy, problem)
+                self.assertNotIn("write plain text on ordinary lines", problem)
+
     def test_unreleased_bullets_pass_the_content_rules_except_raw_html(self) -> None:
         # The bullets already under Unreleased, without their (#N) suffix, are
         # ordinary entries: only the raw-HTML rule, which is newer than some
