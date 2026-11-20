@@ -2395,7 +2395,7 @@
       sasFabricCountPhrase(fabric, "paths", sasFabricList(fabric.paths).length, "path"),
       sasFabricCountPhrase(fabric, "expanders", sasFabricList(fabric.expanders).length, "expander"),
       sasFabricCountPhrase(fabric, "enclosures", sasFabricList(fabric.enclosures).length, "enclosure"),
-      `${sasFabricList(fabric.traces).length} traces`,
+      `${sasFabricList(fabric.traces).length} ${sasFabricList(fabric.traces).length === 1 ? "trace" : "traces"}`,
     ].join(" / ");
   }
 
@@ -2489,7 +2489,7 @@
       metrics.temperature ? `temp ${metrics.temperature}` : null,
       metrics.firmware ? `fw ${metrics.firmware}` : null,
       metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
-      fallback.count ? `${fallback.count} bays` : null,
+      fallback.count ? `${fallback.count} ${Number(fallback.count) === 1 ? "bay" : "bays"}` : null,
     ].filter(Boolean);
     return parts.join(" / ");
   }
@@ -2817,7 +2817,7 @@
         ${kvRow("Status", node.status || "n/a")}
         ${kvRow("Reported ID", node.raw_id || "n/a", Boolean(node.raw_id))}
         ${kvRow("Slots", formatSasFabricSlots(node.related_slots, 999))}
-        ${sasFabricMetricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
+        ${sasFabricMetricRows(node.metrics, { present: "Present", health: "Health", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev", pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
         ${kvRow("Source", formatSasFabricValue(node.evidence))}
       </div>
       ${node.kind === "controller" && node.raw?.iocfacts ? `
