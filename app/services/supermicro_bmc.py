@@ -35,9 +35,15 @@ SUPER_MICRO_LOGIN_PATH = "/cgi/login.cgi"
 REDFISH_ERROR_BODY_LIMIT = 64 * 1024
 # #737: bound web-XML discovery. One inventory pass makes four fixed requests
 # plus three per controller, so the controller cap is also its request budget
-# (52 requests at the cap).
-BMC_MAX_CONTROLLERS = 16
-BMC_MAX_DRIVES_PER_CONTROLLER = 256
+# (196 requests at the cap). #1309: both counts only stop a runaway reply and
+# sit far above real hardware: 64 controllers is more than one host has PCIe
+# slots for, and 4,096 drives per controller is four full SAS expanders of
+# 1,024 disks each. A reply over either is refused with a warning that names
+# the count and the limit.
+BMC_MAX_CONTROLLERS = 64
+BMC_MAX_DRIVES_PER_CONTROLLER = 4096
+# A reported count is shown in a warning; past this it is shown as a bound.
+BMC_SHOWN_COUNT_LIMIT = 1_000_000
 DRIVE_LINK_SPEEDS = {
     1: "1.5 Gbps",
     2: "3.0 Gbps",
@@ -131,6 +137,14 @@ def _int_from_decimal(value: Any) -> int | None:
         return int(text, 10)
     except ValueError:
         return None
+
+
+def _shown_count(count: int) -> str:
+    """A BMC-reported count as warning text, never longer than the bound."""
+
+    if count > BMC_SHOWN_COUNT_LIMIT:
+        return f"more than {BMC_SHOWN_COUNT_LIMIT:,}"
+    return f"{count:,}"
 
 
 def _log_bmc_failure(operation: str, exc: BaseException) -> None:
@@ -361,8 +375,8 @@ class SupermicroBMCService:
         # controller), so an implausible value is refused before any of them.
         if not 0 < controller_count <= BMC_MAX_CONTROLLERS:
             raise LocalServiceError(
-                f"Supermicro BMC reported an unsupported Broadcom controller count "
-                f"(supported: 1 to {BMC_MAX_CONTROLLERS}).",
+                f"Supermicro BMC reported {_shown_count(controller_count)} Broadcom controllers "
+                f"(supported: 1 to {BMC_MAX_CONTROLLERS:,}); the BMC web inventory was not read.",
                 category="response_invalid",
             )
 
@@ -412,8 +426,9 @@ class SupermicroBMCService:
             drive_nodes = hdd_info.findall("HDD")
             if len(drive_nodes) > BMC_MAX_DRIVES_PER_CONTROLLER:
                 raise LocalServiceError(
-                    f"Supermicro BMC reported more physical drives on controller {controller_id} "
-                    f"than the supported {BMC_MAX_DRIVES_PER_CONTROLLER}.",
+                    f"Supermicro BMC reported {len(drive_nodes):,} physical drives on controller {controller_id}, "
+                    f"more than the supported {BMC_MAX_DRIVES_PER_CONTROLLER:,}; "
+                    f"drives on that and any later controller were not read.",
                     category="response_invalid",
                 )
             for physical_index, drive_node in enumerate(drive_nodes):
