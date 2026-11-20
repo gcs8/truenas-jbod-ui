@@ -79,11 +79,11 @@ for (const completeness of UNREPORTED) {
     const { sasFabricCountSummary } = loadMainHelpers();
     assert.equal(
       sasFabricCountSummary(fabricWith("complete", completeness)),
-      "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 traces",
+      "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 trace",
     );
     assert.equal(
       sasFabricCountSummary(fabricWith("healthy_lists", completeness)),
-      "1 source, completeness not reported / paths not reported / 1 expander, completeness not reported / 1 enclosure, completeness not reported / 1 traces",
+      "1 source, completeness not reported / paths not reported / 1 expander, completeness not reported / 1 enclosure, completeness not reported / 1 trace",
     );
   });
 }
@@ -94,16 +94,16 @@ test("main summary: a CORE payload identified only by its fabric kind follows th
   assert.equal(fabric.platform, undefined);
   assert.equal(
     sasFabricCountSummary(fabric),
-    "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 traces",
+    "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 trace",
   );
 });
 
 test("main summary: reported counts keep their text (complete zero stays 0, partial and not read unchanged)", () => {
   const { sasFabricCountSummary } = loadMainHelpers();
-  assert.equal(sasFabricCountSummary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 traces");
-  assert.equal(sasFabricCountSummary(CASES.healthy_lists.fabric), "1 source / 0 paths / 1 expander / 1 enclosure / 1 traces");
-  assert.equal(sasFabricCountSummary(CASES.no_controller_bays.fabric), "sources not read / paths not read / expanders not read / enclosures not read / 1 traces");
-  assert.equal(sasFabricCountSummary(CASES.unreadable_second_unit.fabric), "at least 1 source / 0 paths / expanders not read / enclosures not read / 1 traces");
+  assert.equal(sasFabricCountSummary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 trace");
+  assert.equal(sasFabricCountSummary(CASES.healthy_lists.fabric), "1 source / 0 paths / 1 expander / 1 enclosure / 1 trace");
+  assert.equal(sasFabricCountSummary(CASES.no_controller_bays.fabric), "sources not read / paths not read / expanders not read / enclosures not read / 1 trace");
+  assert.equal(sasFabricCountSummary(CASES.unreadable_second_unit.fabric), "at least 1 source / 0 paths / expanders not read / enclosures not read / 1 trace");
 });
 
 test("main summary: payloads outside the CORE contract keep their plain counts", () => {
@@ -113,7 +113,7 @@ test("main summary: payloads outside the CORE contract keep their plain counts",
     if (platform === undefined) delete fabric.platform;
     else fabric.platform = platform;
     fabric.raw.fabric_kind = kind;
-    assert.equal(sasFabricCountSummary(fabric), "1 source / 0 paths / 1 expander / 1 enclosure / 1 traces", `${platform} ${kind}`);
+    assert.equal(sasFabricCountSummary(fabric), "1 source / 0 paths / 1 expander / 1 enclosure / 1 trace", `${platform} ${kind}`);
   }
 });
 
@@ -197,15 +197,15 @@ renderSasFabric();`, sandbox);
 }
 
 test("main page render: the visible summary of a CORE payload without reported completeness says not reported", () => {
-  const unreported = "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 traces";
+  const unreported = "1 source, completeness not reported / paths not reported / expanders not reported / enclosures not reported / 1 trace";
   assert.equal(renderMainSummary(fabricWith("complete", "absent")), unreported);
   assert.equal(renderMainSummary(fabricWith("complete", "absent", { kindOnly: true })), unreported);
   assert.equal(
     renderMainSummary(fabricWith("healthy_lists", "counts-absent")),
-    "1 source, completeness not reported / paths not reported / 1 expander, completeness not reported / 1 enclosure, completeness not reported / 1 traces",
+    "1 source, completeness not reported / paths not reported / 1 expander, completeness not reported / 1 enclosure, completeness not reported / 1 trace",
   );
   // Control: counts reported complete stay plain numbers, zero included.
-  assert.equal(renderMainSummary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 traces");
+  assert.equal(renderMainSummary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 trace");
 });
 
 test("the main page reads counts through a textual twin of the Storage Fabric page reader", () => {
@@ -214,4 +214,33 @@ test("the main page reads counts through a textual twin of the Storage Fabric pa
     functionSource(APP_SOURCE, "sasFabricCountPhrase").replace("function sasFabricCountPhrase(", "function fabricCountPhrase("),
     functionSource(FABRIC_SOURCE, "fabricCountPhrase"),
   );
+});
+
+// A single trace or bay takes the singular noun; other counts keep the
+// plural, and the not-read and partial wording of the other domains stays.
+function loadMainWording() {
+  const sandbox = vm.createContext({});
+  vm.runInContext(`${["sasFabricList", "fabricCountState", "sasFabricCountPhrase", "sasFabricCountSummary", "sasFabricNodeMeta"].map((name) => functionSource(APP_SOURCE, name)).join("\n")}
+this.helpers = { sasFabricCountSummary, sasFabricNodeMeta };`, sandbox);
+  return sandbox.helpers;
+}
+
+test("main summary: one trace reads 1 trace; zero and two keep the plural", () => {
+  const { sasFabricCountSummary } = loadMainWording();
+  const withTraces = (count) => ({ ...clone(CASES.complete.fabric), traces: Array.from({ length: count }, (_, index) => ({ id: `bay:${index}` })) });
+  assert.equal(sasFabricCountSummary(withTraces(1)), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 trace");
+  assert.equal(sasFabricCountSummary(withTraces(2)), "1 source / 0 paths / 0 expanders / 0 enclosures / 2 traces");
+  assert.equal(sasFabricCountSummary(withTraces(0)), "1 source / 0 paths / 0 expanders / 0 enclosures / 0 traces");
+  assert.equal(
+    sasFabricCountSummary({ controllers: [], paths: [], expanders: [], enclosures: [], traces: [{ id: "bay:0" }] }),
+    "0 sources / 0 paths / 0 expanders / 0 enclosures / 1 trace",
+  );
+});
+
+test("main node meta: one bay reads 1 bay; two keep the plural; no count adds nothing", () => {
+  const { sasFabricNodeMeta } = loadMainWording();
+  assert.equal(sasFabricNodeMeta({}, { count: 1 }), "1 bay");
+  assert.equal(sasFabricNodeMeta({}, { count: 2 }), "2 bays");
+  assert.equal(sasFabricNodeMeta({}, { count: 24, pcie_slot: "Slot 3" }), "Slot 3 / 24 bays");
+  assert.equal(sasFabricNodeMeta({}, {}), "");
 });

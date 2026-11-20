@@ -2525,10 +2525,12 @@
       return Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
     };
     const slack = slackOf();
+    // No slack: nothing to give back, so the box's own height is not read.
+    if (!slack) return Math.max(0, settled);
     // A box at a limit that is not a whole pixel gives back the fraction less than the slack (its
     // clientHeight is rounded up), and below the limit it is whole: give back the rest in this redraw.
     const tall = Number(typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect()?.height : NaN);
-    if (!slack || !Number.isFinite(tall) || tall === Math.round(tall)) return Math.max(0, settled - slack);
+    if (!Number.isFinite(tall) || tall === Math.round(tall)) return Math.max(0, settled - slack);
     sizeRoom(box, left, top, settled - slack);
     return Math.max(0, (Number(box.clientHeight) || 0) - slackOf());
   }
