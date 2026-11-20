@@ -234,6 +234,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_read_ui_auth",
         "test_release_wrap_evidence_rows",
         "test_release_wrap_validator",
+        "test_restore_refusal_cleanup",
         "test_sas_fabric",
         "test_scheduled_backup",
         "test_segment_migration",

@@ -105,6 +105,7 @@ from history_service.startup import HistorySchemaVersionError
 from history_service.store import (
     SQLITE_CONNECT_TIMEOUT_SECONDS,
     HistoryStore,
+    require_bounded_restored_timestamps,
     require_restorable_schema_version,
 )
 
@@ -1205,6 +1206,19 @@ class _ImportActivationTransaction:
                 "candidate": record_restore_tree(staged_segments_path),
             },
         }
+        # Rollback retires the unconsumed staged copies by an authenticated
+        # rename before deleting them, as it does journaled configuration
+        # (#1273): an interrupted delete leaves either the intact staged copy
+        # under its recorded name or a retired remainder, never a part-deleted
+        # tree under the name the journal records.
+        self._recorded_artifacts[staged_hot_path] = (
+            journal_payload["hot"]["candidate"],
+            "file",
+        )
+        self._recorded_artifacts[staged_segments_path] = (
+            journal_payload["segments"]["candidate"],
+            "directory",
+        )
         self._prepared_segmented_restore = _PreparedSegmentedRestore(
             store=store,
             hot_member_key=hot_member_key,
@@ -1667,13 +1681,7 @@ class _ImportActivationTransaction:
                 )
         if target_kind == "file":
             backup_dir = self.rollback_root / f"history-{len(self._journal_order):04d}"
-            backup_path = store.create_backup(
-                backup_dir,
-                retention_count=1,
-                long_term_backup_dir=None,
-                weekly_retention_count=0,
-                monthly_retention_count=0,
-            )
+            backup_path = store._create_rollback_snapshot(backup_dir)
             if backup_path is None:
                 raise ValueError("Unable to create rollback snapshot for the live history database.")
             backup_path = Path(backup_path)
@@ -1780,7 +1788,7 @@ class _ImportActivationTransaction:
             if failures:
                 raise RuntimeError(self._failure_summary(failures))
         else:
-            entry.history_store.restore_backup(entry.backup_path)
+            entry.history_store._restore_rollback_snapshot(entry.backup_path)
             self._fsync_file(entry.target_path)
             self._fsync_directory(entry.target_path.parent)
         entry.mutated = False
@@ -4412,6 +4420,8 @@ class SystemBackupService:
                         raise ValueError(
                             f"History database table {table_name} is missing required columns."
                         )
+                if rows == [("ok",)]:
+                    require_bounded_restored_timestamps(connection)
             if rows != [("ok",)]:
                 raise ValueError("History database integrity check failed.")
 

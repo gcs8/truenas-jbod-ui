@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import logging
 import os
 import secrets
@@ -12,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+from collections import Counter
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -202,6 +204,87 @@ def require_restorable_schema_version(found_version: int) -> None:
         "Nothing was restored and the current history was not changed. Restore it "
         "with the release that wrote it, or restore a backup taken with this release."
     )
+
+
+# Restore admission bound for timestamp text (#1292). A timestamp this service
+# writes is 32 characters, at most 64 bytes in a UTF-16 database; the bound is
+# per field and limits runaway text, not how many rows or devices a restored
+# database holds.
+MAX_RESTORED_TIMESTAMP_BYTES = 256
+RESTORED_TIMESTAMP_COLUMNS = (
+    ("slot_state_current", "last_seen_at"),
+    ("slot_events", "observed_at"),
+    ("metric_samples", "observed_at"),
+    ("metric_rollups", "bucket_start"),
+    ("metric_rollups", "last_observed_at"),
+    ("history_maintenance_state", "backup_at"),
+)
+
+
+def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
+    """Refuse a database with a timestamp field longer than the restore bound.
+
+    Nothing is truncated or dropped: one oversized field refuses the whole
+    database with a reason the operator can act on. A table or column an
+    older supported schema lacks is skipped.
+    """
+    for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
+        present = connection.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            (table_name, column_name),
+        ).fetchone()
+        if present is None:
+            continue
+        oversized = connection.execute(
+            f'SELECT 1 FROM "{table_name}" '
+            f'WHERE length(CAST("{column_name}" AS BLOB)) > ? LIMIT 1',
+            (MAX_RESTORED_TIMESTAMP_BYTES,),
+        ).fetchone()
+        if oversized is not None:
+            raise ValueError(
+                f"The history database in this backup has a {table_name}.{column_name} "
+                f"timestamp longer than {MAX_RESTORED_TIMESTAMP_BYTES} bytes. Nothing was "
+                "restored and the current history was not changed."
+            )
+
+
+def count_oversized_restored_timestamps(
+    connection: sqlite3.Connection,
+) -> Counter[tuple[str, str, str]]:
+    """Count over-long timestamp fields by (table, column, sha256 of the stored value)."""
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
+        present = connection.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            (table_name, column_name),
+        ).fetchone()
+        if present is None:
+            continue
+        for (value,) in connection.execute(
+            f'SELECT CAST("{column_name}" AS BLOB) FROM "{table_name}" '
+            f'WHERE length(CAST("{column_name}" AS BLOB)) > ?',
+            (MAX_RESTORED_TIMESTAMP_BYTES,),
+        ):
+            counts[(table_name, column_name, hashlib.sha256(value).hexdigest())] += 1
+    return counts
+
+
+def require_restored_timestamps_within(
+    connection: sqlite3.Connection, allowance: Counter[tuple[str, str, str]]
+) -> None:
+    """Refuse over-long timestamp fields beyond those a rollback snapshot held.
+
+    Each over-long field must match one the snapshot held, by table, column
+    and content, and no value may appear more often than it did there.
+    """
+    beyond = count_oversized_restored_timestamps(connection) - allowance
+    if beyond:
+        table_name, column_name, _ = min(beyond)
+        raise ValueError(
+            f"The rollback copy has a {table_name}.{column_name} timestamp longer than "
+            f"{MAX_RESTORED_TIMESTAMP_BYTES} bytes that the snapshot did not hold when "
+            "it was taken. Nothing was restored and the current history was not changed."
+        )
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -693,6 +776,12 @@ class HistoryStore:
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         # Exact per-system hot counts, kept current without full rescans (#664).
         self._hot_summary_counts = HotSystemSummaryCounts()
+        # Rollback snapshots this store wrote for an import, by path: the file
+        # identity (a one-use tripwire) and the over-long timestamp fields the
+        # snapshot held, the only ones its restore may bring back (#1292).
+        self._rollback_snapshots: dict[
+            Path, tuple[tuple[int, int, int, int], Counter[tuple[str, str, str]]]
+        ] = {}
         # Deferred index builds and exact-count scans do not overlap (#1092).
         self._index_maintenance_condition = threading.Condition()
         self._index_maintenance_depth = 0
@@ -2452,6 +2541,33 @@ class HistoryStore:
         weekly_retention_count: int = 0,
         monthly_retention_count: int = 0,
     ) -> Path | None:
+        final_path, _ = self._write_backup(
+            backup_dir,
+            snapshot_label=snapshot_label,
+            retention_count=retention_count,
+            long_term_backup_dir=long_term_backup_dir,
+            weekly_retention_count=weekly_retention_count,
+            monthly_retention_count=monthly_retention_count,
+            count_oversized_timestamps=False,
+        )
+        return final_path
+
+    def _write_backup(
+        self,
+        backup_dir: str | Path,
+        *,
+        snapshot_label: str | None,
+        retention_count: int,
+        long_term_backup_dir: str | Path | None,
+        weekly_retention_count: int,
+        monthly_retention_count: int,
+        count_oversized_timestamps: bool,
+    ) -> tuple[Path, Counter[tuple[str, str, str]] | None]:
+        """Copy, publish and rotate one backup.
+
+        With ``count_oversized_timestamps`` the over-long timestamp fields are
+        counted on the private copy before it is published (#1292).
+        """
         self._require_unsegmented_operation("v1 backup")
         backup_root = Path(backup_dir)
         self._ensure_backup_directory(backup_root)
@@ -2480,6 +2596,11 @@ class HistoryStore:
                 backup_connection.execute("PRAGMA journal_mode=MEMORY")
                 source_connection.backup(backup_connection)
                 backup_connection.commit()
+                oversized_timestamps = (
+                    count_oversized_restored_timestamps(backup_connection)
+                    if count_oversized_timestamps
+                    else None
+                )
             with history_write_lock(self.file_path, blocking=True):
                 with self._lock:
                     if source_identity is None or self._database_file_identity() != source_identity:
@@ -2510,7 +2631,7 @@ class HistoryStore:
                 os.close(temp_fd)
             self._discard_owned_path(temp_path, temp_metadata)
 
-        return final_path
+        return final_path, oversized_timestamps
 
     def _database_file_identity(self) -> tuple[int, int] | None:
         try:
@@ -2591,7 +2712,71 @@ class HistoryStore:
         latest = max(snapshots, key=lambda candidate: candidate.stat().st_mtime)
         return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
 
-    def _restore_backup_locked(self, source_path: str | Path) -> None:
+    @staticmethod
+    def _snapshot_identity(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+    def _create_rollback_snapshot(self, backup_dir: str | Path) -> Path | None:
+        """Write an import rollback snapshot and remember exactly that file.
+
+        The over-long timestamp fields are counted on the store's private copy
+        before it is published, never by reopening the published path.
+        """
+        snapshot, allowance = self._write_backup(
+            backup_dir,
+            snapshot_label=None,
+            retention_count=1,
+            long_term_backup_dir=None,
+            weekly_retention_count=0,
+            monthly_retention_count=0,
+            count_oversized_timestamps=True,
+        )
+        if allowance is None:
+            raise ValueError("The rollback snapshot was not counted.")
+        identity = self._snapshot_identity(snapshot)
+        if identity is None:
+            raise ValueError("The rollback snapshot is not a regular file.")
+        with self._lock:
+            self._rollback_snapshots = {
+                path: known
+                for path, known in self._rollback_snapshots.items()
+                if self._snapshot_identity(path) == known[0]
+            }
+            self._rollback_snapshots[snapshot] = (identity, allowance)
+        return snapshot
+
+    def _restore_rollback_snapshot(self, snapshot_path: str | Path) -> None:
+        """Restore a snapshot from ``_create_rollback_snapshot``, once.
+
+        The live history can already hold timestamp text that earlier versions
+        admitted. This restore may bring back exactly the over-long timestamp
+        fields the snapshot held when it was written, checked on the private
+        restore copy; any other over-long field refuses it (#1292).
+        """
+        snapshot = Path(snapshot_path)
+        with self._lock:
+            known = self._rollback_snapshots.pop(snapshot, None)
+        if known is None or self._snapshot_identity(snapshot) != known[0]:
+            raise ValueError(f"{snapshot} is not a rollback snapshot this history store wrote.")
+        self._require_unsegmented_operation("v1 restore")
+        try:
+            with history_write_lock(self.file_path, blocking=False):
+                self._restore_backup_locked(snapshot, rollback_allowance=known[1])
+        finally:
+            self._hot_summary_counts.clear()
+
+    def _restore_backup_locked(
+        self,
+        source_path: str | Path,
+        *,
+        rollback_allowance: Counter[tuple[str, str, str]] | None = None,
+    ) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
@@ -2619,6 +2804,15 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    # Incoming backups get the bound. Only
+                    # _restore_rollback_snapshot passes an allowance: the
+                    # over-long fields its snapshot held, no others (#1292).
+                    if rollback_allowance is None:
+                        require_bounded_restored_timestamps(restore_connection)
+                    else:
+                        require_restored_timestamps_within(
+                            restore_connection, rollback_allowance
+                        )
                     # The backup's counters are outside input that sizes
                     # index builds; replace them with real counts (#1093).
                     self._recount_restored_table_counts(restore_connection)
