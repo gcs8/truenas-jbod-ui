@@ -1307,7 +1307,9 @@ function scrollingPanel(item, { inner = 1100, height: limit = 600, page = null }
     // The box's part of the document: what sits above it in the panel, the
     // box itself and its two 1 px borders.
     if (page) page.panelHeight = () => top + client() + 2;
+    // Every read of the box's place on the page is counted on the panel.
     const rect = () => {
+      item.boxReads += 1;
       const y = page ? page.above + top - page.scrollY : top;
       return { left: 20, top: y, right: 20 + inner, bottom: y + client(), width: inner, height: client() };
     };
@@ -1326,6 +1328,7 @@ function scrollingPanel(item, { inner = 1100, height: limit = 600, page = null }
   };
   item.clientWidth = inner + 2;
   item.box = null;
+  item.boxReads = 0;
   Object.defineProperty(item, "innerHTML", {
     get: () => html,
     set(value) {
@@ -2715,4 +2718,76 @@ test("after a collapse with a fractional box height and page position the room a
     }
   }
   assert.deepEqual(unsettled, [], "settled after the first pin, nothing moved, the box never grew");
+});
+
+// ---- geometry reads per redraw ---------------------------------------------------
+
+// A redraw that keeps the view reads the box's place on the page only to tell
+// whether the box's height is a whole pixel, which matters only when the page
+// has slack to give back; it reads the page's length a second time only for a
+// fractional height. Each redraw's reads are counted, so the budget cannot
+// grow unnoticed: the box's rectangle, the page's length (both its scroll
+// height and its client height count), and the sizings of the room.
+function redrawReads(view, act) {
+  const boxReads = view.panel.boxReads;
+  const pageReads = view.page.reads;
+  const sizings = [];
+  const mount = view.T.mount;
+  view.T.mount = (...args) => {
+    let heights = 0;
+    const svg = view.panel.box.svg;
+    const set = svg.setAttribute;
+    svg.setAttribute = (name, value) => {
+      if (name === "height") heights += 1;
+      set(name, value);
+    };
+    mount(...args);
+    sizings.push(heights);
+  };
+  act();
+  view.T.mount = mount;
+  return { boxReads: view.panel.boxReads - boxReads, pageReads: view.page.reads - pageReads, sizings };
+}
+
+test("a redraw reads the box's rectangle only when the page has slack to give back, and the page's length a second time only for a fractional height", () => {
+  const counts = {};
+  const pins = (name, view, n) => {
+    const reads = [];
+    for (let pin = 1; pin <= n; pin += 1) {
+      // Slack: what the page can lose below its scroll position before the pin.
+      const slack = view.page.scrollY > 0 && Math.floor(view.page.range() - view.page.scrollY) > 0;
+      reads.push({ slack, ...redrawReads(view, () => pinLink(view)) });
+    }
+    counts[name] = reads;
+  };
+  const fractional = (base) => ({ ...base, limit: cssLimit(base.viewport) });
+  // The shelf drawn in full and scrolled well inside it, the page at its top: nothing to keep.
+  const full = measuredPage(bigShelf(), MEASURED_WINDOWS[4]);
+  full.click({ "data-fabric-expand-slots": expandControls(full.panel)[0].key });
+  full.panel.box.scrollTop = 400;
+  pins("inside the drawing", full, 1);
+  // After a collapse from the top start: the view lies below the drawing's top.
+  pins("view below the drawing's top", collapsedFrom(MEASURED_WINDOWS[4], "top"), 1);
+  // After a collapse from the bottom start the first pin gives back the
+  // page's slack; later pins find none and read no rectangle.
+  pins("whole-pixel box", collapsedFrom(MEASURED_WINDOWS[4], "bottom"), 3);
+  // A fractional box at its limit with slack: the second read of the page's length.
+  pins("fractional box with slack", collapsedFrom(fractional(MEASURED_WINDOWS[7]), "bottom"), 3);
+  // A fractional box whose page has no slack from the first pin on.
+  pins("fractional box without slack", collapsedFrom(fractional(MEASURED_WINDOWS[6]), "bottom"), 2);
+  // The page put at its bottom before the pins: no slack.
+  const held = collapsedFrom(fractional(MEASURED_WINDOWS[4]), "bottom");
+  held.page.scrollTo(0, held.page.range());
+  pins("page at its bottom", held, 2);
+  const once = { boxReads: 0, pageReads: 0, sizings: [1] };
+  const kept = { boxReads: 0, pageReads: 0, sizings: [2] };
+  const none = { slack: false, boxReads: 0, pageReads: 2, sizings: [2] };
+  assert.deepEqual(counts, {
+    "inside the drawing": [{ slack: false, ...once }],
+    "view below the drawing's top": [{ slack: true, ...kept }],
+    "whole-pixel box": [{ slack: true, boxReads: 1, pageReads: 2, sizings: [2] }, none, none],
+    "fractional box with slack": [{ slack: true, boxReads: 1, pageReads: 4, sizings: [3] }, none, none],
+    "fractional box without slack": [none, none],
+    "page at its bottom": [none, none],
+  });
 });
