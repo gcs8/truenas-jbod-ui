@@ -9949,8 +9949,11 @@ class InventoryService(InventorySourceCollectionMixin):
                     last_smart_test_type=None,
                     last_smart_test_status=None,
                     last_smart_test_lifetime_hours=None,
-                    logical_block_size=self._extract_quantastor_int(disk, "logicalBlockSize", "sectorSize", "logSectorSize"),
-                    physical_block_size=self._extract_quantastor_int(disk, "physicalBlockSize", "phySectorSize"),
+                    # A negative block size is not a reading (#1299).
+                    logical_block_size=self._extract_quantastor_unsigned(
+                        disk, "logicalBlockSize", "sectorSize", "logSectorSize")[0],
+                    physical_block_size=self._extract_quantastor_unsigned(
+                        disk, "physicalBlockSize", "phySectorSize")[0],
                     enclosure_id=disk_enclosure_id or selected_system_id,
                     slot=slot,
                     smart_devices=smart_devices,
@@ -11668,12 +11671,36 @@ class InventoryService(InventorySourceCollectionMixin):
             or self._extract_quantastor_temperature(raw_disk.get("driveTemp"))
             or slot_view.temperature_c
         )
+        # Every measurement below cannot be negative. A negative report, also
+        # one between -1 and 0, is refused before conversion and named not
+        # read, never published as a size, count or zero (#1299).
+        refused: set[str] = set()
+
+        def unsigned(field_name: str, *keys: str, as_bytes: bool = False) -> int | None:
+            value, was_refused = self._extract_quantastor_unsigned(raw_disk, *keys, as_bytes=as_bytes)
+            if was_refused:
+                refused.add(field_name)
+            return value
+
         power_on_hours = self._extract_quantastor_int(raw_disk, "powerOnHours", "powerOnTimeHours", "powerOnTime")
-        bytes_read = self._extract_quantastor_bytes(raw_disk, "bytesRead", "dataReadBytes", "logicalBytesRead")
-        bytes_written = self._extract_quantastor_bytes(raw_disk, "bytesWritten", "dataWrittenBytes", "logicalBytesWritten")
-        rotation_rate = self._extract_quantastor_int(raw_disk, "rotationRate", "rotationRateRpm", "rpm")
-        if rotation_rate is None and raw_disk.get("isSsd") is True:
+        bytes_read = unsigned("bytes_read", "bytesRead", "dataReadBytes", "logicalBytesRead", as_bytes=True)
+        bytes_written = unsigned(
+            "bytes_written", "bytesWritten", "dataWrittenBytes", "logicalBytesWritten", as_bytes=True)
+        rotation_rate = unsigned("rotation_rate_rpm", "rotationRate", "rotationRateRpm", "rpm")
+        if rotation_rate is None and "rotation_rate_rpm" not in refused and raw_disk.get("isSsd") is True:
             rotation_rate = 0
+        # The slot's block sizes are a reading from the bay; only a
+        # non-negative one may stand in for the disk's own.
+        slot_logical_block_size = (
+            slot_view.logical_block_size
+            if isinstance(slot_view.logical_block_size, int) and slot_view.logical_block_size >= 0
+            else None
+        )
+        slot_physical_block_size = (
+            slot_view.physical_block_size
+            if isinstance(slot_view.physical_block_size, int) and slot_view.physical_block_size >= 0
+            else None
+        )
         form_factor = normalize_text(raw_disk.get("formFactor") or raw_disk.get("diskFormFactor"))
         smart_health_status = normalize_text(raw_disk.get("smartHealthTest"))
         if smart_health_status and smart_health_status.startswith("[") and smart_health_status.endswith("]"):
@@ -11690,12 +11717,12 @@ class InventoryService(InventorySourceCollectionMixin):
             power_on_hours=power_on_hours,
             power_on_days=(power_on_hours // 24) if isinstance(power_on_hours, int) else None,
             logical_block_size=(
-                self._extract_quantastor_int(raw_disk, "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize")
-                or slot_view.logical_block_size
+                unsigned("logical_block_size", "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize")
+                or slot_logical_block_size
             ),
             physical_block_size=(
-                self._extract_quantastor_int(raw_disk, "physicalBlockSize", "phySectorSize", "blockSize")
-                or slot_view.physical_block_size
+                unsigned("physical_block_size", "physicalBlockSize", "phySectorSize", "blockSize")
+                or slot_physical_block_size
             ),
             bytes_read=bytes_read,
             bytes_written=bytes_written,
@@ -11709,12 +11736,12 @@ class InventoryService(InventorySourceCollectionMixin):
                 if isinstance(bytes_written, int) and isinstance(power_on_hours, int) and power_on_hours > 0
                 else None
             ),
-            endurance_remaining_percent=self._extract_quantastor_int(raw_disk, "ssdLifeLeft", "lifeLeftPercent"),
-            media_errors=self._extract_quantastor_int(raw_disk, "mediumErrors", "mediaErrors", "readErrors", "writeErrors"),
-            predictive_errors=self._extract_quantastor_int(raw_disk, "predictiveErrors", "errCountPredictive"),
-            non_medium_errors=self._extract_quantastor_int(raw_disk, "errCountNonMedium", "nonMediumErrors"),
-            uncorrected_read_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedRead"),
-            uncorrected_write_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedWrite"),
+            endurance_remaining_percent=unsigned("endurance_remaining_percent", "ssdLifeLeft", "lifeLeftPercent"),
+            media_errors=unsigned("media_errors", "mediumErrors", "mediaErrors", "readErrors", "writeErrors"),
+            predictive_errors=unsigned("predictive_errors", "predictiveErrors", "errCountPredictive"),
+            non_medium_errors=unsigned("non_medium_errors", "errCountNonMedium", "nonMediumErrors"),
+            uncorrected_read_errors=unsigned("uncorrected_read_errors", "errCountUncorrectedRead"),
+            uncorrected_write_errors=unsigned("uncorrected_write_errors", "errCountUncorrectedWrite"),
             rotation_rate_rpm=rotation_rate,
             form_factor=form_factor,
             firmware_version=normalize_text(raw_disk.get("firmwareVersion") or raw_disk.get("revisionLevel")),
@@ -11736,7 +11763,9 @@ class InventoryService(InventorySourceCollectionMixin):
                 else "SMART data comes from QuantaStor."
             ),
         )
+        summary.unread_fields = sorted({*summary.unread_fields, *refused})
         self._refuse_negative_power_on(summary)
+        self._prune_unread_smart_fields(summary)
         if not any(
             value is not None
             for value in (
@@ -11753,7 +11782,13 @@ class InventoryService(InventorySourceCollectionMixin):
             fallback = self._fallback_smart_summary(
                 slot_view,
                 "QuantaStor reports this disk but no SMART counters."
-                + (" Its power-on time was reported but not read." if summary.unread_fields else ""),
+                + (
+                    " Its power-on time was reported but not read."
+                    if any(name in POWER_ON_FIELDS for name in summary.unread_fields)
+                    else " Some reported values were not read."
+                    if summary.unread_fields
+                    else ""
+                ),
             )
             fallback.unread_fields = summary.unread_fields
             return fallback
@@ -13057,6 +13092,44 @@ class InventoryService(InventorySourceCollectionMixin):
                     if match:
                         return int(match.group(0).replace(",", ""))
         return None
+
+    @staticmethod
+    def _quantastor_signed_negative(value: Any) -> bool:
+        """Whether a reported value is below zero, read before any truncation."""
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value < 0
+        if isinstance(value, str):
+            match = re.search(r"-?(?:\d[\d,]*(?:\.\d*)?|\.\d+)", value)
+            if match:
+                try:
+                    return float(match.group(0).replace(",", "")) < 0
+                except ValueError:
+                    return False
+        return False
+
+    @classmethod
+    def _extract_quantastor_unsigned(
+        cls, payload: dict[str, Any], *keys: str, as_bytes: bool = False,
+    ) -> tuple[int | None, bool]:
+        """(value, refused) for a measurement that cannot be negative (#1299).
+
+        The first alias that yields a value decides, as in the plain extractors.
+        A negative value, including one between -1 and 0, is refused: no value,
+        and refused=True so the caller can name the field as not read.
+        """
+        extract = cls._extract_quantastor_bytes if as_bytes else cls._extract_quantastor_int
+        for key in keys:
+            value = extract(payload, key)
+            if value is None:
+                if cls._quantastor_signed_negative(payload.get(key)):
+                    return None, True
+                continue
+            if value < 0 or cls._quantastor_signed_negative(payload.get(key)):
+                return None, True
+            return value, False
+        return None, False
 
     @staticmethod
     def _extract_quantastor_temperature(value: Any) -> int | None:
