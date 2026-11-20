@@ -211,6 +211,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_backup_keeper_comment_wording",
             "tests.test_backup_list_assurance",
             "tests.test_backup_retention_keeper_budget",
+            "tests.test_backup_uncertain_upload_provider",
             "tests.test_background_refresh_busy_routes",
             "tests.test_background_refresh_deadlines",
             "tests.test_browser_write_origin_policy",
