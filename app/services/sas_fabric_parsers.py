@@ -395,14 +395,30 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     return expanders
 
 
+# The enclosure handle is printed "%04d": a 16-bit handle from 10000 up takes
+# five decimal digits (#1416).
 _MPR_EXPANDER_HEADER = re.compile(
-    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9]{5}|[0-9a-fA-F]{4})\s+(\d+)\s*$"
 )
 # mprutil prints a zero parent or enclosure handle as four blanks in its fixed
 # columns ("%04x       %s     %s       %d"), so those headers are read by position.
 _MPR_EXPANDER_HEADER_BLANK_HANDLES = re.compile(
-    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4}) {7}([0-9a-fA-F]{4}| {4}) {5}([0-9a-fA-F]{4}| {4}) {7}(\d+)\s*$"
+    r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4}) {7}([0-9a-fA-F]{4}| {4}) {5}([0-9]{5}|[0-9a-fA-F]{4}| {4}) {7}(\d+)\s*$"
 )
+# Any line that starts like an expander header: a PHY count, then a SAS address.
+_MPR_EXPANDER_HEADER_SHAPE = re.compile(r"\s*[0-9]+\s+[0-9a-fA-F]{16}(?:\s|$)")
+
+
+def rejected_mpr_expander_headers(text: str) -> int:
+    """Lines shaped like an expander header that neither header form admits.
+
+    Each is an expander whose header was not read, so the list is not whole.
+    """
+    return sum(
+        1
+        for line in text.splitlines()
+        if _MPR_EXPANDER_HEADER_SHAPE.match(line) and not _match_mpr_expander_header(line)
+    )
 
 
 def _mpr_expander_enclosure_handle(printed: str) -> str | None:
@@ -415,7 +431,8 @@ def _mpr_expander_enclosure_handle(printed: str) -> str | None:
     names no enclosure; it is not guessed to be hexadecimal.
     """
     text = printed.strip()
-    if not _MPR_EXPANDER_DECIMAL_HANDLE.fullmatch(text):
+    if not _MPR_EXPANDER_DECIMAL_HANDLE.fullmatch(text) or int(text, 10) > 0xFFFF:
+        # Past 16 bits the field is no handle and names no enclosure.
         return None
     return f"{int(text, 10):04x}"
 

@@ -40,6 +40,7 @@ from app.services.sas_fabric_parsers import (
     MAX_CORE_MPR_SUMMARY_UNITS,
     mpr_summary_units_over_limit,
     rejected_mpr_summary_rows,
+    rejected_mpr_expander_headers,
     rejected_mpr_summary_unit_tokens,
     parse_dmidecode_slots,
     parse_mpr_adapter_detail,
@@ -1936,6 +1937,10 @@ def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, A
     if rejected_device_rows:
         # A device row that was not understood: the rows kept are not the whole list.
         payload["lists"]["devices"] = "unreadable"
+    if rejected_mpr_expander_headers(replies["expanders"] or ""):
+        # An expander header that was not admitted: the expanders kept are
+        # not the whole list (#1416).
+        payload["lists"]["expanders"] = "unreadable"
     return payload
 
 

@@ -118,6 +118,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_config_example",
     "tests.test_core_adapter_summary_admission",
     "tests.test_core_counter_markers",
+    "tests.test_core_expander_handle_width",
     "tests.test_core_fabric_legacy_controller",
     "tests.test_core_numeric_coordinates",
     "tests.test_core_reply_completeness",
