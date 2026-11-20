@@ -3877,7 +3877,7 @@
           ${kvRow("Status", node.status || "n/a")}
           ${kvRow("Raw ID", node.raw_id || "n/a")}
           ${kvRow("Slots", formatSlots(node.related_slots, 999))}
-          ${metricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts", phy_error_counters: "PHY error counters" })}
+          ${metricRows(node.metrics, { present: "Present", health: "Health", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev", pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts", phy_error_counters: "PHY error counters" })}
           ${kvRow("Sources", node.evidence)}
         </div>
         <section class="fabric-inspector-section">

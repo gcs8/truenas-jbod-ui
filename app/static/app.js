@@ -2817,7 +2817,7 @@
         ${kvRow("Status", node.status || "n/a")}
         ${kvRow("Reported ID", node.raw_id || "n/a", Boolean(node.raw_id))}
         ${kvRow("Slots", formatSasFabricSlots(node.related_slots, 999))}
-        ${sasFabricMetricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
+        ${sasFabricMetricRows(node.metrics, { present: "Present", health: "Health", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev", pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
         ${kvRow("Source", formatSasFabricValue(node.evidence))}
       </div>
       ${node.kind === "controller" && node.raw?.iocfacts ? `

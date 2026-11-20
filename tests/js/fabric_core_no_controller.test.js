@@ -406,3 +406,68 @@ test("Storage Fabric page node meta: one related bay or disk takes the singular 
   assert.equal(nodeMeta(bay([0, 1], false)), "2 disks");
   assert.equal(nodeMeta({ kind: "controller", metrics: {} }), "n/a");
 });
+
+// Both inspectors label the bay facts the way they label the rows around
+// them; the values (unknown, no, yes) are left as they are.
+const BAY_METRICS = { present: "unknown", pool_name: "tank", vdev_name: "mirror-0", device_name: "da0", health: "Unknown" };
+
+function inspectorLabels(html) {
+  return [...html.matchAll(/<span>([^<]*)<\/span>\s*<strong>([^<]*)<\/strong>/g)].map(([, label, value]) => `${label}: ${value}`);
+}
+
+test("main page node inspector labels presence and health like its other rows", () => {
+  const sandbox = vm.createContext({
+    kvRow: (label, value) => `<span>${label}</span><strong>${value}</strong>`,
+    formatSasFabricValue: (value) => (typeof value === "boolean" ? (value ? "yes" : "no") : String(value)),
+    sasFabricDisplayLabel: (node) => node.label,
+    formatSasFabricKind: (kind) => kind,
+    formatSasFabricSlots: (slots) => slots.join(", "),
+  });
+  vm.runInContext(`${["sasFabricList", "sasFabricMetricRows", "renderSasFabricNodeInspector"].map(appFunctionSource).join("\n")}\nthis.inspect = renderSasFabricNodeInspector;`, sandbox);
+  for (const [present, health] of [["unknown", "Unknown"], [false, "FAULTED"], [true, "ONLINE"]]) {
+    const node = { id: "bay:0", kind: "bay", label: "Bay 1", status: "healthy", related_slots: [0], metrics: { ...BAY_METRICS, present, health }, evidence: "inventory" };
+    const rows = inspectorLabels(sandbox.inspect(node));
+    const presentValue = present === "unknown" ? "unknown" : present ? "yes" : "no";
+    assert.ok(rows.includes(`Present: ${presentValue}`), rows.join(" | "));
+    assert.ok(rows.includes(`Health: ${health}`), rows.join(" | "));
+    assert.ok(rows.includes("Pool: tank") && rows.includes("Vdev: mirror-0") && rows.includes("Device: da0"), rows.join(" | "));
+    assert.ok(!rows.some((row) => /^(present|health|pool name|vdev name|device name):/.test(row)), rows.join(" | "));
+  }
+});
+
+test("Storage Fabric page node inspector labels presence and health like its other rows", () => {
+  const elements = new Map();
+  const fabric = JSON.parse(JSON.stringify(FIXTURE));
+  const bayNode = fabric.nodes.find((node) => node.id === "bay:0");
+  const sandbox = vm.createContext({
+    URLSearchParams,
+    window: { location: { search: "" }, SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "", dataset: {}, className: "", closest: () => null });
+        return elements.get(id);
+      },
+      querySelectorAll: () => [],
+    },
+  });
+  const end = FABRIC_SOURCE.indexOf("  elements.modeButtons.forEach((button) => {", FABRIC_SOURCE.indexOf("  function render()"));
+  assert.ok(end > 0);
+  vm.runInContext(`${FABRIC_SOURCE.slice(0, end)}
+    window.renderTest = { renderInspector, state };
+  })();`, sandbox);
+  const api = sandbox.window.renderTest;
+  api.state.fabric = fabric;
+  api.state.mode = "lanes";
+  for (const [present, health] of [["unknown", "Unknown"], [false, "FAULTED"], [true, "ONLINE"]]) {
+    bayNode.metrics = { ...BAY_METRICS, present, health };
+    api.state.selectedTraceId = null;
+    api.state.selectedNodeId = "bay:0";
+    api.renderInspector(fabric);
+    const rows = inspectorLabels(elements.get("fabric-inspector-body").innerHTML);
+    assert.ok(rows.includes("Status: " + (bayNode.status || "n/a")), rows.join(" | "));
+    assert.ok(rows.some((row) => row.startsWith("Present: ")), rows.join(" | "));
+    assert.ok(rows.includes(`Health: ${health}`), rows.join(" | "));
+    assert.ok(rows.includes("Pool: tank") && rows.includes("Vdev: mirror-0") && rows.includes("Device: da0"), rows.join(" | "));
+    assert.ok(!rows.some((row) => /^(present|health|pool name|vdev name|device name):/.test(row)), rows.join(" | "));
+  }
+});
