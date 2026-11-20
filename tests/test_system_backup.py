@@ -7678,17 +7678,31 @@ sys.stdout.flush()
         expected_counts = self.store.counts()
         transaction = _ImportActivationTransaction({"history": imported_source.read_bytes()})
 
-        with patch.object(self.store, "create_backup", wraps=self.store.create_backup) as snapshot:
+        # The rollback snapshot is written by the store's private snapshot
+        # writer, which counts its over-long timestamps before publication.
+        with patch.object(
+            self.store,
+            "_create_rollback_snapshot",
+            wraps=self.store._create_rollback_snapshot,
+        ) as snapshot:
             with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
-                with self.assertRaisesRegex(RuntimeError, "late failure"):
-                    with transaction:
-                        transaction.activate_history(self.store, "history")
-                        Path(f"{self.history_db_path}-wal").write_bytes(b"stale-wal")
-                        Path(f"{self.history_db_path}-shm").write_bytes(b"stale-shm")
-                        raise RuntimeError("late failure")
+                with patch.object(
+                    self.store,
+                    "_restore_rollback_snapshot",
+                    wraps=self.store._restore_rollback_snapshot,
+                ) as rollback_restore:
+                    with self.assertRaisesRegex(RuntimeError, "late failure"):
+                        with transaction:
+                            transaction.activate_history(self.store, "history")
+                            Path(f"{self.history_db_path}-wal").write_bytes(b"stale-wal")
+                            Path(f"{self.history_db_path}-shm").write_bytes(b"stale-shm")
+                            raise RuntimeError("late failure")
 
         self.assertEqual(snapshot.call_count, 1)
-        self.assertEqual(restore.call_count, 2)
+        # The incoming member goes through the public restore; the rollback
+        # restores the store's own snapshot through the private path (#1292).
+        self.assertEqual(restore.call_count, 1)
+        self.assertEqual(rollback_restore.call_count, 1)
         self.assertEqual(self.store.counts(), expected_counts)
         self.assertFalse(Path(f"{self.history_db_path}-wal").exists())
         self.assertFalse(Path(f"{self.history_db_path}-shm").exists())
