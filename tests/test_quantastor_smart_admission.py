@@ -1,4 +1,4 @@
-"""QuantaStor SMART admission: unsigned readings.
+"""QuantaStor SMART admission: unsigned readings and node-local SMART paths.
 
 Synthetic fixtures only; no appliance payload or SMART command is used.
 
@@ -9,6 +9,10 @@ Celsius temperatures stay valid.
 
 #1300: a negative power-on time between -1 and 0 (number or text) is refused
 before conversion to whole hours, so it never becomes a measured zero.
+
+#1318: a pool-device row from a peer node can be admitted for the selected
+node's disk through a stable shared identity, but its node-local device path
+never becomes a SMART candidate on the selected node.
 """
 
 from __future__ import annotations
@@ -205,6 +209,70 @@ class QuantastorFractionalNegativeLifetimeTests(unittest.TestCase):
         summary = _summary(_service(), {"powerOnHours": "-0.5"})
         self.assertIsNone(summary.power_on_hours)
         self.assertEqual(summary.unread_fields, ["power_on_days", "power_on_hours"])
+
+
+class QuantastorPeerSmartPathTests(unittest.TestCase):
+    """#1318."""
+
+    def test_peer_row_admitted_by_stable_identity_adds_no_smart_path(self) -> None:
+        service = _service()
+        own_row = {**PEER_ROW, "id": "member-own", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                   "physicalDiskObj": {"id": "disk-a", "devicePath": "/dev/sda", "storageSystemId": "node-a"}}
+        for rows in ([PEER_ROW], [PEER_ROW, own_row], [own_row, PEER_ROW]):
+            with self.subTest(rows=[row["id"] for row in rows]):
+                record = service._build_quantastor_disk_records(
+                    _raw(disks=[DISK_A], pools=[POOL], pool_devices=rows), "node-a",
+                )[0]
+                # The peer row is still admitted for placement.
+                self.assertEqual(record.slot, 0)
+                self.assertIn("quantastor_pool_device", record.raw)
+                self.assertEqual(record.smart_devices, ["sda"])
+
+    def test_peer_row_in_either_disk_order_adds_no_smart_path(self) -> None:
+        service = _service()
+        disk_b = {**DISK_A, "id": "disk-b", "storageSystemId": "node-b", "devicePath": "/dev/sda",
+                  "serialNumber": "SANITIZED-QS-B", "slot": 1}
+        for order in (1, -1):
+            with self.subTest(order=order):
+                records = service._build_quantastor_disk_records(
+                    _raw(disks=[DISK_A, disk_b][::order], pools=[POOL], pool_devices=[PEER_ROW]), "node-a",
+                )
+                self.assertEqual([(record.serial, record.smart_devices) for record in records],
+                                 [("SANITIZED-QS-A", ["sda"])])
+
+    def test_peer_hardware_row_adds_no_smart_path(self) -> None:
+        # The same rule for the hardware-disk row admitted by serial.
+        service = _service()
+        disk = {key: value for key, value in DISK_A.items() if key != "devicePath"}
+        disk["name"] = "disk-a"
+        peer_hw = {"id": "hw-peer", "serialNum": "SANITIZED-QS-A", "storageSystemId": "node-b",
+                   "enclosureId": "shelf-a", "slot": 0, "devicePath": "/dev/sdq"}
+        record = service._build_quantastor_disk_records(
+            _raw(disks=[disk], hw_disks=[peer_hw]), "node-a",
+        )[0]
+        self.assertNotIn("sdq", record.smart_devices)
+        self.assertNotIn("/dev/sdq", record.smart_devices)
+
+    def test_own_node_rows_still_contribute_their_paths(self) -> None:
+        service = _service()
+        disk = {key: value for key, value in DISK_A.items() if key != "devicePath"}
+        own_row = {**PEER_ROW, "storageSystemId": "node-a", "devicePath": "/dev/disk/by-id/scsi-SANITIZED",
+                   "physicalDiskObj": {"devicePath": "/dev/sdc"}}
+        own_hw = {"id": "hw-own", "serialNum": "SANITIZED-QS-A", "storageSystemId": "node-a",
+                  "enclosureId": "shelf-a", "slot": 0, "devicePath": "/dev/sdd"}
+        record = service._build_quantastor_disk_records(
+            _raw(disks=[disk], pools=[POOL], pool_devices=[own_row], hw_disks=[own_hw]), "node-a",
+        )[0]
+        self.assertEqual(record.smart_devices, ["disk/by-id/scsi-SANITIZED", "sdd", "sdc"])
+
+    def test_single_node_rows_without_an_owner_still_contribute_their_paths(self) -> None:
+        service = _service()
+        disk = {key: value for key, value in DISK_A.items() if key not in ("devicePath", "storageSystemId")}
+        row = {key: value for key, value in PEER_ROW.items() if key not in ("storageSystemId", "physicalDiskObj")}
+        record = service._build_quantastor_disk_records(
+            _raw(disks=[disk], pools=[POOL], pool_devices=[row], systems=({"id": "node-a"},)), "node-a",
+        )[0]
+        self.assertEqual(record.smart_devices, ["sdq"])
 
 
 if __name__ == "__main__":

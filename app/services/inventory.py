@@ -9803,6 +9803,7 @@ class InventoryService(InventorySourceCollectionMixin):
             raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         )
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
@@ -9928,7 +9929,10 @@ class InventoryService(InventorySourceCollectionMixin):
             slot = pool_hint.get("slot") if pool_hint else hint.get("slot") if hint else None
             if not isinstance(slot, int):
                 slot = self._extract_quantastor_slot(disk)
-            smart_devices = self._build_quantastor_smart_devices(disk, merged_raw, cli_hint, hint, pool_hint)
+            smart_devices = self._build_quantastor_smart_devices(
+                disk, merged_raw, cli_hint, hint, pool_hint,
+                disk_node=disk_node, several_nodes=several_nodes,
+            )
 
             records.append(
                 DiskRecord(
@@ -10043,6 +10047,9 @@ class InventoryService(InventorySourceCollectionMixin):
         cli_hint: dict[str, Any] | None,
         hw_hint: dict[str, Any] | None,
         pool_hint: dict[str, Any] | None,
+        *,
+        disk_node: str | None = None,
+        several_nodes: bool = False,
     ) -> list[str]:
         direct_candidates: list[str] = []
         stable_candidates: list[str] = []
@@ -10068,9 +10075,29 @@ class InventoryService(InventorySourceCollectionMixin):
             else:
                 fallback_candidates.append(normalized)
 
+        def own_node(row: Any, parent_owner: str | None = None) -> bool:
+            # A device path is local to the node that reported it (#1318). A
+            # row admitted through a stable shared identity may place the disk
+            # but never lends another node's path to SMART on this one. On a
+            # grid of several nodes a row of no known node lends none.
+            if not isinstance(row, dict):
+                return False
+            owner = normalize_value_text(row.get("storageSystemId")) or parent_owner
+            if owner is None or disk_node is None:
+                return not several_nodes
+            return owner == disk_node
+
         pool_device = pool_hint.get("pool_device_raw") if isinstance(pool_hint, dict) else None
         physical_disk_obj = pool_device.get("physicalDiskObj") if isinstance(pool_device, dict) else None
         hw_raw = hw_hint.get("hw_raw") if isinstance(hw_hint, dict) else None
+        if not own_node(pool_device):
+            pool_device = physical_disk_obj = None
+        elif not own_node(physical_disk_obj, normalize_value_text(pool_device.get("storageSystemId"))):
+            physical_disk_obj = None
+        if not own_node(hw_raw):
+            # merged_raw holds the disk's own fields, filled in from hw_raw:
+            # only the disk's own paths are left to take from it.
+            hw_raw = merged_raw = None
 
         for payload in (
             disk,
