@@ -6,10 +6,14 @@ Synthetic fixtures only; no appliance payload or SMART command is used.
 rate, endurance, error counters, byte totals) is not a reading. It stays
 unknown and is named in ``unread_fields``; legitimate zeroes and negative
 Celsius temperatures stay valid.
+
+#1300: a negative power-on time between -1 and 0 (number or text) is refused
+before conversion to whole hours, so it never becomes a measured zero.
 """
 
 from __future__ import annotations
 
+import itertools
 import unittest
 
 from app.config import (
@@ -171,6 +175,36 @@ class QuantastorNegativeUnsignedReadingTests(unittest.TestCase):
         summary = _summary(_service(), {**READABLE, "logicalBlockSize": -1}, logical_block_size=512)
         self.assertEqual(summary.logical_block_size, 512)
         self.assertNotIn("logical_block_size", summary.unread_fields)
+
+
+class QuantastorFractionalNegativeLifetimeTests(unittest.TestCase):
+    """#1300."""
+
+    def test_fractional_negative_power_on_is_not_a_zero_lifetime(self) -> None:
+        service = _service()
+        for key, value in itertools.product(("powerOnHours", "powerOnTimeHours", "powerOnTime"), (-0.5, "-0.5")):
+            with self.subTest(key=key, value=value):
+                summary = _summary(service, {"smartHealthTest": "PASSED", key: value})
+                self.assertIsNone(summary.power_on_hours)
+                self.assertIsNone(summary.power_on_days)
+                self.assertEqual(summary.unread_fields, ["power_on_days", "power_on_hours"])
+
+    def test_real_zero_and_positive_lifetimes_and_minus_one_are_unchanged(self) -> None:
+        service = _service()
+        for key in ("powerOnHours", "powerOnTimeHours", "powerOnTime"):
+            with self.subTest(key=key):
+                zero = _summary(service, {"smartHealthTest": "PASSED", key: 0})
+                self.assertEqual((zero.power_on_hours, zero.power_on_days, zero.unread_fields), (0, 0, []))
+                hours = _summary(service, {"smartHealthTest": "PASSED", key: "48"})
+                self.assertEqual((hours.power_on_hours, hours.power_on_days, hours.unread_fields), (48, 2, []))
+                refused = _summary(service, {"smartHealthTest": "PASSED", key: -1})
+                self.assertIsNone(refused.power_on_hours)
+                self.assertEqual(refused.unread_fields, ["power_on_days", "power_on_hours"])
+
+    def test_fractional_negative_lifetime_alone_keeps_its_not_read_marker(self) -> None:
+        summary = _summary(_service(), {"powerOnHours": "-0.5"})
+        self.assertIsNone(summary.power_on_hours)
+        self.assertEqual(summary.unread_fields, ["power_on_days", "power_on_hours"])
 
 
 if __name__ == "__main__":

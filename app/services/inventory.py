@@ -11673,7 +11673,7 @@ class InventoryService(InventorySourceCollectionMixin):
         )
         # Every measurement below cannot be negative. A negative report, also
         # one between -1 and 0, is refused before conversion and named not
-        # read, never published as a size, count or zero (#1299).
+        # read, never published as a size, count or zero (#1299, #1300).
         refused: set[str] = set()
 
         def unsigned(field_name: str, *keys: str, as_bytes: bool = False) -> int | None:
@@ -11682,7 +11682,9 @@ class InventoryService(InventorySourceCollectionMixin):
                 refused.add(field_name)
             return value
 
-        power_on_hours = self._extract_quantastor_int(raw_disk, "powerOnHours", "powerOnTimeHours", "powerOnTime")
+        power_on_hours = unsigned("power_on_hours", "powerOnHours", "powerOnTimeHours", "powerOnTime")
+        if "power_on_hours" in refused:
+            refused.add("power_on_days")
         bytes_read = unsigned("bytes_read", "bytesRead", "dataReadBytes", "logicalBytesRead", as_bytes=True)
         bytes_written = unsigned(
             "bytes_written", "bytesWritten", "dataWrittenBytes", "logicalBytesWritten", as_bytes=True)
