@@ -25,10 +25,13 @@ def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
         parts = line.split()
         if len(parts) < 4:
             continue
+        # Only the whole field `/dev/mpr<unit>` names an adapter; text before
+        # or after the name leaves the row without a unit (#1316).
+        device = _MPR_ADAPTER_DEVICE.fullmatch(parts[0])
         rows.append(
             {
                 "device": parts[0],
-                "unit": _mpr_unit_from_text(parts[0]),
+                "unit": device.group("unit") if device else None,
                 "chip": parts[1],
                 "board": " ".join(parts[2:-1]),
                 "firmware": parts[-1],
@@ -874,6 +877,26 @@ def admit_mpr_unit_number(token: str | None) -> int | None:
     return int(token) if token is not None and _MPR_UNIT_NUMBER.fullmatch(token) else None
 
 
+# A runaway bound on the unique units one adapter summary may plan reads for,
+# far above any real host (each unit is one controller). Units past it are
+# counted and not read; every unit inside it is still read.
+MAX_CORE_MPR_SUMMARY_UNITS = 128
+
+
+def rejected_mpr_summary_rows(text: str) -> int:
+    """Adapter summary rows whose device field is not an mpr device name at all.
+
+    A row naming `/dev/mpr<token>` with a token that is not a unit number is a
+    rejected unit instead (see `rejected_mpr_summary_unit_tokens`).
+    """
+    return sum(1 for row in parse_mpr_adapter_summary(text) if not row["device"].startswith("/dev/mpr"))
+
+
+def mpr_summary_units_over_limit(text: str) -> int:
+    """Admitted unique units of an adapter summary past `MAX_CORE_MPR_SUMMARY_UNITS`."""
+    return max(0, len(_admitted_mpr_summary_units(text)) - MAX_CORE_MPR_SUMMARY_UNITS)
+
+
 def rejected_mpr_summary_unit_tokens(text: str) -> set[str]:
     """Unit tokens of adapter summary rows naming an mpr device whose unit number was not admitted."""
     return {
@@ -883,13 +906,18 @@ def rejected_mpr_summary_unit_tokens(text: str) -> set[str]:
     }
 
 
-def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
+def _admitted_mpr_summary_units(text: str) -> list[int]:
     units: set[int] = set()
     for row in parse_mpr_adapter_summary(text):
         unit = admit_mpr_unit_number(row.get("unit"))
         if unit is not None:
             units.add(unit)
     return sorted(units)
+
+
+def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
+    """The admitted units, lowest first, up to `MAX_CORE_MPR_SUMMARY_UNITS`."""
+    return _admitted_mpr_summary_units(text)[:MAX_CORE_MPR_SUMMARY_UNITS]
 
 
 def build_core_mprutil_unit_commands(adapter_summary_output: str, seen_commands: set[str] | None = None) -> list[str]:
@@ -934,3 +962,6 @@ def _mpr_unit_from_text(value: str | None) -> str | None:
 
 
 _MPR_UNIT_NUMBER = re.compile(r"[0-9]{1,4}")
+# The adapter summary's device field, matched whole: the unit is the token
+# after the name, admitted separately by `admit_mpr_unit_number`.
+_MPR_ADAPTER_DEVICE = re.compile(r"/dev/mpr(?P<unit>[0-9]{1,4})")

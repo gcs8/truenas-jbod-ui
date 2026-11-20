@@ -3390,6 +3390,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                         },
                         "lists": {},
                         "rejected_units": 0,
+                        "rejected_summary_rows": 0,
+                        "summary_units_over_limit": 0,
                         "unread_phy_tables": 0,
                     },
                 },

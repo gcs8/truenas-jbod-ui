@@ -37,6 +37,9 @@ from app.services.sas_fabric_parsers import (
     admit_mpr_unit_number,
     build_core_mprutil_unit_commands as build_core_mprutil_unit_commands,
     discover_mpr_units_from_adapter_summary,
+    MAX_CORE_MPR_SUMMARY_UNITS,
+    mpr_summary_units_over_limit,
+    rejected_mpr_summary_rows,
     rejected_mpr_summary_unit_tokens,
     parse_dmidecode_slots,
     parse_mpr_adapter_detail,
@@ -496,11 +499,8 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
     )
     path_counts, path_slots = _path_counts_from_slots(snapshot.slots)
     controller_names = sorted(
-        {
-            f"mpr{row['unit']}"
-            for row in adapter_summary
-            if row.get("unit") is not None
-        }
+        # Only the summary's admitted units, inside the unit bound.
+        {f"mpr{unit}" for unit in discover_mpr_units_from_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))}
         | set(path_counts)
         | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
@@ -820,6 +820,9 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
     ]
 
     unit_reads, rejected_units = _mpr_unit_read_results(normalized_outputs, unit_data, command_failures)
+    adapter_summary_text = normalized_outputs.get("mprutil show adapters", "")
+    rejected_summary_rows = rejected_mpr_summary_rows(adapter_summary_text)
+    summary_units_over_limit = mpr_summary_units_over_limit(adapter_summary_text)
     unread_units = [item["controller"] for item in unit_reads if item["result"] != "read"]
     if not unit_data and any(item["result"] == "unreadable" for item in unit_reads):
         fabric_warnings.append(
@@ -855,6 +858,18 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             + ("unit that is not a unit number, so it was" if rejected_units == 1 else "units that are not unit numbers, so they were")
             + " not read."
         )
+    if rejected_summary_rows:
+        fabric_warnings.append(
+            f"The CORE mprutil adapter list had {rejected_summary_rows} "
+            + ("row that is not an adapter device name, so it was" if rejected_summary_rows == 1 else "rows that are not an adapter device name, so they were")
+            + " not read and controller counts may be incomplete."
+        )
+    if summary_units_over_limit:
+        fabric_warnings.append(
+            f"The CORE mprutil adapter list named more than {MAX_CORE_MPR_SUMMARY_UNITS} controller units; "
+            f"{summary_units_over_limit} {'was' if summary_units_over_limit == 1 else 'were'} not read, "
+            "so controller, expander and enclosure counts may be incomplete."
+        )
     unread_tables = Counter(
         node.kind
         for node in nodes.values()
@@ -872,7 +887,8 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         "counts": _mpr_count_completeness(
             unit_data,
             unit_reads,
-            rejected_units=rejected_units,
+            # Summary rows and units that were not read leave the counts short too.
+            rejected_units=rejected_units + rejected_summary_rows + summary_units_over_limit,
             controllers_seen=bool(controller_names),
             paths_seen=bool(paths),
         ),
@@ -880,6 +896,10 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         # measured zero), unreadable, or not kept at all.
         "lists": {_mpr_controller_name_for_unit(unit): dict(payload["lists"]) for unit, payload in sorted(unit_data.items())},
         "rejected_units": rejected_units,
+        # Adapter summary rows that name no adapter device, and admitted units
+        # past the summary's unit bound: counts only, never the text.
+        "rejected_summary_rows": rejected_summary_rows,
+        "summary_units_over_limit": summary_units_over_limit,
         "unread_phy_tables": sum(unread_tables.values()),
     }
     # Without controller data the bays, pools and vdevs the inventory already

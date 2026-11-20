@@ -7349,7 +7349,9 @@
        "expanders": "read"
       }
      },
+     "rejected_summary_rows": 0,
      "rejected_units": 0,
+     "summary_units_over_limit": 0,
      "units": [
       {
        "controller": "mpr0",
