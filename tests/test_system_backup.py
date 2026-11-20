@@ -7678,7 +7678,13 @@ sys.stdout.flush()
         expected_counts = self.store.counts()
         transaction = _ImportActivationTransaction({"history": imported_source.read_bytes()})
 
-        with patch.object(self.store, "create_backup", wraps=self.store.create_backup) as snapshot:
+        # The rollback snapshot is written by the store's private snapshot
+        # writer, which counts its over-long timestamps before publication.
+        with patch.object(
+            self.store,
+            "_create_rollback_snapshot",
+            wraps=self.store._create_rollback_snapshot,
+        ) as snapshot:
             with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
                 with patch.object(
                     self.store,

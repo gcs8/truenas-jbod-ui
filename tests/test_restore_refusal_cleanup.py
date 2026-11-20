@@ -11,11 +11,12 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
+import history_service.store as store_module
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
 from history_service.segmented_restore import record_file as record_restore_file
@@ -634,6 +635,236 @@ class RollbackSnapshotTimestampBoundTests(_ImportRootCleanup):
         self.assertEqual(live.read_bytes(), before)
         with self.assertRaises(ValueError):
             SystemBackupService._validate_history_member(candidate)
+
+
+class RollbackSnapshotContentBoundTests(_ImportRootCleanup):
+    """#1292: a rollback restores only the over-long timestamps its snapshot held.
+
+    The allowance is counted on the store's private copy before the snapshot
+    is published and checked on the private restore copy before it is
+    published, so what the snapshot path later holds cannot widen it.
+    """
+
+    ORDINARY = RestoreTimestampSizeTests.ORDINARY
+    OVERSIZED = RollbackSnapshotTimestampBoundTests.OVERSIZED
+    # Same length as OVERSIZED, different content.
+    FOREIGN = "2024-01-01T00:00:00+00:00" + " " * 300
+
+    _service = RollbackSnapshotTimestampBoundTests._service
+    _artifact = RollbackSnapshotTimestampBoundTests._artifact
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self._directory.name)
+
+    def _store_with_snapshot(self) -> tuple[Path, HistoryStore, Path, list[str], list[str]]:
+        """A live history holding one over-long timestamp, its rollback
+        snapshot, then an imported history published over it."""
+        (self.root / "live").mkdir()
+        live = _history_database(self.root / "live" / "history.sqlite3", [self.OVERSIZED])
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        original_dump = _dump(live)
+        snapshot = store._create_rollback_snapshot(self.root / "rollback")
+        assert snapshot is not None
+        store.restore_backup(
+            _history_database(self.root / "imported.sqlite3", [self.ORDINARY, self.ORDINARY])
+        )
+        imported_dump = _dump(live)
+        self.assertNotEqual(imported_dump, original_dump)
+        return live, store, snapshot, original_dump, imported_dump
+
+    @contextmanager
+    def _inside_restore_lock(self, action: Callable[[], None]):
+        """Run ``action`` once, after the snapshot identity check, while the
+        rollback restore holds the real history write lock."""
+        real_lock = store_module.history_write_lock
+        armed = [True]
+
+        @contextmanager
+        def wrapped(file_path: Path, *, blocking: bool):
+            with real_lock(file_path, blocking=blocking):
+                if armed:
+                    armed.clear()
+                    action()
+                yield
+
+        with patch.object(store_module, "history_write_lock", wrapped):
+            yield
+        self.assertEqual(armed, [], "the rollback restore never took the lock")
+
+    def _assert_refused_and_unchanged(
+        self, refused: Any, live: Path, imported_dump: list[str]
+    ) -> None:
+        message = str(refused.exception)
+        self.assertIn("metric_samples.observed_at", message)
+        self.assertIn("that the snapshot did not hold", message)
+        self.assertEqual(_dump(live), imported_dump)
+        self.assertNotIn((self.FOREIGN, 0, 30), _metric_rows(live))
+
+    def test_untampered_snapshot_restores_its_over_long_timestamp(self) -> None:
+        live, store, snapshot, original_dump, _ = self._store_with_snapshot()
+        store._restore_rollback_snapshot(snapshot)
+        self.assertEqual(_dump(live), original_dump)
+        self.assertEqual(_metric_rows(live), [(self.OVERSIZED, 0, 30)])
+
+    def test_identical_copy_swapped_in_after_the_identity_check_restores(self) -> None:
+        # Control for the injector below: it reaches the restore, and only
+        # the content decides.
+        live, store, snapshot, original_dump, _ = self._store_with_snapshot()
+        copy = self.root / "copy.sqlite3"
+        shutil.copyfile(snapshot, copy)
+        with self._inside_restore_lock(lambda: os.replace(copy, snapshot)):
+            store._restore_rollback_snapshot(snapshot)
+        self.assertEqual(_dump(live), original_dump)
+
+    def test_snapshot_replaced_after_the_identity_check_is_refused(self) -> None:
+        live, store, snapshot, _, imported_dump = self._store_with_snapshot()
+        foreign = _history_database(self.root / "foreign.sqlite3", [self.FOREIGN])
+        with self._inside_restore_lock(lambda: os.replace(foreign, snapshot)):
+            with self.assertRaises(ValueError) as refused:
+                store._restore_rollback_snapshot(snapshot)
+        self._assert_refused_and_unchanged(refused, live, imported_dump)
+
+    def test_snapshot_rewritten_in_place_with_size_and_mtime_kept_is_refused(self) -> None:
+        live, store, snapshot, _, imported_dump = self._store_with_snapshot()
+        rewritten = self.root / "rewritten.sqlite3"
+        shutil.copyfile(snapshot, rewritten)
+        with closing(sqlite3.connect(rewritten)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute(
+                "UPDATE metric_samples SET observed_at = ? WHERE observed_at = ?",
+                (self.FOREIGN, self.OVERSIZED),
+            )
+            connection.commit()
+        content = rewritten.read_bytes()
+        before = os.stat(snapshot)
+        self.assertEqual(len(content), before.st_size)
+        with open(snapshot, "r+b") as handle:
+            handle.write(content)
+            handle.truncate()
+        os.utime(snapshot, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = os.stat(snapshot)
+        self.assertEqual(
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
+        )
+        with self.assertRaises(ValueError) as refused:
+            store._restore_rollback_snapshot(snapshot)
+        self._assert_refused_and_unchanged(refused, live, imported_dump)
+
+    def _plant_wal(self, snapshot: Path) -> None:
+        """Leave a write-ahead log next to the snapshot that changes its rows."""
+        work = self.root / "wal-work"
+        work.mkdir()
+        copy = work / "copy.sqlite3"
+        shutil.copyfile(snapshot, copy)
+        connection = sqlite3.connect(copy)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+            )
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute(
+                "UPDATE metric_samples SET observed_at = ? WHERE observed_at = ?",
+                (self.FOREIGN, self.OVERSIZED),
+            )
+            connection.commit()
+            shutil.copyfile(f"{copy}-wal", f"{snapshot}-wal")
+        finally:
+            connection.close()
+
+    def test_planted_wal_sidecar_is_refused(self) -> None:
+        live, store, snapshot, _, imported_dump = self._store_with_snapshot()
+        self._plant_wal(snapshot)
+        with self.assertRaises(ValueError) as refused:
+            store._restore_rollback_snapshot(snapshot)
+        self._assert_refused_and_unchanged(refused, live, imported_dump)
+
+    def test_more_copies_of_the_held_value_than_the_snapshot_held_are_refused(self) -> None:
+        live, store, snapshot, _, imported_dump = self._store_with_snapshot()
+        repeated = _history_database(
+            self.root / "repeated.sqlite3", [self.OVERSIZED, self.OVERSIZED]
+        )
+        with self._inside_restore_lock(lambda: os.replace(repeated, snapshot)):
+            with self.assertRaises(ValueError) as refused:
+                store._restore_rollback_snapshot(snapshot)
+        self._assert_refused_and_unchanged(refused, live, imported_dump)
+        self.assertNotIn((self.OVERSIZED, 1, 31), _metric_rows(live))
+
+    def test_allowance_is_counted_before_the_snapshot_is_published(self) -> None:
+        (self.root / "live").mkdir()
+        live = _history_database(self.root / "live" / "history.sqlite3", [self.OVERSIZED])
+        store = HistoryStore(str(live), recover_unreadable_database=False)
+        rollback_dir = self.root / "rollback"
+        foreign = _history_database(self.root / "foreign.sqlite3", [self.FOREIGN])
+        real_publish = HistoryStore._publish_replacement
+
+        def publish_then_swap(
+            instance: HistoryStore, temp_path: Path, target_path: Path, **kwargs: Any
+        ) -> None:
+            real_publish(instance, temp_path, target_path, **kwargs)
+            if Path(target_path).parent == rollback_dir:
+                os.replace(foreign, target_path)
+
+        with patch.object(HistoryStore, "_publish_replacement", publish_then_swap):
+            snapshot = store._create_rollback_snapshot(rollback_dir)
+        assert snapshot is not None
+        self.assertFalse(foreign.exists(), "the swap after publication did not run")
+        store.restore_backup(_history_database(self.root / "imported.sqlite3", [self.ORDINARY]))
+        imported_dump = _dump(live)
+        with self.assertRaises(ValueError) as refused:
+            store._restore_rollback_snapshot(snapshot)
+        self._assert_refused_and_unchanged(refused, live, imported_dump)
+
+    def test_failed_import_with_a_changed_snapshot_fails_closed_and_keeps_it(self) -> None:
+        artifact = self._artifact()
+        live_dir = self.root / "live-history"
+        live_dir.mkdir()
+        live = _history_database(live_dir / "history.sqlite3", [self.OVERSIZED])
+        target = self._service(self.root / "target", live)
+        snapshots: list[Path] = []
+        real_create = HistoryStore._create_rollback_snapshot
+
+        def record_snapshot(store: HistoryStore, backup_dir: Path) -> Path | None:
+            snapshot = real_create(store, backup_dir)
+            if snapshot is not None:
+                snapshots.append(Path(snapshot))
+            return snapshot
+
+        activated_dumps: list[list[str]] = []
+        real_activate = _ImportActivationTransaction.activate_history
+
+        def activate_then_tamper(transaction, store, member_key):
+            real_activate(transaction, store, member_key)
+            self._plant_wal(snapshots[-1])
+            activated_dumps.append(_dump(live))
+
+        def fail_after_history_activation():
+            if activated_dumps:
+                raise RuntimeError("injected settings reload failure")
+            return target.app_settings
+
+        with patch.object(
+            HistoryStore, "_create_rollback_snapshot", record_snapshot
+        ), patch.object(
+            _ImportActivationTransaction, "activate_history", activate_then_tamper
+        ), patch.object(
+            target, "_load_app_settings", side_effect=fail_after_history_activation
+        ):
+            with self.assertRaises(RuntimeError) as failed:
+                target.import_bundle_from_file(artifact.path, passphrase=PASSPHRASE)
+
+        message = str(failed.exception)
+        self.assertIn("Import activation rollback is incomplete", message)
+        self.assertIn("that the snapshot did not hold", message)
+        self.assertEqual(len(snapshots), 1)
+        # The snapshot stays as recovery material and the history the import
+        # published is left as it was, without the snapshot's changed rows.
+        self.assertTrue(snapshots[0].is_file())
+        self.assertEqual(_dump(live), activated_dumps[0])
+        self.assertEqual(
+            _metric_rows(live), [(self.ORDINARY, 0, 30), (self.ORDINARY, 1, 31)]
+        )
 
 
 if __name__ == "__main__":
