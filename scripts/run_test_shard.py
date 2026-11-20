@@ -219,6 +219,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_activation_marker_startup",
         "test_history_backend_bounds",
         "test_history_bulk_bounds",
+        "test_history_hardware_scale",
         "test_history_runtime_damage_pause",
         "test_interrupted_restore_recovery",
         "test_ipmi_duplicate_bays",

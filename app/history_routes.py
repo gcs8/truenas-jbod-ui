@@ -213,7 +213,10 @@ def add_history_routes(router: APIRouter, routes: ModuleType) -> None:
         if len(requested_slots) > routes.MAX_TARGETS:
             raise HTTPException(
                 status_code=413,
-                detail=f"History can be requested for at most {routes.MAX_TARGETS} slots at a time.",
+                detail=(
+                    f"History can be requested for at most {routes.MAX_TARGETS} slots at a time; "
+                    f"{len(requested_slots)} requested."
+                ),
             )
         registry = routes.get_inventory_registry()
         service = registry.get_service(system_id)
