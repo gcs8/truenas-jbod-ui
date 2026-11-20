@@ -59,7 +59,7 @@ function loadPage(fabric, mode = "lanes", slots = []) {
   const end = FABRIC_SOURCE.indexOf("  elements.modeButtons.forEach((button) => {", FABRIC_SOURCE.indexOf("  function render()"));
   assert.ok(end > 0);
   vm.runInContext(`${FABRIC_SOURCE.slice(0, end)}
-    window.renderTest = { renderMap, renderStatus, renderWarnings, renderSummary, metricRows, state, phyFact: typeof phyFact === "function" ? phyFact : undefined };
+    window.renderTest = { renderMap, renderStatus, renderWarnings, renderSummary, metricRows, nodeMeta, state, phyFact: typeof phyFact === "function" ? phyFact : undefined };
   })();`, sandbox);
   const api = sandbox.window.renderTest;
   if (mode === null) return api;
@@ -245,9 +245,9 @@ test("control: an unavailable payload still hides the map", () => {
 
 test("main page topology summary uses the same not-read rule", () => {
   const { sasFabricCountSummary: summary, sasFabricNoControllerText: noController } = loadAppCountHelpers();
-  assert.equal(summary(CASES.no_controller_bays.fabric), "sources not read / paths not read / expanders not read / enclosures not read / 1 traces");
-  assert.equal(summary(CASES.unreadable_second_unit.fabric), "at least 1 source / 0 paths / expanders not read / enclosures not read / 1 traces");
-  assert.equal(summary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 traces");
+  assert.equal(summary(CASES.no_controller_bays.fabric), "sources not read / paths not read / expanders not read / enclosures not read / 1 trace");
+  assert.equal(summary(CASES.unreadable_second_unit.fabric), "at least 1 source / 0 paths / expanders not read / enclosures not read / 1 trace");
+  assert.equal(summary(CASES.complete.fabric), "1 source / 0 paths / 0 expanders / 0 enclosures / 1 trace");
   assert.deepEqual({ ...noController(CASES.no_controller_bays.fabric, false) }, {
     meta: "HBA controllers not read",
     message: "Controller data could not be read. Check the SSH setup for this system in the admin console.",
@@ -395,4 +395,14 @@ test("main page inspector and lanes follow the same not-read facts", () => {
   assert.equal(emptyText(CASES.unparsed_lists.fabric, "mpr0", "expanders"), "Not read");
   assert.equal(emptyText(CASES.complete.fabric, "mpr0", "expanders"), "No objects reported");
   assert.equal(emptyText({ raw: {} }, "mpr0", "expanders"), "No objects reported");
+});
+
+test("Storage Fabric page node meta: one related bay or disk takes the singular noun", () => {
+  const { nodeMeta } = loadPage(FIXTURE, null);
+  const bay = (slots, physical) => ({ id: `bay:${slots[0]}`, kind: "bay", related_slots: slots, metrics: { physical_location_known: physical } });
+  assert.equal(nodeMeta(bay([0], true)), "1 bay");
+  assert.equal(nodeMeta(bay([0, 1], true)), "2 bays");
+  assert.equal(nodeMeta(bay([0], false)), "1 disk");
+  assert.equal(nodeMeta(bay([0, 1], false)), "2 disks");
+  assert.equal(nodeMeta({ kind: "controller", metrics: {} }), "n/a");
 });

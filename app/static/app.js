@@ -2395,7 +2395,7 @@
       sasFabricCountPhrase(fabric, "paths", sasFabricList(fabric.paths).length, "path"),
       sasFabricCountPhrase(fabric, "expanders", sasFabricList(fabric.expanders).length, "expander"),
       sasFabricCountPhrase(fabric, "enclosures", sasFabricList(fabric.enclosures).length, "enclosure"),
-      `${sasFabricList(fabric.traces).length} traces`,
+      `${sasFabricList(fabric.traces).length} ${sasFabricList(fabric.traces).length === 1 ? "trace" : "traces"}`,
     ].join(" / ");
   }
 
@@ -2489,7 +2489,7 @@
       metrics.temperature ? `temp ${metrics.temperature}` : null,
       metrics.firmware ? `fw ${metrics.firmware}` : null,
       metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
-      fallback.count ? `${fallback.count} bays` : null,
+      fallback.count ? `${fallback.count} ${Number(fallback.count) === 1 ? "bay" : "bays"}` : null,
     ].filter(Boolean);
     return parts.join(" / ");
   }

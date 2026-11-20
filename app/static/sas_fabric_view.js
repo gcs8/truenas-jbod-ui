@@ -1747,7 +1747,7 @@
       metrics.temperature ? `temp ${metrics.temperature}` : null,
       metrics.firmware ? `fw ${metrics.firmware}` : null,
       metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
-      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} ${sortedSlots(node.related_slots).every((slotNumber) => diskLocation(slotNumber, node.kind === "bay" ? node : undefined).physical) ? "bays" : "disks"}` : null,
+      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} ${sortedSlots(node.related_slots).every((slotNumber) => diskLocation(slotNumber, node.kind === "bay" ? node : undefined).physical) ? "bay" : "disk"}${sortedSlots(node.related_slots).length === 1 ? "" : "s"}` : null,
       node?.raw_id,
     ].filter(Boolean).join(" / ") || "n/a";
   }
