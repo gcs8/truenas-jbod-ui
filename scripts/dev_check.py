@@ -238,6 +238,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_service",
             "tests.test_history_smart_metric_failure",
             "tests.test_incomplete_refresh_status",
+            "tests.test_import_validated_member",
             "tests.test_interrupted_restore_recovery",
             "tests.test_inventory",
             "tests.test_inventory_helpers",

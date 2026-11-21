@@ -220,6 +220,10 @@ RESTORED_TIMESTAMP_COLUMNS = (
     ("history_maintenance_state", "backup_at"),
 )
 
+# Files SQLite can read together with a database file. A validated import
+# member is installed only while none of them is next to it (#1422).
+VALIDATED_MEMBER_SIDE_FILE_SUFFIXES = ("-wal", "-journal", "-shm")
+
 
 def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
     """Refuse a database with a timestamp field longer than the restore bound.
@@ -2776,10 +2780,29 @@ class HistoryStore:
         source_path: str | Path,
         *,
         rollback_allowance: Counter[tuple[str, str, str]] | None = None,
+        member_check: Callable[[sqlite3.Connection], None] | None = None,
     ) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
+        if member_check is not None:
+            # A validated member is installed as the one file it is (#1422).
+            side_files = [
+                suffix
+                for suffix in VALIDATED_MEMBER_SIDE_FILE_SUFFIXES
+                if os.path.lexists(f"{source}{suffix}")
+            ]
+            if side_files:
+                raise ValueError(
+                    "SQLite side files ("
+                    + ", ".join(side_files)
+                    + ") are next to the staged history member, so it is not the "
+                    "member that was validated. Nothing was restored and the "
+                    "current history was not changed."
+                )
+            source_target = f"{source.absolute().as_uri()}?mode=ro&immutable=1"
+        else:
+            source_target = str(source)
 
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
@@ -2793,7 +2816,9 @@ class HistoryStore:
         temp_metadata = os.fstat(temp_fd)
         try:
             with self._lock:
-                with closing(sqlite3.connect(source)) as source_connection, closing(
+                with closing(
+                    sqlite3.connect(source_target, uri=member_check is not None)
+                ) as source_connection, closing(
                     sqlite3.connect(f"/proc/self/fd/{temp_fd}")
                 ) as restore_connection:
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
@@ -2804,6 +2829,10 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    # An import's member checks run again on the copy that is
+                    # published, not only on the file validated earlier (#1422).
+                    if member_check is not None:
+                        member_check(restore_connection)
                     # Incoming backups get the bound. Only
                     # _restore_rollback_snapshot passes an allowance: the
                     # over-long fields its snapshot held, no others (#1292).
@@ -2842,6 +2871,26 @@ class HistoryStore:
         try:
             with history_write_lock(self.file_path, blocking=False):
                 self._restore_backup_locked(source_path)
+        finally:
+            self._hot_summary_counts.clear()
+
+    def restore_validated_member(
+        self,
+        source_path: str | Path,
+        *,
+        member_check: Callable[[sqlite3.Connection], None],
+    ) -> None:
+        """Install an import's staged history member as it was validated.
+
+        The member is read as one file: SQLite side files next to it refuse
+        the restore, and it is opened immutable so none that appears later is
+        read. ``member_check`` runs on the private restore copy before it is
+        published, with the timestamp bound every incoming backup gets (#1422).
+        """
+        self._require_unsegmented_operation("v1 restore")
+        try:
+            with history_write_lock(self.file_path, blocking=False):
+                self._restore_backup_locked(source_path, member_check=member_check)
         finally:
             self._hot_summary_counts.clear()
 

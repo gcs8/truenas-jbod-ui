@@ -1566,7 +1566,12 @@ class _ImportActivationTransaction:
         entry = self._record_history(store)
         self._ensure_parent_hierarchy(entry.target_path.parent)
         entry.mutated = True
-        store.restore_backup(self._staged_member(member_key))
+        # Install the staged member as validated: the store refuses side files
+        # next to it and checks the copy it publishes again (#1422).
+        store.restore_validated_member(
+            self._staged_member(member_key),
+            member_check=SystemBackupService._check_history_connection,
+        )
         self._fsync_file(entry.target_path)
         self._fsync_directory(entry.target_path.parent)
 
@@ -4378,52 +4383,70 @@ class SystemBackupService:
             else:
                 candidate_path = Path(temp_dir) / "history.sqlite3"
                 candidate_path.write_bytes(content)
-            database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
+            # The member is judged as the one file activation copies and
+            # installs; side files next to it are not part of it (#1422).
+            database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro&immutable=1"
             with closing(sqlite3.connect(database_uri, uri=True)) as connection:
-                # The database's own compatibility marker, checked against the
-                # range startup admits before anything is activated (#1189).
-                # Raises HistorySchemaVersionError; callers turn it into the
-                # operator-facing ValueError so the reason is not wrapped away.
-                require_restorable_schema_version(
-                    int(connection.execute("PRAGMA user_version").fetchone()[0])
+                SystemBackupService._check_history_connection(
+                    connection,
+                    integrity_checked=integrity_checked,
                 )
-                rows = (
-                    [("ok",)]
-                    if integrity_checked
-                    else connection.execute("PRAGMA quick_check").fetchall()
+
+    @staticmethod
+    def _check_history_connection(
+        connection: sqlite3.Connection,
+        *,
+        integrity_checked: bool = False,
+    ) -> None:
+        """The history member checks, on an open database.
+
+        Import validation runs them on the extracted member, and activation
+        runs them again, with the integrity check, on the private copy it
+        publishes (#1422).
+        """
+        # The database's own compatibility marker, checked against the
+        # range startup admits before anything is activated (#1189).
+        # Raises HistorySchemaVersionError; callers turn it into the
+        # operator-facing ValueError so the reason is not wrapped away.
+        require_restorable_schema_version(
+            int(connection.execute("PRAGMA user_version").fetchone()[0])
+        )
+        rows = (
+            [("ok",)]
+            if integrity_checked
+            else connection.execute("PRAGMA quick_check").fetchall()
+        )
+        required_columns = {
+            "slot_state_current": {"system_id", "enclosure_key", "slot"},
+            "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
+            "metric_samples": {
+                "system_id",
+                "enclosure_key",
+                "slot",
+                "observed_at",
+                "metric_name",
+            },
+        }
+        for table_name, expected_columns in required_columns.items():
+            table_row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if table_row is None:
+                raise ValueError(f"History database is missing table {table_name}.")
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            }
+            if not expected_columns.issubset(columns):
+                raise ValueError(
+                    f"History database table {table_name} is missing required columns."
                 )
-                required_columns = {
-                    "slot_state_current": {"system_id", "enclosure_key", "slot"},
-                    "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
-                    "metric_samples": {
-                        "system_id",
-                        "enclosure_key",
-                        "slot",
-                        "observed_at",
-                        "metric_name",
-                    },
-                }
-                for table_name, expected_columns in required_columns.items():
-                    table_row = connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-                        (table_name,),
-                    ).fetchone()
-                    if table_row is None:
-                        raise ValueError(f"History database is missing table {table_name}.")
-                    columns = {
-                        str(row[1])
-                        for row in connection.execute(
-                            f'PRAGMA table_info("{table_name}")'
-                        ).fetchall()
-                    }
-                    if not expected_columns.issubset(columns):
-                        raise ValueError(
-                            f"History database table {table_name} is missing required columns."
-                        )
-                if rows == [("ok",)]:
-                    require_bounded_restored_timestamps(connection)
-            if rows != [("ok",)]:
-                raise ValueError("History database integrity check failed.")
+        if rows != [("ok",)]:
+            raise ValueError("History database integrity check failed.")
+        require_bounded_restored_timestamps(connection)
 
     def _build_history_snapshot_to_directory(self, target_dir: Path) -> Path | None:
         backup_path = self.store.create_backup(
