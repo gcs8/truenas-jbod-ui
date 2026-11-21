@@ -564,6 +564,27 @@ class PrivateCopySideFilesTests(_ImportRootCleanup):
             self._import()
         self._assert_refused_unchanged(refused, "-wal")
 
+    def test_rollback_journal_after_the_side_file_check_is_refused(self) -> None:
+        # A hot journal appears once the side-file check has passed, before
+        # SQLite's first read: SQLite replays it at that read and reports
+        # rollback journaling, so the journal left beside the copy refuses.
+        real_check = HistoryStore._refuse_private_copy_side_files
+
+        def check_then_plant(private: Path) -> None:
+            real_check(private)
+            if not self.planted:
+                self._plant(private, "-journal")
+
+        with (
+            patch.object(
+                HistoryStore, "_refuse_private_copy_side_files", staticmethod(check_then_plant)
+            ),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import()
+        self._assert_refused_unchanged(refused, "-journal")
+        self.assertNotIn(777, [row[2] for row in _metric_rows(self.live)])
+
     def _assert_ignored(self, suffix: str) -> None:
         self._import(after_open=suffix)
         self.assertEqual(self.planted, [suffix], "the side file was never planted")

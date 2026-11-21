@@ -3001,6 +3001,10 @@ class HistoryStore:
         connection.execute("PRAGMA schema_version").fetchone()
         if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
             raise ValueError(PRIVATE_COPY_WAL_MESSAGE)
+        # A rollback journal that appeared between the check above and the
+        # first read is replayed by SQLite at that read and, under the
+        # exclusive lock, stays beside the copy: check again after the read.
+        cls._refuse_private_copy_side_files(private_path)
 
     @staticmethod
     def _refuse_private_copy_side_files(private_path: Path) -> None:
