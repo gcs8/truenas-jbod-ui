@@ -5658,9 +5658,10 @@ class InventoryService(InventorySourceCollectionMixin):
                 if self._slot_detail_field_missing(value):
                     continue
                 smart_fields[field_name] = value
-            # A refused lifetime is a read that happened: write its names down.
-            refused = [name for name in POWER_ON_FIELDS
-                       if name in smart_summary.unread_fields and getattr(smart_summary, name) is None]
+            # A refused field is a read that happened: write its name down, for
+            # every stable field the saved reader can show (#1294).
+            refused = sorted(name for name in STABLE_SMART_DETAIL_FIELDS
+                             if name in smart_summary.unread_fields and getattr(smart_summary, name) is None)
             if refused:
                 smart_fields["unread_fields"] = refused
             if smart_fields:
@@ -17483,9 +17484,9 @@ class InventoryService(InventorySourceCollectionMixin):
 
     @staticmethod
     def _stored_smart_summary(smart_fields: Mapping[str, Any]) -> SmartSummaryView:
-        """Rebuild a stored SMART half; only a refused lifetime is stored as not read."""
+        """Rebuild a stored SMART half; a stored "not read" name counts for a stable field only."""
         summary = SmartSummaryView.model_validate(smart_fields)
-        summary.unread_fields = [name for name in summary.unread_fields if name in POWER_ON_FIELDS]
+        summary.unread_fields = [name for name in summary.unread_fields if name in STABLE_SMART_DETAIL_FIELDS]
         InventoryService._prune_unread_smart_fields(summary)
         # An earlier writer saved negative sizes as readings (#1299).
         for name in UNSIGNED_STORED_SMART_FIELDS:
