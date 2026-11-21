@@ -18,7 +18,9 @@ never becomes a SMART candidate on the selected node.
 from __future__ import annotations
 
 import itertools
+import tempfile
 import unittest
+from pathlib import Path
 
 from app.config import (
     EnclosureProfileConfig,
@@ -28,9 +30,10 @@ from app.config import (
     SystemConfig,
     TrueNASConfig,
 )
-from app.models.domain import SlotView
+from app.models.domain import SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
 from app.services.profile_registry import ProfileRegistry
+from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASRawData
 
 
@@ -273,6 +276,156 @@ class QuantastorPeerSmartPathTests(unittest.TestCase):
             _raw(disks=[disk], pools=[POOL], pool_devices=[row], systems=({"id": "node-a"},)), "node-a",
         )[0]
         self.assertEqual(record.smart_devices, ["sdq"])
+
+
+def _slot_from_record(record, **overrides) -> SlotView:
+    fields = {
+        "slot": 0, "slot_label": "00", "row_index": 0, "column_index": 0, "present": True,
+        "serial": record.serial, "device_name": record.device_name, "enclosure_id": "shelf-a",
+        "logical_block_size": record.logical_block_size, "physical_block_size": record.physical_block_size,
+        "raw_status": {"disk_raw": record.raw}, "smart_device_names": list(record.smart_devices),
+    }
+    fields.update(overrides)
+    return SlotView(**fields)
+
+
+# Saved before the node of the SMART paths was recorded: entries written by the
+# earlier writer carry no such key.
+SMART_NODE_KEY = "quantastor_smart_device_node"
+
+
+class QuantastorSavedSlotDetailTests(unittest.TestCase):
+    """Saved slot details must not bring a refused value back (#1299, #1318).
+
+    Each test saves an entry, reloads it through a new service and store, and
+    reads the consumer after the backfill, as a restart after an upgrade does.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = str(Path(self._tmp.name) / "slot_details.json")
+
+    def _save(self, slot: SlotView, summary: SmartSummaryView | None, *, legacy: bool) -> dict:
+        service = _service()
+        service.slot_detail_store = SlotDetailStore(self.path)
+        entry = service._build_slot_detail_entry(slot, smart_summary=summary, loaded_entries={})
+        if entry is None:
+            self.fail("the writer saved nothing")
+        if legacy:
+            # The earlier writer wrote the same fields and no node.
+            entry.slot_fields.pop(SMART_NODE_KEY, None)
+        service.slot_detail_store.save_entries([entry])
+        return dict(entry.slot_fields)
+
+    def _reload(self, raw: TrueNASRawData) -> tuple[InventoryService, SlotView]:
+        service = _service()
+        service.slot_detail_store = SlotDetailStore(self.path)
+        slot = _slot_from_record(service._build_quantastor_disk_records(raw, "node-a")[0])
+        service._apply_persisted_slot_details([slot])
+        return service, slot
+
+    # A1 (#1318)
+    def test_saved_peer_path_from_an_earlier_writer_is_not_a_candidate_after_reload(self) -> None:
+        disk = {key: value for key, value in {**DISK_A, **READABLE}.items() if key != "devicePath"}
+        raw = _raw(disks=[disk], pools=[POOL], pool_devices=[PEER_ROW])
+        record = _service()._build_quantastor_disk_records(raw, "node-a")[0]
+        self.assertEqual(record.smart_devices, [])
+        # The earlier builder lent node-b's path, and its writer saved it.
+        saved = self._save(_slot_from_record(record, smart_device_names=["sdq"]), None, legacy=True)
+        self.assertEqual(saved["smart_device_names"], ["sdq"])
+
+        _service_after, slot = self._reload(raw)
+        self.assertEqual(slot.smart_device_names, [])
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+
+    def test_saved_path_recorded_for_another_node_is_not_a_candidate(self) -> None:
+        disk = {key: value for key, value in {**DISK_A, **READABLE}.items() if key != "devicePath"}
+        raw = _raw(disks=[disk], pools=[POOL], pool_devices=[PEER_ROW])
+        record = _service()._build_quantastor_disk_records(raw, "node-a")[0]
+        peer_view = {**record.raw, "storageSystemId": "node-b"}
+        self._save(_slot_from_record(record, smart_device_names=["sdq"], raw_status={"disk_raw": peer_view}),
+                   None, legacy=False)
+
+        _service_after, slot = self._reload(raw)
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+
+    def test_saved_same_node_path_is_still_a_candidate_after_reload(self) -> None:
+        # Control: the current poll omits the disk's path; the path saved on
+        # this node is still used.
+        disk = {**DISK_A, **READABLE}
+        record = _service()._build_quantastor_disk_records(_raw(disks=[disk]), "node-a")[0]
+        self.assertEqual(record.smart_devices, ["sda"])
+        saved = self._save(_slot_from_record(record), None, legacy=False)
+        self.assertEqual(saved["smart_device_names"], ["sda"])
+
+        current = {key: value for key, value in disk.items() if key != "devicePath"}
+        _service_after, slot = self._reload(_raw(disks=[current]))
+        self.assertEqual(slot.smart_device_names, ["sda"])
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), ["sda"])
+
+    # A2 (#1299)
+    def test_saved_negative_block_sizes_stay_not_read_after_reload(self) -> None:
+        disk = {**DISK_A, **READABLE, "logicalBlockSize": -1, "physicalBlockSize": -512}
+        raw = _raw(disks=[disk])
+        record = _service()._build_quantastor_disk_records(raw, "node-a")[0]
+        # The earlier record and summary published the negative sizes, and
+        # its writer saved them in both halves of the entry.
+        earlier = SmartSummaryView(available=True, logical_block_size=-1, physical_block_size=-512,
+                                   rotation_rate_rpm=-1, power_on_hours=100, power_on_days=4)
+        saved = self._save(_slot_from_record(record, logical_block_size=-1, physical_block_size=-512),
+                           earlier, legacy=True)
+        self.assertEqual((saved["logical_block_size"], saved["physical_block_size"]), (-1, -512))
+
+        service, slot = self._reload(raw)
+        self.assertIsNone(slot.logical_block_size)
+        self.assertIsNone(slot.physical_block_size)
+        summary = service._merge_smart_summary(slot, service._build_quantastor_smart_summary(slot))
+        self.assertIsNone(summary.logical_block_size)
+        self.assertIsNone(summary.physical_block_size)
+        self.assertIn("logical_block_size", summary.unread_fields)
+        self.assertIn("physical_block_size", summary.unread_fields)
+        # The saved SMART half is not a reading of them either.
+        persisted = service._build_persisted_smart_summary(slot)
+        if persisted is None:
+            self.fail("no saved SMART half was served")
+        self.assertIsNone(persisted.logical_block_size)
+        self.assertIsNone(persisted.physical_block_size)
+        self.assertIsNone(persisted.rotation_rate_rpm)
+        self.assertEqual(persisted.unread_fields, ["logical_block_size", "physical_block_size", "rotation_rate_rpm"])
+        self.assertEqual(persisted.power_on_hours, 100)
+
+    def test_saved_non_negative_block_sizes_are_still_shown_after_reload(self) -> None:
+        # Control: a real cached reading fills a poll that omits it.
+        disk = {**DISK_A, **READABLE, "logicalBlockSize": 512, "physicalBlockSize": 4096}
+        record = _service()._build_quantastor_disk_records(_raw(disks=[disk]), "node-a")[0]
+        self._save(_slot_from_record(record), SmartSummaryView(
+            available=True, logical_block_size=512, physical_block_size=4096), legacy=True)
+
+        current = {key: value for key, value in disk.items() if "BlockSize" not in key}
+        service, slot = self._reload(_raw(disks=[current]))
+        self.assertEqual((slot.logical_block_size, slot.physical_block_size), (512, 4096))
+        summary = service._merge_smart_summary(slot, service._build_quantastor_smart_summary(slot))
+        self.assertEqual((summary.logical_block_size, summary.physical_block_size), (512, 4096))
+        self.assertEqual(summary.unread_fields, [])
+        persisted = service._build_persisted_smart_summary(slot)
+        if persisted is None:
+            self.fail("no saved SMART half was served")
+        self.assertEqual((persisted.logical_block_size, persisted.physical_block_size), (512, 4096))
+
+    def test_merge_does_not_copy_a_negative_slot_block_size(self) -> None:
+        # The final merge holds the same rule whatever filled the slot.
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                        logical_block_size=-1, physical_block_size=-512)
+        summary = SmartSummaryView(available=True, power_on_hours=1,
+                                   unread_fields=["logical_block_size", "physical_block_size"])
+        merged = InventoryService._merge_smart_summary(slot, summary)
+        self.assertIsNone(merged.logical_block_size)
+        self.assertIsNone(merged.physical_block_size)
+        self.assertEqual(merged.unread_fields, ["logical_block_size", "physical_block_size"])
+        slot.logical_block_size, slot.physical_block_size = 0, 4096
+        merged = InventoryService._merge_smart_summary(slot, SmartSummaryView(available=True))
+        self.assertEqual((merged.logical_block_size, merged.physical_block_size), (0, 4096))
 
 
 if __name__ == "__main__":

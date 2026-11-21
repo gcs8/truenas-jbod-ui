@@ -535,6 +535,14 @@ STABLE_SLOT_DETAIL_FIELDS = (
 STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
 SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
 POWER_ON_FIELDS = ("power_on_days", "power_on_hours")
+# Saved slot and SMART fields that hold an unsigned size or rate. A negative
+# one is not a reading, also when an earlier writer saved it (#1299).
+UNSIGNED_SLOT_DETAIL_FIELDS = ("logical_block_size", "physical_block_size")
+UNSIGNED_STORED_SMART_FIELDS = (*UNSIGNED_SLOT_DETAIL_FIELDS, "rotation_rate_rpm")
+# The QuantaStor node whose data produced a saved entry's SMART paths. A path
+# names a device only on that node; a saved list without it, as every entry
+# written before this key existed, is not restored (#1318).
+QUANTASTOR_SMART_NODE_SLOT_FIELD = "quantastor_smart_device_node"
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -5511,6 +5519,7 @@ class InventoryService(InventorySourceCollectionMixin):
 
         if loaded_entries is None:
             loaded_entries = self.slot_detail_store.load_all()
+        quantastor = self.system.truenas.platform == "quantastor"
         for slot_view in slots:
             entry = self._bound_slot_detail_entry(
                 slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
@@ -5527,6 +5536,15 @@ class InventoryService(InventorySourceCollectionMixin):
                     continue
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
+                    continue
+                if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
+                    continue
+                saved_node = entry.slot_fields.get(QUANTASTOR_SMART_NODE_SLOT_FIELD)
+                if field_name == "smart_device_names" and quantastor and (
+                    saved_node is None or saved_node != self._quantastor_slot_smart_node(slot_view)
+                ):
+                    # Unknown provenance is unproven: only paths saved from
+                    # this disk's own node may stand in for current ones.
                     continue
                 current_value = getattr(slot_view, field_name)
                 if not self._slot_detail_field_missing(current_value):
@@ -5631,6 +5649,12 @@ class InventoryService(InventorySourceCollectionMixin):
                 slot_fields[field_name] = value.model_dump(mode="json")
             else:
                 slot_fields[field_name] = value
+        if "smart_device_names" in slot_fields and self.system.truenas.platform == "quantastor":
+            # These paths are the current node's own or were restored only
+            # because they were saved from it; say which node that is.
+            smart_node = self._quantastor_slot_smart_node(slot_view)
+            if smart_node:
+                slot_fields[QUANTASTOR_SMART_NODE_SLOT_FIELD] = smart_node
 
         smart_fields: dict[str, Any] = {}
         smart_updated_at: str | None = None
@@ -11720,16 +11744,8 @@ class InventoryService(InventorySourceCollectionMixin):
             rotation_rate = 0
         # The slot's block sizes are a reading from the bay; only a
         # non-negative one may stand in for the disk's own.
-        slot_logical_block_size = (
-            slot_view.logical_block_size
-            if isinstance(slot_view.logical_block_size, int) and slot_view.logical_block_size >= 0
-            else None
-        )
-        slot_physical_block_size = (
-            slot_view.physical_block_size
-            if isinstance(slot_view.physical_block_size, int) and slot_view.physical_block_size >= 0
-            else None
-        )
+        slot_logical_block_size = self._unsigned_block_size(slot_view.logical_block_size)
+        slot_physical_block_size = self._unsigned_block_size(slot_view.physical_block_size)
         form_factor = normalize_text(raw_disk.get("formFactor") or raw_disk.get("diskFormFactor"))
         smart_health_status = normalize_text(raw_disk.get("smartHealthTest"))
         if smart_health_status and smart_health_status.startswith("[") and smart_health_status.endswith("]"):
@@ -17419,8 +17435,12 @@ class InventoryService(InventorySourceCollectionMixin):
         summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
         if summary.last_test_lifetime_hours is None:
             summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
-        summary.logical_block_size = summary.logical_block_size or slot_view.logical_block_size
-        summary.physical_block_size = summary.physical_block_size or slot_view.physical_block_size
+        # A negative slot block size is not a reading, whatever filled the
+        # slot; a refused one stays not read (#1299).
+        summary.logical_block_size = (
+            summary.logical_block_size or InventoryService._unsigned_block_size(slot_view.logical_block_size))
+        summary.physical_block_size = (
+            summary.physical_block_size or InventoryService._unsigned_block_size(slot_view.physical_block_size))
         summary.logical_unit_id = summary.logical_unit_id or slot_view.logical_unit_id
         summary.sas_address = summary.sas_address or slot_view.sas_address
         if summary.power_on_hours is not None and summary.power_on_days is None:
@@ -17444,7 +17464,26 @@ class InventoryService(InventorySourceCollectionMixin):
         summary = SmartSummaryView.model_validate(smart_fields)
         summary.unread_fields = [name for name in summary.unread_fields if name in POWER_ON_FIELDS]
         InventoryService._prune_unread_smart_fields(summary)
+        # An earlier writer saved negative sizes as readings (#1299).
+        for name in UNSIGNED_STORED_SMART_FIELDS:
+            if (getattr(summary, name) or 0) < 0:
+                setattr(summary, name, None)
+                summary.unread_fields = sorted({*summary.unread_fields, name})
         return InventoryService._refuse_negative_power_on(summary)
+
+    @staticmethod
+    def _unsigned_block_size(value: Any) -> int | None:
+        """A block size or None: a negative one is not a reading (#1299)."""
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    @staticmethod
+    def _quantastor_slot_smart_node(slot_view: SlotView) -> str | None:
+        """The node that reported this bay's QuantaStor disk, if it says (#1318)."""
+        raw_disk = slot_view.raw_status.get("disk_raw") if isinstance(slot_view.raw_status, dict) else None
+        if not isinstance(raw_disk, dict):
+            return None
+        return next(filter(None, (normalize_value_text(raw_disk.get(key))
+                                  for key in ("storageSystemId", "systemId", "controllerId"))), None)
 
     @staticmethod
     def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:
