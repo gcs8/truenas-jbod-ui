@@ -3,10 +3,12 @@
 Validation reads the member as one file and records its size and SHA-256.
 Activation copies the staged member through one opened descriptor into a
 private file, refuses it unless that copy has the validated size and digest,
-checks the copy and publishes only that copy. A segmented import holds its
-staged hot database and segments to the validated digests the same way. SQLite
-side files next to the staged member still refuse the import. Every fixture is
-synthetic and lives in a temporary directory.
+checks the copy and publishes only that copy. SQLite reads that copy as one
+file: a side file beside it at SQLite's first read refuses the import, one
+appearing later is ignored. A segmented import holds its staged hot database
+and segments to the validated digests the same way. SQLite side files next to
+the staged member still refuse the import. Every fixture is synthetic and lives
+in a temporary directory.
 """
 
 from __future__ import annotations
@@ -406,6 +408,172 @@ class MemberChecksOnThePrivateCopyTests(_ImportRootCleanup):
         member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
         self._restore(member)
         self.assertEqual(_metric_rows(self.live), [(ORDINARY, 0, 30), (ORDINARY, 1, 31)])
+
+    def test_member_whose_header_records_write_ahead_logging_is_installed(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        for suffix in ("-wal", "-shm"):
+            Path(f"{member}{suffix}").unlink(missing_ok=True)
+        self.assertEqual(member.read_bytes()[18:20], b"\x02\x02")
+        self._restore(member)
+        self.assertEqual(_metric_rows(self.live), [(ORDINARY, 0, 30), (ORDINARY, 1, 31)])
+
+
+def _committed_write_ahead_log(database: Path, work: Path, value: int) -> bytes:
+    """A committed write-ahead log for a copy of ``database`` that sets every
+    sample to ``value``."""
+    work.mkdir()
+    copy = work / "copy.sqlite3"
+    shutil.copyfile(database, copy)
+    connection = sqlite3.connect(copy)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("UPDATE metric_samples SET value_integer = ?", (value,))
+        connection.commit()
+        content = Path(f"{copy}-wal").read_bytes()
+    finally:
+        connection.close()
+    shutil.rmtree(work)
+    return content
+
+
+def _hot_rollback_journal(database: Path, work: Path, value: int) -> bytes:
+    """A hot rollback journal for a copy of ``database`` whose saved pages set
+    every sample to ``value``: SQLite replays it at its first read."""
+    work.mkdir()
+    copy = work / "copy.sqlite3"
+    shutil.copyfile(database, copy)
+    connection = sqlite3.connect(copy, isolation_level=None)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("UPDATE metric_samples SET value_integer = ?", (value,))
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE metric_samples SET value_integer = 1")
+        content = Path(f"{copy}-journal").read_bytes()
+        connection.execute("ROLLBACK")
+    finally:
+        connection.close()
+    shutil.rmtree(work)
+    return content
+
+
+class PrivateCopySideFilesTests(_ImportRootCleanup):
+    """SQLite reads no side file beside the private copy it checks and publishes.
+
+    A side file beside the private copy when SQLite first reads it refuses the
+    import; one that appears after that first read is ignored, and the
+    validated rows are installed.
+    """
+
+    _service = refusal.RollbackSnapshotTimestampBoundTests._service
+    _artifact = refusal.RollbackSnapshotTimestampBoundTests._artifact
+    ORDINARY = ORDINARY
+    IMPORTED_ROWS = ImportInstallsTheValidatedMemberTests.IMPORTED_ROWS
+    PLANTED = {"-wal": 999, "-journal": 777}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self._directory.name)
+        self.artifact = self._artifact()
+        live_dir = self.root / "live-history"
+        live_dir.mkdir()
+        self.live = _history_database(live_dir / "history.sqlite3", [ORDINARY])
+        self.target = self._service(self.root / "target", self.live)
+        self.original_dump = _dump(self.live)
+        self.private: list[Path] = []
+        self.planted: list[str] = []
+
+    def _plant(self, private: Path, suffix: str) -> None:
+        work = self.root / f"plant-work-{len(self.planted)}"
+        if suffix == "-wal":
+            content = _committed_write_ahead_log(private, work, self.PLANTED[suffix])
+        elif suffix == "-journal":
+            content = _hot_rollback_journal(private, work, self.PLANTED[suffix])
+        else:
+            content = b"\0" * 32768
+        Path(f"{private}{suffix}").write_bytes(content)
+        self.planted.append(suffix)
+
+    def _import(self, *, after_copy: str | None = None, after_open: str | None = None) -> None:
+        """Run the real encrypted import. ``after_copy`` plants a side file
+        beside the private copy once the validated bytes are in it, before
+        SQLite opens it; ``after_open`` plants one after SQLite has read it,
+        just before the schema version gate."""
+        real_copy = HistoryStore._copy_validated_member
+        real_gate = store_module.require_restorable_schema_version
+
+        def copy_then_plant(source: Path, target_descriptor: int, *args: Any) -> None:
+            real_copy(source, target_descriptor, *args)
+            self.private.append(Path(os.readlink(f"/proc/self/fd/{target_descriptor}")))
+            if after_copy is not None:
+                self._plant(self.private[0], after_copy)
+
+        def plant_then_gate(version: int) -> None:
+            if after_open is not None and self.private and not self.planted:
+                self._plant(self.private[0], after_open)
+            real_gate(version)
+
+        with (
+            patch.object(HistoryStore, "_copy_validated_member", staticmethod(copy_then_plant)),
+            patch.object(store_module, "require_restorable_schema_version", plant_then_gate),
+        ):
+            self.target.import_bundle_from_file(self.artifact.path, passphrase=PASSPHRASE)
+
+    def _assert_refused_unchanged(self, refused: Any, suffix: str) -> None:
+        self.assertEqual(self.planted, [suffix], "the side file was never planted")
+        self.assertIn("private copy of the staged history member", str(refused.exception))
+        self.assertIn("current history was not changed", str(refused.exception))
+        self.assertEqual(_dump(self.live), self.original_dump)
+
+    def test_clean_import_installs_the_validated_rows(self) -> None:
+        self._import()
+        self.assertEqual(len(self.private), 1, "the private copy was never made")
+        self.assertEqual(_metric_rows(self.live), self.IMPORTED_ROWS)
+
+    def test_side_file_beside_the_private_copy_before_it_is_opened_is_refused(self) -> None:
+        for suffix in ("-wal", "-journal", "-shm"):
+            with self.subTest(suffix=suffix):
+                self.private.clear()
+                self.planted.clear()
+                with self.assertRaises(ValueError) as refused:
+                    self._import(after_copy=suffix)
+                self._assert_refused_unchanged(refused, suffix)
+
+    def test_write_ahead_log_after_the_side_file_check_is_refused(self) -> None:
+        # The log appears once the side-file check has passed, before SQLite's
+        # first read: SQLite then reports write-ahead logging, which refuses.
+        real_check = getattr(HistoryStore, "_refuse_private_copy_side_files", None)
+
+        def check_then_plant(private: Path) -> None:
+            if real_check is not None:
+                real_check(private)
+            self._plant(private, "-wal")
+
+        with (
+            patch.object(
+                HistoryStore,
+                "_refuse_private_copy_side_files",
+                staticmethod(check_then_plant),
+                create=True,
+            ),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import()
+        self._assert_refused_unchanged(refused, "-wal")
+
+    def _assert_ignored(self, suffix: str) -> None:
+        self._import(after_open=suffix)
+        self.assertEqual(self.planted, [suffix], "the side file was never planted")
+        self.assertEqual(_metric_rows(self.live), self.IMPORTED_ROWS)
+
+    def test_write_ahead_log_appearing_after_the_first_read_is_ignored(self) -> None:
+        self._assert_ignored("-wal")
+
+    def test_rollback_journal_appearing_after_the_first_read_is_ignored(self) -> None:
+        self._assert_ignored("-journal")
 
 
 class SegmentedImportInstallsTheValidatedMembersTests(_ImportRootCleanup):
