@@ -60,8 +60,8 @@ class HistoryOperationBoundsTests(unittest.TestCase):
 
     def test_contract_constants_are_server_owned(self) -> None:
         self.assertEqual(HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS, 1)
-        self.assertEqual(MAX_SCOPES, 32)
-        self.assertEqual(MAX_TARGETS, 347)
+        self.assertEqual(MAX_SCOPES, 256)
+        self.assertEqual(MAX_TARGETS, 16384)
         self.assertEqual(MAX_EVENT_ROWS, 4096)
         self.assertEqual(MAX_RETURNED_ROWS, 36000)
         self.assertEqual(MAX_HISTORY_HOURS, 8760)

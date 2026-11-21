@@ -23,8 +23,12 @@ HISTORY_METRIC_MAX_LIMITS = {
     "power_on_hours": 60,
 }
 INTERNAL_HISTORY_METRIC_MAX_LIMITS = {**HISTORY_METRIC_MAX_LIMITS, "temperature": 96}
-MAX_SCOPES = 32
-MAX_TARGETS = 347
+# #1310: the scope and bay counts only stop a runaway request and sit far above
+# real hardware (one SAS expander carries up to 1,024 disks). The work and the
+# reply size stay bounded by the event-row, returned-row, request-byte and
+# response-byte budgets below, which every admitted read still has to pass.
+MAX_SCOPES = 256
+MAX_TARGETS = 16384
 MAX_METRICS = len(ALLOWED_HISTORY_METRICS)
 MAX_EVENT_ROWS = 4096
 MAX_RETURNED_ROWS = 36000
@@ -49,7 +53,7 @@ class HistoryBudgetExceeded(ValueError):
         self.limit_name = limit_name
         self.value = value
         self.limit = limit
-        super().__init__(f"History request exceeds {limit_name} limit ({limit}).")
+        super().__init__(f"History request exceeds {limit_name} limit ({limit}); {value} requested.")
 
 
 class HistoryReadBusy(RuntimeError):
