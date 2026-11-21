@@ -132,6 +132,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_prometheus_alert_rules",
         "test_public_demo_provenance",
         "test_public_screenshots",
+        "test_qa_script_credentials",
         "test_segment_sealer",
         "test_segmented_history_reader",
         "test_snapshot_export",
