@@ -74,6 +74,7 @@ from app.config import (
 from app.models.domain import ManualMapping, SasFabricAlias
 from app.services.json_state_budget import (
     JsonStateFileRefused,
+    JsonStateFileTooLarge,
     check_json_state,
     read_json_state,
 )
@@ -4102,6 +4103,9 @@ class SystemBackupService:
             except HistorySchemaVersionError as exc:
                 raise ValueError(exc.reason) from exc
             except JsonStateFileRefused as exc:
+                if isinstance(exc, JsonStateFileTooLarge) and exc.unit == "levels of nesting":
+                    # Preserve the streaming validator's existing depth diagnostic.
+                    raise ValueError(f"Backup bundle selected {group_key} member is invalid.") from exc
                 raise ValueError(
                     f"Backup bundle member {exc.name} is {exc.detail}, so the application "
                     "would not load it after a restore."

@@ -19,7 +19,10 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 import zipfile
@@ -141,7 +144,23 @@ def _realistic_entry(index: int) -> SlotDetailCacheEntry:
 
 
 def _counted_items(data: bytes) -> int:
-    return 1 + sum(data.count(marker) for marker in (b",", b":", b"{", b"["))
+    """Independent structural upper bound: values, keys and empty containers.
+
+    Read the parsed tree rather than the scanner's markers. Quoted identity
+    keys can contain colons that no longer consume the structural budget.
+    """
+    pending = [json.loads(data)]
+    items = 0
+    while pending:
+        value = pending.pop()
+        items += 1
+        if isinstance(value, dict):
+            items += len(value) + int(not value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            items += int(not value)
+            pending.extend(value)
+    return items
 
 
 def _write_bulk(path: Path, head: bytes, values: int, tail: bytes, item: bytes = b"0.5") -> None:
@@ -927,6 +946,126 @@ class DeeplyNestedJsonTests(_TempDirTestCase):
                             packaging="zip", included_paths=[group_key],
                             scrub_secrets=scrub, scrub_disk_identifiers=scrub,
                         ).cleanup())
+
+
+class JsonStringScanTests(unittest.TestCase):
+    """String contents never consume structural budgets or an expanding scan stack."""
+
+    def _at_item_limit(self, document: bytes, items: int, *, chunk_size: int) -> None:
+        budget = _budget_module()
+        json.loads(document)  # Every boundary probe is valid JSON.
+        with mock.patch.object(budget, "JSON_STATE_READ_CHUNK_BYTES", chunk_size), \
+                mock.patch.object(budget, "MAX_JSON_STATE_FILE_ITEMS", items):
+            try:
+                self.assertEqual(budget.read_json_state(io.BytesIO(document), "state.json"), document)
+                budget.check_json_state(io.BytesIO(document), "state.json")
+            except budget.JsonStateFileRefused as exc:
+                self.fail(f"valid JSON at its structural item limit was refused: {exc}")
+            with mock.patch.object(budget, "MAX_JSON_STATE_FILE_ITEMS", items - 1):
+                for scan in (budget.read_json_state, budget.check_json_state):
+                    with self.assertRaisesRegex(budget.JsonStateFileTooLarge, "keys and values"):
+                        scan(io.BytesIO(document), "state.json")
+
+    def test_escape_heavy_string_scan_has_chunk_bounded_overhead(self) -> None:
+        # Isolate tracemalloc from coverage and other tests. Allocate the input
+        # first: check retains no data; read necessarily retains and joins it.
+        code = textwrap.dedent(r'''
+            import gc
+            import io
+            import json
+            import tracemalloc
+            from app.services import json_state_budget as budget
+
+            document = b'{"padding":"' + b'\\n' * (2 * 1024 * 1024) + b'"}'
+            assert len(json.loads(document)["padding"]) == 2 * 1024 * 1024
+            peaks = {}
+            for label, scan in (("check", budget.check_json_state), ("read", budget.read_json_state)):
+                source = io.BytesIO(document)
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    result = scan(source, "state.json")
+                    _, peaks[label] = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+                assert result == document if label == "read" else result is None
+                del result
+            print(json.dumps({"document_bytes": len(document),
+                              "chunk_bytes": budget.JSON_STATE_READ_CHUNK_BYTES, **peaks}))
+        ''')
+        completed = subprocess.run(
+            [sys.executable, "-B", "-c", code], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=90, check=True,
+        )
+        peaks = json.loads(completed.stdout)
+        print("String scan heap bytes: " + json.dumps(peaks, sort_keys=True), flush=True)
+        self.assertLess(peaks["check"], 4 * peaks["chunk_bytes"], "check retained the string")
+        self.assertLess(
+            peaks["read"], 2 * peaks["document_bytes"] + 4 * peaks["chunk_bytes"],
+            "read built an escape-proportional scan stack",
+        )
+
+    def test_escape_and_string_state_carry_across_chunk_boundaries(self) -> None:
+        # An escaped quote followed by brackets must remain inside the string,
+        # even if the backslash is the last byte of a chunk. Include pairs of
+        # backslashes too: only an odd run escapes the following quote.
+        for text in ('"' + '[{' * 200, '\\"' + '[{' * 200, '\\', 'a\nb'):
+            document = b'[' + json.dumps(text).encode("ascii") + b',0]'
+            for chunk_size in range(1, 33):
+                with self.subTest(text=text[:4], chunk_size=chunk_size):
+                    self._at_item_limit(document, 3, chunk_size=chunk_size)
+
+    def test_quoted_structural_characters_do_not_count(self) -> None:
+        document = json.dumps({"text": ',:{[' * 200}).encode("ascii")
+        self._at_item_limit(document, 3, chunk_size=7)
+
+    def test_quotes_inside_strings_and_even_backslashes(self) -> None:
+        for text in ('"', '\\"', '\\\\"', '"end\\', '\\\\'):
+            with self.subTest(text=text):
+                document = json.dumps({text: [text, 0]}, separators=(",", ":")).encode("ascii")
+                self._at_item_limit(document, 5, chunk_size=2)
+
+    def test_unicode_escapes_and_utf8_do_not_become_structural_bytes(self) -> None:
+        for document in (
+            br'{"\u0022\u005c":"\u0022\u005c\u005b\u007b\u002c\u003a\ud83d\ude00"}',
+            json.dumps({"text": '\u00e9\U0001f600"\\[,:'}, ensure_ascii=False).encode("utf-8"),
+        ):
+            for chunk_size in (1, 5, 11):
+                with self.subTest(document=document, chunk_size=chunk_size):
+                    self._at_item_limit(document, 3, chunk_size=chunk_size)
+
+    def test_structural_count_is_an_upper_bound_for_valid_json(self) -> None:
+        def values(value: Any) -> int:
+            if isinstance(value, dict):
+                return 1 + sum(1 + values(child) for child in value.values())
+            if isinstance(value, list):
+                return 1 + sum(values(child) for child in value)
+            return 1
+
+        def empty_containers(value: Any) -> int:
+            if isinstance(value, (dict, list)):
+                children = value.values() if isinstance(value, dict) else value
+                return int(not value) + sum(empty_containers(child) for child in children)
+            return 0
+
+        for value in (None, 0, True, '"\\,:[{', [], {}, [1, 2], {"a": 0},
+                      {"a": [[], {}, {"b": [1, '"\\,:[{']}]}, [[], [], {}]):
+            document = json.dumps(value, separators=(",", ":")).encode("ascii")
+            # Each empty container adds one conservative item; all other
+            # keys, values and containers are counted exactly.
+            items = values(value) + empty_containers(value)
+            with self.subTest(value=value):
+                self._at_item_limit(document, items, chunk_size=3)
+
+    def test_load_and_check_share_depth_limit_across_chunks(self) -> None:
+        budget = _budget_module()
+        for chunk_size in (1, 7, 1024):
+            with self.subTest(chunk_size=chunk_size), \
+                    mock.patch.object(budget, "JSON_STATE_READ_CHUNK_BYTES", chunk_size):
+                for scan in (budget.read_json_state, budget.check_json_state):
+                    scan(io.BytesIO(_nested(DEPTH_LIMIT)), "state.json")
+                    with self.assertRaisesRegex(budget.JsonStateFileTooLarge, "levels of nesting"):
+                        scan(io.BytesIO(_nested(DEPTH_LIMIT + 1)), "state.json")
 
 
 @contextmanager

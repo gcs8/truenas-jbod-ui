@@ -16,10 +16,11 @@ only to the size it had when opened: one that is not a regular file, or that
 changes size while it is read, is refused like an unreadable file.
 
 The item count is taken from the file's bytes as they are read: one plus the
-number of commas, colons, ``{`` and ``[``. In valid JSON each key has
-exactly one colon and a container with k > 0 children has k - 1 commas, so
-this bounds the number of keys plus values from above; separators inside
-strings only add to it.
+number of commas, colons, ``{`` and ``[`` outside strings. In valid JSON each
+key has exactly one colon and a container with k > 0 children has k - 1
+commas, so this bounds the number of keys plus values from above. The same
+linear scan measures nesting, carrying string and escape state between
+chunks without keeping string contents or a per-escape stack.
 
 Sizing: the largest slot detail entry the inventory writes (every stable
 slot and SMART field, a two-path multipath block) is about 3 KB and 155
@@ -33,9 +34,7 @@ objects), where before it was bounded only by the archive member limit.
 from __future__ import annotations
 
 import os
-import re
 import stat
-from itertools import accumulate
 from typing import Any, IO
 
 MAX_JSON_STATE_FILE_BYTES = 64 * 1024 * 1024
@@ -46,10 +45,6 @@ JSON_STATE_READ_CHUNK_BYTES = 1024 * 1024
 # Checked on the bytes before parsing, so no parser recursion limit (which
 # depends on the interpreter and its stack) decides whether a file is read.
 MAX_JSON_STATE_FILE_DEPTH = 128
-_ITEM_MARKERS = (b",", b":", b"{", b"[")
-_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
-_NOT_BRACKETS = bytes(byte for byte in range(256) if byte not in b"[]{}")
-_BRACKET_STEP = tuple(1 if byte in b"[{" else -1 for byte in range(256))
 
 
 class JsonStateFileRefused(ValueError):
@@ -112,6 +107,9 @@ def _scan(source: IO[bytes], name: str, *, retain: bool, size: int | None) -> by
     chunks: list[bytes] = []
     total = 0
     items = 1
+    depth = 0
+    in_string = False
+    escaped = False
     while True:
         chunk = source.read(min(JSON_STATE_READ_CHUNK_BYTES, limit + 1 - total))
         if not isinstance(chunk, (bytes, bytearray)):
@@ -123,7 +121,27 @@ def _scan(source: IO[bytes], name: str, *, retain: bool, size: int | None) -> by
             if size is None:
                 raise JsonStateFileTooLarge(name, max_bytes, "bytes")
             raise JsonStateFileChanged(name, "larger than when it was opened")
-        items += sum(chunk.count(marker) for marker in _ITEM_MARKERS)
+        # Each byte is visited once. Only these two flags cross a string
+        # boundary; no string copy or stack grows with its escape count.
+        for byte in chunk:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif byte == 92:  # backslash
+                    escaped = True
+                elif byte == 34:  # quote
+                    in_string = False
+            elif byte == 34:
+                in_string = True
+            elif byte in (123, 91):  # { [
+                items += 1
+                depth += 1
+                if depth > MAX_JSON_STATE_FILE_DEPTH:
+                    raise JsonStateFileTooLarge(name, MAX_JSON_STATE_FILE_DEPTH, "levels of nesting")
+            elif byte in (125, 93):  # } ]
+                depth -= 1
+            elif byte in (44, 58):  # , :
+                items += 1
         if items > max_items:
             raise JsonStateFileTooLarge(name, max_items, "keys and values")
         if retain:
@@ -131,12 +149,6 @@ def _scan(source: IO[bytes], name: str, *, retain: bool, size: int | None) -> by
     if size is not None and total != size:
         raise JsonStateFileChanged(name, "smaller than when it was opened")
     return b"".join(chunks) if retain else None
-
-
-def _nesting_depth(data: bytes) -> int:
-    """The deepest container nesting in ``data``; brackets in strings do not count."""
-    brackets = _JSON_STRING.sub(b"", data).translate(None, _NOT_BRACKETS)
-    return max(accumulate(map(_BRACKET_STEP.__getitem__, brackets)), default=0)
 
 
 def read_json_state(source: IO[bytes], name: str, *, size: int | None = None) -> bytes:
@@ -149,8 +161,6 @@ def read_json_state(source: IO[bytes], name: str, *, size: int | None = None) ->
     """
     data = _scan(source, name, retain=True, size=size)
     assert data is not None
-    if _nesting_depth(data) > MAX_JSON_STATE_FILE_DEPTH:
-        raise JsonStateFileTooLarge(name, MAX_JSON_STATE_FILE_DEPTH, "levels of nesting")
     return data
 
 
