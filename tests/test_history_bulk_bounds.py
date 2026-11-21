@@ -19,7 +19,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from history_service import main as history_main
-from history_service.operation_bounds import MAX_RESPONSE_BYTES
+from history_service.operation_bounds import MAX_RESPONSE_BYTES, MAX_TARGETS
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.store import HistoryStore
 
@@ -252,7 +252,7 @@ class HistoryBulkRouteBoundsTests(unittest.TestCase):
             {"slots": [], "metrics": ["temperature_c"], "since": SINCE, "event_limit": 0, "metric_limit": 24},
             {"slots": [0], "metrics": ["temperature_c"], "since": None, "event_limit": 0, "metric_limit": 24},
             {"slots": [0], "metrics": ["unknown"], "since": SINCE, "event_limit": 0, "metric_limit": 24},
-            {"slots": list(range(348)), "metrics": ["temperature_c"], "since": SINCE, "event_limit": 0, "metric_limit": 24},
+            {"slots": list(range(MAX_TARGETS + 1)), "metrics": ["temperature_c"], "since": SINCE, "event_limit": 0, "metric_limit": 24},
         )
         with patch.object(history_main, "store", store):
             for arguments in cases:

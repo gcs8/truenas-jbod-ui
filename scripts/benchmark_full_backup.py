@@ -51,6 +51,8 @@ if str(ROOT) not in sys.path:
 
 MIB = 1024**2
 GIB = 1024**3
+# New address space each phase may map on top of what its worker inherits.
+ADDRESS_SPACE_BUDGET_BYTES = GIB
 CHUNK_BYTES = MIB
 BATCH_ROWS = 64
 MAX_TARGET_BYTES = 4 * GIB
@@ -334,6 +336,16 @@ def operation(phase: str, request: dict) -> dict:
         service._cleanup_extracted_archive(meta.get("_cleanup_root"))
 
 
+def address_space_bytes() -> int:
+    """This process's current virtual size, the figure RLIMIT_AS is checked against."""
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            fields = line.split()
+            if fields[:1] == ["VmSize:"] and len(fields) == 3 and fields[2] == "kB" and fields[1].isdigit():
+                return int(fields[1]) * 1024
+    raise ValueError("address space size unavailable")
+
+
 def worker(phase: str) -> int:
     try:
         request = json.loads(sys.stdin.readline(8192))
@@ -341,9 +353,17 @@ def worker(phase: str) -> int:
         timeout = request["timeout"]
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
             return 1
+        # An owned worker is a fork of the supervisor and starts with the
+        # supervisor's whole address space. The 1 GiB budget is for the
+        # phase, so it sits on top of that inherited image. A flat 1 GiB
+        # limit left no room once the supervisor itself neared 1 GiB, and
+        # the phase's first new mapping (for example the stack glibc maps
+        # for posix_spawn) failed with ENOMEM.
+        inherited = address_space_bytes()
+        address_space_limit = inherited + ADDRESS_SPACE_BUDGET_BYTES
     except (ValueError, TypeError, KeyError, OSError):
         return 1
-    resource.setrlimit(resource.RLIMIT_AS, (GIB, GIB))
+    resource.setrlimit(resource.RLIMIT_AS, (address_space_limit, address_space_limit))
     resource.setrlimit(resource.RLIMIT_CPU, (math.ceil(timeout), math.ceil(timeout) + 1))
     resource.setrlimit(resource.RLIMIT_FSIZE, (6 * GIB, 6 * GIB))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -358,7 +378,9 @@ def worker(phase: str) -> int:
     result.update({"state": "complete", "phase": phase,
                    "wall_seconds": time.monotonic() - started,
                    "cpu_seconds": own.ru_utime + own.ru_stime + descendants.ru_utime + descendants.ru_stime,
-                   "peak_rss_bytes": max(own.ru_maxrss, descendants.ru_maxrss) * 1024})
+                   "peak_rss_bytes": max(own.ru_maxrss, descendants.ru_maxrss) * 1024,
+                   "address_space_inherited_bytes": inherited,
+                   "address_space_limit_bytes": address_space_limit})
     print(json.dumps(result, allow_nan=False))
     return 0
 
@@ -422,13 +444,18 @@ class OwnedWorkerProcess:
         return self.returncode
 
 
+# Per-phase fields; null when the phase did not report them (failed, timed out,
+# cancelled or blocked phases).
+UNKNOWN_ADDRESS_SPACE = {"address_space_inherited_bytes": None, "address_space_limit_bytes": None}
+
+
 def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: float, owned_phase=None) -> dict:
     """Run a phase with bounded pipe capture; never retain stderr or secrets."""
     scratch = scratch.resolve(strict=True)
     started = time.monotonic()
     result = {"state": "failed", "wall_seconds": None, "cpu_seconds": None,
               "peak_rss_bytes": None, "input_bytes": None, "output_bytes": None,
-              "exit_code": None}
+              "exit_code": None, **UNKNOWN_ADDRESS_SPACE}
     wire = json.dumps(request).encode()
     if len(wire) > 8192:
         return result
@@ -503,6 +530,13 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
                 for key in ("fixture", "rows", "archive_sha256"):
                     if key in payload:
                         result[key] = payload[key]
+                inherited = payload.get("address_space_inherited_bytes")
+                limit = payload.get("address_space_limit_bytes")
+                # Only a limit that is exactly inherited size plus the budget;
+                # anything else stays unknown rather than misreported.
+                if type(inherited) is int and type(limit) is int and inherited > 0 \
+                        and limit == inherited + ADDRESS_SPACE_BUDGET_BYTES:
+                    result.update(address_space_inherited_bytes=inherited, address_space_limit_bytes=limit)
     except (ValueError, TypeError, AttributeError):
         pass
     return result
@@ -520,7 +554,16 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
               "sqlite": sqlite3.sqlite_version, "profile": PROFILES[archive_format],
               "worker_cap": PROFILES[archive_format]["workers"],
               "fixture_limits": fixture_limits(),
-              "per_process_address_space_limit_bytes": GIB, "phase_timeout_seconds": timeout,
+              "per_phase_address_space_budget_bytes": ADDRESS_SPACE_BUDGET_BYTES,
+              # Kept for existing readers. Before the budget became relative
+              # this was the absolute limit; it now equals the budget.
+              "per_process_address_space_limit_bytes": ADDRESS_SPACE_BUDGET_BYTES,
+              "per_process_address_space_limit_bytes_meaning": (
+                  "legacy name: equals per_phase_address_space_budget_bytes, not the limit a phase ran under;"
+                  " see phases[].address_space_limit_bytes"),
+              "address_space_limit_scope": ("each phase's RLIMIT_AS (soft and hard) is the address space its forked"
+                                            " worker inherited plus the budget; phases[] records both, null if unreported"),
+              "phase_timeout_seconds": timeout,
               "process_model": "forked owned-scratch workers; RSS includes inherited supervisor memory",
               "rss_scope": "max Linux process high-water RSS across worker and reaped descendants; not concurrent aggregate",
               "timing_scope": "whole production operations; overlapping work, not additive; fixture excluded from backup timing",
@@ -539,7 +582,8 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
             if blocked:
                 report["phases"].append({"phase": phase, "state": "blocked", "reason": blocked,
                                          "wall_seconds": None, "cpu_seconds": None, "peak_rss_bytes": None,
-                                         "input_bytes": None, "output_bytes": None, "exit_code": None})
+                                         "input_bytes": None, "output_bytes": None, "exit_code": None,
+                                         **UNKNOWN_ADDRESS_SPACE})
                 continue
             with tempfile.TemporaryDirectory(prefix="phase-", dir=run) as scratch:
                 request = {"root": str(run), "target_bytes": target_bytes, "seed": seed,

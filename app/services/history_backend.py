@@ -16,6 +16,7 @@ from app.request_context import request_id_headers
 from app.services.history_status import project_public_collector_status
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
+    MAX_REQUEST_BYTES,
     HistoryBudgetExceeded,
     HistoryRequestShapeError,
     build_history_read_plan,
@@ -414,8 +415,10 @@ class HistoryBackendClient:
             histories = payload.get("histories")
             if not isinstance(histories, dict):
                 raise HistoryBackendResponseError(0, "History backend returned a malformed histories payload.")
-        except (HistoryBudgetExceeded, HistoryRequestShapeError) as exc:
-            raise ValueError(str(exc)) from exc
+        except (HistoryBudgetExceeded, HistoryRequestShapeError):
+            # Both are ValueError subclasses; keep the type so a route can
+            # answer a budget refusal with 413 and its counts.
+            raise
         except HistoryBackendUnavailableError as exc:
             logger.warning("History backend scope history request failed (%s).", _log_reason(exc))
             return {
@@ -497,6 +500,10 @@ class HistoryBackendClient:
 
     async def _send_json(self, path: str, document: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(body) > MAX_REQUEST_BYTES:
+            # The history service refuses this body anyway; refuse it here, with
+            # its size, so the page gets a counted budget error and no request is sent.
+            raise HistoryBudgetExceeded("request_bytes", len(body), MAX_REQUEST_BYTES)
         headers = {"Content-Type": "application/json"}
         if self.config.refresh_token is not None:
             headers["Authorization"] = f"Bearer {self.config.refresh_token.get_secret_value()}"

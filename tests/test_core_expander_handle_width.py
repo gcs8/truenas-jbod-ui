@@ -67,8 +67,14 @@ def _one_expander(text: str) -> dict:
     return parsed[0]
 
 
+def _blank_parent_header(address: str, dev_handle: str, enclosure_field: str) -> str:
+    # A zero parent handle is printed as four blanks in its fixed column.
+    return f"  00    {address}    {dev_handle}                {enclosure_field}       1\n"
+
+
 ORDINARY = _header(EXPANDER_A, "0009", "0009")
 FIVE_DIGIT = _header(EXPANDER_B, "000c", "10000")
+BLANK_PARENT_FIVE_DIGIT = _blank_parent_header(EXPANDER_B, "000c", "10000")
 
 
 class FiveDigitHandleParseTests(unittest.TestCase):
@@ -93,6 +99,16 @@ class FiveDigitHandleParseTests(unittest.TestCase):
         parsed = _one_expander(_header(EXPANDER_B, "000c", "70000"))
         self.assertEqual(parsed["sas_address"], EXPANDER_B)
         self.assertIsNone(parsed["enc_handle"])
+
+    def test_five_digit_handle_with_a_blank_parent_is_read(self) -> None:
+        # Only the fixed-column header form reads a blank parent field (#1423).
+        for printed, expected in (("10000", "2710"), ("65535", "ffff")):
+            with self.subTest(printed=printed):
+                parsed = _one_expander(_blank_parent_header(EXPANDER_B, "000c", printed))
+                self.assertEqual(parsed["sas_address"], EXPANDER_B)
+                self.assertEqual(parsed["dev_handle"], "000c")
+                self.assertIsNone(parsed["parent"])
+                self.assertEqual(parsed["enc_handle"], expected)
 
     def test_mixed_reply_reads_both_expanders(self) -> None:
         parsed = parse_mpr_expanders(ORDINARY + FIVE_DIGIT)
@@ -122,6 +138,17 @@ class ExpanderListCompletenessTests(unittest.TestCase):
 
         self.assertEqual((state, count), ("read", "complete"))
         # The expander behind the five-digit handle is drawn in its enclosure's scope.
+        self.assertEqual([node.raw_id for node in nodes], [EXPANDER_B])
+        [enclosure] = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
+        self.assertEqual(enclosure.raw_id, ENCLOSURE_B)
+        self.assertEqual([(link.source, link.target) for link in links], [(nodes[0].id, enclosure.id)])
+        self.assertNotIn(LIST_WARNING, fabric.warnings)
+
+    def test_blank_parent_five_digit_reply_reads_every_expander(self) -> None:
+        fabric, state, count, nodes, links = self._read(ORDINARY + BLANK_PARENT_FIVE_DIGIT, ENCLOSURE_B)
+
+        self.assertEqual((state, count), ("read", "complete"))
+        # The blank-parent expander is drawn in its five-digit enclosure's scope.
         self.assertEqual([node.raw_id for node in nodes], [EXPANDER_B])
         [enclosure] = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
         self.assertEqual(enclosure.raw_id, ENCLOSURE_B)

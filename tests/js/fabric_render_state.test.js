@@ -123,16 +123,29 @@ function makeElement(id, focusLog) {
     classList: { toggle() {}, add() {}, remove() {} },
     closest() { return null; },
     querySelector() { return null; },
+    // A rebuilt element starts unscrolled, so per-tag scroll offsets live on
+    // the container and are cleared by every innerHTML write.
+    regionScroll: new Map(),
     querySelectorAll(selector) {
       const pairs = attributePairs(selector);
-      if (!pairs.length) return [];
+      const present = Array.from(selector.matchAll(/\[([\w-]+)\]/g)).map((match) => match[1]);
+      if (!pairs.length && !present.length) return [];
       return Array.from(element._innerHTML.matchAll(/<[a-z]+\b[^>]*>/g))
         .map((match) => match[0])
         .filter((tag) => pairs.every(([name, value]) => tag.includes(`${name}="${value}"`)))
+        .filter((tag) => present.every((name) => tag.includes(` ${name}="`)))
         .map((tag) => ({
           tag,
           focus() { focusLog.push(tag); },
           setSelectionRange(start, end) { focusLog.push(`selection:${start}:${end}`); },
+          getAttribute(name) {
+            const match = tag.match(new RegExp(` ${name}="([^"]*)"`));
+            return match ? match[1] : null;
+          },
+          get scrollLeft() { return element.regionScroll.get(tag)?.left || 0; },
+          set scrollLeft(value) { element.regionScroll.set(tag, { ...element.regionScroll.get(tag), left: value }); },
+          get scrollTop() { return element.regionScroll.get(tag)?.top || 0; },
+          set scrollTop(value) { element.regionScroll.set(tag, { ...element.regionScroll.get(tag), top: value }); },
         }));
     },
     setAttribute() {},
@@ -146,6 +159,7 @@ function makeElement(id, focusLog) {
       element.innerHTMLWrites += 1;
       element.scrollTop = 0;
       element.scrollLeft = 0;
+      element.regionScroll.clear();
     },
   });
   return element;
@@ -731,4 +745,112 @@ test("alias ownership: failed same-scope refresh stays inert and mismatched succ
   assert.equal(page.elements.get("fabric-map-panel").inert, true, "displayed and selected enclosure must agree");
   submitFabricAlias(page, form);
   assert.equal(page.requests.filter((request) => request.options.method === "POST").length, 0);
+});
+
+// The Recent event sample's scroll region is keyboard-focusable (a narrow screen
+// scrolls the wide table without a mouse). A pending SMART read that completes
+// re-renders the map with innerHTML, so the region needs a per-table identity
+// in the focus memory, and its scroll offset must survive the rebuild.
+function pageWithOpenEventSample() {
+  const page = loadFabricPage();
+  const controller = page.fabric.nodes.find((node) => node.id === "controller:mpr1");
+  controller.metrics.kernel_diagnostics = {
+    event_count: 3,
+    devices: ["da3"],
+    recent_events: [
+      { device: "da3", message: "synthetic error", severity: "error" },
+      { device: "da3", message: "synthetic warning", severity: "warning" },
+      { device: "da3", message: "synthetic info", severity: "info" },
+    ],
+  };
+  page.state.mode = "disk";
+  page.state.selectedTraceId = "bay:3";
+  page.state.selectedDiskTraceId = "bay:3";
+  page.render();
+  for (const key of Object.keys(page.state.diagnosticTables)) {
+    page.state.diagnosticTables[key].open = true;
+    page.state.openEvidencePanels.add(key);
+  }
+  page.render();
+  return page;
+}
+
+function eventSampleRegionTag(page) {
+  const html = page.elements.get("fabric-map-panel").innerHTML;
+  const tag = html.match(/<div\b[^>]*class="fabric-diagnostic-table-wrap"[^>]*>/)?.[0];
+  assert.ok(tag, "the renderer emits the event sample's scroll region");
+  assert.match(tag, /tabindex="0"/, "the region is keyboard-focusable");
+  return tag;
+}
+
+function focusMapTag(page, tag) {
+  const attrs = new Map(Array.from(tag.matchAll(/([\w-]+)="([^"]*)"/g)).map((match) => [match[1], match[2]]));
+  const panel = page.elements.get("fabric-map-panel");
+  page.document.activeElement = {
+    getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+    hasAttribute: (name) => attrs.has(name),
+    closest: (selector) => (selector.includes("#fabric-map-panel") ? panel : null),
+  };
+  return panel;
+}
+
+async function completePendingSmartRead(page, panel) {
+  const writes = panel.innerHTMLWrites;
+  const renders = page.counters.renders;
+  assert.equal(page.fetchLog.filter((url) => url.includes("/api/slots/3/smart")).length, 1, "one SMART read is pending");
+  await page.resolvePending();
+  assert.ok(page.counters.renders > renders, "the SMART result re-renders the page");
+  assert.ok(panel.innerHTMLWrites > writes, "the map holding the sample region is rebuilt");
+}
+
+test("control: the sample's filter box regains focus when a pending SMART read re-renders the map", async () => {
+  const page = pageWithOpenEventSample();
+  const html = page.elements.get("fabric-map-panel").innerHTML;
+  const tag = html.match(/<input\b[^>]*data-fabric-diagnostic-filter-key="[^"]*"[^>]*>/)?.[0];
+  assert.ok(tag);
+  const panel = focusMapTag(page, tag);
+  await completePendingSmartRead(page, panel);
+  assert.equal(page.focusLog.filter((entry) => entry.startsWith("<")).length, 1);
+  assert.match(page.focusLog[0], /data-fabric-diagnostic-filter-key/);
+});
+
+test("the event sample's scroll region keeps keyboard focus when a pending SMART read re-renders the map", async () => {
+  const page = pageWithOpenEventSample();
+  const tag = eventSampleRegionTag(page);
+  const tableKey = page.elements.get("fabric-map-panel").innerHTML.match(/data-fabric-diagnostic-table-key="([^"]+)"/)?.[1];
+  assert.ok(tableKey);
+  const panel = focusMapTag(page, tag);
+  await completePendingSmartRead(page, panel);
+  assert.equal(page.focusLog.length, 1, "the focused sample region must be re-focused after the rebuild");
+  assert.match(page.focusLog[0], /class="fabric-diagnostic-table-wrap"/);
+  assert.ok(page.focusLog[0].includes(`="${tableKey}"`), "the region is found by its own table's identity");
+});
+
+test("the event sample's scroll region keeps its scroll offset when a pending SMART read re-renders the map", async () => {
+  const page = pageWithOpenEventSample();
+  const panel = page.elements.get("fabric-map-panel");
+  const [region] = panel.querySelectorAll("[data-fabric-diagnostic-scroll-key]");
+  assert.ok(region, "the sample region carries a per-table scroll identity");
+  region.scrollLeft = 240;
+  region.scrollTop = 12;
+  focusMapTag(page, eventSampleRegionTag(page));
+  await completePendingSmartRead(page, panel);
+  const [rebuilt] = panel.querySelectorAll("[data-fabric-diagnostic-scroll-key]");
+  assert.equal(rebuilt.scrollLeft, 240, "horizontal offset survives the rebuild");
+  assert.equal(rebuilt.scrollTop, 12, "vertical offset survives the rebuild");
+});
+
+test("an unfocused event sample keeps its horizontal offset across a re-render", () => {
+  const page = pageWithOpenEventSample();
+  const panel = page.elements.get("fabric-map-panel");
+  const [region] = panel.querySelectorAll("[data-fabric-diagnostic-scroll-key]");
+  assert.ok(region, "the sample region carries a per-table scroll identity");
+  region.scrollLeft = 180;
+  page.document.activeElement = null;
+  const writes = panel.innerHTMLWrites;
+  page.render();
+  assert.ok(panel.innerHTMLWrites > writes);
+  const [rebuilt] = panel.querySelectorAll("[data-fabric-diagnostic-scroll-key]");
+  assert.equal(rebuilt.scrollLeft, 180);
+  assert.equal(page.focusLog.length, 0, "nothing is focused that was not focused before");
 });
