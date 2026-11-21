@@ -320,6 +320,10 @@ def effective_main_view_order(
         return [preferred, *(entry for entry in automatic if entry != preferred)]
     return automatic
 QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
+# Fields that name the node presenting a QuantaStor disk row, in the one order
+# used for disk selection, CLI correlation and SMART path admission. An I/O
+# fence ID is not among them: it is not the node that reports the path.
+QUANTASTOR_PRESENTING_NODE_FIELDS = ("storageSystemId", "systemId", "controllerId")
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
@@ -9834,11 +9838,7 @@ class InventoryService(InventorySourceCollectionMixin):
 
         records: list[DiskRecord] = []
         for disk, cli_hint in zip(raw_data.disks, cli_disk_hints):
-            owner_id = normalize_text(
-                str(disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId"))
-                if (disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId")) is not None
-                else None
-            )
+            owner_id = next(iter(self._quantastor_presenting_node_ids(disk)), None)
             if selected_system_id and owner_id and owner_id != selected_system_id:
                 continue
 
@@ -9931,10 +9931,8 @@ class InventoryService(InventorySourceCollectionMixin):
                 merged_raw = self._merge_quantastor_payloads(
                     self._quantastor_cli_health_fields(cli_hint), merged_raw)
                 merged_raw["quantastor_cli_disk"] = cli_hint
-                same_owner = (
-                    self._quantastor_cli_identity(disk)["owner"]
-                    & self._quantastor_cli_identity(cli_hint)["owner"]
-                )
+                disk_owner = self._quantastor_path_owner(disk)
+                same_owner = disk_owner is not None and disk_owner == self._quantastor_path_owner(cli_hint)
                 # Node-local paths are permitted only for SMART on the same
                 # owner. They never enter lookup keys, raw identity or bay aliases.
                 cli_hint = ({key: cli_hint[key] for key in (
@@ -10097,20 +10095,27 @@ class InventoryService(InventorySourceCollectionMixin):
             # A device path is local to the node that reported it (#1318). A
             # row admitted through a stable shared identity may place the disk
             # but never lends another node's path to SMART on this one. On a
-            # grid of several nodes a row of no known node lends none.
+            # grid of several nodes a row of no known node lends none. A row's
+            # own presenting node wins over its parent's, so a foreign one is
+            # refused; owner fields that disagree prove no node at all.
             if not isinstance(row, dict):
                 return False
-            owner = normalize_value_text(row.get("storageSystemId")) or parent_owner
+            nodes = self._quantastor_presenting_node_ids(row)
+            if len(nodes) > 1:
+                return False
+            owner = nodes[0] if nodes else parent_owner
             if owner is None or disk_node is None:
                 return not several_nodes
             return owner == disk_node
 
+        if len(self._quantastor_presenting_node_ids(disk)) > 1:
+            return []
         pool_device = pool_hint.get("pool_device_raw") if isinstance(pool_hint, dict) else None
         physical_disk_obj = pool_device.get("physicalDiskObj") if isinstance(pool_device, dict) else None
         hw_raw = hw_hint.get("hw_raw") if isinstance(hw_hint, dict) else None
         if not own_node(pool_device):
             pool_device = physical_disk_obj = None
-        elif not own_node(physical_disk_obj, normalize_value_text(pool_device.get("storageSystemId"))):
+        elif not own_node(physical_disk_obj, self._quantastor_path_owner(pool_device)):
             physical_disk_obj = None
         if not own_node(hw_raw):
             # merged_raw holds the disk's own fields, filled in from hw_raw:
@@ -10243,7 +10248,7 @@ class InventoryService(InventorySourceCollectionMixin):
             # Disk and port SAS addresses are distinct identifier types.
             "sasAddress": ("sasAddress",),
             "portSasAddress": ("portSasAddress",),
-            "owner": ("storageSystemId", "systemId", "iofenceSystemId", "controllerId"),
+            "owner": QUANTASTOR_PRESENTING_NODE_FIELDS,
             "path": ("devicePath", "altDevicePath", "deviceName", "device", "name"),
         }
         identity = {
@@ -10257,11 +10262,33 @@ class InventoryService(InventorySourceCollectionMixin):
         identity["path"] = {
             normalized for value in identity["path"] if (normalized := normalize_device_name(value))
         }
-        # These are fallbacks, not interchangeable owner aliases. An explicit
-        # storageSystemId must not be overridden by a controller or fence ID.
-        owner = next((value for field in fields["owner"] if (value := normalize_value_text(row.get(field)))), None)
+        # The presenting node, resolved as for disk selection. An explicit
+        # storageSystemId is not overridden by a later field, and an I/O
+        # fence ID is not the presenting node.
+        owner = next(iter(InventoryService._quantastor_presenting_node_ids(row)), None)
         identity["owner"] = {owner} if owner else set()
         return identity
+
+    @staticmethod
+    def _quantastor_presenting_node_ids(row: Any) -> list[str]:
+        """Distinct node IDs a row names as its presenting node, in field order."""
+        if not isinstance(row, dict):
+            return []
+        nodes: list[str] = []
+        for name in QUANTASTOR_PRESENTING_NODE_FIELDS:
+            value = normalize_value_text(row.get(name))
+            if value and value not in nodes:
+                nodes.append(value)
+        return nodes
+
+    @classmethod
+    def _quantastor_path_owner(cls, row: Any) -> str | None:
+        """The node whose local paths a row reports, or None when unproven.
+
+        Owner fields that name different nodes prove no owner (#1318).
+        """
+        nodes = cls._quantastor_presenting_node_ids(row)
+        return nodes[0] if len(nodes) == 1 else None
 
     @classmethod
     def _build_quantastor_cli_disk_hints(

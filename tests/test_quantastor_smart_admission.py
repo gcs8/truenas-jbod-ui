@@ -15,7 +15,11 @@ node's disk through a stable shared identity, but its node-local device path
 never becomes a SMART candidate on the selected node. SMART read targets are
 only the current poll's own-node paths: a saved device name, a saved path list
 or a manual mapping's device name is never one, and a saved device name is not
-restored. Which host a read goes to is not covered here.
+restored. A path counts as the disk's own node's only when the row reporting
+it names that node, or names none under an own parent, through one presenting-
+node resolution shared by disk, nested and CLI rows; owner fields that disagree
+admit no path, and an I/O fence ID does not name the presenting node. Which host
+a read goes to is not covered here.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,8 +44,10 @@ from app.config import (
 )
 from app.models.domain import ManualMapping, SlotView, SmartSummaryView, StorageViewRuntimeView
 from app.services.inventory import InventoryService, _ManualOnlyStorageViewSlots
+from app.services.parsers import ParsedSSHData
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
+from app.services.ssh_probe import SSHCommandResult
 from app.services.truenas_ws import TrueNASRawData
 
 
@@ -633,6 +640,111 @@ class QuantastorManualMappingSmartTargetTests(unittest.TestCase):
                 slot, cache_key=key, candidates=list(key[4]),
                 generation_token=service._smart_cache_generation_token(key), allow_stale_cache=False))
         self.assertEqual(fetch.await_args_list, [])
+
+
+class QuantastorPresentingNodePathTests(unittest.TestCase):
+    """A path is admitted only from a row whose presenting node is the disk's own.
+
+    One resolution for the disk row, a nested ``physicalDiskObj`` and a CLI
+    row: ``storageSystemId``, ``systemId``, ``controllerId``. A foreign value in
+    any of them is refused and never inherits an own parent; owner fields that
+    disagree are unproven; an I/O fence ID is not the presenting node.
+    """
+
+    def _targets(self, disk, *, pool_devices=(), cli_disks=(), systems=TWO_NODES):
+        service = _service()
+        service.system.ssh.enabled = True
+        service.system.ssh.host = "node-a.invalid"
+        service.system.ssh.ha_nodes = [HANodeConfig(system_id="node-a", host="node-a.invalid")]
+        raw = _raw(disks=[disk], pool_devices=pool_devices, systems=systems)
+        raw.cli_disks = list(cli_disks)
+        slot = next(s for s in service._correlate_quantastor(raw, [], "node-a", ParsedSSHData())[0] if s.slot == 0)
+        service._annotate_quantastor_slot_context([slot], raw, "node-a", {})
+        key = service._smart_cache_key(slot)
+        commands: list[str] = []
+
+        async def command(cmds, host=None, **kwargs):
+            commands.extend(shlex.split(item)[-1] for item in cmds)
+            return [SSHCommandResult(command=item, ok=False, exit_code=1, stdout="", stderr="not available")
+                    for item in cmds]
+
+        with patch.object(service, "_run_ssh_commands", side_effect=command):
+            asyncio.run(service._get_slot_smart_summary_for_slot_view(slot))
+        return list(slot.smart_device_names), list(key[4]), sorted(set(commands))
+
+    def _assert_targets(self, expected, disk, **kwargs) -> None:
+        names, key, commands = self._targets(disk, **kwargs)
+        self.assertEqual(names, expected)
+        self.assertEqual(key, expected)
+        self.assertEqual(commands, ["/dev/" + name for name in expected])
+
+    @staticmethod
+    def _nested(child_owner: dict, parent_owner: dict | None = None) -> dict:
+        parent = {key: value for key, value in PEER_ROW.items() if key != "storageSystemId"}
+        return {**parent, **(parent_owner or {"storageSystemId": "node-a"}), "devicePath": None,
+                "physicalDiskObj": {"id": "disk-a", **child_owner, "devicePath": "/dev/sdq"}}
+
+    def test_nested_row_owned_by_a_peer_under_an_own_parent_is_not_read(self) -> None:
+        disk = {**DISK_A, **READABLE, "devicePath": None}
+        for field in ("storageSystemId", "systemId", "controllerId"):
+            with self.subTest(field=field):
+                self._assert_targets([], disk, pool_devices=[self._nested({field: "node-b"})])
+
+    def test_nested_row_of_the_own_node_is_still_read(self) -> None:
+        disk = {**DISK_A, **READABLE, "devicePath": None}
+        for child in ({"storageSystemId": "node-a"}, {"systemId": "node-a"}, {"controllerId": "node-a"}, {}):
+            with self.subTest(child=child):
+                self._assert_targets(["sdq"], disk, pool_devices=[self._nested(child)])
+
+    def test_parent_owned_by_a_peer_through_any_owner_field_lends_no_path(self) -> None:
+        disk = {**DISK_A, **READABLE, "devicePath": None}
+        for field in ("storageSystemId", "systemId", "controllerId"):
+            with self.subTest(field=field):
+                self._assert_targets([], disk, pool_devices=[self._nested({}, {field: "node-b"})])
+
+    def test_cli_row_of_a_peer_is_not_read_when_the_fence_names_the_peer(self) -> None:
+        disk = {**DISK_A, **READABLE, "storageSystemId": None, "controllerId": "node-a",
+                "iofenceSystemId": "node-b", "devicePath": None}
+        cli = {**DISK_A, **READABLE, "storageSystemId": "node-b", "devicePath": "/dev/sdq"}
+        self._assert_targets([], disk, cli_disks=[cli])
+
+    def test_fence_id_does_not_replace_the_disk_owner_for_an_own_cli_row(self) -> None:
+        disk = {**DISK_A, **READABLE, "storageSystemId": None, "controllerId": "node-a",
+                "iofenceSystemId": "node-b", "devicePath": None}
+        cli = {**DISK_A, **READABLE, "storageSystemId": "node-a", "devicePath": "/dev/sdq"}
+        self._assert_targets(["sdq"], disk, cli_disks=[cli])
+
+    def test_cli_owner_controls(self) -> None:
+        disk = {**DISK_A, **READABLE, "devicePath": None}
+        for owner, expected in (("node-a", ["sdq"]), ("node-b", [])):
+            with self.subTest(owner=owner):
+                cli = {**DISK_A, **READABLE, "storageSystemId": owner, "devicePath": "/dev/sdq"}
+                self._assert_targets(expected, disk, cli_disks=[cli])
+
+    def test_conflicting_owner_fields_admit_no_path(self) -> None:
+        conflict = {"storageSystemId": "node-a", "systemId": "node-b"}
+        disk = {**DISK_A, **READABLE, "devicePath": None}
+        with self.subTest(row="disk"):
+            self._assert_targets([], {**DISK_A, **READABLE, "controllerId": "node-b"})
+        with self.subTest(row="nested"):
+            self._assert_targets([], disk, pool_devices=[self._nested(
+                {"storageSystemId": "node-a", "controllerId": "node-b"})])
+        with self.subTest(row="parent"):
+            self._assert_targets([], disk, pool_devices=[self._nested({}, conflict)])
+        with self.subTest(row="cli"):
+            cli = {**DISK_A, **READABLE, **conflict, "devicePath": "/dev/sdq"}
+            self._assert_targets([], disk, cli_disks=[cli])
+
+    def test_own_and_single_node_ownerless_rows_are_unchanged(self) -> None:
+        with self.subTest(row="own disk"):
+            self._assert_targets(["sda"], {**DISK_A, **READABLE})
+        with self.subTest(row="own disk, owner by systemId"):
+            disk = {key: value for key, value in DISK_A.items() if key != "storageSystemId"}
+            self._assert_targets(["sda"], {**disk, **READABLE, "systemId": "node-a"})
+        with self.subTest(row="ownerless, single node"):
+            disk = {key: value for key, value in DISK_A.items() if key not in ("storageSystemId", "devicePath")}
+            row = {key: value for key, value in PEER_ROW.items() if key not in ("storageSystemId", "physicalDiskObj")}
+            self._assert_targets(["sdq"], {**disk, **READABLE}, pool_devices=[row], systems=({"id": "node-a"},))
 
 
 if __name__ == "__main__":
