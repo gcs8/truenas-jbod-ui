@@ -563,6 +563,9 @@ class PrivateCopySideFilesTests(_ImportRootCleanup):
         ):
             self._import()
         self._assert_refused_unchanged(refused, "-wal")
+        # The refusal comes from SQLite's journal-mode report, not from the
+        # later side-file recheck.
+        self.assertIn("SQLite opened the private copy", str(refused.exception))
 
     def test_rollback_journal_after_the_side_file_check_is_refused(self) -> None:
         # A hot journal appears once the side-file check has passed, before
