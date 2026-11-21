@@ -160,7 +160,7 @@ class AdminTransportRouteReplacementTests(unittest.TestCase):
     def test_replaced_ssh_key_manager_reaches_the_moved_endpoints(self) -> None:
         list_keys = self._endpoint("list_ssh_keys")
         generate = self._endpoint("generate_ssh_key")
-        settings = SimpleNamespace(config_file="/synthetic/config.yaml")
+        settings = SimpleNamespace(config_file="/synthetic/config.yaml", ssh=SimpleNamespace(key_path=""), systems=[])
         manager = MagicMock()
         manager.list_keys.return_value = [{"name": "id_synthetic"}]
         manager.generate_keypair.side_effect = ValueError("synthetic refusal")
@@ -171,7 +171,7 @@ class AdminTransportRouteReplacementTests(unittest.TestCase):
             response = asyncio.run(list_keys())
             with self.assertRaises(HTTPException) as caught:
                 asyncio.run(generate(SSHKeyGenerateRequest(name="id_synthetic")))
-        self.assertEqual(json.loads(response.body), {"ok": True, "keys": [{"name": "id_synthetic"}]})
+        self.assertEqual(json.loads(response.body), {"ok": True, "keys": [{"name": "id_synthetic"}], "ssh_key_warnings": []})
         self.assertEqual(manager_class.call_args_list[0].args, ("/synthetic/config.yaml",))
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(caught.exception.detail, "synthetic refusal")

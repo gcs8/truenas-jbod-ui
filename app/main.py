@@ -41,6 +41,7 @@ from app.services.mapping_store import (
     MappingScopeConflict,
 )
 from app.services.profile_registry import build_profile_reference_warnings
+from app.services.ssh_key_manager import configured_key_paths, private_key_warnings
 from app.services.storage_writability import (
     check_known_hosts_files,
     probe_writable_directories,
@@ -112,7 +113,9 @@ def create_app() -> FastAPI:
     ]
     for problem in startup_problems:
         logger.error("%s", problem)
-    for warning in known_hosts_read_only:
+    app.state.ssh_key_paths = configured_key_paths(startup_settings)
+    app.state.ssh_key_warnings = tuple(private_key_warnings(app.state.ssh_key_paths))
+    for warning in (*known_hosts_read_only, *app.state.ssh_key_warnings):
         logger.warning("%s", warning)
     app.state.startup_problems = tuple(startup_problems)
     app.state.known_hosts_warnings = tuple(known_hosts_read_only)
