@@ -3,23 +3,30 @@
 A slow mapping-file read must not stall other requests on the same loop. The
 read runs on a worker thread that the request keeps until it finishes, even
 through cancellation, and readers still never wait for a writer lock. The
-result and the errors the read raises are unchanged. Synthetic data only.
+result and the errors the read raises are unchanged. Admission is bounded
+before work reaches the shared executor: a burst beyond the bound is refused
+as busy, and a cancelled caller keeps its admission until its worker ends.
+Synthetic data only.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.config import SystemConfig
 from app.models.domain import InventorySnapshot, ManualMapping, MappingBundle
 from app.services import mapping_store as mapping_store_module
-from app.services.inventory import InventoryService
+from app import main as app_main
+from app import routes as app_routes
+from app.services.inventory import InventoryService, SnapshotStateBusyError
 from app.services.mapping_store import (
     MappingReadBusy,
     MappingRevisionConflict,
@@ -220,6 +227,205 @@ class MappingReadResultsAndErrorsUnchangedTests(unittest.TestCase):
                         with self.assertRaises(type(error)) as raised:
                             asyncio.run(read())
                         self.assertIs(raised.exception, error)
+
+
+# The admission contract: at most this many mapping reads in the shared default
+# executor at once, at most this many callers waiting for a turn, busy beyond.
+ADMITTED_READS = 2
+WAITING_READS = 8
+EXECUTOR_WORKERS = 4  # more than the admitted reads, as every real default executor
+BUSY_DETAIL = "The server is busy. Try again in a moment."
+
+
+class _CountingExecutor(ThreadPoolExecutor):
+    """A default executor that counts submissions and exposes its queue."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=EXECUTOR_WORKERS)
+        self.submitted = 0
+
+    def submit(self, *args, **kwargs):
+        self.submitted += 1
+        return super().submit(*args, **kwargs)
+
+    @property
+    def queued(self) -> int:
+        return self._work_queue.qsize()
+
+
+class MappingReadAdmissionTests(unittest.TestCase):
+    """Bursts, cancellation and recovery against the real service and store."""
+
+    def run_gated(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            revision = store.scope_revision("sys-a", "shelf-a")
+            service = bare_service(MappingStore(path))
+            gate = _GatedLstat(path)
+            executor = _CountingExecutor()
+
+            async def main():
+                asyncio.get_running_loop().set_default_executor(executor)
+                return await scenario(service, revision, gate, executor)
+
+            rescue = threading.Timer(5.0, gate.release.set)
+            rescue.start()
+            try:
+                with gate.patch():
+                    return asyncio.run(main())
+            finally:
+                gate.release.set()
+                rescue.cancel()
+                rescue.join()
+                executor.shutdown(wait=True)
+
+    @staticmethod
+    async def settle() -> None:
+        # Let admitted callers reach their gated reads and refused ones finish.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+
+    def test_a_burst_beyond_the_bound_is_refused_as_busy_not_queued_in_the_executor(self) -> None:
+        async def scenario(service, revision, gate, executor):
+            reads = list(operations(service, revision).values())
+            tasks = [asyncio.ensure_future(reads[index % len(reads)]()) for index in range(24)]
+            await self.settle()
+            submitted, queued = executor.submitted, executor.queued
+            refused = [
+                task for task in tasks
+                if task.done() and not task.cancelled() and isinstance(task.exception(), SnapshotStateBusyError)
+            ]
+            # Unrelated work in the same default executor still gets a thread.
+            unrelated = asyncio.get_running_loop().run_in_executor(None, lambda: "unrelated done")
+            done, _ = await asyncio.wait({unrelated}, timeout=1.0)
+            gate.release.set()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            await unrelated
+            recovered = await service.export_mapping_bundle(selected_enclosure_id="shelf-a")
+            return submitted, queued, refused, bool(done), outcomes, recovered
+
+        submitted, queued, refused, unrelated_done, outcomes, recovered = self.run_gated(scenario)
+        with self.subTest(check="executor submissions"):
+            self.assertLessEqual(submitted, ADMITTED_READS, "mapping reads beyond the bound reached the executor")
+        with self.subTest(check="executor queue"):
+            self.assertEqual(queued, 0, "mapping reads were left queued in the shared executor")
+        with self.subTest(check="refused as busy"):
+            self.assertEqual(
+                len(refused), 24 - ADMITTED_READS - WAITING_READS, "the burst beyond the bound was not refused",
+            )
+            for error in refused:
+                self.assertEqual(str(error.exception()), BUSY_DETAIL)
+        with self.subTest(check="unrelated executor work"):
+            self.assertTrue(unrelated_done, "mapping reads starved unrelated default-executor work")
+        admitted = [outcome for outcome in outcomes if not isinstance(outcome, SnapshotStateBusyError)]
+        self.assertEqual(len(admitted), ADMITTED_READS + WAITING_READS)
+        for outcome in admitted:
+            # Admitted callers get the store's own answer: rows, or the stale pre-check refusal.
+            if isinstance(outcome, BaseException):
+                self.assertIsInstance(outcome, MappingRevisionConflict)
+        self.assertEqual([row.slot for row in recovered.mappings], [1, 2], "no recovery after the burst drained")
+
+    def test_cancelled_callers_leave_no_executor_jobs_and_keep_admission_until_their_worker_ends(self) -> None:
+        async def scenario(service, revision, gate, executor):
+            export = operations(service, revision)["export"]
+            running = [asyncio.ensure_future(export()) for _ in range(ADMITTED_READS)]
+            await self.settle()
+            waiting = [asyncio.ensure_future(export()) for _ in range(WAITING_READS)]
+            await self.settle()
+            for task in waiting:
+                task.cancel()
+            await self.settle()
+            waiters_gone = all(task.done() for task in waiting)
+            after_waiters = (executor.submitted, executor.queued)
+            # Cancel the admitted callers too; their workers are still in the read.
+            for task in running:
+                task.cancel()
+            await self.settle()
+            running_retained = not any(task.done() for task in running)
+            late = asyncio.ensure_future(export())
+            await self.settle()
+            after_running = (executor.submitted, executor.queued, late.done())
+            gate.release.set()
+            running_outcomes = await asyncio.gather(*running, return_exceptions=True)
+            late_bundle = await late
+            recovered = await service.export_mapping_bundle(selected_enclosure_id="shelf-a")
+            return (
+                waiters_gone, after_waiters, running_retained, after_running,
+                running_outcomes, late_bundle, recovered, executor.submitted,
+            )
+
+        (
+            waiters_gone, after_waiters, running_retained, after_running,
+            running_outcomes, late_bundle, recovered, total_submitted,
+        ) = self.run_gated(scenario)
+        with self.subTest(check="cancelled waiters"):
+            self.assertTrue(waiters_gone, "cancelled waiting callers were kept behind queued executor jobs")
+            self.assertEqual(after_waiters, (ADMITTED_READS, 0), "cancelled waiting callers left executor jobs")
+        with self.subTest(check="cancelled admitted callers"):
+            self.assertTrue(running_retained, "a cancelled caller let go of its read while the worker still ran")
+            self.assertEqual(
+                after_running, (ADMITTED_READS, 0, False),
+                "admission was released on caller cancellation, before the worker finished",
+            )
+        for outcome in running_outcomes:
+            self.assertIsInstance(outcome, asyncio.CancelledError)
+        self.assertEqual([row.slot for row in late_bundle.mappings], [1, 2])
+        self.assertEqual([row.slot for row in recovered.mappings], [1, 2], "no recovery after cancellation")
+        self.assertEqual(total_submitted, ADMITTED_READS + 2)
+
+    def test_the_export_route_answers_a_refused_read_with_the_existing_busy_response(self) -> None:
+        async def request() -> tuple[int, dict[bytes, bytes], dict]:
+            sent: list[dict] = []
+            delivered = False
+
+            async def receive():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                await asyncio.Future()
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {
+                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1",
+                "method": "GET", "scheme": "http", "path": "/api/mappings/export",
+                "raw_path": b"/api/mappings/export", "query_string": b"system_id=sys-a&enclosure_id=shelf-a",
+                "root_path": "", "headers": [(b"host", b"synthetic")], "server": ("synthetic", 80),
+                "client": ("synthetic", 1234),
+            }
+            await app_main.app(scope, receive, send)
+            start = next(message for message in sent if message["type"] == "http.response.start")
+            body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+            return start["status"], dict(start["headers"]), json.loads(body)
+
+        async def scenario(service, revision, gate, executor):
+            export = operations(service, revision)["export"]
+            held = [asyncio.ensure_future(export()) for _ in range(ADMITTED_READS + WAITING_READS)]
+            await self.settle()
+            attempt = asyncio.ensure_future(request())
+            done, _ = await asyncio.wait({attempt}, timeout=1.0)
+            refused = attempt.result() if done else (None, {}, {})
+            gate.release.set()
+            await asyncio.gather(*held, attempt)
+            served = await request()
+            return refused, served
+
+        registry = Mock()
+
+        async def scenario_with_registry(service, revision, gate, executor):
+            registry.get_service.return_value = service
+            return await scenario(service, revision, gate, executor)
+
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+            refused, served = self.run_gated(scenario_with_registry)
+        status, headers, body = refused
+        self.assertEqual(status, 503)
+        self.assertEqual(body.get("detail"), BUSY_DETAIL)
+        self.assertEqual(headers.get(b"retry-after"), b"1")
+        self.assertEqual(served[0], 200)
+        self.assertEqual([row["slot"] for row in served[2]["mappings"]], [1, 2])
 
 
 if __name__ == "__main__":
