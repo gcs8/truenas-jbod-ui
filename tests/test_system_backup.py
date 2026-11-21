@@ -2268,29 +2268,43 @@ class SystemBackupServiceTests(unittest.TestCase):
         artifact = self._export_stream_full(passphrase)
         original_mapping = self.mapping_path.read_bytes()
         try:
-            with self.assertRaisesRegex(ValueError, "Check the passphrase"):
-                self.backup_service.preflight_import_bundle_file(
-                    artifact.path, passphrase="not the passphrase", expected_encrypted=True
-                )
-            with self.assertRaisesRegex(ValueError, "passphrase is required"):
-                self.backup_service.preflight_import_bundle_file(artifact.path, passphrase=None)
-            raw = artifact.path.read_bytes()
-            damaged = self.temp_dir / "damaged.tar.zst.enc"
-            for label, mutated in (
-                ("flipped", raw[:-40] + bytes([raw[-40] ^ 1]) + raw[-39:]),
-                ("truncated", raw[: len(raw) - 20]),
-                ("appended", raw + b"\0" * 64),
-                ("header", raw[:9] + bytes([raw[9] ^ 1]) + raw[10:]),
+            # Crash-recovery tests can leave import workspaces in the run's
+            # shared temp directory. Count only work owned by this test, before
+            # TemporaryDirectory's cleanup could hide an importer leak.
+            with (
+                tempfile.TemporaryDirectory(dir=self.temp_dir) as import_root,
+                patch.object(tempfile, "tempdir", import_root),
             ):
-                with self.subTest(label=label):
-                    damaged.unlink(missing_ok=True)
-                    damaged.write_bytes(mutated)
-                    with self.assertRaises(ValueError):
-                        self.backup_service.import_bundle_from_file(
-                            damaged, passphrase=passphrase, expected_encrypted=True
-                        )
-            self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
-            self.assertEqual(list(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*/bundle.tar")), [])
+                digest = self.backup_service.preflight_import_bundle_file(
+                    artifact.path, passphrase=passphrase, expected_encrypted=True
+                )
+                self.assertEqual(digest, hashlib.sha256(artifact.path.read_bytes()).hexdigest())
+                self.assertEqual(list(Path(import_root).iterdir()), [])
+                with self.assertRaisesRegex(ValueError, "Check the passphrase"):
+                    self.backup_service.preflight_import_bundle_file(
+                        artifact.path, passphrase="not the passphrase", expected_encrypted=True
+                    )
+                self.assertEqual(list(Path(import_root).iterdir()), [])
+                with self.assertRaisesRegex(ValueError, "passphrase is required"):
+                    self.backup_service.preflight_import_bundle_file(artifact.path, passphrase=None)
+                self.assertEqual(list(Path(import_root).iterdir()), [])
+                raw = artifact.path.read_bytes()
+                damaged = self.temp_dir / "damaged.tar.zst.enc"
+                for label, mutated in (
+                    ("flipped", raw[:-40] + bytes([raw[-40] ^ 1]) + raw[-39:]),
+                    ("truncated", raw[: len(raw) - 20]),
+                    ("appended", raw + b"\0" * 64),
+                    ("header", raw[:9] + bytes([raw[9] ^ 1]) + raw[10:]),
+                ):
+                    with self.subTest(label=label):
+                        damaged.unlink(missing_ok=True)
+                        damaged.write_bytes(mutated)
+                        with self.assertRaises(ValueError):
+                            self.backup_service.import_bundle_from_file(
+                                damaged, passphrase=passphrase, expected_encrypted=True
+                            )
+                        self.assertEqual(list(Path(import_root).iterdir()), [])
+                self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
         finally:
             artifact.cleanup()
 

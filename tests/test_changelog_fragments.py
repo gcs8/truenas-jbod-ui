@@ -515,11 +515,15 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.repo.read("CHANGELOG.md"), other.read("CHANGELOG.md"))
 
     def test_current_unreleased_body_text_is_kept(self) -> None:
-        # Pins the checked-in Unreleased body: collection keeps the text of
-        # every existing line in its order and only inserts fragment bullets
-        # (plus headings for subsections the body does not have yet). Line
-        # endings are written as LF, which .gitattributes requires.
-        real = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        # A release commit has no checked-in Unreleased section. Use a
+        # synthetic body to pin preservation independently of the release cycle:
+        # every existing line stays in order, with only fragment bullets and
+        # missing subsection headings inserted. Line endings stay LF.
+        real = BASE_CHANGELOG.replace(
+            "## Unreleased\n\n",
+            "## Unreleased\n\nRelease preparation notes.\n\n"
+            "### Highlights\n\n- Kept an existing release theme.\n\n",
+        )
         module = _fragments()
         bullets = {
             section: [[f"- Synthetic {section} entry (#9{index})."]]

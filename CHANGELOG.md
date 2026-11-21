@@ -563,6 +563,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added a startup health warning and an admin key-list warning for configured SSH
   private keys with unsafe ownership or permissions, including symlinks. Both
   warnings name the file and explain how to correct it without changing the key (#1450).
+- Kept release-commit source tests independent of an Unreleased changelog heading
+  and isolated encrypted-import cleanup checks from crash-recovery fixtures (#1454).
 
 ### Performance
 
