@@ -1,6 +1,7 @@
 """Synthetic-only benchmark contracts; never use a maintainer database."""
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -372,7 +373,9 @@ raise SystemExit(b.main())
             try:
                 subprocess.Popen([sys.executable, "-c", child])
             except BaseException as error:
-                note(b"operation-raised " + type(error).__name__.encode())
+                # The errno name (for example ENOMEM) names the failing call's cause.
+                name = errno.errorcode.get(getattr(error, "errno", None) or 0, "")
+                note(f"operation-raised {type(error).__name__} {name}".strip().encode())
                 raise
             note(b"operation-spawned")
             time.sleep(5)

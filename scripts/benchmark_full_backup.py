@@ -334,6 +334,16 @@ def operation(phase: str, request: dict) -> dict:
         service._cleanup_extracted_archive(meta.get("_cleanup_root"))
 
 
+def address_space_bytes() -> int:
+    """This process's current virtual size, the figure RLIMIT_AS is checked against."""
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            fields = line.split()
+            if fields[:1] == ["VmSize:"] and len(fields) == 3 and fields[2] == "kB" and fields[1].isdigit():
+                return int(fields[1]) * 1024
+    raise ValueError("address space size unavailable")
+
+
 def worker(phase: str) -> int:
     try:
         request = json.loads(sys.stdin.readline(8192))
@@ -341,9 +351,16 @@ def worker(phase: str) -> int:
         timeout = request["timeout"]
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
             return 1
+        # An owned worker is a fork of the supervisor and starts with the
+        # supervisor's whole address space. The 1 GiB budget is for the
+        # phase, so it sits on top of that inherited image. A flat 1 GiB
+        # limit left no room once the supervisor itself neared 1 GiB, and
+        # the phase's first new mapping (for example the stack glibc maps
+        # for posix_spawn) failed with ENOMEM.
+        address_space_limit = address_space_bytes() + GIB
     except (ValueError, TypeError, KeyError, OSError):
         return 1
-    resource.setrlimit(resource.RLIMIT_AS, (GIB, GIB))
+    resource.setrlimit(resource.RLIMIT_AS, (address_space_limit, address_space_limit))
     resource.setrlimit(resource.RLIMIT_CPU, (math.ceil(timeout), math.ceil(timeout) + 1))
     resource.setrlimit(resource.RLIMIT_FSIZE, (6 * GIB, 6 * GIB))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -520,7 +537,9 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
               "sqlite": sqlite3.sqlite_version, "profile": PROFILES[archive_format],
               "worker_cap": PROFILES[archive_format]["workers"],
               "fixture_limits": fixture_limits(),
-              "per_process_address_space_limit_bytes": GIB, "phase_timeout_seconds": timeout,
+              "per_process_address_space_limit_bytes": GIB,
+              "address_space_limit_scope": "new address space per phase, above the forked supervisor image",
+              "phase_timeout_seconds": timeout,
               "process_model": "forked owned-scratch workers; RSS includes inherited supervisor memory",
               "rss_scope": "max Linux process high-water RSS across worker and reaped descendants; not concurrent aggregate",
               "timing_scope": "whole production operations; overlapping work, not additive; fixture excluded from backup timing",

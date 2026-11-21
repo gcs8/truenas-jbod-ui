@@ -153,6 +153,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_background_refresh_busy_routes",
         "test_background_refresh_deadlines",
         "test_backup_integration",
+        "test_benchmark_worker_address_space",
         "test_ci_browser_legs",
         "test_ci_contract",
         "test_combined_shelf_upgrade",
