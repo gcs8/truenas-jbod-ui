@@ -331,6 +331,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_qa_script_credentials",
             "tests.test_ses_discovery_filter",
             "tests.test_settings_reload",
+            "tests.test_ssh_key_permissions",
             "tests.test_ssh_probe",
             "tests.test_startup_migration_recovery",
             "tests.test_startup_writability",
