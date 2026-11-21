@@ -229,6 +229,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_runtime_damage_pause",
             "tests.test_history_health_states",
             "tests.test_history_retention_absolute_time",
+            "tests.test_history_retention_bounded_scan",
             "tests.test_history_retention_split",
             "tests.test_history_rollup_time_coherence",
             "tests.test_history_deferred_indexes",
