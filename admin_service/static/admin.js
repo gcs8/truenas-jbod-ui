@@ -21,6 +21,7 @@
     storageViewTemplates: Array.isArray(bootstrap.storage_view_templates) ? bootstrap.storage_view_templates : [],
     platformDefaults: bootstrap.setup_platform_defaults || {},
     sshKeys: Array.isArray(bootstrap.ssh_keys) ? bootstrap.ssh_keys : [],
+    sshKeyWarnings: bootstrap.ssh_key_warnings || [],
     esxiHostPrep: bootstrap.esxi_host_prep || { temp_dir: "", staged_packages: [] },
     runtime: bootstrap.runtime || { available: false, detail: null, containers: [] },
     runtimeBehavior: bootstrap.runtime_behavior || { fields: [] },
@@ -350,6 +351,7 @@
     profileBuilderPreviewGrid: document.getElementById("profile-builder-preview-grid"),
     profileBuilderPreviewMeta: document.getElementById("profile-builder-preview-meta"),
     setupSshKeyHelp: document.getElementById("setup-ssh-key-help"),
+    setupSshKeyWarnings: document.getElementById("setup-ssh-key-warnings"),
   };
 
   function escapeHtml(value) {
@@ -4624,6 +4626,9 @@
   }
 
   function syncKeyHelp() {
+    if (elements.setupSshKeyWarnings) {
+      elements.setupSshKeyWarnings.textContent = (state.sshKeyWarnings || []).join(" ");
+    }
     if (!elements.setupSshKeyHelp) {
       return;
     }
@@ -6876,6 +6881,7 @@
       state.storageViewTemplates = Array.isArray(payload.storage_view_templates) ? payload.storage_view_templates : [];
       state.platformDefaults = payload.setup_platform_defaults || {};
       state.sshKeys = Array.isArray(payload.ssh_keys) ? payload.ssh_keys : [];
+      state.sshKeyWarnings = payload.ssh_key_warnings || [];
       state.esxiHostPrep = payload.esxi_host_prep || state.esxiHostPrep;
       if (
         !currentStagedEsxiHostPrepPackages().some((item) => item.token === state.selectedEsxiHostPrepToken)
@@ -7755,6 +7761,7 @@
       const payload = await fetchJson("/api/admin/ssh-keys");
       const draftBefore = setupDraftSnapshot();
       state.sshKeys = Array.isArray(payload.keys) ? payload.keys : [];
+      state.sshKeyWarnings = payload.ssh_key_warnings || [];
       syncKeyMode();
       recordSetupDraftChange(draftBefore);
       if (!quiet) {
@@ -7789,6 +7796,7 @@
       requireMutationResult(validGeneratedKeyResult(payload, desiredName), "SSH key generation");
       recordAdminEditorOutcome("key-generation", desiredName, "success");
       state.sshKeys = payload.keys;
+      state.sshKeyWarnings = payload.ssh_key_warnings || [];
       if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
       renderSshKeyOptions(payload.key?.name || desiredName);

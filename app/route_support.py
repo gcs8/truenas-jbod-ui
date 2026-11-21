@@ -29,6 +29,7 @@ from app.config import (
 )
 from app.settings_reload import SettingsGeneration, SettingsRuntime, config_reload_problems
 from app.services.profile_registry import build_profile_reference_warnings
+from app.services.ssh_key_manager import configured_key_paths, private_key_warnings
 from app.http_auth import (
     basic_auth_matches,
     browser_write_origin_decision,
@@ -306,6 +307,7 @@ def after_config_reload(app: Any, _before: Settings, after: Settings) -> None:
         SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
     app.state.writable_directories = tuple(ui_writable_directories(after))
     app.state.known_hosts_files = tuple(split_known_hosts_paths(after)[1])
+    app.state.ssh_key_paths = configured_key_paths(after)
     app.state.known_hosts_warnings = tuple(startup_known_hosts_warnings(after))
     app.state.storage_checked_at_monotonic = 0.0
     for warning in build_profile_reference_warnings(after):
@@ -1102,6 +1104,11 @@ def known_hosts_warnings_for(request: Request) -> list[str]:
     return [str(line) for line in (getattr(app_state, "known_hosts_warnings", None) or ())]
 
 
+def ssh_key_warnings_for(request: Request) -> list[str]:
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    return list(getattr(app_state, "ssh_key_warnings", ()) or ())
+
+
 def startup_problems_for(request: Request) -> list[str]:
     app_state = getattr(getattr(request, "app", None), "state", None)
     return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
@@ -1148,6 +1155,11 @@ def refresh_storage_problems(request: Request) -> list[str]:
             logger.info("Data, log and known-hosts folders are writable again.")
         elif previous_warnings and not known_hosts_read_only:
             logger.info("Pinned known-hosts files are writable again.")
+        key_warnings = private_key_warnings(getattr(app_state, "ssh_key_paths", ()))
+        for warning in key_warnings:
+            if warning not in getattr(app_state, "ssh_key_warnings", ()):
+                logger.warning("%s", warning)
+        app_state.ssh_key_warnings = tuple(key_warnings)
         app_state.startup_problems = current
         app_state.storage_checked_at_monotonic = now
         return list(current)
@@ -1165,6 +1177,7 @@ def runtime_warnings_for(request: Request) -> list[str]:
     return [
         *startup_problems_for(request),
         *known_hosts_warnings_for(request),
+        *ssh_key_warnings_for(request),
         *config_reload_problems(request),
     ]
 
