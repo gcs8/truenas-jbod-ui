@@ -190,7 +190,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         model = {"services": {"enclosure-ui": {"user": "10001:10001", "read_only": True,
                  "cap_drop": ["ALL"], "tmpfs": ["/tmp"], "security_opt": ["no-new-privileges:true"]}}}
         with contextlib.ExitStack() as stack:
-            for name in ("_assert_compose_resources_removed", "_verify_runtime_contract", "_verify_ui", "_cleanup_variant"):
+            for name in ("_assert_compose_resources_removed", "_verify_runtime_contract", "_verify_ui", "_wait_mapping_inventory", "_cleanup_variant"):
                 stack.enter_context(patch.object(module, name))
             stack.enter_context(patch.object(module, "_prepare_variant_root", side_effect=lambda *a, **k: events.append("prepare")))
             stack.enter_context(patch.object(module, "_verify_rendered_contract", return_value=model))
@@ -206,7 +206,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             module._run_variant(Path("/synthetic"), variant, compose_path=ROOT / "docker-compose.yml",
                                 config_fixture=ROOT / "config/config.example.yaml", image="sha256:" + "a" * 64,
                                 ports=module.Ports(19080, 19081, 19082), source_commit="b" * 40)
-        self.assertEqual(events, ["prepare", "up", "ps", "source", "alias", "mapping", "journal"])
+        self.assertEqual(events, ["prepare", "up", "source", "ps", "alias", "mapping", "journal"])
         self.assertEqual(pencil.call_args.kwargs, {"expected_owner": owner})
         self.assertEqual(mapping.call_args.kwargs, {"expected_owner": owner})
         self.assertEqual(journal.call_args.args[-1], owner)
@@ -873,6 +873,7 @@ sys.argv = sys.argv[:3]
         with (
             patch.object(module, "_run") as run,
             patch.object(module, "_start_mapping_source") as start_source,
+            patch.object(module, "_wait_mapping_inventory") as inventory_ready,
             patch.object(module, "_verify_ui") as verify_ui,
         ):
             module._restart_ui(prefix, ports)
@@ -895,6 +896,7 @@ sys.argv = sys.argv[:3]
             ],
         )
         start_source.assert_called_once_with(prefix)
+        inventory_ready.assert_called_once_with(ports)
         verify_ui.assert_called_once_with(ports)
 
     def test_ui_writer_owner_matches_the_default_compose_user(self) -> None:
@@ -956,7 +958,7 @@ sys.argv = sys.argv[:3]
             with (
                 patch.object(module, "_request", side_effect=[(401, b""), (403, b"")]),
                 patch.object(module, "_require_status", side_effect=require_alias),
-                patch.object(module, "_restart_ui", side_effect=lambda *_: events.append("restart")),
+                patch.object(module, "_restart_ui", side_effect=lambda *_, **kwargs: events.append("restart")),
                 patch.object(module, "UI_WRITER_UID", os.getuid()),
                 patch.object(module, "UI_WRITER_GID", os.getgid()),
             ):
@@ -1084,7 +1086,8 @@ sys.argv = sys.argv[:3]
 
             with (
                 patch.object(module, "_require_status", side_effect=require_mapping),
-                patch.object(module, "_restart_ui", side_effect=lambda *_: events.append("restart")),
+                patch.object(module, "_verify_unread_mapping"),
+                patch.object(module, "_restart_ui", side_effect=lambda *_, **kwargs: events.append("restart")),
                 patch.object(module, "UI_WRITER_UID", os.getuid()),
                 patch.object(module, "UI_WRITER_GID", os.getgid()),
             ):
@@ -1185,6 +1188,7 @@ sys.argv = sys.argv[:3]
             with self.subTest(inventory_extra=inventory_extra), tempfile.TemporaryDirectory() as temp_dir:
                 with (
                     patch.object(module, "_require_status", side_effect=stop_after_export),
+                    patch.object(module, "_verify_unread_mapping"),
                     self.assertRaisesRegex(RuntimeError, "stop after scope check"),
                 ):
                     module._verify_mapping_cycle(Path(temp_dir), module.VARIANTS[0], ports, prefix)
@@ -1207,6 +1211,7 @@ sys.argv = sys.argv[:3]
                     "_require_status",
                     return_value=json.dumps(inventory).encode(),
                 ) as require_status,
+                patch.object(module, "_verify_unread_mapping"),
                 self.assertRaisesRegex(RuntimeError, "slot save revision is unavailable"),
             ):
                 module._verify_mapping_cycle(
@@ -1383,6 +1388,7 @@ sys.argv = sys.argv[:3]
             events, children = [], []
             original = RuntimeError("original variant failure")
             state = {"started": False, "down": False}
+            running_services = set()
             expected_services = set(variant.services)
             services = {}
             port_map = {"enclosure-ui": (19080, 8000), "enclosure-history": (19081, 8001), "enclosure-admin": (19082, 8002)}
@@ -1448,6 +1454,7 @@ sys.argv = sys.argv[:3]
                     if "up" in command:
                         events.append("up")
                         state["started"] = True
+                        running_services.update(service for service in services if service in command)
                         if variant.admin_initial_setup and command[-1] == "enclosure-ui":
                             expected_services.add("enclosure-ui")
                         if failure.startswith("cleanup-"):
@@ -1459,7 +1466,7 @@ sys.argv = sys.argv[:3]
                             return Mock(returncode=1, stdout="")
                     if "ps" in command:
                         if "--services" in command:
-                            return Mock(returncode=0, stdout="\n".join(expected_services))
+                            return Mock(returncode=0, stdout="\n".join(running_services))
                         if failure == "cleanup-diagnostics":
                             raise RuntimeError("diagnostics must not mask original")
                     return Mock(returncode=0, stdout="")
@@ -1470,7 +1477,7 @@ sys.argv = sys.argv[:3]
                     events.append("inspect")
                     records = []
                     for service, spec in services.items():
-                        if service not in expected_services:
+                        if service not in running_services:
                             continue
                         ports = {f"{p['target']}/tcp": [{"HostIp": p["host_ip"], "HostPort": p["published"]}] for p in spec["ports"]}
                         record = {"Image": image, "State": {"Running": True},
@@ -1516,7 +1523,7 @@ sys.argv = sys.argv[:3]
                         if failure == "cleanup-unknown":
                             return Mock(returncode=1, stdout="")
                         return Mock(returncode=0, stdout="residual" if failure in {"cleanup-down", "cleanup-residual"} else "")
-                    return Mock(returncode=0, stdout="\n".join("id-" + s for s in expected_services))
+                    return Mock(returncode=0, stdout="\n".join("id-" + s for s in running_services))
                 if "network" in command or "volume" in command:
                     events.append("readback")
                 return Mock(returncode=0, stdout="")
@@ -1534,6 +1541,10 @@ sys.argv = sys.argv[:3]
                 stack.enter_context(patch.object(module.subprocess, "run", side_effect=transport))
                 stack.enter_context(patch.object(module, "_require_status", return_value=b'{"ok": true, "system": {"id": "demo-builder-lab"}}'))
                 stack.enter_context(patch.object(module, "_read_app_owned_text", return_value="demo-builder-lab demo-builder-lab-chassis"))
+                # This transport-isolation fixture records readiness like its
+                # other behavioral gates; native integrations exercise discovery.
+                stack.enter_context(patch.object(module, "_wait_mapping_inventory",
+                                                 side_effect=lambda *_: events.append("inventory-ready")))
                 for name in ("validate_ports_available", "validate_available_memory", "validate_free_disk",
                              "_verify_ui", "_verify_history", "_verify_admin", "_verify_pencil_cycle",
                              "_verify_mapping_cycle", "_verify_ui_journal_read", "_verify_scheduler_disabled", "_verify_scheduler_enabled"):
@@ -1575,6 +1586,8 @@ sys.argv = sys.argv[:3]
                 self.assertIn("config", events)
                 self.assertIn("inspect", events)
                 self.assertLess(events.index("config"), events.index("up"))
+                if self.load_matrix_module().VARIANTS[variant_index].ui_enabled:
+                    self.assertLess(events.index("inspect"), events.index("inventory-ready"))
                 for command, kwargs in children:
                     env = kwargs.get("env")
                     self.assertIsInstance(env, dict, command)

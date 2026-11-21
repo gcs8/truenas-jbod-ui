@@ -136,7 +136,7 @@ def probe(mode, directory):
                 snapshots.append(json.loads(body))
             return status, body
 
-        def restart(*args):
+        def restart(*args, **kwargs):
             nonlocal application
             restarts.append(json.loads(path.read_text()))
             # Discard the real service/store objects, as a UI process restart does.
@@ -157,6 +157,9 @@ def probe(mode, directory):
 
         error = None
         with (
+            # The original smoke fixture predates the dedicated unread pair.
+            # Keep its direct real-bay refusal control, not a success-cycle claim.
+            patch.object(matrix, "_verify_unread_mapping") if mode == "unread" else contextlib.nullcontext(),
             patch.object(matrix, "_request", side_effect=asgi_request),
             patch.object(matrix, "_restart_ui", side_effect=restart),
             patch.object(matrix, "_read_app_owned_json", side_effect=lambda p: json.loads(p.read_bytes())),
