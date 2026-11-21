@@ -352,9 +352,10 @@ UNPARSED_HOST_LOG_PLACEHOLDER = "<unparsed-host>"
 # output; reaching it is shown on the page with both counts.
 SG_SES_DEVICE_RE = re.compile(r"/dev/sg(0|[1-9][0-9]{0,4})")
 SG_SES_MAX_DISCOVERED_DEVICES = 16384
-# Discovery skips a node whose sysfs identity is complete and shows a storage
-# device without enclosure services, and ends its output with this count line
-# (#1314). A node with a missing, unreadable or short identity is still read.
+# Discovery skips a node whose sysfs identity is complete, consistent and shows
+# a storage device without enclosure services, and ends its output with this
+# count line (#1314). A node with a missing, unreadable, short or contradictory
+# identity is still read.
 SG_SES_DISCOVERY_SKIPPED_RE = re.compile(r"skipped-not-enclosure (0|[1-9][0-9]{0,4})")
 # SCSI peripheral device types that are storage devices, not enclosures: disk,
 # tape, write-once, CD/DVD, optical memory and simplified direct-access.
@@ -13086,21 +13087,26 @@ class InventoryService(InventorySourceCollectionMixin):
     @staticmethod
     def _build_sg_ses_discovery_command() -> str:
         # Only the elevated AES read needs sudo. Each node's peripheral type
-        # and INQUIRY data are read from sysfs first, unprivileged; a node is
-        # skipped only when its type is a storage device and INQUIRY byte 6 is
-        # read and has the EncServ bit clear. Anything else is read (#1314).
+        # and INQUIRY data are read from sysfs first, unprivileged. A node is
+        # skipped only when both reads succeed and agree: the type is a storage
+        # device; the INQUIRY data is at least the standard 36 bytes and as
+        # long as its header says (additional length + 5); byte 0 equals the
+        # type (peripheral qualifier 0, same type); and byte 6 has EncServ
+        # clear. Anything short, failed or contradictory is read (#1314).
+        # ``od -v`` prints every byte (no ``*`` for repeated lines), and the
+        # split runs with globbing off.
         types = "|".join(SG_SES_NON_ENCLOSURE_TYPES)
         script = (
             "skipped=0; "
             "for dev in /dev/sg*; do "
             'id="/sys/class/scsi_generic/${dev##*/}/device"; '
-            'type=$(cat "$id/type" 2>/dev/null); '
+            'if type=$(cat "$id/type" 2>/dev/null) && inq=$(od -An -tu1 -v -N260 "$id/inquiry" 2>/dev/null); then '
             f'case "$type" in {types}) '
-            "flags=$(od -An -tu1 -j6 -N1 \"$id/inquiry\" 2>/dev/null | tr -d ' \\n'); "
-            'case "$flags" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) '
-            "if [ $((flags & 64)) -eq 0 ]; then skipped=$((skipped + 1)); continue; fi;; "
-            "esac;; "
+            "set -f; set -- $inq; set +f; "
+            'if [ $# -ge 36 ] && [ $# -ge $(($5 + 5)) ] && [ "$1" = "$type" ] && [ $(($7 & 64)) -eq 0 ]; then '
+            "skipped=$((skipped + 1)); continue; fi;; "
             "esac; "
+            "fi; "
             'if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; '
             "done; "
             'echo "skipped-not-enclosure $skipped"'
