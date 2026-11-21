@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,12 +10,15 @@ from typing import Iterable
 from app.models.domain import SasFabricAlias
 from app.services.atomic_write import write_atomically
 from app.services.config_change_journal import record_config_change
+from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileRefused
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
     describe_capacity_failure,
     is_unwritable_error,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SasFabricAliasStorageUnwritable(StorageDirectoryUnwritable):
@@ -36,14 +40,18 @@ class SasFabricAliasStore:
 
     def _load_authoritative(self) -> dict[str, SasFabricAlias]:
         try:
-            handle = self.file_path.open("r", encoding="utf-8")
+            # Binary, so the budget counts encoded bytes; decoded as UTF-8.
+            handle = self.file_path.open("rb")
         except FileNotFoundError:
             return {}
         except OSError as exc:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:
             with handle:
-                payload = json.load(handle)
+                payload = json.load(BudgetedJsonSource(handle, self.file_path.name))
+        except JsonStateFileRefused as exc:
+            logger.warning("SAS Fabric alias store %s not loaded: %s", self.file_path, exc)
+            raise ValueError(f"{exc} No changes were saved.") from exc
         except (OSError, ValueError) as exc:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:
