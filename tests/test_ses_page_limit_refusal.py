@@ -456,6 +456,84 @@ class OtherHostRefusalSurvivesSelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(overlay.ses_enclosures), 1)
                 self.assert_refusals(failures, REFUSED_HOST, 5, 4)
 
+    async def cached_rediscovery(self, wrapper: str, rediscovered: dict[str, dict[str, str]]):  # noqa: ANN201
+        pages_by_host = {
+            REFUSED_HOST: {
+                "/dev/sg7": self.pages(3, "FIRSTSHELF"),
+                "/dev/sg8": self.pages(4, "SECONDSHELF"),
+            },
+        }
+        service = self.service([REFUSED_HOST], pages_by_host)
+        fetch = service._fetch_scale_ses_overlay if wrapper == "scale" else service._fetch_quantastor_ses_overlay
+        _overlay, failures = await fetch()
+        self.assertEqual(failures, [])
+        self.assertEqual(service._get_cached_sg_ses_devices(REFUSED_HOST), ["/dev/sg7", "/dev/sg8"])
+
+        # The cached read refuses the first shelf, but still reads the second.
+        cached_pages = {
+            "/dev/sg7": self.pages(5, "FIRSTSHELF"),
+            "/dev/sg8": self.pages(4, "SECONDSHELF"),
+        }
+        cached_answers = {
+            result.command: result
+            for device, pages in cached_pages.items()
+            for result in _page_results(device, pages)
+        }
+
+        async def run_commands(commands, host, **_kwargs):  # noqa: ANN001, ANN202
+            self.assertEqual(host, REFUSED_HOST)
+            self.assertEqual(set(commands), {*cached_answers, LINUX_ENCLOSURE_SYSFS_MAP_COMMAND})
+            return [
+                cached_answers.get(command)
+                or SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                for command in commands
+            ]
+
+        # Rediscovery can omit the refused shelf, repeat it, or find no healthy page.
+        pages_by_host[REFUSED_HOST] = rediscovered
+        service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+        service._run_ssh_planned_commands = AsyncMock(wraps=service._run_ssh_planned_commands)
+        result = await fetch()
+        service._run_ssh_commands.assert_awaited_once()
+        service._run_ssh_planned_commands.assert_awaited_once()
+        return result
+
+    async def test_cached_refusal_survives_rediscovery_of_only_the_other_healthy_device(self) -> None:
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                overlay, failures = await self.cached_rediscovery(
+                    wrapper, {"/dev/sg8": self.pages(4, "SECONDSHELF")}
+                )
+                self.assertEqual(len(overlay.ses_enclosures), 1)
+                self.assertEqual(overlay.ses_enclosures[0].ses_device, "/dev/sg8")
+                self.assertEqual(len(failures), 3, failures)
+                self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+
+    async def test_cached_and_rediscovered_refusal_sentences_are_reported_once(self) -> None:
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                overlay, failures = await self.cached_rediscovery(wrapper, {
+                    "/dev/sg7": self.pages(5, "FIRSTSHELF"),
+                    "/dev/sg8": self.pages(4, "SECONDSHELF"),
+                })
+                self.assertEqual(len(overlay.ses_enclosures), 1)
+                self.assertEqual(len(failures), 3, failures)
+                self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+                for failure in failures:
+                    self.assertEqual(failures.count(failure), 1, failures)
+
+    async def test_cached_refusal_survives_rediscovery_without_a_healthy_page(self) -> None:
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                overlay, failures = await self.cached_rediscovery(
+                    wrapper, {"/dev/sg8": self.pages(6, "SECONDSHELF")}
+                )
+                self.assertEqual(overlay.ses_enclosures, [])
+                self.assertEqual(len(failures), 6, failures)
+                for device, count in (("/dev/sg7", 5), ("/dev/sg8", 6)):
+                    refused = [failure for failure in failures if f" from {device} " in failure]
+                    self.assert_refusals(refused, REFUSED_HOST, count, 4)
+
     async def test_selected_host_refusal_is_reported_once_beside_another_hosts(self) -> None:
         pages_by_host = {
             REFUSED_HOST: {"/dev/sg7": self.pages(5, "REFUSEDSHELF")},

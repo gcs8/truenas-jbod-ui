@@ -12526,6 +12526,10 @@ class InventoryService(InventorySourceCollectionMixin):
                     cached_devices,
                     failure_prefix=failure_prefix,
                 )
+                # Keep evidence from this read even if rediscovery finds a different device.
+                page_refusals.extend(
+                    f"{failure_prefix} {refusal.describe(host)}" for refusal in cached_overlay.ses_page_refusals
+                )
                 cached_score = self._score_sg_ses_overlay(cached_overlay)
                 if cached_score > 0 and not cached_failures:
                     if merge_hosts:
@@ -12549,9 +12553,6 @@ class InventoryService(InventorySourceCollectionMixin):
                 failures.extend(host_failures)
                 if cached_failures:
                     failures.extend(cached_failures)
-                    page_refusals.extend(
-                        f"{failure_prefix} {refusal.describe(host)}" for refusal in cached_overlay.ses_page_refusals
-                    )
                 continue
             page_refusals.extend(f"{failure_prefix} {refusal.describe(host)}" for refusal in host_overlay.ses_page_refusals)
 
@@ -12570,6 +12571,9 @@ class InventoryService(InventorySourceCollectionMixin):
                 best_failures = list(host_failures)
 
         if best_score <= 0:
+            for warning in page_refusals:
+                if warning not in failures:
+                    failures.append(warning)
             return ParsedSSHData(), failures, None
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
