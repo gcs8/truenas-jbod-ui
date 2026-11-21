@@ -43,12 +43,14 @@ If the sidecar is unavailable, the `History` button is hidden. The main UI and s
 
 Bulk history requests must specify a window from 1 hour through 1 year. The API accepts the six documented history metrics and applies these limits:
 
-- 32 scopes
-- 347 scope-slot targets
+- 256 scopes
+- 16,384 scope-slot targets
 - 4,096 event rows
 - 36,000 projected rows across the request
 - 64 KiB request body for multi-scope requests
 - 24 MiB serialized response
+
+The scope and target counts sit far above real enclosures and only stop runaway requests; the row and byte budgets bound the work. A refused request names the limit it reached and the requested count.
 
 Heat-map playback requests no events, requests only the selected one or two metrics, and returns at most 24 samples per metric. The single-slot drawer uses its own bounded request path.
 

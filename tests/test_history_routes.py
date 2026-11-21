@@ -260,7 +260,7 @@ class HistoryRoutesModuleTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 413)
         self.assertEqual(
             raised.exception.detail,
-            "History can be requested for at most 1 slots at a time.",
+            "History can be requested for at most 1 slots at a time; 2 requested.",
         )
         registry.get_service.assert_not_called()
 

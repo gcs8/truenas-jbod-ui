@@ -49,6 +49,14 @@ from history_service.operation_bounds import (
 )
 
 
+def _history_service_refusal_detail(slot_count: int) -> str:
+    """Page text for a read the history service refused under its own policy."""
+    return (
+        f"The history service refused this request for {slot_count} slots. "
+        "Check the history service log."
+    )
+
+
 def add_storage_view_slot_history_route(router: APIRouter, routes: ModuleType) -> None:
     """Add the per-slot history route of a storage view, between its SMART routes."""
 
@@ -213,7 +221,10 @@ def add_history_routes(router: APIRouter, routes: ModuleType) -> None:
         if len(requested_slots) > routes.MAX_TARGETS:
             raise HTTPException(
                 status_code=413,
-                detail=f"History can be requested for at most {routes.MAX_TARGETS} slots at a time.",
+                detail=(
+                    f"History can be requested for at most {routes.MAX_TARGETS} slots at a time; "
+                    f"{len(requested_slots)} requested."
+                ),
             )
         registry = routes.get_inventory_registry()
         service = registry.get_service(system_id)
@@ -263,6 +274,16 @@ def add_history_routes(router: APIRouter, routes: ModuleType) -> None:
             )
         except HistoryBackendBusyError:
             return routes._history_read_busy_response()
+        except HistoryBackendPolicyError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=_history_service_refusal_detail(len(normalized_slots)),
+            ) from exc
+        except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
+            raise HTTPException(
+                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
+                detail=str(exc),
+            ) from exc
         return JSONResponse(
             {
                 "configured": history_backend.configured,
@@ -352,6 +373,13 @@ def add_history_routes(router: APIRouter, routes: ModuleType) -> None:
             )
         except HistoryBackendBusyError:
             return routes._history_read_busy_response()
+        except HistoryBackendPolicyError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=_history_service_refusal_detail(
+                    sum(len(scope["slots"]) for scope in scopes)
+                ),
+            ) from exc
         except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
             # The local read planner rejected the request shape or budget
             # before any backend call (#1044); other errors stay server errors.
