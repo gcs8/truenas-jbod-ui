@@ -5535,10 +5535,11 @@ class InventoryService(InventorySourceCollectionMixin):
                     continue
                 if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
                     continue
-                if field_name == "smart_device_names" and quantastor:
+                if field_name in ("smart_device_names", "device_name") and quantastor:
                     # A QuantaStor path names a device on one node only, and a
-                    # saved list cannot show which. SMART paths come from the
-                    # current poll's own-node data alone; none means unread (#1318).
+                    # saved name cannot show which. Device names and SMART
+                    # paths come from the current poll's own-node data alone;
+                    # none means no device name and unread SMART (#1318).
                     continue
                 current_value = getattr(slot_view, field_name)
                 if not self._slot_detail_field_missing(current_value):
@@ -6644,12 +6645,17 @@ class InventoryService(InventorySourceCollectionMixin):
         return SmartSummaryView(available=False, message="Disk identity changed during SMART lookup; retry for the current disk.")
 
     def _smart_cache_key(self, slot_view: SlotView) -> SmartCacheKey:
+        # The key's candidate tuple is the only list of SMART read targets. On
+        # QuantaStor it holds only the current poll's own-node paths: the
+        # builder's ``smart_device_names``, never restored from saved details.
+        # A display name (saved, multipath or manual mapping) is not a target.
+        own_node_paths_only = self.system.truenas.platform == "quantastor"
         return (
             self.system.id,
             self.system.truenas.platform,
             normalize_text(slot_view.enclosure_id) or UNSCOPED_KEY,
             slot_view.slot,
-            tuple(self._smart_candidate_devices(slot_view)),
+            tuple(self._smart_candidate_devices(slot_view, own_node_paths_only=own_node_paths_only)),
             self._smart_disk_identity(slot_view),
         )
 
@@ -17296,7 +17302,7 @@ class InventoryService(InventorySourceCollectionMixin):
         return None
 
     @staticmethod
-    def _smart_candidate_devices(slot_view: SlotView) -> list[str]:
+    def _smart_candidate_devices(slot_view: SlotView, *, own_node_paths_only: bool = False) -> list[str]:
         candidates: list[str] = []
         seen: set[str] = set()
 
@@ -17305,6 +17311,8 @@ class InventoryService(InventorySourceCollectionMixin):
             if normalized and not InventoryService._is_placeholder_hint_device(normalized) and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(normalized)
+        if own_node_paths_only:
+            return candidates
 
         if slot_view.multipath:
             # Prefer ACTIVE member paths first so ad-hoc smartctl calls land on

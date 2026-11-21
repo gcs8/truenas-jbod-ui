@@ -12,7 +12,10 @@ before conversion to whole hours, so it never becomes a measured zero.
 
 #1318: a pool-device row from a peer node can be admitted for the selected
 node's disk through a stable shared identity, but its node-local device path
-never becomes a SMART candidate on the selected node.
+never becomes a SMART candidate on the selected node. SMART read targets are
+only the current poll's own-node paths: a saved device name, a saved path list
+or a manual mapping's device name is never one, and a saved device name is not
+restored. Which host a read goes to is not covered here.
 """
 
 from __future__ import annotations
@@ -27,14 +30,15 @@ from unittest.mock import AsyncMock, patch
 
 from app.config import (
     EnclosureProfileConfig,
+    HANodeConfig,
     LayoutConfig,
     PathConfig,
     Settings,
     SystemConfig,
     TrueNASConfig,
 )
-from app.models.domain import SlotView, SmartSummaryView
-from app.services.inventory import InventoryService
+from app.models.domain import ManualMapping, SlotView, SmartSummaryView, StorageViewRuntimeView
+from app.services.inventory import InventoryService, _ManualOnlyStorageViewSlots
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASRawData
@@ -339,8 +343,13 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         return service, slot
 
     def _loader_reads(self, service: InventoryService, slot: SlotView) -> list[list[str]]:
-        """The device lists the real QuantaStor loader hands to the SSH boundary."""
+        """The device lists the real QuantaStor loader hands to the SSH boundary.
+
+        The hosts each call would go to are kept in ``self.loader_hosts`` as a
+        record only; which host reads a path is not decided here.
+        """
         service.system.ssh.enabled = True
+        service.system.ssh.host = service.system.ssh.host or "node-a.invalid"
         key = service._smart_cache_key(slot)
         fetch = AsyncMock(return_value=(None, None))
         with patch.object(service, "_summary_needs_ssh_enrichment", return_value=True), \
@@ -349,6 +358,7 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
             asyncio.run(service._load_uncached_smart_summary(
                 slot, cache_key=key, candidates=list(key[4]),
                 generation_token=service._smart_cache_generation_token(key), allow_stale_cache=False))
+        self.loader_hosts = [call.kwargs.get("hosts") for call in fetch.await_args_list]
         return [list(call.args[0]) for call in fetch.await_args_list]
 
     def _save_node_b_path(self, *, smart_node: str | None) -> None:
@@ -466,6 +476,72 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         self.assertEqual(fresh.slot_fields["smart_device_names"], ["sda"])
         self.assertNotIn(SMART_NODE_KEY, fresh.slot_fields)
 
+    def _save_node_b_direct_name(self) -> None:
+        # An ordinary node-B poll: the disk's own path is both its device name
+        # and its SMART path, and the real writer saves both.
+        disk = {**DISK_A, **READABLE, "storageSystemId": "node-b", "devicePath": "/dev/sdq"}
+        record = _service()._build_quantastor_disk_records(_raw(disks=[disk]), "node-b")[0]
+        saved = self._save(_slot_from_record(record), None, legacy=False)
+        self.assertEqual((saved["device_name"], saved["smart_device_names"]), ("sdq", ["sdq"]))
+
+    def test_saved_device_name_is_neither_restored_nor_read(self) -> None:
+        # The current node-A poll reports no path for the disk. The saved
+        # direct name came from node B; it is not shown and not read.
+        for owner_key, peer_hardware in (
+            ("storageSystemId", False), ("systemId", True), ("controllerId", True), (None, True),
+        ):
+            with self.subTest(owner_key=owner_key, peer_hardware=peer_hardware):
+                self._save_node_b_direct_name()
+                disk = {key: value for key, value in {**DISK_A, **READABLE}.items()
+                        if key not in ("devicePath", "storageSystemId")}
+                if owner_key:
+                    disk[owner_key] = "node-a"
+                service, slot = self._reload(_raw(disks=[disk], hw_disks=[PEER_HW] if peer_hardware else []))
+                # The page's Device row is null (shown as n/a).
+                self.assertIsNone(slot.device_name)
+                self.assertNotIn("sdq", slot.search_text or "")
+                self.assertEqual(slot.smart_device_names, [])
+                self.assertEqual(service._smart_cache_key(slot)[4], ())
+                self.assertEqual(self._loader_reads(service, slot), [])
+
+    def test_current_own_node_direct_name_is_still_shown_and_read(self) -> None:
+        # Control: a current own-node path is the device name and the target.
+        self._save_node_b_direct_name()
+        disk = {key: value for key, value in {**DISK_A, **READABLE}.items() if key != "storageSystemId"}
+        disk["systemId"] = "node-a"
+        service, slot = self._reload(_raw(disks=[disk], hw_disks=[PEER_HW]))
+        self.assertEqual(slot.device_name, "sda")
+        self.assertEqual(service._smart_cache_key(slot)[4], ("sda",))
+        self.assertEqual(self._loader_reads(service, slot), [["sda"]])
+
+    def test_current_pool_only_path_is_still_read_without_the_saved_name(self) -> None:
+        # Control: a path the current poll reports only through the disk's own
+        # pool row is still a target; the saved direct name is not added.
+        self._save_node_b_direct_name()
+        current = {key: value for key, value in {**DISK_A, **READABLE}.items() if key != "devicePath"}
+        own_row = {**PEER_ROW, "storageSystemId": "node-a", "devicePath": "/dev/sdc",
+                   "physicalDiskObj": {"id": "disk-a", "devicePath": "/dev/sdc", "storageSystemId": "node-a"}}
+        service, slot = self._reload(_raw(disks=[current], pools=[POOL], pool_devices=[own_row]))
+        self.assertIsNone(slot.device_name)
+        self.assertEqual(slot.smart_device_names, ["sdc"])
+        self.assertEqual(service._smart_cache_key(slot)[4], ("sdc",))
+        self.assertEqual(self._loader_reads(service, slot), [["sdc"]])
+
+    def test_other_platforms_still_restore_and_read_a_saved_device_name(self) -> None:
+        # Control: another platform keeps both saved fields and reads both.
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                        serial="SANITIZED-SCALE-A", device_name="sdr", smart_device_names=["sdq"])
+        saved = self._save(slot, None, legacy=False, platform="scale")
+        self.assertEqual((saved["device_name"], saved["smart_device_names"]), ("sdr", ["sdq"]))
+
+        service = _service("scale")
+        service.slot_detail_store = SlotDetailStore(self.path)
+        current = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                           serial="SANITIZED-SCALE-A")
+        service._apply_persisted_slot_details([current])
+        self.assertEqual((current.device_name, current.smart_device_names), ("sdr", ["sdq"]))
+        self.assertEqual(service._smart_cache_key(current)[4], ("sdq", "sdr"))
+
     # A2 (#1299)
     def test_saved_negative_block_sizes_stay_not_read_after_reload(self) -> None:
         disk = {**DISK_A, **READABLE, "logicalBlockSize": -1, "physicalBlockSize": -512}
@@ -528,6 +604,35 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         slot.logical_block_size, slot.physical_block_size = 0, 4096
         merged = InventoryService._merge_smart_summary(slot, SmartSummaryView(available=True))
         self.assertEqual((merged.logical_block_size, merged.physical_block_size), (0, 4096))
+
+
+class QuantastorManualMappingSmartTargetTests(unittest.TestCase):
+    """A saved manual mapping names a bay; on QuantaStor it is not a SMART target."""
+
+    def test_manual_only_bay_without_a_live_disk_forms_no_smart_read(self) -> None:
+        service = _service()
+        service.system.ssh.enabled = True
+        service.system.ssh.host = "node-a.invalid"
+        service.system.ssh.ha_nodes = [HANodeConfig(system_id="node-a", host="node-a.invalid"),
+                                       HANodeConfig(system_id="node-b", host="node-b.invalid")]
+        mapping = ManualMapping(system_id=service.system.id, slot=3, enclosure_id="node-a",
+                                serial="SANITIZED-QS-A", device_name="sdq")
+        runtime_slot = _ManualOnlyStorageViewSlots(mappings={3: mapping}, live_slots_by_key={}).runtime_slot(
+            3, "03", None)
+        view = StorageViewRuntimeView(id="manual-view", label="Manual view", kind="manual", template_id="generic",
+                                      profile_pinned=True, slots=[runtime_slot])
+        slot = service._build_slot_view_from_storage_view_runtime_slot(view, runtime_slot)
+        # The saved mapping still labels the bay.
+        self.assertEqual(slot.device_name, "sdq")
+        key = service._smart_cache_key(slot)
+        self.assertEqual(key[4], ())
+        fetch = AsyncMock(return_value=(None, None))
+        with patch.object(service, "_fetch_smart_summary_over_ssh", fetch), \
+                patch.object(service, "_store_smart_summary_cache", return_value=False):
+            asyncio.run(service._load_uncached_smart_summary(
+                slot, cache_key=key, candidates=list(key[4]),
+                generation_token=service._smart_cache_generation_token(key), allow_stale_cache=False))
+        self.assertEqual(fetch.await_args_list, [])
 
 
 if __name__ == "__main__":
