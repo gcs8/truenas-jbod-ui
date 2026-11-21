@@ -198,6 +198,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 events.append("up" if "up" in command else "ps")
                 return Mock(stdout="enclosure-ui\n")
             stack.enter_context(patch.object(module, "_run", side_effect=run))
+            stack.enter_context(patch.object(module, "_start_mapping_source", side_effect=lambda *_: events.append("source")))
             pencil = stack.enter_context(patch.object(module, "_verify_pencil_cycle", side_effect=lambda *a, **k: events.append("alias")))
             mapping = stack.enter_context(patch.object(module, "_verify_mapping_cycle", side_effect=lambda *a, **k: events.append("mapping")))
             journal = stack.enter_context(patch.object(module, "_verify_ui_journal_read", side_effect=lambda *a: events.append("journal")))
@@ -205,7 +206,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             module._run_variant(Path("/synthetic"), variant, compose_path=ROOT / "docker-compose.yml",
                                 config_fixture=ROOT / "config/config.example.yaml", image="sha256:" + "a" * 64,
                                 ports=module.Ports(19080, 19081, 19082), source_commit="b" * 40)
-        self.assertEqual(events, ["prepare", "up", "ps", "alias", "mapping", "journal"])
+        self.assertEqual(events, ["prepare", "up", "ps", "source", "alias", "mapping", "journal"])
         self.assertEqual(pencil.call_args.kwargs, {"expected_owner": owner})
         self.assertEqual(mapping.call_args.kwargs, {"expected_owner": owner})
         self.assertEqual(journal.call_args.args[-1], owner)
@@ -770,6 +771,11 @@ sys.argv = sys.argv[:3]
                     config = yaml.safe_load(source.read_text(encoding="utf-8"))
                     self.assertNotIn("systems", config)
                     self.assertNotIn("truenas", config)
+                elif variant.ui_enabled:
+                    self.assertEqual(source, ROOT / "tests/fixtures/compose-runtime-config.yaml")
+                    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+                    self.assertEqual([item["id"] for item in config["systems"]], ["matrix-live", "matrix-unread"])
+                    self.assertTrue(any(cmd[-1] == str(root / "config/compose-runtime-source.py") for cmd in commands))
                 else:
                     self.assertEqual(source, fixture)
 
@@ -866,6 +872,7 @@ sys.argv = sys.argv[:3]
         ports = module.Ports(19080, 19081, 19082)
         with (
             patch.object(module, "_run") as run,
+            patch.object(module, "_start_mapping_source") as start_source,
             patch.object(module, "_verify_ui") as verify_ui,
         ):
             module._restart_ui(prefix, ports)
@@ -887,6 +894,7 @@ sys.argv = sys.argv[:3]
                 ),
             ],
         )
+        start_source.assert_called_once_with(prefix)
         verify_ui.assert_called_once_with(ports)
 
     def test_ui_writer_owner_matches_the_default_compose_user(self) -> None:
