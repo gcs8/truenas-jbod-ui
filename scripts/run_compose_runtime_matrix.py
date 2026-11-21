@@ -50,6 +50,7 @@ MATRIX_CONTAINER_NAMES = {
 }
 SYNTHETIC_BACKUP_PASSPHRASE = "synthetic-compose-matrix-backup-passphrase"
 SCHEDULER_WAIT_SECONDS = 90
+MAPPING_WAIT_SECONDS = 30
 SUCCESS_MARKER = (
     "compose_runtime_matrix=ok variants=8 ui_alias_cycles=5 "
     "ui_mapping_cycles=5 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
@@ -621,6 +622,44 @@ PUBLIC_HTTP_ERRORS = {
         "The disk in this bay changed. Reload to see it, then clear again.",
     ),
     "mapping_revision_conflict": ("Mapping scope revision changed before this write.",),
+    "mapping_scope_conflict": ("Conflicting mapping rows exist for the same physical slot.",),
+    "mapping_import_bays_changed": ("Bays changed since the preview. Preview the import again.",),
+    "mapping_import_digest_mismatch": ("Mapping import digest does not match the confirmed preview.",),
+    "mapping_read_busy": ("The mappings were being changed while they were read. Try again.",),
+    "mapping_durability_indeterminate": (
+        "Mapping update was published, but it could not be confirmed that the mapping file "
+        "still holds it or that it is durable. Nothing was rolled back. Reload before saving again.",
+    ),
+    "data_directory_unwritable": ("Could not save: the data folder is not writable by the app. See Troubleshooting.",),
+    "storage_directory_unwritable": ("Could not save: the data folder is not writable by the app. See Troubleshooting.",),
+    "data_directory_capacity_exhausted": ("Could not save: the data folder has insufficient capacity. See Troubleshooting.",),
+    "mapping_writer_lock_unavailable": tuple(
+        detail + " The mappings were not changed. See Troubleshooting: saving bay mappings."
+        for detail in (
+            "Could not save: another bay mapping save is in progress.",
+            "Could not save: a file lock could not be taken on the storage holding the mapping file.",
+            "Could not save: the mapping lock file could not be opened as a regular file.",
+            "Could not save: the mapping lock file cannot be opened for writing.",
+        )
+    ),
+}
+PUBLIC_HTTP_DETAILS = {
+    "Unable to resolve selected enclosure layout.",
+    "Mapping bundle is invalid.",
+    "The mapping import preview could not be prepared.",
+    "Requested enclosure is not available for this system.",
+    "The server is busy. Try again in a moment.",
+    "No inventory snapshot is available yet: the first inventory read is still running. Try again in a moment.",
+    "The inventory is still refreshing. Try again in a moment.",
+    *(change + " The inventory is still refreshing, so reload the page in a moment to see it."
+      for change in ("Saved the bay assignment.", "Cleared the bay assignment.", "The bay assignment was already clear.")),
+    "Sign-in is not enabled on this server.",
+    "Main UI authentication required.",
+    "This request came from a different site and was blocked.",
+    "Changes are disabled because the sign-in settings could not be read.",
+    # These routes are pinned to bay zero in the maintained controller.
+    "Slot 0 is not part of this enclosure.",
+    "Slot 0 is outside the configured layout.",
 }
 MATRIX_HTTP_ROUTES = (
     "/", "/livez", "/healthz", "/api/inventory", "/api/history/status",
@@ -649,12 +688,13 @@ def _http_failure_context(url: str, method: str, body: bytes) -> str:
     if not isinstance(payload, dict):
         return context
     error = payload.get("error")
-    if not isinstance(error, str) or error not in PUBLIC_HTTP_ERRORS:
-        return context
-    context = f"{verb} {route}; error={error}"
     detail = payload.get("detail")
-    if isinstance(detail, str) and detail in PUBLIC_HTTP_ERRORS[error]:
-        context += f"; detail={detail}"
+    if isinstance(error, str) and error in PUBLIC_HTTP_ERRORS:
+        context = f"{verb} {route}; error={error}"
+        if isinstance(detail, str) and detail in PUBLIC_HTTP_ERRORS[error]:
+            context += f"; detail={detail}"
+    elif isinstance(detail, str) and detail in PUBLIC_HTTP_DETAILS:
+        context = f"{verb} {route}; detail={detail}"
     return context
 
 
@@ -892,8 +932,44 @@ def _start_mapping_source(prefix: Sequence[str]) -> None:
     _run((*prefix, "exec", "-T", "enclosure-ui", "python", source, "--check"))
 
 
-def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
+def _wait_mapping_inventory(ports: Ports) -> None:
+    # Health and a DDP handshake do not invalidate a cold failed-source cache.
+    url = (f"http://127.0.0.1:{ports.ui}/api/inventory"
+           "?system_id=matrix-live&enclosure_id=matrix-shelf&force=true")
+    deadline = time.monotonic() + MAPPING_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            snapshot = _json_object(_require_status(url, 200, authenticated=True), "Mapping inventory")
+            sources = snapshot.get("sources")
+            api = sources.get("api") if isinstance(sources, dict) else None
+            slots = snapshot.get("slots")
+            slot = next((item for item in slots if isinstance(item, dict) and item.get("slot") == 0), None) if isinstance(slots, list) else None
+            if (snapshot.get("selected_system_id") == "matrix-live"
+                    and snapshot.get("selected_enclosure_id") == "matrix-shelf"
+                    and isinstance(api, dict) and api.get("ok") is True
+                    and isinstance(slot, dict) and slot.get("state") == "empty"
+                    and slot.get("present") is False and slot.get("identity_state") == "known"
+                    and slot.get("presence_known") is not False):
+                return
+        except (RuntimeError, OSError):
+            # No arbitrary transport/server prose in the timeout diagnostic.
+            pass
+        time.sleep(0.25)
+    raise RuntimeError("Synthetic mapping inventory did not become ready before the deadline: "
+                       "expected live API evidence, selected enclosure layout and known-empty bay.")
+
+
+def _start_history(prefix: Sequence[str]) -> None:
+    _run((*prefix, "up", "-d", "--no-deps", "--wait", "--wait-timeout", "90", "enclosure-history"))
+
+
+def _restart_ui(prefix: Sequence[str], ports: Ports, *, history_enabled: bool = False) -> None:
+    # The producer lives inside the UI container. Quiesce its inventory consumer
+    # before killing it, and do not resume history on a failed readiness gate.
+    if history_enabled:
+        _run((*prefix, "stop", "--timeout", "15", "enclosure-history"))
     _run((*prefix, "restart", "enclosure-ui"))
+    _start_mapping_source(prefix)
     _run(
         (
             *prefix,
@@ -906,8 +982,10 @@ def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
             "enclosure-ui",
         )
     )
-    _start_mapping_source(prefix)
+    _wait_mapping_inventory(ports)
     _verify_ui(ports)
+    if history_enabled:
+        _start_history(prefix)
 
 
 def _ui_writer_owner(model: dict[str, object], variant: Variant) -> tuple[int, int]:
@@ -984,7 +1062,7 @@ def _verify_pencil_cycle(
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(alias_path)
     _require_ui_written_file(owner_uid, owner_gid, file_mode, "alias", expected_owner=expected_owner)
 
-    _restart_ui(prefix, ports)
+    _restart_ui(prefix, ports, history_enabled=variant.history_enabled)
     aliases = _read_app_owned_json(alias_path).get("sas_fabric_aliases")
     if not isinstance(aliases, dict) or len(aliases) != 1:
         raise RuntimeError("alias restart persistence readback failed")
@@ -1014,6 +1092,8 @@ def _verify_pencil_cycle(
 def _verify_unread_mapping(base: str) -> None:
     query = "system_id=matrix-unread"
     inventory = json.loads(_require_status(f"{base}/api/inventory?{query}", 200, authenticated=True))
+    if inventory.get("selected_system_id") != "matrix-unread":
+        raise RuntimeError("Unread mapping source is unavailable; paired refusal check cannot run.")
     slot = inventory["slots"][0]
     revision = slot["mapping_revision"]
     export_url = f"{base}/api/mappings/export?{query}"
@@ -1046,8 +1126,6 @@ def _verify_mapping_cycle(
     )
     system_id = inventory.get("selected_system_id")
     enclosure_id = inventory.get("selected_enclosure_id")
-    if system_id == "matrix-live":
-        _verify_unread_mapping(base)
     # Mapping scope may omit an enclosure, but successful writes also require
     # live occupancy evidence. The dedicated producer supplies one empty bay.
     if (
@@ -1056,6 +1134,8 @@ def _verify_mapping_cycle(
         or (enclosure_id is not None and (not isinstance(enclosure_id, str) or not enclosure_id))
     ):
         raise RuntimeError("physical mapping scope is unavailable")
+    # Never silently drop the paired refusal when the default scope changes.
+    _verify_unread_mapping(base)
     inventory_slots = inventory.get("slots")
     selected_slot = next(
         (
@@ -1128,7 +1208,7 @@ def _verify_mapping_cycle(
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(mapping_path)
     _require_ui_written_file(owner_uid, owner_gid, file_mode, "mapping", expected_owner=expected_owner)
 
-    _restart_ui(prefix, ports)
+    _restart_ui(prefix, ports, history_enabled=variant.history_enabled)
     mappings = _read_app_owned_json(mapping_path).get("slot_mappings")
     if not isinstance(mappings, dict) or len(mappings) != 1:
         raise RuntimeError("mapping restart persistence readback failed")
@@ -1526,8 +1606,18 @@ def _run_variant(
         up = [*prefix, "up", "-d", "--wait", "--wait-timeout", "90"]
         if variant.admin_initial_setup:
             up.append("--no-deps")
-        up.extend(variant.services)
+        # Do not start history's inventory reader before the container-local
+        # producer and the application's forced discovery are both ready.
+        startup_services = tuple(service for service in variant.services
+                                 if not (variant.ui_enabled and service == "enclosure-history"))
+        up.extend(startup_services)
         _run(up)
+        _verify_runtime_contract(prefix, model, startup_services, source_commit)
+        if variant.ui_enabled:
+            _start_mapping_source(prefix)
+            _wait_mapping_inventory(ports)
+            if variant.history_enabled:
+                _start_history(prefix)
         running = set(
             _run((*prefix, "ps", "--services", "--filter", "status=running"), capture_output=True)
             .stdout.splitlines()
@@ -1538,7 +1628,6 @@ def _run_variant(
         if variant.ui_enabled:
             if owner is None:
                 raise RuntimeError("Compose UI writer identity contract is missing.")
-            _start_mapping_source(prefix)
             _verify_ui(ports)
             _verify_pencil_cycle(root, variant, ports, prefix, expected_owner=owner)
             _verify_mapping_cycle(root, variant, ports, prefix, expected_owner=owner)
