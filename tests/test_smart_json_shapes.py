@@ -1315,10 +1315,12 @@ class LiveRefusedPowerOnTests(unittest.IsolatedAsyncioTestCase):
     """The public SMART summary request on a QuantaStor system, with a real store.
 
     An observation that yields no usable SMART value is unavailable: it is not
-    cached as a reading and it is not saved, so the slot-detail entry from an
-    earlier read stays. A reply whose only value is a refused power-on time is
-    such an observation, like a reply with no SMART values at all. A refused
-    power-on time beside another value is a reading and replaces the entry.
+    cached as a reading. A reply with no SMART values at all is not saved, so
+    the slot-detail entry from an earlier read stays. A reply whose only value
+    is a refused power-on time is still an observation of this disk: the saved
+    entry records the refusal in place of the earlier lifetime, so a restart
+    does not serve the older lifetime as current (#1294). A refused power-on
+    time beside another value is a reading and replaces the entry too.
     Every request and every reader below uses a new service and a new store
     object on the same file, so nothing is shared in memory.
     """
@@ -1390,21 +1392,25 @@ class LiveRefusedPowerOnTests(unittest.IsolatedAsyncioTestCase):
         service, live = await self._request(powerOnHours=-1)
         self._assert_refused_only_answer(service, live)
         after = self._stored()
-        self.assertEqual(after.smart_fields, before.smart_fields)
-        self.assertNotIn("unread_fields", after.smart_fields)
-        self.assertEqual((after.smart_updated_at, after.smart_stale), (before.smart_updated_at, False))
+        # Changed for #1294: the refusal replaces the earlier lifetime instead
+        # of leaving it to be served as current after a restart.
+        self.assertNotEqual(before.smart_fields, after.smart_fields)
+        self.assertEqual(after.smart_fields, {"unread_fields": self.UNREAD, "available": False})
+        self.assertFalse(after.smart_stale)
         for reader, lifetime in self._readers().items():
             with self.subTest(reader=reader):
-                self.assertEqual(lifetime, (100, 4, []))
+                self.assertEqual(lifetime, (None, None, self.UNREAD))
 
     async def test_a_refused_only_reply_with_no_earlier_entry_saves_no_smart_fields(self) -> None:
         service, live = await self._request(powerOnHours=-1)
         self._assert_refused_only_answer(service, live)
         entry = self._stored()
-        self.assertEqual({} if entry is None else entry.smart_fields, {})
+        # Changed for #1294: the refusal is saved as the disk's only SMART fact.
+        self.assertEqual({} if entry is None else entry.smart_fields,
+                         {"unread_fields": self.UNREAD, "available": False})
         for reader, lifetime in self._readers().items():
             with self.subTest(reader=reader):
-                self.assertIsNone(lifetime)
+                self.assertEqual(lifetime, (None, None, self.UNREAD))
 
     async def test_a_refused_power_on_time_beside_a_health_result_replaces_the_saved_lifetime(self) -> None:
         await self._store_100_hours()

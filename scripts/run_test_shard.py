@@ -284,6 +284,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_inventory_status_error_text",
         "test_nonroot_cli",
         "test_perf_budgets",
+        "test_persisted_smart_unread",
         "test_profiles",
         "test_public_doc_privacy",
         "test_public_docs_contract",
