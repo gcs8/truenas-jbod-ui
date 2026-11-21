@@ -118,7 +118,7 @@ function parse(html) {
       continue;
     }
     const classes = (/\bclass="([^"]*)"/.exec(attributes)?.[1] || "").split(/\s+/).filter(Boolean);
-    const element = { tag, classes, children: [], parent: current };
+    const element = { tag, classes, attributes, children: [], parent: current };
     current.children.push(element);
     if (!VOID.has(tag) && !attributes.trim().endsWith("/")) current = element;
   }
@@ -295,4 +295,18 @@ test("control: the model sees the page widen when the panel's columns keep an au
   } finally {
     RULES.length = saved;
   }
+});
+
+// Once the table scrolls inside its box, that box is a scrollable region: it
+// takes keyboard focus, so the table can be scrolled without a pointer, and
+// it is named, as the history table's box is (#1116).
+test("the table's scroll box is a named region that takes keyboard focus and shows it", () => {
+  const html = renderOpenEvidence();
+  const box = find(parse(html), (node) => node.classes.includes("fabric-diagnostic-table-wrap"));
+  assert.match(box.attributes, /\brole="region"/);
+  assert.match(box.attributes, /\btabindex="0"/);
+  assert.match(box.attributes, /\baria-label="Recent event sample"/);
+  const focus = rules(STYLE).find((rule) => rule.selectors.some((selector) => /\.fabric-diagnostic-table-wrap:focus-visible$/.test(selector)));
+  assert.ok(focus, "a focus ring rule for the box");
+  assert.match(focus.body, /outline:\s*2px solid var\(--selected\)/);
 });

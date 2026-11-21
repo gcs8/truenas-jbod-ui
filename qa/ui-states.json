@@ -398,7 +398,7 @@
       "id": "fabric.diagnostics", "page": "fabric", "safety": "read", "ci": true,
       "description": "Disk Path fault evidence and its event tables. The evidence renders only in Disk Path, so the state switches there first and is not applicable only when no evidence shows after the switch.",
       "steps": [{"click": "#fabric-mode-disk"}, {"wait": 800}, {"requireVisible": "[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-diagnostic-table-key]"}, {"wait": 600}],
-      "covers": ["[data-fabric-evidence-key]", "[data-fabric-diagnostic-table-key]", "[data-fabric-diagnostic-page]", "[data-fabric-diagnostic-page=prev]", "[data-fabric-diagnostic-page=next]", "[data-fabric-diagnostic-filter-key]", "[data-fabric-diagnostic-type-key]", "[data-fabric-diagnostic-severity-key]", "[data-fabric-diagnostic-confidence-key]"]
+      "covers": ["[data-fabric-evidence-key]", "[data-fabric-diagnostic-table-key]", "[data-fabric-diagnostic-page]", "[data-fabric-diagnostic-page=prev]", "[data-fabric-diagnostic-page=next]", "[data-fabric-diagnostic-filter-key]", "[data-fabric-diagnostic-type-key]", "[data-fabric-diagnostic-severity-key]", "[data-fabric-diagnostic-confidence-key]", ".fabric-diagnostic-table-wrap"]
     },
     {
       "id": "fabric.alias.editor", "page": "fabric", "safety": "read", "ci": true,

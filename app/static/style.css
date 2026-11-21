@@ -2830,6 +2830,11 @@ button.disk-path-card:hover,
   overflow-x: auto;
 }
 
+.fabric-diagnostic-raw .fabric-diagnostic-table-wrap:focus-visible {
+  outline: 2px solid var(--selected);
+  outline-offset: 2px;
+}
+
 .fabric-diagnostic-table {
   width: 100%;
   min-width: 1180px;
