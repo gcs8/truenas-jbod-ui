@@ -254,6 +254,101 @@ class UnnamedFloorProgressTests(unittest.TestCase):
                     self.assertEqual(_texts(path, population), [self.LONG_KEPT] * 6)
 
 
+def _encoded_database(test: unittest.TestCase, name: str, encoding: str) -> Path:
+    temporary = tempfile.TemporaryDirectory(prefix="retention-page-")
+    test.addCleanup(temporary.cleanup)
+    path = Path(temporary.name) / name
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"PRAGMA encoding = '{encoding}'")
+        connection.execute("CREATE TABLE encoding_marker (value)")
+        connection.commit()
+    HistoryStore(str(path))
+    return path
+
+
+def _batch_steps(connection: sqlite3.Connection, cutoffs: dict, batch_size: int, floors: dict) -> tuple[int, dict]:
+    """Run one real batch from the given floors; return (SQLite VM steps, result)."""
+
+    steps = [0]
+
+    def progress() -> int:
+        steps[0] += 1
+        return 0
+
+    connection.set_progress_handler(progress, 1)
+    try:
+        result = HistoryStore._maintain_retention_batch(
+            connection, cutoffs=cutoffs, batch_size=batch_size, scan_floors=floors
+        )
+    finally:
+        connection.set_progress_handler(None, 0)
+    connection.commit()
+    return steps[0], result
+
+
+class EqualTimestampLaterPageTests(unittest.TestCase):
+    """A batch after a floor inside a run of equal timestamps seeks past the run.
+
+    The floor names a (timestamp, key) position. Its work must not grow with
+    the number of kept rows that share its timestamp and lie behind it, for
+    a floor named by text or by key, in every encoding. Floors come only from
+    real earlier batches.
+    """
+
+    SMALL = 300
+    LARGE = 3000
+    SLACK = 300
+    EXPIRED = "2026-11-14T10:00:00+00:00"
+
+    def _later_batch_steps(self, population: str, text: str, count: int, encoding: str) -> int:
+        path = _encoded_database(self, f"{population}-{count}-{encoding}.db", encoding)
+        _insert(path, population, [text] * count + [self.EXPIRED])
+        cutoffs = POPULATION_CUTOFFS[population]
+        with closing(sqlite3.connect(path)) as connection:
+            # A real first batch reads the whole run and leaves its floor on the last kept row.
+            _, first = _batch_steps(connection, cutoffs, count // 2, {})
+            self.assertEqual(_removed(first), 0)
+            self.assertTrue(first["has_more"])
+            (floor,) = first["scan_floors"].values()
+            # Too long to hand back: the floor names the kept row by its key.
+            self.assertEqual(floor[0] is None, text == UnnamedFloorProgressTests.LONG_KEPT, floor)
+            steps, result = _batch_steps(connection, cutoffs, 1, first["scan_floors"])
+        self.assertEqual(_removed(result), 1)
+        self.assertEqual(_texts(path, population), [text] * count)
+        return steps
+
+    def test_a_batch_after_a_floor_in_an_equal_timestamp_run_does_not_reread_the_run(self) -> None:
+        forms = {"text": KEPT_TEXT, "key": UnnamedFloorProgressTests.LONG_KEPT}
+        for encoding in ("UTF-8", "UTF-16le"):
+            for population in POPULATION_CUTOFFS:
+                for form, text in forms.items():
+                    with self.subTest(encoding=encoding, population=population, floor=form):
+                        steps = {
+                            count: self._later_batch_steps(population, text, count, encoding)
+                            for count in (self.SMALL, self.LARGE)
+                        }
+                        self.assertLessEqual(steps[self.LARGE] - steps[self.SMALL], self.SLACK, steps)
+
+    def test_fixed_size_batches_through_an_equal_timestamp_run_do_constant_work(self) -> None:
+        # Batches of one, each starting from the floor the one before left:
+        # the thousandth costs what the second (the first with a floor) does.
+        for population, cutoffs in POPULATION_CUTOFFS.items():
+            with self.subTest(population=population):
+                path = _database(self, f"{population}-fixed.db")
+                _insert(path, population, [KEPT_TEXT] * 2100 + [self.EXPIRED])
+                floors: dict = {}
+                steps: dict[int, int] = {}
+                with closing(sqlite3.connect(path)) as connection:
+                    for number in range(1, 1001):
+                        steps[number], result = _batch_steps(connection, cutoffs, 1, floors)
+                        self.assertTrue(result["has_more"])
+                        self.assertEqual(_removed(result), 0)
+                        floors = result["scan_floors"]
+                sampled = {number: steps[number] for number in (1, 2, 100, 1000)}
+                self.assertLessEqual(max(steps[100], steps[1000]) - steps[2], self.SLACK, sampled)
+                self.assertEqual(len(_texts(path, population)), 2101)
+
+
 class BoundedPagePlanTests(unittest.TestCase):
     """The page, the key deletes and the remaining check never scan a table."""
 
@@ -453,6 +548,42 @@ class RestoreOrderableTimestampTests(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             self.store.restore_backup(candidate)
         self.assertIn("2 slot_events.observed_at timestamps", str(refused.exception))
+
+    def test_a_timestamp_stored_as_a_blob_is_refused_and_the_same_text_is_admitted(self) -> None:
+        # A BLOB never sorts before a TEXT cutoff, so retention would keep it
+        # forever, however valid the ISO text its bytes hold.
+        text = "2020-01-01T00:00:00+00:00"
+        for column in RETAINED_COLUMNS:
+            table, name = column.split(".")
+            for storage in ("blob", "text"):
+                with self.subTest(column=column, storage=storage):
+                    candidate = _candidate(self.root, f"{column}-{storage}.sqlite3", column, text)
+                    with closing(sqlite3.connect(candidate)) as connection:
+                        connection.execute(f"UPDATE {table} SET {name} = CAST({name} AS {storage.upper()})")
+                        connection.commit()
+                        stored = connection.execute(f"SELECT typeof({name}), count(*) FROM {table}").fetchone()
+                    self.assertEqual(stored, (storage, 1))
+                    checks = (
+                        lambda: SystemBackupService._validate_history_member(candidate),
+                        lambda: self.store.restore_backup(candidate),
+                    )
+                    if storage == "text":
+                        for check in checks:
+                            check()
+                        with closing(sqlite3.connect(self.live)) as connection:
+                            restored = connection.execute(f"SELECT typeof({name}), {name} FROM {table}").fetchall()
+                        self.assertEqual(restored, [("text", text)])
+                        continue
+                    before = self._live_events()
+                    for check in checks:
+                        with self.assertRaises(ValueError) as refused:
+                            check()
+                        message = str(refused.exception)
+                        self.assertIn(f"1 {column} timestamp", message)
+                        self.assertIn("cannot order", message)
+                        self.assertIn("stored as text", message)
+                        self.assertIn("Nothing was restored", message)
+                    self.assertEqual(self._live_events(), before)
 
     def test_mixed_offset_timestamps_are_restored(self) -> None:
         # Control: every orderable spelling, in every retained column.

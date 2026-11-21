@@ -439,49 +439,57 @@ def _remove_retention_page(
     The page is the next rows whose text sorts before the cutoff, after the
     table's floor, in index order, at most _RETENTION_PAGE_FACTOR times the
     batch size; no other candidate is read, however many rows the exact-time
-    test keeps (#1268). The first batch_size expired rows of the page are
-    rolled up (`roll_up`, given their ids as a SELECT and its parameters) and
+    test keeps or share the floor's timestamp (#1268). The first batch_size
+    expired rows of the page are rolled up (`roll_up`, given their ids as a
+    SELECT and its parameters) and
     deleted, and the floor moves past every row the batch read and did not
     leave for the next batch, kept rows included. A floor whose text is None
     names a kept row by its key. `scope` is an extra
     equality prefix of the index ("bucket_seconds = ? AND ", parameters).
     finished: nothing after the floor can be eligible, because every
     candidate after it was read with this cutoff, or none is left. With a
-    batch_size of 0 nothing is read but that one-row check.
+    batch_size of 0 nothing is read but those one-row checks.
     """
 
     page_size = store_module._RETENTION_PAGE_FACTOR * batch_size
     _, settled, instant = cls._retention_bounds(cutoff)
     scope_sql, scope_parameters = scope
 
-    def candidates(floor: tuple[bytes | str | None, int] | None) -> tuple[str, tuple[Any, ...]]:
-        after, after_parameters = "", ()
-        if floor is not None and floor[0] is None:
+    def candidates(floor: tuple[bytes | str | None, int] | None) -> list[tuple[str, tuple[Any, ...]]]:
+        # The ranges after the floor, in index order. A (timestamp, key)
+        # row value is only a seek on the timestamp, so SQLite would walk
+        # every earlier row with the floor's timestamp: the rest of that
+        # timestamp after the key, then the later timestamps, are two seeks.
+        head, before = f"FROM {table_name} WHERE {scope_sql}", f"{timestamp_column} < ?"
+        if floor is None:
+            return [(f"{head}{before}", (*scope_parameters, cutoff))]
+        if floor[0] is None:
             # A kept row whose text the batch could not hand back is named by
             # its key; SQLite reads the text itself.
-            after = (
-                f" AND ({timestamp_column}, {key_column}) > "
-                f"((SELECT {timestamp_column} FROM {table_name} WHERE {key_column} = ?), ?)"
-            )
-            after_parameters = (floor[1], floor[1])
-        elif floor is not None:
-            after = f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)"
-            after_parameters = floor
-        return (
-            f"FROM {table_name} WHERE {scope_sql}{timestamp_column} < ?{after}",
-            (*scope_parameters, cutoff, *after_parameters),
-        )
+            text = f"(SELECT {timestamp_column} FROM {table_name} WHERE {key_column} = ?)"
+            text_parameters: tuple[Any, ...] = (floor[1],)
+        else:
+            text, text_parameters = "CAST(? AS TEXT)", (floor[0],)
+        return [
+            (f"{head}{timestamp_column} = {text} AND {key_column} > ? AND {before}",
+             (*scope_parameters, *text_parameters, floor[1], cutoff)),
+            (f"{head}{timestamp_column} > {text} AND {before}", (*scope_parameters, *text_parameters, cutoff)),
+        ]
 
-    source, parameters = candidates(floors.get(name))
-    # CASE, not OR: the exact-time function runs only for rows in the day
-    # before the cutoff, as in the expiry predicate.
-    page = connection.execute(
-        f"SELECT {cls._deleted_floor_text(timestamp_column)}, {key_column}, "
-        f"CASE WHEN {timestamp_column} < ? THEN 1 "
-        f"WHEN _history_utc_instant(CAST({timestamp_column} AS BLOB)) < ? THEN 1 ELSE 0 END "
-        f"{source} ORDER BY {timestamp_column}, {key_column} LIMIT ?",
-        (settled, instant, *parameters, page_size),
-    ).fetchall()
+    page: list[Any] = []
+    for source, parameters in candidates(floors.get(name)):
+        # CASE, not OR: the exact-time function runs only for rows in the
+        # day before the cutoff, as in the expiry predicate. Both ranges
+        # share the page.
+        page += connection.execute(
+            f"SELECT {cls._deleted_floor_text(timestamp_column)}, {key_column}, "
+            f"CASE WHEN {timestamp_column} < ? THEN 1 "
+            f"WHEN _history_utc_instant(CAST({timestamp_column} AS BLOB)) < ? THEN 1 ELSE 0 END "
+            f"{source} ORDER BY {timestamp_column}, {key_column} LIMIT ?",
+            (settled, instant, *parameters, page_size - len(page)),
+        ).fetchall()
+        if len(page) == page_size:
+            break
     keys: list[int] = []
     processed = len(page)
     for index, (_, key, expired) in enumerate(page):
@@ -510,6 +518,7 @@ def _remove_retention_page(
         return len(keys), False
     if len(page) < page_size:
         return len(keys), True
-    source, parameters = candidates(floors.get(name))
-    remaining = connection.execute(f"SELECT EXISTS(SELECT 1 {source})", parameters).fetchone()[0]
-    return len(keys), not remaining
+    for source, parameters in candidates(floors.get(name)):
+        if connection.execute(f"SELECT EXISTS(SELECT 1 {source})", parameters).fetchone()[0]:
+            return len(keys), False
+    return len(keys), True

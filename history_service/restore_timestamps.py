@@ -52,8 +52,9 @@ def require_orderable_restored_timestamps(
 ) -> None:
     """Refuse a database with a retained timestamp retention cannot order.
 
-    Such a row (no offset, an invalid one, another ISO-8601 layout, or text
-    that is not valid in the database's encoding) would be kept or expired
+    Such a row (no offset, an invalid one, another ISO-8601 layout, text
+    that is not valid in the database's encoding, or a value not stored as
+    TEXT, such as a BLOB holding valid text) would be kept or expired
     by its text alone, and every retention pass would read it again while it
     is in the day before the cutoff. Nothing is rewritten: the database is
     refused with the count and column. A table or column an older supported
@@ -80,8 +81,12 @@ def require_orderable_restored_timestamps(
             connection.create_function("_history_retention_can_order", 1, can_order, deterministic=True)
             registered = True
         column = f'"{column_name}"'
+        # Retention compares the stored value with a TEXT cutoff; a value of
+        # another storage class (a BLOB holding the same characters) never
+        # sorts before it, so only TEXT can be ordered.
         count = connection.execute(
-            f'SELECT count(*) FROM "{table_name}" WHERE NOT COALESCE(({column} GLOB ? OR {column} GLOB ?) '
+            f'SELECT count(*) FROM "{table_name}" WHERE typeof({column}) IS NOT \'text\' '
+            f"OR NOT COALESCE(({column} GLOB ? OR {column} GLOB ?) "
             f"AND strftime('%Y-%m-%dT%H:%M:%S', {column}) = substr({column}, 1, 19), 0) "
             f"AND NOT _history_retention_can_order(CAST({column} AS BLOB))",
             _SERVICE_TIMESTAMP_GLOBS,
@@ -90,6 +95,6 @@ def require_orderable_restored_timestamps(
             raise ValueError(
                 f"The history database in this backup has {count} {table_name}.{column_name} "
                 f"timestamp{'' if count == 1 else 's'} that history retention cannot order: each "
-                "needs an ISO-8601 date and time with a UTC offset, starting with its own date "
-                "(YYYY-MM-DD). Nothing was restored and the current history was not changed."
+                "needs an ISO-8601 date and time with a UTC offset, stored as text, starting with "
+                "its own date (YYYY-MM-DD). Nothing was restored and the current history was not changed."
             )
