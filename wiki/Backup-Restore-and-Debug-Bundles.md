@@ -319,8 +319,14 @@ history database (4 CPUs):
 | Peak memory (create) | 193 MiB | 95 MiB |
 
 These are whole production operations measured with
-`scripts/benchmark_full_backup.py`, with a 1 GiB address-space limit on each
-phase.
+`scripts/benchmark_full_backup.py` when it still gave each phase a flat 1 GiB
+address-space limit. They have not been rerun since. The script now limits each
+phase to the address space its worker inherits from the benchmark process plus
+1 GiB. Its report names that 1 GiB as `per_phase_address_space_budget_bytes`
+and records, for each phase, `address_space_inherited_bytes` and the
+`address_space_limit_bytes` the phase ran under (null when the phase did not
+finish). The older field `per_process_address_space_limit_bytes` is kept and
+equals the budget, not the limit.
 
 `7z` spends most of a full backup compressing on one core, so its create step
 gets 10 minutes or one second per 512 KiB of staged input, whichever is longer,
