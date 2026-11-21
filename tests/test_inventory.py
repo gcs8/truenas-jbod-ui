@@ -20230,7 +20230,12 @@ class ReviewRegressionTests(unittest.TestCase):
                 smart_test_results=[],
             )
 
-            with patch("app.services.inventory.EnclosureOption", wraps=EnclosureOption) as option_factory:
+            # The shipped bound sits far above real shelf counts (#1307); pin the
+            # former bound so this keeps proving dedup happens before expansion.
+            with (
+                patch("app.services.inventory.QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES", 64),
+                patch("app.services.inventory.EnclosureOption", wraps=EnclosureOption) as option_factory,
+            ):
                 options = service._build_quantastor_enclosure_options(raw_data)
 
             self.assertEqual(

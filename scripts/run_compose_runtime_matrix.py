@@ -21,6 +21,13 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Sequence
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.services.atomic_write import write_atomically  # noqa: E402
+
+
 APP_UID = 10001
 APP_GID = 10001
 BACKUP_UID = 1000
@@ -421,8 +428,7 @@ def _write_environment(
     values.append("")
     environment = "\n".join(values)
     env_path = root / ".env"
-    env_path.write_text(environment, encoding="utf-8", newline="\n")
-    env_path.chmod(0o600)
+    write_atomically(env_path, lambda handle: handle.write(environment), newline="\n", mode=0o600)
 
 
 # Initial setup starts from a fresh install: no systems and no legacy
@@ -540,8 +546,7 @@ def _prepare_variant_root(
     )
     if variant.scheduler_policy_enabled:
         source = root / ".synthetic-backup-passphrase"
-        source.write_text(SYNTHETIC_BACKUP_PASSPHRASE, encoding="utf-8")
-        source.chmod(0o600)
+        write_atomically(source, lambda handle: handle.write(SYNTHETIC_BACKUP_PASSPHRASE), mode=0o600)
         try:
             _run(
                 (
