@@ -472,7 +472,9 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
         self.assertEqual(result["events_removed"], len(expired))
         self.assertFalse(result["has_more"])
         self.assertEqual(_event_labels(self.path), ["kept"] * len(rejected))
-        self.assertEqual(parsed[0], 40)
+        # Each rejected row once: a batch's page moves the floor past the rows
+        # it keeps (#1268); 40 when the floor moved only past deleted rows.
+        self.assertEqual(parsed[0], 30)
 
     def test_a_floor_that_cannot_be_named_stays_lower_and_the_pass_still_ends(self) -> None:
         # Text bytes the database's encoding cannot decode (a lone surrogate
@@ -493,9 +495,15 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
             first = connection.execute("SELECT min(id) FROM slot_events").fetchone()[0]
             batches = self._event_batches(connection)
             left = [row[0] - first for row in connection.execute("SELECT id FROM slot_events ORDER BY id")]
-        named = self.ENCODING == "UTF-8"
-        floor_keys = [0, 1 if named else 0, 2 if named else 0, 3 if named else 0, 4, 7]
-        self.assertEqual(batches, [(1, first + key) for key in floor_keys])
+        # A batch reads a page of two rows and its floor moves past the rows it
+        # keeps (#1268). In UTF-8 the batch that deletes row 4 also passes the
+        # kept row 5. In UTF-16 row 5 cannot be named, so that batch keeps the
+        # floor at row 0 and the next one reads rows 5 and 6, deleting nothing.
+        if self.ENCODING == "UTF-8":
+            expected = [(1, key) for key in (0, 1, 2, 3, 5, 7)]
+        else:
+            expected = [(1, 0)] * 5 + [(0, 6), (1, 7)]
+        self.assertEqual(batches, [(removed, first + key) for removed, key in expected])
         self.assertEqual(left, [5, 6])
 
 
@@ -729,8 +737,9 @@ class RetentionBatchWorkTests(unittest.TestCase):
     def test_only_rows_in_the_day_before_the_cutoff_grow_the_work_of_a_batch(self) -> None:
         # Valid rows newer than the cutoff whose -05:00 text sorts before it,
         # and recent rows whose time cannot be read, both sit in the window.
-        # A batch reads each of them once, so its work grows linearly with the
-        # window rows. That is the documented bound, not a size-only bound.
+        # A batch used to read each of them, so its work grew linearly with
+        # the window rows. It now reads one bounded page of them (#1268), so
+        # they no longer grow it, and it reports that rows are left unread.
         cases = (
             ("negative-offset", "2026-11-14T08:00:00-05:00", True,
              {"metric": CUTOFF, "event": CUTOFF, "hourly": CUTOFF, "daily": CUTOFF}),
@@ -744,10 +753,8 @@ class RetentionBatchWorkTests(unittest.TestCase):
                     self._fill(path, observed_at, count, metrics=metrics)
                     work[count], result = _batch_work(path, cutoffs)
                     self.assertEqual(result["events_removed"], 0)
-                    self.assertFalse(result["has_more"])
-                growth = work[self.LARGE] / work[self.SMALL]
-                self.assertGreater(growth, 5, work)
-                self.assertLessEqual(growth, 1.1 * self.LARGE / self.SMALL, work)
+                    self.assertTrue(result["has_more"])
+                self.assertLessEqual(work[self.LARGE] - work[self.SMALL], self.SLACK, work)
 
     def test_a_full_pass_reads_each_window_row_a_bounded_number_of_times(self) -> None:
         # Expired UTC rows interleaved with -05:00 rows that are newer than the
@@ -2332,8 +2339,13 @@ class RetentionQueryPlanTests(unittest.TestCase):
                             for table in self.TABLES:
                                 self.assertFalse(line.startswith(f"SCAN {table}"), plan)
                         searches = [line for line in plan if line.startswith("SEARCH")]
+                        # The rollup insert reads the raw rows the batch's
+                        # bounded page selected, by key (#1268).
+                        selected_by_key = sql.lstrip().upper().startswith("INSERT") and (
+                            "SEARCH metric_samples USING INTEGER PRIMARY KEY (rowid=?)" in searches
+                        )
                         self.assertTrue(
-                            any(
+                            selected_by_key or any(
                                 "idx_metric_samples_observed_at (observed_at" in line
                                 or "idx_slot_events_observed_at (observed_at" in line
                                 or "idx_metric_rollups_retention (bucket_seconds=? AND bucket_start" in line

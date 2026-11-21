@@ -250,12 +250,92 @@ _ROLLBACK_JOURNAL_FILE_FORMAT = b"\x01\x01"
 _FILE_FORMAT_HEADER_OFFSET = 18
 
 
+# Columns whose text retention compares with its cutoff. A restore admits
+# only values that comparison can order (#1268).
+RETENTION_TIMESTAMP_COLUMNS = (
+    ("slot_events", "observed_at"),
+    ("metric_samples", "observed_at"),
+    ("metric_rollups", "bucket_start"),
+)
+_DIGITS = "[0-9]"
+_SERVICE_TIMESTAMP_PREFIX = (
+    f"{_DIGITS * 4}-{_DIGITS * 2}-{_DIGITS * 2}T{_DIGITS * 2}:{_DIGITS * 2}:{_DIGITS * 2}"
+)
+# The forms the service writes (UTC, whole second or six fraction digits).
+# Matching text with a real date and time skips the exact check in Python.
+_SERVICE_TIMESTAMP_GLOBS = (
+    f"{_SERVICE_TIMESTAMP_PREFIX}+00:00",
+    f"{_SERVICE_TIMESTAMP_PREFIX}.{_DIGITS * 6}+00:00",
+)
+
+
+def _retention_can_order(text: object) -> bool:
+    """Whether retention orders this timestamp text correctly.
+
+    It needs an exact UTC instant (an ISO-8601 date and time with an offset
+    under a day) and text that starts with that time's own date: retention
+    expires text more than a day before the cutoff by its date alone, and
+    never reads text that sorts after the cutoff.
+    """
+
+    if not isinstance(text, str) or _history_utc_instant(text) is None:
+        return False
+    return text[:10] == datetime.fromisoformat(text).date().isoformat()
+
+
+def require_orderable_restored_timestamps(connection: sqlite3.Connection) -> None:
+    """Refuse a database with a retained timestamp retention cannot order.
+
+    Such a row (no offset, an invalid one, another ISO-8601 layout, or text
+    that is not valid in the database's encoding) would be kept or expired
+    by its text alone, and every retention pass would read it again while it
+    is in the day before the cutoff. Nothing is rewritten: the database is
+    refused with the count and column. A table or column an older supported
+    schema lacks is skipped.
+    """
+    registered = False
+    for table_name, column_name in RETENTION_TIMESTAMP_COLUMNS:
+        present = connection.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            (table_name, column_name),
+        ).fetchone()
+        if present is None:
+            continue
+        if not registered:
+            encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+
+            def can_order(value: object) -> bool:
+                try:
+                    text = value.decode(encoding) if isinstance(value, bytes) else value
+                except UnicodeDecodeError:
+                    return False
+                return _retention_can_order(text)
+
+            connection.create_function("_history_retention_can_order", 1, can_order, deterministic=True)
+            registered = True
+        column = f'"{column_name}"'
+        count = connection.execute(
+            f'SELECT count(*) FROM "{table_name}" WHERE NOT COALESCE(({column} GLOB ? OR {column} GLOB ?) '
+            f"AND strftime('%Y-%m-%dT%H:%M:%S', {column}) = substr({column}, 1, 19), 0) "
+            f"AND NOT _history_retention_can_order(CAST({column} AS BLOB))",
+            _SERVICE_TIMESTAMP_GLOBS,
+        ).fetchone()[0]
+        if count:
+            raise ValueError(
+                f"The history database in this backup has {count} {table_name}.{column_name} "
+                f"timestamp{'' if count == 1 else 's'} that history retention cannot order: each "
+                "needs an ISO-8601 date and time with a UTC offset, starting with its own date "
+                "(YYYY-MM-DD). Nothing was restored and the current history was not changed."
+            )
+
+
 def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
     """Refuse a database with a timestamp field longer than the restore bound.
 
     Nothing is truncated or dropped: one oversized field refuses the whole
     database with a reason the operator can act on. A table or column an
-    older supported schema lacks is skipped.
+    older supported schema lacks is skipped. Retained timestamps must also
+    be ones retention can order (require_orderable_restored_timestamps).
     """
     for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
         present = connection.execute(
@@ -275,6 +355,7 @@ def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
                 f"timestamp longer than {MAX_RESTORED_TIMESTAMP_BYTES} bytes. Nothing was "
                 "restored and the current history was not changed."
             )
+    require_orderable_restored_timestamps(connection)
 
 
 def count_oversized_restored_timestamps(
@@ -744,6 +825,10 @@ class HistoryBackupSourceReplacedError(RuntimeError):
 # column; retention deletes such a row like any other old text but does not
 # read its text back, so a batch holds at most this much for each row.
 _RETENTION_FLOOR_TEXT_MAX_BYTES = 256
+# A retention batch reads at most this many candidate rows per table for
+# each row it may remove: room for a full batch of removals and as many rows
+# the exact-time test keeps, however many of those the table holds (#1268).
+_RETENTION_PAGE_FACTOR = 2
 
 
 def _history_utc_instant(value: object) -> str | None:
@@ -798,6 +883,9 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must not be world-writable.")
         self._ensure_database_parent()
         self._lock = threading.Lock()
+        # Scan floors a retention pass that ended with more work hands to the
+        # next pass (see maintain_retention). In memory only.
+        self._retention_carry: dict[str, tuple[bytes | str, int]] = {}
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
         self._segment_reader_lock = threading.Lock()
@@ -3342,8 +3430,16 @@ class HistoryStore:
             "interrupted": False,
         }
 
-        # In-memory scan state for this pass only (see _maintain_retention_batch).
-        scan_floors: dict[str, tuple[bytes | str, int]] = {}
+        # In-memory scan state (see _maintain_retention_batch). A pass that
+        # uses its whole batch budget hands its unfinished floors to the next
+        # pass, so a kept set larger than one pass can read is read once per
+        # sweep instead of from its start by every pass, and the sweep reaches
+        # the rows behind it (#1268). A row kept by an earlier pass of the same
+        # sweep that has since become eligible waits, like a row added behind
+        # the floor, for the next pass, which starts with no floor once a pass
+        # ends without more work.
+        scan_floors = self._retention_carry
+        self._retention_carry = {}
         finished_tables: set[str] = set()
         for _ in range(max_batches):
             if should_continue is not None and not should_continue():
@@ -3379,6 +3475,11 @@ class HistoryStore:
             if not summary["has_more"]:
                 break
 
+        # A stopped pass hands nothing on: the service is shutting down.
+        if summary["has_more"] and not summary["interrupted"]:
+            self._retention_carry = {
+                name: floor for name, floor in scan_floors.items() if name not in finished_tables
+            }
         summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
         summary["pages_reclaimed"] = 0
         if summary["total_rows_removed"] and not summary["interrupted"]:
@@ -3440,30 +3541,27 @@ class HistoryStore:
         scan_floors: dict[str, tuple[bytes | str, int]] | None = None,
         finished_tables: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
-        # The same ordered, bounded subquery selects the batch for both rollups and
-        # the delete, so the rows aggregated are exactly the rows removed and the
-        # batch size never turns into one SQL variable per row.
+        # One bounded page per table selects the batch for both rollups and
+        # the delete, so the rows aggregated are exactly the rows removed.
         #
-        # Work: rows whose text sorts at or after the cutoff are never visited,
-        # and rows before the settled bound are taken in index order, so one
-        # batch visits at most batch_size rows plus the rows whose text lies in
-        # the day before the cutoff that the exact-time test rejects. Two pieces
-        # of in-memory state, kept for one pass only, stop later batches of the
-        # same pass reading those rejected rows again (#1204):
-        # - a scan floor per table (the last row a batch deleted, by text and
-        #   key): the next batch starts after it;
-        # - a finished set: a table whose batch deleted nothing has nothing
-        #   eligible from its floor, so it is not read again in this pass while
-        #   other tables keep the pass running.
+        # Work: rows whose text sorts at or after the cutoff are never visited.
+        # Each table's page is the next candidates after its scan floor, in
+        # index order, at most _RETENTION_PAGE_FACTOR times the batch size,
+        # however many rows in the day before the cutoff the exact-time test
+        # keeps (#1268). Two pieces of in-memory state, kept for one pass (and
+        # carried to the next while work remains, see maintain_retention):
+        # - a scan floor per table (the last row a batch read and did not
+        #   leave for the next batch, kept rows included): the next batch
+        #   starts after it;
+        # - a finished set: a table whose candidates after its floor were all
+        #   read with this cutoff has nothing eligible left, so it is not read
+        #   again in this pass while other tables keep the pass running.
         # Both only narrow the scan. A row another writer adds behind the
-        # floor, or in a finished table, waits for the next pass: a deletion
+        # floor, or in a finished table, waits for a later pass: a deletion
         # can be delayed, never advanced. A rollup this batch writes is known
         # to the pass, so when its bucket is already past that table's cutoff
         # the same batch deletes it by key, wherever it lies; has_more=false
-        # therefore never leaves a row the pass wrote and could delete. Rollups
-        # still cover exactly the raw rows deleted, because one subquery
-        # selects both. Each table's rejected window rows are therefore read a
-        # bounded number of times per pass, whatever the other tables hold.
+        # therefore never leaves a row the pass wrote and could delete.
         cls._register_retention_functions(connection)
         floors = dict(scan_floors or {})
         finished = set(finished_tables)
@@ -3471,42 +3569,47 @@ class HistoryStore:
         def active(name: str, cutoff: str | None) -> bool:
             return cutoff is not None and name not in finished
 
-        def record(name: str, removed: int) -> int:
-            if not removed:
+        def remove_page(name: str, table_name: str, timestamp_column: str, key_column: str,
+                        cutoff: str, limit: int, **options: Any) -> int:
+            removed, done = cls._remove_retention_page(
+                connection,
+                name=name,
+                table_name=table_name,
+                timestamp_column=timestamp_column,
+                key_column=key_column,
+                cutoff=cutoff,
+                batch_size=limit,
+                floors=floors,
+                **options,
+            )
+            if done:
                 finished.add(name)
             return removed
 
         metric_samples_removed = 0
         written_expired: dict[int, list[int]] = {3600: [], 86400: []}
         if active("metric_samples", cutoffs["metric"]):
-            for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
-                written_expired[bucket_seconds] = cls._roll_up_metric_rows(
-                    connection,
-                    cutoff=cutoffs["metric"],
-                    batch_size=batch_size,
-                    bucket_seconds=bucket_seconds,
-                    floor=floors.get("metric_samples"),
-                    rollup_cutoff=cutoffs[kind],
-                )
-            metric_samples_removed = record("metric_samples", cls._delete_expired_rows(
-                connection,
-                table_name="metric_samples",
-                timestamp_column="observed_at",
-                cutoff=cutoffs["metric"],
-                batch_size=batch_size,
-                floors=floors,
-            ))
+
+            def roll_up(selected_rows: str, selected_parameters: tuple[Any, ...]) -> None:
+                for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
+                    written_expired[bucket_seconds] = cls._roll_up_selected_rows(
+                        connection,
+                        selected_rows=selected_rows,
+                        selected_parameters=selected_parameters,
+                        bucket_seconds=bucket_seconds,
+                        rollup_cutoff=cutoffs[kind],
+                    )
+
+            metric_samples_removed = remove_page(
+                "metric_samples", "metric_samples", "observed_at", "id",
+                cutoffs["metric"], batch_size, roll_up=roll_up,
+            )
 
         events_removed = 0
         if active("slot_events", cutoffs["event"]):
-            events_removed = record("slot_events", cls._delete_expired_rows(
-                connection,
-                table_name="slot_events",
-                timestamp_column="observed_at",
-                cutoff=cutoffs["event"],
-                batch_size=batch_size,
-                floors=floors,
-            ))
+            events_removed = remove_page(
+                "slot_events", "slot_events", "observed_at", "id", cutoffs["event"], batch_size,
+            )
         rollups_removed = {}
         for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
             name = f"rollups_{bucket_seconds}"
@@ -3516,39 +3619,24 @@ class HistoryStore:
                 "DELETE FROM metric_rollups WHERE rowid = ? AND bucket_seconds = ?",
                 [(rowid, bucket_seconds) for rowid in written_expired[bucket_seconds]],
             ).rowcount if written_expired[bucket_seconds] else 0
-            if active(name, cutoffs[kind]) and removed < batch_size:
-                removed += record(name, cls._delete_rollup_batch(
-                    connection,
-                    bucket_seconds=bucket_seconds,
-                    cutoff=cutoffs[kind],
-                    batch_size=batch_size - removed,
-                    floors=floors,
-                ))
+            if active(name, cutoffs[kind]):
+                # With no budget left the page is empty and only the one-row
+                # check for candidates after the floor runs.
+                removed += remove_page(
+                    name, "metric_rollups", "bucket_start", "rowid", cutoffs[kind], batch_size - removed,
+                    scope=("bucket_seconds = ? AND ", (bucket_seconds,)),
+                )
             rollups_removed[bucket_seconds] = removed
-        # A table that just deleted nothing has nothing eligible left in this
-        # transaction, so it is skipped here too; a table whose check finds
-        # nothing is finished as well.
-        remaining_checks = (
-            ("metric_samples", cutoffs["metric"], lambda floor: cls._retention_rows_exist(
-                connection, "metric_samples", "observed_at", cutoffs["metric"], floor=floor,
-            )),
-            ("slot_events", cutoffs["event"], lambda floor: cls._retention_rows_exist(
-                connection, "slot_events", "observed_at", cutoffs["event"], floor=floor,
-            )),
-            ("rollups_3600", cutoffs["hourly"], lambda floor: cls._rollups_exist(
-                connection, 3600, cutoffs["hourly"], floor=floor,
-            )),
-            ("rollups_86400", cutoffs["daily"], lambda floor: cls._rollups_exist(
-                connection, 86400, cutoffs["daily"], floor=floor,
-            )),
+        # A table not finished may hold eligible rows this batch did not read.
+        has_more = any(
+            active(name, cutoffs[kind])
+            for name, kind in (
+                ("metric_samples", "metric"),
+                ("slot_events", "event"),
+                ("rollups_3600", "hourly"),
+                ("rollups_86400", "daily"),
+            )
         )
-        has_more = False
-        for name, cutoff, exists in remaining_checks:
-            if active(name, cutoff):
-                if exists(floors.get(name)):
-                    has_more = True
-                else:
-                    finished.add(name)
         return {
             "metric_samples_removed": metric_samples_removed,
             "events_removed": events_removed,
@@ -3753,6 +3841,56 @@ class HistoryStore:
         floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         return store_retention._rollups_exist(_STORE_MODULE, cls, connection, bucket_seconds, cutoff, floor=floor)
+
+    @classmethod
+    def _roll_up_selected_rows(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        selected_rows: str,
+        selected_parameters: tuple[Any, ...],
+        bucket_seconds: int,
+        rollup_cutoff: str | None = None,
+    ) -> list[int]:
+        return store_retention._roll_up_selected_rows(
+            _STORE_MODULE,
+            cls,
+            connection,
+            selected_rows=selected_rows,
+            selected_parameters=selected_parameters,
+            bucket_seconds=bucket_seconds,
+            rollup_cutoff=rollup_cutoff,
+        )
+
+    @classmethod
+    def _remove_retention_page(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        name: str,
+        table_name: str,
+        timestamp_column: str,
+        key_column: str,
+        cutoff: str,
+        batch_size: int,
+        floors: dict[str, tuple[bytes | str, int]],
+        scope: tuple[str, tuple[Any, ...]] = ("", ()),
+        roll_up: Callable[[str, tuple[Any, ...]], None] | None = None,
+    ) -> tuple[int, bool]:
+        return store_retention._remove_retention_page(
+            _STORE_MODULE,
+            cls,
+            connection,
+            name=name,
+            table_name=table_name,
+            timestamp_column=timestamp_column,
+            key_column=key_column,
+            cutoff=cutoff,
+            batch_size=batch_size,
+            floors=floors,
+            scope=scope,
+            roll_up=roll_up,
+        )
 
     def list_slot_events(
         self,

@@ -12,12 +12,16 @@ time, and sibling helpers are called through `cls`, so a replacement made on
 the store module or class still reaches this code. This module does not
 import the store module. Multi-line SQL keeps the indentation it had in the
 class, so every statement is byte-for-byte the released text, except that
-rollup buckets are named from julianday() (#1320).
+rollup buckets are named from julianday() (#1320). The bounded-page
+statements of _remove_retention_page are new (#1268); retention batches use
+them, and the earlier per-table helpers keep their released text.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Callable
 from types import ModuleType
 from typing import Any
 
@@ -208,6 +212,33 @@ def _roll_up_metric_rows(
     statement inserted or updated.
     """
 
+    expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
+    return cls._roll_up_selected_rows(
+        connection,
+        selected_rows=expired_rows,
+        selected_parameters=(*cls._retention_parameters(cutoff, floor), batch_size),
+        bucket_seconds=bucket_seconds,
+        rollup_cutoff=rollup_cutoff,
+    )
+
+
+def _roll_up_selected_rows(
+    store_module: ModuleType,
+    cls,
+    connection: sqlite3.Connection,
+    *,
+    selected_rows: str,
+    selected_parameters: tuple[Any, ...],
+    bucket_seconds: int,
+    rollup_cutoff: str | None = None,
+) -> list[int]:
+    """Roll up the raw rows whose ids `selected_rows` returns; return the written rollups already expired.
+
+    `selected_rows` is a SELECT of metric_samples ids and `selected_parameters`
+    are its parameters. Expiry is the rollup table's own predicate, evaluated
+    on each row the statement inserted or updated.
+    """
+
     if rollup_cutoff is None:
         returning, returning_parameters = "RETURNING rowid, 0", ()
     else:
@@ -226,7 +257,6 @@ def _roll_up_metric_rows(
         bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', julianday(observed_at))"
     else:
         raise ValueError("Unsupported history rollup interval.")
-    expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
     # The last value's order (see _newer_last_sample): SQLite's reading,
     # the text, then the row id. Rows without a value are not ranked.
     partition = (
@@ -267,7 +297,7 @@ def _roll_up_metric_rows(
                         ORDER BY julianday(observed_at) DESC, observed_at DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
-                WHERE id IN ({expired_rows})
+                WHERE id IN ({selected_rows})
                   AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
             ) selected_samples
             GROUP BY
@@ -304,8 +334,7 @@ def _roll_up_metric_rows(
         + returning,
         (
             bucket_seconds,
-            *cls._retention_parameters(cutoff, floor),
-            batch_size,
+            *selected_parameters,
             *returning_parameters,
         ),
     ).fetchall()
@@ -388,3 +417,77 @@ def _rollups_exist(
         (bucket_seconds, *cls._retention_parameters(cutoff, floor)),
     ).fetchone()
     return bool(row[0])
+
+
+def _remove_retention_page(
+    store_module: ModuleType,
+    cls,
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    table_name: str,
+    timestamp_column: str,
+    key_column: str,
+    cutoff: str,
+    batch_size: int,
+    floors: dict[str, tuple[bytes | str, int]],
+    scope: tuple[str, tuple[Any, ...]] = ("", ()),
+    roll_up: Callable[[str, tuple[Any, ...]], None] | None = None,
+) -> tuple[int, bool]:
+    """Remove up to batch_size expired rows from one bounded page; return (removed, finished).
+
+    The page is the next rows whose text sorts before the cutoff, after the
+    table's floor, in index order, at most _RETENTION_PAGE_FACTOR times the
+    batch size; no other candidate is read, however many rows the exact-time
+    test keeps (#1268). The first batch_size expired rows of the page are
+    rolled up (`roll_up`, given their ids as a SELECT and its parameters) and
+    deleted, and the floor moves past every row the batch read and did not
+    leave for the next batch, kept rows included. `scope` is an extra
+    equality prefix of the index ("bucket_seconds = ? AND ", parameters).
+    finished: nothing after the floor can be eligible, because every
+    candidate after it was read with this cutoff, or none is left. With a
+    batch_size of 0 nothing is read but that one-row check.
+    """
+
+    page_size = store_module._RETENTION_PAGE_FACTOR * batch_size
+    _, settled, instant = cls._retention_bounds(cutoff)
+    scope_sql, scope_parameters = scope
+
+    def candidates(floor: tuple[bytes | str, int] | None) -> tuple[str, tuple[Any, ...]]:
+        after = f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)" if floor else ""
+        return (
+            f"FROM {table_name} WHERE {scope_sql}{timestamp_column} < ?{after}",
+            (*scope_parameters, cutoff, *(floor or ())),
+        )
+
+    source, parameters = candidates(floors.get(name))
+    # CASE, not OR: the exact-time function runs only for rows in the day
+    # before the cutoff, as in the expiry predicate.
+    page = connection.execute(
+        f"SELECT {cls._deleted_floor_text(timestamp_column)}, {key_column}, "
+        f"CASE WHEN {timestamp_column} < ? THEN 1 "
+        f"WHEN _history_utc_instant(CAST({timestamp_column} AS BLOB)) < ? THEN 1 ELSE 0 END "
+        f"{source} ORDER BY {timestamp_column}, {key_column} LIMIT ?",
+        (settled, instant, *parameters, page_size),
+    ).fetchall()
+    keys: list[int] = []
+    processed = len(page)
+    for index, (_, key, expired) in enumerate(page):
+        if expired:
+            if len(keys) == batch_size:
+                processed = index
+                break
+            keys.append(int(key))
+    if keys:
+        selected = ("SELECT value FROM json_each(?)", (json.dumps(keys),))
+        if roll_up is not None:
+            roll_up(*selected)
+        connection.execute(f"DELETE FROM {table_name} WHERE {key_column} IN ({selected[0]})", selected[1])
+    cls._advance_scan_floor(connection, floors, name, page[:processed])
+    if processed < len(page):
+        return len(keys), False
+    if len(page) < page_size:
+        return len(keys), True
+    source, parameters = candidates(floors.get(name))
+    remaining = connection.execute(f"SELECT EXISTS(SELECT 1 {source})", parameters).fetchone()[0]
+    return len(keys), not remaining

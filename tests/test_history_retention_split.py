@@ -67,6 +67,12 @@ MOVED = {
         "(connection: 'sqlite3.Connection', *, cutoff: 'str', batch_size: 'int', bucket_seconds: 'int', "
         "floor: 'tuple[bytes | str, int] | None', rollup_cutoff: 'str | None' = None) -> 'list[int]'",
     ),
+    # Added with the bounded retention page (#1268), as is _remove_retention_page.
+    "_roll_up_selected_rows": (
+        "class",
+        "(connection: 'sqlite3.Connection', *, selected_rows: 'str', selected_parameters: 'tuple[Any, ...]', "
+        "bucket_seconds: 'int', rollup_cutoff: 'str | None' = None) -> 'list[int]'",
+    ),
     "_delete_rollup_batch": (
         "class",
         "(connection: 'sqlite3.Connection', *, bucket_seconds: 'int', cutoff: 'str | None', batch_size: 'int', "
@@ -81,6 +87,13 @@ MOVED = {
         "class",
         "(connection: 'sqlite3.Connection', bucket_seconds: 'int', cutoff: 'str | None', *, "
         "floor: 'tuple[bytes | str, int] | None' = None) -> 'bool'",
+    ),
+    "_remove_retention_page": (
+        "class",
+        "(connection: 'sqlite3.Connection', *, name: 'str', table_name: 'str', timestamp_column: 'str', "
+        "key_column: 'str', cutoff: 'str', batch_size: 'int', floors: 'dict[str, tuple[bytes | str, int]]', "
+        "scope: 'tuple[str, tuple[Any, ...]]' = ('', ()), "
+        "roll_up: 'Callable[[str, tuple[Any, ...]], None] | None' = None) -> 'tuple[int, bool]'",
     ),
 }
 
