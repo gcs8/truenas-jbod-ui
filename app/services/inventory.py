@@ -1473,6 +1473,21 @@ async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> Re
     return worker.result()
 
 
+async def _run_mapping_store_read(read: Callable[[], RetainedResultT]) -> RetainedResultT:
+    """Run one mapping-store read on a worker thread, not the event loop (#1284).
+
+    A slow mapping-file read otherwise stalls every other request on the loop.
+    The read never waits for a writer lock (#1228); it is bounded by the
+    store's reread count, not by a wall-clock deadline, because a worker thread
+    cannot be stopped. So, like the snapshot's store reads, the caller keeps the
+    worker until it finishes, even through cancellation, and then reports the
+    cancellation. The result and any error are the store's, unchanged.
+    """
+    return await _drain_inventory_worker(
+        asyncio.get_running_loop().run_in_executor(None, copy_context().run, read)
+    )
+
+
 async def _run_mapping_store_write(
     write: Callable[[], RetainedResultT],
     on_committed: Callable[[RetainedResultT], None],
@@ -7716,7 +7731,9 @@ class InventoryService(InventorySourceCollectionMixin):
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         # Rows and revision from one read, so a save in between cannot pair
         # one version's rows with another's revision (#1228).
-        mappings, revision = self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
+        mappings, revision = await _run_mapping_store_read(
+            lambda: self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
+        )
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
@@ -7857,10 +7874,12 @@ class InventoryService(InventorySourceCollectionMixin):
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            rewritten,
+        preview = await _run_mapping_store_read(
+            lambda: self.mapping_store.preview_replace_mappings(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+            )
         )
         # Record the disk in every bay the restore writes and bind them into
         # the digest the confirmation returns, so a confirmation after any of
@@ -7906,10 +7925,12 @@ class InventoryService(InventorySourceCollectionMixin):
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            rewritten,
+        preview = await _run_mapping_store_read(
+            lambda: self.mapping_store.preview_replace_mappings(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+            )
         )
         if preview["revision"] != expected_revision:
             # Already stale: refuse before reading the bays.

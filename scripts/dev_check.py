@@ -339,6 +339,7 @@ WINDOWS_EXCLUSIONS = (
             "are not reliable under the Windows event loop"
         ),
         modules=(
+            "tests.test_mapping_export_preview_off_loop",
             "tests.test_ssh_session_reuse",
             "tests.test_truenas_middleware_limits",
             "tests.test_truenas_ws",

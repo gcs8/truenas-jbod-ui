@@ -229,6 +229,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_import_validated_member",
         "test_interrupted_restore_recovery",
         "test_ipmi_duplicate_bays",
+        "test_mapping_export_preview_off_loop",
         "test_mapping_routes",
         "test_nonroot_migration",
         "test_persisted_smart_binding",
