@@ -1,8 +1,9 @@
 """Source collection and SSH command planning for ``InventoryService``.
 
 ``InventorySourceCollectionMixin`` holds the methods that summarize SSH
-failures, plan the SSH, StorCLI and SMP counter commands of one refresh, and
-collect one ``InventorySourceBundle`` from the platform API, SSH and the BMC.
+failures, plan the SSH, StorCLI and SMP counter commands of one refresh, handle
+SES discovery admission and overlay merging, and collect one
+``InventorySourceBundle`` from the platform API, SSH and the BMC.
 ``InventoryService`` inherits it, so these stay methods of the same instance
 and class. Source TTLs, cache admission, publication, locks and generations
 stay on ``InventoryService``.
@@ -332,6 +333,189 @@ class InventorySourceCollectionMixin:
       ``_smp_counter_planned``, ``_smp_counter_queue``,
       ``_smp_counter_started_at``, ``_smp_counter_stopped``.
     """
+
+    @staticmethod
+    def _admit_sg_ses_devices(values: Iterable[object]) -> tuple[list[str], int, int]:
+        """SG device paths in the kernel's form, deduplicated, in numeric order.
+
+        Returns the admitted devices (the lowest indexes, at most the limit),
+        the number of values that are not an SG device path, and the number of
+        devices beyond the limit. A value that is not admitted is counted,
+        never kept or shown.
+        """
+
+        indexes: set[int] = set()
+        rejected = 0
+        for value in values:
+            device = _facade.normalize_text(value) if isinstance(value, str) else None
+            if not device:
+                continue
+            match = _facade.SG_SES_DEVICE_RE.fullmatch(device)
+            if match is None:
+                rejected += 1
+                continue
+            indexes.add(int(match.group(1)))
+        ordered = sorted(indexes)
+        limit = _facade.SG_SES_MAX_DISCOVERED_DEVICES
+        return [f"/dev/sg{index}" for index in ordered[:limit]], rejected, max(0, len(ordered) - limit)
+
+    @staticmethod
+    def _split_sg_ses_discovery_output(stdout: str) -> tuple[list[str], int]:
+        """Discovery lines without the first well-formed skipped-count line, and that count.
+
+        A count line in any other form stays a line for admission, which
+        counts it as not an SG device path.
+        """
+
+        lines: list[str] = []
+        skipped: int | None = None
+        for line in (stdout or "").splitlines():
+            match = _facade.SG_SES_DISCOVERY_SKIPPED_RE.fullmatch(line.strip()) if skipped is None else None
+            if match is not None:
+                skipped = int(match.group(1))
+                continue
+            lines.append(line)
+        return lines, skipped or 0
+
+    @classmethod
+    def _parse_sg_ses_discovery_devices(cls, stdout: str) -> list[str]:
+        return cls._admit_sg_ses_devices(cls._split_sg_ses_discovery_output(stdout)[0])[0]
+
+    @staticmethod
+    def _build_sg_ses_discovery_command() -> str:
+        # Only the elevated AES read needs sudo. Each node's peripheral type
+        # and INQUIRY data are read from sysfs first, unprivileged. A node is
+        # skipped only when both reads succeed and agree: the type is a storage
+        # device; the INQUIRY data is at least the standard 36 bytes and as
+        # long as its header says (additional length + 5); byte 0 equals the
+        # type (peripheral qualifier 0, same type); and byte 6 has EncServ
+        # clear. Anything short, failed or contradictory is read (#1314).
+        # ``od -v`` prints every byte (no ``*`` for repeated lines), and the
+        # split runs with globbing off.
+        types = "|".join(_facade.SG_SES_NON_ENCLOSURE_TYPES)
+        script = (
+            "skipped=0; "
+            "for dev in /dev/sg*; do "
+            'id="/sys/class/scsi_generic/${dev##*/}/device"; '
+            'if type=$(cat "$id/type" 2>/dev/null) && inq=$(od -An -tu1 -v -N260 "$id/inquiry" 2>/dev/null); then '
+            f'case "$type" in {types}) '
+            "set -f; set -- $inq; set +f; "
+            'if [ $# -ge 36 ] && [ $# -ge $(($5 + 5)) ] && [ "$1" = "$type" ] && [ $(($7 & 64)) -eq 0 ]; then '
+            "skipped=$((skipped + 1)); continue; fi;; "
+            "esac; "
+            "fi; "
+            'if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; '
+            "done; "
+            'echo "skipped-not-enclosure $skipped"'
+        )
+        return _facade.shlex.join(["/bin/sh", "-lc", script])
+
+    @staticmethod
+    def _tag_ses_overlay(ssh_data: ParsedSSHData, host: str) -> None:
+        tagged_host = _facade.normalize_text(host)
+        if not tagged_host:
+            return
+
+        for payload in ssh_data.ses_slot_candidates.values():
+            targets = payload.get("ses_targets")
+            if not isinstance(targets, list):
+                continue
+            tagged_targets: list[dict[str, Any]] = []
+            for item in targets:
+                if not isinstance(item, dict):
+                    continue
+                tagged = dict(item)
+                tagged["ssh_host"] = tagged_host
+                tagged_targets.append(tagged)
+            if tagged_targets:
+                payload["ses_targets"] = _facade._merge_control_targets(tagged_targets, [])
+
+        for enclosure in ssh_data.ses_enclosures:
+            enclosure.ssh_host = tagged_host
+            for slot in enclosure.slots.values():
+                tagged_targets: list[dict[str, Any]] = []
+                for item in slot.control_targets:
+                    if not isinstance(item, dict):
+                        continue
+                    tagged = dict(item)
+                    tagged["ssh_host"] = tagged_host
+                    tagged_targets.append(tagged)
+                if tagged_targets:
+                    slot.control_targets = _facade._merge_control_targets(tagged_targets, [])
+
+    @staticmethod
+    def _augment_ses_targets_from_redundant_hosts(
+        authoritative: ParsedSSHData,
+        overlays: list[ParsedSSHData],
+    ) -> ParsedSSHData:
+        authoritative_enclosures = list(authoritative.ses_enclosures)
+        authoritative.ses_enclosures = _facade._merge_ses_enclosures(
+            [
+                *authoritative.ses_enclosures,
+                *[
+                    enclosure
+                    for overlay in overlays
+                    if overlay is not authoritative
+                    for enclosure in overlay.ses_enclosures
+                ],
+            ]
+        )
+        for overlay in overlays:
+            if overlay is authoritative:
+                continue
+            supplemental_candidates: dict[int, dict[str, Any]] = {}
+            for slot, primary in authoritative.ses_slot_candidates.items():
+                # A merged same-host enclosure can retain a slot on another SES path.
+                primary_enclosure = next((enclosure for enclosure in authoritative_enclosures
+                    if enclosure.enclosure_id == primary.get("enclosure_id")
+                    and primary.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
+                if primary_enclosure is None:
+                    continue
+                for payload in overlay.ses_slot_candidates.values():
+                    if not isinstance(payload, dict) or primary.get("ses_slot_number") is None:
+                        continue
+                    other_enclosure = next((enclosure for enclosure in overlay.ses_enclosures
+                        if enclosure.enclosure_id == payload.get("enclosure_id")
+                        and payload.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
+                    if (other_enclosure is None
+                        or not _facade._ses_enclosures_share_identity(primary_enclosure, other_enclosure)
+                        or primary.get("ses_slot_number") != payload.get("ses_slot_number")):
+                        continue
+                    supplemental_candidates[slot] = {
+                        "ses_targets": payload.get("ses_targets", []),
+                        "identify_active": payload.get("identify_active", False),
+                    }
+            if supplemental_candidates:
+                authoritative.ses_slot_candidates = _facade.merge_slot_candidate_maps(
+                    authoritative.ses_slot_candidates,
+                    supplemental_candidates,
+                )
+        return authoritative
+
+    @staticmethod
+    def _merge_ses_overlay_data(base: ParsedSSHData, overlay: ParsedSSHData) -> ParsedSSHData:
+        merged = _facade.ParsedSSHData(
+            glabel=base.glabel,
+            zpool_members=dict(base.zpool_members),
+            zpool_device_members=dict(base.zpool_device_members),
+            zpool_pool_states=dict(base.zpool_pool_states),
+            multipath_info=dict(base.multipath_info),
+            ses_slot_to_device=dict(base.ses_slot_to_device),
+            camcontrol_models=dict(base.camcontrol_models),
+            camcontrol_controllers=dict(base.camcontrol_controllers),
+            camcontrol_peer_devices=dict(base.camcontrol_peer_devices),
+            ses_slot_candidates=_facade.merge_slot_candidate_maps(base.ses_slot_candidates, overlay.ses_slot_candidates),
+            ses_selected_meta=_facade.merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
+            ses_enclosures=_facade._merge_ses_enclosures([*base.ses_enclosures, *overlay.ses_enclosures]),
+            linux_blockdevices=list(base.linux_blockdevices),
+            linux_scsi_devices=list(base.linux_scsi_devices) + list(overlay.linux_scsi_devices),
+            linux_mdadm_arrays=dict(base.linux_mdadm_arrays),
+            linux_nvme_subsystems=dict(base.linux_nvme_subsystems),
+            ubntstorage_disks=list(base.ubntstorage_disks),
+            ubntstorage_spaces=list(base.ubntstorage_spaces),
+            unifi_led_states=dict(base.unifi_led_states),
+        )
+        return merged
 
     @classmethod
     def _summarize_ssh_failures(

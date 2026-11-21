@@ -248,6 +248,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_inventory_nested_slot_zero",
             "tests.test_inventory_projection_split",
             "tests.test_inventory_registry_routes",
+            "tests.test_inventory_ses_split",
             "tests.test_inventory_status_error_text",
             "tests.test_log_noise",
             "tests.test_mapping_routes",
