@@ -108,9 +108,37 @@ function buildFabric() {
   };
 }
 
+// #1133: the same shelf with kernel fault evidence on mpr0's path to bay 00,
+// enough events that the event sample table is shown.
+function buildFaultFabric() {
+  const fabric = buildFabric();
+  const rows = Array.from({ length: 8 }, (_, index) => ({
+    event_id: `synthetic-event-${index}`,
+    order: index + 1,
+    severity: index % 2 ? "warning" : "error",
+    event_type: "scsi_command_failed",
+    controller: "mpr0",
+    device: "da0",
+    target: "4",
+    loginfo: "31120303",
+    asc: "11/00",
+    opcode: "READ(10)",
+  }));
+  const controller = fabric.nodes.find((node) => node.id === "controller:mpr0");
+  controller.metrics.kernel_diagnostics = {
+    event_count: rows.length,
+    devices: ["da0"],
+    targets: [4],
+    operator_summary: `${rows.length} synthetic kernel events on the mpr0 path to da0`,
+    event_table: { rows, sample_count: rows.length },
+  };
+  return fabric;
+}
+
 const fixture = {};
 test.beforeAll(() => {
   const fabric = buildFabric();
+  const faultFabric = buildFaultFabric();
   Object.assign(fixture, python(`
 import json
 import sys
@@ -169,8 +197,19 @@ fabric_html = builder.TEMPLATES.env.get_template("sas_fabric.html").render(
     app_version="synthetic",
     bootstrap_json=json.dumps(dict(snapshot=snapshot_json, fabric=fabric)),
 )
-print(json.dumps(dict(html=builder.build_live_fixture_html(runtime), fabricHtml=fabric_html, snapshot=snapshot_json, fabric=fabric)))
-`, [String(BAYS), TITLE, JSON.stringify(fabric)]));
+fault_fabric = json.loads(sys.argv[4])
+fault_fabric_html = builder.TEMPLATES.env.get_template("sas_fabric.html").render(
+    request=builder.build_fixture_request(),
+    snapshot=snapshot_json,
+    fabric=fault_fabric,
+    app_version="synthetic",
+    bootstrap_json=json.dumps(dict(snapshot=snapshot_json, fabric=fault_fabric)),
+)
+print(json.dumps(dict(
+    html=builder.build_live_fixture_html(runtime), fabricHtml=fabric_html, snapshot=snapshot_json, fabric=fabric,
+    faultFabricHtml=fault_fabric_html, faultFabric=fault_fabric,
+)))
+`, [String(BAYS), TITLE, JSON.stringify(fabric), JSON.stringify(faultFabric)]));
   // The offline snapshot export inlines the same stylesheet and script; build
   // it through the shipping exporter so the header is checked there too.
   fixture.exportHtml = python(`
@@ -208,7 +247,7 @@ function temperatureFor(slot) {
   return 30 + (slot % 6);
 }
 
-async function routeSynthetic(page, documentBody) {
+async function routeSynthetic(page, documentBody, fabric = fixture.fabric) {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.route("**/*", async (route) => {
@@ -223,7 +262,7 @@ async function routeSynthetic(page, documentBody) {
     let data = { ok: true, available: false };
     if (url.pathname === "/api/inventory") data = fixture.snapshot;
     if (url.pathname === "/api/storage-views") data = { system_id: "synthetic-system", views: [] };
-    if (url.pathname === "/api/sas-fabric") data = fixture.fabric;
+    if (url.pathname === "/api/sas-fabric") data = fabric;
     if (url.pathname === "/api/slots/smart-batch") {
       const slots = request.postDataJSON()?.slots || [];
       data = { summaries: slots.map((slot) => ({ slot, summary: { available: true, temperature_c: temperatureFor(slot), serial: `SANITIZED-${String(slot).padStart(4, "0")}` } })) };
@@ -435,3 +474,82 @@ test("a Topology search keeps the page inside a 390 px window and cuts the statu
   await capture(page, page.locator(".fabric-view-panel .panel-header"), "topology-search-status-390");
   expect(errors).toEqual([]);
 });
+
+// #1133: the open kernel fault evidence table on Disk Path scrolls inside its
+// own box; the page never scrolls sideways at 390 px, and desktop widths keep
+// the table inside the window too. Like the #1374 check above, this guards
+// the page against overflow; phone layout is not a tested capability.
+for (const viewport of [{ width: 390, height: 900 }, { width: 1600, height: 1000 }]) {
+  test(`Disk Path fault evidence table scrolls inside its own box at ${viewport.width} px (#1133)`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const errors = await routeSynthetic(page, fixture.faultFabricHtml, fixture.faultFabric);
+    await page.goto(`${ORIGIN}/?mode=disk`);
+    const panel = page.locator(".disk-path-evidence-stack .fabric-diagnostic-evidence").first();
+    await expect(panel).toBeVisible();
+    await panel.locator(":scope > summary").click();
+    const sample = panel.locator("[data-fabric-diagnostic-table-key]");
+    await sample.locator(":scope > summary").click();
+    const table = sample.locator(".fabric-diagnostic-table");
+    await expect(table).toBeVisible();
+    const geometry = await table.evaluate((element) => {
+      const box = element.closest(".fabric-diagnostic-table-wrap");
+      const evidence = element.closest(".fabric-diagnostic-evidence").getBoundingClientRect();
+      return {
+        window: window.innerWidth,
+        page: document.documentElement.scrollWidth,
+        overflowX: getComputedStyle(box).overflowX,
+        boxScrollWidth: box.scrollWidth,
+        boxClientWidth: box.clientWidth,
+        boxRight: box.getBoundingClientRect().right,
+        evidenceRight: evidence.right,
+      };
+    });
+    const detail = JSON.stringify(geometry);
+    expect(geometry.window, "actual viewport width").toBe(viewport.width);
+    expect(geometry.page, `the page does not scroll sideways ${detail}`).toBeLessThanOrEqual(geometry.window);
+    expect(geometry.evidenceRight, `the evidence panel stays inside the window ${detail}`).toBeLessThanOrEqual(geometry.window + 0.5);
+    expect(geometry.boxRight, `the table's box stays inside the window ${detail}`).toBeLessThanOrEqual(geometry.window + 0.5);
+    expect(geometry.overflowX, "the table's own box scrolls").toMatch(/auto|scroll/);
+    if (viewport.width === 390) expect(geometry.boxScrollWidth, `the table is wider than its box ${detail}`).toBeGreaterThan(geometry.boxClientWidth);
+    await capture(page, panel, `disk-path-fault-evidence-${viewport.width}`);
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1378: the sticky trace band never lies over Fit when Topology opens, at a
+// phone's width or a desktop's. The band sticks inside the drawing's own
+// block, so it cannot rise above the drawing; a click at Fit's centre reaches
+// Fit wherever Fit is in the window.
+for (const viewport of [{ width: 390, height: 844 }, { width: 1241, height: 900 }, { width: 1920, height: 1080 }]) {
+  test(`the Topology trace band never covers Fit when the page opens at ${viewport.width}x${viewport.height} (#1378)`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const errors = await routeSynthetic(page, fixture.fabricHtml);
+    await page.goto(`${ORIGIN}/?mode=topology`);
+    const fit = page.locator("[data-topology-fit]");
+    await expect(fit).toBeVisible();
+    await expect(page.locator("[data-topology-trace]")).toBeVisible();
+    const geometry = await fit.evaluate((button) => {
+      const band = document.querySelector("[data-topology-trace]").getBoundingClientRect();
+      const rect = button.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      const inWindow = y >= 0 && y < window.innerHeight;
+      const hit = inWindow ? document.elementFromPoint(x, y) : null;
+      return {
+        scrollY: window.scrollY,
+        window: { width: window.innerWidth, height: window.innerHeight },
+        fit: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right },
+        band: { top: band.top, bottom: band.bottom, left: band.left, right: band.right },
+        overlap: Math.max(0, Math.min(rect.bottom, band.bottom) - Math.max(rect.top, band.top)) * (rect.left < band.right && band.left < rect.right ? 1 : 0),
+        inWindow,
+        hitsFit: Boolean(hit && button.contains(hit)),
+      };
+    });
+    const detail = JSON.stringify(geometry);
+    expect(geometry.window.width, "actual viewport width").toBe(viewport.width);
+    expect(geometry.overlap, `the band covers none of Fit ${detail}`).toBe(0);
+    if (geometry.inWindow) expect(geometry.hitsFit, `a click at Fit's centre reaches Fit ${detail}`).toBe(true);
+    await capture(page, page.locator(".fabric-topology"), `topology-fit-clear-${viewport.width}`);
+    expect(errors).toEqual([]);
+  });
+}
