@@ -2837,7 +2837,7 @@
             <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
               <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(presentation.total))})</summary>
               ${renderDiagnosticTableControls(presentation)}
-              <div class="fabric-diagnostic-table-wrap" role="region" aria-label="Recent event sample" tabindex="0">
+              <div class="fabric-diagnostic-table-wrap" role="region" aria-label="Recent event sample" tabindex="0" data-fabric-diagnostic-scroll-key="${escapeHtml(tableKey)}">
                 <table class="fabric-diagnostic-table">
                   <thead>
                     <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
@@ -4400,6 +4400,8 @@
     "data-fabric-diagnostic-type-key",
     "data-fabric-diagnostic-severity-key",
     "data-fabric-diagnostic-confidence-key",
+    // The event sample's keyboard-scrollable region, keyed per table (#1428).
+    "data-fabric-diagnostic-scroll-key",
   ];
 
   function attributeSelector(name, value) {
@@ -4466,9 +4468,45 @@
     }
   }
 
+  // Scrollable regions inside the rebuilt panels (the event sample table) are
+  // recreated unscrolled; keep each one's offset by its per-table key (#1428).
+  const SCROLL_REGION_ATTRIBUTE = "data-fabric-diagnostic-scroll-key";
+
+  function rememberRegionScroll(container) {
+    if (!container || typeof container.querySelectorAll !== "function") {
+      return [];
+    }
+    const seen = new Map();
+    return Array.from(container.querySelectorAll(`[${SCROLL_REGION_ATTRIBUTE}]`))
+      .map((region) => {
+        const key = region.getAttribute(SCROLL_REGION_ATTRIBUTE) || "";
+        const index = seen.get(key) || 0;
+        seen.set(key, index + 1);
+        return { container, key, index, left: region.scrollLeft || 0, top: region.scrollTop || 0 };
+      })
+      .filter((memory) => memory.left || memory.top);
+  }
+
+  function restoreRegionScroll(memory) {
+    const region = Array.from(memory.container.querySelectorAll(attributeSelector(SCROLL_REGION_ATTRIBUTE, memory.key)))[memory.index];
+    if (!region) {
+      return;
+    }
+    if (region.scrollLeft !== memory.left) {
+      region.scrollLeft = memory.left;
+    }
+    if (region.scrollTop !== memory.top) {
+      region.scrollTop = memory.top;
+    }
+  }
+
   function render() {
     const focusMemory = rememberFocus();
     const scrollMemory = [rememberScroll(elements.mapPanel), rememberScroll(elements.inspectorBody)];
+    const regionScrollMemory = [
+      ...rememberRegionScroll(elements.mapPanel),
+      ...rememberRegionScroll(elements.inspectorBody),
+    ];
     const pageScroll = { x: window.scrollX || 0, y: window.scrollY || 0 };
     renderSelectors();
     renderSummary();
@@ -4482,6 +4520,7 @@
     syncLocation();
     elements.refreshButton.disabled = state.loading;
     scrollMemory.forEach(restoreScroll);
+    regionScrollMemory.forEach(restoreRegionScroll);
     if (typeof window.scrollTo === "function" && (window.scrollX !== pageScroll.x || window.scrollY !== pageScroll.y)) {
       window.scrollTo(pageScroll.x, pageScroll.y);
     }
