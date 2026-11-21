@@ -44,7 +44,7 @@ from history_service.segment_reader import (
     metric_sample_identity,
 )
 from history_service.sqlite_temp import effective_sqlite_temporary_directory
-from history_service import store_retention
+from history_service import store_retention, store_retention_pass
 from history_service.restore_timestamps import require_orderable_restored_timestamps
 from history_service import store_schema
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
@@ -1802,29 +1802,7 @@ class HistoryStore:
         backup_at: datetime | str,
         operation: Callable[[], dict[str, Any]],
     ) -> dict[str, Any] | None:
-        with self.segmented_retention_write_lock():
-            if not self.claim_segmented_retention_backup(
-                backup_at,
-                migration_lock_held=True,
-            ):
-                return None
-            retention_completed = False
-            try:
-                result = operation()
-                retention_completed = True
-                self.finish_segmented_retention_backup(
-                    backup_at,
-                    has_more=bool(result.get("has_more")),
-                    migration_lock_held=True,
-                )
-                return result
-            except BaseException:
-                if not retention_completed:
-                    self.release_segmented_retention_backup(
-                        backup_at,
-                        migration_lock_held=True,
-                    )
-                raise
+        return store_retention_pass.run_segmented_retention(_STORE_MODULE, self, backup_at, operation)
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
         lock_context = (
@@ -3363,90 +3341,15 @@ class HistoryStore:
         should_continue: Callable[[], bool] | None = None,
         migration_lock_held: bool = False,
     ) -> dict[str, Any]:
-        retention_values = (
-            raw_metric_retention_days,
-            event_retention_days,
-            hourly_rollup_retention_days,
-            daily_rollup_retention_days,
+        return store_retention_pass.maintain_retention(
+            _STORE_MODULE, self, now=now,
+            raw_metric_retention_days=raw_metric_retention_days,
+            event_retention_days=event_retention_days,
+            hourly_rollup_retention_days=hourly_rollup_retention_days,
+            daily_rollup_retention_days=daily_rollup_retention_days,
+            batch_size=batch_size, max_batches=max_batches,
+            should_continue=should_continue, migration_lock_held=migration_lock_held,
         )
-        if any(value < 0 for value in retention_values):
-            raise ValueError("History retention days cannot be negative.")
-        if batch_size < 1:
-            raise ValueError("History retention batch size must be at least 1.")
-        if max_batches < 1:
-            raise ValueError("History retention max batches must be at least 1.")
-
-        normalized_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-        normalized_now = normalized_now.astimezone(timezone.utc)
-        cutoffs = {
-            "metric": self._retention_cutoff(normalized_now, raw_metric_retention_days),
-            "event": self._retention_cutoff(normalized_now, event_retention_days),
-            "hourly": self._retention_cutoff(normalized_now, hourly_rollup_retention_days),
-            "daily": self._retention_cutoff(normalized_now, daily_rollup_retention_days),
-        }
-        summary: dict[str, Any] = {
-            "metric_samples_removed": 0,
-            "events_removed": 0,
-            "hourly_rollups_removed": 0,
-            "daily_rollups_removed": 0,
-            "total_rows_removed": 0,
-            "batches_completed": 0,
-            "has_more": False,
-            "interrupted": False,
-        }
-
-        # In-memory scan state (see _maintain_retention_batch). A pass that uses
-        # its whole budget hands its unfinished floors on, so a kept set larger
-        # than one pass can read is swept once, not from its start by every
-        # pass (#1268). A row the sweep passed that has since become eligible
-        # waits, like a row added behind a floor, for the next fresh pass.
-        scan_floors = self._retention_carry
-        self._retention_carry = {}
-        finished_tables: set[str] = set()
-        for _ in range(max_batches):
-            if should_continue is not None and not should_continue():
-                summary["interrupted"] = True
-                break
-            try:
-                batch = self._execute_write(
-                    lambda connection: self._maintain_retention_batch(
-                        connection,
-                        cutoffs=cutoffs,
-                        batch_size=batch_size,
-                        scan_floors=scan_floors,
-                        finished_tables=frozenset(finished_tables),
-                    ),
-                    migration_lock_held=migration_lock_held,
-                )
-            except Exception as exc:
-                summary["has_more"] = True
-                summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
-                setattr(exc, "retention_summary", dict(summary))
-                raise
-            summary["batches_completed"] += 1
-            scan_floors.update(batch["scan_floors"])
-            finished_tables.update(batch["finished_tables"])
-            for key in (
-                "metric_samples_removed",
-                "events_removed",
-                "hourly_rollups_removed",
-                "daily_rollups_removed",
-            ):
-                summary[key] += int(batch[key])
-            summary["has_more"] = bool(batch["has_more"])
-            if not summary["has_more"]:
-                break
-
-        # A stopped pass hands nothing on: the service is shutting down.
-        if summary["has_more"] and not summary["interrupted"]:
-            self._retention_carry = {
-                name: floor for name, floor in scan_floors.items() if name not in finished_tables
-            }
-        summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
-        summary["pages_reclaimed"] = 0
-        if summary["total_rows_removed"] and not summary["interrupted"]:
-            summary["pages_reclaimed"] = self._reclaim_free_pages(migration_lock_held=migration_lock_held)
-        return summary
 
     def _reclaim_free_pages(self, *, migration_lock_held: bool) -> int:
         """Hand pages freed by retention back to the filesystem and shrink the WAL.
@@ -3454,44 +3357,15 @@ class HistoryStore:
         incremental_vacuum only does work on databases created in incremental mode;
         older databases keep reusing freed pages in place, exactly as before.
         """
-
-        def operation(connection: sqlite3.Connection) -> int:
-            before = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
-            if before:
-                # Each sqlite3_step of incremental_vacuum frees one page, and
-                # Connection.execute() steps only once; executescript() runs the
-                # statement to completion, so every free page is returned.
-                connection.executescript("PRAGMA incremental_vacuum;")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-            after = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
-            return max(0, before - after)
-
-        try:
-            return int(self._execute_write(operation, migration_lock_held=migration_lock_held))
-        except sqlite3.Error as exc:
-            logger.warning(
-                "History retention could not return free pages to the filesystem this pass: %s",
-                exc,
-            )
-            return 0
+        return store_retention_pass._reclaim_free_pages(_STORE_MODULE, self, migration_lock_held=migration_lock_held)
 
     @staticmethod
     def _retention_total_rows_removed(summary: dict[str, Any]) -> int:
-        return sum(
-            int(summary[key])
-            for key in (
-                "metric_samples_removed",
-                "events_removed",
-                "hourly_rollups_removed",
-                "daily_rollups_removed",
-            )
-        )
+        return store_retention_pass._retention_total_rows_removed(_STORE_MODULE, summary)
 
     @staticmethod
     def _retention_cutoff(now: datetime, days: int) -> str | None:
-        if days <= 0:
-            return None
-        return (now - timedelta(days=days)).isoformat()
+        return store_retention_pass._retention_cutoff(_STORE_MODULE, now, days)
 
     @classmethod
     def _maintain_retention_batch(
@@ -3524,90 +3398,10 @@ class HistoryStore:
         # to the pass, so when its bucket is already past that table's cutoff
         # the same batch deletes it by key, wherever it lies; has_more=false
         # therefore never leaves a row the pass wrote and could delete.
-        cls._register_retention_functions(connection)
-        floors = dict(scan_floors or {})
-        finished = set(finished_tables)
-
-        def active(name: str, cutoff: str | None) -> bool:
-            return cutoff is not None and name not in finished
-
-        def remove_page(name: str, table_name: str, timestamp_column: str, key_column: str,
-                        cutoff: str, limit: int, **options: Any) -> int:
-            removed, done = cls._remove_retention_page(
-                connection,
-                name=name,
-                table_name=table_name,
-                timestamp_column=timestamp_column,
-                key_column=key_column,
-                cutoff=cutoff,
-                batch_size=limit,
-                floors=floors,
-                **options,
-            )
-            if done:
-                finished.add(name)
-            return removed
-
-        metric_samples_removed = 0
-        written_expired: dict[int, list[int]] = {3600: [], 86400: []}
-        if active("metric_samples", cutoffs["metric"]):
-
-            def roll_up(selected_rows: str, selected_parameters: tuple[Any, ...]) -> None:
-                for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
-                    written_expired[bucket_seconds] = cls._roll_up_selected_rows(
-                        connection,
-                        selected_rows=selected_rows,
-                        selected_parameters=selected_parameters,
-                        bucket_seconds=bucket_seconds,
-                        rollup_cutoff=cutoffs[kind],
-                    )
-
-            metric_samples_removed = remove_page(
-                "metric_samples", "metric_samples", "observed_at", "id",
-                cutoffs["metric"], batch_size, roll_up=roll_up,
-            )
-
-        events_removed = 0
-        if active("slot_events", cutoffs["event"]):
-            events_removed = remove_page(
-                "slot_events", "slot_events", "observed_at", "id", cutoffs["event"], batch_size,
-            )
-        rollups_removed = {}
-        for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
-            name = f"rollups_{bucket_seconds}"
-            # At most one written rollup per raw row this batch selected, so
-            # these never exceed the batch size; they count against it.
-            removed = connection.executemany(
-                "DELETE FROM metric_rollups WHERE rowid = ? AND bucket_seconds = ?",
-                [(rowid, bucket_seconds) for rowid in written_expired[bucket_seconds]],
-            ).rowcount if written_expired[bucket_seconds] else 0
-            if active(name, cutoffs[kind]):
-                # With no budget left the page is empty and only the one-row
-                # check for candidates after the floor runs.
-                removed += remove_page(
-                    name, "metric_rollups", "bucket_start", "rowid", cutoffs[kind], batch_size - removed,
-                    scope=("bucket_seconds = ? AND ", (bucket_seconds,)),
-                )
-            rollups_removed[bucket_seconds] = removed
-        # A table not finished may hold eligible rows this batch did not read.
-        has_more = any(
-            active(name, cutoffs[kind])
-            for name, kind in (
-                ("metric_samples", "metric"),
-                ("slot_events", "event"),
-                ("rollups_3600", "hourly"),
-                ("rollups_86400", "daily"),
-            )
+        return store_retention_pass._maintain_retention_batch(
+            _STORE_MODULE, cls, connection, cutoffs=cutoffs, batch_size=batch_size,
+            scan_floors=scan_floors, finished_tables=finished_tables,
         )
-        return {
-            "metric_samples_removed": metric_samples_removed,
-            "events_removed": events_removed,
-            "hourly_rollups_removed": rollups_removed[3600],
-            "daily_rollups_removed": rollups_removed[86400],
-            "has_more": has_more,
-            "scan_floors": floors,
-            "finished_tables": frozenset(finished),
-        }
 
     @staticmethod
     def _register_retention_functions(connection: sqlite3.Connection) -> None:
