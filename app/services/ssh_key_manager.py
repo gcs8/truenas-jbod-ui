@@ -1,14 +1,59 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
+import os
 import re
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from app.config import Settings
 from app.services.atomic_write import write_atomically
+
+
+def configured_key_paths(settings: Settings) -> tuple[str, ...]:
+    paths = (settings.ssh.key_path, *(system.ssh.key_path for system in settings.systems))
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+def private_key_warnings(paths: tuple[str, ...]) -> list[str]:
+    """Inspect only existing configured entries. Never open a key or follow its final symlink."""
+    warnings = []
+    for path in paths:
+        label = f"SSH private key {path!r}"
+        try:
+            info = Path(path).lstat()
+        except FileNotFoundError:
+            # The default key path can be unused (SSH off or password-only).
+            continue
+        except (OSError, ValueError):
+            warnings.append(f"{label}: cannot check permissions. Check the path and directory access.")
+            continue
+        remedy = "Use chmod 600 for owner-only access or chmod 640 with the application group (APP_GID)."
+        if not stat.S_ISREG(info.st_mode):
+            reason = "is a symlink" if stat.S_ISLNK(info.st_mode) else "is not a regular file"
+            warnings.append(f"{label} {reason}. Configure a regular private key file instead. {remedy}")
+            continue
+        try:
+            # Both services use the UI identity, even when admin runs as root.
+            uid = int(os.getenv("APP_UID") or "10001")
+            gid = int(os.getenv("APP_GID") or "10001")
+        except ValueError:
+            warnings.append(f"{label}: cannot check ownership. Set APP_UID and APP_GID to numeric IDs.")
+            continue
+        if (info.st_uid not in (0, uid) or info.st_mode & (stat.S_IRWXO | stat.S_IWGRP)
+                or (info.st_mode & stat.S_IRGRP and info.st_gid != gid)):
+            warnings.append(f"{label} has unsafe ownership or permissions. Set the owner to root or APP_UID. {remedy}")
+    return warnings
+
+
+def list_keys_with_warnings(manager: SSHKeyManager, settings: Settings) -> tuple[list[dict[str, Any]], list[str]]:
+    # A configured key need not be in the picker directory or parseable.
+    return manager.list_keys(), private_key_warnings(configured_key_paths(settings))
 
 
 class SSHKeyManager:
@@ -21,14 +66,16 @@ class SSHKeyManager:
         self.key_dir.mkdir(parents=True, exist_ok=True)
         keys: list[dict[str, Any]] = []
         for path in sorted(self.key_dir.iterdir(), key=lambda item: item.name.lower()):
-            if not path.is_file():
-                continue
             if not self._is_private_key_candidate(path):
                 continue
             try:
-                keys.append(self._describe_private_key(path))
-            except ValueError:
+                if stat.S_ISREG(path.lstat().st_mode):
+                    keys.append(self._describe_private_key(path))
+            except (ValueError, FileNotFoundError, PermissionError):
                 continue
+            except OSError as exc:
+                if exc.errno != errno.ELOOP:  # Replaced by a symlink during listing.
+                    raise
         return keys
 
     def generate_keypair(self, name: str) -> dict[str, Any]:
@@ -80,7 +127,12 @@ class SSHKeyManager:
         return True
 
     def _describe_private_key(self, path: Path) -> dict[str, Any]:
-        private_key = self._load_private_key(path.read_bytes())
+        # Verify the opened file too: a directory entry may change during listing.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("File is not a regular private key.")
+            private_key = self._load_private_key(handle.read())
         public_text = private_key.public_key().public_bytes(
             encoding=serialization.Encoding.OpenSSH,
             format=serialization.PublicFormat.OpenSSH,

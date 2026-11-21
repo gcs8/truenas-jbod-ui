@@ -126,6 +126,13 @@ On the Docker host, keep a dedicated key for this app in:
 
 and mount it read-only into the container, which the compose file already does.
 
+Use a regular private key file, not a symlink. Its owner must be root or the
+UI user (`APP_UID`). On the Docker host use `chmod 600` for owner-only access.
+If the non-root UI needs to read a root-owned key, set its group to the
+application group (`APP_GID`) and use `chmod 640` instead. Do not grant group
+write or any access to other users. Startup and the admin key list report
+unsafe permissions; neither changes the file. This does not apply to `.pub` files.
+
 Example OpenSSH key generation on the Docker host:
 
 ```bash
