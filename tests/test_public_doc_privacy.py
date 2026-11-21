@@ -329,6 +329,26 @@ class PublicDocPrivacyTests(unittest.TestCase):
         actual = _scan_text((REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8"))
         self.assertEqual(actual, expected)
 
+    def test_compose_runtime_exception_matches_only_explicit_loopback_sources(self) -> None:
+        relative_path = "tests/fixtures/compose-runtime-config.yaml"
+        text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+        hosts = [
+            match.group(1)
+            for line in text.splitlines()
+            if (match := YAML_HOST_FIELD.match(line)) is not None
+        ]
+        self.assertEqual(hosts, ["http://127.0.0.1:19443", "http://127.0.0.1:9"])
+        actual = _scan_text(text)
+        self.assertEqual([category for category, _fingerprint in actual], ["internal_hostname"])
+        self.assertEqual(sum(actual.values()), 2)
+        _reason, categories = REVIEWED_FINDING_EXCEPTIONS.get(relative_path, ("", {}))
+        expected = Counter({
+            (category, fingerprint): count
+            for category, fingerprints in categories.items()
+            for fingerprint, count in fingerprints.items()
+        })
+        self.assertEqual(actual, expected)
+
     def test_tracked_public_text_contains_no_unreviewed_private_lab_identifiers(self) -> None:
         expected: Counter[tuple[str, str, str]] = Counter()
         for path, (reason, categories) in REVIEWED_FINDING_EXCEPTIONS.items():

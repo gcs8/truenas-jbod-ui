@@ -565,6 +565,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   warnings name the file and explain how to correct it without changing the key (#1450).
 - Kept release-commit source tests independent of an Unreleased changelog heading
   and isolated encrypted-import cleanup checks from crash-recovery fixtures (#1454).
+- Restored the Compose runtime matrix's successful mapping persistence cycle with
+  an isolated synthetic live occupancy producer, kept unread-bay refusal coverage,
+  and added bounded, sanitized HTTP failure diagnostics. Product mapping guards
+  were unchanged; full runtime qualification remains a separate QA gate (#1456).
 
 ### Performance
 

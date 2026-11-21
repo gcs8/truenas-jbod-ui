@@ -162,6 +162,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_ci_contract",
         "test_combined_shelf_upgrade",
         "test_compose_runtime_matrix",
+        "test_compose_runtime_occupancy",
         "test_config_example",
         "test_core_counter_markers",
         "test_demo_create_durability",

@@ -1,0 +1,38 @@
+# Dedicated disposable matrix input. The general CI smoke fixture stays unread.
+app:
+  release_check_enabled: false
+  startup_warm_cache_enabled: false
+  startup_warm_smart_enabled: false
+  log_level: WARNING
+  debug: false
+history:
+  service_url: ""
+admin:
+  service_url: ""
+systems:
+  - id: matrix-live
+    label: Synthetic live source
+    truenas:
+      host: http://127.0.0.1:19443
+      api_key: synthetic-compose-source-key
+      platform: core
+      timeout_seconds: 2
+    ssh:
+      enabled: false
+    layout:
+      slot_count: 1
+      rows: 1
+      columns: 1
+  - id: matrix-unread
+    label: Synthetic unread source
+    truenas:
+      host: http://127.0.0.1:9
+      api_key: ""
+      platform: core
+      timeout_seconds: 1
+    ssh:
+      enabled: false
+    layout:
+      slot_count: 1
+      rows: 1
+      columns: 1
