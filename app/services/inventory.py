@@ -352,6 +352,13 @@ UNPARSED_HOST_LOG_PLACEHOLDER = "<unparsed-host>"
 # output; reaching it is shown on the page with both counts.
 SG_SES_DEVICE_RE = re.compile(r"/dev/sg(0|[1-9][0-9]{0,4})")
 SG_SES_MAX_DISCOVERED_DEVICES = 16384
+# Discovery skips a node whose sysfs identity is complete and shows a storage
+# device without enclosure services, and ends its output with this count line
+# (#1314). A node with a missing, unreadable or short identity is still read.
+SG_SES_DISCOVERY_SKIPPED_RE = re.compile(r"skipped-not-enclosure (0|[1-9][0-9]{0,4})")
+# SCSI peripheral device types that are storage devices, not enclosures: disk,
+# tape, write-once, CD/DVD, optical memory and simplified direct-access.
+SG_SES_NON_ENCLOSURE_TYPES = ("0", "1", "4", "5", "7", "14")
 # Addresses one QuantaStor node may contribute as SSH destinations, per system
 # row and per system's gateway ports. Reaching it is shown on the page.
 QUANTASTOR_MAX_REPORTED_HOSTS = 256
@@ -12198,9 +12205,27 @@ class InventoryService(InventorySourceCollectionMixin):
         limit = SG_SES_MAX_DISCOVERED_DEVICES
         return [f"/dev/sg{index}" for index in ordered[:limit]], rejected, max(0, len(ordered) - limit)
 
+    @staticmethod
+    def _split_sg_ses_discovery_output(stdout: str) -> tuple[list[str], int]:
+        """Discovery lines without the first well-formed skipped-count line, and that count.
+
+        A count line in any other form stays a line for admission, which
+        counts it as not an SG device path.
+        """
+
+        lines: list[str] = []
+        skipped: int | None = None
+        for line in (stdout or "").splitlines():
+            match = SG_SES_DISCOVERY_SKIPPED_RE.fullmatch(line.strip()) if skipped is None else None
+            if match is not None:
+                skipped = int(match.group(1))
+                continue
+            lines.append(line)
+        return lines, skipped or 0
+
     @classmethod
     def _parse_sg_ses_discovery_devices(cls, stdout: str) -> list[str]:
-        return cls._admit_sg_ses_devices((stdout or "").splitlines())[0]
+        return cls._admit_sg_ses_devices(cls._split_sg_ses_discovery_output(stdout)[0])[0]
 
     def _log_sg_ses_discovery_admission(self, host: str, rejected: int, beyond_limit: int) -> None:
         summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
@@ -12288,22 +12313,29 @@ class InventoryService(InventorySourceCollectionMixin):
                 None,
             )
 
-        devices, rejected_lines, beyond_limit = self._admit_sg_ses_devices(
-            (discovery_result.stdout or "").splitlines()
-        )
+        discovery_lines, skipped = self._split_sg_ses_discovery_output(discovery_result.stdout)
+        devices, rejected_lines, beyond_limit = self._admit_sg_ses_devices(discovery_lines)
         if rejected_lines or beyond_limit:
             self._log_sg_ses_discovery_admission(host, rejected_lines, beyond_limit)
+        if skipped:
+            logger.info(
+                "SG SES discovery on %s skipped %d SG devices whose identity shows a storage device "
+                "without enclosure services.",
+                _log_safe_host(host),
+                skipped,
+            )
+        skipped_note = f" ({skipped} SG devices skipped as not enclosures)" if skipped else ""
         if not devices:
             if not report_empty_discovery:
                 # Discovery ran and found no SES device. On a host with a
                 # plain HBA that is the normal answer, not a failure; the
                 # caller decides whether enclosure evidence was expected.
-                logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
+                logger.info("%s discovery found no sg_ses devices on %s%s.", failure_prefix, host, skipped_note)
                 return [], ParsedSSHData(), [], None
             return (
                 [],
                 ParsedSSHData(),
-                [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."],
+                [f"{failure_prefix} discovery found no usable sg_ses devices on {host}{skipped_note}."],
                 None,
             )
         page_results = [result for result in results if result.command != discovery_command]
@@ -13053,7 +13085,26 @@ class InventoryService(InventorySourceCollectionMixin):
 
     @staticmethod
     def _build_sg_ses_discovery_command() -> str:
-        script = 'for dev in /dev/sg*; do if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; done'
+        # Only the elevated AES read needs sudo. Each node's peripheral type
+        # and INQUIRY data are read from sysfs first, unprivileged; a node is
+        # skipped only when its type is a storage device and INQUIRY byte 6 is
+        # read and has the EncServ bit clear. Anything else is read (#1314).
+        types = "|".join(SG_SES_NON_ENCLOSURE_TYPES)
+        script = (
+            "skipped=0; "
+            "for dev in /dev/sg*; do "
+            'id="/sys/class/scsi_generic/${dev##*/}/device"; '
+            'type=$(cat "$id/type" 2>/dev/null); '
+            f'case "$type" in {types}) '
+            "flags=$(od -An -tu1 -j6 -N1 \"$id/inquiry\" 2>/dev/null | tr -d ' \\n'); "
+            'case "$flags" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) '
+            "if [ $((flags & 64)) -eq 0 ]; then skipped=$((skipped + 1)); continue; fi;; "
+            "esac;; "
+            "esac; "
+            'if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; '
+            "done; "
+            'echo "skipped-not-enclosure $skipped"'
+        )
         return shlex.join(["/bin/sh", "-lc", script])
 
     @staticmethod
