@@ -973,7 +973,7 @@ class JsonStringScanTests(unittest.TestCase):
             import gc
             import io
             import json
-            import tracemalloc
+            from tests import heap_probe
             from app.services import json_state_budget as budget
 
             document = b'{"padding":"' + b'\\n' * (2 * 1024 * 1024) + b'"}'
@@ -982,12 +982,12 @@ class JsonStringScanTests(unittest.TestCase):
             for label, scan in (("check", budget.check_json_state), ("read", budget.read_json_state)):
                 source = io.BytesIO(document)
                 gc.collect()
-                tracemalloc.start()
+                heap_probe.start()
                 try:
                     result = scan(source, "state.json")
-                    _, peaks[label] = tracemalloc.get_traced_memory()
+                    _, peaks[label] = heap_probe.get_traced_memory()
                 finally:
-                    tracemalloc.stop()
+                    heap_probe.stop()
                 assert result == document if label == "read" else result is None
                 del result
             print(json.dumps({"document_bytes": len(document),
