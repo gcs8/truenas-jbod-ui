@@ -375,6 +375,51 @@ class BMCReplyByteLimitTests(unittest.TestCase):
             ],
         )
 
+    def test_session_setup_replies_count_toward_the_pass_limit(self) -> None:
+        # The login and storage-page replies of an inventory pass are part of
+        # that pass: together with the inventory XML they stay within one
+        # pass limit, not one limit plus two more full replies.
+        per_reply = supermicro_bmc.BMC_MAX_RESPONSE_BYTES - 1024
+        total = supermicro_bmc.BMC_MAX_INVENTORY_RESPONSE_BYTES
+        session_bytes = supermicro_bmc.BMC_MAX_RESPONSE_BYTES - 1
+        controllers = total // per_reply + 2
+        service = _service()
+
+        def answer(params: dict[str, str]) -> str:
+            if params["op"] == CONTROLLER_ATTR:
+                return f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{controllers}"/></IPMI>'
+            if params["op"] == PHYSICAL_DRIVES:
+                head = f"<IPMI><HDDInfo>{_drive_nodes(1).replace('SANITIZED-0', f'SANITIZED-{_controller(params)}')}"
+                return head + " " * (per_reply - len(head) - 17) + "</HDDInfo></IPMI>"
+            return "<IPMI/>"
+
+        opener = _WebOpener(answer)
+        session_reply = _Reply(b" " * session_bytes)
+
+        def open_web_session():
+            supermicro_bmc._read_reply(session_reply, "/cgi/login.cgi")
+            return opener, "synthetic-csrf"
+
+        service._open_web_session = MagicMock(side_effect=open_web_session)
+        with (
+            patch.object(SupermicroBMCService, "_populate_redfish_inventory", lambda _self, _inventory: None),
+            patch.object(SupermicroBMCService, "_populate_redfish_simple_storage_fallback", lambda _self, _inventory: None),
+        ):
+            inventory = service.fetch_inventory()
+
+        xml_bytes = sum(reply.bytes_given for _op, reply in opener.replies)
+        self.assertLessEqual(session_reply.bytes_given + xml_bytes, total + 1)
+        self.assertFalse(inventory.source_details["web_xml_ok"])
+        self.assertEqual(len(inventory.drives), (total - session_bytes) // per_reply)
+        self.assertEqual(
+            inventory.warnings,
+            [
+                f"Supermicro BMC web inventory replies came to more than the supported {total:,} bytes "
+                "for one inventory; the reply that passed it and any later one were not read."
+            ],
+        )
+        self.assertIsNone(supermicro_bmc._WEB_INVENTORY_BYTES.get())
+
     def test_every_other_reply_read_is_bounded(self) -> None:
         limit = supermicro_bmc.BMC_MAX_RESPONSE_BYTES
         oversized = b" " * (2 * limit)

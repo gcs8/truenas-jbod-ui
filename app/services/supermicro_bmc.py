@@ -427,9 +427,11 @@ class SupermicroBMCService:
         return drives
 
     def _populate_web_inventory(self, inventory: BMCInventory) -> None:
-        opener, csrf = self._open_web_session()
+        # The login and storage-page replies belong to this pass, so they share
+        # its byte budget with the inventory XML.
         token = _WEB_INVENTORY_BYTES.set(_ReplyByteBudget(BMC_MAX_INVENTORY_RESPONSE_BYTES))
         try:
+            opener, csrf = self._open_web_session()
             self._read_web_inventory(inventory, opener, csrf)
         finally:
             _WEB_INVENTORY_BYTES.reset(token)
