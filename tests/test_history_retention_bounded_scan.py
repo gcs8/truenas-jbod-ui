@@ -234,13 +234,36 @@ class KeptSetProgressTests(unittest.TestCase):
                 self.assertEqual(carried["total_rows_removed"] + fresh["total_rows_removed"], 61)
 
 
+class UnnamedFloorProgressTests(unittest.TestCase):
+    """A page of kept rows whose text is too long to hand back still moves the floor."""
+
+    # 13:00 UTC with 300 fraction digits: a valid, kept time longer than the
+    # 256 bytes a batch reads back for its floor.
+    LONG_KEPT = "2026-11-14T08:00:00." + "1" * 300 + "-05:00"
+
+    def test_expired_rows_behind_kept_rows_too_long_to_name_are_reached(self) -> None:
+        for population, days in POPULATION_DAYS.items():
+            for batch_size in (1, 2):
+                with self.subTest(population=population, batch_size=batch_size):
+                    path = _database(self, f"{population}-{batch_size}-long.db")
+                    store = HistoryStore(str(path))
+                    _insert(path, population, [self.LONG_KEPT] * 6 + ["2026-11-14T10:00:00+00:00"])
+                    result = _retain(store, NOW, batch_size=batch_size, max_batches=20, **days)
+                    self.assertEqual(result["total_rows_removed"], 1)
+                    self.assertFalse(result["has_more"])
+                    self.assertEqual(_texts(path, population), [self.LONG_KEPT] * 6)
+
+
 class BoundedPagePlanTests(unittest.TestCase):
     """The page, the key deletes and the remaining check never scan a table."""
 
     def test_every_statement_of_a_paged_pass_searches_an_index_or_the_key(self) -> None:
         path = _database(self)
         store = HistoryStore(str(path))
-        texts = [KEPT_TEXT] * 30 + ["2026-11-14T07:00:00+00:00"] * 30 + ["2026-11-01T00:00:00+00:00"] * 30
+        texts = (
+            [KEPT_TEXT] * 30 + ["2026-11-14T07:00:00+00:00"] * 30 + ["2026-11-01T00:00:00+00:00"] * 30
+            + [UnnamedFloorProgressTests.LONG_KEPT] * 10
+        )
         for population in POPULATION_DAYS:
             _insert(path, population, texts)
         statements: list[str] = []
@@ -266,6 +289,8 @@ class BoundedPagePlanTests(unittest.TestCase):
         kinds = {" ".join(sql.split()[:4]) for sql in paged}
         self.assertTrue(any("json_each" in sql for sql in paged), kinds)
         self.assertTrue(any(sql.startswith("SELECT EXISTS(SELECT 1 FROM") for sql in paged), kinds)
+        # A floor named by key: the kept rows too long to hand back.
+        self.assertTrue(any("FROM slot_events WHERE id = " in sql for sql in paged), kinds)
         with closing(sqlite3.connect(path)) as connection:
             HistoryStore._register_retention_functions(connection)
             for sql in paged:

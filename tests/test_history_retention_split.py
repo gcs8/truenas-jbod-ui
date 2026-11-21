@@ -91,7 +91,7 @@ MOVED = {
     "_remove_retention_page": (
         "class",
         "(connection: 'sqlite3.Connection', *, name: 'str', table_name: 'str', timestamp_column: 'str', "
-        "key_column: 'str', cutoff: 'str', batch_size: 'int', floors: 'dict[str, tuple[bytes | str, int]]', "
+        "key_column: 'str', cutoff: 'str', batch_size: 'int', floors: 'dict[str, tuple[bytes | str | None, int]]', "
         "scope: 'tuple[str, tuple[Any, ...]]' = ('', ()), "
         "roll_up: 'Callable[[str, tuple[Any, ...]], None] | None' = None) -> 'tuple[int, bool]'",
     ),

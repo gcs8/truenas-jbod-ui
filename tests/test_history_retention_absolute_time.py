@@ -496,14 +496,11 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
             batches = self._event_batches(connection)
             left = [row[0] - first for row in connection.execute("SELECT id FROM slot_events ORDER BY id")]
         # A batch reads a page of two rows and its floor moves past the rows it
-        # keeps (#1268). In UTF-8 the batch that deletes row 4 also passes the
-        # kept row 5. In UTF-16 row 5 cannot be named, so that batch keeps the
-        # floor at row 0 and the next one reads rows 5 and 6, deleting nothing.
-        if self.ENCODING == "UTF-8":
-            expected = [(1, key) for key in (0, 1, 2, 3, 5, 7)]
-        else:
-            expected = [(1, 0)] * 5 + [(0, 6), (1, 7)]
-        self.assertEqual(batches, [(removed, first + key) for removed, key in expected])
+        # keeps (#1268), so the batch that deletes row 4 also passes the kept
+        # row 5; in UTF-16, where row 5's text cannot be named, by its key.
+        named = self.ENCODING == "UTF-8"
+        floor_keys = [0, 1 if named else 0, 2 if named else 0, 3 if named else 0, 5, 7]
+        self.assertEqual(batches, [(1, first + key) for key in floor_keys])
         self.assertEqual(left, [5, 6])
 
 

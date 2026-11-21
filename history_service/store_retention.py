@@ -430,7 +430,7 @@ def _remove_retention_page(
     key_column: str,
     cutoff: str,
     batch_size: int,
-    floors: dict[str, tuple[bytes | str, int]],
+    floors: dict[str, tuple[bytes | str | None, int]],
     scope: tuple[str, tuple[Any, ...]] = ("", ()),
     roll_up: Callable[[str, tuple[Any, ...]], None] | None = None,
 ) -> tuple[int, bool]:
@@ -442,7 +442,8 @@ def _remove_retention_page(
     test keeps (#1268). The first batch_size expired rows of the page are
     rolled up (`roll_up`, given their ids as a SELECT and its parameters) and
     deleted, and the floor moves past every row the batch read and did not
-    leave for the next batch, kept rows included. `scope` is an extra
+    leave for the next batch, kept rows included. A floor whose text is None
+    names a kept row by its key. `scope` is an extra
     equality prefix of the index ("bucket_seconds = ? AND ", parameters).
     finished: nothing after the floor can be eligible, because every
     candidate after it was read with this cutoff, or none is left. With a
@@ -453,11 +454,22 @@ def _remove_retention_page(
     _, settled, instant = cls._retention_bounds(cutoff)
     scope_sql, scope_parameters = scope
 
-    def candidates(floor: tuple[bytes | str, int] | None) -> tuple[str, tuple[Any, ...]]:
-        after = f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)" if floor else ""
+    def candidates(floor: tuple[bytes | str | None, int] | None) -> tuple[str, tuple[Any, ...]]:
+        after, after_parameters = "", ()
+        if floor is not None and floor[0] is None:
+            # A kept row whose text the batch could not hand back is named by
+            # its key; SQLite reads the text itself.
+            after = (
+                f" AND ({timestamp_column}, {key_column}) > "
+                f"((SELECT {timestamp_column} FROM {table_name} WHERE {key_column} = ?), ?)"
+            )
+            after_parameters = (floor[1], floor[1])
+        elif floor is not None:
+            after = f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)"
+            after_parameters = floor
         return (
             f"FROM {table_name} WHERE {scope_sql}{timestamp_column} < ?{after}",
-            (*scope_parameters, cutoff, *(floor or ())),
+            (*scope_parameters, cutoff, *after_parameters),
         )
 
     source, parameters = candidates(floors.get(name))
@@ -483,7 +495,17 @@ def _remove_retention_page(
         if roll_up is not None:
             roll_up(*selected)
         connection.execute(f"DELETE FROM {table_name} WHERE {key_column} IN ({selected[0]})", selected[1])
-    cls._advance_scan_floor(connection, floors, name, page[:processed])
+    # The floor is the last row read and not left for the next batch, named
+    # by its text as before (_advance_scan_floor). A kept row after it whose
+    # text is too long to hand back, or does not decode, is named by its key
+    # instead, so a page of such rows cannot stop the sweep.
+    read = page[:processed]
+    cls._advance_scan_floor(connection, floors, name, read)
+    floor = floors.get(name)
+    named = max((index for index, row in enumerate(read) if floor and int(row[1]) == floor[1]), default=-1)
+    kept_after = [int(row[1]) for row in read[named + 1:] if not row[2]]
+    if kept_after:
+        floors[name] = (None, kept_after[-1])
     if processed < len(page):
         return len(keys), False
     if len(page) < page_size:

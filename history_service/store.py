@@ -44,6 +44,7 @@ from history_service.segment_reader import (
 )
 from history_service.sqlite_temp import effective_sqlite_temporary_directory
 from history_service import store_retention
+from history_service.restore_timestamps import require_orderable_restored_timestamps
 from history_service import store_schema
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
@@ -250,92 +251,13 @@ _ROLLBACK_JOURNAL_FILE_FORMAT = b"\x01\x01"
 _FILE_FORMAT_HEADER_OFFSET = 18
 
 
-# Columns whose text retention compares with its cutoff. A restore admits
-# only values that comparison can order (#1268).
-RETENTION_TIMESTAMP_COLUMNS = (
-    ("slot_events", "observed_at"),
-    ("metric_samples", "observed_at"),
-    ("metric_rollups", "bucket_start"),
-)
-_DIGITS = "[0-9]"
-_SERVICE_TIMESTAMP_PREFIX = (
-    f"{_DIGITS * 4}-{_DIGITS * 2}-{_DIGITS * 2}T{_DIGITS * 2}:{_DIGITS * 2}:{_DIGITS * 2}"
-)
-# The forms the service writes (UTC, whole second or six fraction digits).
-# Matching text with a real date and time skips the exact check in Python.
-_SERVICE_TIMESTAMP_GLOBS = (
-    f"{_SERVICE_TIMESTAMP_PREFIX}+00:00",
-    f"{_SERVICE_TIMESTAMP_PREFIX}.{_DIGITS * 6}+00:00",
-)
-
-
-def _retention_can_order(text: object) -> bool:
-    """Whether retention orders this timestamp text correctly.
-
-    It needs an exact UTC instant (an ISO-8601 date and time with an offset
-    under a day) and text that starts with that time's own date: retention
-    expires text more than a day before the cutoff by its date alone, and
-    never reads text that sorts after the cutoff.
-    """
-
-    if not isinstance(text, str) or _history_utc_instant(text) is None:
-        return False
-    return text[:10] == datetime.fromisoformat(text).date().isoformat()
-
-
-def require_orderable_restored_timestamps(connection: sqlite3.Connection) -> None:
-    """Refuse a database with a retained timestamp retention cannot order.
-
-    Such a row (no offset, an invalid one, another ISO-8601 layout, or text
-    that is not valid in the database's encoding) would be kept or expired
-    by its text alone, and every retention pass would read it again while it
-    is in the day before the cutoff. Nothing is rewritten: the database is
-    refused with the count and column. A table or column an older supported
-    schema lacks is skipped.
-    """
-    registered = False
-    for table_name, column_name in RETENTION_TIMESTAMP_COLUMNS:
-        present = connection.execute(
-            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
-            (table_name, column_name),
-        ).fetchone()
-        if present is None:
-            continue
-        if not registered:
-            encoding = connection.execute("PRAGMA encoding").fetchone()[0]
-
-            def can_order(value: object) -> bool:
-                try:
-                    text = value.decode(encoding) if isinstance(value, bytes) else value
-                except UnicodeDecodeError:
-                    return False
-                return _retention_can_order(text)
-
-            connection.create_function("_history_retention_can_order", 1, can_order, deterministic=True)
-            registered = True
-        column = f'"{column_name}"'
-        count = connection.execute(
-            f'SELECT count(*) FROM "{table_name}" WHERE NOT COALESCE(({column} GLOB ? OR {column} GLOB ?) '
-            f"AND strftime('%Y-%m-%dT%H:%M:%S', {column}) = substr({column}, 1, 19), 0) "
-            f"AND NOT _history_retention_can_order(CAST({column} AS BLOB))",
-            _SERVICE_TIMESTAMP_GLOBS,
-        ).fetchone()[0]
-        if count:
-            raise ValueError(
-                f"The history database in this backup has {count} {table_name}.{column_name} "
-                f"timestamp{'' if count == 1 else 's'} that history retention cannot order: each "
-                "needs an ISO-8601 date and time with a UTC offset, starting with its own date "
-                "(YYYY-MM-DD). Nothing was restored and the current history was not changed."
-            )
-
-
 def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
     """Refuse a database with a timestamp field longer than the restore bound.
 
     Nothing is truncated or dropped: one oversized field refuses the whole
     database with a reason the operator can act on. A table or column an
     older supported schema lacks is skipped. Retained timestamps must also
-    be ones retention can order (require_orderable_restored_timestamps).
+    be ones retention can order (#1268).
     """
     for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
         present = connection.execute(
@@ -355,7 +277,7 @@ def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
                 f"timestamp longer than {MAX_RESTORED_TIMESTAMP_BYTES} bytes. Nothing was "
                 "restored and the current history was not changed."
             )
-    require_orderable_restored_timestamps(connection)
+    require_orderable_restored_timestamps(connection, _history_utc_instant)
 
 
 def count_oversized_restored_timestamps(
@@ -883,8 +805,7 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must not be world-writable.")
         self._ensure_database_parent()
         self._lock = threading.Lock()
-        # Scan floors a retention pass that ended with more work hands to the
-        # next pass (see maintain_retention). In memory only.
+        # Scan floors a retention pass hands to the next (maintain_retention).
         self._retention_carry: dict[str, tuple[bytes | str, int]] = {}
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
@@ -3430,14 +3351,11 @@ class HistoryStore:
             "interrupted": False,
         }
 
-        # In-memory scan state (see _maintain_retention_batch). A pass that
-        # uses its whole batch budget hands its unfinished floors to the next
-        # pass, so a kept set larger than one pass can read is read once per
-        # sweep instead of from its start by every pass, and the sweep reaches
-        # the rows behind it (#1268). A row kept by an earlier pass of the same
-        # sweep that has since become eligible waits, like a row added behind
-        # the floor, for the next pass, which starts with no floor once a pass
-        # ends without more work.
+        # In-memory scan state (see _maintain_retention_batch). A pass that uses
+        # its whole budget hands its unfinished floors on, so a kept set larger
+        # than one pass can read is swept once, not from its start by every
+        # pass (#1268). A row the sweep passed that has since become eligible
+        # waits, like a row added behind a floor, for the next fresh pass.
         scan_floors = self._retention_carry
         self._retention_carry = {}
         finished_tables: set[str] = set()
@@ -3873,7 +3791,7 @@ class HistoryStore:
         key_column: str,
         cutoff: str,
         batch_size: int,
-        floors: dict[str, tuple[bytes | str, int]],
+        floors: dict[str, tuple[bytes | str | None, int]],
         scope: tuple[str, tuple[Any, ...]] = ("", ()),
         roll_up: Callable[[str, tuple[Any, ...]], None] | None = None,
     ) -> tuple[int, bool]:
