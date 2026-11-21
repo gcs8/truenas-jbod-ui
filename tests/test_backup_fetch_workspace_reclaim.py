@@ -20,6 +20,12 @@ import hashlib
 import json
 import logging
 import os
+import select
+import shutil
+import subprocess
+import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,7 +41,7 @@ NEEDS_PERMISSIONS = unittest.skipIf(
 )
 
 
-class FetchWorkspaceReclaimTests(SchedulerTestBase):
+class _FetchWorkspaceBase(SchedulerTestBase):
     def setUp(self) -> None:
         super().setUp()
         self.scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
@@ -115,6 +121,9 @@ class FetchWorkspaceReclaimTests(SchedulerTestBase):
         self.assertEqual(status, 200, body)
         return json.loads(body)
 
+
+
+class FetchWorkspaceReclaimTests(_FetchWorkspaceBase):
     # -- the issue's reproduction ------------------------------------------------
 
     @NEEDS_PERMISSIONS
@@ -261,6 +270,288 @@ class FetchWorkspaceReclaimTests(SchedulerTestBase):
 
     def test_the_bound_constant_matches(self) -> None:
         self.assertEqual(service.MAX_ABANDONED_FETCH_WORKSPACES, ABANDONED_LIMIT)
+
+
+# Another process acting on the state folder. Commands arrive as JSON lines and
+# each is answered with one line, so a test can stop the scheduler at an exact
+# step, let the other process act, and continue.
+_HELPER = r"""
+import fcntl, json, os, sys
+for line in sys.stdin:
+    op, *args = json.loads(line)
+    try:
+        if op == "swap-ancestor":  # state -> parked; state becomes a link to elsewhere
+            os.rename(args[0], args[1])
+            os.symlink(args[2], args[0])
+        elif op == "restore-ancestor":
+            os.unlink(args[0])
+            os.rename(args[1], args[0])
+        elif op == "replace":  # without the lock: move the directory away and recreate the name
+            os.rename(args[0], args[1])
+            os.mkdir(args[0], 0o700)
+        elif op == "replace-locked":  # as any lock holder would: lock, then move and recreate
+            lock = os.open(args[0], os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                os.rename(args[1], args[2])
+            except FileNotFoundError:
+                pass
+            os.mkdir(args[1], 0o700)
+            os.close(lock)
+        print("ok", flush=True)
+    except OSError as exc:
+        print("error", type(exc).__name__, flush=True)
+"""
+
+# A second scheduler process making a fetch workspace, paused right after the
+# directory exists and before its creator has opened or locked it.
+_CREATOR = r"""
+import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from history_service.backup_scheduler import service
+
+real_mkdir = os.mkdir
+
+def paused_mkdir(path, *args, **kwargs):
+    real_mkdir(path, *args, **kwargs)
+    name = os.path.basename(os.fspath(path))
+    if name.startswith(service.FETCH_WORKSPACE_PREFIX):
+        print("made", name, flush=True)
+        sys.stdin.readline()
+
+os.mkdir = paused_mkdir
+scheduler = service.BackupScheduler.__new__(service.BackupScheduler)
+scheduler.paths = SimpleNamespace(state_dir=Path(sys.argv[1]))
+try:
+    held = scheduler._new_fetch_workspace()
+except Exception as exc:
+    print("error", type(exc).__name__, flush=True)
+else:
+    print("held", flush=True)
+sys.stdin.readline()
+"""
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# Names in the state folder, written out so a change is a visible test edit.
+STATE_LOCK_NAME = ".backup-fetch.lock"
+FETCH_MARKER_NAME = "fetch-workspace"
+
+
+class _Process:
+    """A real second process driven line by line over pipes."""
+
+    def __init__(self, test: unittest.TestCase, script: str, *args: str) -> None:
+        self._process = subprocess.Popen(
+            [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r})\n{script}", *args],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=REPO_ROOT,
+        )
+        self._buffer = b""
+        test.addCleanup(self.close)
+
+    def send(self, *command: str) -> None:
+        self._process.stdin.write((json.dumps(list(command)) + "\n").encode())
+        self._process.stdin.flush()
+
+    def line(self, timeout: float) -> str | None:
+        deadline = time.monotonic() + timeout
+        stream = self._process.stdout.fileno()
+        while b"\n" not in self._buffer:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([stream], [], [], left)[0]:
+                return None
+            chunk = os.read(stream, 4096)
+            if not chunk:
+                return None
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line.decode()
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.stdin.close()
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+        self._process.stdout.close()
+
+
+class PinnedStateFolderTests(_FetchWorkspaceBase):
+    """Reclamation works on the state folder it checked, under a lock every process shares."""
+
+    def _hook(self, name: str, victim: str, action):
+        """Run ``action`` once, just before ``os.<name>`` touches the entry ``victim``."""
+
+        real = getattr(os, name)
+        fired: list[bool] = []
+
+        def hooked(path, *args, **kwargs):
+            if not fired and os.path.basename(os.fspath(path)) == victim:
+                fired.append(True)
+                return action(real, path, *args, **kwargs)
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(os, name, hooked)
+
+    def test_a_state_folder_swapped_for_a_link_cannot_redirect_reclamation(self) -> None:
+        victim = "backup-fetch-victim"
+        self.abandoned_workspace(victim, content=b"abandoned copy")
+        elsewhere = self.root / "elsewhere"
+        (elsewhere / victim).mkdir(parents=True, mode=0o700)
+        (elsewhere / victim / "archive").write_bytes(b"not part of the state folder")
+        parked = self.root / "state-parked"
+        helper = _Process(self, _HELPER)
+
+        def swapped_while_opening(real, path, *args, **kwargs):
+            # Another process swaps the state folder for a link just before the
+            # workspace is opened, and puts it back right after.
+            helper.send("swap-ancestor", str(self.state_dir), str(parked), str(elsewhere))
+            self.assertEqual(helper.line(10), "ok")
+            try:
+                return real(path, *args, **kwargs)
+            finally:
+                helper.send("restore-ancestor", str(self.state_dir), str(parked))
+                self.assertEqual(helper.line(10), "ok")
+
+        with self._hook("open", victim, swapped_while_opening):
+            self.assertEqual(hashlib.sha256(self.fetch()).hexdigest(), self.remote.sha256)
+        outside = elsewhere / victim / "archive"
+        self.assertTrue(outside.is_file(), "a file outside the state folder was deleted")
+        self.assertEqual(outside.read_bytes(), b"not part of the state folder")
+        self.assertFalse((self.state_dir / victim).exists(), "the checked workspace is the one reclaimed")
+        self.assertEqual(self.workspaces(), [])
+
+    def test_a_lock_holder_cannot_swap_a_workspace_between_check_and_removal(self) -> None:
+        victim = "backup-fetch-victim"
+        self.abandoned_workspace(victim)
+        moved = self.root / "moved-away"
+        helper = _Process(self, _HELPER)
+        answered: list[str | None] = []
+
+        def replaced_before_removal(real, path, *args, **kwargs):
+            # Another process that takes the state-folder lock moves the checked
+            # workspace away and puts a different directory under its name.
+            helper.send("replace-locked", str(self.state_dir / STATE_LOCK_NAME), str(self.state_dir / victim), str(moved))
+            answered.append(helper.line(1.0))  # it must still be waiting for the lock
+            return real(path, *args, **kwargs)
+
+        with self._hook("rmdir", victim, replaced_before_removal):
+            self.fetch()
+        self.assertEqual(answered, [None], "the removal was not serialised with other lock holders")
+        self.assertEqual(helper.line(10), "ok")
+        self.assertTrue((self.state_dir / victim).is_dir(), "a directory made after the check was removed")
+        self.assertFalse(moved.exists(), "the checked workspace itself was reclaimed")
+
+    def test_a_new_workspace_of_another_process_is_not_reclaimed_before_it_is_locked(self) -> None:
+        creator = _Process(self, _CREATOR, str(self.state_dir))
+        made = creator.line(60)
+        self.assertIsNotNone(made, "the second process never made its workspace")
+        name = str(made).split()[1]
+        fetched: list[bytes] = []
+        thread = threading.Thread(target=lambda: fetched.append(self.fetch()))
+        thread.start()
+        try:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and (self.state_dir / name).exists() and thread.is_alive():
+                time.sleep(0.02)
+            creator.send("go")
+            self.assertEqual(creator.line(30), "held", "a live fetch lost its new workspace")
+        finally:
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([hashlib.sha256(data).hexdigest() for data in fetched], [self.remote.sha256])
+        self.assertEqual(self.workspaces(), [name], "the live workspace survives the other fetch")
+        # Once that process is gone, its marked workspace is abandoned and reclaimed.
+        creator.close()
+        self.fetch()
+        self.assertEqual(self.workspaces(), [])
+
+    def test_a_workspace_swapped_before_its_identity_check_is_left(self) -> None:
+        victim = "backup-fetch-victim"
+        self.abandoned_workspace(victim)
+        moved = self.root / "moved-away"
+        helper = _Process(self, _HELPER)
+
+        def replaced_after_emptying(real, path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            helper.send("replace", str(self.state_dir / victim), str(moved))
+            self.assertEqual(helper.line(10), "ok")
+            return result
+
+        with self._hook("unlink", "archive", replaced_after_emptying), self._logged() as logs:
+            self.fetch()
+        self.assertTrue((self.state_dir / victim).is_dir(), "a directory put under the name was removed")
+        self.assertTrue(moved.is_dir())
+        self.assertTrue(any("unrecognised-layout=1" in line for line in logs), logs)
+
+    def test_an_empty_workspace_without_its_fetch_marker_is_left_in_place(self) -> None:
+        empty = self.state_dir / "backup-fetch-empty"
+        empty.mkdir(mode=0o700)
+        with self._logged() as logs:
+            self.fetch()
+        self.assertTrue(empty.is_dir(), "an empty directory proves nothing about who made it")
+        self.assertTrue(any("left 1" in line and "unrecognised-layout=1" in line for line in logs), logs)
+
+    def test_a_workspace_its_fetch_marked_is_reclaimed_before_any_bytes_arrive(self) -> None:
+        marked = self.state_dir / "backup-fetch-marked"
+        marked.mkdir(mode=0o700)
+        (marked / FETCH_MARKER_NAME).write_bytes(b"")
+        self.fetch()
+        self.assertEqual(self.workspaces(), [])
+
+    def test_a_state_folder_that_is_a_link_is_refused(self) -> None:
+        real = self.root / "state-real"
+        self.state_dir.rename(real)
+        self.state_dir.symlink_to(real, target_is_directory=True)
+        self.abandoned_workspace_at(real)
+        result = self.verify()
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertIn("state folder", result["detail"])
+        self.assertTrue((real / "backup-fetch-abandoned" / "archive").exists())
+        self.assertEqual(sorted(p.name for p in real.glob("backup-fetch-*")), ["backup-fetch-abandoned"])
+
+    def test_a_state_folder_others_can_write_is_refused(self) -> None:
+        self.abandoned_workspace()
+        self.state_dir.chmod(0o770)
+        self.addCleanup(self.state_dir.chmod, 0o700)
+        result = self.verify()
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertIn("state folder", result["detail"])
+        self.assertEqual(self.workspaces(), ["backup-fetch-abandoned"])
+
+    def abandoned_workspace_at(self, folder: Path) -> None:
+        (folder / "backup-fetch-abandoned").mkdir(mode=0o700)
+        (folder / "backup-fetch-abandoned" / "archive").write_bytes(b"full copy")
+
+    def test_stale_keeper_scratch_removal_stays_in_the_state_folder(self) -> None:
+        victim = "keeper-check-stale"
+        (self.state_dir / victim / "nested").mkdir(parents=True, mode=0o700)
+        elsewhere = self.root / "elsewhere"
+        (elsewhere / victim / "nested").mkdir(parents=True)
+        (elsewhere / victim / "nested" / "data").write_bytes(b"not part of the state folder")
+        parked = self.root / "state-parked"
+        helper = _Process(self, _HELPER)
+        real_rmtree = shutil.rmtree
+
+        def swapped_while_removing(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) != victim:
+                return real_rmtree(path, *args, **kwargs)
+            helper.send("swap-ancestor", str(self.state_dir), str(parked), str(elsewhere))
+            self.assertEqual(helper.line(10), "ok")
+            try:
+                return real_rmtree(path, *args, **kwargs)
+            finally:
+                helper.send("restore-ancestor", str(self.state_dir), str(parked))
+                self.assertEqual(helper.line(10), "ok")
+
+        with mock.patch.object(service.shutil, "rmtree", swapped_while_removing):
+            service._remove_stale_keeper_scratch(self.state_dir)
+        outside = elsewhere / victim / "nested" / "data"
+        self.assertTrue(outside.is_file(), "a tree outside the state folder was deleted")
+        self.assertEqual(outside.read_bytes(), b"not part of the state folder")
+        self.assertFalse((self.state_dir / victim).exists())
 
 
 if __name__ == "__main__":

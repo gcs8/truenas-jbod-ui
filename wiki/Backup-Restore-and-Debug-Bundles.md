@@ -666,11 +666,18 @@ directory under the scheduler state directory and delete it afterwards. If
 that deletion fails, the Verify result still stands and the scheduler log says
 so. The next remote fetch deletes such a directory when it belongs to the
 scheduler's account, no running fetch holds it, and it holds only the fetched
-file. Anything else is left in place and counted by reason in the scheduler
-log. While four or more of these directories are left, Verify and download of
-remote copies are refused before anything is downloaded, with the count in the
-answer (`not_read` for Verify); remove them from the state directory to
-continue.
+file and the marker its fetch wrote. An empty directory, or anything else, is
+left in place and counted by reason in the scheduler log. While four or more
+of these directories are left, Verify and download of remote copies are
+refused before anything is downloaded, with the count in the answer
+(`not_read` for Verify); remove them from the state directory to continue.
+
+The state directory must be a real directory (not a link) owned by the
+scheduler's account and not writable by other accounts; otherwise Verify and
+download of remote copies are refused with a message that says so. Making,
+checking and removing these directories happens inside the directory the
+scheduler opened and checked, while it holds the `.backup-fetch.lock` file
+there, which every scheduler process sharing the directory also takes.
 
 ## Create a debug bundle
 
