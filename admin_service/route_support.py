@@ -52,7 +52,7 @@ from app.services.profile_builder import collect_profile_references
 from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings, profile_is_system_layout
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.release_status import ReleaseStatusService, describe_release_status
-from app.services.ssh_key_manager import SSHKeyManager
+from app.services.ssh_key_manager import SSHKeyManager, list_keys_with_warnings
 from app.services.ssh_probe import SSHProbe
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views, system_storage_views_are_generated
@@ -616,7 +616,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
     runtime_service = get_runtime_service()
     runtime_payload = await build_runtime_payload(runtime_service)
     key_manager = SSHKeyManager(settings.config_file)
-    ssh_keys = await asyncio.to_thread(key_manager.list_keys)
+    ssh_keys, key_warnings = await asyncio.to_thread(list_keys_with_warnings, key_manager, settings)
     admin_settings = get_admin_settings()
     history_settings = get_history_settings()
     expires_at = compute_expires_at(admin_settings)
@@ -647,6 +647,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
         "ssh_keys": ssh_keys,
+        "ssh_key_warnings": key_warnings,
         "esxi_host_prep": {
             "temp_dir": admin_settings.host_prep_temp_dir,
             "staged_packages": await asyncio.to_thread(get_esxi_host_prep_service().list_staged_packages),

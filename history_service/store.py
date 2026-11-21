@@ -32,6 +32,7 @@ from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
+    hash_descriptor,
     open_regular_file,
     path_entry_exists,
 )
@@ -2895,14 +2896,27 @@ class HistoryStore:
                     self._recount_restored_table_counts(restore_connection)
                     restore_connection.commit()
 
+                publish_content = (
+                    self._hash_private_publication_descriptor(temp_fd)
+                    if validated_content is not None
+                    else None
+                )
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
                 publish_descriptor = temp_fd
                 temp_fd = None
-                self._publish_replacement(
-                    temp_path,
-                    self.file_path,
-                    temp_descriptor=publish_descriptor,
-                )
+                if publish_content is None:
+                    self._publish_replacement(
+                        temp_path,
+                        self.file_path,
+                        temp_descriptor=publish_descriptor,
+                    )
+                else:
+                    self._publish_replacement(
+                        temp_path,
+                        self.file_path,
+                        temp_descriptor=publish_descriptor,
+                        expected_content=publish_content,
+                    )
                 for suffix in ("-shm", "-wal"):
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
                 self._normalize_database_permissions()
@@ -2990,6 +3004,36 @@ class HistoryStore:
                 or digest.hexdigest() != sha256
             ):
                 raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+
+    @staticmethod
+    def _hash_private_publication_descriptor(descriptor: int) -> tuple[int, str]:
+        """Return stable content from the single-link private publication file."""
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hash_descriptor(
+            descriptor,
+            opened,
+            changed=VALIDATED_MEMBER_CHANGED_MESSAGE,
+        )
+        current = os.fstat(descriptor)
+        identity_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if current.st_nlink != 1 or tuple(
+            getattr(current, field) for field in identity_fields
+        ) != tuple(getattr(opened, field) for field in identity_fields):
+            raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+        return opened.st_size, digest
 
     @classmethod
     def _read_private_copy_alone(
@@ -5013,6 +5057,7 @@ class HistoryStore:
         target_path: Path,
         *,
         temp_descriptor: int | None = None,
+        expected_content: tuple[int, str] | None = None,
     ) -> None:
         with ExitStack() as descriptor_stack:
             if temp_descriptor is None:
@@ -5062,6 +5107,13 @@ class HistoryStore:
             # SQLite/copy completion is not a publication barrier. Flush the
             # final file metadata too, after mode and restore-owner changes.
             os.fsync(temp_descriptor)
+            if (
+                expected_content is not None
+                and self._hash_private_publication_descriptor(temp_descriptor)
+                != expected_content
+            ):
+                raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+            temp_metadata = os.fstat(temp_descriptor)
             if not self._path_matches_metadata(temp_path, temp_metadata):
                 raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
 

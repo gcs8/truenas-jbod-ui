@@ -25,6 +25,13 @@ from typing import Any, Callable, NamedTuple, Sequence
 import yaml
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.services.atomic_write import write_atomically  # noqa: E402
+
+
 # The documented segmented-history catalog location (.env.example).
 SEGMENT_CATALOG_PATH = "/app/history/segments/catalog.json"
 SEGMENTED_BACKUP_SCHEMA_VERSION = 2
@@ -1065,8 +1072,7 @@ def _write_runtime_files(
         )
     )
     env_path = runtime_root / ".env"
-    env_path.write_text(environment, encoding="utf-8")
-    env_path.chmod(0o600)
+    write_atomically(env_path, lambda handle: handle.write(environment), mode=0o600)
     override = {
         "networks": {
             "default": (

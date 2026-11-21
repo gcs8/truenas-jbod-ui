@@ -26,6 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
+from app.services.ssh_key_manager import list_keys_with_warnings
 from app.models.domain import (
     SSHKeyGenerateRequest,
     TLSCertificateImportRequest,
@@ -41,8 +42,8 @@ def add_transport_routes(router: APIRouter, routes: ModuleType) -> None:
     async def list_ssh_keys() -> JSONResponse:
         settings = routes.reload_app_settings()
         key_manager = routes.SSHKeyManager(settings.config_file)
-        keys = await asyncio.to_thread(key_manager.list_keys)
-        return JSONResponse({"ok": True, "keys": keys})
+        keys, warnings = await asyncio.to_thread(list_keys_with_warnings, key_manager, settings)
+        return JSONResponse({"ok": True, "keys": keys, "ssh_key_warnings": warnings})
 
     @router.post("/api/admin/ssh-keys/generate")
     async def generate_ssh_key(payload: SSHKeyGenerateRequest) -> JSONResponse:
@@ -52,8 +53,8 @@ def add_transport_routes(router: APIRouter, routes: ModuleType) -> None:
             generated_key = await asyncio.to_thread(key_manager.generate_keypair, payload.name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        keys = await asyncio.to_thread(key_manager.list_keys)
-        return JSONResponse({"ok": True, "key": generated_key, "keys": keys})
+        keys, warnings = await asyncio.to_thread(list_keys_with_warnings, key_manager, settings)
+        return JSONResponse({"ok": True, "key": generated_key, "keys": keys, "ssh_key_warnings": warnings})
 
     @router.post("/api/admin/tls/inspect")
     async def inspect_tls_certificate(payload: TLSCertificateInspectRequest) -> JSONResponse:

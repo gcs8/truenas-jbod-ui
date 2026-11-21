@@ -89,6 +89,7 @@ from app.route_support import (
     resolve_read_ui_write_policy,
     runtime_warnings_for,
     known_hosts_warnings_for,
+    ssh_key_warnings_for,
     readback_after_write,
     templates,
     upgrade_notice_data_dir,
@@ -1377,6 +1378,7 @@ def build_router() -> APIRouter:
             startup_problems=storage_problems,
             remote_problems=[
                 *known_hosts_warnings_for(request),
+                *ssh_key_warnings_for(request),
                 *config_reload_problems(request, include_restart_notice=False),
                 *([history_problem] if history_problem else []),
                 *backup_problems,
