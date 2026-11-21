@@ -88,8 +88,7 @@ class SlotDetailStore:
             # Read like an unreadable file, but say so: the cache is not served.
             logger.warning("Slot detail cache %s not loaded: %s", self.file_path, exc)
             return {}
-        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
-            # Nesting deeper than the parser follows is unreadable too.
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
 
         if not isinstance(payload, dict):

@@ -33,13 +33,23 @@ objects), where before it was bounded only by the archive member limit.
 from __future__ import annotations
 
 import os
+import re
 import stat
+from itertools import accumulate
 from typing import Any, IO
 
 MAX_JSON_STATE_FILE_BYTES = 64 * 1024 * 1024
 MAX_JSON_STATE_FILE_ITEMS = 4 * 1024 * 1024
 JSON_STATE_READ_CHUNK_BYTES = 1024 * 1024
+# Container nesting a state file may use. The files this application writes
+# nest about eight levels; backup validation already refuses more than 64.
+# Checked on the bytes before parsing, so no parser recursion limit (which
+# depends on the interpreter and its stack) decides whether a file is read.
+MAX_JSON_STATE_FILE_DEPTH = 128
 _ITEM_MARKERS = (b",", b":", b"{", b"[")
+_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
+_NOT_BRACKETS = bytes(byte for byte in range(256) if byte not in b"[]{}")
+_BRACKET_STEP = tuple(1 if byte in b"[{" else -1 for byte in range(256))
 
 
 class JsonStateFileRefused(ValueError):
@@ -123,15 +133,24 @@ def _scan(source: IO[bytes], name: str, *, retain: bool, size: int | None) -> by
     return b"".join(chunks) if retain else None
 
 
+def _nesting_depth(data: bytes) -> int:
+    """The deepest container nesting in ``data``; brackets in strings do not count."""
+    brackets = _JSON_STRING.sub(b"", data).translate(None, _NOT_BRACKETS)
+    return max(accumulate(map(_BRACKET_STEP.__getitem__, brackets)), default=0)
+
+
 def read_json_state(source: IO[bytes], name: str, *, size: int | None = None) -> bytes:
     """Return all of binary ``source``, or raise ``JsonStateFileRefused``.
 
     ``size`` is the caller's own ``fstat`` size of a file it has already
     checked is regular; otherwise the size and kind are taken from ``source``.
-    Either way the bytes read are counted too.
+    Either way the bytes read are counted too. A file nested deeper than
+    ``MAX_JSON_STATE_FILE_DEPTH`` is refused before it is parsed.
     """
     data = _scan(source, name, retain=True, size=size)
     assert data is not None
+    if _nesting_depth(data) > MAX_JSON_STATE_FILE_DEPTH:
+        raise JsonStateFileTooLarge(name, MAX_JSON_STATE_FILE_DEPTH, "levels of nesting")
     return data
 
 

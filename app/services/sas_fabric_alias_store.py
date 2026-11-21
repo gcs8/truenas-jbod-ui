@@ -52,7 +52,7 @@ class SasFabricAliasStore:
         except JsonStateFileRefused as exc:
             logger.warning("SAS Fabric alias store %s not loaded: %s", self.file_path, exc)
             raise ValueError(f"{exc} No changes were saved.") from exc
-        except (OSError, ValueError, RecursionError) as exc:
+        except (OSError, ValueError) as exc:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:
             if not isinstance(payload, dict) or not isinstance(payload.get("sas_fabric_aliases"), dict):

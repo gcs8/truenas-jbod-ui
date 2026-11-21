@@ -766,17 +766,39 @@ class EncodedByteCountTests(_TempDirTestCase):
         self.assertTrue(any("larger than when it was opened" in message for message in warnings), warnings)
 
 
-# Valid JSON well inside both limits, nested deeper than the parser recurses.
+# Valid JSON well inside the byte and item limits, nested far deeper than the
+# depth limit. Whether a parser could follow it depends on the interpreter and
+# its stack (a large stack parses it), so the refusal must not depend on that.
 DEEP_DEPTH = 100_000
 DEEP_ARRAY = b"[" * DEEP_DEPTH + b"]" * DEEP_DEPTH
+DEPTH_LIMIT = 128
 
 
 def _deep_member(head: bytes, tail: bytes) -> bytes:
     return head + DEEP_ARRAY + tail
 
 
+def _nested(depth: int) -> bytes:
+    """A slot detail document whose deepest container is ``depth`` levels down."""
+    # The document itself, slot_details, the entry and slot_fields: 4 levels.
+    inner = depth - 4
+    return (
+        b'{"version":1,"slot_details":{"system-a:enclosure-a:0":{"system_id":"system-a",'
+        b'"enclosure_id":"enclosure-a","slot":0,"slot_fields":{"padding":'
+        + b"[" * inner + b"]" * inner + b"}}}}"
+    )
+
+
+@contextmanager
+def _no_parse(test: unittest.TestCase) -> Iterator[None]:
+    """Fail if anything is parsed: the refusal must come before the parser."""
+    with mock.patch.object(json, "loads", wraps=json.loads) as loads:
+        yield
+    test.assertEqual(loads.call_count, 0, "the deep document reached the parser")
+
+
 class DeeplyNestedJsonTests(_TempDirTestCase):
-    """Nesting the parser cannot follow is an unreadable file, never an escape."""
+    """Nesting past the limit is refused before parsing, never a parser escape."""
 
     def _call(self, action: Any) -> Any:
         try:
@@ -784,21 +806,59 @@ class DeeplyNestedJsonTests(_TempDirTestCase):
         except RecursionError:
             self.fail("RecursionError escaped the public boundary")
 
-    def test_slot_detail_store_reads_deep_files_as_unreadable(self) -> None:
+    def test_depth_limit_matches_the_module(self) -> None:
+        self.assertEqual(getattr(_budget_module(), "MAX_JSON_STATE_FILE_DEPTH", None), DEPTH_LIMIT)
+
+    def test_store_reads_the_depth_limit_and_refuses_one_more(self) -> None:
+        path = self.temp_dir / "slot_detail_cache.json"
+        store = SlotDetailStore(str(path))
+        for depth, loads in ((7, True), (DEPTH_LIMIT, True), (DEPTH_LIMIT + 1, False)):
+            with self.subTest(depth=depth), _captured_warnings("app.services.slot_detail_store") as warnings:
+                path.write_bytes(_nested(depth))
+                self.assertEqual(bool(store.load_all()), loads)
+                if not loads:
+                    self.assertTrue(
+                        any(f"over the limit of {DEPTH_LIMIT:,} levels of nesting" in message for message in warnings),
+                        warnings,
+                    )
+
+    def test_brackets_inside_strings_do_not_count(self) -> None:
+        budget = _budget_module()
+        path = self.temp_dir / "slot_detail_cache.json"
+        deep_text = ("[{" * 200 + '\\"' + "]}" * 200).encode("ascii")
+        path.write_bytes(SLOT_DETAIL_SMALL.replace(b"SYN-0001", deep_text))
+        loaded = SlotDetailStore(str(path)).load_all()
+        self.assertEqual(list(loaded), ["system-a:enclosure-a:0"])
+        with mock.patch.object(budget, "MAX_JSON_STATE_FILE_DEPTH", 4, create=True):
+            try:
+                data = budget.read_json_state(io.BytesIO(path.read_bytes()), "x")
+            except budget.JsonStateFileRefused:
+                self.fail("a document exactly at the depth limit was refused")
+            self.assertEqual(data, path.read_bytes())
+        with mock.patch.object(budget, "MAX_JSON_STATE_FILE_DEPTH", 3, create=True), \
+                self.assertRaises(budget.JsonStateFileTooLarge):
+            budget.read_json_state(io.BytesIO(path.read_bytes()), "x")
+
+    def test_slot_detail_store_refuses_deep_files_before_parsing(self) -> None:
         path = self.temp_dir / "slot_detail_cache.json"
         for document in (DEEP_ARRAY, _deep_member(SLOT_DETAIL_ONE_ENTRY_HEAD, SLOT_DETAIL_ONE_ENTRY_TAIL)):
-            with self.subTest(size=len(document)):
+            with self.subTest(size=len(document)), _no_parse(self), \
+                    _captured_warnings("app.services.slot_detail_store") as warnings:
                 path.write_bytes(document)
                 self.assertEqual(self._call(SlotDetailStore(str(path)).load_all), {})
+                self.assertTrue(any("levels of nesting" in message for message in warnings), warnings)
 
-    def test_sas_alias_store_refuses_deep_files(self) -> None:
+    def test_sas_alias_store_refuses_deep_files_before_parsing(self) -> None:
         path = self.temp_dir / "sas_fabric_aliases.json"
         for document in (DEEP_ARRAY, _deep_member(SAS_ALIAS_HEAD, PADDING_TAIL)):
-            with self.subTest(size=len(document)):
+            with self.subTest(size=len(document)), _no_parse(self), \
+                    _captured_warnings("app.services.sas_fabric_alias_store"):
                 path.write_bytes(document)
                 store = SasFabricAliasStore(path)
                 self.assertEqual(self._call(store.load_all), {})
-                with self.assertRaisesRegex(ValueError, "Cannot read the authoritative SAS Fabric alias store"):
+                with self.assertRaisesRegex(
+                    ValueError, f"over the limit of {DEPTH_LIMIT:,} levels of nesting .* No changes were saved",
+                ):
                     self._call(lambda: store.save_alias(
                         SasFabricAlias(system_id="system-a", object_id="expander-2", label="Shelf B")
                     ))
@@ -810,14 +870,19 @@ class DeeplyNestedJsonTests(_TempDirTestCase):
             b'{"version":2,"slot_mappings":{"v2:' + DEEP_ARRAY + b'":{"system_id":"system-a",'
             b'"enclosure_id":"enclosure-a","slot":0,"serial":"SYN-0001"}}}'
         )
-        for document in (DEEP_ARRAY, _deep_member(MAPPING_HEAD, PADDING_TAIL), deep_key):
-            with self.subTest(size=len(document)):
-                path.write_bytes(document)
-                store = MappingStore(path)
-                with self.assertRaises(MappingScopeConflict):
-                    self._call(store.load_read_snapshot)
-                if document is not deep_key:
+        with _captured_warnings("app.services.mapping_store"):
+            for document in (DEEP_ARRAY, _deep_member(MAPPING_HEAD, PADDING_TAIL)):
+                with self.subTest(size=len(document)), _no_parse(self):
+                    path.write_bytes(document)
+                    store = MappingStore(path)
+                    with self.assertRaises(MappingScopeConflict):
+                        self._call(store.load_read_snapshot)
                     self.assertEqual(dict(self._call(store.load_all)), {})
+            # A key is a string, so its nesting is not the file's: the key
+            # decoder refuses it, whether or not the parser could follow it.
+            path.write_bytes(deep_key)
+            with self.assertRaises(MappingScopeConflict):
+                self._call(MappingStore(path).load_read_snapshot)
 
     def test_backup_preflight_refuses_deep_members_the_same_way_from_file_and_memory(self) -> None:
         for group_key, head, tail in (
@@ -837,13 +902,27 @@ class DeeplyNestedJsonTests(_TempDirTestCase):
                     self.assertEqual(messages[0], messages[1])
                     self.assertEqual(messages[0], f"Backup bundle selected {group_key} member is invalid.")
 
-    def test_debug_bundle_refuses_deep_state_files(self) -> None:
+    def test_backup_check_refuses_every_member_the_store_refuses_for_depth(self) -> None:
+        # Backup validation's own nesting limit is stricter than the store's,
+        # so a member the store would refuse never passes the check.
+        for depth in (DEPTH_LIMIT, DEPTH_LIMIT + 1):
+            with self.subTest(depth=depth):
+                document = _nested(depth)
+                path = self.temp_dir / "member.json"
+                path.write_bytes(document)
+                for content in (path, document):
+                    with self.assertRaisesRegex(ValueError, "member is invalid"):
+                        _preflight(SLOT_DETAIL_FILE_KEY, content)
+
+    def test_debug_bundle_refuses_deep_state_files_before_parsing(self) -> None:
         service = _debug_service(self.temp_dir)
         for group_key, file_name, _document in DEBUG_GROUPS:
             (self.temp_dir / file_name).write_bytes(DEEP_ARRAY)
             for scrub in (False, True):
-                with self.subTest(group_key=group_key, scrub=scrub):
-                    with self.assertRaisesRegex(ValueError, f"^{file_name} could not be read"):
+                with self.subTest(group_key=group_key, scrub=scrub), _no_parse(self):
+                    with self.assertRaisesRegex(
+                        ValueError, f"^{file_name} is over the limit of {DEPTH_LIMIT:,} levels of nesting",
+                    ):
                         self._call(lambda: service.export_debug_bundle_to_file(
                             packaging="zip", included_paths=[group_key],
                             scrub_secrets=scrub, scrub_disk_identifiers=scrub,

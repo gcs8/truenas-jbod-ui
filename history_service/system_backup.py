@@ -4071,19 +4071,21 @@ class SystemBackupService:
                         content,
                         integrity_checked=history_integrity_checked,
                     )
-                elif isinstance(content, Path) and group_key == MAPPING_FILE_KEY:
+                # In memory or on disk, the same streaming validator (#1286):
+                # one verdict, whatever the representation.
+                elif group_key == MAPPING_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "slot_mappings",
                         ManualMapping,
                     )
-                elif isinstance(content, Path) and group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "sas_fabric_aliases",
                         SasFabricAlias,
                     )
-                elif isinstance(content, Path) and group_key == SLOT_DETAIL_FILE_KEY:
+                elif group_key == SLOT_DETAIL_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "slot_details",
@@ -4104,12 +4106,7 @@ class SystemBackupService:
                     f"Backup bundle member {exc.name} is {exc.detail}, so the application "
                     "would not load it after a restore."
                 ) from exc
-            except (
-                UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError,
-                # Nesting deeper than the in-memory parser follows: invalid,
-                # as the file-backed validator's depth limit already says.
-                RecursionError,
-            ) as exc:
+            except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
                 ) from exc
@@ -4237,10 +4234,13 @@ class SystemBackupService:
 
     @staticmethod
     def _validate_streaming_json_member(
-        content: Path,
+        content: ExtractedMember,
         target_key: str,
         model: Any,
     ) -> int:
+        if isinstance(content, bytes):
+            with io.TextIOWrapper(io.BytesIO(content), encoding="utf-8") as source:
+                return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
         with content.open("r", encoding="utf-8", buffering=JSON_STREAM_CHUNK_CHARS) as source:
             return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
 
@@ -7189,19 +7189,17 @@ class SystemBackupService:
         """Read one JSON state file snapshot under the stores' budget (#1286).
 
         ``name`` is the state file's own name, for the operator-visible
-        refusal. Over budget, the snapshot is refused before it is parsed.
+        refusal. Over budget (bytes, keys and values, or nesting), the
+        snapshot is refused before it is parsed.
         """
         if not path.exists():
             return b""
         with path.open("rb") as source:
             raw = read_json_state(source, name)
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-            if scrubber is not None:
-                payload = scrubber.scrub_payload(payload)
-            return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        except RecursionError:
-            raise ValueError(f"{name} could not be read: its JSON is nested too deeply.") from None
+        payload = json.loads(raw.decode("utf-8"))
+        if scrubber is not None:
+            payload = scrubber.scrub_payload(payload)
+        return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
 
     def _build_scrubbed_history_snapshot_file(
         self,

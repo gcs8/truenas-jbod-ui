@@ -640,8 +640,7 @@ class MappingStore:
                 raw.decode("utf-8"),
                 object_pairs_hook=self._reject_duplicate_object_keys,
             )
-        except (UnicodeError, json.JSONDecodeError, RecursionError):
-            # Nesting deeper than the parser follows is unreadable JSON too.
+        except (UnicodeError, json.JSONDecodeError):
             if strict:
                 raise MappingScopeConflict() from None
             return 1, {}
