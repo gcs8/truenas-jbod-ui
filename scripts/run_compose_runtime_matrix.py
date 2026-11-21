@@ -530,6 +530,13 @@ def _prepare_variant_root(
             str(root / "backup-api"),
         )
     )
+    if variant.ui_enabled:
+        # The source is an extra process in the owned UI container, not a host
+        # listener or a new service. Container teardown owns its cleanup.
+        _run(("sudo", "install", "-m", "0640", "-o", str(APP_UID), "-g", str(APP_GID),
+              str(ROOT / "tests/fixtures/compose-runtime-source.py"),
+              str(root / "config/compose-runtime-source.py")))
+        config_fixture = ROOT / "tests/fixtures/compose-runtime-config.yaml"
     _run(
         (
             "sudo",
@@ -598,7 +605,57 @@ def _request(
         with urllib.request.urlopen(request, timeout=15) as response:
             return int(response.status), response.read()
     except urllib.error.HTTPError as exc:
-        return int(exc.code), exc.read()
+        with exc:
+            return int(exc.code), exc.read(4097)
+
+
+# Only literal public categories/details are printable. Do not sanitize arbitrary
+# server prose by truncation: even a short detail can contain a credential.
+PUBLIC_HTTP_ERRORS = {
+    "mapping_disk_unverifiable": (
+        "The disk in this bay could not be checked right now. Nothing was saved. Reload and try again.",
+        "The disk in this bay could not be checked right now. Nothing was cleared. Reload and try again.",
+    ),
+    "mapping_disk_changed": (
+        "The disk in this bay changed. Reload to see it, then save again.",
+        "The disk in this bay changed. Reload to see it, then clear again.",
+    ),
+    "mapping_revision_conflict": ("Mapping scope revision changed before this write.",),
+}
+MATRIX_HTTP_ROUTES = (
+    "/", "/livez", "/healthz", "/api/inventory", "/api/history/status",
+    "/api/sas-fabric/aliases", "/api/mappings/export", "/api/slots/0/mapping",
+    "/api/admin/state", "/api/admin/system-setup/demo", "/api/admin/backups",
+    "/api/admin/backups/run",
+)
+
+
+def _http_failure_context(url: str, method: str, body: bytes) -> str:
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        path = ""
+    route = path if path in MATRIX_HTTP_ROUTES else "route omitted"
+    if re.fullmatch(r"/api/admin/backups/[a-zA-Z0-9_-]{1,128}/verify", path):
+        route = "/api/admin/backups/{id}/verify"
+    verb = method if method in {"GET", "POST", "DELETE"} else "method omitted"
+    context = f"{verb} {route}; body omitted"
+    if len(body) > 4096:
+        return context
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return context
+    if not isinstance(payload, dict):
+        return context
+    error = payload.get("error")
+    if not isinstance(error, str) or error not in PUBLIC_HTTP_ERRORS:
+        return context
+    context = f"{verb} {route}; error={error}"
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail in PUBLIC_HTTP_ERRORS[error]:
+        context += f"; detail={detail}"
+    return context
 
 
 def _require_status(
@@ -618,7 +675,10 @@ def _require_status(
         origin=origin,
     )
     if status != expected:
-        raise RuntimeError(f"Unexpected HTTP status for matrix route: expected {expected}, got {status}.")
+        raise RuntimeError(
+            f"Unexpected HTTP status for matrix route: expected {expected}, got {status}. "
+            f"{_http_failure_context(url, method, body)}"
+        )
     return body
 
 
@@ -826,6 +886,12 @@ def _verify_scheduler_enabled(ports: Ports, prefix: Sequence[str]) -> None:
         raise RuntimeError("Backup scheduler restart readback did not retain the verified artifact.")
 
 
+def _start_mapping_source(prefix: Sequence[str]) -> None:
+    source = "/app/config/compose-runtime-source.py"
+    _run((*prefix, "exec", "-d", "-T", "enclosure-ui", "python", source))
+    _run((*prefix, "exec", "-T", "enclosure-ui", "python", source, "--check"))
+
+
 def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
     _run((*prefix, "restart", "enclosure-ui"))
     _run(
@@ -840,6 +906,7 @@ def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
             "enclosure-ui",
         )
     )
+    _start_mapping_source(prefix)
     _verify_ui(ports)
 
 
@@ -944,6 +1011,27 @@ def _verify_pencil_cycle(
         raise RuntimeError("alias clear readback failed")
 
 
+def _verify_unread_mapping(base: str) -> None:
+    query = "system_id=matrix-unread"
+    inventory = json.loads(_require_status(f"{base}/api/inventory?{query}", 200, authenticated=True))
+    slot = inventory["slots"][0]
+    revision = slot["mapping_revision"]
+    export_url = f"{base}/api/mappings/export?{query}"
+    before = json.loads(_require_status(export_url, 200, authenticated=True))
+    response = json.loads(_require_status(
+        f"{base}/api/slots/0/mapping?{query}", 409, method="POST",
+        payload={"expected_revision": revision, "notes": "Unread source must refuse",
+                 "clear_identify_after_save": False}, authenticated=True, origin=base,
+    ))
+    after = json.loads(_require_status(export_url, 200, authenticated=True))
+    if (response.get("error") != "mapping_disk_unverifiable"
+            or response.get("current_revision") != revision
+            or slot.get("presence_known") is not False
+            or before.get("revision") != after.get("revision")
+            or before.get("mappings") != [] or after.get("mappings") != []):
+        raise RuntimeError("Unread mapping source refusal contract failed.")
+
+
 def _verify_mapping_cycle(
     root: Path,
     variant: Variant,
@@ -958,9 +1046,10 @@ def _verify_mapping_cycle(
     )
     system_id = inventory.get("selected_system_id")
     enclosure_id = inventory.get("selected_enclosure_id")
-    # The CI smoke fixture points at an unreachable source, so discovery finds no
-    # enclosure and the UI selects none. Mapping then uses the system scope alone,
-    # which the mapping routes accept. A present enclosure ID must still be valid.
+    if system_id == "matrix-live":
+        _verify_unread_mapping(base)
+    # Mapping scope may omit an enclosure, but successful writes also require
+    # live occupancy evidence. The dedicated producer supplies one empty bay.
     if (
         not isinstance(system_id, str)
         or not system_id
@@ -1449,6 +1538,7 @@ def _run_variant(
         if variant.ui_enabled:
             if owner is None:
                 raise RuntimeError("Compose UI writer identity contract is missing.")
+            _start_mapping_source(prefix)
             _verify_ui(ports)
             _verify_pencil_cycle(root, variant, ports, prefix, expected_owner=owner)
             _verify_mapping_cycle(root, variant, ports, prefix, expected_owner=owner)

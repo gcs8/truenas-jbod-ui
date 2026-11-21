@@ -231,6 +231,14 @@
     },
     "reason": "Reviewed source literal for sanitized capture or QA tooling."
   },
+  "tests/fixtures/compose-runtime-config.yaml": {
+    "findings": {
+      "internal_hostname": {
+        "sha256:f14465bfd3600ab231caa10ae9b560c40155160fda1854630dfa5a8a9cda3ba0": 2
+      }
+    },
+    "reason": "Synthetic container-loopback HTTP URLs with explicit ports; exact values and detector counts are pinned."
+  },
   "tests/fixtures/ci-smoke-config.yaml": {
     "findings": {
       "internal_hostname": {

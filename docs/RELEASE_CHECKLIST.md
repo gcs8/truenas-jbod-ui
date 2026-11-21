@@ -218,7 +218,12 @@ python scripts/validate_release_wrap.py "$version" \
     against the exact built image and base Compose file. It verifies the service
     set, health, auth boundary, exact OCI source revision, and authenticated alias
     and slot-mapping save/readback/restart/readback/clear cycles for every
-    UI-bearing mode. Keep this full matrix
+    UI-bearing mode. UI variants use `tests/fixtures/compose-runtime-config.yaml`
+    and a read-only synthetic WebSocket producer on the UI container's loopback.
+    The producer is restarted with the UI and removed by the existing container
+    teardown. An unread source must still refuse a mapping write without changing
+    its revision or stored rows. The supplied `--config-fixture` remains the input
+    for non-UI variants. Keep this full matrix
     off hosted CI. This synthetic gate does not use appliance or private data; a
     production-derived restore is a separate private QA gate
   - The separate production-derived restore gate is
