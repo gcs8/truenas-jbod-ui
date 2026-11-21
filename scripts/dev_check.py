@@ -316,6 +316,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_immutable_deployment",
             "tests.test_image_upgrade_contract",
             "tests.test_image_upgrade_smoke_safety",
+            "tests.test_mapping_publication_unconfirmed",
             "tests.test_mapping_store",
             "tests.test_mapping_store_writer_lock",
             "tests.test_nonroot_migration",
