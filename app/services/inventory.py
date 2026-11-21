@@ -6744,6 +6744,33 @@ class InventoryService(InventorySourceCollectionMixin):
         self._smart_negative_cache.pop(cache_key, None)
         return True
 
+    def _admit_smart_summary_to_saved_row(
+        self,
+        slot_view: SlotView,
+        summary: SmartSummaryView,
+        *,
+        expected_generation: SmartCacheGenerationToken,
+        cache_key: SmartCacheKey,
+    ) -> bool:
+        """Cache a readable reply; admit an unread-only one to the saved row alone.
+
+        A reply that read nothing but named stable fields it could not read is
+        still an observation of this disk. It stays out of the reading cache
+        (it is not a reading), but the saved row must say so, or a restart
+        serves the older value as current (#1294).
+        """
+        if self._store_smart_summary_cache(
+            slot_view, summary, expected_generation=expected_generation, cache_key=cache_key,
+        ):
+            return True
+        return (
+            summary.available is False
+            and any(name in STABLE_SMART_DETAIL_FIELDS and getattr(summary, name) is None
+                    for name in summary.unread_fields)
+            and self._smart_disk_is_current(cache_key)
+            and self._smart_cache_generation_token(cache_key) == expected_generation
+        )
+
     def _store_negative_smart_summary(
         self,
         cache_key: SmartCacheKey,
@@ -6963,7 +6990,7 @@ class InventoryService(InventorySourceCollectionMixin):
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
-            if self._store_smart_summary_cache(
+            if self._admit_smart_summary_to_saved_row(
                 slot_view,
                 summary,
                 expected_generation=generation_token,
@@ -6991,7 +7018,7 @@ class InventoryService(InventorySourceCollectionMixin):
                         summary,
                         self._merge_smart_summary(slot_view, ssh_summary),
                     )
-            if self._store_smart_summary_cache(
+            if self._admit_smart_summary_to_saved_row(
                 slot_view,
                 summary,
                 expected_generation=generation_token,
@@ -7012,7 +7039,9 @@ class InventoryService(InventorySourceCollectionMixin):
             return cached_fallback or fallback
 
         persisted = await persisted_summary()
-        if persisted is not None and allow_stale_cache:
+        # A saved unread-only row is not a reading to answer with: it would
+        # never enter the reading cache, so no refresh would replace it. Read live.
+        if persisted is not None and allow_stale_cache and persisted.available is not False:
             add_perf_metadata(smart_cache="persistent-hit")
             # Mark before scheduling: the refresh must not take this answer.
             loader = asyncio.current_task()
@@ -7039,7 +7068,7 @@ class InventoryService(InventorySourceCollectionMixin):
             )
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
-                if self._store_smart_summary_cache(
+                if self._admit_smart_summary_to_saved_row(
                     slot_view,
                     summary,
                     expected_generation=generation_token,
@@ -7119,7 +7148,7 @@ class InventoryService(InventorySourceCollectionMixin):
             if api_summary.transport_protocol is None and transport != "unknown":
                 api_summary.transport_protocol = transport
 
-            if self._store_smart_summary_cache(
+            if self._admit_smart_summary_to_saved_row(
                 slot_view,
                 api_summary,
                 expected_generation=generation_token,
@@ -7138,7 +7167,7 @@ class InventoryService(InventorySourceCollectionMixin):
             )
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
-                if self._store_smart_summary_cache(
+                if self._admit_smart_summary_to_saved_row(
                     slot_view,
                     ssh_summary,
                     expected_generation=generation_token,

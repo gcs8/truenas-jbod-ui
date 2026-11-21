@@ -17,9 +17,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from app.config import Settings, SystemConfig, TrueNASConfig
-from app.models.domain import SlotView, SmartSummaryView
+from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.inventory import (
     STABLE_SMART_DETAIL_FIELDS,
     InventoryService,
@@ -27,6 +28,8 @@ from app.services.inventory import (
     slot_detail_collection_binding,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.truenas_ws import TrueNASAPIError
+from tests.inventory_fixtures import build_inventory_service
 
 SERIAL = "SER-SYNTHETIC-1294"
 
@@ -226,6 +229,186 @@ class QuantaStorPersistedUnreadMarkerTests(PersistedUnreadMarkerTests):
         entry = self._save(live)
         self.assertEqual(entry.smart_fields.get("unread_fields"), ["rotation_rate_rpm"])
         self._assert_unread_after_restart("rotation_rate_rpm")
+
+
+class LoaderPersistedUnreadMarkerTests(unittest.TestCase):
+    """The same contract through the real SMART loader, CORE middleware path.
+
+    A reply whose only stable field could not be read has nothing readable, so
+    it is not a successful reading and never enters the reading cache. It is
+    still an observation: the saved row must name the field as not read, or a
+    restart serves the older measurement as if nothing had happened.
+    """
+
+    PLATFORM = "core"
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.directory = temp_dir.name
+
+    def _service(self) -> InventoryService:
+        # A new service and store on the same files: a restarted process.
+        return build_inventory_service(
+            Settings(), SystemConfig(id="synthetic", truenas=TrueNASConfig(platform=self.PLATFORM)),
+            AsyncMock(), AsyncMock(), self.directory,
+        )
+
+    def _payload(self, rotation: object, temperature: int | None = None) -> dict:
+        payload: dict[str, object] = {"rotation_rate": rotation}
+        if temperature is not None:
+            payload["temperature"] = {"current": temperature}
+        return payload
+
+    def _read(
+        self, payload: dict, *, failure: Exception | None = None, allow_stale_cache: bool = False,
+    ) -> tuple[InventoryService, SmartSummaryView]:
+        service = self._service()
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                        serial=SERIAL, enclosure_id="enc-1", device_name="da0", smart_device_names=["da0"],
+                        raw_status={"disk_raw": payload} if self.PLATFORM == "quantastor" else {})
+        if failure is not None:
+            service.truenas_client.fetch_disk_smartctl.side_effect = failure
+        else:
+            service.truenas_client.fetch_disk_smartctl.return_value = json.dumps(payload)
+        service.get_snapshot = AsyncMock(return_value=InventorySnapshot(
+            slots=[slot], refresh_interval_seconds=30, selected_enclosure_id="enc-1"))
+        summary = asyncio.run(service.get_slot_smart_summary(0, "enc-1", allow_stale_cache=allow_stale_cache))
+        return service, summary
+
+    def _restarted(self) -> SmartSummaryView | None:
+        return self._service().get_cached_slot_smart_summary_without_layout(0, "enc-1")
+
+    def _seed(self) -> None:
+        _service, seed = self._read(self._payload(7200))
+        self.assertEqual(seed.rotation_rate_rpm, 7200)
+        restarted = self._restarted()
+        self.assertIsNotNone(restarted)
+        self.assertEqual(restarted.rotation_rate_rpm, 7200)
+
+    def _unread(self, temperature: int | None = None) -> tuple[InventoryService, SmartSummaryView]:
+        rotation = -1 if self.PLATFORM == "quantastor" else True
+        service, live = self._read(self._payload(rotation, temperature))
+        self.assertIsNone(live.rotation_rate_rpm)
+        self.assertIn("rotation_rate_rpm", live.unread_fields)
+        return service, live
+
+    def _assert_restart_reads_unread(self) -> None:
+        restarted = self._restarted()
+        self.assertIsNotNone(restarted)
+        self.assertIsNone(restarted.rotation_rate_rpm,
+                          "an explicit not-read observation must supersede the older reading")
+        self.assertIn("rotation_rate_rpm", restarted.unread_fields)
+
+    def test_an_unread_only_reply_is_saved_and_survives_a_restart(self) -> None:
+        self._seed()
+        service, live = self._unread()
+        self.assertIs(live.available, False)
+        # Nothing readable: no successful-reading cache entry, the reply stays a negative one.
+        self.assertEqual(service._smart_cache, {})
+        self.assertEqual(len(service._smart_negative_cache), 1)
+        self._assert_restart_reads_unread()
+
+    def test_a_readable_sibling_control_survives_a_restart(self) -> None:
+        self._seed()
+        service, live = self._unread(temperature=30)
+        self.assertIsNot(live.available, False)
+        self.assertEqual(len(service._smart_cache), 1)
+        self._assert_restart_reads_unread()
+
+    def test_a_failed_read_with_nothing_unread_keeps_the_older_row(self) -> None:
+        # Not an observation of the disk: the saved reading is not replaced.
+        self._seed()
+        _service, live = self._read({}, failure=TrueNASAPIError("synthetic failure"))
+        self.assertEqual(live.unread_fields, [])
+        restarted = self._restarted()
+        self.assertIsNotNone(restarted)
+        self.assertEqual(restarted.rotation_rate_rpm, 7200)
+
+    def test_an_unread_only_reply_for_a_replaced_generation_is_not_saved(self) -> None:
+        self._seed()
+        original = InventoryService._smart_cache_generation_token
+        calls = {"n": 0}
+
+        def moving_generation(service: InventoryService, cache_key: Any) -> Any:
+            # The first read of the token is the loader's own; every later one
+            # sees a newer generation, as if the disk changed mid-read.
+            calls["n"] += 1
+            token = original(service, cache_key)
+            return token if calls["n"] == 1 else (token, "newer")
+
+        with patch.object(InventoryService, "_smart_cache_generation_token", moving_generation):
+            self._read(self._payload(-1 if self.PLATFORM == "quantastor" else True))
+        restarted = self._restarted()
+        self.assertIsNotNone(restarted)
+        self.assertEqual(restarted.rotation_rate_rpm, 7200)
+
+    def test_a_later_readable_reply_replaces_the_saved_marker(self) -> None:
+        self._seed()
+        self._unread()
+        _service, live = self._read(self._payload(5400))
+        self.assertEqual(live.rotation_rate_rpm, 5400)
+        restarted = self._restarted()
+        self.assertEqual((restarted.rotation_rate_rpm, restarted.unread_fields), (5400, []))
+
+    def test_saved_row_admission_of_an_unread_only_reply_keeps_its_checks(self) -> None:
+        service = self._service()
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                        serial=SERIAL, enclosure_id="enc-1", device_name="da0", smart_device_names=["da0"])
+        cache_key = service._smart_cache_key(slot)
+        token = service._smart_cache_generation_token(cache_key)
+        unread = SmartSummaryView(available=False, unread_fields=["rotation_rate_rpm"])
+
+        def admit(summary: SmartSummaryView, generation: Any = token) -> bool:
+            return service._admit_smart_summary_to_saved_row(
+                slot, summary, expected_generation=generation, cache_key=cache_key,
+            )
+
+        self.assertTrue(admit(unread))
+        self.assertEqual(service._smart_cache, {}, "an unread-only reply is not a reading")
+        with self.subTest("a newer generation"):
+            self.assertFalse(admit(unread, (token, "newer")))
+        with self.subTest("nothing unread"):
+            self.assertFalse(admit(SmartSummaryView(available=False)))
+        with self.subTest("only a non-stable name unread"):
+            self.assertFalse(admit(SmartSummaryView(available=False, unread_fields=["temperature_c"])))
+        with self.subTest("a disk that is no longer current"), patch.object(
+            InventoryService, "_smart_disk_is_current", return_value=False,
+        ):
+            self.assertFalse(admit(unread))
+
+    def test_a_saved_unread_only_row_does_not_stop_a_stale_allowed_live_read(self) -> None:
+        # The saved row is not a reading: it never enters the reading cache, so
+        # answering with it would leave nothing to schedule a refresh. After a
+        # restart a stale-allowed request reads live and saves the new reading.
+        self._seed()
+        self._unread()
+        _service, live = self._read(self._payload(5400), allow_stale_cache=True)
+        self.assertEqual((live.rotation_rate_rpm, live.unread_fields), (5400, []))
+        restarted = self._restarted()
+        self.assertEqual((restarted.rotation_rate_rpm, restarted.unread_fields), (5400, []))
+
+
+class QuantaStorLoaderPersistedUnreadMarkerTests(LoaderPersistedUnreadMarkerTests):
+    """The same through the QuantaStor loader; its saved-path rules are unchanged."""
+
+    PLATFORM = "quantastor"
+
+    def _payload(self, rotation: object, temperature: int | None = None) -> dict:
+        payload: dict[str, object] = {"rotationRate": rotation}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        return payload
+
+    def test_a_failed_read_with_nothing_unread_keeps_the_older_row(self) -> None:
+        # QuantaStor reads from the inventory row, not from a middleware call.
+        self._seed()
+        _service, live = self._read({})
+        self.assertIs(live.available, False)
+        self.assertEqual(live.unread_fields, [])
+        restarted = self._restarted()
+        self.assertIsNotNone(restarted)
+        self.assertEqual(restarted.rotation_rate_rpm, 7200)
 
 
 if __name__ == "__main__":
