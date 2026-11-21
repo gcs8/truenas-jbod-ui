@@ -300,6 +300,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_atomic_write",
             "tests.test_backup_archive_lifecycle",
             "tests.test_backup_archive_transport",
+            "tests.test_benchmark_report_address_space",
             "tests.test_benchmark_worker_address_space",
             "tests.test_changelog_gate_output",
             "tests.test_ci_contract",
