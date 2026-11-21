@@ -3627,7 +3627,8 @@ Additional element status diagnostic page:
             "sg_ses aes /dev/sg8",
         )
 
-        self.assertIsNone(parsed)
+        self.assertIsInstance(parsed, parsers.SESPageRefusal)
+        self.assertEqual((parsed.reason, parsed.count, parsed.limit), ("elements", descriptor_cap + 1, descriptor_cap))
 
     def test_aes_output_cap_accepts_the_exact_boundary(self) -> None:
         output_cap = 4 * 1024 * 1024
@@ -3645,7 +3646,9 @@ Additional element status diagnostic page:
         output = self._build_bounded_aes_output(1)
         output = output.ljust(output_cap + 1)
 
-        self.assertIsNone(parse_sg_ses_aes(output, "sg_ses aes /dev/sg8"))
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg8")
+        self.assertIsInstance(parsed, parsers.SESPageRefusal)
+        self.assertEqual((parsed.reason, parsed.count, parsed.limit), ("characters", output_cap + 1, output_cap))
 
     def test_aes_invalid_descriptor_translation_has_linear_membership_work(self) -> None:
         class ComparisonCountingInt(int):

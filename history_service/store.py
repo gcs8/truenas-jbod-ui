@@ -44,7 +44,8 @@ from history_service.segment_reader import (
     metric_sample_identity,
 )
 from history_service.sqlite_temp import effective_sqlite_temporary_directory
-from history_service import store_retention
+from history_service import store_retention, store_retention_pass
+from history_service.restore_timestamps import require_orderable_restored_timestamps
 from history_service import store_schema
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
@@ -256,7 +257,8 @@ def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
 
     Nothing is truncated or dropped: one oversized field refuses the whole
     database with a reason the operator can act on. A table or column an
-    older supported schema lacks is skipped.
+    older supported schema lacks is skipped. Retained timestamps must also
+    be ones retention can order (#1268).
     """
     for table_name, column_name in RESTORED_TIMESTAMP_COLUMNS:
         present = connection.execute(
@@ -276,6 +278,7 @@ def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
                 f"timestamp longer than {MAX_RESTORED_TIMESTAMP_BYTES} bytes. Nothing was "
                 "restored and the current history was not changed."
             )
+    require_orderable_restored_timestamps(connection, _history_utc_instant)
 
 
 def count_oversized_restored_timestamps(
@@ -745,6 +748,10 @@ class HistoryBackupSourceReplacedError(RuntimeError):
 # column; retention deletes such a row like any other old text but does not
 # read its text back, so a batch holds at most this much for each row.
 _RETENTION_FLOOR_TEXT_MAX_BYTES = 256
+# A retention batch reads at most this many candidate rows per table for
+# each row it may remove: room for a full batch of removals and as many rows
+# the exact-time test keeps, however many of those the table holds (#1268).
+_RETENTION_PAGE_FACTOR = 2
 
 
 def _history_utc_instant(value: object) -> str | None:
@@ -799,6 +806,8 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must not be world-writable.")
         self._ensure_database_parent()
         self._lock = threading.Lock()
+        # Scan floors a retention pass hands to the next (maintain_retention).
+        self._retention_carry: dict[str, tuple[bytes | str, int]] = {}
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
         self._segment_reader_lock = threading.Lock()
@@ -1793,29 +1802,7 @@ class HistoryStore:
         backup_at: datetime | str,
         operation: Callable[[], dict[str, Any]],
     ) -> dict[str, Any] | None:
-        with self.segmented_retention_write_lock():
-            if not self.claim_segmented_retention_backup(
-                backup_at,
-                migration_lock_held=True,
-            ):
-                return None
-            retention_completed = False
-            try:
-                result = operation()
-                retention_completed = True
-                self.finish_segmented_retention_backup(
-                    backup_at,
-                    has_more=bool(result.get("has_more")),
-                    migration_lock_held=True,
-                )
-                return result
-            except BaseException:
-                if not retention_completed:
-                    self.release_segmented_retention_backup(
-                        backup_at,
-                        migration_lock_held=True,
-                    )
-                raise
+        return store_retention_pass.run_segmented_retention(_STORE_MODULE, self, backup_at, operation)
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
         lock_context = (
@@ -3354,80 +3341,15 @@ class HistoryStore:
         should_continue: Callable[[], bool] | None = None,
         migration_lock_held: bool = False,
     ) -> dict[str, Any]:
-        retention_values = (
-            raw_metric_retention_days,
-            event_retention_days,
-            hourly_rollup_retention_days,
-            daily_rollup_retention_days,
+        return store_retention_pass.maintain_retention(
+            _STORE_MODULE, self, now=now,
+            raw_metric_retention_days=raw_metric_retention_days,
+            event_retention_days=event_retention_days,
+            hourly_rollup_retention_days=hourly_rollup_retention_days,
+            daily_rollup_retention_days=daily_rollup_retention_days,
+            batch_size=batch_size, max_batches=max_batches,
+            should_continue=should_continue, migration_lock_held=migration_lock_held,
         )
-        if any(value < 0 for value in retention_values):
-            raise ValueError("History retention days cannot be negative.")
-        if batch_size < 1:
-            raise ValueError("History retention batch size must be at least 1.")
-        if max_batches < 1:
-            raise ValueError("History retention max batches must be at least 1.")
-
-        normalized_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-        normalized_now = normalized_now.astimezone(timezone.utc)
-        cutoffs = {
-            "metric": self._retention_cutoff(normalized_now, raw_metric_retention_days),
-            "event": self._retention_cutoff(normalized_now, event_retention_days),
-            "hourly": self._retention_cutoff(normalized_now, hourly_rollup_retention_days),
-            "daily": self._retention_cutoff(normalized_now, daily_rollup_retention_days),
-        }
-        summary: dict[str, Any] = {
-            "metric_samples_removed": 0,
-            "events_removed": 0,
-            "hourly_rollups_removed": 0,
-            "daily_rollups_removed": 0,
-            "total_rows_removed": 0,
-            "batches_completed": 0,
-            "has_more": False,
-            "interrupted": False,
-        }
-
-        # In-memory scan state for this pass only (see _maintain_retention_batch).
-        scan_floors: dict[str, tuple[bytes | str, int]] = {}
-        finished_tables: set[str] = set()
-        for _ in range(max_batches):
-            if should_continue is not None and not should_continue():
-                summary["interrupted"] = True
-                break
-            try:
-                batch = self._execute_write(
-                    lambda connection: self._maintain_retention_batch(
-                        connection,
-                        cutoffs=cutoffs,
-                        batch_size=batch_size,
-                        scan_floors=scan_floors,
-                        finished_tables=frozenset(finished_tables),
-                    ),
-                    migration_lock_held=migration_lock_held,
-                )
-            except Exception as exc:
-                summary["has_more"] = True
-                summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
-                setattr(exc, "retention_summary", dict(summary))
-                raise
-            summary["batches_completed"] += 1
-            scan_floors.update(batch["scan_floors"])
-            finished_tables.update(batch["finished_tables"])
-            for key in (
-                "metric_samples_removed",
-                "events_removed",
-                "hourly_rollups_removed",
-                "daily_rollups_removed",
-            ):
-                summary[key] += int(batch[key])
-            summary["has_more"] = bool(batch["has_more"])
-            if not summary["has_more"]:
-                break
-
-        summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
-        summary["pages_reclaimed"] = 0
-        if summary["total_rows_removed"] and not summary["interrupted"]:
-            summary["pages_reclaimed"] = self._reclaim_free_pages(migration_lock_held=migration_lock_held)
-        return summary
 
     def _reclaim_free_pages(self, *, migration_lock_held: bool) -> int:
         """Hand pages freed by retention back to the filesystem and shrink the WAL.
@@ -3435,44 +3357,15 @@ class HistoryStore:
         incremental_vacuum only does work on databases created in incremental mode;
         older databases keep reusing freed pages in place, exactly as before.
         """
-
-        def operation(connection: sqlite3.Connection) -> int:
-            before = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
-            if before:
-                # Each sqlite3_step of incremental_vacuum frees one page, and
-                # Connection.execute() steps only once; executescript() runs the
-                # statement to completion, so every free page is returned.
-                connection.executescript("PRAGMA incremental_vacuum;")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-            after = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
-            return max(0, before - after)
-
-        try:
-            return int(self._execute_write(operation, migration_lock_held=migration_lock_held))
-        except sqlite3.Error as exc:
-            logger.warning(
-                "History retention could not return free pages to the filesystem this pass: %s",
-                exc,
-            )
-            return 0
+        return store_retention_pass._reclaim_free_pages(_STORE_MODULE, self, migration_lock_held=migration_lock_held)
 
     @staticmethod
     def _retention_total_rows_removed(summary: dict[str, Any]) -> int:
-        return sum(
-            int(summary[key])
-            for key in (
-                "metric_samples_removed",
-                "events_removed",
-                "hourly_rollups_removed",
-                "daily_rollups_removed",
-            )
-        )
+        return store_retention_pass._retention_total_rows_removed(_STORE_MODULE, summary)
 
     @staticmethod
     def _retention_cutoff(now: datetime, days: int) -> str | None:
-        if days <= 0:
-            return None
-        return (now - timedelta(days=days)).isoformat()
+        return store_retention_pass._retention_cutoff(_STORE_MODULE, now, days)
 
     @classmethod
     def _maintain_retention_batch(
@@ -3484,124 +3377,31 @@ class HistoryStore:
         scan_floors: dict[str, tuple[bytes | str, int]] | None = None,
         finished_tables: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
-        # The same ordered, bounded subquery selects the batch for both rollups and
-        # the delete, so the rows aggregated are exactly the rows removed and the
-        # batch size never turns into one SQL variable per row.
+        # One bounded page per table selects the batch for both rollups and
+        # the delete, so the rows aggregated are exactly the rows removed.
         #
-        # Work: rows whose text sorts at or after the cutoff are never visited,
-        # and rows before the settled bound are taken in index order, so one
-        # batch visits at most batch_size rows plus the rows whose text lies in
-        # the day before the cutoff that the exact-time test rejects. Two pieces
-        # of in-memory state, kept for one pass only, stop later batches of the
-        # same pass reading those rejected rows again (#1204):
-        # - a scan floor per table (the last row a batch deleted, by text and
-        #   key): the next batch starts after it;
-        # - a finished set: a table whose batch deleted nothing has nothing
-        #   eligible from its floor, so it is not read again in this pass while
-        #   other tables keep the pass running.
+        # Work: rows whose text sorts at or after the cutoff are never visited.
+        # Each table's page is the next candidates after its scan floor, in
+        # index order, at most _RETENTION_PAGE_FACTOR times the batch size,
+        # however many rows in the day before the cutoff the exact-time test
+        # keeps (#1268). Two pieces of in-memory state, kept for one pass (and
+        # carried to the next while work remains, see maintain_retention):
+        # - a scan floor per table (the last row a batch read and did not
+        #   leave for the next batch, kept rows included): the next batch
+        #   starts after it;
+        # - a finished set: a table whose candidates after its floor were all
+        #   read with this cutoff has nothing eligible left, so it is not read
+        #   again in this pass while other tables keep the pass running.
         # Both only narrow the scan. A row another writer adds behind the
-        # floor, or in a finished table, waits for the next pass: a deletion
+        # floor, or in a finished table, waits for a later pass: a deletion
         # can be delayed, never advanced. A rollup this batch writes is known
         # to the pass, so when its bucket is already past that table's cutoff
         # the same batch deletes it by key, wherever it lies; has_more=false
-        # therefore never leaves a row the pass wrote and could delete. Rollups
-        # still cover exactly the raw rows deleted, because one subquery
-        # selects both. Each table's rejected window rows are therefore read a
-        # bounded number of times per pass, whatever the other tables hold.
-        cls._register_retention_functions(connection)
-        floors = dict(scan_floors or {})
-        finished = set(finished_tables)
-
-        def active(name: str, cutoff: str | None) -> bool:
-            return cutoff is not None and name not in finished
-
-        def record(name: str, removed: int) -> int:
-            if not removed:
-                finished.add(name)
-            return removed
-
-        metric_samples_removed = 0
-        written_expired: dict[int, list[int]] = {3600: [], 86400: []}
-        if active("metric_samples", cutoffs["metric"]):
-            for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
-                written_expired[bucket_seconds] = cls._roll_up_metric_rows(
-                    connection,
-                    cutoff=cutoffs["metric"],
-                    batch_size=batch_size,
-                    bucket_seconds=bucket_seconds,
-                    floor=floors.get("metric_samples"),
-                    rollup_cutoff=cutoffs[kind],
-                )
-            metric_samples_removed = record("metric_samples", cls._delete_expired_rows(
-                connection,
-                table_name="metric_samples",
-                timestamp_column="observed_at",
-                cutoff=cutoffs["metric"],
-                batch_size=batch_size,
-                floors=floors,
-            ))
-
-        events_removed = 0
-        if active("slot_events", cutoffs["event"]):
-            events_removed = record("slot_events", cls._delete_expired_rows(
-                connection,
-                table_name="slot_events",
-                timestamp_column="observed_at",
-                cutoff=cutoffs["event"],
-                batch_size=batch_size,
-                floors=floors,
-            ))
-        rollups_removed = {}
-        for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
-            name = f"rollups_{bucket_seconds}"
-            # At most one written rollup per raw row this batch selected, so
-            # these never exceed the batch size; they count against it.
-            removed = connection.executemany(
-                "DELETE FROM metric_rollups WHERE rowid = ? AND bucket_seconds = ?",
-                [(rowid, bucket_seconds) for rowid in written_expired[bucket_seconds]],
-            ).rowcount if written_expired[bucket_seconds] else 0
-            if active(name, cutoffs[kind]) and removed < batch_size:
-                removed += record(name, cls._delete_rollup_batch(
-                    connection,
-                    bucket_seconds=bucket_seconds,
-                    cutoff=cutoffs[kind],
-                    batch_size=batch_size - removed,
-                    floors=floors,
-                ))
-            rollups_removed[bucket_seconds] = removed
-        # A table that just deleted nothing has nothing eligible left in this
-        # transaction, so it is skipped here too; a table whose check finds
-        # nothing is finished as well.
-        remaining_checks = (
-            ("metric_samples", cutoffs["metric"], lambda floor: cls._retention_rows_exist(
-                connection, "metric_samples", "observed_at", cutoffs["metric"], floor=floor,
-            )),
-            ("slot_events", cutoffs["event"], lambda floor: cls._retention_rows_exist(
-                connection, "slot_events", "observed_at", cutoffs["event"], floor=floor,
-            )),
-            ("rollups_3600", cutoffs["hourly"], lambda floor: cls._rollups_exist(
-                connection, 3600, cutoffs["hourly"], floor=floor,
-            )),
-            ("rollups_86400", cutoffs["daily"], lambda floor: cls._rollups_exist(
-                connection, 86400, cutoffs["daily"], floor=floor,
-            )),
+        # therefore never leaves a row the pass wrote and could delete.
+        return store_retention_pass._maintain_retention_batch(
+            _STORE_MODULE, cls, connection, cutoffs=cutoffs, batch_size=batch_size,
+            scan_floors=scan_floors, finished_tables=finished_tables,
         )
-        has_more = False
-        for name, cutoff, exists in remaining_checks:
-            if active(name, cutoff):
-                if exists(floors.get(name)):
-                    has_more = True
-                else:
-                    finished.add(name)
-        return {
-            "metric_samples_removed": metric_samples_removed,
-            "events_removed": events_removed,
-            "hourly_rollups_removed": rollups_removed[3600],
-            "daily_rollups_removed": rollups_removed[86400],
-            "has_more": has_more,
-            "scan_floors": floors,
-            "finished_tables": frozenset(finished),
-        }
 
     @staticmethod
     def _register_retention_functions(connection: sqlite3.Connection) -> None:
@@ -3797,6 +3597,56 @@ class HistoryStore:
         floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         return store_retention._rollups_exist(_STORE_MODULE, cls, connection, bucket_seconds, cutoff, floor=floor)
+
+    @classmethod
+    def _roll_up_selected_rows(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        selected_rows: str,
+        selected_parameters: tuple[Any, ...],
+        bucket_seconds: int,
+        rollup_cutoff: str | None = None,
+    ) -> list[int]:
+        return store_retention._roll_up_selected_rows(
+            _STORE_MODULE,
+            cls,
+            connection,
+            selected_rows=selected_rows,
+            selected_parameters=selected_parameters,
+            bucket_seconds=bucket_seconds,
+            rollup_cutoff=rollup_cutoff,
+        )
+
+    @classmethod
+    def _remove_retention_page(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        name: str,
+        table_name: str,
+        timestamp_column: str,
+        key_column: str,
+        cutoff: str,
+        batch_size: int,
+        floors: dict[str, tuple[bytes | str | None, int]],
+        scope: tuple[str, tuple[Any, ...]] = ("", ()),
+        roll_up: Callable[[str, tuple[Any, ...]], None] | None = None,
+    ) -> tuple[int, bool]:
+        return store_retention._remove_retention_page(
+            _STORE_MODULE,
+            cls,
+            connection,
+            name=name,
+            table_name=table_name,
+            timestamp_column=timestamp_column,
+            key_column=key_column,
+            cutoff=cutoff,
+            batch_size=batch_size,
+            floors=floors,
+            scope=scope,
+            roll_up=roll_up,
+        )
 
     def list_slot_events(
         self,

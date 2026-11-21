@@ -620,7 +620,7 @@ class SesPreCountWorkTests(BoundedWorkAssertions):
 
         with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
             self.assertIsNotNone(parse_sg_ses_join_filter(page(4), "sg_ses join /dev/sg7"))
-            self.assertIsNone(parse_sg_ses_join_filter(page(5), "sg_ses join /dev/sg7"))
+            self.assertIsInstance(parse_sg_ses_join_filter(page(5), "sg_ses join /dev/sg7"), parsers.SESPageRefusal)
 
     def test_join_header_recognition_keeps_descriptor_and_bracket_rules(self) -> None:
         def only_slot(output: str):  # noqa: ANN202
