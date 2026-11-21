@@ -12442,6 +12442,7 @@ class InventoryService(InventorySourceCollectionMixin):
             host_failures.extend(
                 f"{failure_prefix} {refusal.describe(host)}" for refusal in parsed.ses_page_refusals
             )
+            host_overlay.ses_page_refusals.extend(parsed.ses_page_refusals)
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)
@@ -12485,6 +12486,8 @@ class InventoryService(InventorySourceCollectionMixin):
         best_failures: list[str] = []
         failures: list[str] = []
         incomplete_reads: list[str] = []
+        # Like incomplete reads, a refused page on any host is reported whichever host is selected (#1308).
+        page_refusals: list[str] = []
         successful_overlays: list[ParsedSSHData] = []
 
         for host in hosts:
@@ -12519,7 +12522,11 @@ class InventoryService(InventorySourceCollectionMixin):
                 failures.extend(host_failures)
                 if cached_failures:
                     failures.extend(cached_failures)
+                    page_refusals.extend(
+                        f"{failure_prefix} {refusal.describe(host)}" for refusal in cached_overlay.ses_page_refusals
+                    )
                 continue
+            page_refusals.extend(f"{failure_prefix} {refusal.describe(host)}" for refusal in host_overlay.ses_page_refusals)
 
             if host_failures:
                 failures.extend(host_failures)
@@ -12539,7 +12546,9 @@ class InventoryService(InventorySourceCollectionMixin):
             return ParsedSSHData(), failures, None
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
-        best_failures.extend(warning for warning in incomplete_reads if warning not in best_failures)
+        for warning in (*page_refusals, *incomplete_reads):
+            if warning not in best_failures:
+                best_failures.append(warning)
         return best_overlay, best_failures, best_host
 
     def _scale_expected_ses_missing_failure(self) -> str:

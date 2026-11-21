@@ -288,6 +288,203 @@ class ScaleOverlayRefusalReachesWarningsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("5 elements" in failure for failure in failures), failures)
 
 
+REFUSED_HOST = "refused.example.test"
+ACCEPTED_HOST = "accepted.example.test"
+
+
+class OtherHostRefusalSurvivesSelectionTests(unittest.IsolatedAsyncioTestCase):
+    """A refused page on one host is still reported when another host is selected."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def service(self, hosts: list[str], pages_by_host: dict[str, dict[str, dict[str, str]]]) -> InventoryService:
+        service = _service(self._temp.name)
+        service._build_scale_ssh_hosts = lambda: list(hosts)
+        service._build_configured_quantastor_hosts = lambda **_kwargs: list(hosts)
+
+        async def run_planned(planner, *, initial_commands, host):  # noqa: ANN001, ANN202
+            pages_by_device = pages_by_host[host]
+            discovery = SSHCommandResult(
+                command=initial_commands[0], ok=True, stdout="".join(f"{device}\n" for device in pages_by_device),
+                exit_code=0,
+            )
+            planned = planner([discovery])
+            answers = {
+                result.command: result
+                for device, pages in pages_by_device.items()
+                for result in _page_results(device, pages)
+            }
+            return [
+                discovery,
+                *(
+                    answers.get(command)
+                    or SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                    for command in planned
+                ),
+            ]
+
+        service._run_ssh_planned_commands = run_planned
+        return service
+
+    @staticmethod
+    def pages(count: int, shelf: str) -> dict[str, str]:
+        return {
+            name: build(count).replace("BIGSHELF", shelf, 1)
+            for name, build in (("aes", aes_page), ("ec", ec_page), ("join", join_page))
+        }
+
+    async def fetch(self, wrapper: str, hosts: list[str], pages_by_host):  # noqa: ANN001, ANN201
+        service = self.service(hosts, pages_by_host)
+        if wrapper == "scale":
+            overlay, failures = await service._fetch_scale_ses_overlay()
+            return overlay, failures, service._scale_preferred_ses_host
+        overlay, failures = await service._fetch_quantastor_ses_overlay()
+        return overlay, failures, service._quantastor_preferred_ses_host
+
+    def assert_refusals(self, failures: list[str], host: str, count: int, limit: int) -> None:
+        refused = [failure for failure in failures if f"on {host} was refused" in failure]
+        self.assertEqual(
+            sorted(failure.split(" from ")[0].split(" SES ", 1)[1] for failure in refused),
+            ["AES page", "enclosure status page", "joined page"],
+            failures,
+        )
+        for failure in refused:
+            self.assertIn(f"has {count} elements, over the limit of {limit}", failure)
+
+    async def test_refusal_on_another_host_survives_best_host_selection_in_both_orders(self) -> None:
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(5, "REFUSEDSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            for hosts in ([REFUSED_HOST, ACCEPTED_HOST], [ACCEPTED_HOST, REFUSED_HOST]):
+                with self.subTest(wrapper=wrapper, hosts=hosts), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                    overlay, failures, best_host = await self.fetch(wrapper, hosts, pages_by_host)
+                    self.assertEqual(best_host, ACCEPTED_HOST)
+                    self.assertEqual(len(overlay.ses_enclosures), 1)
+                    self.assertEqual(len(failures), 3, failures)
+                    self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+
+    async def test_refusal_on_another_host_survives_at_the_real_element_limit(self) -> None:
+        limit = parsers.MAX_SES_ELEMENTS
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(limit + 1, "REFUSEDSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper):
+                overlay, failures, best_host = await self.fetch(wrapper, [REFUSED_HOST, ACCEPTED_HOST], pages_by_host)
+                self.assertEqual(best_host, ACCEPTED_HOST)
+                self.assertEqual(len(overlay.ses_enclosures), 1)
+                self.assert_refusals(failures, REFUSED_HOST, limit + 1, limit)
+
+    async def test_refusal_survives_when_the_selected_host_is_read_from_the_device_cache(self) -> None:
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(5, "REFUSEDSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                service = self.service([ACCEPTED_HOST, REFUSED_HOST], pages_by_host)
+                cached_pages = {
+                    result.command: result for result in _page_results("/dev/sg8", pages_by_host[ACCEPTED_HOST]["/dev/sg8"])
+                }
+
+                async def run_commands(commands, host, **_kwargs):  # noqa: ANN001, ANN202
+                    self.assertEqual(host, ACCEPTED_HOST)
+                    return [
+                        cached_pages.get(command)
+                        or SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                        for command in commands
+                    ]
+
+                service._run_ssh_commands = run_commands
+                fetch = (
+                    service._fetch_scale_ses_overlay if wrapper == "scale" else service._fetch_quantastor_ses_overlay
+                )
+                await fetch()  # the first refresh discovers and caches the accepted host's device
+                self.assertEqual(service._get_cached_sg_ses_devices(ACCEPTED_HOST), ["/dev/sg8"])
+                overlay, failures = await fetch()
+                self.assertEqual(len(overlay.ses_enclosures), 1)
+                self.assertEqual(len(failures), 3, failures)
+                self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+
+    async def test_cached_read_refusal_survives_when_rediscovery_finds_no_device(self) -> None:
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(3, "REFUSEDSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            with self.subTest(wrapper=wrapper), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                pages_by_host[REFUSED_HOST] = {"/dev/sg7": self.pages(3, "REFUSEDSHELF")}
+                service = self.service([ACCEPTED_HOST, REFUSED_HOST], pages_by_host)
+                fetch = (
+                    service._fetch_scale_ses_overlay if wrapper == "scale" else service._fetch_quantastor_ses_overlay
+                )
+                await fetch()  # both hosts read within the bound: both device lists are cached
+                self.assertEqual(service._get_cached_sg_ses_devices(REFUSED_HOST), ["/dev/sg7"])
+
+                # The cached shelf now answers with a page over the bound, and rediscovery finds nothing.
+                pages_by_host[REFUSED_HOST] = {"/dev/sg7": self.pages(5, "REFUSEDSHELF")}
+
+                async def run_commands(commands, host, **_kwargs):  # noqa: ANN001, ANN202
+                    answers = {
+                        result.command: result
+                        for device, pages in pages_by_host[host].items()
+                        for result in _page_results(device, pages)
+                    }
+                    return [
+                        answers.get(command)
+                        or SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                        for command in commands
+                    ]
+
+                planned = service._run_ssh_planned_commands
+
+                async def run_planned(planner, *, initial_commands, host):  # noqa: ANN001, ANN202
+                    if host == REFUSED_HOST:
+                        return [SSHCommandResult(command=initial_commands[0], ok=True, stdout="", exit_code=0)]
+                    return await planned(planner, initial_commands=initial_commands, host=host)
+
+                service._run_ssh_commands = run_commands
+                service._run_ssh_planned_commands = run_planned
+                overlay, failures = await fetch()
+                self.assertEqual(len(overlay.ses_enclosures), 1)
+                self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+
+    async def test_selected_host_refusal_is_reported_once_beside_another_hosts(self) -> None:
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(5, "REFUSEDSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF"), "/dev/sg9": self.pages(6, "OTHERSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            for hosts in ([REFUSED_HOST, ACCEPTED_HOST], [ACCEPTED_HOST, REFUSED_HOST]):
+                with self.subTest(wrapper=wrapper, hosts=hosts), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                    _overlay, failures, best_host = await self.fetch(wrapper, hosts, pages_by_host)
+                    self.assertEqual(best_host, ACCEPTED_HOST)
+                    self.assertEqual(len(failures), 6, failures)
+                    self.assertEqual(len(set(failures)), 6, failures)
+                    self.assert_refusals(failures, REFUSED_HOST, 5, 4)
+                    self.assert_refusals(failures, ACCEPTED_HOST, 6, 4)
+
+    async def test_two_hosts_within_the_bound_report_no_failure(self) -> None:
+        pages_by_host = {
+            REFUSED_HOST: {"/dev/sg7": self.pages(3, "SMALLSHELF")},
+            ACCEPTED_HOST: {"/dev/sg8": self.pages(4, "GOODSHELF")},
+        }
+        for wrapper in ("scale", "quantastor"):
+            for hosts in ([REFUSED_HOST, ACCEPTED_HOST], [ACCEPTED_HOST, REFUSED_HOST]):
+                with self.subTest(wrapper=wrapper, hosts=hosts), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                    overlay, failures, best_host = await self.fetch(wrapper, hosts, pages_by_host)
+                    self.assertEqual(best_host, ACCEPTED_HOST)
+                    self.assertTrue(overlay.ses_enclosures)
+                    self.assertEqual(failures, [])
+
+
 class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
