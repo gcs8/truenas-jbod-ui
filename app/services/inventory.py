@@ -1500,6 +1500,8 @@ async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> Re
 
 MAPPING_READ_MAX_CONCURRENCY = 2
 MAPPING_READ_MAX_WAITERS = 8
+MAPPING_WRITE_MAX_CONCURRENCY = 2
+MAPPING_WRITE_MAX_WAITERS = 8
 
 
 @dataclass(slots=True)
@@ -1509,9 +1511,10 @@ class _MappingReadLoopAdmission:
 
 
 class MappingReadAdmission:
-    """Bound mapping-store reads before they reach the shared default executor.
+    """Bound mapping-store work before it reaches the shared default executor.
 
-    At most ``max_concurrency`` reads hold a worker thread, at most
+    Reused for writes with a separate gate and a post-cancellation commit hook.
+    At most ``max_concurrency`` calls hold a worker thread, at most
     ``max_waiters`` callers wait for a turn, and any further caller is refused
     with the existing busy error (503). A turn is released only when the worker
     finishes, never when its caller is cancelled, because the thread keeps
@@ -1519,14 +1522,20 @@ class MappingReadAdmission:
     the default executor it protects.
     """
 
-    def __init__(self, *, max_concurrency: int, max_waiters: int) -> None:
+    def __init__(
+        self, *, max_concurrency: int, max_waiters: int, reason: str = "mapping-read-admission",
+    ) -> None:
+        self.reason = reason
         self.max_concurrency = max(1, int(max_concurrency))
         self.max_waiters = max(0, int(max_waiters))
         self._loops: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _MappingReadLoopAdmission] = (
             weakref.WeakKeyDictionary()
         )
 
-    async def run(self, read: Callable[[], RetainedResultT]) -> RetainedResultT:
+    async def run(
+        self, read: Callable[[], RetainedResultT], *,
+        on_committed: Callable[[RetainedResultT], None] | None = None,
+    ) -> RetainedResultT:
         loop = asyncio.get_running_loop()
         state = self._loops.setdefault(loop, _MappingReadLoopAdmission())
         if state.running < self.max_concurrency:
@@ -1544,14 +1553,19 @@ class MappingReadAdmission:
                         state.waiters.remove(turn)
                 raise
         else:
-            raise SnapshotStateBusyError(reason="mapping-read-admission")
+            raise SnapshotStateBusyError(reason=self.reason)
         try:
             worker = loop.run_in_executor(None, copy_context().run, read)
         except BaseException:
             self._release(state)
             raise
         worker.add_done_callback(lambda _done: self._release(state))
-        return await _drain_inventory_worker(worker)
+        try:
+            return await _drain_inventory_worker(worker)
+        except asyncio.CancelledError:
+            if on_committed is not None and not worker.cancelled() and worker.exception() is None:
+                on_committed(worker.result())
+            raise
 
     @staticmethod
     def _release(state: _MappingReadLoopAdmission) -> None:
@@ -1566,6 +1580,11 @@ class MappingReadAdmission:
 MAPPING_READ_ADMISSION = MappingReadAdmission(
     max_concurrency=MAPPING_READ_MAX_CONCURRENCY,
     max_waiters=MAPPING_READ_MAX_WAITERS,
+)
+MAPPING_WRITE_ADMISSION = MappingReadAdmission(
+    max_concurrency=MAPPING_WRITE_MAX_CONCURRENCY,
+    max_waiters=MAPPING_WRITE_MAX_WAITERS,
+    reason="mapping-write-admission",
 )
 
 
@@ -1595,20 +1614,11 @@ async def _run_mapping_store_write(
     keeps ownership until the write finishes, even through cancellation, so a
     write is never left running unobserved. A write that commits after its
     caller was cancelled still runs ``on_committed`` (cache invalidation),
-    because that caller will not, and then reports the cancellation.
+    because that caller will not, and then reports the cancellation. Admission
+    is bounded before submission by ``MAPPING_WRITE_ADMISSION``; cancelled
+    waiters submit nothing, and overflow gets the existing busy response.
     """
-    worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, write)
-    cancelled = False
-    while not worker.done():
-        try:
-            await asyncio.wait({worker})
-        except asyncio.CancelledError:
-            cancelled = True
-    if not cancelled:
-        return worker.result()
-    if not worker.cancelled() and worker.exception() is None:
-        on_committed(worker.result())
-    raise asyncio.CancelledError
+    return await MAPPING_WRITE_ADMISSION.run(write, on_committed=on_committed)
 
 
 class SmartDetailBatch:
