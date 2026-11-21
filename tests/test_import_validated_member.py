@@ -1,24 +1,43 @@
 """An import installs exactly the history member it validated (#1422).
 
-Validation reads the member as one file, and activation installs that same
-file: SQLite side files next to the staged member refuse the import, and the
-member checks run again on the private copy that is published. Every fixture
-is synthetic and lives in a temporary directory.
+Validation reads the member as one file and records its size and SHA-256.
+Activation copies the staged member through one opened descriptor into a
+private file, refuses it unless that copy has the validated size and digest,
+checks the copy and publishes only that copy. A segmented import holds its
+staged hot database and segments to the validated digests the same way. SQLite
+side files next to the staged member still refuse the import. Every fixture is
+synthetic and lives in a temporary directory.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import sqlite3
+import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
-from history_service.store import SCHEMA
-from history_service.system_backup import SystemBackupService, _ImportActivationTransaction
-from tests.test_interrupted_restore_recovery import PASSPHRASE
+import history_service.store as store_module
+import history_service.system_backup as system_backup_module
+from history_service.store import SCHEMA, HistoryStore
+from history_service.system_backup import (
+    HISTORY_DB_KEY,
+    SEGMENTED_CATALOG_STAGING_KEY,
+    SystemBackupService,
+    _ImportActivationTransaction,
+)
+from tests.test_interrupted_restore_recovery import (
+    PASSPHRASE,
+    _create_history,
+    _deployment,
+    _hot_events,
+    _tree_snapshot,
+)
 # Module import, not class import: importing the test classes would run
 # them a second time under this module.
 from tests import test_restore_refusal_cleanup as refusal
@@ -31,6 +50,7 @@ from tests.test_restore_refusal_cleanup import (
 
 ORDINARY = refusal.RestoreTimestampSizeTests.ORDINARY
 SIDE_FILE_REASON = "next to the staged history member"
+CONTENT_REASON = "is not the member that was validated"
 
 
 def _rewrite_in_place(target: Path, change: Callable[[sqlite3.Connection], None]) -> None:
@@ -149,15 +169,23 @@ class ImportInstallsTheValidatedMemberTests(_ImportRootCleanup):
         # The log lands just before the restore opens the staged member, after
         # any check for side files: the validated rows are installed.
         real_connect = sqlite3.connect
+        real_open = os.open
         armed = [True]
 
-        def plant_on_open(target: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        def plant_once(target: Any) -> None:
             if armed and self.staged and str(self.staged[0]) in str(target):
                 armed.clear()
                 self._plant_write_ahead_log(self.staged[0])
+
+        def plant_on_connect(target: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+            plant_once(target)
             return real_connect(target, *args, **kwargs)
 
-        with patch("sqlite3.connect", plant_on_open):
+        def plant_on_open(target: Any, *args: Any, **kwargs: Any) -> int:
+            plant_once(target)
+            return real_open(target, *args, **kwargs)
+
+        with patch("sqlite3.connect", plant_on_connect), patch("os.open", plant_on_open):
             self._import(None)
         self.assertEqual(armed, [], "the staged member was never opened")
         self.assertEqual(_metric_rows(self.live), self.IMPORTED_ROWS)
@@ -174,13 +202,16 @@ class ImportInstallsTheValidatedMemberTests(_ImportRootCleanup):
                     self._import(plant)
                 self._assert_refused_unchanged(refused, SIDE_FILE_REASON)
 
+    # A staged member rewritten after validation differs from what was
+    # validated, so the content check refuses it before any SQLite check;
+    # MemberChecksOnThePrivateCopyTests shows those checks still run.
     def test_staged_member_missing_a_required_table_is_refused(self) -> None:
         def drop(staged: Path) -> None:
             _rewrite_in_place(staged, _drop_slot_events)
 
         with self.assertRaises(ValueError) as refused:
             self._import(drop)
-        self._assert_refused_unchanged(refused, "missing table slot_events")
+        self._assert_refused_unchanged(refused, CONTENT_REASON)
 
     def test_staged_member_failing_the_integrity_check_is_refused(self) -> None:
         def corrupt(staged: Path) -> None:
@@ -190,7 +221,287 @@ class ImportInstallsTheValidatedMemberTests(_ImportRootCleanup):
 
         with self.assertRaises(ValueError) as refused:
             self._import(corrupt)
-        self._assert_refused_unchanged(refused, "integrity check failed")
+        self._assert_refused_unchanged(refused, CONTENT_REASON)
+
+    def _valid_replacement(self, like: Path | None = None) -> Path:
+        """A well-formed history database whose rows differ from the import's.
+
+        With ``like``, it is a copy of that file with other values, so it has
+        the same size and only its digest tells it apart.
+        """
+        replacement = self.root / "replacement.sqlite3"
+        replacement.unlink(missing_ok=True)
+        if like is None:
+            _history_database(replacement, [ORDINARY, ORDINARY, ORDINARY])
+        else:
+            shutil.copyfile(like, replacement)
+        with closing(sqlite3.connect(replacement)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("UPDATE metric_samples SET value_integer = 777")
+            connection.commit()
+        if like is not None:
+            self.assertEqual(replacement.stat().st_size, like.stat().st_size)
+        SystemBackupService._validate_history_member(replacement)
+        return replacement
+
+    def _assert_replacement_not_installed(self, refused: Any) -> None:
+        self._assert_refused_unchanged(refused, CONTENT_REASON)
+        self.assertNotIn(777, [row[2] for row in _metric_rows(self.live)])
+
+    def test_valid_database_moved_onto_the_staged_path_is_refused(self) -> None:
+        def swap(staged: Path) -> None:
+            os.replace(self._valid_replacement(like=staged), staged)
+
+        with self.assertRaises(ValueError) as refused:
+            self._import(swap)
+        self._assert_replacement_not_installed(refused)
+
+    def test_valid_database_rewritten_into_the_staged_file_is_refused(self) -> None:
+        def rewrite(staged: Path) -> None:
+            inode = staged.stat().st_ino
+            content = self._valid_replacement(like=staged).read_bytes()
+            with open(staged, "r+b") as handle:
+                handle.write(content)
+                handle.truncate()
+            self.assertEqual(staged.stat().st_ino, inode)
+
+        with self.assertRaises(ValueError) as refused:
+            self._import(rewrite)
+        self._assert_replacement_not_installed(refused)
+
+    def test_member_changed_between_validation_and_staging_is_refused(self) -> None:
+        real_init = _ImportActivationTransaction.__init__
+        changed: list[Path] = []
+
+        def change_then_stage(transaction, extracted_members, **kwargs):
+            member = next(
+                content
+                for content in extracted_members.values()
+                if isinstance(content, Path) and content.read_bytes()[:16] == b"SQLite format 3\0"
+            )
+            os.replace(self._valid_replacement(like=member), member)
+            changed.append(member)
+            real_init(transaction, extracted_members, **kwargs)
+
+        with (
+            patch.object(_ImportActivationTransaction, "__init__", change_then_stage),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self.target.import_bundle_from_file(self.artifact.path, passphrase=PASSPHRASE)
+        self.assertEqual(len(changed), 1, "the extracted member was never changed")
+        self.assertIn(CONTENT_REASON, str(refused.exception))
+        self.assertEqual(_dump(self.live), self.original_dump)
+
+    def test_content_is_judged_through_the_descriptor_that_is_copied(self) -> None:
+        # The staged path names different files before and after the restore
+        # opens it; the refusal must follow the opened file, whichever the
+        # path names when the digest is taken.
+        real_open = os.open
+        for case in ("changed-just-before-open", "restored-just-after-open"):
+            with self.subTest(case=case):
+                self.staged.clear()
+                state: dict[str, Any] = {"armed": True}
+
+                def prepare(staged: Path) -> None:
+                    state["validated"] = staged.read_bytes()
+                    state["replacement"] = self._valid_replacement(like=staged).read_bytes()
+                    if case == "restored-just-after-open":
+                        staged.write_bytes(state["replacement"])
+
+                def swap_around_open(target: Any, *args: Any, **kwargs: Any) -> int:
+                    hit = state["armed"] and self.staged and str(target) == str(self.staged[0])
+                    if hit and case == "changed-just-before-open":
+                        state["armed"] = False
+                        replacement = self.root / "before-open.sqlite3"
+                        replacement.write_bytes(state["replacement"])
+                        os.replace(replacement, self.staged[0])
+                    descriptor = real_open(target, *args, **kwargs)
+                    if hit and case == "restored-just-after-open":
+                        state["armed"] = False
+                        validated = self.root / "after-open.sqlite3"
+                        validated.write_bytes(state["validated"])
+                        os.replace(validated, self.staged[0])
+                    return descriptor
+
+                with patch("os.open", swap_around_open), self.assertRaises(ValueError) as refused:
+                    self._import(prepare)
+                self.assertFalse(state["armed"], "the staged member was never opened")
+                self._assert_replacement_not_installed(refused)
+
+    def test_timestamp_admission_runs_once_on_the_installed_copy(self) -> None:
+        calls: list[str] = []
+        activating = [False]
+        real_bound = store_module.require_bounded_restored_timestamps
+        real_activate = _ImportActivationTransaction.activate_history
+
+        def count(where: str) -> Callable[[sqlite3.Connection], None]:
+            def bound(connection: sqlite3.Connection) -> None:
+                if activating[0]:
+                    calls.append(where)
+                real_bound(connection)
+
+            return bound
+
+        def activate(transaction, store, member_key):
+            activating[0] = True
+            try:
+                real_activate(transaction, store, member_key)
+            finally:
+                activating[0] = False
+
+        with (
+            patch.object(store_module, "require_bounded_restored_timestamps", count("store")),
+            patch.object(
+                system_backup_module, "require_bounded_restored_timestamps", count("member check")
+            ),
+            patch.object(_ImportActivationTransaction, "activate_history", activate),
+        ):
+            self.target.import_bundle_from_file(self.artifact.path, passphrase=PASSPHRASE)
+        self.assertEqual(calls, ["store"])
+        self.assertEqual(_metric_rows(self.live), self.IMPORTED_ROWS)
+
+
+class MemberChecksOnThePrivateCopyTests(_ImportRootCleanup):
+    """The member checks still run on the private copy that is published,
+    including for content that matches the recorded size and digest."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self._directory.name)
+        live_dir = self.root / "live-history"
+        live_dir.mkdir()
+        self.live = _history_database(live_dir / "history.sqlite3", [ORDINARY])
+        self.store = HistoryStore(str(self.live), recover_unreadable_database=False)
+        self.original_dump = _dump(self.live)
+
+    def _restore(self, member: Path) -> None:
+        content = member.read_bytes()
+        self.store.restore_validated_member(
+            member,
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            member_check=SystemBackupService._check_history_structure,
+        )
+
+    def test_member_missing_a_required_table_is_refused(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            _drop_slot_events(connection)
+            connection.commit()
+        with self.assertRaises(ValueError) as refused:
+            self._restore(member)
+        self.assertIn("missing table slot_events", str(refused.exception))
+        self.assertEqual(_dump(self.live), self.original_dump)
+
+    def test_member_failing_the_integrity_check_is_refused(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            _null_metric_name(connection)
+        with self.assertRaises(ValueError) as refused:
+            self._restore(member)
+        self.assertIn("integrity check failed", str(refused.exception))
+        self.assertEqual(_dump(self.live), self.original_dump)
+
+    def test_matching_member_is_installed(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        self._restore(member)
+        self.assertEqual(_metric_rows(self.live), [(ORDINARY, 0, 30), (ORDINARY, 1, 31)])
+
+
+class SegmentedImportInstallsTheValidatedMembersTests(_ImportRootCleanup):
+    """A segmented import installs the hot database and segments it validated."""
+
+    artifact: Any = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._class_directory = tempfile.TemporaryDirectory()
+        class_root = Path(cls._class_directory.name)
+        source = _deployment(class_root / "source", "candidate")
+        cls.artifact = source.service.export_bundle_to_file(
+            packaging="tar.zst",
+            encrypt=True,
+            passphrase=PASSPHRASE,
+            included_paths=[HISTORY_DB_KEY],
+        )
+        # Well-formed history files with other rows, for the replacements.
+        cls.other_hot, cls.other_segments = _create_history(class_root / "other", "other")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.artifact is not None:
+            cls.artifact.cleanup()
+        cls._class_directory.cleanup()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.target = _deployment(Path(self._directory.name) / "target", "prior")
+        self.prior_events = _hot_events(self.target.hot)
+        self.prior_hot = self.target.hot.read_bytes()
+        self.prior_segments = _tree_snapshot(self.target.segments)
+        self.tampered: list[str] = []
+
+    def _import(self, tamper: Callable[[_ImportActivationTransaction, str, list], None] | None):
+        real_prepare = _ImportActivationTransaction.prepare_segmented_history
+
+        def tamper_then_prepare(transaction, store, *, hot_member_key, segment_members, **kwargs):
+            if tamper is not None:
+                tamper(transaction, hot_member_key, segment_members)
+            return real_prepare(
+                transaction,
+                store,
+                hot_member_key=hot_member_key,
+                segment_members=segment_members,
+                **kwargs,
+            )
+
+        with patch.object(
+            _ImportActivationTransaction, "prepare_segmented_history", tamper_then_prepare
+        ):
+            self.target.service.import_bundle_from_file(self.artifact.path, passphrase=PASSPHRASE)
+
+    def _replace_hot(self, transaction, hot_member_key, _segment_members) -> None:
+        staged = transaction._staged_member(hot_member_key)
+        replacement = staged.with_name("replacement")
+        shutil.copyfile(self.other_hot, replacement)
+        os.replace(replacement, staged)
+        self.tampered.append("hot")
+
+    def _rewrite_segment(self, transaction, _hot_member_key, segment_members) -> None:
+        member_key = next(
+            key for key, _path in segment_members if key != SEGMENTED_CATALOG_STAGING_KEY
+        )
+        staged = transaction._staged_member(member_key)
+        other_segment = next(
+            path for path in sorted(self.other_segments.rglob("*.sqlite3"))
+        )
+        SystemBackupService._validate_history_member(other_segment)
+        with open(staged, "r+b") as handle:
+            handle.write(other_segment.read_bytes())
+            handle.truncate()
+        self.tampered.append("segment")
+
+    def _assert_refused_unchanged(self, refused: Any, part: str) -> None:
+        self.assertEqual(self.tampered, [part], "the staged member was never changed")
+        self.assertIn(CONTENT_REASON, str(refused.exception))
+        self.assertEqual(self.target.hot.read_bytes(), self.prior_hot)
+        self.assertEqual(_tree_snapshot(self.target.segments), self.prior_segments)
+        self.assertEqual(_hot_events(self.target.hot), self.prior_events)
+
+    def test_untampered_segmented_import_installs_the_validated_history(self) -> None:
+        self._import(None)
+        self.assertNotEqual(_hot_events(self.target.hot), self.prior_events)
+        self.assertNotEqual(_tree_snapshot(self.target.segments), self.prior_segments)
+
+    def test_hot_member_replaced_after_validation_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            self._import(self._replace_hot)
+        self._assert_refused_unchanged(refused, "hot")
+
+    def test_segment_member_rewritten_after_validation_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            self._import(self._rewrite_segment)
+        self._assert_refused_unchanged(refused, "segment")
 
 
 class MemberValidationReadsOneFileTests(_ImportRootCleanup):
@@ -229,6 +540,13 @@ class MemberValidationReadsOneFileTests(_ImportRootCleanup):
     def test_complete_member_still_validates(self) -> None:
         member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
         SystemBackupService._validate_history_member(member)
+
+    def test_validation_reports_the_size_and_digest_it_judged(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        content = member.read_bytes()
+        expected = (len(content), hashlib.sha256(content).hexdigest())
+        self.assertEqual(tuple(SystemBackupService._validate_history_member(member)), expected)
+        self.assertEqual(tuple(SystemBackupService._validate_history_member(content)), expected)
 
 
 if __name__ == "__main__":

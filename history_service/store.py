@@ -32,6 +32,7 @@ from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
+    open_regular_file,
     path_entry_exists,
 )
 from history_service.segment_reader import (
@@ -223,6 +224,14 @@ RESTORED_TIMESTAMP_COLUMNS = (
 # Files SQLite can read together with a database file. A validated import
 # member is installed only while none of them is next to it (#1422).
 VALIDATED_MEMBER_SIDE_FILE_SUFFIXES = ("-wal", "-journal", "-shm")
+# An import installs a history member only when its content has the size and
+# SHA-256 recorded when it was validated (#1422).
+VALIDATED_MEMBER_CHANGED_MESSAGE = (
+    "The staged history member is not the member that was validated: its "
+    "content differs from the validated size and SHA-256. Nothing was restored "
+    "and the current history was not changed."
+)
+_VALIDATED_MEMBER_COPY_CHUNK_BYTES = 1024 * 1024
 
 
 def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
@@ -2781,10 +2790,13 @@ class HistoryStore:
         *,
         rollback_allowance: Counter[tuple[str, str, str]] | None = None,
         member_check: Callable[[sqlite3.Connection], None] | None = None,
+        validated_content: tuple[int, str] | None = None,
     ) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
+        if (member_check is None) != (validated_content is None):
+            raise ValueError("A validated member restore needs its checks and its content.")
         if member_check is not None:
             # A validated member is installed as the one file it is (#1422).
             side_files = [
@@ -2800,9 +2812,6 @@ class HistoryStore:
                     "member that was validated. Nothing was restored and the "
                     "current history was not changed."
                 )
-            source_target = f"{source.absolute().as_uri()}?mode=ro&immutable=1"
-        else:
-            source_target = str(source)
 
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
@@ -2816,13 +2825,22 @@ class HistoryStore:
         temp_metadata = os.fstat(temp_fd)
         try:
             with self._lock:
-                with closing(
-                    sqlite3.connect(source_target, uri=member_check is not None)
-                ) as source_connection, closing(
-                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                ) as restore_connection:
+                if validated_content is not None:
+                    # The private copy is the validated content or nothing:
+                    # it is the only file checked and published (#1422).
+                    self._copy_validated_member(source, temp_fd, *validated_content)
+                with ExitStack() as connections:
+                    source_connection = (
+                        connections.enter_context(closing(sqlite3.connect(str(source))))
+                        if validated_content is None
+                        else None
+                    )
+                    restore_connection = connections.enter_context(
+                        closing(sqlite3.connect(f"/proc/self/fd/{temp_fd}"))
+                    )
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
-                    source_connection.backup(restore_connection)
+                    if source_connection is not None:
+                        source_connection.backup(restore_connection)
                     # Gate the exact bytes about to be published (#1189); a
                     # refusal leaves only the private temp copy, which the
                     # finally below discards.
@@ -2831,6 +2849,8 @@ class HistoryStore:
                     )
                     # An import's member checks run again on the copy that is
                     # published, not only on the file validated earlier (#1422).
+                    # The timestamp bound below is not part of them, so it
+                    # runs once.
                     if member_check is not None:
                         member_check(restore_connection)
                     # Incoming backups get the bound. Only
@@ -2878,21 +2898,69 @@ class HistoryStore:
         self,
         source_path: str | Path,
         *,
+        size_bytes: int,
+        sha256: str,
         member_check: Callable[[sqlite3.Connection], None],
     ) -> None:
-        """Install an import's staged history member as it was validated.
+        """Install an import's staged history member exactly as it was validated.
 
-        The member is read as one file: SQLite side files next to it refuse
-        the restore, and it is opened immutable so none that appears later is
-        read. ``member_check`` runs on the private restore copy before it is
-        published, with the timestamp bound every incoming backup gets (#1422).
+        SQLite side files next to the member refuse the restore. The member is
+        opened once and copied through that descriptor into a private file;
+        unless the copy has ``size_bytes`` and ``sha256``, the values recorded
+        when it was validated, nothing is restored. ``member_check`` and the
+        timestamp bound every incoming backup gets then run on that copy, and
+        only that copy is published (#1422).
         """
         self._require_unsegmented_operation("v1 restore")
         try:
             with history_write_lock(self.file_path, blocking=False):
-                self._restore_backup_locked(source_path, member_check=member_check)
+                self._restore_backup_locked(
+                    source_path,
+                    member_check=member_check,
+                    validated_content=(size_bytes, sha256),
+                )
         finally:
             self._hot_summary_counts.clear()
+
+    @staticmethod
+    def _copy_validated_member(
+        source: Path,
+        target_descriptor: int,
+        size_bytes: int,
+        sha256: str,
+    ) -> None:
+        """Copy ``source`` through one opened descriptor, hashing what is copied.
+
+        Refuses unless the copied bytes have exactly the validated size and
+        SHA-256; a longer file is not read past that size.
+        """
+        with open_regular_file(
+            source,
+            invalid=VALIDATED_MEMBER_CHANGED_MESSAGE,
+            single_link=False,
+        ) as (descriptor, opened):
+            if opened.st_size != size_bytes:
+                raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+            digest = hashlib.sha256()
+            copied = 0
+            while copied < size_bytes and (
+                chunk := os.read(
+                    descriptor,
+                    min(_VALIDATED_MEMBER_COPY_CHUNK_BYTES, size_bytes - copied),
+                )
+            ):
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.pwrite(target_descriptor, view, copied)
+                    copied += written
+                    view = view[written:]
+            if (
+                copied != size_bytes
+                or os.read(descriptor, 1)
+                or digest.hexdigest() != sha256
+            ):
+                raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
