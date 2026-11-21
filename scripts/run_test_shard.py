@@ -191,6 +191,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_segmented_restore_recovery",
         "test_ses_flag_whole_values",
         "test_ses_merge_coordinate_pairing",
+        "test_ses_page_limit_refusal",
         "test_ses_unknown_occupancy_consumers",
         "test_ses_unknown_presence",
         "test_ses_zero_address_identity",

@@ -1,0 +1,371 @@
+"""An SES page over the parser budget is a typed refusal, not "no enclosure" (#1308).
+
+The ``sg_ses`` page readers refuse a page with more than ``MAX_SES_ELEMENTS``
+element headers or more than ``MAX_SES_OUTPUT_CHARS`` characters. They used to
+return ``None`` for it, the same answer as a page with no enclosure evidence, so
+the host overlay dropped the page without a failure and the operator saw no
+warning. A refused page now carries its reason and counts to the page warnings.
+
+The pages are synthetic text and the SSH layer is a stub; no appliance is read.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+from unittest.mock import AsyncMock
+
+from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
+from app.models.domain import LedAction, SlotView
+from app.services import parsers
+from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
+from app.services.mapping_store import MappingStore
+from app.services.parsers import (
+    parse_sg_ses_aes,
+    parse_sg_ses_enclosure_status,
+    parse_sg_ses_join_filter,
+    parse_ssh_outputs,
+)
+from app.services.profile_registry import ProfileRegistry
+from app.services.slot_detail_store import SlotDetailStore
+from app.services.ssh_probe import SSHCommandResult
+
+HEADER = "  SYNTH     BIGSHELF      0100\n  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+
+
+def join_page(count: int) -> str:
+    return HEADER + "".join(
+        f"Slot{element + 1:04d} [0,{element}]  Element type: Array device slot\n"
+        "  Enclosure Status:\n"
+        "    Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+        "  Additional Element Status:\n"
+        "    Transport protocol: SAS\n"
+        f"    number of phys: 1, not all phys: 0, device slot number: {element + 1}\n"
+        for element in range(count)
+    )
+
+
+def aes_page(count: int) -> str:
+    return (
+        HEADER
+        + "Additional element status diagnostic page:\n"
+        "  additional element status descriptor list\n"
+        "    Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+        + "".join(
+            f"      Element index: {element}  eiioe=0\n"
+            "        Transport protocol: SAS\n"
+            f"        number of phys: 1, not all phys: 0, device slot number: {element + 1}\n"
+            "        phy index: 0\n"
+            f"          SAS address: 0x5aaaaaaa{element + 1:08x}\n"
+            for element in range(count)
+        )
+    )
+
+
+def ec_page(count: int) -> str:
+    return (
+        HEADER
+        + "Enclosure Status diagnostic page:\n"
+        "  status descriptor list\n"
+        "    Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+        + "".join(
+            f"      Element {element} descriptor:\n"
+            "        Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+            "        Ready to insert=0, RMV=0, Ident=0, Report=0\n"
+            for element in range(count)
+        )
+    )
+
+
+READERS = {
+    "aes": (parse_sg_ses_aes, aes_page, "sg_ses aes /dev/sg7"),
+    "ec": (parse_sg_ses_enclosure_status, ec_page, "sg_ses ec /dev/sg7"),
+    "join": (parse_sg_ses_join_filter, join_page, "sg_ses join /dev/sg7"),
+}
+
+
+def _slot_count(enclosure) -> int:  # noqa: ANN001
+    return len(enclosure.slots) + len(enclosure.unmapped_slots)
+
+
+class SgSesReaderRefusalTests(unittest.TestCase):
+    def assert_refusal(self, result, *, page: str, reason: str, count: int, limit: int) -> None:  # noqa: ANN001
+        refusal_type = getattr(parsers, "SESPageRefusal", None)
+        self.assertIsNotNone(result, "a refused page reads the same as a page with no enclosure")
+        self.assertIsNotNone(refusal_type, "the parser has no typed SES page refusal")
+        self.assertIsInstance(result, refusal_type)
+        self.assertEqual(
+            (result.page, result.reason, result.count, result.limit, result.ses_device),
+            (page, reason, count, limit, "/dev/sg7"),
+        )
+
+    def test_real_element_limit_is_inclusive_and_the_next_element_is_a_typed_refusal(self) -> None:
+        limit = parsers.MAX_SES_ELEMENTS
+        self.assertEqual(limit, 8192)
+        accepted = parse_sg_ses_join_filter(join_page(limit), "sg_ses join /dev/sg7")
+        self.assertIsInstance(accepted, parsers.SESMapEnclosure)
+        self.assertEqual(_slot_count(accepted), limit)
+
+        refused = parse_sg_ses_join_filter(join_page(limit + 1), "sg_ses join /dev/sg7")
+        self.assert_refusal(refused, page="join", reason="elements", count=limit + 1, limit=limit)
+
+    def test_every_sg_ses_reader_refuses_with_its_page_and_counts(self) -> None:
+        for page, (reader, build, command) in READERS.items():
+            with self.subTest(page=page), mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+                accepted = reader(build(4), command)
+                self.assertIsInstance(accepted, parsers.SESMapEnclosure)
+                self.assertEqual(_slot_count(accepted), 4)
+                # The count is the page's real element count, not the first one over.
+                self.assert_refusal(reader(build(9), command), page=page, reason="elements", count=9, limit=4)
+
+    def test_text_budget_refusal_carries_the_character_count(self) -> None:
+        for page, (reader, build, command) in READERS.items():
+            text = build(2)
+            with self.subTest(page=page):
+                with mock.patch.object(parsers, "MAX_SES_OUTPUT_CHARS", len(text)):
+                    self.assertIsInstance(reader(text, command), parsers.SESMapEnclosure)
+                with mock.patch.object(parsers, "MAX_SES_OUTPUT_CHARS", len(text) - 1):
+                    self.assert_refusal(
+                        reader(text, command), page=page, reason="characters", count=len(text), limit=len(text) - 1
+                    )
+
+    def test_refusal_sentence_names_the_page_device_and_counts(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            refusal = parse_sg_ses_aes(aes_page(6), "sg_ses aes /dev/sg7")
+        self.assertIsNotNone(refusal)
+        sentence = refusal.describe("node.example.test")
+        for part in ("AES page", "/dev/sg7", "node.example.test", "6 elements", "limit of 4"):
+            self.assertIn(part, sentence)
+
+    def test_page_without_enclosure_evidence_is_still_none(self) -> None:
+        for page, (reader, _build, command) in READERS.items():
+            with self.subTest(page=page):
+                self.assertIsNone(reader("sg_ses: no enclosure here\n", command))
+
+
+class ParseSshOutputsRefusalTests(unittest.TestCase):
+    def test_refused_page_is_recorded_and_warned_not_counted_as_an_enclosure(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            parsed = parse_ssh_outputs({"sg_ses join /dev/sg7": join_page(5)}, 4, None, None)
+        self.assertEqual(parsed.ses_enclosures, [])
+        refusals = getattr(parsed, "ses_page_refusals", None)
+        self.assertTrue(refusals, "the refused page left no record")
+        self.assertEqual([(item.page, item.count, item.limit) for item in refusals], [("join", 5, 4)])
+        self.assertEqual(len(parsed.warnings), 1, parsed.warnings)
+        self.assertIn("5 elements", parsed.warnings[0])
+
+    def test_page_within_budget_adds_no_warning(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            parsed = parse_ssh_outputs({"sg_ses join /dev/sg7": join_page(4)}, 4, None, None)
+        self.assertEqual(len(parsed.ses_enclosures), 1)
+        self.assertEqual(parsed.warnings, [])
+        self.assertEqual(getattr(parsed, "ses_page_refusals", []), [])
+
+
+def _overlay_stub() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        settings=types.SimpleNamespace(layout=types.SimpleNamespace(slot_count=4)),
+        _optional_ssh_transport_failure=InventoryService._optional_ssh_transport_failure,
+        _format_optional_ssh_transport_failure=InventoryService._format_optional_ssh_transport_failure,
+        _local_failure_sentence=InventoryService._local_failure_sentence,
+        _ssh_failure_public_summary=InventoryService._ssh_failure_public_summary,
+        _tag_ses_overlay=InventoryService._tag_ses_overlay,
+        _merge_ses_overlay_data=InventoryService._merge_ses_overlay_data,
+    )
+
+
+def _page_results(device: str, pages: dict[str, str]) -> list[SSHCommandResult]:
+    results = []
+    for page, text in pages.items():
+        command = (
+            f"sudo -n /usr/bin/sg_ses --join --filter {device}"
+            if page == "join"
+            else f"sudo -n /usr/bin/sg_ses -p {page} {device}"
+        )
+        results.append(SSHCommandResult(command=command, ok=True, stdout=text, stderr="", exit_code=0))
+    return results
+
+
+def _sysfs_result() -> SSHCommandResult:
+    return SSHCommandResult(command=LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, ok=True, stdout="", stderr="", exit_code=0)
+
+
+class HostOverlayRefusalTests(unittest.TestCase):
+    def fetch(self, pages_by_device: dict[str, dict[str, str]]):  # noqa: ANN201
+        results = [result for device, pages in pages_by_device.items() for result in _page_results(device, pages)]
+        return asyncio.run(
+            InventoryService._fetch_sg_ses_host_overlay(
+                _overlay_stub(),
+                "node.example.test",
+                list(pages_by_device),
+                failure_prefix="TrueNAS SCALE SSH SES",
+                command_results=[*results, _sysfs_result()],
+            )
+        )
+
+    def test_completed_pages_over_the_bound_are_a_recorded_failure(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            overlay, failures = self.fetch({"/dev/sg7": {"aes": aes_page(6), "ec": ec_page(6), "join": join_page(6)}})
+        self.assertEqual(overlay.ses_enclosures, [])
+        self.assertEqual(len(failures), 3, failures)
+        labels = ("AES page", "joined page", "enclosure status page")
+        self.assertEqual([failure.split(" from ")[0] for failure in failures],
+                         [f"TrueNAS SCALE SSH SES {label}" for label in labels])
+        for failure in failures:
+            for part in ("/dev/sg7", "node.example.test", "6 elements", "limit of 4"):
+                self.assertIn(part, failure)
+
+    def test_refused_page_is_reported_beside_a_device_that_still_maps(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            overlay, failures = self.fetch(
+                {"/dev/sg7": {"aes": aes_page(4)}, "/dev/sg8": {"aes": aes_page(5)}}
+            )
+        self.assertEqual(len(overlay.ses_enclosures), 1)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("/dev/sg8", failures[0])
+        self.assertIn("5 elements", failures[0])
+
+    def test_pages_within_the_bound_record_no_failure(self) -> None:
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            overlay, failures = self.fetch({"/dev/sg7": {"aes": aes_page(4), "ec": ec_page(4), "join": join_page(4)}})
+        self.assertEqual(failures, [])
+        self.assertEqual(len(overlay.ses_enclosures), 1)
+
+
+def _service(directory: str) -> InventoryService:
+    settings = Settings()
+    system = SystemConfig(
+        id="synthetic-scale",
+        truenas=TrueNASConfig(platform="scale"),
+        ssh=SSHConfig(enabled=True, host="node.example.test", user="synthetic-operator", commands=[]),
+    )
+    return InventoryService(
+        settings,
+        system,
+        AsyncMock(),
+        AsyncMock(),
+        None,
+        MappingStore(str(Path(directory) / "slot_mappings.json")),
+        ProfileRegistry(settings),
+        SlotDetailStore(str(Path(directory) / "slot_detail_cache.json")),
+    )
+
+
+class ScaleOverlayRefusalReachesWarningsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    async def test_only_shelf_refused_returns_the_refusal_not_an_empty_answer(self) -> None:
+        service = _service(self._temp.name)
+
+        async def run_planned(planner, *, initial_commands, host):  # noqa: ANN001, ANN202
+            del host
+            discovery = SSHCommandResult(command=initial_commands[0], ok=True, stdout="/dev/sg7\n", exit_code=0)
+            planned = planner([discovery])
+            pages = {"aes": aes_page(5), "ec": ec_page(5), "join": join_page(5)}
+            answers = {result.command: result for result in _page_results("/dev/sg7", pages)}
+            return [
+                discovery,
+                *(
+                    answers.get(command)
+                    or SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                    for command in planned
+                ),
+            ]
+
+        service._run_ssh_planned_commands = run_planned
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            overlay, failures = await service._fetch_scale_ses_overlay()
+        self.assertEqual(overlay.ses_enclosures, [])
+        self.assertTrue(failures, "a refused shelf read the same as a host without SES")
+        self.assertTrue(all("5 elements" in failure for failure in failures), failures)
+
+
+class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    async def test_refused_readback_page_leaves_the_light_state_unknown(self) -> None:
+        service = _service(self._temp.name)
+        identity = "  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+
+        async def run_sequence(_host, commands, *, then=None):  # noqa: ANN001, ANN202
+            preflight = [
+                SSHCommandResult(command=command, ok=True, stdout=identity, exit_code=0) for command in commands
+            ]
+            planned = then(preflight) if then is not None else []
+            later = [
+                SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=ec_page(5) if " -p ec " in f" {command} " else "",
+                    exit_code=0,
+                )
+                for command in planned
+            ]
+            return [(result, 0.0) for result in (*preflight, *later)]
+
+        service._run_led_ssh_sequence = run_sequence
+        slot = SlotView(slot=1, slot_label="01", row_index=0, column_index=0)
+        target = {
+            "ssh_host": None,
+            "ses_device": "/dev/sg7",
+            "ses_element_id": 1,
+            "ses_slot_number": 2,
+            "enclosure_id": "5eeeeeee0000beef",
+        }
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            result = await service._set_sg_ses_slot_led_over_ssh(slot, LedAction.identify, True, [target])
+        self.assertIsNone(result["identify_active"])
+        self.assertFalse(result["confirmed"])
+        self.assertEqual([path["identify_active"] for path in result["paths"]], [None])
+
+    async def test_readback_page_within_budget_confirms_the_light(self) -> None:
+        service = _service(self._temp.name)
+        identity = "  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+        lit = ec_page(4).replace(
+            "      Element 1 descriptor:\n        Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+            "        Ready to insert=0, RMV=0, Ident=0, Report=0\n",
+            "      Element 1 descriptor:\n        Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+            "        Ready to insert=0, RMV=0, Ident=1, Report=0\n",
+        )
+
+        async def run_sequence(_host, commands, *, then=None):  # noqa: ANN001, ANN202
+            preflight = [
+                SSHCommandResult(command=command, ok=True, stdout=identity, exit_code=0) for command in commands
+            ]
+            planned = then(preflight) if then is not None else []
+            later = [
+                SSHCommandResult(command=command, ok=True, stdout=lit if " -p ec " in f" {command} " else "",
+                                 exit_code=0)
+                for command in planned
+            ]
+            return [(result, 0.0) for result in (*preflight, *later)]
+
+        service._run_led_ssh_sequence = run_sequence
+        slot = SlotView(slot=1, slot_label="01", row_index=0, column_index=0)
+        target = {
+            "ssh_host": None,
+            "ses_device": "/dev/sg7",
+            "ses_element_id": 1,
+            "ses_slot_number": 2,
+            "enclosure_id": "5eeeeeee0000beef",
+        }
+        with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
+            result = await service._set_sg_ses_slot_led_over_ssh(slot, LedAction.identify, True, [target])
+        self.assertIs(result["identify_active"], True)
+        self.assertTrue(result["confirmed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -168,6 +168,7 @@ from app.services.parsers import (
     fixed_device_sg_ses_reads,  # noqa: F401
     MultipathInfo,
     ParsedSSHData,
+    SESMapEnclosure,
     ZpoolMember,
     _extract_slot_number,
     _merge_control_targets,
@@ -12436,6 +12437,11 @@ class InventoryService(InventorySourceCollectionMixin):
                 None,
                 enclosure_sysfs_slots=sysfs_slots,
             )
+            # A page over the parser budget was read and left out: record it
+            # as a failure so it is not mistaken for a device without SES (#1308).
+            host_failures.extend(
+                f"{failure_prefix} {refusal.describe(host)}" for refusal in parsed.ses_page_refusals
+            )
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)
@@ -16592,7 +16598,8 @@ class InventoryService(InventorySourceCollectionMixin):
                         readback_result.stdout,
                         readback_result.command,
                     )
-                    if enclosure is not None:
+                    # A refused page is unread: the light state stays unknown.
+                    if isinstance(enclosure, SESMapEnclosure):
                         mapped_slot = next(
                             (
                                 candidate
