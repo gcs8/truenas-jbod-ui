@@ -2837,7 +2837,7 @@
             <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
               <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(presentation.total))})</summary>
               ${renderDiagnosticTableControls(presentation)}
-              <div class="fabric-diagnostic-table-wrap">
+              <div class="fabric-diagnostic-table-wrap" role="region" aria-label="Recent event sample" tabindex="0">
                 <table class="fabric-diagnostic-table">
                   <thead>
                     <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
