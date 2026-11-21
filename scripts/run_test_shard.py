@@ -209,6 +209,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_backup_archive_journal",
         "test_backup_archive_lifecycle",
         "test_backup_archive_transport",
+        "test_backup_fetch_workspace_reclaim",
         "test_backup_json_entry_bounds",
         "test_backup_keeper_comment_wording",
         "test_backup_list_assurance",

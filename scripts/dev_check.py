@@ -212,6 +212,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_backup_7z_split",
             "tests.test_backup_archive_journal",
             "tests.test_backup_integration",
+            "tests.test_backup_fetch_workspace_reclaim",
             "tests.test_backup_json_entry_bounds",
             "tests.test_backup_keeper_comment_wording",
             "tests.test_backup_list_assurance",

@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -36,7 +37,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
@@ -100,6 +101,17 @@ KEEPER_SCRATCH_PREFIX = "keeper-check-"
 # (size, sha256), or None for a read that did not complete.
 _LocalReads = dict[str, tuple[int, str] | None]
 KEEPER_SCRATCH_HEADROOM_BYTES = 64 * 1024 * 1024
+# Verify and download read a remote copy into a ``backup-fetch-*`` directory
+# under the state directory (#1290). One whose clean-up failed is reclaimed by
+# a later fetch once it is shown to be this account's, unused and of the
+# expected layout; anything else is left in place, and a fetch is refused while
+# this many such directories (each may hold a full copy) are left.
+FETCH_WORKSPACE_PREFIX = "backup-fetch-"
+MAX_ABANDONED_FETCH_WORKSPACES = 4
+_FETCH_WORKSPACE_FILE = "archive"
+# Creating and locking a fetch workspace and scanning for abandoned ones never
+# interleave, so a scan cannot see a new workspace before it is locked.
+_FETCH_WORKSPACE_LOCK = threading.Lock()
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
@@ -118,6 +130,10 @@ class ArtifactNotFoundError(LookupError):
 
 class ArchiveIntegrityError(RuntimeError):
     """A copy's bytes do not match its catalogued size and SHA-256."""
+
+
+class FetchWorkspaceLimitError(RuntimeError):
+    """Too many abandoned fetch workspaces are left to make another copy (#1290)."""
 
 
 def _utcnow() -> datetime:
@@ -1659,9 +1675,9 @@ class BackupScheduler:
         target = self.policy.target(record.location)
         if target is None:
             raise ArtifactNotFoundError("The target holding this copy is no longer configured.")
-        workspace = Path(tempfile.mkdtemp(prefix="backup-fetch-", dir=self.paths.state_dir))
+        workspace, held = self._new_fetch_workspace()
         try:
-            local = workspace / "archive"
+            local = workspace / _FETCH_WORKSPACE_FILE
             with self._open_configured_target(target) as remote:
                 size, digest = remote.get(record.name, local, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
@@ -1675,7 +1691,51 @@ class BackupScheduler:
                 workspace.rmdir()
             except OSError as exc:
                 # Never let clean-up replace the result of the read and comparison (#1202).
+                # A later fetch reclaims the directory once this lock is gone (#1290).
                 logger.error("Backup fetch workspace could not be removed (%s).", type(exc).__name__)
+            finally:
+                os.close(held)
+
+    def _new_fetch_workspace(self) -> tuple[Path, int]:
+        """Reclaim abandoned fetch workspaces, then make and lock a new one (#1290).
+
+        The returned descriptor holds an exclusive ``flock`` on the new
+        directory for as long as the fetch uses it; the lock ends with the
+        descriptor or the process, which is how a later scan tells a live
+        fetch from abandoned work. Refuses with ``FetchWorkspaceLimitError``,
+        before any copy is made, while ``MAX_ABANDONED_FETCH_WORKSPACES`` or
+        more abandoned directories could not be reclaimed.
+        """
+
+        owner = os.geteuid() if hasattr(os, "geteuid") else None
+        with _FETCH_WORKSPACE_LOCK:
+            found = _reclaim_fetch_workspaces(self.paths.state_dir, owner=owner)
+            left = sum(found.left.values())
+            if found.reclaimed or left:
+                reasons = ", ".join(f"{reason}={count}" for reason, count in sorted(found.left.items())) or "none"
+                logger.warning(
+                    "Backup fetch workspaces: reclaimed %d, left %d in place (%s), %d in use.",
+                    found.reclaimed, left, reasons, found.in_use,
+                )
+            if left >= MAX_ABANDONED_FETCH_WORKSPACES:
+                raise FetchWorkspaceLimitError(
+                    f"Backup fetch refused: {left} abandoned fetch workspaces could not be reclaimed "
+                    f"(limit {MAX_ABANDONED_FETCH_WORKSPACES}). The scheduler log names the reasons; "
+                    "remove them from the scheduler state folder."
+                )
+            workspace = Path(tempfile.mkdtemp(prefix=FETCH_WORKSPACE_PREFIX, dir=self.paths.state_dir))
+            try:
+                held = os.open(workspace, _DIRECTORY_OPEN_FLAGS)
+            except BaseException:
+                workspace.rmdir()
+                raise
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(held)
+                workspace.rmdir()
+                raise
+        return workspace, held
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
@@ -1858,6 +1918,83 @@ def _remove_stale_keeper_scratch(state_dir: Path) -> None:
         if not stat.S_ISDIR(metadata.st_mode) or (owner is not None and metadata.st_uid != owner):
             continue
         shutil.rmtree(entry)
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+@dataclass
+class _FetchReclaim:
+    """What one scan of ``backup-fetch-*`` entries did (#1290)."""
+
+    reclaimed: int = 0
+    in_use: int = 0
+    left: dict[str, int] = field(default_factory=dict)  # abandoned but kept, by reason
+
+
+def _reclaim_fetch_workspaces(state_dir: Path, *, owner: int | None) -> _FetchReclaim:
+    """Remove abandoned ``backup-fetch-*`` directories whose state is established (#1290).
+
+    Unlike keeper checks, fetches run concurrently, so a directory is removed
+    only when it is a plain directory owned by ``owner``, its lock can be
+    taken (no live fetch holds it) and it holds nothing but a regular fetched
+    file. Every other entry with the prefix is left untouched and counted by
+    reason; in-use directories are counted separately.
+    """
+
+    result = _FetchReclaim()
+    for entry in Path(state_dir).iterdir():
+        if not entry.name.startswith(FETCH_WORKSPACE_PREFIX):
+            continue
+        outcome = _reclaim_fetch_workspace(entry, owner)
+        if outcome == "reclaimed":
+            result.reclaimed += 1
+        elif outcome == "in-use":
+            result.in_use += 1
+        elif outcome is not None:
+            result.left[outcome] = result.left.get(outcome, 0) + 1
+    return result
+
+
+def _reclaim_fetch_workspace(entry: Path, owner: int | None) -> str | None:
+    try:
+        descriptor = os.open(entry, _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        return None  # removed meanwhile
+    except OSError as exc:
+        return "not-a-directory" if exc.errno in (errno.ELOOP, errno.ENOTDIR) else "unreadable"
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "not-a-directory"
+        if owner is not None and metadata.st_uid != owner:
+            return "other-owner"
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "in-use"
+        try:
+            names = os.listdir(descriptor)
+            if any(name != _FETCH_WORKSPACE_FILE for name in names) or (
+                names
+                and not stat.S_ISREG(os.stat(_FETCH_WORKSPACE_FILE, dir_fd=descriptor, follow_symlinks=False).st_mode)
+            ):
+                return "unrecognised-layout"
+            if names:
+                os.unlink(_FETCH_WORKSPACE_FILE, dir_fd=descriptor)
+            current = os.lstat(entry)
+            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                return "unrecognised-layout"  # the name now points somewhere else
+            os.rmdir(entry)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return "removal-failed"
+        return "reclaimed"
+    finally:
+        os.close(descriptor)
 
 
 def _scratch_free_bytes(path: Path) -> int:
