@@ -516,3 +516,40 @@ for (const viewport of [{ width: 390, height: 900 }, { width: 1600, height: 1000
   });
 }
 
+// #1378: the sticky trace band never lies over Fit when Topology opens, at a
+// phone's width or a desktop's. The band sticks inside the drawing's own
+// block, so it cannot rise above the drawing; a click at Fit's centre reaches
+// Fit wherever Fit is in the window.
+for (const viewport of [{ width: 390, height: 844 }, { width: 1241, height: 900 }, { width: 1920, height: 1080 }]) {
+  test(`the Topology trace band never covers Fit when the page opens at ${viewport.width}x${viewport.height} (#1378)`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const errors = await routeSynthetic(page, fixture.fabricHtml);
+    await page.goto(`${ORIGIN}/?mode=topology`);
+    const fit = page.locator("[data-topology-fit]");
+    await expect(fit).toBeVisible();
+    await expect(page.locator("[data-topology-trace]")).toBeVisible();
+    const geometry = await fit.evaluate((button) => {
+      const band = document.querySelector("[data-topology-trace]").getBoundingClientRect();
+      const rect = button.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      const inWindow = y >= 0 && y < window.innerHeight;
+      const hit = inWindow ? document.elementFromPoint(x, y) : null;
+      return {
+        scrollY: window.scrollY,
+        window: { width: window.innerWidth, height: window.innerHeight },
+        fit: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right },
+        band: { top: band.top, bottom: band.bottom, left: band.left, right: band.right },
+        overlap: Math.max(0, Math.min(rect.bottom, band.bottom) - Math.max(rect.top, band.top)) * (rect.left < band.right && band.left < rect.right ? 1 : 0),
+        inWindow,
+        hitsFit: Boolean(hit && button.contains(hit)),
+      };
+    });
+    const detail = JSON.stringify(geometry);
+    expect(geometry.window.width, "actual viewport width").toBe(viewport.width);
+    expect(geometry.overlap, `the band covers none of Fit ${detail}`).toBe(0);
+    if (geometry.inWindow) expect(geometry.hitsFit, `a click at Fit's centre reaches Fit ${detail}`).toBe(true);
+    await capture(page, page.locator(".fabric-topology"), `topology-fit-clear-${viewport.width}`);
+    expect(errors).toEqual([]);
+  });
+}

@@ -2281,14 +2281,17 @@
       + notices
       + `<div class="fabric-topology-bar">${fitControl}${wide}</div>`
       + fitNotice
-      + `<div class="fabric-topology-scroll">${svg}</div>`
+      // The drawing, its trace band and the footer share one block: the band
+      // sticks inside it, so it never rises over Fit or the notices above
+      // the drawing (#1378).
+      + `<div class="fabric-topology-stage"><div class="fabric-topology-scroll">${svg}</div>`
       // Below the drawing: hover text that wraps to more lines never moves
       // the drawing, and a label, from under the pointer. The band is held as
       // tall as the tallest sentence the drawing can show, measured in the
       // empty box after the sentence, so its height stays the same.
       + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>`
       + `<div class="fabric-topology-trace-measure" data-topology-measure aria-hidden="true"></div></div>`
-      + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p>`
+      + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p></div>`
       + "</div>";
   }
 

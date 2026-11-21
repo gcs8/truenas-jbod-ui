@@ -64,9 +64,21 @@ body.fabric-topology-mode .fabric-page-shell {
 
 /* Narrow pages: the parts, legend and notices wrap inside the panel, long
    ids included; only the drawing scrolls sideways, inside its own box. */
-.fabric-topology > * {
+.fabric-topology > *,
+.fabric-topology-stage > * {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* The drawing's box, the trace band and the footer: the band's containing
+   block. A sticky band moves only inside it, so it never rises over the
+   parts, legend, notices or Fit above the drawing (#1378); until the drawing
+   reaches the window's bottom edge the band stays in its own place. Same
+   column and spacing as the view, so nothing moves. */
+.fabric-topology-stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
 }
 
 .fabric-topology .warning-item {
