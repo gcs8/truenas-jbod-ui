@@ -32,6 +32,7 @@ from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
+    open_regular_file,
     path_entry_exists,
 )
 from history_service.segment_reader import (
@@ -219,6 +220,34 @@ RESTORED_TIMESTAMP_COLUMNS = (
     ("metric_rollups", "last_observed_at"),
     ("history_maintenance_state", "backup_at"),
 )
+
+# Files SQLite can read together with a database file. A validated import
+# member is installed only while none of them is next to it (#1422).
+VALIDATED_MEMBER_SIDE_FILE_SUFFIXES = ("-wal", "-journal", "-shm")
+# An import installs a history member only when its content has the size and
+# SHA-256 recorded when it was validated (#1422).
+VALIDATED_MEMBER_CHANGED_MESSAGE = (
+    "The staged history member is not the member that was validated: its "
+    "content differs from the validated size and SHA-256. Nothing was restored "
+    "and the current history was not changed."
+)
+_VALIDATED_MEMBER_COPY_CHUNK_BYTES = 1024 * 1024
+# The private copy that is checked and published is read as that one file: a
+# side file next to it when SQLite first reads it refuses the restore (#1422).
+PRIVATE_COPY_SIDE_FILE_MESSAGE = (
+    "SQLite side files ({side_files}) are next to the private copy of the "
+    "staged history member, so the copy would not be read as the member that "
+    "was validated. Nothing was restored and the current history was not changed."
+)
+PRIVATE_COPY_WAL_MESSAGE = (
+    "SQLite opened the private copy of the staged history member with a "
+    "write-ahead log next to it, so the copy would not be read as the member "
+    "that was validated. Nothing was restored and the current history was not changed."
+)
+# Database header bytes 18 and 19 (file format write and read versions):
+# 1 is rollback journaling, so SQLite does not start a write-ahead log itself.
+_ROLLBACK_JOURNAL_FILE_FORMAT = b"\x01\x01"
+_FILE_FORMAT_HEADER_OFFSET = 18
 
 
 def require_bounded_restored_timestamps(connection: sqlite3.Connection) -> None:
@@ -2776,10 +2805,29 @@ class HistoryStore:
         source_path: str | Path,
         *,
         rollback_allowance: Counter[tuple[str, str, str]] | None = None,
+        member_check: Callable[[sqlite3.Connection], None] | None = None,
+        validated_content: tuple[int, str] | None = None,
     ) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
+        if (member_check is None) != (validated_content is None):
+            raise ValueError("A validated member restore needs its checks and its content.")
+        if member_check is not None:
+            # A validated member is installed as the one file it is (#1422).
+            side_files = [
+                suffix
+                for suffix in VALIDATED_MEMBER_SIDE_FILE_SUFFIXES
+                if os.path.lexists(f"{source}{suffix}")
+            ]
+            if side_files:
+                raise ValueError(
+                    "SQLite side files ("
+                    + ", ".join(side_files)
+                    + ") are next to the staged history member, so it is not the "
+                    "member that was validated. Nothing was restored and the "
+                    "current history was not changed."
+                )
 
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
@@ -2793,17 +2841,37 @@ class HistoryStore:
         temp_metadata = os.fstat(temp_fd)
         try:
             with self._lock:
-                with closing(sqlite3.connect(source)) as source_connection, closing(
-                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                ) as restore_connection:
+                if validated_content is not None:
+                    # The private copy is the validated content or nothing:
+                    # it is the only file checked and published (#1422).
+                    self._copy_validated_member(source, temp_fd, *validated_content)
+                    os.pwrite(temp_fd, _ROLLBACK_JOURNAL_FILE_FORMAT, _FILE_FORMAT_HEADER_OFFSET)
+                with ExitStack() as connections:
+                    source_connection = (
+                        connections.enter_context(closing(sqlite3.connect(str(source))))
+                        if validated_content is None
+                        else None
+                    )
+                    restore_connection = connections.enter_context(
+                        closing(sqlite3.connect(f"/proc/self/fd/{temp_fd}"))
+                    )
+                    if validated_content is not None:
+                        self._read_private_copy_alone(restore_connection, temp_path)
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
-                    source_connection.backup(restore_connection)
+                    if source_connection is not None:
+                        source_connection.backup(restore_connection)
                     # Gate the exact bytes about to be published (#1189); a
                     # refusal leaves only the private temp copy, which the
                     # finally below discards.
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    # An import's member checks run again on the copy that is
+                    # published, not only on the file validated earlier (#1422).
+                    # The timestamp bound below is not part of them, so it
+                    # runs once.
+                    if member_check is not None:
+                        member_check(restore_connection)
                     # Incoming backups get the bound. Only
                     # _restore_rollback_snapshot passes an allowance: the
                     # over-long fields its snapshot held, no others (#1292).
@@ -2844,6 +2912,111 @@ class HistoryStore:
                 self._restore_backup_locked(source_path)
         finally:
             self._hot_summary_counts.clear()
+
+    def restore_validated_member(
+        self,
+        source_path: str | Path,
+        *,
+        size_bytes: int,
+        sha256: str,
+        member_check: Callable[[sqlite3.Connection], None],
+    ) -> None:
+        """Install an import's staged history member exactly as it was validated.
+
+        SQLite side files next to the member refuse the restore. The member is
+        opened once and copied through that descriptor into a private file;
+        unless the copy has ``size_bytes`` and ``sha256``, the values recorded
+        when it was validated, nothing is restored. SQLite then reads that copy
+        as one file (see ``_read_private_copy_alone``). ``member_check`` and
+        the timestamp bound every incoming backup gets run on that copy, and
+        only that copy is published (#1422).
+        """
+        self._require_unsegmented_operation("v1 restore")
+        try:
+            with history_write_lock(self.file_path, blocking=False):
+                self._restore_backup_locked(
+                    source_path,
+                    member_check=member_check,
+                    validated_content=(size_bytes, sha256),
+                )
+        finally:
+            self._hot_summary_counts.clear()
+
+    @staticmethod
+    def _copy_validated_member(
+        source: Path,
+        target_descriptor: int,
+        size_bytes: int,
+        sha256: str,
+    ) -> None:
+        """Copy ``source`` through one opened descriptor, hashing what is copied.
+
+        Refuses unless the copied bytes have exactly the validated size and
+        SHA-256; a longer file is not read past that size.
+        """
+        with open_regular_file(
+            source,
+            invalid=VALIDATED_MEMBER_CHANGED_MESSAGE,
+            single_link=False,
+        ) as (descriptor, opened):
+            if opened.st_size != size_bytes:
+                raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+            digest = hashlib.sha256()
+            copied = 0
+            while copied < size_bytes and (
+                chunk := os.read(
+                    descriptor,
+                    min(_VALIDATED_MEMBER_COPY_CHUNK_BYTES, size_bytes - copied),
+                )
+            ):
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.pwrite(target_descriptor, view, copied)
+                    copied += written
+                    view = view[written:]
+            if (
+                copied != size_bytes
+                or os.read(descriptor, 1)
+                or digest.hexdigest() != sha256
+            ):
+                raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+
+    @classmethod
+    def _read_private_copy_alone(
+        cls,
+        connection: sqlite3.Connection,
+        private_path: Path,
+    ) -> None:
+        """Make ``connection`` read the private copy as the one file it is.
+
+        Its header already records rollback journaling. With an exclusive lock
+        SQLite looks for a rollback journal or write-ahead log only at its
+        first read, so one appearing later is never read. A side file present
+        at that first read, or a write-ahead log SQLite opened there, refuses
+        the restore (#1422).
+        """
+        connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+        cls._refuse_private_copy_side_files(private_path)
+        connection.execute("PRAGMA schema_version").fetchone()
+        if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+            raise ValueError(PRIVATE_COPY_WAL_MESSAGE)
+        # A rollback journal that appeared between the check above and the
+        # first read is replayed by SQLite at that read and, under the
+        # exclusive lock, stays beside the copy: check again after the read.
+        cls._refuse_private_copy_side_files(private_path)
+
+    @staticmethod
+    def _refuse_private_copy_side_files(private_path: Path) -> None:
+        side_files = [
+            suffix
+            for suffix in VALIDATED_MEMBER_SIDE_FILE_SUFFIXES
+            if os.path.lexists(f"{private_path}{suffix}")
+        ]
+        if side_files:
+            raise ValueError(
+                PRIVATE_COPY_SIDE_FILE_MESSAGE.format(side_files=", ".join(side_files))
+            )
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:

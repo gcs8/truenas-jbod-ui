@@ -7334,7 +7334,11 @@ sys.stdout.flush()
 
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
-            with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
+            with patch.object(
+                self.store,
+                "restore_validated_member",
+                wraps=self.store.restore_validated_member,
+            ) as restore:
                 with self.assertRaisesRegex(ValueError, "redirected"):
                     self.backup_service.import_bundle(bundle)
 
@@ -7685,7 +7689,11 @@ sys.stdout.flush()
             "_create_rollback_snapshot",
             wraps=self.store._create_rollback_snapshot,
         ) as snapshot:
-            with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
+            with patch.object(
+                self.store,
+                "restore_validated_member",
+                wraps=self.store.restore_validated_member,
+            ) as restore:
                 with patch.object(
                     self.store,
                     "_restore_rollback_snapshot",
@@ -7699,8 +7707,9 @@ sys.stdout.flush()
                             raise RuntimeError("late failure")
 
         self.assertEqual(snapshot.call_count, 1)
-        # The incoming member goes through the public restore; the rollback
-        # restores the store's own snapshot through the private path (#1292).
+        # The incoming member goes through the validated-member restore
+        # (#1422); the rollback restores the store's own snapshot through the
+        # private path (#1292).
         self.assertEqual(restore.call_count, 1)
         self.assertEqual(rollback_restore.call_count, 1)
         self.assertEqual(self.store.counts(), expected_counts)

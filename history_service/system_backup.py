@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
@@ -80,7 +80,10 @@ from history_service.segment_catalog import (
     HISTORY_SEGMENT_GROUP_KEY,
     SEGMENTED_BACKUP_SCHEMA_VERSION,
     activation_pending_path,
+    hash_descriptor,
+    open_regular_file,
     path_entry_exists,
+    require_unchanged,
     validate_segmented_manifest,
 )
 from history_service.migration_lock import history_write_lock
@@ -104,6 +107,7 @@ from history_service.segmented_restore import (
 from history_service.startup import HistorySchemaVersionError
 from history_service.store import (
     SQLITE_CONNECT_TIMEOUT_SECONDS,
+    VALIDATED_MEMBER_CHANGED_MESSAGE,
     HistoryStore,
     require_bounded_restored_timestamps,
     require_restorable_schema_version,
@@ -318,6 +322,14 @@ ZSTD_BOUNDED_INPUT_BYTES = 32
 MAX_STRUCTURED_YAML_MEMBER_BYTES = 2 * 1024 * 1024
 
 ExtractedMember = bytes | Path
+
+
+class _MemberContent(NamedTuple):
+    """The size and SHA-256 of a member's bytes."""
+
+    size_bytes: int
+    sha256: str
+
 
 PASSPHRASE_REQUIRED_MESSAGE = "This backup is encrypted. Enter its passphrase to continue."
 EXPORT_PASSPHRASE_REQUIRED_MESSAGE = "Enter a passphrase to encrypt this backup."
@@ -667,11 +679,16 @@ class _ImportActivationTransaction:
         extracted_members: dict[str, ExtractedMember],
         *,
         history_store: HistoryStore | None = None,
+        validated_members: Mapping[str, _MemberContent] | None = None,
     ) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-import-"))
         self.staging_root = self.root / "staged"
         self.rollback_root = self.root / "rollback"
         self._staged_members: dict[str, Path] = {}
+        # The content each staged member must have when it is installed: the
+        # size and SHA-256 recorded when it was validated, else those of the
+        # bytes this transaction was given (#1422).
+        self._member_contents: dict[str, _MemberContent] = {}
         self._journal: dict[str, _ImportRollbackEntry] = {}
         self._journal_order: list[str] = []
         self._created_parents: list[Path] = []
@@ -707,10 +724,17 @@ class _ImportActivationTransaction:
                     member_key.encode("utf-8")
                 ).hexdigest()
                 if isinstance(content, Path):
-                    self._copy_staged_file(staged_path, content)
+                    staged_content = self._copy_staged_file(staged_path, content)
                 else:
                     self._write_staged_bytes(staged_path, content)
+                    staged_content = _MemberContent(
+                        len(content), hashlib.sha256(content).hexdigest()
+                    )
+                validated = (validated_members or {}).get(member_key)
+                if validated is not None and validated != staged_content:
+                    raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
                 self._staged_members[member_key] = staged_path
+                self._member_contents[member_key] = staged_content
             self._fsync_directory(self.staging_root)
             self._fsync_directory(self.rollback_root)
             self._fsync_directory(self.root)
@@ -1219,6 +1243,13 @@ class _ImportActivationTransaction:
             journal_payload["segments"]["candidate"],
             "directory",
         )
+        # The recorded candidates are what activation installs; they must be
+        # the validated members, by size and SHA-256 (#1422).
+        self._require_validated_candidates(
+            journal_payload,
+            hot_member_key=hot_member_key,
+            segment_members=segment_members,
+        )
         self._prepared_segmented_restore = _PreparedSegmentedRestore(
             store=store,
             hot_member_key=hot_member_key,
@@ -1232,6 +1263,39 @@ class _ImportActivationTransaction:
             journal_payload=journal_payload,
         )
         return journal_payload
+
+    def _require_validated_candidates(
+        self,
+        journal_payload: dict[str, Any],
+        *,
+        hot_member_key: str,
+        segment_members: list[tuple[str, Path]],
+    ) -> None:
+        def recorded_as(record: Any, content: _MemberContent) -> bool:
+            return (
+                isinstance(record, dict)
+                and record.get("size_bytes") == content.size_bytes
+                and record.get("sha256") == content.sha256
+            )
+
+        expected = {
+            relative_path.as_posix(): self._member_content(member_key)
+            for member_key, relative_path in segment_members
+        }
+        recorded = {
+            item.get("path"): item
+            for item in journal_payload["segments"]["candidate"].get("files", [])
+            if isinstance(item, dict)
+        }
+        if (
+            not recorded_as(
+                journal_payload["hot"]["candidate"],
+                self._member_content(hot_member_key),
+            )
+            or set(recorded) != set(expected)
+            or not all(recorded_as(recorded[path], expected[path]) for path in expected)
+        ):
+            raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
 
     def _stage_segmented_hot(
         self,
@@ -1566,7 +1630,17 @@ class _ImportActivationTransaction:
         entry = self._record_history(store)
         self._ensure_parent_hierarchy(entry.target_path.parent)
         entry.mutated = True
-        store.restore_backup(self._staged_member(member_key))
+        # Install exactly the validated member: the store copies the staged
+        # member into a private file, refuses a copy whose size or SHA-256
+        # differs from the validated ones, checks that copy again and
+        # publishes only it (#1422).
+        content = self._member_content(member_key)
+        store.restore_validated_member(
+            self._staged_member(member_key),
+            size_bytes=content.size_bytes,
+            sha256=content.sha256,
+            member_check=SystemBackupService._check_history_structure,
+        )
         self._fsync_file(entry.target_path)
         self._fsync_directory(entry.target_path.parent)
 
@@ -1594,6 +1668,10 @@ class _ImportActivationTransaction:
         if staged_path is None:
             raise ValueError(f"Backup bundle is missing staged member {member_key!r}.")
         return staged_path
+
+    def _member_content(self, member_key: str) -> _MemberContent:
+        self._staged_member(member_key)
+        return self._member_contents[member_key]
 
     @staticmethod
     def _target_path_kind(
@@ -2023,14 +2101,26 @@ class _ImportActivationTransaction:
             os.fsync(handle.fileno())
 
     @classmethod
-    def _copy_staged_file(cls, target_path: Path, source_path: Path) -> None:
+    def _copy_staged_file(cls, target_path: Path, source_path: Path) -> _MemberContent:
+        """Copy a member through one opened descriptor; return what was copied."""
+        invalid = "Backup bundle extracted member is not a regular file."
         source_metadata = source_path.stat(follow_symlinks=False)
         if source_path.is_symlink() or not stat.S_ISREG(source_metadata.st_mode):
-            raise ValueError("Backup bundle extracted member is not a regular file.")
+            raise ValueError(invalid)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, target_path, follow_symlinks=False)
+        digest = hashlib.sha256()
+        size_bytes = 0
+        with (
+            open_regular_file(source_path, invalid=invalid, single_link=False) as (descriptor, _),
+            target_path.open("wb") as target,
+        ):
+            while chunk := os.read(descriptor, ARCHIVE_READ_CHUNK_BYTES):
+                digest.update(chunk)
+                size_bytes += len(chunk)
+                target.write(chunk)
         target_path.chmod(cls._MISSING_FILE_MODE)
         cls._fsync_file(target_path)
+        return _MemberContent(size_bytes, digest.hexdigest())
 
     @staticmethod
     def _path_exists(path: Path) -> bool:
@@ -2872,11 +2962,15 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
         *,
         history_integrity_checked: bool = False,
-    ) -> tuple[dict[str, _ImportRestoreDestination], bytes | None]:
-        """Check current deployment admission without changing live or extracted files."""
+    ) -> tuple[dict[str, _ImportRestoreDestination], bytes | None, dict[str, _MemberContent]]:
+        """Check current deployment admission without changing live or extracted files.
+
+        Also returns the size and SHA-256 of every validated history member;
+        activation installs those members only with that content (#1422).
+        """
         self._validate_manifest_member_metadata(manifest, extracted)
         self._preflight_selected_group_members(manifest, group_entries, extracted)
-        self._preflight_import_members(
+        validated = self._preflight_import_members(
             manifest, group_entries, extracted,
             history_integrity_checked=history_integrity_checked,
         )
@@ -2884,8 +2978,9 @@ class SystemBackupService:
         destinations = self._build_restore_destination_graph(manifest, group_entries, extracted)
         catalog = self._prepare_segmented_history_import(
             manifest, extracted, history_integrity_checked=history_integrity_checked,
+            validated=validated,
         )
-        return destinations, catalog
+        return destinations, catalog, validated
 
     def inspect_bundle_file(
         self,
@@ -3363,7 +3458,7 @@ class SystemBackupService:
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
-            restore_destinations, catalog = self._admit_restore(
+            restore_destinations, catalog, validated_members = self._admit_restore(
                 manifest,
                 group_entries,
                 extracted,
@@ -3395,6 +3490,7 @@ class SystemBackupService:
                     transaction = _ImportActivationTransaction(
                         extracted,
                         history_store=self.store,
+                        validated_members=validated_members,
                     )
                     try:
                         with transaction:
@@ -3632,7 +3728,9 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
         *,
         history_integrity_checked: bool = False,
+        validated: dict[str, _MemberContent] | None = None,
     ) -> bytes | None:
+        """Validate the segments; record each one's content in ``validated``."""
         if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
             return None
         history_catalog = manifest.get("history_catalog")
@@ -3650,12 +3748,14 @@ class SystemBackupService:
             if not isinstance(member_key, str) or member_key not in extracted:
                 raise ValueError("Segmented history archive is missing a required segment.")
             try:
-                self._validate_history_member(
+                segment_content = self._validate_history_member(
                     extracted[member_key],
                     integrity_checked=history_integrity_checked,
                 )
             except HistorySchemaVersionError as exc:
                 raise ValueError(exc.reason) from exc
+            if validated is not None:
+                validated[member_key] = segment_content
             segment_id = entry.get("segment_id")
             local_segments.append(
                 {
@@ -3925,7 +4025,9 @@ class SystemBackupService:
         extracted_members: dict[str, ExtractedMember],
         *,
         history_integrity_checked: bool = False,
-    ) -> None:
+    ) -> dict[str, _MemberContent]:
+        """Validate the selected members; return the validated history content."""
+        validated: dict[str, _MemberContent] = {}
         validators: dict[str, Any] = {
             CONFIG_FILE_KEY: self._validate_config_member,
             RUNTIME_OVERRIDES_FILE_KEY: self._validate_runtime_overrides_member,
@@ -3950,7 +4052,7 @@ class SystemBackupService:
             try:
                 content = extracted_members[member_key]
                 if group_key == HISTORY_DB_KEY:
-                    self._validate_history_member(
+                    validated[member_key] = self._validate_history_member(
                         content,
                         integrity_checked=history_integrity_checked,
                     )
@@ -3986,6 +4088,7 @@ class SystemBackupService:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
                 ) from exc
+        return validated
 
     def _preflight_selected_group_members(
         self,
@@ -4371,59 +4474,102 @@ class SystemBackupService:
         content: ExtractedMember,
         *,
         integrity_checked: bool = False,
-    ) -> None:
+    ) -> _MemberContent:
+        """Check a history member; return the size and SHA-256 it was judged at.
+
+        The member is opened once. Its digest and the SQLite checks both read
+        that opened file, as one file: side files next to it are not part of
+        it. Activation installs it only with this size and digest (#1422).
+        """
+        changed = "History database member changed while it was validated."
         with tempfile.TemporaryDirectory() as temp_dir:
             if isinstance(content, Path):
                 candidate_path = content
             else:
                 candidate_path = Path(temp_dir) / "history.sqlite3"
                 candidate_path.write_bytes(content)
-            database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
-            with closing(sqlite3.connect(database_uri, uri=True)) as connection:
-                # The database's own compatibility marker, checked against the
-                # range startup admits before anything is activated (#1189).
-                # Raises HistorySchemaVersionError; callers turn it into the
-                # operator-facing ValueError so the reason is not wrapped away.
-                require_restorable_schema_version(
-                    int(connection.execute("PRAGMA user_version").fetchone()[0])
+            with open_regular_file(
+                candidate_path,
+                invalid="Backup bundle extracted member is not a regular file.",
+                single_link=False,
+            ) as (descriptor, opened):
+                sha256 = hash_descriptor(descriptor, opened, changed=changed)
+                database_uri = f"file:/proc/self/fd/{descriptor}?mode=ro&immutable=1"
+                with closing(sqlite3.connect(database_uri, uri=True)) as connection:
+                    SystemBackupService._check_history_connection(
+                        connection,
+                        integrity_checked=integrity_checked,
+                    )
+                require_unchanged(candidate_path, descriptor, opened, changed=changed)
+        return _MemberContent(opened.st_size, sha256)
+
+    @staticmethod
+    def _check_history_connection(
+        connection: sqlite3.Connection,
+        *,
+        integrity_checked: bool = False,
+    ) -> None:
+        """Import validation's checks of a history member, on an open database."""
+        SystemBackupService._check_history_structure(
+            connection,
+            integrity_checked=integrity_checked,
+        )
+        require_bounded_restored_timestamps(connection)
+
+    @staticmethod
+    def _check_history_structure(
+        connection: sqlite3.Connection,
+        *,
+        integrity_checked: bool = False,
+    ) -> None:
+        """The history member checks other than the timestamp bound.
+
+        Activation runs them again, with the integrity check, on the private
+        copy it publishes; the store adds the timestamp bound there once
+        (#1422).
+        """
+        # The database's own compatibility marker, checked against the
+        # range startup admits before anything is activated (#1189).
+        # Raises HistorySchemaVersionError; callers turn it into the
+        # operator-facing ValueError so the reason is not wrapped away.
+        require_restorable_schema_version(
+            int(connection.execute("PRAGMA user_version").fetchone()[0])
+        )
+        rows = (
+            [("ok",)]
+            if integrity_checked
+            else connection.execute("PRAGMA quick_check").fetchall()
+        )
+        required_columns = {
+            "slot_state_current": {"system_id", "enclosure_key", "slot"},
+            "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
+            "metric_samples": {
+                "system_id",
+                "enclosure_key",
+                "slot",
+                "observed_at",
+                "metric_name",
+            },
+        }
+        for table_name, expected_columns in required_columns.items():
+            table_row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if table_row is None:
+                raise ValueError(f"History database is missing table {table_name}.")
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            }
+            if not expected_columns.issubset(columns):
+                raise ValueError(
+                    f"History database table {table_name} is missing required columns."
                 )
-                rows = (
-                    [("ok",)]
-                    if integrity_checked
-                    else connection.execute("PRAGMA quick_check").fetchall()
-                )
-                required_columns = {
-                    "slot_state_current": {"system_id", "enclosure_key", "slot"},
-                    "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
-                    "metric_samples": {
-                        "system_id",
-                        "enclosure_key",
-                        "slot",
-                        "observed_at",
-                        "metric_name",
-                    },
-                }
-                for table_name, expected_columns in required_columns.items():
-                    table_row = connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-                        (table_name,),
-                    ).fetchone()
-                    if table_row is None:
-                        raise ValueError(f"History database is missing table {table_name}.")
-                    columns = {
-                        str(row[1])
-                        for row in connection.execute(
-                            f'PRAGMA table_info("{table_name}")'
-                        ).fetchall()
-                    }
-                    if not expected_columns.issubset(columns):
-                        raise ValueError(
-                            f"History database table {table_name} is missing required columns."
-                        )
-                if rows == [("ok",)]:
-                    require_bounded_restored_timestamps(connection)
-            if rows != [("ok",)]:
-                raise ValueError("History database integrity check failed.")
+        if rows != [("ok",)]:
+            raise ValueError("History database integrity check failed.")
 
     def _build_history_snapshot_to_directory(self, target_dir: Path) -> Path | None:
         backup_path = self.store.create_backup(

@@ -226,6 +226,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_bulk_bounds",
         "test_history_hardware_scale",
         "test_history_runtime_damage_pause",
+        "test_import_validated_member",
         "test_interrupted_restore_recovery",
         "test_ipmi_duplicate_bays",
         "test_mapping_routes",
