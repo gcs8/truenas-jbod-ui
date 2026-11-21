@@ -247,6 +247,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_inventory_projection_split",
             "tests.test_inventory_registry_routes",
             "tests.test_inventory_status_error_text",
+            "tests.test_json_state_file_budget",
             "tests.test_log_noise",
             "tests.test_mapping_routes",
             "tests.test_metrics",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
@@ -11,6 +12,9 @@ from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_valid
 
 from app.models.domain import utcnow
 from app.services.atomic_write import write_atomically
+from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileTooLarge
+
+logger = logging.getLogger(__name__)
 
 # Mapping-owned state that caches written before #909 stored beside the disk's
 # hardware facts. It belongs to the mapping store and the live inventory, so a
@@ -78,7 +82,11 @@ class SlotDetailStore:
 
         try:
             with self.file_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+                payload = json.load(BudgetedJsonSource(handle, self.file_path.name))
+        except JsonStateFileTooLarge as exc:
+            # Read like an unreadable file, but say so: the cache is not served.
+            logger.warning("Slot detail cache %s not loaded: %s", self.file_path, exc)
+            return {}
         except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
 

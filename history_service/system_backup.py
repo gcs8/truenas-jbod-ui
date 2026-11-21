@@ -72,6 +72,7 @@ from app.config import (
     load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
+from app.services.json_state_budget import JsonStateFileTooLarge, check_json_state
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry
 from app.services.storage_views import resolve_system_storage_views
@@ -265,6 +266,11 @@ SENSITIVE_GROUP_KEYS: set[str] = {
 }
 STRUCTURED_YAML_GROUP_KEYS = frozenset(
     {CONFIG_FILE_KEY, RUNTIME_OVERRIDES_FILE_KEY, PROFILE_FILE_KEY}
+)
+# Members a store reads back whole after a restore, under the JSON state file
+# budget of app.services.json_state_budget.
+JSON_STATE_GROUP_KEYS = frozenset(
+    {MAPPING_FILE_KEY, SAS_FABRIC_ALIAS_FILE_KEY, SLOT_DETAIL_FILE_KEY}
 )
 
 
@@ -4051,6 +4057,11 @@ class SystemBackupService:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
             try:
                 content = extracted_members[member_key]
+                if group_key in JSON_STATE_GROUP_KEYS:
+                    # The whole-file budget the store applies when it reads
+                    # the restored file, so a member it would refuse is
+                    # refused here (#1286).
+                    self._check_json_state_member(content, str(member_entry["archive_path"]))
                 if group_key == HISTORY_DB_KEY:
                     validated[member_key] = self._validate_history_member(
                         content,
@@ -4084,6 +4095,11 @@ class SystemBackupService:
                     validator(self._extracted_member_bytes(content))
             except HistorySchemaVersionError as exc:
                 raise ValueError(exc.reason) from exc
+            except JsonStateFileTooLarge as exc:
+                raise ValueError(
+                    f"Backup bundle member {exc.name} is {exc.detail}, so the application "
+                    "would not load it after a restore."
+                ) from exc
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
@@ -4201,6 +4217,14 @@ class SystemBackupService:
             while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _check_json_state_member(content: ExtractedMember, name: str) -> None:
+        if isinstance(content, bytes):
+            check_json_state(io.BytesIO(content), name, size=len(content))
+            return
+        with content.open("rb", buffering=0) as source:
+            check_json_state(source, name)
 
     @staticmethod
     def _validate_streaming_json_member(

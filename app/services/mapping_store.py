@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import secrets
 import stat
@@ -23,6 +24,7 @@ from pydantic import ValidationError
 from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
 from app.services.config_change_journal import record_config_change
+from app.services.json_state_budget import JsonStateFileTooLarge, read_json_state
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
@@ -34,6 +36,8 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows is best effort; containers are Linux
     fcntl = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 _DRAWER_SUB_PROFILE_IDS = frozenset(
     sub_profile_id
@@ -253,6 +257,18 @@ class _SourceReplacedDuringRead(Exception):
     def __init__(self, original: OSError | None = None) -> None:
         super().__init__("Configured mapping source identity changed during open.")
         self.original = original
+
+
+class _DescriptorSource:
+    """The opened source descriptor as a ``read`` for the budgeted reader."""
+
+    __slots__ = ("descriptor",)
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor = descriptor
+
+    def read(self, size: int) -> bytes:
+        return os.read(self.descriptor, size)
 
 
 class _SourceNotRegular(OSError):
@@ -603,6 +619,12 @@ class MappingStore:
             raw = self._read_source_bytes()
         except _SourceNotRegular:
             raise
+        except JsonStateFileTooLarge as exc:
+            # Refused like unreadable JSON below, and named in the log (#1286).
+            logger.warning("Mapping file %s not loaded: %s", self.file_path, exc)
+            if strict:
+                raise MappingScopeConflict() from None
+            return 1, {}
         except OSError:
             if strict:
                 raise
@@ -696,13 +718,9 @@ class MappingStore:
                 or opened.st_ino != observed.st_ino
             ):
                 raise _SourceReplacedDuringRead()
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            return b"".join(chunks)
+            return read_json_state(
+                _DescriptorSource(descriptor), self.file_path.name, size=opened.st_size,
+            )
         except OSError as exc:
             if exc.errno is not None and exc.errno == getattr(errno, "ESTALE", None):
                 raise _SourceReplacedDuringRead(exc) from exc

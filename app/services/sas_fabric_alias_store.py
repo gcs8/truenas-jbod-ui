@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,12 +10,15 @@ from typing import Iterable
 from app.models.domain import SasFabricAlias
 from app.services.atomic_write import write_atomically
 from app.services.config_change_journal import record_config_change
+from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileTooLarge
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
     describe_capacity_failure,
     is_unwritable_error,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SasFabricAliasStorageUnwritable(StorageDirectoryUnwritable):
@@ -43,7 +47,10 @@ class SasFabricAliasStore:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:
             with handle:
-                payload = json.load(handle)
+                payload = json.load(BudgetedJsonSource(handle, self.file_path.name))
+        except JsonStateFileTooLarge as exc:
+            logger.warning("SAS Fabric alias store %s not loaded: %s", self.file_path, exc)
+            raise ValueError(f"{exc} No changes were saved.") from exc
         except (OSError, ValueError) as exc:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:

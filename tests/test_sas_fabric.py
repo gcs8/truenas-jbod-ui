@@ -2904,7 +2904,7 @@ class FabricAliasMutationRegressionTests(unittest.TestCase):
                 return self
             def __exit__(self, *args):
                 return False
-            def read(self):
+            def read(self, *_size):
                 raise FileNotFoundError("synthetic read failure after open")
         real_open = Path.open
         def fail_read(path, mode="r", *args, **kwargs):
