@@ -34,7 +34,7 @@ from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.ssh_probe import SSHCommandResult
 
-HEADER = "  SYNTH     BIGSHELF      0100\n  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+HEADER = "  SYNTH     BIGSHELF      0100\n"
 
 
 def join_page(count: int) -> str:
@@ -297,7 +297,8 @@ class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refused_readback_page_leaves_the_light_state_unknown(self) -> None:
         service = _service(self._temp.name)
-        identity = "  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+        # No logical identifier on either side: the shelf check compares None with None.
+        identity = "  SYNTH     BIGSHELF      0100\n"
 
         async def run_sequence(_host, commands, *, then=None):  # noqa: ANN001, ANN202
             preflight = [
@@ -322,7 +323,7 @@ class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
             "ses_device": "/dev/sg7",
             "ses_element_id": 1,
             "ses_slot_number": 2,
-            "enclosure_id": "5eeeeeee0000beef",
+            "enclosure_id": None,
         }
         with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
             result = await service._set_sg_ses_slot_led_over_ssh(slot, LedAction.identify, True, [target])
@@ -332,7 +333,8 @@ class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_readback_page_within_budget_confirms_the_light(self) -> None:
         service = _service(self._temp.name)
-        identity = "  Primary enclosure logical identifier (hex): 5eeeeeee0000beef\n"
+        # No logical identifier on either side: the shelf check compares None with None.
+        identity = "  SYNTH     BIGSHELF      0100\n"
         lit = ec_page(4).replace(
             "      Element 1 descriptor:\n        Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
             "        Ready to insert=0, RMV=0, Ident=0, Report=0\n",
@@ -359,7 +361,7 @@ class LedReadbackRefusalTests(unittest.IsolatedAsyncioTestCase):
             "ses_device": "/dev/sg7",
             "ses_element_id": 1,
             "ses_slot_number": 2,
-            "enclosure_id": "5eeeeeee0000beef",
+            "enclosure_id": None,
         }
         with mock.patch.object(parsers, "MAX_SES_ELEMENTS", 4):
             result = await service._set_sg_ses_slot_led_over_ssh(slot, LedAction.identify, True, [target])
