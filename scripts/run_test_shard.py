@@ -238,6 +238,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_demo_deterministic",
         "test_public_demo_fixture",
         "test_quantastor_api",
+        "test_quantastor_enclosure_options_limit",
         "test_quantastor_pool_device_scope",
         "test_quantastor_ses_projection",
         "test_quantastor_smart_admission",
