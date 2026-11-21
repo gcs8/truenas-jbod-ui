@@ -7,6 +7,7 @@ import logging
 import re
 import ssl
 import xml.etree.ElementTree as ET
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from http.client import HTTPException
 from typing import Any
@@ -42,6 +43,20 @@ REDFISH_ERROR_BODY_LIMIT = 64 * 1024
 # the count and the limit.
 BMC_MAX_CONTROLLERS = 64
 BMC_MAX_DRIVES_PER_CONTROLLER = 4096
+# #1309: the drive count of one whole BMC inventory, across all controllers
+# (and across the Redfish fallback resources). One BMC manages one host; this
+# is eight full 1,024-disk expanders. It bounds the drive and disk records one
+# inventory pass keeps in memory, which the two limits above do not.
+BMC_MAX_DRIVES_PER_INVENTORY = 8192
+# Every BMC reply body is read up to this many bytes and refused, unparsed, past
+# it. A drive record is about 600 bytes of XML, so the largest reply a
+# controller at its drive limit sends is about 2.5 MB; this admits 1,000 bytes
+# per drive there.
+BMC_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+# All web replies of one inventory pass together, sized the same way from the
+# inventory drive limit. It bounds what one pass keeps, however the replies are
+# shaped.
+BMC_MAX_INVENTORY_RESPONSE_BYTES = 12 * 1024 * 1024
 # A reported count is shown in a warning; past this it is shown as a bound.
 BMC_SHOWN_COUNT_LIMIT = 1_000_000
 DRIVE_LINK_SPEEDS = {
@@ -145,6 +160,40 @@ def _shown_count(count: int) -> str:
     if count > BMC_SHOWN_COUNT_LIMIT:
         return f"more than {BMC_SHOWN_COUNT_LIMIT:,}"
     return f"{count:,}"
+
+
+@dataclass(slots=True)
+class _ReplyByteBudget:
+    """Bytes the web replies of one inventory pass may still use."""
+
+    remaining: int
+
+
+_WEB_INVENTORY_BYTES: ContextVar[_ReplyByteBudget | None] = ContextVar("bmc_web_inventory_bytes", default=None)
+
+
+def _read_reply(response: Any, path: str) -> bytes:
+    """A BMC reply body, read no further than its byte limit; past it, refused unread."""
+
+    budget = _WEB_INVENTORY_BYTES.get()
+    limit = BMC_MAX_RESPONSE_BYTES if budget is None else min(BMC_MAX_RESPONSE_BYTES, budget.remaining)
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        if limit < BMC_MAX_RESPONSE_BYTES:
+            message = (
+                f"Supermicro BMC web inventory replies came to more than the supported "
+                f"{BMC_MAX_INVENTORY_RESPONSE_BYTES:,} bytes for one inventory; "
+                "the reply that passed it and any later one were not read."
+            )
+        else:
+            message = (
+                f"Supermicro BMC sent a reply larger than the supported {BMC_MAX_RESPONSE_BYTES:,} bytes; "
+                "it was not read, and nothing after it was requested."
+            )
+        raise LocalServiceError(message, category="response_invalid", method=path)
+    if budget is not None:
+        budget.remaining -= len(body)
+    return body
 
 
 def _log_bmc_failure(operation: str, exc: BaseException) -> None:
@@ -314,24 +363,42 @@ class SupermicroBMCService:
     def _populate_redfish_simple_storage_fallback(self, inventory: BMCInventory) -> None:
         for path in ("/redfish/v1/Systems/1/SimpleStorage/1", "/redfish/v1/Systems/1/SimpleStorage/2"):
             try:
-                drives = self._read_redfish_simple_storage(path)
+                drives = self._read_redfish_simple_storage(path, BMC_MAX_DRIVES_PER_INVENTORY - len(inventory.drives))
             except TrueNASAPIError as exc:
                 if exc.category == "response_invalid":
-                    # An unusable resource adds no drives, and says so (#1312).
+                    # An unusable resource adds no drives, and says so (#1312);
+                    # a limit this service applies says which one.
                     _log_bmc_failure("BMC Redfish storage fallback", exc)
-                    warning = "BMC Redfish storage fallback returned an unusable response."
+                    warning = (
+                        str(exc)
+                        if is_local_failure_message(exc)
+                        else "BMC Redfish storage fallback returned an unusable response."
+                    )
                     if warning not in inventory.warnings:
                         inventory.warnings.append(warning)
                 continue
             inventory.drives.extend(drives)
 
-    def _read_redfish_simple_storage(self, path: str) -> list[BMCDriveRecord]:
+    def _read_redfish_simple_storage(
+        self, path: str, drive_limit: int = BMC_MAX_DRIVES_PER_INVENTORY
+    ) -> list[BMCDriveRecord]:
         """One SimpleStorage resource's drives, all or none: a wrong-typed member is unusable."""
 
         payload = self._redfish_get_json(path)
         interface_type = _redfish_text(payload, "Description", path)
+        devices = _redfish_members(payload, "Devices", path)
+        if len(devices) > drive_limit:
+            already = BMC_MAX_DRIVES_PER_INVENTORY - drive_limit
+            raise LocalServiceError(
+                f"BMC Redfish storage fallback reported {len(devices):,} devices in one storage resource, "
+                f"which brings this inventory to {already + len(devices):,}, more than the supported "
+                f"{BMC_MAX_DRIVES_PER_INVENTORY:,} for one BMC; {already:,} drives were read before it, "
+                "and that resource was not read.",
+                category="response_invalid",
+                method=path,
+            )
         drives: list[BMCDriveRecord] = []
-        for index, device in enumerate(_redfish_members(payload, "Devices", path)):
+        for index, device in enumerate(devices):
             if not isinstance(device, dict):
                 continue
             name = _redfish_text(device, "Name", path)
@@ -361,6 +428,14 @@ class SupermicroBMCService:
 
     def _populate_web_inventory(self, inventory: BMCInventory) -> None:
         opener, csrf = self._open_web_session()
+        token = _WEB_INVENTORY_BYTES.set(_ReplyByteBudget(BMC_MAX_INVENTORY_RESPONSE_BYTES))
+        try:
+            self._read_web_inventory(inventory, opener, csrf)
+        finally:
+            _WEB_INVENTORY_BYTES.reset(token)
+
+    def _read_web_inventory(self, inventory: BMCInventory, opener, csrf: str) -> None:
+        drives_reported = 0
         ctrl_attr_root = self._post_web_xml(
             opener,
             csrf,
@@ -431,6 +506,15 @@ class SupermicroBMCService:
                     f"drives on that and any later controller were not read.",
                     category="response_invalid",
                 )
+            if drives_reported + len(drive_nodes) > BMC_MAX_DRIVES_PER_INVENTORY:
+                raise LocalServiceError(
+                    f"Supermicro BMC reported {len(drive_nodes):,} physical drives on controller {controller_id}, "
+                    f"which brings this inventory to {drives_reported + len(drive_nodes):,}, more than the supported "
+                    f"{BMC_MAX_DRIVES_PER_INVENTORY:,} for one BMC; the {drives_reported:,} drives on earlier "
+                    f"controllers were read, drives on that and any later controller were not read.",
+                    category="response_invalid",
+                )
+            drives_reported += len(drive_nodes)
             for physical_index, drive_node in enumerate(drive_nodes):
                 drive = self._parse_web_drive_node(controller_id, physical_index, drive_node)
                 if drive is not None:
@@ -511,7 +595,8 @@ class SupermicroBMCService:
         )
         try:
             with self._build_https_opener().open(request, timeout=self.config.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8", "replace"))
+                body = _read_reply(response, path)
+            payload = json.loads(body.decode("utf-8", "replace"))
         except HTTPError as exc:
             try:
                 with exc:
@@ -567,7 +652,7 @@ class SupermicroBMCService:
         )
         try:
             with opener.open(request, timeout=self.config.timeout_seconds) as response:
-                body = response.read().decode("utf-8", "replace")
+                body = _read_reply(response, SUPER_MICRO_LOGIN_PATH).decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
             category, code = classify_remote_failure(exc)
             raise TrueNASAPIError(
@@ -627,7 +712,7 @@ class SupermicroBMCService:
         )
         try:
             with opener.open(request, timeout=self.config.timeout_seconds) as response:
-                return response.read().decode("utf-8", "replace")
+                return _read_reply(response, path).decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
             category, code = classify_remote_failure(exc)
             raise TrueNASAPIError(
@@ -641,7 +726,7 @@ class SupermicroBMCService:
     def _fetch_web_text(self, opener, url: str) -> str:
         try:
             with opener.open(url, timeout=self.config.timeout_seconds) as response:
-                return response.read().decode("utf-8", "replace")
+                return _read_reply(response, urlsplit(url).path).decode("utf-8", "replace")
         except (HTTPError, URLError, OSError) as exc:
             category, code = classify_remote_failure(exc)
             raise TrueNASAPIError(
