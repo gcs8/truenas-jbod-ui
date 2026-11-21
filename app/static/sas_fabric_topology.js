@@ -2281,7 +2281,7 @@
       + notices
       + `<div class="fabric-topology-bar">${fitControl}${wide}</div>`
       + fitNotice
-      // The drawing, its trace band and the footer share one block: the band
+      // The drawing, its trace band and the footer share a block: the band
       // sticks inside it, so it never rises over Fit or the notices above
       // the drawing (#1378).
       + `<div class="fabric-topology-stage"><div class="fabric-topology-scroll">${svg}</div>`
