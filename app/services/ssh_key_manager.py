@@ -69,8 +69,7 @@ class SSHKeyManager:
             if not self._is_private_key_candidate(path):
                 continue
             try:
-                if stat.S_ISREG(path.lstat().st_mode):
-                    keys.append(self._describe_private_key(path))
+                keys.append(self._describe_private_key(path))
             except (ValueError, FileNotFoundError, PermissionError):
                 continue
             except OSError as exc:
@@ -128,9 +127,14 @@ class SSHKeyManager:
 
     def _describe_private_key(self, path: Path) -> dict[str, Any]:
         # Verify the opened file too: a directory entry may change during listing.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        entry = path.lstat()
+        if not stat.S_ISREG(entry.st_mode):
+            raise ValueError("File is not a regular private key.")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(entry, opened):
                 raise ValueError("File is not a regular private key.")
             private_key = self._load_private_key(handle.read())
         public_text = private_key.public_key().public_bytes(

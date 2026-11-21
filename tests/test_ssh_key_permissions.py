@@ -56,6 +56,14 @@ class SSHKeyPermissionTests(unittest.TestCase):
                         self.assertIn("chmod 640", warnings[0])
                         self.assertNotIn("synthetic contents", warnings[0])
 
+    def test_regular_keys_can_be_generated_and_listed_without_posix_open_flags(self):
+        portable_os = SimpleNamespace(O_RDONLY=os.O_RDONLY, open=os.open, fdopen=os.fdopen,
+                                      fstat=os.fstat, path=os.path)
+        manager = SSHKeyManager(self.settings.config_file)
+        with patch("app.services.ssh_key_manager.os", portable_os):
+            generated = manager.generate_keypair("portable")
+            self.assertEqual(manager.list_keys(), [generated])
+
     def test_configured_symlink_warns_without_offering_its_target_as_a_key(self):
         manager = SSHKeyManager(self.settings.config_file)
         generated = manager.generate_keypair("source")
