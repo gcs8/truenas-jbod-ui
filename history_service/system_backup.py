@@ -72,7 +72,11 @@ from app.config import (
     load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
-from app.services.json_state_budget import JsonStateFileTooLarge, check_json_state
+from app.services.json_state_budget import (
+    JsonStateFileRefused,
+    check_json_state,
+    read_json_state,
+)
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry
 from app.services.storage_views import resolve_system_storage_views
@@ -4095,12 +4099,17 @@ class SystemBackupService:
                     validator(self._extracted_member_bytes(content))
             except HistorySchemaVersionError as exc:
                 raise ValueError(exc.reason) from exc
-            except JsonStateFileTooLarge as exc:
+            except JsonStateFileRefused as exc:
                 raise ValueError(
                     f"Backup bundle member {exc.name} is {exc.detail}, so the application "
                     "would not load it after a restore."
                 ) from exc
-            except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
+            except (
+                UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError,
+                # Nesting deeper than the in-memory parser follows: invalid,
+                # as the file-backed validator's depth limit already says.
+                RecursionError,
+            ) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
                 ) from exc
@@ -4909,7 +4918,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.mapping_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -4924,7 +4935,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.sas_fabric_alias_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -4939,7 +4952,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.slot_detail_cache_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -7168,13 +7183,25 @@ class SystemBackupService:
             allow_unicode=False,
         ).encode("utf-8")
 
-    def _read_scrubbed_json_file(self, path: Path, scrubber: DebugScrubber | None) -> bytes:
+    def _read_scrubbed_json_file(
+        self, path: Path, scrubber: DebugScrubber | None, name: str,
+    ) -> bytes:
+        """Read one JSON state file snapshot under the stores' budget (#1286).
+
+        ``name`` is the state file's own name, for the operator-visible
+        refusal. Over budget, the snapshot is refused before it is parsed.
+        """
         if not path.exists():
             return b""
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if scrubber is not None:
-            payload = scrubber.scrub_payload(payload)
-        return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        with path.open("rb") as source:
+            raw = read_json_state(source, name)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            if scrubber is not None:
+                payload = scrubber.scrub_payload(payload)
+            return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        except RecursionError:
+            raise ValueError(f"{name} could not be read: its JSON is nested too deeply.") from None
 
     def _build_scrubbed_history_snapshot_file(
         self,

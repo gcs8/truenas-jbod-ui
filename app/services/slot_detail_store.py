@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_valid
 
 from app.models.domain import utcnow
 from app.services.atomic_write import write_atomically
-from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileTooLarge
+from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileRefused
 
 logger = logging.getLogger(__name__)
 
@@ -81,13 +81,15 @@ class SlotDetailStore:
             return {}
 
         try:
-            with self.file_path.open("r", encoding="utf-8") as handle:
+            # Binary, so the budget counts encoded bytes; decoded as UTF-8.
+            with self.file_path.open("rb") as handle:
                 payload = json.load(BudgetedJsonSource(handle, self.file_path.name))
-        except JsonStateFileTooLarge as exc:
+        except JsonStateFileRefused as exc:
             # Read like an unreadable file, but say so: the cache is not served.
             logger.warning("Slot detail cache %s not loaded: %s", self.file_path, exc)
             return {}
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+            # Nesting deeper than the parser follows is unreadable too.
             return {}
 
         if not isinstance(payload, dict):

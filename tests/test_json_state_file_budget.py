@@ -14,16 +14,22 @@ and passes validation.
 from __future__ import annotations
 
 import io
+import json
 import logging
+import os
 import shutil
+import stat
 import tempfile
+import threading
 import unittest
+import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from app.config import PathConfig, Settings
 from app.models.domain import SasFabricAlias
 from app.services.mapping_store import MappingScopeConflict, MappingStore
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
@@ -35,6 +41,8 @@ from history_service.system_backup import (
     SLOT_DETAIL_FILE_KEY,
     SystemBackupService,
 )
+from history_service.config import HistorySettings
+from history_service.store import HistoryStore
 from tests import heap_probe
 
 # The budget these tests are written against. The first test pins it to the
@@ -461,6 +469,385 @@ class LoadAndCheckAgreeTests(_TempDirTestCase):
                         budget.check_json_state(io.BytesIO(document), "state.json")
                 with mock.patch.object(budget, "MAX_JSON_STATE_FILE_ITEMS", items):
                     budget.check_json_state(io.BytesIO(document), "state.json")
+
+
+def _debug_service(root: Path) -> SystemBackupService:
+    """A backup service whose state files live under ``root``."""
+    settings = Settings(
+        paths=PathConfig(
+            mapping_file=str(root / "slot_mappings.json"),
+            sas_fabric_alias_file=str(root / "sas_fabric_aliases.json"),
+            slot_detail_cache_file=str(root / "slot_detail_cache.json"),
+            profile_file=str(root / "profiles.yaml"),
+            runtime_overrides_file=str(root / "runtime-overrides.yaml"),
+            log_file=str(root / "app.log"),
+        ),
+    )
+    history_path = root / "history.db"
+    return SystemBackupService(
+        HistorySettings(
+            sqlite_path=str(history_path),
+            backup_dir=str(root / "history-backups"),
+            startup_grace_seconds=0,
+        ),
+        HistoryStore(str(history_path)),
+        settings,
+    )
+
+
+DEBUG_GROUPS = (
+    (MAPPING_FILE_KEY, "slot_mappings.json", MAPPING_SMALL),
+    (SAS_FABRIC_ALIAS_FILE_KEY, "sas_fabric_aliases.json", SAS_ALIAS_SMALL),
+    (SLOT_DETAIL_FILE_KEY, "slot_detail_cache.json", SLOT_DETAIL_SMALL),
+)
+
+
+class DebugBundleBudgetTests(_TempDirTestCase):
+    """The debug bundle reads the same state files and must apply the same budget."""
+
+    def _export(self, service: SystemBackupService, group_key: str, *, scrub: bool) -> Any:
+        return service.export_debug_bundle_to_file(
+            packaging="zip",
+            included_paths=[group_key],
+            scrub_secrets=scrub,
+            scrub_disk_identifiers=scrub,
+        )
+
+    def test_each_selected_state_file_over_the_budget_is_refused_before_parsing(self) -> None:
+        budget = _budget_module()
+        service = _debug_service(self.temp_dir)
+        for group_key, file_name, document in DEBUG_GROUPS:
+            path = self.temp_dir / file_name
+            path.write_bytes(document)
+            items = _counted_items(document)
+            for limit_name, limit, unit in (
+                ("MAX_JSON_STATE_FILE_ITEMS", items - 1, "keys and values"),
+                ("MAX_JSON_STATE_FILE_BYTES", len(document) - 1, "bytes"),
+            ):
+                for scrub in (False, True):
+                    with self.subTest(group_key=group_key, limit=limit_name, scrub=scrub), \
+                            mock.patch.object(budget, limit_name, limit), \
+                            mock.patch("history_service.system_backup.json.loads", wraps=json.loads) as loads:
+                        with self.assertRaises(ValueError) as raised:
+                            self._export(service, group_key, scrub=scrub).cleanup()
+                        self.assertEqual(
+                            str(raised.exception),
+                            f"{file_name} is over the limit of {limit:,} {unit} for a JSON state file "
+                            "and was not read.",
+                        )
+                        self.assertNotIn(str(self.temp_dir), str(raised.exception))
+                        self.assertEqual(loads.call_count, 0, "the over-budget file was parsed")
+
+    def test_each_selected_state_file_at_the_budget_is_exported(self) -> None:
+        budget = _budget_module()
+        service = _debug_service(self.temp_dir)
+        for group_key, file_name, document in DEBUG_GROUPS:
+            path = self.temp_dir / file_name
+            path.write_bytes(document)
+            with self.subTest(group_key=group_key), \
+                    mock.patch.object(budget, "MAX_JSON_STATE_FILE_ITEMS", _counted_items(document)), \
+                    mock.patch.object(budget, "MAX_JSON_STATE_FILE_BYTES", len(document)):
+                artifact = self._export(service, group_key, scrub=False)
+                try:
+                    with zipfile.ZipFile(artifact.path) as archive:
+                        member = str(BACKUP_GROUP_METADATA[group_key]["archive_root"])
+                        self.assertEqual(json.loads(archive.read(member)), json.loads(document))
+                finally:
+                    artifact.cleanup()
+
+    def test_issue_shaped_slot_detail_file_is_refused_within_the_heap_budget(self) -> None:
+        service = _debug_service(self.temp_dir)
+        path = self.temp_dir / "slot_detail_cache.json"
+        _write_bulk(path, SLOT_DETAIL_ONE_ENTRY_HEAD, FILE_ITEM_LIMIT, SLOT_DETAIL_ONE_ENTRY_TAIL)
+
+        def export() -> str:
+            with self.assertRaises(ValueError) as raised:
+                self._export(service, SLOT_DETAIL_FILE_KEY, scrub=False).cleanup()
+            return str(raised.exception)
+
+        message, peak = self._peak_while(export)
+        self.assertIn("slot_detail_cache.json is over the limit", message)
+        self.assertLess(peak, path.stat().st_size + REFUSAL_HEAP_SLACK_BYTES)
+
+
+# A slot detail document whose serial is multibyte UTF-8: more bytes than
+# characters, so a budget that counts characters admits more than its limit.
+MULTIBYTE_SERIAL = "\u00e9" * 20
+MULTIBYTE_SLOT_DETAIL = (
+    '{"version":1,"slot_details":{"system-a:enclosure-a:0":{"system_id":"system-a",'
+    '"enclosure_id":"enclosure-a","slot":0,"slot_fields":{"serial":"' + MULTIBYTE_SERIAL + '"}}}}'
+).encode("utf-8")
+MULTIBYTE_SAS_ALIAS = (
+    '{"version":1,"sas_fabric_aliases":{"system-a:system:expander-1":{"system_id":"system-a",'
+    '"object_id":"expander-1","label":"' + MULTIBYTE_SERIAL + '"}}}'
+).encode("utf-8")
+
+
+@contextmanager
+def _fifo_feeding(path: Path, data: bytes) -> Iterator[None]:
+    """A FIFO at ``path`` that a writer fills with ``data`` once a reader opens it."""
+    os.mkfifo(path)
+
+    def feed() -> None:
+        try:
+            descriptor = os.open(path, os.O_WRONLY)
+        except OSError:
+            return
+        try:
+            os.write(descriptor, data)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    try:
+        yield
+    finally:
+        if writer.is_alive():
+            # Release a writer still waiting for a reader.
+            try:
+                os.close(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        writer.join(5)
+
+
+@contextmanager
+def _grows_after_fstat(path: Path, growth: bytes) -> Iterator[None]:
+    """Append ``growth`` to ``path`` right after the first ``fstat`` of it."""
+    real_fstat = os.fstat
+    target = path.stat().st_ino
+    grown = []
+
+    def fstat(descriptor: int) -> os.stat_result:
+        result = real_fstat(descriptor)
+        if not grown and result.st_ino == target:
+            grown.append(True)
+            with path.open("ab") as output:
+                output.write(growth)
+        return result
+
+    with mock.patch.object(os, "fstat", fstat):
+        yield
+    if not grown:
+        raise AssertionError("the reader never took the file's size")
+
+
+class EncodedByteCountTests(_TempDirTestCase):
+    """The budget counts encoded bytes read, not characters or a stale size."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFOs need a POSIX host")
+
+    def test_a_character_stream_is_not_counted_as_bytes(self) -> None:
+        budget = _budget_module()
+        with self.assertRaises(TypeError):
+            budget.read_json_state(io.StringIO('{"a":1}'), "state.json")
+
+    def test_slot_detail_store_refuses_a_multibyte_fifo_under_a_character_limit(self) -> None:
+        budget = _budget_module()
+        path = self.temp_dir / "slot_detail_cache.json"
+        characters = len(MULTIBYTE_SLOT_DETAIL.decode("utf-8"))
+        self.assertGreater(len(MULTIBYTE_SLOT_DETAIL), characters)
+        store = SlotDetailStore(str(path))
+        with _fifo_feeding(path, MULTIBYTE_SLOT_DETAIL), \
+                mock.patch.object(budget, "MAX_JSON_STATE_FILE_BYTES", characters), \
+                _captured_warnings("app.services.slot_detail_store") as warnings:
+            loaded = store.load_all()
+        self.assertEqual(loaded, {})
+        self.assertTrue(
+            any(path.name in message and "not a regular file" in message for message in warnings), warnings,
+        )
+
+    def test_slot_detail_store_refuses_a_file_that_shrank_after_fstat(self) -> None:
+        # What is left is a complete document, but not the file whose size
+        # was checked.
+        path = self.temp_dir / "slot_detail_cache.json"
+        path.write_bytes(SLOT_DETAIL_SMALL + b" " * 64)
+        real_fstat = os.fstat
+        target = path.stat().st_ino
+
+        def fstat(descriptor: int) -> os.stat_result:
+            result = real_fstat(descriptor)
+            if result.st_ino == target:
+                os.truncate(path, len(SLOT_DETAIL_SMALL))
+            return result
+
+        store = SlotDetailStore(str(path))
+        with _captured_warnings("app.services.slot_detail_store") as warnings, \
+                mock.patch.object(os, "fstat", fstat):
+            loaded = store.load_all()
+        self.assertEqual(loaded, {})
+        self.assertTrue(any("smaller than when it was opened" in message for message in warnings), warnings)
+        self.assertEqual(list(store.load_all()), ["system-a:enclosure-a:0"])
+
+    def test_sas_alias_store_refuses_a_multibyte_fifo_under_a_character_limit(self) -> None:
+        budget = _budget_module()
+        path = self.temp_dir / "sas_fabric_aliases.json"
+        characters = len(MULTIBYTE_SAS_ALIAS.decode("utf-8"))
+        store = SasFabricAliasStore(path)
+        with _fifo_feeding(path, MULTIBYTE_SAS_ALIAS), \
+                mock.patch.object(budget, "MAX_JSON_STATE_FILE_BYTES", characters), \
+                _captured_warnings("app.services.sas_fabric_alias_store"):
+            with self.assertRaisesRegex(ValueError, "No changes were saved"):
+                store.save_alias(SasFabricAlias(system_id="system-a", object_id="expander-2", label="Shelf B"))
+        self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode), "the refused save replaced the source")
+
+    def test_mapping_store_refuses_a_fifo(self) -> None:
+        # Control: the mapping store already refused anything not a regular file.
+        path = self.temp_dir / "slot_mappings.json"
+        os.mkfifo(path)
+        with self.assertRaises(OSError):
+            MappingStore(path).load_read_snapshot()
+
+    def _assert_grown_file_refused_by_store_and_check(self, *, limit: int) -> None:
+        budget = _budget_module()
+        path = self.temp_dir / "slot_detail_cache.json"
+        split = MULTIBYTE_SLOT_DETAIL.index(MULTIBYTE_SERIAL.encode("utf-8"))
+        path.write_bytes(MULTIBYTE_SLOT_DETAIL[:split])
+        store = SlotDetailStore(str(path))
+        with mock.patch.object(budget, "MAX_JSON_STATE_FILE_BYTES", limit), \
+                _captured_warnings("app.services.slot_detail_store") as warnings:
+            with _grows_after_fstat(path, MULTIBYTE_SLOT_DETAIL[split:]):
+                loaded = store.load_all()
+            self.assertEqual(path.read_bytes(), MULTIBYTE_SLOT_DETAIL)
+            self.assertEqual(loaded, {}, "the store read past the size it checked")
+            self.assertTrue(any(path.name in message for message in warnings), warnings)
+            # The same bytes, read whole, without the growth: same store
+            # verdict as backup validation of those bytes.
+            store_verdict = bool(store.load_all())
+            check_verdicts = []
+            for content in (path, path.read_bytes()):
+                try:
+                    _preflight(SLOT_DETAIL_FILE_KEY, content)
+                    check_verdicts.append(True)
+                except ValueError:
+                    check_verdicts.append(False)
+        self.assertEqual(check_verdicts, [store_verdict, store_verdict])
+        self.assertEqual(store_verdict, len(MULTIBYTE_SLOT_DETAIL) <= limit)
+
+    def test_slot_detail_store_refuses_a_file_grown_past_the_byte_limit_after_fstat(self) -> None:
+        # Character count is at the limit; the encoded bytes are over it.
+        self._assert_grown_file_refused_by_store_and_check(
+            limit=len(MULTIBYTE_SLOT_DETAIL.decode("utf-8")),
+        )
+
+    def test_slot_detail_store_refuses_a_file_that_changed_size_after_fstat(self) -> None:
+        # Within every limit, but not the file whose size was checked.
+        self._assert_grown_file_refused_by_store_and_check(limit=FILE_BYTE_LIMIT)
+
+    def test_mapping_store_rereads_a_file_that_changed_size_after_fstat(self) -> None:
+        # Control: the mapping store re-reads a changed source and loads the
+        # complete document, as it did before.
+        path = self.temp_dir / "slot_mappings.json"
+        split = len(MAPPING_SMALL) // 2
+        path.write_bytes(MAPPING_SMALL[:split])
+        with _grows_after_fstat(path, MAPPING_SMALL[split:]):
+            try:
+                loaded = MappingStore(path).load_read_snapshot()
+            except MappingScopeConflict:
+                self.fail("a size change was refused instead of re-read")
+        self.assertEqual(len(loaded), 1)
+
+    def test_slot_detail_store_reads_no_further_than_the_size_it_checked(self) -> None:
+        path = self.temp_dir / "slot_detail_cache.json"
+        path.write_bytes(SLOT_DETAIL_SMALL)
+        growth = b" " * (4 * REFUSAL_HEAP_SLACK_BYTES)
+        store = SlotDetailStore(str(path))
+        with _captured_warnings("app.services.slot_detail_store") as warnings, \
+                _grows_after_fstat(path, growth):
+            loaded, peak = self._peak_while(store.load_all)
+        self.assertEqual(loaded, {})
+        self.assertLess(peak, REFUSAL_HEAP_SLACK_BYTES, "the store read the growth")
+        self.assertTrue(any("larger than when it was opened" in message for message in warnings), warnings)
+
+
+# Valid JSON well inside both limits, nested deeper than the parser recurses.
+DEEP_DEPTH = 100_000
+DEEP_ARRAY = b"[" * DEEP_DEPTH + b"]" * DEEP_DEPTH
+
+
+def _deep_member(head: bytes, tail: bytes) -> bytes:
+    return head + DEEP_ARRAY + tail
+
+
+class DeeplyNestedJsonTests(_TempDirTestCase):
+    """Nesting the parser cannot follow is an unreadable file, never an escape."""
+
+    def _call(self, action: Any) -> Any:
+        try:
+            return action()
+        except RecursionError:
+            self.fail("RecursionError escaped the public boundary")
+
+    def test_slot_detail_store_reads_deep_files_as_unreadable(self) -> None:
+        path = self.temp_dir / "slot_detail_cache.json"
+        for document in (DEEP_ARRAY, _deep_member(SLOT_DETAIL_ONE_ENTRY_HEAD, SLOT_DETAIL_ONE_ENTRY_TAIL)):
+            with self.subTest(size=len(document)):
+                path.write_bytes(document)
+                self.assertEqual(self._call(SlotDetailStore(str(path)).load_all), {})
+
+    def test_sas_alias_store_refuses_deep_files(self) -> None:
+        path = self.temp_dir / "sas_fabric_aliases.json"
+        for document in (DEEP_ARRAY, _deep_member(SAS_ALIAS_HEAD, PADDING_TAIL)):
+            with self.subTest(size=len(document)):
+                path.write_bytes(document)
+                store = SasFabricAliasStore(path)
+                self.assertEqual(self._call(store.load_all), {})
+                with self.assertRaisesRegex(ValueError, "Cannot read the authoritative SAS Fabric alias store"):
+                    self._call(lambda: store.save_alias(
+                        SasFabricAlias(system_id="system-a", object_id="expander-2", label="Shelf B")
+                    ))
+                self.assertEqual(path.read_bytes(), document)
+
+    def test_mapping_store_refuses_deep_files_and_deep_keys(self) -> None:
+        path = self.temp_dir / "slot_mappings.json"
+        deep_key = (
+            b'{"version":2,"slot_mappings":{"v2:' + DEEP_ARRAY + b'":{"system_id":"system-a",'
+            b'"enclosure_id":"enclosure-a","slot":0,"serial":"SYN-0001"}}}'
+        )
+        for document in (DEEP_ARRAY, _deep_member(MAPPING_HEAD, PADDING_TAIL), deep_key):
+            with self.subTest(size=len(document)):
+                path.write_bytes(document)
+                store = MappingStore(path)
+                with self.assertRaises(MappingScopeConflict):
+                    self._call(store.load_read_snapshot)
+                if document is not deep_key:
+                    self.assertEqual(dict(self._call(store.load_all)), {})
+
+    def test_backup_preflight_refuses_deep_members_the_same_way_from_file_and_memory(self) -> None:
+        for group_key, head, tail in (
+            (SLOT_DETAIL_FILE_KEY, SLOT_DETAIL_ONE_ENTRY_HEAD, SLOT_DETAIL_ONE_ENTRY_TAIL),
+            (SAS_FABRIC_ALIAS_FILE_KEY, SAS_ALIAS_HEAD, PADDING_TAIL),
+            (MAPPING_FILE_KEY, MAPPING_HEAD, PADDING_TAIL),
+        ):
+            for document in (DEEP_ARRAY, _deep_member(head, tail)):
+                with self.subTest(group_key=group_key, size=len(document)):
+                    path = self.temp_dir / f"{group_key}.json"
+                    path.write_bytes(document)
+                    messages = []
+                    for content in (path, document):
+                        with self.assertRaises(ValueError) as raised:
+                            self._call(lambda: _preflight(group_key, content))
+                        messages.append(str(raised.exception))
+                    self.assertEqual(messages[0], messages[1])
+                    self.assertEqual(messages[0], f"Backup bundle selected {group_key} member is invalid.")
+
+    def test_debug_bundle_refuses_deep_state_files(self) -> None:
+        service = _debug_service(self.temp_dir)
+        for group_key, file_name, _document in DEBUG_GROUPS:
+            (self.temp_dir / file_name).write_bytes(DEEP_ARRAY)
+            for scrub in (False, True):
+                with self.subTest(group_key=group_key, scrub=scrub):
+                    with self.assertRaisesRegex(ValueError, f"^{file_name} could not be read"):
+                        self._call(lambda: service.export_debug_bundle_to_file(
+                            packaging="zip", included_paths=[group_key],
+                            scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                        ).cleanup())
 
 
 @contextmanager

@@ -24,7 +24,11 @@ from pydantic import ValidationError
 from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
 from app.services.config_change_journal import record_config_change
-from app.services.json_state_budget import JsonStateFileTooLarge, read_json_state
+from app.services.json_state_budget import (
+    JsonStateFileChanged,
+    JsonStateFileRefused,
+    read_json_state,
+)
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
@@ -504,7 +508,7 @@ class MappingStore:
         encoded = key[3:]
         try:
             decoded = json.loads(encoded)
-        except (json.JSONDecodeError, UnicodeError):
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
             raise MappingScopeConflict() from None
         if not isinstance(decoded, list) or len(decoded) != 3:
             raise MappingScopeConflict()
@@ -619,7 +623,7 @@ class MappingStore:
             raw = self._read_source_bytes()
         except _SourceNotRegular:
             raise
-        except JsonStateFileTooLarge as exc:
+        except JsonStateFileRefused as exc:
             # Refused like unreadable JSON below, and named in the log (#1286).
             logger.warning("Mapping file %s not loaded: %s", self.file_path, exc)
             if strict:
@@ -636,7 +640,8 @@ class MappingStore:
                 raw.decode("utf-8"),
                 object_pairs_hook=self._reject_duplicate_object_keys,
             )
-        except (UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            # Nesting deeper than the parser follows is unreadable JSON too.
             if strict:
                 raise MappingScopeConflict() from None
             return 1, {}
@@ -718,9 +723,13 @@ class MappingStore:
                 or opened.st_ino != observed.st_ino
             ):
                 raise _SourceReplacedDuringRead()
-            return read_json_state(
-                _DescriptorSource(descriptor), self.file_path.name, size=opened.st_size,
-            )
+            try:
+                return read_json_state(
+                    _DescriptorSource(descriptor), self.file_path.name, size=opened.st_size,
+                )
+            except JsonStateFileChanged:
+                # Not the size it had when opened: a change met mid-read.
+                raise _SourceReplacedDuringRead() from None
         except OSError as exc:
             if exc.errno is not None and exc.errno == getattr(errno, "ESTALE", None):
                 raise _SourceReplacedDuringRead(exc) from exc

@@ -10,7 +10,7 @@ from typing import Iterable
 from app.models.domain import SasFabricAlias
 from app.services.atomic_write import write_atomically
 from app.services.config_change_journal import record_config_change
-from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileTooLarge
+from app.services.json_state_budget import BudgetedJsonSource, JsonStateFileRefused
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
@@ -40,7 +40,8 @@ class SasFabricAliasStore:
 
     def _load_authoritative(self) -> dict[str, SasFabricAlias]:
         try:
-            handle = self.file_path.open("r", encoding="utf-8")
+            # Binary, so the budget counts encoded bytes; decoded as UTF-8.
+            handle = self.file_path.open("rb")
         except FileNotFoundError:
             return {}
         except OSError as exc:
@@ -48,10 +49,10 @@ class SasFabricAliasStore:
         try:
             with handle:
                 payload = json.load(BudgetedJsonSource(handle, self.file_path.name))
-        except JsonStateFileTooLarge as exc:
+        except JsonStateFileRefused as exc:
             logger.warning("SAS Fabric alias store %s not loaded: %s", self.file_path, exc)
             raise ValueError(f"{exc} No changes were saved.") from exc
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
         try:
             if not isinstance(payload, dict) or not isinstance(payload.get("sas_fabric_aliases"), dict):

@@ -2799,7 +2799,7 @@ class FabricAliasMutationRegressionTests(unittest.TestCase):
         before = self.path.read_bytes()
         real_open = Path.open
         def fail_read(path, mode="r", *args, **kwargs):
-            if path == self.path and mode == "r":
+            if path == self.path and mode in ("r", "rb"):
                 raise OSError("synthetic read failure")
             return real_open(path, mode, *args, **kwargs)
         for label in (None, "New name"):
@@ -2908,7 +2908,7 @@ class FabricAliasMutationRegressionTests(unittest.TestCase):
                 raise FileNotFoundError("synthetic read failure after open")
         real_open = Path.open
         def fail_read(path, mode="r", *args, **kwargs):
-            if path == self.path and mode == "r":
+            if path == self.path and mode in ("r", "rb"):
                 return FailedRead()
             return real_open(path, mode, *args, **kwargs)
         for label in (None, "New name"):

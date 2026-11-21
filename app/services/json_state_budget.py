@@ -1,119 +1,151 @@
 """Whole-file read budget for the application's JSON state files (#1286).
 
 The slot detail cache, the SAS Fabric alias store and the mapping store are
-small JSON files that a backup restores as the archive held them and that the
-application then reads in one piece. Many small values cost far more as Python
-objects than as text, so the file size alone does not bound what a read
-builds. Every read of one of these files goes through this module, which
-refuses a file over either limit while reading it, before anything is built.
-Backup validation runs the same scan on the archive member, so a member the
-application would refuse to load is refused at restore.
+small JSON files that a backup restores as the archive held them and that
+the application then reads in one piece (as does a debug bundle that
+includes them). Many small values cost far more as Python objects than as
+text, so the file size alone does not bound what a read builds. Every read
+of one of these files goes through this module, which refuses a file over
+either limit while reading it, before anything is built. Backup validation
+runs the same scan on the archive member, so a member the application would
+refuse to load is refused at restore.
 
-The item count is taken from the file's text as it is read: one plus the number of commas,
-colons, ``{`` and ``[``. In valid JSON each key has exactly one colon and a
-container with k > 0 children has k - 1 commas, so this bounds the number of
-keys plus values from above; separators inside strings only add to it.
+Files are read as bytes and the budget counts the bytes each read returns,
+so multibyte text cannot pass a byte limit as characters, and a file is read
+only to the size it had when opened: one that is not a regular file, or that
+changes size while it is read, is refused like an unreadable file.
 
-Sizing: the largest slot detail entry the inventory writes (every stable slot
-and SMART field, a two-path multipath block) is about 3 KB and 155 counted
-items in the stored format. Sixteen fully populated 1,024-disk expanders of
-those (16,384 bays) come to about 49 MB and 2.5 million items; the limits
-admit about 22,000. Under them a read builds at most a few hundred MB even of
-the costliest values (about 300 MB for 4 million empty objects), where before
-it was bounded only by the archive member limit.
+The item count is taken from the file's bytes as they are read: one plus the
+number of commas, colons, ``{`` and ``[``. In valid JSON each key has
+exactly one colon and a container with k > 0 children has k - 1 commas, so
+this bounds the number of keys plus values from above; separators inside
+strings only add to it.
+
+Sizing: the largest slot detail entry the inventory writes (every stable
+slot and SMART field, a two-path multipath block) is about 3 KB and 155
+counted items in the stored format. Sixteen fully populated 1,024-disk
+expanders of those (16,384 bays) come to about 49 MB and 2.5 million items;
+the limits admit about 22,000. Under them a read builds at most a few
+hundred MB even of the costliest values (about 300 MB for 4 million empty
+objects), where before it was bounded only by the archive member limit.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, AnyStr, IO
+import stat
+from typing import Any, IO
 
 MAX_JSON_STATE_FILE_BYTES = 64 * 1024 * 1024
 MAX_JSON_STATE_FILE_ITEMS = 4 * 1024 * 1024
 JSON_STATE_READ_CHUNK_BYTES = 1024 * 1024
 _ITEM_MARKERS = (b",", b":", b"{", b"[")
-_TEXT_ITEM_MARKERS = (",", ":", "{", "[")
 
 
-class JsonStateFileTooLarge(ValueError):
-    """A JSON state file is over the whole-file budget and was not read.
+class JsonStateFileRefused(ValueError):
+    """A JSON state file was not read: over the budget, or not a stable file.
 
     ``name`` is what the caller called the file (a file name or an archive
-    path, never a host path in public text); ``detail`` names the limit.
+    path, never a host path in public text); ``detail`` says why.
     """
 
-    def __init__(self, name: str, limit: int, unit: str) -> None:
+    def __init__(self, name: str, detail: str) -> None:
         self.name = name
+        self.detail = detail
+        super().__init__(f"{name} is {detail} and was not read.")
+
+
+class JsonStateFileTooLarge(JsonStateFileRefused):
+    """A JSON state file is over the whole-file budget and was not read."""
+
+    def __init__(self, name: str, limit: int, unit: str) -> None:
         self.limit = limit
         self.unit = unit
-        self.detail = f"over the limit of {limit:,} {unit} for a JSON state file"
-        super().__init__(f"{name} is {self.detail} and was not read.")
+        super().__init__(name, f"over the limit of {limit:,} {unit} for a JSON state file")
 
 
-def _size_hint(source: Any) -> int | None:
+class JsonStateFileChanged(JsonStateFileRefused):
+    """The source is not a regular file, or not the size it had when opened."""
+
+
+def _regular_size(source: Any, name: str) -> int | None:
+    """The size of an open regular file; refuse any other kind of file.
+
+    ``None`` when ``source`` has no descriptor (an in-memory buffer).
+    """
     try:
-        return os.fstat(source.fileno()).st_size
+        descriptor = source.fileno()
     except (AttributeError, OSError, ValueError):
         return None
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise JsonStateFileChanged(name, "not a regular file")
+    return metadata.st_size
 
 
-def _scan(source: IO[AnyStr], name: str, *, retain: bool, size: int | None) -> AnyStr | None:
+def _scan(source: IO[bytes], name: str, *, retain: bool, size: int | None) -> bytes | None:
     """Read ``source`` to its end under the budget; keep the chunks if ``retain``.
 
-    A text source is limited by characters while reading and by bytes through
-    its file size. Markers are ASCII, so a UTF-8 file counts the same items as
-    text and as bytes.
+    The budget counts the encoded bytes each read returns, so a source must be
+    binary. A source with a known size (the caller's own ``fstat``, else this
+    one's) is read to exactly that size: a source that returns more or fewer
+    bytes changed while it was read and is refused, never read past its
+    checked size.
     """
     max_bytes = MAX_JSON_STATE_FILE_BYTES
     max_items = MAX_JSON_STATE_FILE_ITEMS
     if size is None:
-        size = _size_hint(source)
+        size = _regular_size(source, name)
     if size is not None and size > max_bytes:
         raise JsonStateFileTooLarge(name, max_bytes, "bytes")
-    chunks: list[Any] = []
+    limit = max_bytes if size is None else size
+    chunks: list[bytes] = []
     total = 0
     items = 1
     while True:
-        chunk = source.read(min(JSON_STATE_READ_CHUNK_BYTES, max_bytes + 1 - total))
+        chunk = source.read(min(JSON_STATE_READ_CHUNK_BYTES, limit + 1 - total))
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TypeError("A JSON state file is read as bytes, so its budget counts bytes.")
         if not chunk:
             break
         total += len(chunk)
-        if total > max_bytes:
-            raise JsonStateFileTooLarge(name, max_bytes, "bytes")
-        markers: tuple[Any, ...] = _TEXT_ITEM_MARKERS if isinstance(chunk, str) else _ITEM_MARKERS
-        items += sum(chunk.count(marker) for marker in markers)
+        if total > limit:
+            if size is None:
+                raise JsonStateFileTooLarge(name, max_bytes, "bytes")
+            raise JsonStateFileChanged(name, "larger than when it was opened")
+        items += sum(chunk.count(marker) for marker in _ITEM_MARKERS)
         if items > max_items:
             raise JsonStateFileTooLarge(name, max_items, "keys and values")
         if retain:
-            chunks.append(chunk)
-    if not retain:
-        return None
-    if chunks and isinstance(chunks[0], str):
-        return "".join(chunks)  # type: ignore[return-value]
-    return b"".join(chunks)  # type: ignore[return-value]
+            chunks.append(bytes(chunk))
+    if size is not None and total != size:
+        raise JsonStateFileChanged(name, "smaller than when it was opened")
+    return b"".join(chunks) if retain else None
 
 
-def read_json_state(source: IO[AnyStr], name: str, *, size: int | None = None) -> AnyStr:
-    """Return all of ``source``, or raise ``JsonStateFileTooLarge``.
+def read_json_state(source: IO[bytes], name: str, *, size: int | None = None) -> bytes:
+    """Return all of binary ``source``, or raise ``JsonStateFileRefused``.
 
-    ``size`` is the caller's own ``fstat`` size, when it has one; otherwise it
-    is taken from ``source``. Either way the read itself is bounded too.
+    ``size`` is the caller's own ``fstat`` size of a file it has already
+    checked is regular; otherwise the size and kind are taken from ``source``.
+    Either way the bytes read are counted too.
     """
     data = _scan(source, name, retain=True, size=size)
     assert data is not None
     return data
 
 
-def check_json_state(source: IO[Any], name: str, *, size: int | None = None) -> None:
+def check_json_state(source: IO[bytes], name: str, *, size: int | None = None) -> None:
     """Apply the same budget as ``read_json_state`` without keeping the data."""
     _scan(source, name, retain=False, size=size)
 
 
 class BudgetedJsonSource:
-    """An open state file handed to ``json.load`` through the budget.
+    """An open binary state file handed to ``json.load`` through the budget.
 
-    ``read()`` returns the whole file or raises ``JsonStateFileTooLarge``
-    before anything is parsed.
+    ``read()`` returns the whole file decoded as UTF-8, as a UTF-8 text-mode
+    read would, or raises ``JsonStateFileRefused`` before anything is decoded
+    or parsed. The budget counts the encoded bytes the handle returns.
     """
 
     def __init__(self, handle: IO[Any], name: str) -> None:
@@ -124,5 +156,5 @@ class BudgetedJsonSource:
     def name(self) -> Any:
         return getattr(self._handle, "name", self._label)
 
-    def read(self, _size: int = -1) -> Any:
-        return read_json_state(self._handle, self._label)
+    def read(self, _size: int = -1) -> str:
+        return read_json_state(self._handle, self._label).decode("utf-8")
