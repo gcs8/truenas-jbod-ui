@@ -584,7 +584,10 @@ OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
 SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
-QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
+# Output-runaway bound on QuantaStor enclosure choices across all listed
+# storage systems, far above real node and shelf counts. Reaching it is shown on
+# the page with the read and omitted counts (#1307).
+QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 4096
 SNAPSHOT_STATE_MAX_ENTRIES = 64
 # Locate presses each open their own short SSH login, separate from the
 # inventory session (#926). Bound them per host so a burst of presses cannot
@@ -998,6 +1001,20 @@ class _QuantastorCliDiskHints:
     # Batch aggregates retain counts and ordinal sums, never ordinal postings.
     groups: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
     identities: list[dict[str, set[str]]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class QuantaStorEnclosureOptionsRead:
+    """QuantaStor enclosure choices, with the count left out at the bound."""
+
+    options: list[EnclosureOption]
+    read_count: int
+    omitted_count: int
+    limit: int
+
+    @property
+    def incomplete(self) -> bool:
+        return self.omitted_count > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -9582,10 +9599,13 @@ class InventoryService(InventorySourceCollectionMixin):
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         enclosure_owner_ids, enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(raw_data)
-        available_enclosures = self._build_quantastor_enclosure_options(
+        options_read = self._read_quantastor_enclosure_options(
             raw_data,
             enclosure_rows_by_owner=enclosure_rows_by_owner,
         )
+        available_enclosures = options_read.options
+        if options_read.incomplete:
+            warnings.append(self._quantastor_enclosure_options_limit_warning(options_read))
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
             available_enclosures,
@@ -9741,6 +9761,41 @@ class InventoryService(InventorySourceCollectionMixin):
         *,
         enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] | None = None,
     ) -> list[EnclosureOption]:
+        return self._read_quantastor_enclosure_options(
+            raw_data,
+            enclosure_rows_by_owner=enclosure_rows_by_owner,
+        ).options
+
+    def _quantastor_enclosure_options_limit_warning(self, options_read: QuantaStorEnclosureOptionsRead) -> str:
+        """Page warning for enclosure choices left out at the bound, and a rate-limited log line."""
+
+        summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
+            ("quantastor_enclosure_options", self.system.id, "limit"),
+            (options_read.read_count, options_read.omitted_count, options_read.limit),
+        )
+        if summary is not None:
+            logger.warning(
+                "QuantaStor enclosure options stopped at the limit of %d: %d listed, %d left out "
+                "(operation=quantastor_enclosure_options)%s",
+                options_read.limit,
+                options_read.read_count,
+                options_read.omitted_count,
+                summary.suffix(),
+            )
+        return (
+            f"QuantaStor enclosure list is incomplete: {options_read.read_count} "
+            f"{'enclosure' if options_read.read_count == 1 else 'enclosures'} listed, "
+            f"{options_read.omitted_count} left out at the limit of {options_read.limit}. "
+            "The enclosures left out cannot be selected on this page."
+        )
+
+    def _read_quantastor_enclosure_options(
+        self,
+        raw_data: TrueNASRawData,
+        *,
+        enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> QuantaStorEnclosureOptionsRead:
+        limit = QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES
         profile = self.profile_registry.resolve_for_enclosure(
             self.system,
             None,
@@ -9782,18 +9837,24 @@ class InventoryService(InventorySourceCollectionMixin):
             system_rows_by_id.setdefault(system_id, system_row)
 
         options: list[EnclosureOption] = []
+        omitted_count = 0
         for system_id, system_row in system_rows_by_id.items():
+            owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
+            option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
+            room = limit - len(options)
+            if len(option_rows) > room:
+                # Count the choices beyond the bound without building them.
+                omitted_count += len(option_rows) - max(room, 0)
+                option_rows = option_rows[: max(room, 0)]
+            if not option_rows:
+                continue
             label = normalize_text(
                 system_row.get("name")
                 or system_row.get("hostname")
                 or system_row.get("description")
                 or system_id
             )
-            owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
-            option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
             for enclosure_row in option_rows:
-                if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
-                    break
                 enclosure_id = self._quantastor_hw_enclosure_id(enclosure_row) if enclosure_row else None
                 enclosure_label = (
                     normalize_text(
@@ -9828,9 +9889,12 @@ class InventoryService(InventorySourceCollectionMixin):
                         slot_layout=slot_layout,
                     )
                 )
-            if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
-                break
-        return self._finalize_enclosure_options(options)
+        return QuantaStorEnclosureOptionsRead(
+            options=self._finalize_enclosure_options(options),
+            read_count=len(options),
+            omitted_count=omitted_count,
+            limit=limit,
+        )
 
     @staticmethod
     def _quantastor_hw_enclosure_id(row: dict[str, Any] | None) -> str | None:

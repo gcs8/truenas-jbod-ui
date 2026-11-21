@@ -255,6 +255,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_persisted_smart_binding",
             "tests.test_persisted_smart_refresh",
             "tests.test_platform_parity_fixtures",
+            "tests.test_quantastor_enclosure_options_limit",
             "tests.test_quantastor_pool_device_scope",
             "tests.test_quantastor_ses_projection",
             "tests.test_quantastor_smart_admission",
