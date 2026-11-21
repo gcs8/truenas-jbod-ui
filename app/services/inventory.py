@@ -539,10 +539,6 @@ POWER_ON_FIELDS = ("power_on_days", "power_on_hours")
 # one is not a reading, also when an earlier writer saved it (#1299).
 UNSIGNED_SLOT_DETAIL_FIELDS = ("logical_block_size", "physical_block_size")
 UNSIGNED_STORED_SMART_FIELDS = (*UNSIGNED_SLOT_DETAIL_FIELDS, "rotation_rate_rpm")
-# The QuantaStor node whose data produced a saved entry's SMART paths. A path
-# names a device only on that node; a saved list without it, as every entry
-# written before this key existed, is not restored (#1318).
-QUANTASTOR_SMART_NODE_SLOT_FIELD = "quantastor_smart_device_node"
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -5539,12 +5535,10 @@ class InventoryService(InventorySourceCollectionMixin):
                     continue
                 if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
                     continue
-                saved_node = entry.slot_fields.get(QUANTASTOR_SMART_NODE_SLOT_FIELD)
-                if field_name == "smart_device_names" and quantastor and (
-                    saved_node is None or saved_node != self._quantastor_slot_smart_node(slot_view)
-                ):
-                    # Unknown provenance is unproven: only paths saved from
-                    # this disk's own node may stand in for current ones.
+                if field_name == "smart_device_names" and quantastor:
+                    # A QuantaStor path names a device on one node only, and a
+                    # saved list cannot show which. SMART paths come from the
+                    # current poll's own-node data alone; none means unread (#1318).
                     continue
                 current_value = getattr(slot_view, field_name)
                 if not self._slot_detail_field_missing(current_value):
@@ -5649,12 +5643,6 @@ class InventoryService(InventorySourceCollectionMixin):
                 slot_fields[field_name] = value.model_dump(mode="json")
             else:
                 slot_fields[field_name] = value
-        if "smart_device_names" in slot_fields and self.system.truenas.platform == "quantastor":
-            # These paths are the current node's own or were restored only
-            # because they were saved from it; say which node that is.
-            smart_node = self._quantastor_slot_smart_node(slot_view)
-            if smart_node:
-                slot_fields[QUANTASTOR_SMART_NODE_SLOT_FIELD] = smart_node
 
         smart_fields: dict[str, Any] = {}
         smart_updated_at: str | None = None
@@ -17475,15 +17463,6 @@ class InventoryService(InventorySourceCollectionMixin):
     def _unsigned_block_size(value: Any) -> int | None:
         """A block size or None: a negative one is not a reading (#1299)."""
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-    @staticmethod
-    def _quantastor_slot_smart_node(slot_view: SlotView) -> str | None:
-        """The node that reported this bay's QuantaStor disk, if it says (#1318)."""
-        raw_disk = slot_view.raw_status.get("disk_raw") if isinstance(slot_view.raw_status, dict) else None
-        if not isinstance(raw_disk, dict):
-            return None
-        return next(filter(None, (normalize_value_text(raw_disk.get(key))
-                                  for key in ("storageSystemId", "systemId", "controllerId"))), None)
 
     @staticmethod
     def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:

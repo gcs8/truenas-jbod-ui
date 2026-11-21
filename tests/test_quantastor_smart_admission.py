@@ -17,10 +17,13 @@ never becomes a SMART candidate on the selected node.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from app.config import (
     EnclosureProfileConfig,
@@ -48,14 +51,14 @@ class _NoMappings:
         return False
 
 
-def _service() -> InventoryService:
+def _service(platform: str = "quantastor") -> InventoryService:
     profile = EnclosureProfileConfig(
         id="synthetic-2-bay", label="Synthetic bays", rows=1, columns=2, slot_layout=[[0, 1]],
     )
     system = SystemConfig(
         id="synthetic-qs",
         label="Synthetic QuantaStor",
-        truenas=TrueNASConfig(platform="quantastor"),
+        truenas=TrueNASConfig(platform=platform),
         default_profile_id=profile.id,
     )
     settings = Settings(
@@ -289,9 +292,13 @@ def _slot_from_record(record, **overrides) -> SlotView:
     return SlotView(**fields)
 
 
-# Saved before the node of the SMART paths was recorded: entries written by the
-# earlier writer carry no such key.
+# The key an earlier version of this fix wrote beside saved QuantaStor SMART
+# paths. It is no longer written and is ignored when an old file has it.
 SMART_NODE_KEY = "quantastor_smart_device_node"
+# Node B's hardware row for DISK_A, matched by serial. Merging it fills
+# ``storageSystemId=node-b`` into a node-A disk that names its node otherwise.
+PEER_HW = {"id": "hw-peer", "serialNum": "SANITIZED-QS-A", "storageSystemId": "node-b",
+           "enclosureId": "shelf-a", "slot": 0, "devicePath": "/dev/sdq"}
 
 
 class QuantastorSavedSlotDetailTests(unittest.TestCase):
@@ -299,6 +306,8 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
 
     Each test saves an entry, reloads it through a new service and store, and
     reads the consumer after the backfill, as a restart after an upgrade does.
+    QuantaStor SMART paths come only from the current poll's own-node data; a
+    saved path list is never restored for QuantaStor.
     """
 
     def setUp(self) -> None:
@@ -306,8 +315,9 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.path = str(Path(self._tmp.name) / "slot_details.json")
 
-    def _save(self, slot: SlotView, summary: SmartSummaryView | None, *, legacy: bool) -> dict:
-        service = _service()
+    def _save(self, slot: SlotView, summary: SmartSummaryView | None, *, legacy: bool,
+              platform: str = "quantastor", smart_node: str | None = None) -> dict:
+        service = _service(platform)
         service.slot_detail_store = SlotDetailStore(self.path)
         entry = service._build_slot_detail_entry(slot, smart_summary=summary, loaded_entries={})
         if entry is None:
@@ -315,6 +325,9 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         if legacy:
             # The earlier writer wrote the same fields and no node.
             entry.slot_fields.pop(SMART_NODE_KEY, None)
+        if smart_node is not None:
+            # As the earlier version of this fix wrote it.
+            entry.slot_fields[SMART_NODE_KEY] = smart_node
         service.slot_detail_store.save_entries([entry])
         return dict(entry.slot_fields)
 
@@ -324,6 +337,30 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         slot = _slot_from_record(service._build_quantastor_disk_records(raw, "node-a")[0])
         service._apply_persisted_slot_details([slot])
         return service, slot
+
+    def _loader_reads(self, service: InventoryService, slot: SlotView) -> list[list[str]]:
+        """The device lists the real QuantaStor loader hands to the SSH boundary."""
+        service.system.ssh.enabled = True
+        key = service._smart_cache_key(slot)
+        fetch = AsyncMock(return_value=(None, None))
+        with patch.object(service, "_summary_needs_ssh_enrichment", return_value=True), \
+                patch.object(service, "_fetch_smart_summary_over_ssh", fetch), \
+                patch.object(service, "_store_smart_summary_cache", return_value=False):
+            asyncio.run(service._load_uncached_smart_summary(
+                slot, cache_key=key, candidates=list(key[4]),
+                generation_token=service._smart_cache_generation_token(key), allow_stale_cache=False))
+        return [list(call.args[0]) for call in fetch.await_args_list]
+
+    def _save_node_b_path(self, *, smart_node: str | None) -> None:
+        # Node B's own pool row gives this disk the path sdq on node B.
+        disk = {key: value for key, value in DISK_A.items() if key != "devicePath"}
+        disk["storageSystemId"] = "node-b"
+        record = _service()._build_quantastor_disk_records(
+            _raw(disks=[disk], pools=[POOL], pool_devices=[PEER_ROW]), "node-b",
+        )[0]
+        self.assertEqual(record.smart_devices, ["sdq"])
+        saved = self._save(_slot_from_record(record), None, legacy=True, smart_node=smart_node)
+        self.assertEqual(saved["smart_device_names"], ["sdq"])
 
     # A1 (#1318)
     def test_saved_peer_path_from_an_earlier_writer_is_not_a_candidate_after_reload(self) -> None:
@@ -335,34 +372,99 @@ class QuantastorSavedSlotDetailTests(unittest.TestCase):
         saved = self._save(_slot_from_record(record, smart_device_names=["sdq"]), None, legacy=True)
         self.assertEqual(saved["smart_device_names"], ["sdq"])
 
-        _service_after, slot = self._reload(raw)
+        service, slot = self._reload(raw)
         self.assertEqual(slot.smart_device_names, [])
         self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+        self.assertEqual(self._loader_reads(service, slot), [])
 
-    def test_saved_path_recorded_for_another_node_is_not_a_candidate(self) -> None:
-        disk = {key: value for key, value in {**DISK_A, **READABLE}.items() if key != "devicePath"}
-        raw = _raw(disks=[disk], pools=[POOL], pool_devices=[PEER_ROW])
-        record = _service()._build_quantastor_disk_records(raw, "node-a")[0]
-        peer_view = {**record.raw, "storageSystemId": "node-b"}
-        self._save(_slot_from_record(record, smart_device_names=["sdq"], raw_status={"disk_raw": peer_view}),
-                   None, legacy=False)
+    def test_peer_path_is_not_restored_when_hardware_names_the_peer_node(self) -> None:
+        # The disk says node A through another owner key, or not at all; node
+        # B's hardware row fills storageSystemId=node-b into the merged record.
+        for owner_key in ("systemId", "controllerId", None):
+            for smart_node in (None, "node-b"):
+                with self.subTest(owner_key=owner_key, saved_node=smart_node):
+                    self._save_node_b_path(smart_node=smart_node)
+                    disk = {key: value for key, value in DISK_A.items()
+                            if key not in ("devicePath", "storageSystemId")}
+                    if owner_key:
+                        disk[owner_key] = "node-a"
+                    service, slot = self._reload(_raw(disks=[disk], hw_disks=[PEER_HW]))
+                    self.assertEqual(slot.raw_status["disk_raw"].get("storageSystemId"), "node-b")
+                    self.assertEqual(slot.smart_device_names, [])
+                    self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+                    self.assertEqual(self._loader_reads(service, slot), [])
 
-        _service_after, slot = self._reload(raw)
-        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
-
-    def test_saved_same_node_path_is_still_a_candidate_after_reload(self) -> None:
-        # Control: the current poll omits the disk's path; the path saved on
-        # this node is still used.
+    def test_saved_same_node_path_is_not_restored_when_the_poll_has_none(self) -> None:
+        # No own-node path in the current poll: SMART for the disk is unread,
+        # not read through the saved list, even one saved on this node.
         disk = {**DISK_A, **READABLE}
-        record = _service()._build_quantastor_disk_records(_raw(disks=[disk]), "node-a")[0]
-        self.assertEqual(record.smart_devices, ["sda"])
-        saved = self._save(_slot_from_record(record), None, legacy=False)
-        self.assertEqual(saved["smart_device_names"], ["sda"])
-
+        own_row = {**PEER_ROW, "storageSystemId": "node-a", "devicePath": "/dev/sdc",
+                   "physicalDiskObj": {"id": "disk-a", "devicePath": "/dev/sdc", "storageSystemId": "node-a"}}
         current = {key: value for key, value in disk.items() if key != "devicePath"}
-        _service_after, slot = self._reload(_raw(disks=[current]))
+        record = _service()._build_quantastor_disk_records(
+            _raw(disks=[current], pools=[POOL], pool_devices=[own_row]), "node-a")[0]
+        self.assertEqual(record.smart_devices, ["sdc"])
+        saved = self._save(_slot_from_record(record), None, legacy=True, smart_node="node-a")
+        self.assertEqual(saved["smart_device_names"], ["sdc"])
+
+        service, slot = self._reload(_raw(disks=[current]))
+        self.assertIsNone(slot.device_name)
+        self.assertEqual(slot.smart_device_names, [])
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+        self.assertEqual(self._loader_reads(service, slot), [])
+
+    def test_current_own_node_path_is_still_the_candidate(self) -> None:
+        # Control: the current poll reports the disk's own path; a saved peer
+        # path and the peer hardware row add nothing to it.
+        self._save_node_b_path(smart_node="node-b")
+        disk = {key: value for key, value in DISK_A.items() if key != "storageSystemId"}
+        disk["systemId"] = "node-a"
+        service, slot = self._reload(_raw(disks=[disk], hw_disks=[PEER_HW]))
         self.assertEqual(slot.smart_device_names, ["sda"])
         self.assertEqual(InventoryService._smart_candidate_devices(slot), ["sda"])
+        self.assertEqual(self._loader_reads(service, slot), [["sda"]])
+
+    def test_other_platforms_still_restore_saved_paths(self) -> None:
+        # Control: the rule is QuantaStor's; another platform's saved path
+        # list still fills a poll that omits it.
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                        serial="SANITIZED-SCALE-A", smart_device_names=["sdq"])
+        saved = self._save(slot, None, legacy=False, platform="scale")
+        self.assertEqual(saved["smart_device_names"], ["sdq"])
+        self.assertNotIn(SMART_NODE_KEY, saved)
+
+        service = _service("scale")
+        service.slot_detail_store = SlotDetailStore(self.path)
+        current = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                           serial="SANITIZED-SCALE-A")
+        service._apply_persisted_slot_details([current])
+        self.assertEqual(current.smart_device_names, ["sdq"])
+        self.assertEqual(InventoryService._smart_candidate_devices(current), ["sdq"])
+
+    def test_a_file_with_the_earlier_node_key_still_loads(self) -> None:
+        # An entry written by the earlier version of this fix: the key is
+        # ignored, the other saved fields still fill the bay, and the next
+        # write does not carry the key on.
+        disk = {**DISK_A, **READABLE, "model": "SANITIZED-MODEL"}
+        record = _service()._build_quantastor_disk_records(_raw(disks=[disk]), "node-a")[0]
+        self._save(_slot_from_record(record, model="SANITIZED-MODEL"), None, legacy=False, smart_node="node-a")
+        stored = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        self.assertIn(SMART_NODE_KEY, json.dumps(stored))
+
+        current = {key: value for key, value in disk.items() if key != "devicePath"}
+        service, slot = self._reload(_raw(disks=[current]))
+        self.assertEqual(slot.model, "SANITIZED-MODEL")
+        self.assertEqual(slot.smart_device_names, [])
+        entry = service._build_slot_detail_entry(slot, smart_summary=None, loaded_entries={})
+        if entry is None:
+            self.fail("the writer saved nothing")
+        self.assertNotIn(SMART_NODE_KEY, entry.slot_fields)
+        fresh = _service()._build_slot_detail_entry(
+            _slot_from_record(record), smart_summary=None, loaded_entries={})
+        if fresh is None:
+            self.fail("the writer saved nothing")
+        self.assertEqual(fresh.slot_fields["smart_device_names"], ["sda"])
+        self.assertNotIn(SMART_NODE_KEY, fresh.slot_fields)
 
     # A2 (#1299)
     def test_saved_negative_block_sizes_stay_not_read_after_reload(self) -> None:
