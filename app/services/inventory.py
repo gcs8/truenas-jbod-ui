@@ -13,8 +13,8 @@ import sys
 import time
 import threading
 import weakref
-from contextlib import asynccontextmanager, contextmanager, nullcontext
-from collections import Counter, OrderedDict
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
+from collections import Counter, OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass, field, replace
@@ -1471,6 +1471,93 @@ async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> Re
             worker.exception()
         raise asyncio.CancelledError
     return worker.result()
+
+
+MAPPING_READ_MAX_CONCURRENCY = 2
+MAPPING_READ_MAX_WAITERS = 8
+
+
+@dataclass(slots=True)
+class _MappingReadLoopAdmission:
+    running: int = 0
+    waiters: deque[asyncio.Future[None]] = field(default_factory=deque)
+
+
+class MappingReadAdmission:
+    """Bound mapping-store reads before they reach the shared default executor.
+
+    At most ``max_concurrency`` reads hold a worker thread, at most
+    ``max_waiters`` callers wait for a turn, and any further caller is refused
+    with the existing busy error (503). A turn is released only when the worker
+    finishes, never when its caller is cancelled, because the thread keeps
+    running. A cancelled waiter submits nothing. State is per event loop, like
+    the default executor it protects.
+    """
+
+    def __init__(self, *, max_concurrency: int, max_waiters: int) -> None:
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.max_waiters = max(0, int(max_waiters))
+        self._loops: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _MappingReadLoopAdmission] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    async def run(self, read: Callable[[], RetainedResultT]) -> RetainedResultT:
+        loop = asyncio.get_running_loop()
+        state = self._loops.setdefault(loop, _MappingReadLoopAdmission())
+        if state.running < self.max_concurrency:
+            state.running += 1
+        elif len(state.waiters) < self.max_waiters:
+            turn: asyncio.Future[None] = loop.create_future()
+            state.waiters.append(turn)
+            try:
+                await turn
+            except asyncio.CancelledError:
+                if turn.done() and not turn.cancelled():
+                    self._release(state)  # handed a turn it will not use
+                else:
+                    with suppress(ValueError):
+                        state.waiters.remove(turn)
+                raise
+        else:
+            raise SnapshotStateBusyError(reason="mapping-read-admission")
+        try:
+            worker = loop.run_in_executor(None, copy_context().run, read)
+        except BaseException:
+            self._release(state)
+            raise
+        worker.add_done_callback(lambda _done: self._release(state))
+        return await _drain_inventory_worker(worker)
+
+    @staticmethod
+    def _release(state: _MappingReadLoopAdmission) -> None:
+        while state.waiters:
+            turn = state.waiters.popleft()
+            if not turn.done():
+                turn.set_result(None)  # the turn passes on; running is unchanged
+                return
+        state.running -= 1
+
+
+MAPPING_READ_ADMISSION = MappingReadAdmission(
+    max_concurrency=MAPPING_READ_MAX_CONCURRENCY,
+    max_waiters=MAPPING_READ_MAX_WAITERS,
+)
+
+
+async def _run_mapping_store_read(read: Callable[[], RetainedResultT]) -> RetainedResultT:
+    """Run one mapping-store read on a worker thread, not the event loop (#1284).
+
+    A slow mapping-file read otherwise stalls every other request on the loop.
+    The read never waits for a writer lock (#1228); it is bounded by the
+    store's reread count, not by a wall-clock deadline, because a worker thread
+    cannot be stopped. So, like the snapshot's store reads, the caller keeps the
+    worker until it finishes, even through cancellation, and then reports the
+    cancellation. The result and any error are the store's, unchanged.
+    Admission is bounded first (``MAPPING_READ_ADMISSION``), so a burst cannot
+    queue unbounded reads in the shared executor; beyond the bound the caller
+    is told the server is busy.
+    """
+    return await MAPPING_READ_ADMISSION.run(read)
 
 
 async def _run_mapping_store_write(
@@ -7716,7 +7803,9 @@ class InventoryService(InventorySourceCollectionMixin):
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         # Rows and revision from one read, so a save in between cannot pair
         # one version's rows with another's revision (#1228).
-        mappings, revision = self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
+        mappings, revision = await _run_mapping_store_read(
+            lambda: self.mapping_store.export_scope(self.system.id, mapping_enclosure_id)
+        )
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
@@ -7857,10 +7946,12 @@ class InventoryService(InventorySourceCollectionMixin):
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            rewritten,
+        preview = await _run_mapping_store_read(
+            lambda: self.mapping_store.preview_replace_mappings(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+            )
         )
         # Record the disk in every bay the restore writes and bind them into
         # the digest the confirmation returns, so a confirmation after any of
@@ -7906,10 +7997,12 @@ class InventoryService(InventorySourceCollectionMixin):
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        preview = self.mapping_store.preview_replace_mappings(
-            self.system.id,
-            mapping_enclosure_id,
-            rewritten,
+        preview = await _run_mapping_store_read(
+            lambda: self.mapping_store.preview_replace_mappings(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+            )
         )
         if preview["revision"] != expected_revision:
             # Already stale: refuse before reading the bays.

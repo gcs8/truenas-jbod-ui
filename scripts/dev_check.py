@@ -316,6 +316,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_immutable_deployment",
             "tests.test_image_upgrade_contract",
             "tests.test_image_upgrade_smoke_safety",
+            "tests.test_mapping_publication_unconfirmed",
             "tests.test_mapping_store",
             "tests.test_mapping_store_writer_lock",
             "tests.test_nonroot_migration",
@@ -339,6 +340,7 @@ WINDOWS_EXCLUSIONS = (
             "are not reliable under the Windows event loop"
         ),
         modules=(
+            "tests.test_mapping_export_preview_off_loop",
             "tests.test_ssh_session_reuse",
             "tests.test_truenas_middleware_limits",
             "tests.test_truenas_ws",

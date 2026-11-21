@@ -263,9 +263,18 @@ class _SourceNotRegular(OSError):
 
 
 class MappingDurabilityError(RuntimeError):
-    """A complete replacement is visible but its durability is indeterminate."""
+    """A complete replacement was published; the path and durability are unconfirmed.
 
-    public_detail = "Mapping update is visible but durability could not be confirmed."
+    Raised only after the atomic rename, so the update was published. It says
+    nothing about what the mapping path shows now: the directory sync or the
+    readback failed, and an outside process may have removed or replaced the
+    path since (#1285). Nothing is rolled back over the path's current content.
+    """
+
+    public_detail = (
+        "Mapping update was published, but it could not be confirmed that the mapping file "
+        "still holds it or that it is durable. Nothing was rolled back. Reload before saving again."
+    )
 
     def __init__(self) -> None:
         super().__init__(self.public_detail)
@@ -1838,6 +1847,14 @@ class MappingStore:
         # The checked, non-blocking reader: a path that is no longer the
         # regular file just published raises at once instead of blocking or
         # following a link while the writer lock is held.
+        #
+        # The evidence is a descriptor readback (#1285): the bytes come from
+        # the regular file the path named when the descriptor was opened, and
+        # whose identity matched the path's lstat. That confirms what the path
+        # held at that moment, not later. A replacement of the pathname after
+        # the descriptor opened is not seen here, and the save still succeeds;
+        # a failure here means the update was published but the path did not
+        # confirm it. Either way the path's current content is never rolled back.
         actual = self._read_source_bytes()
         if actual is None or actual != expected:
             raise OSError("Published mapping bytes differ from the replacement.")
@@ -1881,6 +1898,9 @@ class MappingStore:
             ):
                 self._unlink_owned_temp_file(temp_path, temp_identity)
             if replaced:
+                # Published, but not confirmed at the path or on disk: report
+                # that, never that the update is visible, and leave the path's
+                # current content alone (#1285).
                 raise MappingDurabilityError() from exc
             capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
             if capacity_reason is not None:
