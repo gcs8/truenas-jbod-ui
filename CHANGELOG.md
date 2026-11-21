@@ -569,6 +569,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   an isolated synthetic live occupancy producer, kept unread-bay refusal coverage,
   and added bounded, sanitized HTTP failure diagnostics. Product mapping guards
   were unchanged; full runtime qualification remains a separate QA gate (#1456).
+- Fixed Compose runtime-matrix startup and UI restart ordering to wait for the
+  synthetic producer and fresh enclosure inventory before resuming history or
+  persistence checks. Kept unread-source refusal mandatory and exposed fixed
+  mapping failure details in bounded diagnostics (#1458).
 
 ### Performance
 
