@@ -760,6 +760,14 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
                     if record.raw.get("storageSystemId") == node
                     and not str(record.device_name).startswith("disk/by-id/dm-")
                 ]
+        # Inventory used to lend node-a's pool-row crypt dm-N to node-b's
+        # records of the same disk. It no longer does (#1318); keep that name
+        # in node-b's views so retention still meets the collision (#921).
+        crypt_dm = {row["physicalDiskSerialNumber"]: row["physicalDiskObj"]["altDevicePath"].rsplit("/", 1)[-1]
+                    for row in pool_devices}
+        for slot in slots_by_node["node-b"]:
+            if slot["serial"] in crypt_dm:
+                slot["smart_device_names"].append(crypt_dm[slot["serial"]])
         return slots_by_node
 
     def test_dm_n_aliases_do_not_merge_distinct_disks_of_an_encrypted_multipath_pair(self) -> None:
@@ -769,17 +777,16 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         self.assertEqual(len({disk["serialNumber"] for disk in disks}), 13)
         self.assertEqual([len(slots) for slots in slots_by_node.values()], [11, 11])
         # The fixture reproduces the collision: on node-b one dm-N name is
-        # held by records of two different disks.
+        # held by a shown disk's view and another disk's own record.
         holders: dict[str, set[str | None]] = {}
-        system = SystemConfig(id="qs", truenas=TrueNASConfig(platform="quantastor"))
-        raw = TrueNASRawData(enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
-                             pool_devices=pool_devices)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = build_service(Settings(systems=[system]), system, temp_dir)
-            for record in service._build_quantastor_disk_records(raw, "node-b"):
-                for name in record.smart_devices:
-                    if name.startswith("dm-") and name[3:].isdigit():
-                        holders.setdefault(name, set()).add(record.serial)
+        for slot in slots_by_node["node-b"]:
+            for name in slot["smart_device_names"]:
+                if name.startswith("dm-") and name[3:].isdigit():
+                    holders.setdefault(name, set()).add(slot["serial"])
+        for disk in disks:
+            name = disk["altDevicePath"].rsplit("/", 1)[-1]
+            if disk["storageSystemId"] == "node-b" and name.startswith("dm-"):
+                holders.setdefault(name, set()).add(disk["serialNumber"])
         self.assertTrue(any(len(serials) > 1 for serials in holders.values()))
 
         retention = self._retention(disks, slots_by_node, pool_devices=pool_devices)

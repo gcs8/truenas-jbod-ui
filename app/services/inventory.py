@@ -320,6 +320,10 @@ def effective_main_view_order(
         return [preferred, *(entry for entry in automatic if entry != preferred)]
     return automatic
 QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
+# Fields that name the node presenting a QuantaStor disk row, in the one order
+# used for disk selection, CLI correlation and SMART path admission. An I/O
+# fence ID is not among them: it is not the node that reports the path.
+QUANTASTOR_PRESENTING_NODE_FIELDS = ("storageSystemId", "systemId", "controllerId")
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
@@ -535,6 +539,10 @@ STABLE_SLOT_DETAIL_FIELDS = (
 STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
 SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
 POWER_ON_FIELDS = ("power_on_days", "power_on_hours")
+# Saved slot and SMART fields that hold an unsigned size or rate. A negative
+# one is not a reading, also when an earlier writer saved it (#1299).
+UNSIGNED_SLOT_DETAIL_FIELDS = ("logical_block_size", "physical_block_size")
+UNSIGNED_STORED_SMART_FIELDS = (*UNSIGNED_SLOT_DETAIL_FIELDS, "rotation_rate_rpm")
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -5511,6 +5519,7 @@ class InventoryService(InventorySourceCollectionMixin):
 
         if loaded_entries is None:
             loaded_entries = self.slot_detail_store.load_all()
+        quantastor = self.system.truenas.platform == "quantastor"
         for slot_view in slots:
             entry = self._bound_slot_detail_entry(
                 slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
@@ -5527,6 +5536,14 @@ class InventoryService(InventorySourceCollectionMixin):
                     continue
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
+                    continue
+                if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
+                    continue
+                if field_name in ("smart_device_names", "device_name") and quantastor:
+                    # A QuantaStor path names a device on one node only, and a
+                    # saved name cannot show which. Device names and SMART
+                    # paths come from the current poll's own-node data alone;
+                    # none means no device name and unread SMART (#1318).
                     continue
                 current_value = getattr(slot_view, field_name)
                 if not self._slot_detail_field_missing(current_value):
@@ -6632,12 +6649,17 @@ class InventoryService(InventorySourceCollectionMixin):
         return SmartSummaryView(available=False, message="Disk identity changed during SMART lookup; retry for the current disk.")
 
     def _smart_cache_key(self, slot_view: SlotView) -> SmartCacheKey:
+        # The key's candidate tuple is the only list of SMART read targets. On
+        # QuantaStor it holds only the current poll's own-node paths: the
+        # builder's ``smart_device_names``, never restored from saved details.
+        # A display name (saved, multipath or manual mapping) is not a target.
+        own_node_paths_only = self.system.truenas.platform == "quantastor"
         return (
             self.system.id,
             self.system.truenas.platform,
             normalize_text(slot_view.enclosure_id) or UNSCOPED_KEY,
             slot_view.slot,
-            tuple(self._smart_candidate_devices(slot_view)),
+            tuple(self._smart_candidate_devices(slot_view, own_node_paths_only=own_node_paths_only)),
             self._smart_disk_identity(slot_view),
         )
 
@@ -9803,6 +9825,7 @@ class InventoryService(InventorySourceCollectionMixin):
             raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         )
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
+        several_nodes = self._quantastor_has_several_nodes(raw_data)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
@@ -9815,11 +9838,7 @@ class InventoryService(InventorySourceCollectionMixin):
 
         records: list[DiskRecord] = []
         for disk, cli_hint in zip(raw_data.disks, cli_disk_hints):
-            owner_id = normalize_text(
-                str(disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId"))
-                if (disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId")) is not None
-                else None
-            )
+            owner_id = next(iter(self._quantastor_presenting_node_ids(disk)), None)
             if selected_system_id and owner_id and owner_id != selected_system_id:
                 continue
 
@@ -9912,10 +9931,8 @@ class InventoryService(InventorySourceCollectionMixin):
                 merged_raw = self._merge_quantastor_payloads(
                     self._quantastor_cli_health_fields(cli_hint), merged_raw)
                 merged_raw["quantastor_cli_disk"] = cli_hint
-                same_owner = (
-                    self._quantastor_cli_identity(disk)["owner"]
-                    & self._quantastor_cli_identity(cli_hint)["owner"]
-                )
+                disk_owner = self._quantastor_path_owner(disk)
+                same_owner = disk_owner is not None and disk_owner == self._quantastor_path_owner(cli_hint)
                 # Node-local paths are permitted only for SMART on the same
                 # owner. They never enter lookup keys, raw identity or bay aliases.
                 cli_hint = ({key: cli_hint[key] for key in (
@@ -9928,7 +9945,10 @@ class InventoryService(InventorySourceCollectionMixin):
             slot = pool_hint.get("slot") if pool_hint else hint.get("slot") if hint else None
             if not isinstance(slot, int):
                 slot = self._extract_quantastor_slot(disk)
-            smart_devices = self._build_quantastor_smart_devices(disk, merged_raw, cli_hint, hint, pool_hint)
+            smart_devices = self._build_quantastor_smart_devices(
+                disk, merged_raw, cli_hint, hint, pool_hint,
+                disk_node=disk_node, several_nodes=several_nodes,
+            )
 
             records.append(
                 DiskRecord(
@@ -9949,8 +9969,11 @@ class InventoryService(InventorySourceCollectionMixin):
                     last_smart_test_type=None,
                     last_smart_test_status=None,
                     last_smart_test_lifetime_hours=None,
-                    logical_block_size=self._extract_quantastor_int(disk, "logicalBlockSize", "sectorSize", "logSectorSize"),
-                    physical_block_size=self._extract_quantastor_int(disk, "physicalBlockSize", "phySectorSize"),
+                    # A negative block size is not a reading (#1299).
+                    logical_block_size=self._extract_quantastor_unsigned(
+                        disk, "logicalBlockSize", "sectorSize", "logSectorSize")[0],
+                    physical_block_size=self._extract_quantastor_unsigned(
+                        disk, "physicalBlockSize", "phySectorSize")[0],
                     enclosure_id=disk_enclosure_id or selected_system_id,
                     slot=slot,
                     smart_devices=smart_devices,
@@ -10040,6 +10063,9 @@ class InventoryService(InventorySourceCollectionMixin):
         cli_hint: dict[str, Any] | None,
         hw_hint: dict[str, Any] | None,
         pool_hint: dict[str, Any] | None,
+        *,
+        disk_node: str | None = None,
+        several_nodes: bool = False,
     ) -> list[str]:
         direct_candidates: list[str] = []
         stable_candidates: list[str] = []
@@ -10065,9 +10091,36 @@ class InventoryService(InventorySourceCollectionMixin):
             else:
                 fallback_candidates.append(normalized)
 
+        def own_node(row: Any, parent_owner: str | None = None) -> bool:
+            # A device path is local to the node that reported it (#1318). A
+            # row admitted through a stable shared identity may place the disk
+            # but never lends another node's path to SMART on this one. On a
+            # grid of several nodes a row of no known node lends none. A row's
+            # own presenting node wins over its parent's, so a foreign one is
+            # refused; owner fields that disagree prove no node at all.
+            if not isinstance(row, dict):
+                return False
+            nodes = self._quantastor_presenting_node_ids(row)
+            if len(nodes) > 1:
+                return False
+            owner = nodes[0] if nodes else parent_owner
+            if owner is None or disk_node is None:
+                return not several_nodes
+            return owner == disk_node
+
+        if len(self._quantastor_presenting_node_ids(disk)) > 1:
+            return []
         pool_device = pool_hint.get("pool_device_raw") if isinstance(pool_hint, dict) else None
         physical_disk_obj = pool_device.get("physicalDiskObj") if isinstance(pool_device, dict) else None
         hw_raw = hw_hint.get("hw_raw") if isinstance(hw_hint, dict) else None
+        if not own_node(pool_device):
+            pool_device = physical_disk_obj = None
+        elif not own_node(physical_disk_obj, self._quantastor_path_owner(pool_device)):
+            physical_disk_obj = None
+        if not own_node(hw_raw):
+            # merged_raw holds the disk's own fields, filled in from hw_raw:
+            # only the disk's own paths are left to take from it.
+            hw_raw = merged_raw = None
 
         for payload in (
             disk,
@@ -10195,7 +10248,7 @@ class InventoryService(InventorySourceCollectionMixin):
             # Disk and port SAS addresses are distinct identifier types.
             "sasAddress": ("sasAddress",),
             "portSasAddress": ("portSasAddress",),
-            "owner": ("storageSystemId", "systemId", "iofenceSystemId", "controllerId"),
+            "owner": QUANTASTOR_PRESENTING_NODE_FIELDS,
             "path": ("devicePath", "altDevicePath", "deviceName", "device", "name"),
         }
         identity = {
@@ -10209,11 +10262,33 @@ class InventoryService(InventorySourceCollectionMixin):
         identity["path"] = {
             normalized for value in identity["path"] if (normalized := normalize_device_name(value))
         }
-        # These are fallbacks, not interchangeable owner aliases. An explicit
-        # storageSystemId must not be overridden by a controller or fence ID.
-        owner = next((value for field in fields["owner"] if (value := normalize_value_text(row.get(field)))), None)
+        # The presenting node, resolved as for disk selection. An explicit
+        # storageSystemId is not overridden by a later field, and an I/O
+        # fence ID is not the presenting node.
+        owner = next(iter(InventoryService._quantastor_presenting_node_ids(row)), None)
         identity["owner"] = {owner} if owner else set()
         return identity
+
+    @staticmethod
+    def _quantastor_presenting_node_ids(row: Any) -> list[str]:
+        """Distinct node IDs a row names as its presenting node, in field order."""
+        if not isinstance(row, dict):
+            return []
+        nodes: list[str] = []
+        for name in QUANTASTOR_PRESENTING_NODE_FIELDS:
+            value = normalize_value_text(row.get(name))
+            if value and value not in nodes:
+                nodes.append(value)
+        return nodes
+
+    @classmethod
+    def _quantastor_path_owner(cls, row: Any) -> str | None:
+        """The node whose local paths a row reports, or None when unproven.
+
+        Owner fields that name different nodes prove no owner (#1318).
+        """
+        nodes = cls._quantastor_presenting_node_ids(row)
+        return nodes[0] if len(nodes) == 1 else None
 
     @classmethod
     def _build_quantastor_cli_disk_hints(
@@ -11668,12 +11743,30 @@ class InventoryService(InventorySourceCollectionMixin):
             or self._extract_quantastor_temperature(raw_disk.get("driveTemp"))
             or slot_view.temperature_c
         )
-        power_on_hours = self._extract_quantastor_int(raw_disk, "powerOnHours", "powerOnTimeHours", "powerOnTime")
-        bytes_read = self._extract_quantastor_bytes(raw_disk, "bytesRead", "dataReadBytes", "logicalBytesRead")
-        bytes_written = self._extract_quantastor_bytes(raw_disk, "bytesWritten", "dataWrittenBytes", "logicalBytesWritten")
-        rotation_rate = self._extract_quantastor_int(raw_disk, "rotationRate", "rotationRateRpm", "rpm")
-        if rotation_rate is None and raw_disk.get("isSsd") is True:
+        # Every measurement below cannot be negative. A negative report, also
+        # one between -1 and 0, is refused before conversion and named not
+        # read, never published as a size, count or zero (#1299, #1300).
+        refused: set[str] = set()
+
+        def unsigned(field_name: str, *keys: str, as_bytes: bool = False) -> int | None:
+            value, was_refused = self._extract_quantastor_unsigned(raw_disk, *keys, as_bytes=as_bytes)
+            if was_refused:
+                refused.add(field_name)
+            return value
+
+        power_on_hours = unsigned("power_on_hours", "powerOnHours", "powerOnTimeHours", "powerOnTime")
+        if "power_on_hours" in refused:
+            refused.add("power_on_days")
+        bytes_read = unsigned("bytes_read", "bytesRead", "dataReadBytes", "logicalBytesRead", as_bytes=True)
+        bytes_written = unsigned(
+            "bytes_written", "bytesWritten", "dataWrittenBytes", "logicalBytesWritten", as_bytes=True)
+        rotation_rate = unsigned("rotation_rate_rpm", "rotationRate", "rotationRateRpm", "rpm")
+        if rotation_rate is None and "rotation_rate_rpm" not in refused and raw_disk.get("isSsd") is True:
             rotation_rate = 0
+        # The slot's block sizes are a reading from the bay; only a
+        # non-negative one may stand in for the disk's own.
+        slot_logical_block_size = self._unsigned_block_size(slot_view.logical_block_size)
+        slot_physical_block_size = self._unsigned_block_size(slot_view.physical_block_size)
         form_factor = normalize_text(raw_disk.get("formFactor") or raw_disk.get("diskFormFactor"))
         smart_health_status = normalize_text(raw_disk.get("smartHealthTest"))
         if smart_health_status and smart_health_status.startswith("[") and smart_health_status.endswith("]"):
@@ -11690,12 +11783,12 @@ class InventoryService(InventorySourceCollectionMixin):
             power_on_hours=power_on_hours,
             power_on_days=(power_on_hours // 24) if isinstance(power_on_hours, int) else None,
             logical_block_size=(
-                self._extract_quantastor_int(raw_disk, "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize")
-                or slot_view.logical_block_size
+                unsigned("logical_block_size", "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize")
+                or slot_logical_block_size
             ),
             physical_block_size=(
-                self._extract_quantastor_int(raw_disk, "physicalBlockSize", "phySectorSize", "blockSize")
-                or slot_view.physical_block_size
+                unsigned("physical_block_size", "physicalBlockSize", "phySectorSize", "blockSize")
+                or slot_physical_block_size
             ),
             bytes_read=bytes_read,
             bytes_written=bytes_written,
@@ -11709,12 +11802,12 @@ class InventoryService(InventorySourceCollectionMixin):
                 if isinstance(bytes_written, int) and isinstance(power_on_hours, int) and power_on_hours > 0
                 else None
             ),
-            endurance_remaining_percent=self._extract_quantastor_int(raw_disk, "ssdLifeLeft", "lifeLeftPercent"),
-            media_errors=self._extract_quantastor_int(raw_disk, "mediumErrors", "mediaErrors", "readErrors", "writeErrors"),
-            predictive_errors=self._extract_quantastor_int(raw_disk, "predictiveErrors", "errCountPredictive"),
-            non_medium_errors=self._extract_quantastor_int(raw_disk, "errCountNonMedium", "nonMediumErrors"),
-            uncorrected_read_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedRead"),
-            uncorrected_write_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedWrite"),
+            endurance_remaining_percent=unsigned("endurance_remaining_percent", "ssdLifeLeft", "lifeLeftPercent"),
+            media_errors=unsigned("media_errors", "mediumErrors", "mediaErrors", "readErrors", "writeErrors"),
+            predictive_errors=unsigned("predictive_errors", "predictiveErrors", "errCountPredictive"),
+            non_medium_errors=unsigned("non_medium_errors", "errCountNonMedium", "nonMediumErrors"),
+            uncorrected_read_errors=unsigned("uncorrected_read_errors", "errCountUncorrectedRead"),
+            uncorrected_write_errors=unsigned("uncorrected_write_errors", "errCountUncorrectedWrite"),
             rotation_rate_rpm=rotation_rate,
             form_factor=form_factor,
             firmware_version=normalize_text(raw_disk.get("firmwareVersion") or raw_disk.get("revisionLevel")),
@@ -11736,7 +11829,9 @@ class InventoryService(InventorySourceCollectionMixin):
                 else "SMART data comes from QuantaStor."
             ),
         )
+        summary.unread_fields = sorted({*summary.unread_fields, *refused})
         self._refuse_negative_power_on(summary)
+        self._prune_unread_smart_fields(summary)
         if not any(
             value is not None
             for value in (
@@ -11753,7 +11848,13 @@ class InventoryService(InventorySourceCollectionMixin):
             fallback = self._fallback_smart_summary(
                 slot_view,
                 "QuantaStor reports this disk but no SMART counters."
-                + (" Its power-on time was reported but not read." if summary.unread_fields else ""),
+                + (
+                    " Its power-on time was reported but not read."
+                    if any(name in POWER_ON_FIELDS for name in summary.unread_fields)
+                    else " Some reported values were not read."
+                    if summary.unread_fields
+                    else ""
+                ),
             )
             fallback.unread_fields = summary.unread_fields
             return fallback
@@ -13057,6 +13158,44 @@ class InventoryService(InventorySourceCollectionMixin):
                     if match:
                         return int(match.group(0).replace(",", ""))
         return None
+
+    @staticmethod
+    def _quantastor_signed_negative(value: Any) -> bool:
+        """Whether a reported value is below zero, read before any truncation."""
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value < 0
+        if isinstance(value, str):
+            match = re.search(r"-?(?:\d[\d,]*(?:\.\d*)?|\.\d+)", value)
+            if match:
+                try:
+                    return float(match.group(0).replace(",", "")) < 0
+                except ValueError:
+                    return False
+        return False
+
+    @classmethod
+    def _extract_quantastor_unsigned(
+        cls, payload: dict[str, Any], *keys: str, as_bytes: bool = False,
+    ) -> tuple[int | None, bool]:
+        """(value, refused) for a measurement that cannot be negative (#1299).
+
+        The first alias that yields a value decides, as in the plain extractors.
+        A negative value, including one between -1 and 0, is refused: no value,
+        and refused=True so the caller can name the field as not read.
+        """
+        extract = cls._extract_quantastor_bytes if as_bytes else cls._extract_quantastor_int
+        for key in keys:
+            value = extract(payload, key)
+            if value is None:
+                if cls._quantastor_signed_negative(payload.get(key)):
+                    return None, True
+                continue
+            if value < 0 or cls._quantastor_signed_negative(payload.get(key)):
+                return None, True
+            return value, False
+        return None, False
 
     @staticmethod
     def _extract_quantastor_temperature(value: Any) -> int | None:
@@ -17190,7 +17329,7 @@ class InventoryService(InventorySourceCollectionMixin):
         return None
 
     @staticmethod
-    def _smart_candidate_devices(slot_view: SlotView) -> list[str]:
+    def _smart_candidate_devices(slot_view: SlotView, *, own_node_paths_only: bool = False) -> list[str]:
         candidates: list[str] = []
         seen: set[str] = set()
 
@@ -17199,6 +17338,8 @@ class InventoryService(InventorySourceCollectionMixin):
             if normalized and not InventoryService._is_placeholder_hint_device(normalized) and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(normalized)
+        if own_node_paths_only:
+            return candidates
 
         if slot_view.multipath:
             # Prefer ACTIVE member paths first so ad-hoc smartctl calls land on
@@ -17317,8 +17458,12 @@ class InventoryService(InventorySourceCollectionMixin):
         summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
         if summary.last_test_lifetime_hours is None:
             summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
-        summary.logical_block_size = summary.logical_block_size or slot_view.logical_block_size
-        summary.physical_block_size = summary.physical_block_size or slot_view.physical_block_size
+        # A negative slot block size is not a reading, whatever filled the
+        # slot; a refused one stays not read (#1299).
+        summary.logical_block_size = (
+            summary.logical_block_size or InventoryService._unsigned_block_size(slot_view.logical_block_size))
+        summary.physical_block_size = (
+            summary.physical_block_size or InventoryService._unsigned_block_size(slot_view.physical_block_size))
         summary.logical_unit_id = summary.logical_unit_id or slot_view.logical_unit_id
         summary.sas_address = summary.sas_address or slot_view.sas_address
         if summary.power_on_hours is not None and summary.power_on_days is None:
@@ -17342,7 +17487,17 @@ class InventoryService(InventorySourceCollectionMixin):
         summary = SmartSummaryView.model_validate(smart_fields)
         summary.unread_fields = [name for name in summary.unread_fields if name in POWER_ON_FIELDS]
         InventoryService._prune_unread_smart_fields(summary)
+        # An earlier writer saved negative sizes as readings (#1299).
+        for name in UNSIGNED_STORED_SMART_FIELDS:
+            if (getattr(summary, name) or 0) < 0:
+                setattr(summary, name, None)
+                summary.unread_fields = sorted({*summary.unread_fields, name})
         return InventoryService._refuse_negative_power_on(summary)
+
+    @staticmethod
+    def _unsigned_block_size(value: Any) -> int | None:
+        """A block size or None: a negative one is not a reading (#1299)."""
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
     @staticmethod
     def _refuse_negative_power_on(summary: SmartSummaryView) -> SmartSummaryView:

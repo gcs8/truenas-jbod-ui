@@ -11359,6 +11359,7 @@ Enclosure Status diagnostic page:
                 row_index=0,
                 column_index=0,
                 device_name="sdb",
+                smart_device_names=["sdb"],
                 serial="QS123",
                 logical_block_size=4096,
                 raw_status={

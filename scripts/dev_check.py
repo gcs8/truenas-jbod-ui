@@ -255,6 +255,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_platform_parity_fixtures",
             "tests.test_quantastor_pool_device_scope",
             "tests.test_quantastor_ses_projection",
+            "tests.test_quantastor_smart_admission",
             "tests.test_quantastor_storage_view_claims",
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",
