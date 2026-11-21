@@ -293,6 +293,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_release_changelog_coverage",
         "test_restore_history_schema_gate",
         "test_route_contracts",
+        "test_ses_discovery_filter",
         "test_settings_reload",
         "test_slot_detail_store",
         "test_smart_grid_io",
