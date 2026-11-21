@@ -13172,6 +13172,12 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             _flush_through_smart_detail_batch(service, [service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
             )])
+            # The seed is served for the disk it belongs to, so the empty
+            # answer below is a withholding, not a store that holds nothing.
+            seeded = service.get_cached_slot_smart_summary_without_layout(5, "enc-1")
+            self.assertIsNotNone(seeded)
+            assert seeded is not None
+            self.assertEqual(seeded.power_on_hours, 321)
 
             replacement = slot_view(
                 serial="SER-REPLACEMENT", sas_address="sas-invented-005",
