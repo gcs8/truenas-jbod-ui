@@ -320,6 +320,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_mapping_publication_unconfirmed",
             "tests.test_mapping_store",
             "tests.test_mapping_store_writer_lock",
+            "tests.test_mapping_write_admission",
             "tests.test_nonroot_migration",
             "tests.test_perf_harness",
             "tests.test_private_qa_restore",
