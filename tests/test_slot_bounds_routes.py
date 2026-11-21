@@ -538,7 +538,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
                     route.endpoint(
                         system_id="system-a",
                         enclosure_id="enc-a",
-                        slots=[5] * (SMART_BATCH_MAX_SLOTS + 1),
+                        slots=[5] * (app_routes.MAX_TARGETS + 1),
                         window_hours=24,
                         metrics=None,
                         event_limit=12,
