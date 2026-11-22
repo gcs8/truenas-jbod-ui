@@ -125,6 +125,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_metrics",
         "test_perf",
         "test_perf_harness",
+        "test_perf_harness_readiness",
         "test_placement_index",
         "test_platform_parity_fixtures",
         "test_private_qa_restore",
