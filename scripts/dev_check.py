@@ -331,6 +331,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_mapping_write_admission",
             "tests.test_nonroot_migration",
             "tests.test_perf_harness",
+            "tests.test_perf_harness_readiness",
             "tests.test_private_qa_restore",
             "tests.test_process_secrets",
             "tests.test_public_demo_fixture",
