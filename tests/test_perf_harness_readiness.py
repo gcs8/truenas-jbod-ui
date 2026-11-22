@@ -5,6 +5,7 @@ import io
 import socket
 import threading
 import time
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import tempfile
@@ -53,6 +54,147 @@ def busy(*, status=503, retry_after="2", detail=BUSY_DETAIL):
 
 
 class PerfHarnessReadinessTests(unittest.TestCase):
+    def test_forced_inventory_get_recovers_after_two_local_busy_replies(self):
+        targets = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                targets.append(self.path)
+                status = 503 if len(targets) <= 2 else 200
+                body = json.dumps({"detail": BUSY_DETAIL} if status == 503 else {"slots": []}).encode()
+                self.send_response(status)
+                if status == 503:
+                    self.send_header("Retry-After", "0")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        try:
+            client = harness.ApiClient(f"http://127.0.0.1:{server.server_port}",
+                                       system_id="SANITIZED-system", enclosure_id="SANITIZED-shelf",
+                                       readiness_timeout_seconds=2)
+            response = client.get_json_with_headers("/api/inventory", {"force": "true"})
+            self.assertEqual(response.data, {"slots": []})
+            self.assertEqual(response.attempts, 3)
+            self.assertGreaterEqual(response.busy_wait_ms, 200)
+            self.assertEqual(targets, [
+                "/api/inventory?force=true&system_id=SANITIZED-system&enclosure_id=SANITIZED-shelf",
+            ] * 3)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+    def test_forced_inventory_nonretryable_error_is_immediate_and_closed(self):
+        for status, headers in ((503, {}), (503, {"Retry-After": "invalid"}),
+                                (500, {"Retry-After": "2"})):
+            stream = io.BytesIO(json.dumps({"detail": BUSY_DETAIL}).encode())
+            response_headers = Message()
+            for key, value in headers.items():
+                response_headers[key] = value
+            error = HTTPError("https://host.example.test/api/inventory?force=true",
+                              status, "synthetic error", response_headers, stream)
+            with (self.subTest(status=status, headers=headers),
+                  patch.object(harness, "urlopen", side_effect=error) as opened,
+                  patch.object(harness.time, "sleep") as sleep):
+                with self.assertRaises(HTTPError) as caught:
+                    harness.ApiClient("https://host.example.test").get_json("/api/inventory", {"force": "true"})
+                self.assertIs(caught.exception, error)
+                self.assertEqual(opened.call_count, 1)
+                sleep.assert_not_called()
+                self.assertTrue(stream.closed)
+
+    def run_inventory_main(self, directory, clock, *, stuck=False):
+        forced_calls = []
+        streams = []
+
+        def open_url(request, timeout):
+            path = urlsplit(request.full_url).path
+            if path == "/api/inventory" and "force=true" in request.full_url:
+                self.assertLess(len(forced_calls), 7, "forced polling exceeded the bounded fixture")
+                forced_calls.append((request.full_url, timeout))
+                clock.now += min(0.25, timeout)
+                if stuck or len(forced_calls) % 3:
+                    error, stream = busy()
+                    streams.append(stream)
+                    raise error
+            if path == "/api/mappings/export":
+                return Response({"schema_version": 1, "mappings": []})
+            return Response({"slots": []})
+
+        output = Path(directory) / "output.json"
+        records = Path(directory) / "records"
+        argv = ["perf", "--iterations", "1", "--skip-mappings-import-roundtrip",
+                "--skip-snapshot-export-estimate", "--readiness-timeout-seconds", "3" if stuck else "10",
+                "--system-id", "SECRET", "--enclosure-id", "SECRET", "--output", str(output),
+                "--record-dir", str(records)]
+        with (patch.object(harness, "urlopen", side_effect=open_url),
+              patch.object(harness.time, "monotonic", clock.monotonic),
+              patch.object(harness.time, "perf_counter", clock.monotonic),
+              patch.object(harness.time, "sleep", clock.sleep),
+              patch.object(harness, "detect_git_context", return_value=harness.GitContext(None, None, False)),
+              patch.object(sys, "argv", argv)):
+            result = harness.main()
+        self.assertTrue(all(stream.closed for stream in streams))
+        return result, json.loads(output.read_text()), forced_calls
+
+    def test_forced_inventory_setup_is_readiness_but_measurement_includes_busy_waits(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as directory:
+            result, payload, calls = self.run_inventory_main(directory, clock)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(len({target for target, _ in calls}), 1)
+        self.assertEqual(clock.sleeps, [2, 2, 2, 2])
+        self.assertEqual(clock.now, 9.5)
+        ready = payload["readiness"][0]
+        self.assertEqual(ready["name"], "inventory_force_readiness")
+        self.assertEqual(ready["duration_ms"], 4750)
+        self.assertEqual(ready["request_count"], 3)
+        self.assertEqual(ready["metadata_counts"]["busy_replies"], 2)
+        self.assertEqual(ready["metadata_counts"]["busy_wait_ms"], 4500)
+        measured = [row for row in payload["results"] if row["name"] == "inventory_force"]
+        self.assertEqual(len(measured), 1)
+        self.assertEqual(measured[0]["duration_ms"], 4750)
+        self.assertEqual(measured[0]["request_count"], 3)
+        self.assertEqual(measured[0]["metadata_counts"]["busy_replies"], 2)
+        self.assertEqual(measured[0]["metadata_counts"]["busy_wait_ms"], 4500)
+        summary = next(row for row in payload["summary"] if row["name"] == "inventory_force")
+        self.assertEqual(summary["avg_ms"], 4750)
+        self.assertEqual(summary["avg_requests"], 3)
+        self.assertNotIn("inventory_force_readiness", {row["name"] for row in payload["results"]})
+        self.assertIn("inventory_force_readiness: 4750.0 ms, 3 attempts", harness.render_markdown(payload))
+
+    def test_never_ready_forced_inventory_writes_bounded_failure_within_budget(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as directory:
+            records = Path(directory) / "records"
+            records.mkdir()
+            latest = records / "latest.json"
+            latest.write_text("previous successful measurement")
+            result, payload, calls = self.run_inventory_main(directory, clock, stuck=True)
+            self.assertEqual(payload, json.loads((records / "failure.json").read_text()))
+            self.assertEqual(latest.read_text(), "previous successful measurement")
+            self.assertFalse((records / "history.jsonl").exists())
+        self.assertEqual(result, 1)
+        self.assertEqual(payload, {"status": "failed", "failure": {
+            "reason": "readiness_deadline_exceeded", "endpoint": "/api/inventory",
+            "status": 503, "attempts": 2, "retry_after_seconds": 2,
+            "elapsed_seconds": 3, "body_category": "inventory_refreshing",
+        }})
+        self.assertEqual([timeout for _, timeout in calls], [3, 0.75])
+        self.assertEqual(clock.sleeps, [2, 0.5])
+        self.assertEqual(clock.now, 3)
+        self.assertNotIn("SECRET", json.dumps(payload))
+        self.assertLess(len(json.dumps(payload)), 600)
+
     def test_safe_estimate_survives_more_than_three_busy_replies(self):
         clock = Clock()
         errors = [busy() for _ in range(4)]
@@ -112,7 +254,8 @@ class PerfHarnessReadinessTests(unittest.TestCase):
 
     def test_writes_forced_reads_and_unlisted_endpoints_are_not_retried(self):
         operations = [
-            lambda client: client.get_json("/api/inventory", {"force": "true"}),
+            lambda client: client.get_json("/api/storage-views", {"force": "true"}),
+            lambda client: client.post_json("/api/inventory", {}, {"force": "true"}),
             lambda client: client.post_json("/api/mappings/import", {}),
             lambda client: client.post_json("/api/mappings/import/preview", {}),
             lambda client: client.post_json("/api/slots/smart-batch", {"force_refresh": True}),
@@ -121,13 +264,13 @@ class PerfHarnessReadinessTests(unittest.TestCase):
         for operation in operations:
             error, stream = busy()
             with (self.subTest(operation=operation),
-                  patch.object(harness, "urlopen", side_effect=error) as opened,
-                  patch.object(harness.time, "sleep") as sleep,
-                  self.assertRaises(HTTPError)):
-                operation(harness.ApiClient("https://host.example.test"))
-            self.assertEqual(opened.call_count, 1)
-            sleep.assert_not_called()
-            self.assertTrue(stream.closed)
+                  patch.object(harness, "urlopen", side_effect=[error, Response({"ok": True})]) as opened,
+                  patch.object(harness.time, "sleep") as sleep):
+                with self.assertRaises(HTTPError):
+                    operation(harness.ApiClient("https://host.example.test"))
+                self.assertEqual(opened.call_count, 1)
+                sleep.assert_not_called()
+                self.assertTrue(stream.closed)
 
     def test_nonretryable_errors_close_without_retaining_body_or_headers(self):
         for status, retry_after in [(500, "2"), (503, "SECRET"), (503, "9" * 1000), (503, "")]:
@@ -546,7 +689,7 @@ class PerfHarnessReadinessTests(unittest.TestCase):
             result, payload = self.run_main(directory, Clock())
         self.assertEqual(result, 0)
         self.assertEqual(payload["status"], "passed")
-        ready = payload["readiness"][0]
+        ready = next(row for row in payload["readiness"] if row["name"] == "snapshot_export_estimate_readiness")
         self.assertEqual(ready["duration_ms"], 28250)
         self.assertEqual(ready["request_count"], 5)
         rows = {row["name"]: row for row in payload["results"]}

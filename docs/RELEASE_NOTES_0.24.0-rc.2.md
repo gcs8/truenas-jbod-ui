@@ -8,8 +8,8 @@ v0.24.0-rc.2 is a testing release candidate, not v0.24.0 final.
   path tracing, search, pinning, shelf expansion and Fit. It names incomplete
   evidence and unsupported records instead of silently omitting them.
   Refreshes and selection preserve the drawing's scroll and focus. Topology
-  node and link accessible names retain their visible wording and native hover
-  titles.
+  node, bay, group, tier and link accessible names retain all visible wording,
+  including clipped labels, while preserving native hover titles.
 - CORE, SCALE, Linux, ESXi, BMC and QuantaStor collection now distinguish
   unknown occupancy, unread measurements and conflicting identities from
   empty bays or measured zeroes. Saved SMART details follow their configured
