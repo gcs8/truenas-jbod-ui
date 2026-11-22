@@ -49,8 +49,8 @@ It is not a registry publication or deployment.
 | Snapshot/export/offline artifact gate | yes | Restored estimate, Auto HTML and explicit ZIP exports and both offline renders carried with original receipt/input proof from 8c9ace94ec82638cc89d516841d9ba161daf3428. Native setup also repeated this path: HTTP 200, zero external requests and console errors. Private partially redacted artifacts not published. | Pass | |
 | Docs/wiki/public-demo gate | yes | Release notes, source diff, metadata, privacy, public documentation, screenshot manifest and prerelease policy checks pass. Public demo deferred: prerelease. No public screenshot or external wiki bytes changed. Wrap-only final head requires its own exact-head CI. | Pass | |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked | |
-| GHCR publish verification | yes | Not authorized in this preparation phase. No image published. | Blocked | |
-| Deployment refresh/sniff tests | yes | Not authorized in this preparation phase. No installation adopted the candidate. | Blocked | |
+| GHCR publish verification | yes | [Release workflow](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45070295617) completed on merge `5d485296313ef94f70cf6b915323ff38f1d5016d`. Annotated `v0.24.0-rc.2` targets that merge; its tree equals qualified head `c41b77f105eaba91f2e608d38c26108ff60bba80`. GitHub prerelease is published, not draft. Fixed version aliases, `dev`, `sha-5d48529` and the full source-SHA alias resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:283fa755b23971efe23c7d2d198184a9abfc9fa80ea90aa8b68dba345a7bce5f`, with the exact merge revision and version labels. SHA aliases copy identical release-built manifest bytes, not another build. Stable/latest pointers remain v0.23.0. | Pass | |
+| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Secondary-installation acceptance and the complete deployed-state crawl remain pending; no complete deployment-gate claim. | Blocked | |
 | Post-release reopen | yes | Publication, deployment and final validation must precede reopen. | Blocked | |
 
 ## Crawl and human-view disposition
@@ -121,3 +121,69 @@ Exact-cut CI Preflight run 45042241558 passes all 24 expected jobs and CodeQL
 are recorded separately on the current PR head before promotion. No narrow-beta
 deferrals apply. No merge, tag, publication, deployment, stable-channel promotion
 or external wiki action occurred in phase A.
+
+## Phase B publication and exact-merge CI
+
+The published source is merge `5d485296313ef94f70cf6b915323ff38f1d5016d`.
+Its tree, `73a6961b1ba38c05e75dac6b5b38227da8b1be08`, equals the qualified
+release head's tree. The release workflow built the published image above;
+it is distinct from the local phase-A QA image.
+
+[Main CI run 45068384634](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45068384634)
+failed on attempt one. Python 3.14 shard 1 ran 1,846 tests with two skips and
+one error in `test_trickled_headers_and_chunk_metadata_obey_whole_response_deadline`,
+headers/status-200 subtest. The post-close `recv(1)` assertion received
+`ConnectionResetError` rather than EOF. The accepted test-only diagnosis is
+RST rather than FIN when a client closes with unread bytes. The failed native
+result remains retained; it is not relabelled a pass. A separate test correction
+is outside this immutable release cut.
+
+The two Python summaries and public-demo aggregate also failed downstream.
+The Python 3.12 summary had verified all 7,048 test identities exactly once;
+its final matrix-result predicate failed because of the 3.14 shard, not a
+separately observed 3.12 test failure.
+
+The four failed jobs were rerun under the authorized continuation. Attempt
+two completed successfully with 23 successful jobs and one expected Changelog
+skip. Nineteen successful executions were retained from attempt one; only the
+four failed jobs executed again. GitHub assigns new job IDs in the attempt-two
+view even to retained jobs, so execution provenance was reconciled by original
+start/completion timestamps and conclusions, not job IDs alone. No application
+source, release tree, test assertion or deadline changed in this lane.
+[Main CodeQL](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45068384579)
+completed successfully for both languages on the same merge, attempt one.
+
+| Main CI job | Attempt-two result | Execution evidence |
+| --- | --- | --- |
+| Python unittest shard (3.14, 1) | success | rerun on attempt 2 |
+| Changelog entry | skipped | expected skip; not executed |
+| Fixture browser specs (leg 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 4) | success | successful execution retained from attempt 1 |
+| Hardened, interrupted and segmented upgrade smoke | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 1) | success | successful execution retained from attempt 1 |
+| Production container smoke | success | successful execution retained from attempt 1 |
+| Diff hygiene | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 4) | success | successful execution retained from attempt 1 |
+| Admin clean-room browser QA | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 4) | success | successful execution retained from attempt 1 |
+| JavaScript syntax and npm lock | success | successful execution retained from attempt 1 |
+| Run routing | success | successful execution retained from attempt 1 |
+| Image-only upgrade smoke | success | successful execution retained from attempt 1 |
+| Bounded Ruff | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 1) | success | successful execution retained from attempt 1 |
+| Python compile and unittest (3.12) | success | rerun on attempt 2 |
+| Python compile and unittest (3.14) | success | rerun on attempt 2 |
+| Checked-in public demo artifact | success | rerun on attempt 2 |
+
+## Phase B acceptance in progress
+
+The first helper adoption and delayed idle observation passed. The complete
+42-chunk deployed-state crawl and its final observation remain separate gates.
+Post-publish issue reconciliation, secondary-installation acceptance and final
+wrap validation are not yet complete. No final promotion, stable-tag movement,
+production activation or external wiki publication is claimed.
