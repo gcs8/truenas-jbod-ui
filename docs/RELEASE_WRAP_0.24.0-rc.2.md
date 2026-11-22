@@ -12,6 +12,8 @@ Base: `main` at `b232fbd47c75eb1d6f083ddddf19a83dcb90504f`.
 Release cut: `8c9ace94ec82638cc89d516841d9ba161daf3428`.
 Qualification outcome: **Blocked**, not release-ready.
 
+Validated against `docs/RELEASE_CHECKLIST.md`, including its prerelease rules.
+
 This additive recut includes the Topology accessibility correction #1464 and
 performance-observer readiness correction #1462. All 85 collected fragments and
 every historical release section were preserved. No release history was rewritten.
