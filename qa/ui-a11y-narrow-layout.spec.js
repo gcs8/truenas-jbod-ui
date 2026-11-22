@@ -295,6 +295,9 @@ async function openMain(page, name, viewport, query = "") {
 require("./fixture-suites/topology-accessible-names")({
   fixture, routeSynthetic, capture, axeViolations, viewports: [NARROW, ...DESKTOP], origin: ORIGIN,
 });
+require("./fixture-suites/topology-node-names")({
+  fixture, routeSynthetic, capture, axeViolations, viewports: [NARROW, ...DESKTOP], origin: ORIGIN,
+});
 
 async function enableHeatMap(page) {
   const toggle = page.locator("#heatmap-toggle-button");

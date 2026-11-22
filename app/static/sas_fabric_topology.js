@@ -1994,7 +1994,10 @@
     const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}" data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(labelName)}"><title style="display:none">${escapeHtml(labelName)}</title>${body}</g>`;
     return { line, label };
   }
-
+  function visibleName(lines, title) {
+    const visible = lines.join(" ");
+    return title === visible || title.startsWith(`${visible}, `) ? title : [visible, title].filter(Boolean).join(", ");
+  }
   function nodeTitle(entry) {
     const phys = entry.phyGroups.length ? `PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}` : "";
     return [entry.label, ...entry.facts, phys, entry.parentUnknown && entry.kind !== "host" ? "parent link not reported" : ""].filter(Boolean).join(", ");
@@ -2006,9 +2009,8 @@
     if (entry.parentUnknown && entry.kind !== "host") used.add("mark-parent-unknown");
     const text = entry.lines.map((line, index) => `<text class="topo-node-${index < entry.titleLines ? "title" : "fact"}" x="${entry.x + 10}" y="${entry.y + 20 + index * LINE_H}">${escapeHtml(line)}</text>`).join(" ");
     const unknown = entry.parentUnknown && entry.kind !== "host" ? " mark-parent-unknown" : "";
-    return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(title)}"><title style="display:none">${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
+    return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(visibleName(entry.lines, title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
   }
-
   function bayTitle(bay) {
     const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
@@ -2016,7 +2018,6 @@
       : "no path state in payload";
     return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
   }
-
   // How many marks fit in a cell, keeping room for a "+N" count when needed.
   function marksFor(bay) {
     const fit = Math.max(1, Math.floor((bay.w - 4) / MARK_PITCH));
@@ -2024,7 +2025,6 @@
     const shown = bay.pathStates.slice(0, Math.max(1, fit - 1));
     return { shown, more: bay.pathStates.length - shown.length };
   }
-
   function renderBayCell(bay, path, used) {
     const highlight = onPathClass(path, "bays", bay.bayId) + (pinnedRef(path, "bay", bay.bayId) ? " is-pinned" : "");
     used.add(`bay-${bay.occupancy}`);
@@ -2045,7 +2045,7 @@
     // A bay label with no supported number is shown as the producer wrote it.
     const shownLabel = bay.locationKnown ? bay.number || bay.label : bay.label;
     const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
-    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title style="display:none">${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number}${marks}${count}</g>`;
+    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(visibleName([shownLabel, more ? `+${more}` : ""].filter(Boolean), title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number} ${marks} ${count}</g>`;
   }
 
   function pathSummary(summary) {
@@ -2088,8 +2088,8 @@
       const { x, y } = toggleBox(group);
       toggle = `<g class="topo-expand" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(group.expandKey)}" aria-expanded="${group.collapsed ? "false" : "true"}" aria-label="${escapeHtml(label)}"><rect x="${x}" y="${y}" width="160" height="22" rx="6"></rect><text class="topo-label-text" x="${x + 80}" y="${y + 15}" text-anchor="middle">${escapeHtml(label)}</text></g>`;
     }
-    const name = `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`;
-    return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join("")}${cells}${toggle}</g>`;
+    const name = visibleName(group.lines.map((line) => line.text), `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`);
+    return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join(" ")}${cells}${toggle}</g>`;
   }
 
   function renderTier(tier, model) {
@@ -2098,9 +2098,9 @@
     const tone = tier.state === "drawn" ? "ok" : token(tier.state);
     const labelLines = tier.labelLines || [tier.label];
     const noteLines = tier.noteLines || [tier.note];
-    const label = `<g class="topo-tier"><title style="display:none">${escapeHtml(`${tier.label}: ${tier.note}`)}</title>`
-      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join("")
-      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join("")
+    const label = `<g class="topo-tier"><title style="display:none">${escapeHtml(visibleName([...labelLines, ...noteLines], [tier.label, tier.note].filter(Boolean).join(" ")))}</title>`
+      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join(" ") + " "
+      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join(" ")
       + "</g>";
     let band = "";
     if (missing && tier.band) {

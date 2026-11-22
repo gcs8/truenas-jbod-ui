@@ -8,11 +8,23 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 async function nativeName(session, selector) {
-  const { root } = await session.send("DOM.getDocument");
-  const { nodeId } = await session.send("DOM.querySelector", { nodeId: root.nodeId, selector });
-  expect(nodeId).not.toBe(0);
-  const { nodes } = await session.send("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false });
-  return nodes.find((node) => node.role?.value === "button")?.name?.value;
+  let name;
+  // Resize can replace a narrow SVG between CDP commands. Re-resolve only
+  // detached-node failures; an absent name still fails the bounded probe.
+  await expect.poll(async () => {
+    const { root } = await session.send("DOM.getDocument");
+    const { nodeId } = await session.send("DOM.querySelector", { nodeId: root.nodeId, selector });
+    if (!nodeId) return false;
+    try {
+      const { nodes } = await session.send("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false });
+      name = nodes.find((node) => node.role?.value === "button")?.name?.value;
+      return typeof name === "string";
+    } catch (error) {
+      if (!error.message.includes("Could not find node with given id")) throw error;
+      return false;
+    }
+  }, { timeout: 5000 }).toBe(true);
+  return name;
 }
 
 module.exports = function register({ fixture, routeSynthetic, capture, axeViolations, viewports, origin }) {

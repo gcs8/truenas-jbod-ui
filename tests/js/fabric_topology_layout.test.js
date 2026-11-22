@@ -305,7 +305,8 @@ test("text that must be shortened is reachable by keyboard focus as well as by h
   fabric.nodes.find((item) => item.id === hba.id).label = long;
   const html = T.render(fabric, {});
   assert.match(html, /…/, "an unbreakable 76-character name is shortened in its box");
-  assert.ok(html.includes(`aria-label="${long}`), "its accessible name is whole");
+  const name = /data-topo-node="controller:mpr0" aria-label="([^"]*)"/.exec(html)[1];
+  assert.ok(name.includes(long), "its accessible name retains the whole label after the visible wording");
   const element = { dataset: { topoNode: hba.id }, closest(selector) { return selector === ".fabric-topology" ? root : this; } };
   handlers.get("focusin")({ target: element });
   assert.ok(pin.textContent.includes(long), "keyboard focus shows the whole text on the page");
