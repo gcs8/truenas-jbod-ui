@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -202,8 +202,12 @@ class ApiClient:
                 if readiness_endpoint is None or status != 503 or retry_after is None:
                     raise
                 busy_wait_ms = (time.monotonic() - started) * 1000
-            except TimeoutError:
-                if readiness_endpoint is None or time.monotonic() < deadline:
+            except (TimeoutError, URLError) as exc:
+                # urllib wraps connection-stage socket timeouts, while body
+                # reads can raise TimeoutError directly. Other transport errors
+                # and timeouts before the total deadline retain their identity.
+                timed_out = isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError)
+                if not timed_out or readiness_endpoint is None or time.monotonic() < deadline:
                     raise
                 category = "transport_timeout"
                 raise exhausted() from None

@@ -8,7 +8,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from tests.test_perf_harness import run_perf_harness as harness
@@ -238,7 +238,35 @@ class PerfHarnessReadinessTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostic["elapsed_seconds"], 3)
         self.assertNotIn("SECRET", str(caught.exception))
 
-    def run_main(self, directory, clock, *, stuck=False, extra_args=()):
+    def test_wrapped_transport_failure_before_deadline_or_not_timeout_is_preserved(self):
+        for reason, elapsed in ((TimeoutError("SECRET"), 0), (ValueError("SECRET"), 180)):
+            clock = Clock()
+            error = URLError(reason)
+
+            def open_url(request, timeout):
+                clock.now += elapsed
+                raise error
+
+            with (self.subTest(reason=type(reason).__name__),
+                  patch.object(harness, "urlopen", side_effect=open_url),
+                  patch.object(harness.time, "monotonic", clock.monotonic)):
+                with self.assertRaises(URLError) as caught:
+                    harness.ApiClient("https://host.example.test").get_json("/api/inventory")
+            self.assertIs(caught.exception, error)
+
+    def test_main_records_wrapped_connection_timeout_at_the_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, payload = self.run_main(directory, Clock(), wrapped_timeout=True,
+                                            extra_args=("--readiness-timeout-seconds", "3"))
+        self.assertEqual(result, 1)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure"]["endpoint"], ESTIMATE)
+        self.assertEqual(payload["failure"]["elapsed_seconds"], 3)
+        self.assertEqual(payload["failure"]["attempts"], 1)
+        self.assertEqual(payload["failure"]["body_category"], "transport_timeout")
+        self.assertNotIn("SECRET", json.dumps(payload))
+
+    def run_main(self, directory, clock, *, stuck=False, wrapped_timeout=False, extra_args=()):
         estimate_calls = 0
         imported = False
 
@@ -252,6 +280,9 @@ class PerfHarnessReadinessTests(unittest.TestCase):
             if path == ESTIMATE:
                 self.assertTrue(imported)
                 estimate_calls += 1
+                if wrapped_timeout:
+                    clock.now += timeout
+                    raise URLError(TimeoutError("SECRET"))
                 if stuck or estimate_calls <= 4:
                     clock.now += min(timeout, 5)
                     raise busy()[0]
