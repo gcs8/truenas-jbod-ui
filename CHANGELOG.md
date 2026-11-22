@@ -576,6 +576,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Corrected the ESXi smoke test to distinguish unread carrier bays from matched
   disks while preserving physical slot order, carrier layout and populated-drive
   identity checks, with synthetic browser controls for both occupancy states (#1460).
+- Updated the performance harness to wait for retryable safe reads within a configurable readiness deadline, separate snapshot-estimate readiness from warm timings, include recovery waits and attempts in workflow results, and record bounded failure diagnostics without response bodies or credentials (#1462).
+- Topology link buttons now announce their visible labels before supplementary path details, multiline SVG labels keep word separators, and the accessibility crawl no longer treats new label mismatches as the existing bay-tile issue (#1464).
 
 ### Performance
 

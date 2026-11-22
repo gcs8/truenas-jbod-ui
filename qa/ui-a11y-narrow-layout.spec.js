@@ -268,7 +268,7 @@ async function routeSynthetic(page, documentBody, data = {}) {
     if (data.api && url.pathname in data.api) body = data.api[url.pathname];
     if (url.pathname === "/api/inventory" && data.snapshot) body = data.snapshot;
     if (url.pathname === "/api/storage-views" && data.runtime) body = data.runtime;
-    if (url.pathname === "/api/sas-fabric") body = fixture.fabric.fabric;
+    if (url.pathname === "/api/sas-fabric") body = data.fabric || fixture.fabric.fabric;
     if (url.pathname === "/api/slots/smart-batch") {
       const slots = request.postDataJSON()?.slots || [];
       body = { summaries: slots.map((slot) => ({ slot, summary: { available: true, temperature_c: 30 + (slot % 9) } })) };
@@ -291,6 +291,10 @@ async function openMain(page, name, viewport, query = "") {
   expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
   return errors;
 }
+
+require("./fixture-suites/topology-accessible-names")({
+  fixture, routeSynthetic, capture, axeViolations, viewports: [NARROW, ...DESKTOP], origin: ORIGIN,
+});
 
 async function enableHeatMap(page) {
   const toggle = page.locator("#heatmap-toggle-button");
