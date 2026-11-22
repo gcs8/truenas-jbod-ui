@@ -171,6 +171,15 @@ class ApiClient:
                 "body_category": category,
             })
 
+        def translate_deadline_timeout(exc: TimeoutError | URLError) -> None:
+            nonlocal category
+            # Connection setup and response-body reads can expose either form.
+            # Preserve earlier timeouts and transport failures unrelated to time.
+            timed_out = isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError)
+            if timed_out and readiness_endpoint is not None and time.monotonic() >= deadline:
+                category = "transport_timeout"
+                raise exhausted() from None
+
         while True:
             remaining = deadline - time.monotonic()
             if readiness_endpoint is not None and remaining <= 0:
@@ -196,21 +205,19 @@ class ApiClient:
                     status = exc.code
                     retry_after = _safe_retry_after((exc.headers or {}).get("Retry-After", ""))
                     if readiness_endpoint is not None:
-                        category = _body_category(exc.read(ERROR_BODY_LIMIT))
+                        try:
+                            category = _body_category(exc.read(ERROR_BODY_LIMIT))
+                        except (TimeoutError, URLError) as body_error:
+                            translate_deadline_timeout(body_error)
+                            raise
                 finally:
                     exc.close()
                 if readiness_endpoint is None or status != 503 or retry_after is None:
                     raise
                 busy_wait_ms = (time.monotonic() - started) * 1000
             except (TimeoutError, URLError) as exc:
-                # urllib wraps connection-stage socket timeouts, while body
-                # reads can raise TimeoutError directly. Other transport errors
-                # and timeouts before the total deadline retain their identity.
-                timed_out = isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError)
-                if not timed_out or readiness_endpoint is None or time.monotonic() < deadline:
-                    raise
-                category = "transport_timeout"
-                raise exhausted() from None
+                translate_deadline_timeout(exc)
+                raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise exhausted() from None

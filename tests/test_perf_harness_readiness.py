@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import io
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import tempfile
 import sys
@@ -81,6 +84,7 @@ class PerfHarnessReadinessTests(unittest.TestCase):
         errors = []
 
         def open_url(request, timeout):
+            self.assertLess(len(errors), 27, "readiness polling exceeded the bounded fake-call fixture")
             self.assertLessEqual(timeout, 180 - clock.now)
             clock.now += min(5, timeout)
             error, stream = busy()
@@ -193,6 +197,118 @@ class PerfHarnessReadinessTests(unittest.TestCase):
         self.assertTrue(stream.closed)
         self.assertEqual(caught.exception.diagnostic["body_category"], "other")
         self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_error_body_timeout_variants_at_deadline_keep_diagnostics_and_close(self):
+        for exception in (TimeoutError("SECRET"), socket.timeout("SECRET"), URLError(socket.timeout("SECRET"))):
+            clock = Clock()
+            error, stream = busy()
+
+            def read_body(limit):
+                self.assertEqual(limit, harness.ERROR_BODY_LIMIT)
+                clock.now += 3
+                raise exception
+
+            with (self.subTest(exception=type(exception).__name__),
+                  patch.object(stream, "read", side_effect=read_body),
+                  patch.object(harness, "urlopen", side_effect=error),
+                  patch.object(harness.time, "monotonic", clock.monotonic)):
+                with self.assertRaises(harness.ReadinessDeadlineExceeded) as caught:
+                    harness.ApiClient("https://host.example.test", readiness_timeout_seconds=3).post_json(ESTIMATE, {})
+                self.assertEqual(caught.exception.diagnostic["status"], 503)
+                self.assertEqual(caught.exception.diagnostic["retry_after_seconds"], 2)
+                self.assertEqual(caught.exception.diagnostic["elapsed_seconds"], 3)
+                self.assertEqual(caught.exception.diagnostic["body_category"], "transport_timeout")
+                self.assertNotIn("SECRET", str(caught.exception))
+                self.assertTrue(stream.closed)
+
+    def test_error_body_failure_before_deadline_or_not_timeout_is_preserved(self):
+        for exception, elapsed in ((TimeoutError("SECRET"), 0), (URLError(TimeoutError("SECRET")), 0),
+                                   (URLError(ValueError("SECRET")), 3)):
+            clock = Clock()
+            error, stream = busy()
+
+            def read_body(limit):
+                clock.now += elapsed
+                raise exception
+
+            with (self.subTest(exception=type(exception).__name__, elapsed=elapsed),
+                  patch.object(stream, "read", side_effect=read_body),
+                  patch.object(harness, "urlopen", side_effect=error),
+                  patch.object(harness.time, "monotonic", clock.monotonic)):
+                with self.assertRaises(type(exception)) as caught:
+                    harness.ApiClient("https://host.example.test", readiness_timeout_seconds=3).post_json(ESTIMATE, {})
+                self.assertIs(caught.exception, exception)
+                self.assertTrue(stream.closed)
+
+    def test_main_reports_stalled_local_503_body_and_closes_response(self):
+        release = threading.Event()
+        headers_sent = threading.Event()
+        responses = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                content = b'{"slots":[]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(503)
+                self.send_header("Retry-After", "2")
+                self.send_header("Content-Length", "81")
+                self.end_headers()
+                self.wfile.flush()
+                headers_sent.set()
+                release.wait(5)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        real_open = harness.urlopen
+
+        def record_error(request, timeout):
+            try:
+                return real_open(request, timeout=timeout)
+            except HTTPError as error:
+                responses.append(error.fp)
+                raise
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output.json"
+                records = Path(directory) / "records"
+                argv = ["perf", "--base-url", f"http://127.0.0.1:{server.server_port}",
+                        "--iterations", "1", "--skip-mappings-import-roundtrip",
+                        "--readiness-timeout-seconds", "0.1", "--output", str(output),
+                        "--record-dir", str(records)]
+                with (patch.object(sys, "argv", argv),
+                      patch.object(harness, "urlopen", side_effect=record_error)):
+                    result = harness.main()
+                self.assertEqual(result, 1)
+                payload = json.loads(output.read_text())
+                self.assertEqual(payload, json.loads((records / "failure.json").read_text()))
+                self.assertEqual(payload["status"], "failed")
+                self.assertEqual(payload["failure"]["reason"], "readiness_deadline_exceeded")
+                self.assertEqual(payload["failure"]["endpoint"], ESTIMATE)
+                self.assertEqual(payload["failure"]["status"], 503)
+                self.assertEqual(payload["failure"]["retry_after_seconds"], 2)
+                self.assertEqual(payload["failure"]["attempts"], 1)
+                self.assertEqual(payload["failure"]["body_category"], "transport_timeout")
+                self.assertTrue(headers_sent.is_set(), "test must reach the withheld error body")
+                self.assertFalse(release.is_set(), "closure must precede server cleanup")
+                self.assertEqual(len(responses), 1)
+                self.assertTrue(responses[0].closed)
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
 
     def test_safe_sibling_reads_recover_and_record_attempts(self):
         for path in sorted(harness.SAFE_GET_PATHS):
