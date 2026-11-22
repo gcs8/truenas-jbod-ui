@@ -120,20 +120,23 @@ async function installFixture(page, html, {
       if (["esxi-ft-node-2", "cryostorage-esxi"].includes(systemId)) {
         const fatTwin = systemId === "esxi-ft-node-2";
         const profileId = fatTwin ? "supermicro-fat-twin-front-6" : "supermicro-aoc-slg4-2h8m2";
-        const layout = fatTwin ? [[2, 5], [1, 4], [0, 3]] : [[0, 1]];
+        // Match the built-in physical profiles, including AOC bay 01 above 00.
+        const layout = fatTwin ? [[2, 5], [1, 4], [0, 3]] : [[1], [0]];
+        const columns = fatTwin ? 2 : 1;
         payload.selected_system_platform = "esxi";
         payload.selected_enclosure_id = profileId;
         payload.selected_profile = { ...payload.selected_profile, id: profileId,
           face_style: fatTwin ? "generic" : "nvme-carrier", slot_layout: layout,
-          rows: layout.length, columns: 2 };
+          rows: layout.length, columns, slot_count: layout.flat().length };
         payload.layout_rows = layout;
         payload.layout_slot_count = layout.flat().length;
-        payload.layout_columns = 2;
-        payload.enclosures = [{ ...payload.enclosures[0], id: profileId, profile_id: profileId, slot_layout: layout }];
+        payload.layout_columns = columns;
+        payload.enclosures = [{ ...payload.enclosures[0], id: profileId, profile_id: profileId,
+          rows: layout.length, columns, slot_count: layout.flat().length, slot_layout: layout }];
         payload.slots = layout.flat().map((slot, i) => ({ ...payload.slots[0], slot,
-          slot_label: String(slot).padStart(2, "0"), row_index: Math.floor(i / 2), column_index: i % 2,
+          slot_label: String(slot).padStart(2, "0"), row_index: Math.floor(i / columns), column_index: i % columns,
           enclosure_id: profileId, serial: `SANITIZED-ESXI-${slot}`,
-          device_name: fatTwin ? `252:${slot}` : `13:${1 - slot}`,
+          device_name: fatTwin ? `252:${slot}` : `13:${slot}`,
           model: fatTwin ? "H7240AS60SUN4.0T" : "Samsung SSD 970 EVO 2TB",
           mapping_source: "ssh", led_supported: fatTwin,
           pool_name: fatTwin ? "ESXi local JBOD" : null, vdev_class: fatTwin ? "JBOD" : null,

@@ -573,6 +573,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   synthetic producer and fresh enclosure inventory before resuming history or
   persistence checks. Kept unread-source refusal mandatory and exposed fixed
   mapping failure details in bounded diagnostics (#1458).
+- Corrected the ESXi smoke test to distinguish unread carrier bays from matched
+  disks while preserving physical slot order, carrier layout and populated-drive
+  identity checks, with synthetic browser controls for both occupancy states (#1460).
 
 ### Performance
 
