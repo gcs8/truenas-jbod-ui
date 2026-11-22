@@ -58,6 +58,14 @@ module.exports = function registerFixtureSuite({ test, expect }) {
     await waitForSelectedScope(page);
     const toggle = page.locator("#auto-refresh-toggle");
     if (await toggle.isChecked()) await toggle.click();
+    // These snapshots use the real built-in carrier profile, not a free-form layout.
+    expect(fixture.snapshot.layout_rows).toEqual([[1], [0]]);
+    const tiles = page.locator("#slot-grid .slot-tile");
+    expect(await tiles.evaluateAll(nodes => nodes.map(node => node.dataset.slot))).toEqual(["1", "0"]);
+    await expect(tiles.locator(".storage-view-runtime-card-slot")).toHaveText(["01", "00"]);
+    const upper = await tiles.nth(0).boundingBox();
+    const lower = await tiles.nth(1).boundingBox();
+    expect(upper.y).toBeLessThan(lower.y);
     return { fixture, requests, errors };
   }
 
@@ -74,6 +82,7 @@ module.exports = function registerFixtureSuite({ test, expect }) {
 
   for (const [name, corrupt, failure] of [
     ["missing source warning", http => { http.fixture.snapshot.warnings = []; }, /toBe/],
+    ["scoped layout differs from rendered order", http => { http.fixture.snapshot.layout_rows = [[0, 1]]; }, /toEqual/],
     ["wrong system response", http => { http.fixture.snapshot.selected_system_id = "synthetic-other"; }, /toBe/],
     ["wrong enclosure response", http => { http.fixture.snapshot.selected_enclosure_id = "synthetic-other"; }, /toBe/],
     ["known empty is not unread", http => {

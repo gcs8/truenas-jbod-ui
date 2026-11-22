@@ -75,6 +75,13 @@ test.describe("ESXi smoke", () => {
     }
 
     await switchSelectedScope(page, "#system-select", "cryostorage-esxi");
+    // The built-in AOC profile puts physical bay 01 above bay 00.
+    const carrierTiles = page.locator("#slot-grid .slot-tile");
+    expect(await carrierTiles.evaluateAll(nodes => nodes.map(node => node.dataset.slot))).toEqual(["1", "0"]);
+    await expect(carrierTiles.locator(".storage-view-runtime-card-slot")).toHaveText(["01", "00"]);
+    const upper = await carrierTiles.nth(0).boundingBox();
+    const lower = await carrierTiles.nth(1).boundingBox();
+    expect(upper.y).toBeLessThan(lower.y);
     await observeAocCarrier(page);
   });
 });

@@ -14,10 +14,6 @@ async function observeAocCarrier(page) {
 
   const tiles = page.locator("#slot-grid .slot-tile");
   await expect(tiles).toHaveCount(2);
-  expect(await tiles.evaluateAll(nodes => nodes.map(node => node.dataset.slot))).toEqual(["1", "0"]);
-  const upper = await tiles.first().boundingBox();
-  const lower = await tiles.nth(1).boundingBox();
-  expect(upper.y).toBeLessThan(lower.y);
 
   // Read only this selected system/enclosure. A warning or tile text alone
   // cannot select a more permissive branch or turn a profile hint into a disk.
@@ -32,7 +28,11 @@ async function observeAocCarrier(page) {
   const snapshot = observed.snapshot;
   expect(snapshot.selected_system_id).toBe(systemId);
   expect(snapshot.selected_enclosure_id).toBe(enclosureId);
-  const slots = [1, 0].map(slot => snapshot.slots.find(item => item.slot === slot));
+  const expectedOrder = snapshot.layout_rows.flat().filter(Number.isInteger);
+  expect(expectedOrder).toHaveLength(2);
+  expect(new Set(expectedOrder).size).toBe(2);
+  expect(await tiles.evaluateAll(nodes => nodes.map(node => node.dataset.slot))).toEqual(expectedOrder.map(String));
+  const slots = expectedOrder.map(slot => snapshot.slots.find(item => item.slot === slot));
   expect(slots.every(Boolean)).toBe(true);
   const unread = slots.every(slot => slot.presence_known === false);
   if (unread) {
@@ -42,7 +42,7 @@ async function observeAocCarrier(page) {
   }
   for (const [index, slot] of slots.entries()) {
     const tile = tiles.nth(index);
-    await expect(tile.locator(".storage-view-runtime-card-slot")).toHaveText(index === 0 ? "01" : "00");
+    await expect(tile.locator(".storage-view-runtime-card-slot")).toHaveText(String(slot.slot).padStart(2, "0"));
     await expect(tile).toHaveAttribute("data-slot-size", "2280");
     if (unread) {
       expect(slot.present).toBe(false);
@@ -64,7 +64,7 @@ async function observeAocCarrier(page) {
   await tiles.first().click();
   await expect(page.locator("#detail-content")).toBeVisible();
   // The detail's device coordinate remains a hint when no occupant was read.
-  await expect(page.locator("#detail-content")).toContainText(unread ? "13:1" : "Samsung SSD 970 EVO 2TB");
+  await expect(page.locator("#detail-content")).toContainText(unread ? `13:${slots[0].slot}` : "Samsung SSD 970 EVO 2TB");
   await expect(page.locator("#detail-led-controls")).toBeHidden();
   await expect(page.locator("#detail-smart-note")).toBeVisible();
   await expect(page.locator(".nvme-carrier-edge-note")).toContainText("M2-1 lower slot");
