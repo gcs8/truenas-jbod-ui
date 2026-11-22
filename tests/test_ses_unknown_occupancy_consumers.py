@@ -865,6 +865,45 @@ class StorcliOnlyEnumerationTests(unittest.TestCase):
                     self.assertEqual(domain_models.slot_occupancy(slot), "unknown", slot.slot)
 
 
+class EsxiCarrierSmokeFixtureTests(unittest.TestCase):
+    """The browser fixture carries real correlation evidence, not handwritten occupancy."""
+
+    def test_unread_profile_hints_do_not_establish_occupants(self) -> None:
+        from tests.esxi_carrier_fixture import build_case
+
+        snapshot = build_case("unread")["snapshot"]
+        self.assertEqual(snapshot["layout_rows"], [[1], [0]])
+        self.assertTrue(any("M.2 slots on this RAID card cannot be mapped" in warning for warning in snapshot["warnings"]))
+        for slot in snapshot["slots"]:
+            self.assertEqual(slot["device_name"], f"13:{slot['slot']}")
+            self.assertFalse(slot["presence_known"])
+            self.assertFalse(slot["present"])
+            self.assertEqual(slot["state"], "unknown")
+            self.assertIsNone(slot["serial"])
+            self.assertFalse(slot["led_supported"])
+
+    def test_populated_aoc_coordinates_keep_the_observed_identities(self) -> None:
+        from tests.esxi_carrier_fixture import build_case
+
+        snapshot = build_case("populated")["snapshot"]
+        for slot in snapshot["slots"]:
+            self.assertTrue(slot.get("presence_known", True))
+            self.assertTrue(slot["present"])
+            self.assertEqual(slot["device_name"], f"13:{slot['slot']}")
+            self.assertEqual(slot["serial"], f"SANITIZED-AOC-{slot['slot']}")
+            self.assertEqual(slot["model"], "Samsung SSD 970 EVO 2TB")
+            self.assertFalse(slot["led_supported"])
+
+    def test_complete_census_unlisted_bay_is_known_empty(self) -> None:
+        from tests.esxi_carrier_fixture import build_case
+
+        slots = build_case("empty")["snapshot"]["slots"]
+        upper = next(slot for slot in slots if slot["slot"] == 1)
+        self.assertTrue(upper.get("presence_known", True))
+        self.assertFalse(upper["present"])
+        self.assertEqual(upper["state"], "empty")
+
+
 def _storcli_drive(slot: int, controller: int = 0, slot_text: str | None = None) -> dict[str, Any]:
     return {"Ctl": f"c{controller}", "EID:Slt": slot_text or f"13:{slot}", "DID": slot, "State": "Onln", "DG": "0",
             "Size": "1 TB", "Intf": "NVMe", "Med": "SSD", "SeSz": "512B", "Model": "Synthetic",
