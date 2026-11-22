@@ -98,8 +98,9 @@ class PerfHarnessTests(unittest.TestCase):
             client.get_json("/api/inventory")
         self.assertEqual(open_url.call_count, 1)
         sleep.assert_called_once_with(3)
-        # Other errors and forced refreshes are never replayed.
-        for error, params in ((busy(retry_after=""), None), (busy(code=500), None), (busy(), {"force": "true"})):
+        # Other errors, including non-busy forced-read failures, are never replayed.
+        for error, params in ((busy(retry_after=""), None), (busy(code=500), None),
+                              (busy(retry_after=""), {"force": "true"}), (busy(code=500), {"force": "true"})):
             with (
                 self.subTest(code=error.code, params=params),
                 patch.object(run_perf_harness, "urlopen", side_effect=error) as open_url,

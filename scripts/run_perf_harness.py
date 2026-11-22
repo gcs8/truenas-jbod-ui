@@ -318,8 +318,8 @@ class ApiClient:
 
     @staticmethod
     def _safe_read(path: str, values: dict[str, Any] | None, allowed: frozenset[str]) -> str | None:
-        # Forced reads and mutations are never replayed. Only literal known
-        # endpoints qualify; query strings cannot enter failure diagnostics.
+        # Force parameters on other reads and read-only POSTs still forbid
+        # replay. Only literal endpoints qualify for bounded diagnostics.
         values = values or {}
         if path not in allowed or any(values.get(key) not in (None, False, "false", "0") for key in ("force", "force_refresh")):
             return None
@@ -334,7 +334,10 @@ class ApiClient:
             method="GET",
             headers=self._headers(),
         )
-        return self._open_json(request, readiness_endpoint=self._safe_read(path, params, SAFE_GET_PATHS))
+        # A busy forced inventory GET is safe to re-issue, unlike a mutation.
+        # Keep the original forced request and its single readiness deadline.
+        endpoint = path if path == "/api/inventory" else self._safe_read(path, params, SAFE_GET_PATHS)
+        return self._open_json(request, readiness_endpoint=endpoint)
 
     def post_json(self, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.post_json_with_headers(path, payload, params=params).data
@@ -819,7 +822,7 @@ def render_markdown(
 
     if payload.get("readiness"):
         lines.extend(["", "## Readiness waits", "",
-                      "These prerequisites are excluded from warm estimate timings and included in workflow timings.", ""])
+                      "Inventory setup is excluded from measurements; estimate readiness is excluded from warm timings and included in workflow timings.", ""])
         for item in payload["readiness"]:
             lines.append(f"- {item['name']}: {item['duration_ms']:.1f} ms, {item['request_count']} attempts, "
                          f"{item['metadata_counts'].get('busy_wait_ms', 0):.1f} ms busy recovery")
@@ -982,7 +985,16 @@ def _run(args: argparse.Namespace) -> int:
     results: list[RunResult] = []
     readiness: list[RunResult] = []
 
-    inventory = client.get_json("/api/inventory", params={"force": "true"})
+    inventory: dict[str, Any] = {}
+
+    def initial_inventory() -> RequestMetrics:
+        nonlocal inventory
+        response = client.get_json_with_headers("/api/inventory", params={"force": "true"})
+        inventory = response.data
+        return build_request_metrics(response)
+
+    # Setup recovery is a prerequisite, not an inventory_force measurement.
+    readiness.append(run_timed("inventory_force_readiness", initial_inventory))
     client.get_json("/api/storage-views")
     mapping_bundle = client.get_json("/api/mappings/export")
     history_status_available = False
