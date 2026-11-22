@@ -4,6 +4,7 @@ import argparse
 import base64
 import concurrent.futures
 import csv
+import io
 import json
 import math
 import re
@@ -14,11 +15,12 @@ import stat
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener, urlopen as _urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Three minutes allows long restored-dataset refreshes without hiding a stuck
@@ -26,6 +28,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_READINESS_TIMEOUT_SECONDS = 180.0
 READINESS_TIMEOUT_ENV = "PERF_HARNESS_READINESS_TIMEOUT_SECONDS"
 ERROR_BODY_LIMIT = 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
+_DEFAULT_HTTPS_CONTEXT = getattr(HTTPSHandler(), "_context")
 SAFE_GET_PATHS = frozenset({
     "/api/inventory", "/api/storage-views", "/api/mappings/export",
     "/api/history/status", "/healthz",
@@ -33,6 +37,90 @@ SAFE_GET_PATHS = frozenset({
 SAFE_POST_PATHS = frozenset({
     "/api/export/enclosure-snapshot/estimate", "/api/slots/smart-batch",
 })
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Apply one absolute budget to every receive, including HTTP framing."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._deadline = deadline
+        self._source: Any = None
+        self._source = sock.makefile("rb", buffering=0)
+
+    def readable(self) -> bool:
+        return not self.closed
+
+    def readinto(self, buffer: Any) -> int | None:
+        if self.closed:
+            raise ValueError("read from closed response")
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("readiness deadline exceeded")
+        self._sock.settimeout(remaining)
+        count = self._source.readinto(memoryview(buffer)[:RESPONSE_READ_CHUNK_SIZE])
+        if time.monotonic() >= self._deadline:
+            raise TimeoutError("readiness deadline exceeded")
+        return count
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                if self._source is not None:
+                    self._source.close()
+            finally:
+                super().close()
+
+
+class _DeadlineSocket:
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        if mode != "rb":
+            raise ValueError("response reader requires binary read mode")
+        reader = _DeadlineSocketReader(self._sock, self._deadline)
+        try:
+            return io.BufferedReader(reader, buffer_size=RESPONSE_READ_CHUNK_SIZE)
+        except BaseException:
+            reader.close()
+            raise
+
+
+def urlopen(request: Request, *, timeout: float) -> Any:
+    # This attribute is local request metadata, never an HTTP header. Keeping
+    # the budget in this opener also preserves it across urllib redirects.
+    deadline = getattr(request, "_readiness_deadline", None)
+    if deadline is None:
+        return _urlopen(request, timeout=timeout)
+
+    def connection_factory(connection_type: Any) -> Any:
+        def connect(host: str, **kwargs: Any) -> Any:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("readiness deadline exceeded")
+            kwargs["timeout"] = min(kwargs["timeout"], remaining)
+            connection = connection_type(host, **kwargs)
+            connection.response_class = lambda sock, *args, **options: HTTPResponse(
+                cast(Any, _DeadlineSocket(sock, deadline)), *args, **options,
+            )
+            return connection
+        return connect
+
+    class DeadlineHTTPHandler(HTTPHandler):
+        def http_open(self, req: Request) -> Any:
+            return self.do_open(connection_factory(HTTPConnection), req)
+
+    class DeadlineHTTPSHandler(HTTPSHandler):
+        def https_open(self, req: Request) -> Any:
+            return self.do_open(connection_factory(HTTPSConnection), req, context=_DEFAULT_HTTPS_CONTEXT)
+
+    # Retain urllib's proxy, redirect and error handlers and the default
+    # certificate-verifying HTTPS context; replace only response socket reads.
+    opener = build_opener(DeadlineHTTPHandler(), DeadlineHTTPSHandler(context=_DEFAULT_HTTPS_CONTEXT))
+    return opener.open(request, timeout=timeout)
 
 
 class ReadinessDeadlineExceeded(RuntimeError):
@@ -159,6 +247,7 @@ class ApiClient:
         retry_after = None
         category = "other"
         busy_wait_ms = 0.0
+        setattr(request, "_readiness_deadline", deadline if readiness_endpoint is not None else None)
 
         def exhausted() -> ReadinessDeadlineExceeded:
             return ReadinessDeadlineExceeded({
@@ -187,6 +276,7 @@ class ApiClient:
             attempts += 1
             try:
                 with urlopen(request, timeout=min(120, remaining) if readiness_endpoint else 120) as response:
+                    status = response.status if isinstance(response, HTTPResponse) else None
                     body = response.read()
                     if readiness_endpoint is not None and time.monotonic() >= deadline:
                         status, category = 200, "other"

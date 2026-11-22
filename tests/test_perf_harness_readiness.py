@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import tempfile
@@ -309,6 +310,128 @@ class PerfHarnessReadinessTests(unittest.TestCase):
             server.server_close()
             worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
+
+    def _assert_trickled_response_deadline(self, status, phase):
+        stop = threading.Event()
+        finished = threading.Event()
+        connections = []
+        responses = []
+        sent = []
+        started = []
+        content = b'{"ok":true,"padding":"slow body"}'
+        budget = 0.3
+        slack = 0.2
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                body = b'{"slots":[]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def trickle(self, data):
+                for byte in data:
+                    if stop.is_set():
+                        return
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    sent.append(byte)
+                    if stop.wait(0.05):
+                        return
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                connections.append(self.connection)
+                try:
+                    if phase == "headers":
+                        headers = f"HTTP/1.1 {status} Synthetic\r\nContent-Length: {len(content)}\r\n\r\n".encode()
+                        self.trickle(headers)
+                        if not stop.is_set():
+                            self.wfile.write(content)
+                    else:
+                        self.send_response(status)
+                        self.send_header("Retry-After", "2")
+                        if phase == "chunked":
+                            self.send_header("Transfer-Encoding", "chunked")
+                        else:
+                            self.send_header("Content-Length", str(len(content)))
+                        self.end_headers()
+                        self.wfile.flush()
+                        if phase == "chunked":
+                            self.trickle(f"{len(content):016x}\r\n".encode())
+                            if not stop.is_set():
+                                self.wfile.write(content + b"\r\n0\r\n\r\n")
+                        else:
+                            self.trickle(content)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    finished.set()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        real_open = harness.urlopen
+
+        def record_response(request, timeout):
+            if urlsplit(request.full_url).path == ESTIMATE:
+                started.append(time.monotonic())
+            try:
+                response = real_open(request, timeout=timeout)
+            except HTTPError as error:
+                responses.append(error.fp)
+                raise
+            if urlsplit(request.full_url).path == ESTIMATE:
+                responses.append(response)
+            return response
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output.json"
+                records = Path(directory) / "records"
+                argv = ["perf", "--base-url", f"http://127.0.0.1:{server.server_port}",
+                        "--iterations", "1", "--skip-mappings-import-roundtrip",
+                        "--readiness-timeout-seconds", str(budget), "--output", str(output),
+                        "--record-dir", str(records)]
+                with (patch.object(sys, "argv", argv), patch.object(harness, "urlopen", side_effect=record_response)):
+                    result = harness.main()
+                elapsed = time.monotonic() - started[0]
+                self.assertEqual(result, 1)
+                self.assertLess(elapsed, budget + slack, "trickled bytes extended the whole-response budget")
+                payload = json.loads(output.read_text())
+                self.assertEqual(payload, json.loads((records / "failure.json").read_text()))
+                self.assertEqual(payload["status"], "failed")
+                self.assertEqual(payload["failure"]["reason"], "readiness_deadline_exceeded")
+                self.assertEqual(payload["failure"]["endpoint"], ESTIMATE)
+                self.assertEqual(payload["failure"]["status"], None if phase == "headers" else status)
+                self.assertEqual(payload["failure"]["attempts"], 1)
+                self.assertEqual(payload["failure"]["body_category"], "transport_timeout")
+                self.assertGreaterEqual(len(sent), 2, "the server must send actual trickled bytes")
+                self.assertTrue(all(response.closed for response in responses))
+                self.assertFalse(stop.is_set(), "closure must precede fixture cleanup")
+                connections[0].settimeout(0.1)
+                self.assertEqual(connections[0].recv(1), b"", "the client socket must close before cleanup")
+        finally:
+            stop.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+            self.assertTrue(finished.wait(5))
+        self.assertFalse(worker.is_alive())
+
+    def test_success_and_busy_trickled_bodies_obey_whole_response_deadline(self):
+        for status in (200, 503):
+            with self.subTest(status=status):
+                self._assert_trickled_response_deadline(status, "body")
+
+    def test_trickled_headers_and_chunk_metadata_obey_whole_response_deadline(self):
+        for phase, status in (("headers", 200), ("chunked", 200), ("chunked", 503)):
+            with self.subTest(phase=phase, status=status):
+                self._assert_trickled_response_deadline(status, phase)
 
     def test_safe_sibling_reads_recover_and_record_attempts(self):
         for path in sorted(harness.SAFE_GET_PATHS):
