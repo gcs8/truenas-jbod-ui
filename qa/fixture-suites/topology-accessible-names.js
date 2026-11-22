@@ -55,6 +55,7 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
           await expect(page.locator("#fabric-inspector-title")).toHaveText(state === "bundle" ? "Selected bay bundle" : "Selected link");
           await expect(page.locator("#fabric-inspector-body")).toContainText(state === "bundle" ? "Bays it carries" : "PHYs");
         }
+        const scrollViolations = state === "unpinned" ? [] : await axeViolations(page, ["label-content-name-mismatch"]);
         // Restore the same page position after keyboard focus scrolls a badge.
         // The diagram keeps its own horizontal scroll position.
         await page.evaluate(() => window.scrollTo(0, 0));
@@ -69,7 +70,7 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
           const visible = await page.locator(selector).first().locator("text").allTextContents();
           names.push({ kind, visible: visible.join(" "), name: await nativeName(session, selector) });
         }
-        observations.push({ state, names, violations: await axeViolations(page, ["label-content-name-mismatch"]) });
+        observations.push({ state, names, scrollViolations, violations: await axeViolations(page, ["label-content-name-mismatch"]) });
       }
       // Name-from-content diagnostic: keep positioned text and its separators,
       // remove only the explicit name and title on a disposable host-node copy.
@@ -85,11 +86,12 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
       const contentName = await nativeName(session, "#topology-content-name-control");
       await page.locator("#topology-content-name-control").evaluate((node) => node.remove());
       await session.detach();
-      for (const { state, names, violations } of observations) {
+      for (const { state, names, scrollViolations, violations } of observations) {
         for (const { kind, visible, name } of names) {
           expect.soft(name?.startsWith(`${visible}, Link `), `${state} ${kind}: ${name}`).toBe(true);
         }
         expect.soft(violations, state).toEqual([]);
+        expect.soft(scrollViolations, `${state} after keyboard scroll`).toEqual([]);
       }
       expect(contentName).toBe(lines.join(" "));
       expect(errors).toEqual([]);

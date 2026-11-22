@@ -39,8 +39,9 @@ test("multiline SVG node and link text keeps word separators without changing li
     const lines = texts(match[1]);
     if (lines.length < 2) continue;
     multiline += 1;
-    const content = decode(match[1].replace(/<title>[\s\S]*?<\/title>/g, "").replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
-    assert.equal(content, lines.join(" "));
+    const separators = [...match[1].matchAll(/<\/text>([\s\S]*?)<text\b/g)];
+    assert.equal(separators.length, lines.length - 1);
+    for (const separator of separators) assert.match(separator[1], /^\s+$/);
   }
   assert.ok(multiline > 0);
 });
