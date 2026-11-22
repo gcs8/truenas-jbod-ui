@@ -557,7 +557,13 @@ class PerfHarnessReadinessTests(unittest.TestCase):
                 self.assertTrue(all(response.closed for response in responses))
                 self.assertFalse(stop.is_set(), "closure must precede fixture cleanup")
                 connections[0].settimeout(0.1)
-                self.assertEqual(connections[0].recv(1), b"", "the client socket must close before cleanup")
+                try:
+                    closed = connections[0].recv(1)
+                except ConnectionResetError:
+                    # Closing with unread trickled bytes may send RST instead of FIN.
+                    pass
+                else:
+                    self.assertEqual(closed, b"", "the client socket must close before cleanup")
         finally:
             stop.set()
             server.shutdown()
