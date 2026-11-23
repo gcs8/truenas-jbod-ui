@@ -11891,9 +11891,10 @@
         }
       }
       if (statusOwner.result !== result) publish(result);
-      if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+      if (!statusOwner.superseded && result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
         try {
-          await refreshSnapshot(true, "manual-refresh");
+          await refreshSnapshot(true, "manual-refresh", () => !statusOwner.superseded
+            && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id));
           publish(result);
         } catch (_error) {
           publish({ ...result, message: `${result.message} The inventory refresh is unavailable; refresh again.` });

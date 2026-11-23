@@ -241,6 +241,67 @@ test("an older refresh completion cannot republish success over a newer failure"
   }
 });
 
+test("an older observed success cannot start a refresh after a newer failure", async () => {
+  const h = harness([
+    { state: "UNKNOWN", job_id: 17, message: "Old job state unknown." },
+    { state: "FAILED", job_id: 18, message: "New job failed.", error: "New job error." },
+    { state: "SUCCESS", job_id: 17, message: "Old job succeeded." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const older = h.context.run("full", "system-a");
+  await observing;
+  await h.context.run("full", "system-a");
+  resume();
+  await older;
+  assert.equal(h.refreshes.length, 0, "a superseded success must not start a new inventory refresh");
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /New job error/);
+});
+
+test("the real inventory refresh cannot hide a superseding job failure", async t => {
+  for (const refreshFails of [false, true]) {
+    await t.test(refreshFails ? "refresh fails" : "refresh completes", async () => {
+      const h = harness([
+        { state: "SUCCESS", job_id: 17, message: "Old job succeeded." },
+        { state: "FAILED", job_id: 18, message: "New job failed.", error: "New job error." },
+      ]);
+      let entered, finish;
+      const refreshing = new Promise(resolve => { entered = resolve; });
+      const inventory = new Promise((resolve, reject) => { finish = refreshFails ? reject : resolve; });
+      const syncFetch = h.context.fetchJson;
+      const applied = [];
+      const noop = () => {};
+      Object.assign(h.state, { latestRefreshToken: 0, refreshesInFlight: 0, sasFabric: {}, history: {} });
+      Object.assign(h.context, {
+        URLSearchParams, cancelAutoRefreshTimer: noop, beginUiPerfRun: () => null,
+        refreshStatusMessage: () => "Refreshing inventory.", buildSelectionParams: () => new URLSearchParams(),
+        applySnapshot: snapshot => applied.push(snapshot), invalidateHistoryCaches: noop, renderAll: noop,
+        fetchStorageViewRuntime: noop, waitForNextPaint: async () => {}, renderUiPerfPanel: noop,
+        renderStorageViewRuntimeStatus: noop, markHistoryCachesStale: noop, renderHistoryPanel: noop, renderHeatmapControls: noop,
+        refreshHistoryStatus: async () => {}, completeUiPerfHistory: noop, setUiPerfSmartPending: noop,
+        candidateSlotsForSmartPrefetch: () => [], currentSmartPrefetchScopeKey: noop,
+        scheduleSmartPrefetch: noop, ensureHeatmapData: noop, maybeFinalizeUiPerfRun: noop, scheduleAutoRefresh: noop,
+        fetchJson: async (url, options) => {
+          if (url.startsWith("/api/inventory?")) { entered(); return inventory; }
+          return syncFetch(url, options);
+        },
+      });
+      vm.runInContext(source.slice(source.indexOf("  async function refreshSnapshot("), source.indexOf("  async function sendLedAction(")), h.context);
+      const older = h.context.run("full", "system-a");
+      await refreshing;
+      await h.context.run("full", "system-a");
+      assert.match(h.statuses.at(-1).text, /New job error/);
+      finish(refreshFails ? new Error("Synthetic inventory read unavailable.") : {});
+      await older;
+      assert.equal(h.statuses.at(-1).kind, "error");
+      assert.match(h.statuses.at(-1).text, /New job error/);
+      assert.equal(applied.length, 0, "a superseded refresh must not publish its captured inventory either");
+    });
+  }
+});
+
 test("a superseded owner stays retired after newer outcomes leave the bounded list", async () => {
   const h = harness([
     { state: "SUCCESS", job_id: 17, message: "Older inventory re-read." },
