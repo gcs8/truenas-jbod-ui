@@ -42,6 +42,42 @@ test("Linux transport records are drawn rather than classified as uncollected", 
   assert.ok(!model.notices.some((notice) => notice.startsWith("Not drawn:")));
 });
 
+test("no-SES SAS transport edges connect the reported bay", () => {
+  const fabric = syntheticFabric();
+  fabric.nodes = fabric.nodes.filter((node) => node.kind !== "ses-enclosure");
+  fabric.nodes.push({ id: "bay:0", kind: "bay", label: "Bay 00", slot: 0, related_slots: [0], metrics: {}, raw: {} });
+  fabric.links = fabric.links.filter((link) => link.kind !== "expander-ses-enclosure");
+  fabric.links.push({ id: "transport-bay:rear", kind: "transport-bay", source: "expander:rear", target: "bay:0", slot: 0, related_slots: [0] });
+  const model = topology().buildTopologyModel(fabric);
+  assert.ok(model.links.some((link) => link.bundle && link.source === "expander:rear"));
+  assert.ok(!model.notices.some((notice) => notice.startsWith("Not drawn:")));
+});
+
+test("shared observed SES membership appears in each matching controller lane", () => {
+  const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
+  const start = source.indexOf("  function renderLanesMode(");
+  const end = source.indexOf("\n  function ", start + 10);
+  const fabric = syntheticFabric();
+  fabric.nodes.push({ id: "controller:host3", kind: "controller", label: "host3" });
+  fabric.nodes.push({ id: "controller:host4", kind: "controller", label: "host4" });
+  const ses = fabric.nodes.find((node) => node.kind === "ses-enclosure");
+  ses.controller_id = null;
+  ses.raw.controller_ids = ["controller:host2", "controller:host3"];
+  const context = vm.createContext({
+    fabricViewCopy: () => ({ laneStages: { controller: "HBA", paths: "Paths", expanders: "Expanders", enclosures: "Enclosures", bays: "Bays" } }),
+    nodeMap: (value) => new Map(value.nodes.map((node) => [node.id, node])), list: (value) => Array.isArray(value) ? value : [],
+    displayLabel: (node) => node?.label || "", sortFabricNodesForLane: (value) => value,
+    sortedSlots: (value) => value || [], selectionTouchesNode: () => false, selectionTouchesSlots: () => false,
+    escapeHtml: String, renderNodeButton: () => "", nodeMeta: () => "", renderPathButton: () => "",
+    renderNodeGrid: (nodes) => nodes.map((node) => node.id).join(" "), laneListEmptyText: () => "empty",
+    aggregateDiskNoun: () => "bay", renderBayChips: () => "", fabricCountPhrase: () => "", hostDiskSummary: () => "",
+    renderUnattachedInventory: () => "", renderLanesWithoutController: () => "",
+  });
+  vm.runInContext(source.slice(start, end) + "\nthis.render = renderLanesMode;", context);
+  const html = context.render(fabric);
+  assert.equal((html.match(/ses:sg9/g) || []).length, 2);
+});
+
 test("SES-only payloads retain the existing not-collected explanation", () => {
   const model = topology().buildTopologyModel(syntheticFabric(false));
   assert.equal(model.contract, "storage");

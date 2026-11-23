@@ -517,7 +517,7 @@
       const target = nodeById.get(item.target);
       if (item.kind === "path-bay") pathBayLinks.push(item);
       const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, mode) && !hiddenByDesign(end, mode));
-      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices"))) {
+      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices") || (mode === "sas" && item.kind === "transport-bay" && ["controller", "expander"].includes(source.kind)))) {
         bayLinks.push(item);
         continue;
       }

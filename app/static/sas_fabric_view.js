@@ -1929,7 +1929,7 @@
       const paths = list(fabric.paths).filter((path) => path.controller === controllerName);
       const expanders = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "expander" && node.controller_id === controllerId));
       const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => (
-        ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && node.controller_id === controllerId
+        ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && (node.controller_id === controllerId || (fabric?.raw?.sas_transport_available === true && list(node.raw?.controller_ids).includes(controllerId)))
       )));
       const laneSlots = new Set(sortedSlots(controller.related_slots || controllerNode?.related_slots));
       paths.forEach((path) => sortedSlots(path.slots).forEach((slot) => laneSlots.add(slot)));

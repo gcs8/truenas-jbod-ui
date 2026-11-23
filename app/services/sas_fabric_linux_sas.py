@@ -130,6 +130,7 @@ def enrich_linux_sas_fabric(
     for node in nodes.values():
         if node.kind == "ses-enclosure":
             node.controller_id = None
+            node.raw["controller_ids"] = []
     projection.attach_bays(snapshot, traces, warnings)
     for controller_id in sorted(projection.controller_ids):
         controller = nodes[controller_id]
@@ -354,7 +355,9 @@ class _Projection:
                     continue
                 phys = _port_phys(port, self.phys)
                 controller_id = chain_nodes[1]
+                ses_detail = dict(trace.metrics.get("path_states", [{}])[0]) if trace.metrics.get("path_states") else {}
                 metric = {
+                    **ses_detail,
                     "controller": self.nodes[controller_id].label,
                     "state": "unknown",
                     "path_id": "path:" + self.nodes[controller_id].label + ":sysfs",
@@ -371,6 +374,11 @@ class _Projection:
                 }
                 port_rows.append(metric)
                 ses_ids = [item for item in trace.node_ids if self.nodes[item].kind == "ses-enclosure"]
+                for ses_id in ses_ids:
+                    enclosure = self.nodes[ses_id]
+                    controller_ids = sorted(set(enclosure.raw.get("controller_ids", []) + [controller_id]))
+                    enclosure.raw["controller_ids"] = controller_ids
+                    enclosure.controller_id = controller_ids[0] if len(controller_ids) == 1 else None
                 destinations = ses_ids or [key]
                 for destination in destinations:
                     edge = self.link(
@@ -388,7 +396,9 @@ class _Projection:
             bay.metrics["sas_transport_ports"] = port_rows
             bay.raw["sas_transport_ports"] = port_rows
             trace.metrics["sas_transport_ports"] = port_rows
-            trace.metrics["path_states"] = port_rows
+            trace.metrics["path_states"] = port_rows or [
+                {**detail, "controller": None, "path_id": None} for detail in trace.metrics.get("path_states", [])
+            ]
             if block and not port_rows:
                 warnings.append(
                     f"Bay {slot.slot}: SAS transport end-device port was not read or could not be joined by block identity."

@@ -122,6 +122,10 @@ def fabric(output: str):
         device_name="sdz",
         present=True,
         ssh_ses_device="/dev/sg9",
+        sg_device="/dev/sg4",
+        scsi_hctl="2:0:0:0",
+        transport_protocol="sas",
+        target_port_protocol="SSP",
         enclosure_id=REAR,
     )
     return build_sas_fabric_snapshot(
@@ -405,6 +409,28 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
             ],
             DISK,
         )
+
+    def test_transport_keeps_ses_membership_and_existing_path_details(self):
+        result = fabric(json.dumps(self.payload))
+        enclosure = next(node for node in result.nodes if node.kind == "ses-enclosure")
+        self.assertEqual(enclosure.controller_id, "controller:host2")
+        self.assertEqual(enclosure.raw["controller_ids"], ["controller:host2"])
+        trace = next(trace for trace in result.traces if trace.id == "bay:0")
+        self.assertEqual(trace.metrics["path_states"][0]["ses_device"], "/dev/sg9")
+        self.assertEqual(trace.metrics["path_states"][0]["sas_address"], DISK)
+        self.assertEqual(trace.metrics["path_states"][0]["sg_device"], "/dev/sg4")
+        self.assertEqual(trace.metrics["path_states"][0]["scsi_hctl"], "2:0:0:0")
+        self.assertEqual(trace.metrics["path_states"][0]["transport_protocol"], "sas")
+        self.assertEqual(trace.metrics["path_states"][0]["target_port_protocol"], "SSP")
+
+    def test_unjoined_transport_retains_the_ses_path_observation(self):
+        payload = deepcopy(self.payload)
+        next(row for row in payload["rows"] if row["kind"] == "sas_end_device")["links"] = {}
+        trace = next(trace for trace in fabric(json.dumps(payload)).traces if trace.id == "bay:0")
+        self.assertEqual(len(trace.metrics["path_states"]), 1)
+        self.assertEqual(trace.metrics["path_states"][0]["ses_device"], "/dev/sg9")
+        self.assertIsNone(trace.metrics["path_states"][0]["controller"])
+        self.assertIsNone(trace.metrics["path_states"][0]["path_id"])
 
     def test_reordered_classes_preserve_graph(self):
         payload = deepcopy(self.payload)
