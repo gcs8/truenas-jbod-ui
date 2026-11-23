@@ -761,7 +761,21 @@ def build_router() -> APIRouter:
         try:
             result = await service.sync_disk_inventory(payload.mode)
         except DiskInventorySyncBusy as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            detail = exc.result.model_dump(mode="json") if exc.result is not None else str(exc)
+            raise HTTPException(status_code=409, detail=detail) from exc
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(result.model_dump(mode="json"))
+
+    @router.get(
+        "/api/systems/{system_id}/disk-inventory-sync",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def disk_inventory_sync_status(system_id: str, job_id: int | None = None) -> JSONResponse:
+        # Job errors are operator-only, just like the authorized sync response.
+        service = route_service(system_id, exact_system_id=True)
+        try:
+            result = await service.get_disk_inventory_sync_status(job_id)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(result.model_dump(mode="json"))
