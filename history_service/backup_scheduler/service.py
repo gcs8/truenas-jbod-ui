@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
 from types import MappingProxyType
-from typing import Any
+from typing import Any, BinaryIO
 
 import yaml
 
@@ -2192,13 +2192,26 @@ class ConfigFileSnapshot(dict[str, Any]):
         self.files = MappingProxyType(dict(files))
 
 
-def snapshot_config_files(paths: Mapping[str, Path]) -> ConfigFileSnapshot:
+_JSON_STATE_SNAPSHOT_KEYS = frozenset({"mappings", "sas_fabric_aliases"})
+
+
+def snapshot_config_files(
+    paths: Mapping[str, Path],
+    *,
+    read_json_state: Callable[[BinaryIO, str], bytes],
+) -> ConfigFileSnapshot:
     """Capture once for both hashing and export; missing documents remain hashed."""
 
     snapshot: dict[str, Any] = {}
     files: dict[Path, bytes | None] = {}
     for logical, path in paths.items():
-        content = path.read_bytes() if path.exists() else None
+        if not path.exists():
+            content = None
+        elif logical in _JSON_STATE_SNAPSHOT_KEYS:
+            with path.open("rb") as source:
+                content = read_json_state(source, path.name)
+        else:
+            content = path.read_bytes()
         files[path.absolute()] = content
         if content is None:
             snapshot[logical] = None
