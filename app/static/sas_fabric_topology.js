@@ -6,19 +6,16 @@
 const NOT_COLLECTED = "HBA and expander hops are not collected on this platform.";
 
 const NOT_SHOWN = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
-    + "Backplane zones, the CORE multipath groupings (shown instead as path marks on each bay) "
+    + "The CORE multipath groupings (shown instead as path marks on each bay) "
     + "and PHY error counters (Disk Path) are not drawn either.";
 
 const NOT_SHOWN_COUNTERS = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
-    + "The equal slot ranges the payload calls backplane zones are not drawn: they are not boards. "
     + "The CORE multipath groupings are shown as the port marks on each bay. "
     + "PHY error counters are in each hover card and in the inspector; Disk Path shows them too.";
 
-const NOT_SHOWN_STORAGE = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
-    + "Backplane zones are not drawn either.";
+const NOT_SHOWN_STORAGE = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them.";
 
 const NOT_SHOWN_SHARED = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
-    + "The equal slot ranges the payload calls backplane zones are not drawn: they are not boards. "
     + "Both head ends are drawn on the one backplane they share, whichever of them this page is on.";
 
 const LOCATION_UNKNOWN = "physical location unavailable";
