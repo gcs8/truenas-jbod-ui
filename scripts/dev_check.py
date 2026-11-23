@@ -204,6 +204,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_demo_create_durability",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",
+            "tests.test_disk_sync_status",
             "tests.test_enclosure_aliases",
             "tests.test_enclosure_option_labels",
             "tests.test_history_routes",

@@ -11708,8 +11708,8 @@
         reason: "SSH is off for this system, so the app cannot ask TrueNAS to re-scan its disks.",
       };
     }
-    if (state.diskInventorySync.inFlight) {
-      return { available: false, reason: "A disk re-scan is already running for this system." };
+    if (state.diskInventorySync[mode] || (state.diskInventorySync.inFlight && !state.diskInventorySync.mode)) {
+      return { available: false, reason: "A disk re-scan request is already running for this system." };
     }
     return { available: true, reason: "" };
   }
@@ -11787,32 +11787,72 @@
       setStatus("Select a system before syncing its TrueNAS disk inventory.", "error");
       return;
     }
+    if (state.diskInventorySync[mode]) return;
+    const owner = {};
+    state.diskInventorySync[mode] = owner;
+    state.diskInventorySync.displayOwner = owner;
     state.diskInventorySync.inFlight = true;
+    state.diskInventorySync.mode = mode;
     renderDiskInventorySyncControls();
     const startedAt = Date.now();
     const showProgress = () => {
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
-      setStatus(`Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s`);
+      if (state.diskInventorySync.displayOwner === owner && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+        setStatus(`Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s`);
+      }
     };
     showProgress();
     const progressTimerId = window.setInterval(showProgress, 1000);
     try {
-      const result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
-        method: "POST",
-        readUiAuth: true,
-        body: JSON.stringify({ mode, confirm: true }),
-      });
-      window.clearInterval(progressTimerId);
-      const succeeded = result?.state === "SUCCESS" && !result?.timed_out;
-      if (succeeded) {
-        await refreshSnapshot(true, "manual-refresh");
+      let result;
+      try {
+        result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
+          method: "POST",
+          readUiAuth: true,
+          body: JSON.stringify({ mode, confirm: true }),
+        });
+      } catch (error) {
+        if (error.status !== 409) throw error;
+        result = typeof error.detail === "object" && error.detail !== null
+          ? error.detail : { state: "UNKNOWN", message: error.detail || error.message };
       }
-      setStatus(formatDiskInventorySyncResult(result), succeeded ? "info" : "error");
+      window.clearInterval(progressTimerId);
+      // Observe only. Never replay the POST when a job is queued or running.
+      for (let attempt = 0; attempt < 720; attempt += 1) {
+        if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
+        const failed = result?.state === "FAILED" || result?.state === "ABORTED";
+        if (state.diskInventorySync.displayOwner === owner) {
+          setStatus(formatDiskInventorySyncResult(result), failed ? "error" : "info");
+        }
+        if (!["WAITING", "RUNNING"].includes(result?.state) || !Number.isInteger(result?.job_id)) break;
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
+        try {
+          result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync?job_id=${result.job_id}`, {
+            method: "GET", readUiAuth: true,
+          });
+        } catch (_error) {
+          result = { state: "UNKNOWN", message: "The disk sync job's state is unknown. You can start a new sync; TrueNAS will queue it." };
+        }
+      }
+      if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+        try {
+          await refreshSnapshot(true, "manual-refresh");
+          if (state.diskInventorySync.displayOwner === owner) setStatus(formatDiskInventorySyncResult(result), "info");
+        } catch (_error) {
+          if (state.diskInventorySync.displayOwner === owner) {
+            setStatus(`${formatDiskInventorySyncResult(result)} The inventory refresh is unavailable; refresh again.`, "info");
+          }
+        }
+      }
     } catch (error) {
       window.clearInterval(progressTimerId);
-      setStatus(`TrueNAS disk inventory sync failed: ${error.message || error}`, "error");
+      if (state.diskInventorySync.displayOwner === owner && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+        setStatus(`TrueNAS disk inventory sync failed: ${error.message || error}`, "error");
+      }
     } finally {
-      state.diskInventorySync.inFlight = false;
+      delete state.diskInventorySync[mode];
+      state.diskInventorySync.inFlight = Boolean(state.diskInventorySync.full || state.diskInventorySync.multipath);
       renderDiskInventorySyncControls();
     }
   }
