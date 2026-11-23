@@ -543,6 +543,174 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
             DISK,
         )
 
+    def selection_fabric(self, platform, slots, output):
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic-system", truenas=TrueNASConfig(platform=platform)),
+            snapshot=InventorySnapshot(
+                slots=slots,
+                refresh_interval_seconds=30,
+                selected_enclosure_id=REAR,
+                selected_enclosure_label="Synthetic storage view",
+            ),
+            ssh_outputs={KEY: output} if output else {},
+        )
+
+    def assert_same_selected_routes(self, platform, slots, output):
+        before = self.selection_fabric(platform, slots, "")
+        after = self.selection_fabric(platform, slots, output)
+        self.assertEqual(after.raw["fabric_kind"], before.raw["fabric_kind"])
+        self.assertEqual(after.controllers, before.controllers)
+        self.assertEqual(after.paths, before.paths)
+        self.assertEqual(after.expanders, before.expanders)
+        self.assertEqual([node.model_dump() for node in after.nodes], [node.model_dump() for node in before.nodes])
+        self.assertEqual([link.model_dump() for link in after.links], [link.model_dump() for link in before.links])
+        self.assertEqual(
+            [trace.model_dump() for trace in after.traces], [trace.model_dump() for trace in before.traces]
+        )
+        return after
+
+    def test_nvme_only_selection_keeps_routes_with_unrelated_sas_survey(self):
+        # Same regression as the missing-route reproduction: selected NVMe,
+        # unrelated SAS HBA, no shared selected disk identity.
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            device_name="nvme0n1",
+            smart_device_names=["/dev/nvme0n1"],
+            transport_protocol="nvme",
+            model="Synthetic NVMe",
+            raw_status={"device_names": ["nvme0n1", "0000:01:00.0"]},
+        )
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                result = self.assert_same_selected_routes(platform, [slot], json.dumps(self.payload))
+                self.assertEqual([path["path_type"] for path in result.paths], ["nvme"])
+                self.assertFalse(any(node.id == "controller:host2" for node in result.nodes))
+
+    def test_unmatched_selected_block_cannot_use_other_view_sas_identity(self):
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            device_name="sdx",
+            transport_protocol="sas",
+            enclosure_id=REAR,
+            # Neither shared enclosure metadata nor another disk's alias is a
+            # primary block join for the selected row.
+            smart_device_names=["/dev/sdz"],
+        )
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                self.assert_same_selected_routes(platform, [slot], json.dumps(self.payload))
+
+    def test_selected_sas_view_still_admits_transport_without_ses(self):
+        disk = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            device_name="/dev/sdz",
+            transport_protocol="sas",
+        )
+        empty = SlotView(slot=1, slot_label="01", row_index=0, column_index=1, present=False)
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                result = self.selection_fabric(platform, [disk, empty], json.dumps(self.payload))
+                self.assertIs(result.raw["sas_transport_available"], True)
+                self.assertIn("controller:host2", {node.id for node in result.nodes})
+                self.assertEqual(len(result.expanders), 2)
+                self.assertTrue(any(link.kind == "transport-bay" and link.target == "bay:0" for link in result.links))
+                trace = next(trace for trace in result.traces if trace.id == "bay:0")
+                self.assertEqual(trace.metrics["sas_transport_ports"][0]["member_device_name"], "sdz")
+                self.assertIn("bay:1", {node.id for node in result.nodes})
+
+    def test_mixed_selected_view_keeps_non_sas_routes(self):
+        slots = [
+            SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                present=True,
+                device_name="sdz",
+                transport_protocol="sas",
+            ),
+            SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                present=True,
+                device_name="nvme0n1",
+                transport_protocol="nvme",
+            ),
+        ]
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                result = self.assert_same_selected_routes(platform, slots, json.dumps(self.payload))
+                self.assertIn("nvme", {path["path_type"] for path in result.paths})
+
+    def test_empty_selection_does_not_admit_unrelated_transport_hardware(self):
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                self.assert_same_selected_routes(platform, [], json.dumps(self.payload))
+
+    def test_ambiguous_selected_block_does_not_replace_existing_routes(self):
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            device_name="sdz",
+            transport_protocol="sas",
+        )
+        payload = deepcopy(self.payload)
+        end = deepcopy(next(row for row in payload["rows"] if row["kind"] == "sas_end_device"))
+        end["name"] = "end_device-2:1:9"
+        end["path"] = end["path"].replace("port-2:1:2/end_device-2:1:2", "port-2:1:9/end_device-2:1:9")
+        payload["rows"].append(end)
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                self.assert_same_selected_routes(platform, [slot], json.dumps(payload))
+                duplicate = slot.model_copy(update={"slot": 1, "slot_label": "01", "column_index": 1})
+                self.assert_same_selected_routes(platform, [slot, duplicate], json.dumps(self.payload))
+
+    def test_unusable_selected_sas_chain_retains_existing_routes(self):
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            device_name="sdz",
+            transport_protocol="sas",
+        )
+        for mutation in ("upstream_port", "end_port", "remote_membership", "host", "incomplete"):
+            payload = deepcopy(self.payload)
+            if mutation == "incomplete":
+                payload["complete"] = False
+            elif mutation == "remote_membership":
+                next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")[
+                    "links"
+                ].pop("end_device-2:1:2")
+            else:
+                kind, name = {
+                    "upstream_port": ("sas_port", "port-2:0"),
+                    "end_port": ("sas_port", "port-2:1:2"),
+                    "host": ("sas_host", "host2"),
+                }[mutation]
+                payload["rows"] = [row for row in payload["rows"] if (row["kind"], row["name"]) != (kind, name)]
+            for platform in ("linux", "scale"):
+                with self.subTest(platform=platform, mutation=mutation):
+                    self.assert_same_selected_routes(platform, [slot], json.dumps(payload))
+
     def test_transport_keeps_ses_membership_and_existing_path_details(self):
         result = fabric(json.dumps(self.payload))
         enclosure = next(node for node in result.nodes if node.kind == "ses-enclosure")

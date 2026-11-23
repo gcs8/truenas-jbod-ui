@@ -260,11 +260,16 @@ def _build_sas_fabric_context(
 def _select_sas_fabric_builder(context: SasFabricBuildContext) -> SasFabricBuilder:
     builder_key = _select_sas_fabric_builder_key(context.system, context.snapshot)
     if context.system.truenas.platform in {"scale", "linux"} and builder_key != "linux_ses":
-        from app.services.linux_sas_transport import parse_sas_transport
+        from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks
         from app.services.linux_sas_transport_read import SAS_TRANSPORT_KEY
 
         transport = parse_sas_transport(context.normalized_outputs.get(SAS_TRANSPORT_KEY, ""))
-        if transport.complete and transport.of_kind("sas_host"):
+        selected_blocks = [
+            (slot.device_name or "").removeprefix("/dev/")
+            for slot in context.snapshot.slots
+            if slot.device_name or slot_occupancy(slot) == "present"
+        ]
+        if transport_matches_selected_blocks(transport, selected_blocks):
             builder_key = "linux_ses"
     try:
         return _SAS_FABRIC_BUILDER_REGISTRY[builder_key]

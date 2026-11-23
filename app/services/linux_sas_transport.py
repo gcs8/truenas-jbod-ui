@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +55,33 @@ class SasTransportData:
 
     def of_kind(self, kind: str) -> list[SasTransportRow]:
         return [row for row in self.rows if row.kind == kind]
+
+
+def transport_matches_selected_blocks(data: SasTransportData, blocks: list[str]) -> bool:
+    """Admit a no-SES view only when all its disk routes can be retained.
+
+    A host-wide HBA census is not evidence for the selected view. Require
+    unique primary block bindings and an explicit nested port chain to a host;
+    mixed or unjoined views keep their existing platform-storage routes.
+    """
+    if not data.complete or not blocks or any(not block for block in blocks) or len(set(blocks)) != len(blocks):
+        return False
+    admitted = {row.path for row in data.of_kind("sas_host")}
+    ports = {row.path: row for row in data.of_kind("sas_port")}
+
+    def attached(row: SasTransportRow) -> bool:
+        port = ports.get(row.owner_path)
+        return port is not None and port.owner_path in admitted and port.links.get(row.name) == row.path
+
+    # Parents precede nested children. Only controllers and expanders can own
+    # downstream ports, matching the projection's ancestry admission.
+    for row in sorted(data.of_kind("sas_expander"), key=lambda row: len(row.path)):
+        if attached(row):
+            admitted.add(row.path)
+    ends = data.of_kind("sas_end_device")
+    claims = Counter(block for row in ends for block in row.links)
+    matched = {block for row in ends if attached(row) for block in row.links}
+    return all(claims[block] == 1 and block in matched for block in blocks)
 
 
 def _integer(value: str | None, maximum: int) -> int | None:

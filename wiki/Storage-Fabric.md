@@ -23,7 +23,11 @@ selection on the main page.
   source PHY IDs and rates. Remote PHY IDs, lane pairings and cable width stay
   not read. Missing or unreadable fields remain not read, never zero. The
   SES-only warning remains without transport data. Unjoined enclosures stay
-  visible without guessed controller membership. See
+  visible without guessed controller membership. Without SES evidence, SAS
+  transport is used only when every selected named disk has a unique reported
+  block binding and a complete path to its SAS host. NVMe-only and mixed or
+  unmatched storage views retain their existing storage routes; an unrelated
+  HBA does not change the selected view. See
   [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] and
   [[Generic Linux Setup|Generic-Linux-Setup]] for the SSH commands involved.
 - **QuantaStor**: HA node, enclosure, pool, vdev and disk from the REST API,
