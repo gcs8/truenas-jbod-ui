@@ -3361,6 +3361,7 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             aliases=aliases,
             expander_counter_capability=self._smp_counter_capability,
             expander_counter_reads=self.expander_counter_reads(),
+            disk_lookup_keys=self._sas_fabric_disk_lookup_keys(source_bundle, snapshot.selected_enclosure_id),
         )
         return fabric.model_copy(
             update={
@@ -3394,8 +3395,49 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                 system=self.system, snapshot=snapshot, ssh_outputs=bundle.ssh_outputs,
                 sources=bundle.sources, warnings=bundle.warnings,
                 command_failures=bundle.ssh_failure_details,
+                disk_lookup_keys=self._sas_fabric_disk_lookup_keys(
+                    bundle, snapshot.selected_enclosure_id, retain=False,
+                ),
             ).nodes
         ]
+
+    def _sas_fabric_disk_lookup_keys(
+        self, bundle: Any, enclosure_id: str | None, *, retain: bool = True,
+    ) -> tuple[frozenset[str], ...] | None:
+        """Lookup keys of every API disk, for Storage Fabric peer admission (#1471).
+
+        This is the full ownership evidence the enclosure view's bay-peer rule
+        reads: all source disks, including unplaced ones and disks on other
+        enclosures, not just the rendered bays. It stays in memory beside the
+        source bundle and never enters a snapshot or payload. ``retain=False``
+        neither reads nor writes service state beyond the bundle's existing
+        entries, so the alias route can call it off the event loop.
+        """
+        if self.system.truenas.platform != "core" or not isinstance(bundle, InventorySourceBundle):
+            return None
+        cache = bundle.fabric_disk_lookup_keys
+        cached = cache.get(enclosure_id)
+        if cached is not None:
+            return cached
+        ssh_data = ParsedSSHData()
+        if bundle.ssh_collected:
+            ssh_data = (
+                self._parsed_ssh_data_for_enclosure(bundle, enclosure_id)
+                if retain
+                else parse_ssh_outputs(
+                    bundle.ssh_outputs,
+                    self.settings.layout.slot_count,
+                    self.system.truenas.enclosure_filter,
+                    selected_enclosure_id=enclosure_id,
+                )
+            )
+        records = self._build_storage_view_candidate_records(bundle.raw_data, ssh_data, enclosure_id)
+        keys = tuple(frozenset(record.lookup_keys) for record in records)
+        if retain:
+            while len(cache) >= PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES:
+                cache.pop(next(iter(cache)), None)
+            cache[enclosure_id] = keys
+        return keys
 
     def _sas_fabric_alias_mutation_context(
         self, object_id: str, object_kind: str | None, observed: tuple[Any, ...] | None = None,
