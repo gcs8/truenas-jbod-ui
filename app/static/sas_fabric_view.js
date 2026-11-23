@@ -1846,7 +1846,7 @@
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
     const portFacts = list(path.sas_transport_port_ids).map((id) => window.SasFabricTransport?.resolveTransportPort?.(fabric, id));
-    const phyNote = portFacts.map((port) => port?.state === "read" ? `${port.phys.length} reported PHY rows` : "PHY rows not read").join(" / ");
+    const phyNote = portFacts.map((port) => port?.state === "read" ? `${port.phys.length} reported PHY rows` : "PHY rows not read").join(" / ") || (fabric.raw?.sas_transport_available === true ? "PHY rows not read" : "");
     return `
       <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
         <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}"${phyNote ? ` title="${escapeHtml(phyNote)}"` : ""}>
@@ -3267,8 +3267,8 @@
         ],
         hoverFacts: [
           ["Path state", stateName],
-          ["Port PHYs", seed.pathState?.sas_transport_port_id ? (transportPort?.state === "read" ? transportPort.phys.map((phy) => phy.phy).join(", ") : "Not read") : null],
-          ["Port PHY counters", transportPort?.phys.map(expanderPhyErrorText).filter(Boolean).join(" / ")],
+          ["Port PHYs", seed.pathState?.sas_transport_port_id || fabric.raw?.sas_transport_available === true ? (transportPort?.state === "read" ? transportPort.phys.map((phy) => phy.phy).join(", ") : "Not read") : null],
+          ["Port PHY counters", transportPort?.state === "read" ? transportPort.phys.map(expanderPhyErrorText).filter(Boolean).join(" / ") : null],
           ["Member device", mprDevice?.member_device_name || seed.device_name],
           ["Disk identity", [seed.pathState?.model, seed.pathState?.serial, seed.pathState?.size_human].filter(Boolean).join(" / ")],
           ["SAS / LUN", seed.pathState?.sas_address || seed.pathState?.logical_unit_id],
