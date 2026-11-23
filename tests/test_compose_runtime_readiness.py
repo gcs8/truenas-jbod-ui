@@ -398,6 +398,29 @@ class ComposeRuntimeReadinessContractTests(unittest.TestCase):
             self.matrix._wait_mapping_inventory(self.ports)
         self.assertNotIn("secret", str(raised.exception))
 
+    def test_inventory_timeout_keeps_last_safe_http_diagnostic(self):
+        detail = "The inventory is still refreshing. Try again in a moment."
+        body = json.dumps({"detail": detail, "password": "secret"}).encode()
+        with (patch.object(self.matrix, "_request", side_effect=[(503, body), OSError("secret")]),
+              patch.object(self.matrix.time, "monotonic", side_effect=[0, 0, 0.25, 30]),
+              patch.object(self.matrix.time, "sleep"), self.assertRaises(RuntimeError) as raised):
+            self.matrix._wait_mapping_inventory(self.ports)
+        message = str(raised.exception)
+        self.assertIn("got 503", message)
+        self.assertIn("GET /api/inventory", message)
+        self.assertIn(detail, message)
+        self.assertNotIn("secret", message)
+        self.assertLess(len(message), 512)
+
+    def test_inventory_timeout_discards_unrecognized_http_body(self):
+        with (patch.object(self.matrix, "_request", return_value=(401, b'{"detail":"secret"}')),
+              patch.object(self.matrix.time, "monotonic", side_effect=[0, 0, 30]),
+              patch.object(self.matrix.time, "sleep"), self.assertRaises(RuntimeError) as raised):
+            self.matrix._wait_mapping_inventory(self.ports)
+        self.assertIn("got 401", str(raised.exception))
+        self.assertIn("body omitted", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
     def test_every_ui_variant_quiesces_history_until_restart_readiness(self):
         for variant in self.matrix.VARIANTS:
             if not variant.ui_enabled:
@@ -453,8 +476,22 @@ class ComposeRuntimeReadinessContractTests(unittest.TestCase):
             (StorageDirectoryCapacityExhausted, "data_directory_capacity_exhausted"),
             (StorageDirectoryUnwritable, "storage_directory_unwritable"),
         )
+        from app import route_support
+
+        # These two categories are serialized by handlers, not exception attributes.
+        handlers = {
+            mapping_store.MappingScopeConflict: route_support.mapping_scope_conflict_exception_handler,
+            mapping_store.MappingDurabilityError: route_support.mapping_durability_exception_handler,
+        }
         for cls, error in categories:
-            self.assertIn(cls.public_detail, self.matrix.PUBLIC_HTTP_ERRORS[error])
+            with self.subTest(exception=cls.__name__):
+                if cls in handlers:
+                    response = asyncio.run(handlers[cls](Mock(), RuntimeError("synthetic failure")))
+                    self.assertEqual(json.loads(bytes(response.body))["error"], error)
+                else:
+                    self.assertEqual(getattr(cls, "error_code"), error)
+                self.assertIn(cls.public_detail, self.matrix.PUBLIC_HTTP_ERRORS[error])
+        self.assertEqual(mapping_store.MappingWriterLockUnavailable.error_code, "mapping_writer_lock_unavailable")
         self.assertEqual(set(mapping_store.MappingWriterLockUnavailable.PUBLIC_DETAILS.values()),
                          set(self.matrix.PUBLIC_HTTP_ERRORS["mapping_writer_lock_unavailable"]))
         for error, details in self.matrix.PUBLIC_HTTP_ERRORS.items():
