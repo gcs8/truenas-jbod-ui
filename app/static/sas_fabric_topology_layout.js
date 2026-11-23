@@ -1758,7 +1758,7 @@ function renderEnclosureHead(group, path, used) {
     const text = group.lines.map((line, index) => `<text class="topo-node-${line.title ? "title" : "fact"}" x="${group.x + 10}" y="${top + 18 + index * context.LINE_H}">${context.escapeHtml(line.text)}</text>`).join(" ");
     const flagged = entry.flagged || "";
     if (flagged) used.add(`flag-${flagged}`);
-    return `<g class="topo-node topo-enclosure-head kind-enclosure${flagged ? ` is-flagged tier-${flagged}` : ""}${entry.parentUnknown ? " mark-parent-unknown" : ""}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${context.escapeHtml(entry.id)}" data-topo-node="${context.escapeHtml(entry.id)}" aria-label="${context.escapeHtml(visibleName(entry.lines, title))}">`
+    return `<g class="topo-node topo-enclosure-head kind-enclosure${flagged ? ` is-flagged tier-${flagged}` : ""}${entry.parentUnknown ? " mark-parent-unknown" : ""}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${context.escapeHtml(entry.id)}" data-topo-node="${context.escapeHtml(entry.id)}" aria-label="${context.escapeHtml(visibleName(group.lines.map((line) => line.text), title))}">`
       + `<rect x="${group.x + 4}" y="${top + 3}" width="${group.w - 8}" height="${group.lines.length * context.LINE_H + 8}" rx="6"></rect>${text}${flagged ? flagBadge(group.x + group.w - 16, top + 16, false, flagged) : ""}</g>`;
   }
 

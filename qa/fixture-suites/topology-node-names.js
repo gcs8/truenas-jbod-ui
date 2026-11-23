@@ -45,6 +45,9 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
           fabric.system_id = bootstrap.systemId;
           fabric.selected_enclosure_id = bootstrap.enclosureId;
           bootstrap.fabric = fabric;
+          // Inventory layout rows spread a bay's paths into one mark each; the
+          // +N overflow is the bay-number-order fallback's shape.
+          if (shape === "overflow" && bootstrap.snapshot) delete bootstrap.snapshot.layout_rows;
           return `window.SAS_FABRIC_BOOTSTRAP = ${JSON.stringify(bootstrap)};`;
         });
         const errors = await routeSynthetic(page, html, { fabric });

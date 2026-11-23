@@ -64,13 +64,19 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
           await button.focus();
           await button.press("Enter");
           await expect(panel.locator(`.topo-link-label${selector}.is-pinned`)).toHaveCount(1);
-          await expect(page.locator("#fabric-inspector-title")).toHaveText(state === "bundle" ? "Selected bay bundle" : "Selected link");
-          await expect(page.locator("#fabric-inspector-body")).toContainText(state === "bundle" ? "Bays it carries" : "PHYs");
+          // Approved design: a bundle into a physical enclosure is an enclosure path; a cable has its own inspector.
+          await expect(page.locator("#fabric-inspector-title")).toHaveText(state === "bundle" ? "Selected enclosure path" : "Selected cable");
+          await expect(page.locator("#fabric-inspector-body")).toContainText(state === "bundle" ? "Bays in the enclosure" : "PHYs");
         }
         const scrollViolations = state === "unpinned" ? [] : await axeViolations(page, ["label-content-name-mismatch"]);
         // Restore the same page position after keyboard focus scrolls a badge.
-        // The diagram keeps its own horizontal scroll position.
-        await page.evaluate(() => window.scrollTo(0, 0));
+        // The diagram is put at its left edge: its first view centres the host,
+        // and axe drops a text line scrolled wholly past the viewport's left
+        // edge, then reads the remaining lines of that box as out of order.
+        await page.evaluate(() => {
+          window.scrollTo(0, 0);
+          document.querySelector("#fabric-map-panel .fabric-topology-scroll").scrollLeft = 0;
+        });
         await page.mouse.move(0, 0);
         await page.locator("#fabric-mode-topology").focus();
         // Focus and hover repaint on animation frames; inspect the settled DOM.
@@ -84,15 +90,20 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
         }
         observations.push({ state, names, scrollViolations, violations: await axeViolations(page, ["label-content-name-mismatch"]) });
       }
+      // Fit draws the whole drawing inside its box: every name is checked at once.
+      await panel.locator("[data-topology-fit]").click();
+      await expect(panel.locator(".fabric-topology-svg.is-fitted")).toHaveCount(1);
+      expect(await axeViolations(page, ["label-content-name-mismatch"]), "fitted").toEqual([]);
       // Name-from-content diagnostic: keep positioned text and its separators,
-      // remove only the explicit name and title on a disposable host-node copy.
+      // remove only the explicit name on a disposable host-node copy. One hover
+      // surface (#1465): the drawing carries no native title at all.
+      await expect(panel.locator("title, [title]")).toHaveCount(0);
       const lines = await panel.locator(".topo-node.kind-host text").allTextContents();
       expect(lines.length).toBeGreaterThan(1);
       await panel.locator(".topo-node.kind-host").evaluate((node) => {
         const copy = node.cloneNode(true);
         copy.id = "topology-content-name-control";
         copy.removeAttribute("aria-label");
-        copy.querySelector("title").remove();
         node.parentNode.append(copy);
       });
       const contentName = await nativeName(session, "#topology-content-name-control");
@@ -100,7 +111,8 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
       await session.detach();
       for (const { state, names, scrollViolations, violations } of observations) {
         for (const { kind, visible, name } of names) {
-          expect.soft(name?.startsWith(`${visible}, Link `), `${state} ${kind}: ${name}`).toBe(true);
+          // Approved design: a bundle into a physical enclosure is named as a path.
+          expect.soft(name?.startsWith(`${visible}, ${kind === "is-bundle" ? "Path" : "Link"} `), `${state} ${kind}: ${name}`).toBe(true);
         }
         expect.soft(violations, state).toEqual([]);
         expect.soft(scrollViolations, `${state} after keyboard scroll`).toEqual([]);

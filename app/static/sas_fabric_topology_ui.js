@@ -181,15 +181,22 @@ function wiringChecks(model, fabric) {
         // (a standby node that does not see the disks): that is not read, not
         // a disagreement in every bay.
         const everyBay = boards.flatMap((board) => board.enclosure.group.bays);
-        const silent = heads.map((entry) => entry.label).filter((label) => !everyBay.some((bay) => bay.heads.some((head) => head.label === label && head.present === true)));
+        // Occupancy through the bay reader: a head that did not read the bay is
+        // not read, never "no disk".
+        const occupancy = (head) => context.bayOccupancy(head);
+        const silent = heads.map((entry) => entry.label).filter((label) => !everyBay.some((bay) => bay.heads.some((head) => head.label === label && occupancy(head) === "yes")));
         if (silent.length) blind.push(`${silent.join(", ")} ${silent.length === 1 ? "reports" : "report"} no disk in any bay: nothing to compare with`);
         for (const bay of everyBay) {
-          const told = bay.heads.filter((head) => !silent.includes(head.label));
-          const present = told.filter((head) => head.present === true);
+          const asked = bay.heads.filter((head) => !silent.includes(head.label));
+          const told = asked.filter((head) => occupancy(head) !== "unknown");
+          const present = told.filter((head) => occupancy(head) === "yes");
           if (!present.length) continue;
+          const unread = asked.filter((head) => occupancy(head) === "unknown");
+          if (unread.length) blind.push(`${bay.label}: ${unread.map((head) => head.label).join(", ")} did not read the bay`);
+          const absent = told.filter((head) => occupancy(head) === "no");
           const serials = [...new Set(present.map((head) => head.serial).filter(Boolean))];
           let text = "";
-          if (present.length < told.length) text = `${bay.label}: ${present.map((head) => head.label).join(", ")} ${present.length === 1 ? "reports" : "report"} a disk, ${told.filter((head) => head.present !== true).map((head) => head.label).join(", ")} ${told.length - present.length === 1 ? "does" : "do"} not`;
+          if (absent.length) text = `${bay.label}: ${present.map((head) => head.label).join(", ")} ${present.length === 1 ? "reports" : "report"} a disk, ${absent.map((head) => head.label).join(", ")} ${absent.length === 1 ? "does" : "do"} not`;
           else if (serials.length > 1) text = tiered(`${bay.label}: the heads report different disks (serials ${serials.join(", ")})`, "critical");
           else if (present.some((head) => !head.serial)) blind.push(`${bay.label}: a head reports no serial, so the disk is not compared`);
           else agreed += 1;
@@ -1538,7 +1545,7 @@ function boardLabel(fabric, id) {
   }
 
 function refFromElement(element) {
-    const target = element?.closest?.("[data-topo-port], [data-topo-link], [data-topo-bay], [data-topo-node], [data-topo-group], [data-topo-tier]");
+    const target = element?.closest?.("[data-topo-link], [data-topo-port], [data-topo-bay], [data-topo-node], [data-topo-group], [data-topo-tier]");
     if (!target || !target.closest(".fabric-topology")) return null;
     if (target.dataset.topoTier) return { kind: "tier", id: target.dataset.topoTier };
     if (target.dataset.topoPort) return { kind: "port", id: target.dataset.topoPort };

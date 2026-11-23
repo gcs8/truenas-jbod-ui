@@ -247,6 +247,26 @@ test("an older payload without the host-wide port census: every fixture still re
   }
 });
 
+test("a far end the port census only lets the page infer is called inferred on its line, its name, its card and its inspector", () => {
+  let inferred = 0;
+  for (const fixture of fixtures.filter((item) => item.transport)) {
+    const model = build(fixture);
+    const html = T.renderTopology(model, {});
+    for (const link of model.links.filter((item) => item.lanes?.targetBasis === "inferred")) {
+      inferred += 1;
+      const ref = { kind: "link", id: link.id };
+      assert.match(link.labelLines.join(" "), /↔ PHY [0-9–, ]+ inferred$/, `${fixture.id}: ${link.id} line label`);
+      const named = [...html.matchAll(/<g class="topo-link-label[^>]*data-topo-link="([^"]*)" aria-label="([^"]*)"/g)].find((match) => decode(match[1]) === link.id);
+      assert.ok(named, `${fixture.id}: ${link.id} is drawn with a name`);
+      assert.match(decode(named[2]), /\(far end inferred\)/, `${fixture.id}: ${link.id} accessible name`);
+      const card = T.cardFor(model, ref);
+      assert.match(card.rows.find((row) => row.label === "Far end").value, /^inferred: /, `${fixture.id}: ${link.id} card`);
+      assert.match(decode(T.detailFor(model, ref).html), /\binferred\b/, `${fixture.id}: ${link.id} inspector`);
+    }
+  }
+  assert.ok(inferred > 10, `${inferred} inferred far ends checked`);
+});
+
 test("control: the checks above can fail. A page held against another fixture's contents is caught", () => {
   const { texts } = everyText(build(byId["wide-x4-sata"]));
   const other = known(byId["no-ses"]);
