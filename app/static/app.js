@@ -11799,25 +11799,35 @@
       return;
     }
     if (state.diskInventorySync[mode]) return;
-    const owner = { mode, systemId, result: null };
+    const sequence = state.diskInventorySync.sequence = (state.diskInventorySync.sequence || 0) + 1;
+    const owner = { mode, systemId, sequence, result: null };
     let statusOwner = owner;
     let observationKey = null;
     const observations = state.diskInventorySync.observations ||= new Map();
     const publish = (result) => {
+      if (statusOwner.superseded) return;
       statusOwner.result = result;
       const rows = state.diskInventorySync.statuses ||= [];
-      if (!rows.includes(statusOwner)) rows.push(statusOwner);
-      if (["SUCCESS", "FAILED", "ABORTED"].includes(result?.state)) {
-        // A rerun replaces earlier finished results for this operation only.
-        const ownerIndex = rows.indexOf(statusOwner);
-        for (let index = ownerIndex - 1; index >= 0; index -= 1) {
-          const row = rows[index];
-          if (row.systemId === systemId && row.mode === mode
-              && ["SUCCESS", "FAILED", "ABORTED"].includes(row.result?.state)) rows.splice(index, 1);
+      const terminal = (value) => ["SUCCESS", "FAILED", "ABORTED"].includes(value?.state);
+      if (terminal(result)) {
+        const peers = rows.filter((row) => row !== statusOwner && row.systemId === systemId && row.mode === mode);
+        // Full syncs are ordered by the job itself, never by request timing.
+        // Synchronous multipath operations have no job IDs and use admission order.
+        const compare = (row) => mode === "full"
+          ? (Number.isInteger(result.job_id) && Number.isInteger(row.result?.job_id) ? result.job_id - row.result.job_id : 0)
+          : statusOwner.sequence - row.sequence;
+        if (peers.some((row) => terminal(row.result) && compare(row) < 0)) {
+          statusOwner.superseded = true;
+        } else {
+          peers.filter((row) => compare(row) > 0).forEach((row) => { row.superseded = true; });
+        }
+        for (let index = rows.length - 1; index >= 0; index -= 1) {
+          if (rows[index].superseded) rows.splice(index, 1);
         }
       }
-      // Retain bounded recent outcomes, independently of active observer ownership.
-      if (rows.length > 8) rows.splice(0, rows.length - 8);
+      if (!statusOwner.superseded && !rows.includes(statusOwner)) rows.push(statusOwner);
+      // Evicted owners must not reappear after a delayed observation or refresh.
+      if (rows.length > 8) rows.splice(0, rows.length - 8).forEach((row) => { row.superseded = true; });
       if (systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) renderDiskInventorySyncStatuses();
     };
     const releaseAdmission = () => {

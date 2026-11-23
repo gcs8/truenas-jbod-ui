@@ -205,9 +205,106 @@ test("unknown job observation permits a separately requested full sync and keeps
   assert.equal(h.requests.length, 3);
   assert.equal(h.requests[2].options.method, "GET");
   assert.match(h.requests[2].url, /job_id=17$/);
-  assert.equal(h.statuses.at(-1).kind, "error");
-  assert.match(h.statuses.at(-1).text, /Synthetic earlier-job error/);
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /Synthetic earlier-job error|Earlier job failed/);
   assert.match(h.statuses.at(-1).text, /New inventory re-read/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("an older refresh completion cannot republish success over a newer failure", async t => {
+  for (const refreshFails of [false, true]) {
+    await t.test(refreshFails ? "refresh unavailable" : "refresh succeeds", async () => {
+      const h = harness([
+        { state: "SUCCESS", job_id: 17, message: "Older inventory re-read." },
+        { state: "FAILED", job_id: 18, message: "New job failed.", error: "New job error." },
+      ]);
+      let entered, finish;
+      const refreshing = new Promise(resolve => { entered = resolve; });
+      const refresh = new Promise((resolve, reject) => { finish = refreshFails ? reject : resolve; });
+      h.context.refreshSnapshot = async () => { entered(); await refresh; };
+      const older = h.context.run("full", "system-a");
+      await refreshing;
+      assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
+      await h.context.run("full", "system-a");
+      assert.equal(h.statuses.at(-1).kind, "error");
+      assert.match(h.statuses.at(-1).text, /New job error/);
+      assert.equal(h.state.diskInventorySync.statuses.length, 1);
+      finish(refreshFails ? new Error("Synthetic refresh unavailable.") : undefined);
+      await older;
+      assert.equal(h.statuses.at(-1).kind, "error");
+      assert.match(h.statuses.at(-1).text, /New job error/);
+      assert.doesNotMatch(h.statuses.at(-1).text, /Older inventory|refresh is unavailable/);
+      assert.equal(h.state.diskInventorySync.statuses.length, 1);
+      assert.equal(h.state.diskInventorySync.statuses[0].result.job_id, 18);
+      assert.equal(h.state.diskInventorySync.observations.size, 0);
+    });
+  }
+});
+
+test("a superseded owner stays retired after newer outcomes leave the bounded list", async () => {
+  const h = harness([
+    { state: "SUCCESS", job_id: 17, message: "Older inventory re-read." },
+    { state: "FAILED", job_id: 18, message: "New job failed.", error: "New job error." },
+    ...Array.from({ length: 8 }, () => ({ state: "SUCCESS", message: "Other system multipath rebuilt." })),
+  ]);
+  let entered, finish;
+  const refreshing = new Promise(resolve => { entered = resolve; });
+  const refresh = new Promise(resolve => { finish = resolve; });
+  h.context.refreshSnapshot = async () => {
+    if (h.state.selectedSystemId === "system-a") { entered(); await refresh; }
+  };
+  const older = h.context.run("full", "system-a");
+  await refreshing;
+  await h.context.run("full", "system-a");
+  for (let index = 0; index < 8; index += 1) {
+    h.state.selectedSystemId = `other-system-${index}`;
+    await h.context.run("multipath", h.state.selectedSystemId);
+  }
+  assert.equal(h.state.diskInventorySync.statuses.length, 8);
+  assert.ok(h.state.diskInventorySync.statuses.every(row => row.systemId !== "system-a"));
+  h.state.selectedSystemId = "system-a";
+  finish();
+  await older;
+  assert.equal(h.state.diskInventorySync.statuses.length, 8);
+  assert.ok(h.state.diskInventorySync.statuses.every(row => row.systemId !== "system-a"),
+    "retired owners cannot return when the replacement is no longer in the list");
+});
+
+test("job recency wins even when the older job is returned to a later request", async () => {
+  const h = harness([
+    { state: "UNKNOWN", job_id: 18, message: "New job state unknown." },
+    { state: "FAILED", job_id: 17, message: "Old job failed.", error: "Old job error." },
+    { state: "SUCCESS", job_id: 18, message: "New job succeeded." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const newer = h.context.run("full", "system-a");
+  await observing;
+  await h.context.run("full", "system-a");
+  resume();
+  await newer;
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /Old job/);
+  assert.match(h.statuses.at(-1).text, /New job succeeded/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("a newer failure or abort replaces an earlier same-mode terminal outcome", async t => {
+  for (const terminal of ["FAILED", "ABORTED"]) {
+    await t.test(terminal, async () => {
+      const h = harness([
+        { state: "SUCCESS", job_id: 17, message: "Old job succeeded." },
+        { state: terminal, job_id: 18, message: "New job stopped.", error: "New terminal error." },
+      ]);
+      await h.context.run("full", "system-a");
+      await h.context.run("full", "system-a");
+      assert.equal(h.state.diskInventorySync.statuses.length, 1);
+      assert.equal(h.statuses.at(-1).kind, "error");
+      assert.doesNotMatch(h.statuses.at(-1).text, /Old job/);
+      assert.match(h.statuses.at(-1).text, /New terminal error/);
+    });
+  }
 });
 
 test("known running observation defers admission decisions to the backend busy refusal", async () => {

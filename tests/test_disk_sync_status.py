@@ -312,6 +312,52 @@ class DiskSyncStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(timeouts), 3)
                 self.assertEqual(timeouts[-1], 4)
 
+    async def test_intermediate_unknown_read_is_not_retained_as_active_at_deadline(self):
+        for active in ("RUNNING", "WAITING"):
+            with self.subTest(active=active):
+                self.clock[0] = 0.0
+                self.service._disk_inventory_sync_active_job_id = 17
+                replies = iter([(1.0, active, None), (3.0, "UNKNOWN", "Intermediate read error."),
+                                (10.0, "UNKNOWN", "Final read error.")])
+
+                async def read(*_args, **_kwargs):
+                    self.clock[0], state, error = next(replies)
+                    return state, error
+
+                self.service._read_disk_sync_job = AsyncMock(side_effect=read)
+                result = await self.service._poll_disk_inventory_sync_job(CORE_MIDCLT, 17, 0.0, 10, 1.0)
+                self.assertEqual(result.state, "UNKNOWN")
+                self.assertEqual(result.error, "Final read error.")
+                self.assertTrue(result.timed_out)
+                self.assertEqual(result.elapsed_seconds, 10.0)
+                self.assertEqual(result.job_id, 17)
+                self.assertIn("state is unknown", result.message)
+                self.assertNotIn("still running", result.message)
+                self.assertNotIn("Status read deadline reached while", result.message)
+                self.assertEqual(self.service._read_disk_sync_job.await_count, 3)
+                self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
+
+    async def test_retained_active_state_drops_the_unknown_reads_error(self):
+        for active in ("RUNNING", "WAITING"):
+            with self.subTest(active=active):
+                self.clock[0] = 0.0
+                self.service._disk_inventory_sync_active_job_id = 17
+                replies = iter([(1.0, active, None), (10.0, "UNKNOWN", "Unreadable status error.")])
+
+                async def read(*_args, **_kwargs):
+                    self.clock[0], state, error = next(replies)
+                    return state, error
+
+                self.service._read_disk_sync_job = AsyncMock(side_effect=read)
+                result = await self.service._poll_disk_inventory_sync_job(CORE_MIDCLT, 17, 0.0, 10, 1.0)
+                self.assertEqual(result.state, active)
+                self.assertIsNone(result.error, "an unknown read error must not become the active job's error")
+                self.assertTrue(result.timed_out)
+                self.assertEqual(result.job_id, 17)
+                self.assertIn("Status read deadline reached while " + active.lower(), result.message)
+                self.assertEqual(self.service._read_disk_sync_job.await_count, 2)
+                self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
+
     async def test_expired_poll_budget_keeps_last_active_state_without_another_read(self):
         self.service.settings.app.disk_inventory_sync_timeout_seconds = 2
         for state in ("RUNNING", "WAITING"):
