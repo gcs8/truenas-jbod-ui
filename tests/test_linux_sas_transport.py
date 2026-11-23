@@ -663,6 +663,43 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual(refused.expanders, [])
         self.assertNotIn("sas_transport_port_index", refused.raw)
 
+    def test_no_ses_budget_refusal_preserves_platform_routes(self):
+        from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks
+
+        payload, slots = shared_port_survey(self.payload, disks=200, phys=256)
+        slots = [slot.model_copy(update={"ssh_ses_device": None}) for slot in slots]
+        output = json.dumps(payload)
+        self.assertTrue(
+            transport_matches_selected_blocks(parse_sas_transport(output), [slot.device_name for slot in slots])
+        )
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                before = self.selection_fabric(platform, slots, "")
+                after = self.selection_fabric(platform, slots, output)
+                self.assertEqual(after.raw["fabric_kind"], before.raw["fabric_kind"])
+                for field in ("controllers", "paths", "nodes", "links", "traces", "enclosures"):
+                    self.assertEqual(getattr(after, field), getattr(before, field), field)
+                self.assertEqual(after.raw.get("sas_transport_reason"), "projection_budget")
+                self.assertEqual(after.raw.get("sas_transport_state"), "not_read")
+                added = [warning for warning in after.warnings if warning not in before.warnings]
+                self.assertEqual(len(added), 1)
+                self.assertIn("projection budget", added[0])
+                self.assertLess(len(added[0]), 200)
+
+    def test_no_ses_other_enrichment_refusal_preserves_platform_routes(self):
+        from unittest.mock import patch
+
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, device_name="sdz", present=True)
+        for platform in ("linux", "scale"):
+            with self.subTest(platform=platform):
+                before = self.selection_fabric(platform, [slot], "")
+                with patch("app.services.sas_fabric_linux_sas.enrich_linux_sas_fabric", return_value=None) as refused:
+                    after = self.selection_fabric(platform, [slot], json.dumps(self.payload))
+                refused.assert_called_once()
+                self.assertEqual(after.raw["fabric_kind"], before.raw["fabric_kind"])
+                for field in ("controllers", "paths", "nodes", "links", "traces", "enclosures"):
+                    self.assertEqual(getattr(after, field), getattr(before, field), field)
+
     def selection_fabric(self, platform, slots, output):
         return build_sas_fabric_snapshot(
             system=SystemConfig(id="synthetic-system", truenas=TrueNASConfig(platform=platform)),

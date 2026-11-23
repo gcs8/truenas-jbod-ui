@@ -1334,6 +1334,11 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         nodes=nodes, links=links, traces=traces, controllers=controllers,
         paths=paths, warnings=fabric_warnings, transport_raw=transport_raw,
     )
+    if expanders is None and not slots_with_ses:
+        fallback = _build_platform_storage_fabric_snapshot(context)
+        fallback.warnings = _dedupe_strings([*fallback.warnings, *fabric_warnings])
+        fallback.raw.update(transport_raw)
+        return fallback
     aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
         nodes=nodes,
