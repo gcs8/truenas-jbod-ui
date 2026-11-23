@@ -245,6 +245,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_import_publication_binding",
             "tests.test_import_validated_member",
             "tests.test_interrupted_restore_recovery",
+            "tests.test_core_fabric_direct_paths",
             "tests.test_inventory",
             "tests.test_inventory_helpers",
             "tests.test_inventory_nested_slot_zero",
