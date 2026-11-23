@@ -873,6 +873,19 @@ def parse_size_to_bytes(value: Any) -> int | None:
     return int(number * (base ** power))
 
 
+def _read_capacity_bytes(value: Any) -> int | None:
+    """Accept a capacity reading, never a substring of an SES descriptor."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    text = value.strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?\s*(?:[KMGTPE](?:iB|B)?|B)?", text, re.IGNORECASE):
+        return None
+    size_bytes = parse_size_to_bytes(text)
+    return size_bytes if size_bytes is not None and size_bytes > 0 else None
+
+
 def build_lunid_alias_tiers(value: str | None, platform: str) -> tuple[str | None, set[str]]:
     """Split lunid aliases into the exact identity and its shifted neighbors."""
     exact = normalize_hex_identifier(value)
@@ -5660,6 +5673,17 @@ class InventoryService(InventorySourceCollectionMixin):
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
                     continue
+                if field_name == "size_bytes":
+                    cached_value = _read_capacity_bytes(cached_value)
+                    if cached_value is None:
+                        continue
+                elif field_name == "size_human":
+                    # Older writers saved free-form SES text as a disk size.
+                    cached_bytes = _read_capacity_bytes(entry.slot_fields.get("size_bytes"))
+                    if cached_bytes is not None:
+                        cached_value = format_bytes(cached_bytes)
+                    elif _read_capacity_bytes(cached_value) is None:
+                        continue
                 if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
                     continue
                 if field_name in ("smart_device_names", "device_name") and quantastor:
@@ -9270,6 +9294,7 @@ class InventoryService(InventorySourceCollectionMixin):
                         ),
                         "serial_hint": disk.serial,
                         "model_hint": disk.model,
+                        "reported_size_bytes": disk.size_bytes,
                         "reported_size": format_bytes(disk.size_bytes),
                         "storcli_physical_drive": disk.raw,
                         "storcli_slot": disk.raw.get("storcli_slot"),
@@ -9734,6 +9759,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,
                 "model_hint": disk.model if disk else None,
+                "reported_size_bytes": disk.size_bytes if disk else None,
                 "reported_size": format_bytes(disk.size_bytes) if disk and disk.size_bytes else None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
@@ -13634,6 +13660,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "value": drive.health,
                 "serial_hint": drive.serial,
                 "model_hint": drive.model,
+                "reported_size_bytes": drive.size_bytes,
                 "reported_size": format_bytes(drive.size_bytes),
                 "identify_active": bool(drive.raw.get("bmc_identify_active")),
                 "bmc_slot_number": drive.raw.get("bmc_slot_number"),
@@ -13686,6 +13713,7 @@ class InventoryService(InventorySourceCollectionMixin):
             raw_slot_status["serial_hint"] = drive.serial
         if not normalize_text(raw_slot_status.get("model_hint")):
             raw_slot_status["model_hint"] = drive.model
+        raw_slot_status["reported_size_bytes"] = drive.size_bytes
         if not normalize_text(raw_slot_status.get("reported_size")):
             raw_slot_status["reported_size"] = format_bytes(drive.size_bytes)
 
@@ -14178,6 +14206,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_hint": device_names[0] if device_names else None,
                 "serial_hint": normalize_text(entry.get("serial")),
                 "model_hint": normalize_text(entry.get("model")),
+                "reported_size_bytes": _read_capacity_bytes(size_value),
                 "reported_size": (
                     format_bytes(size_value)
                     if isinstance(size_value, int)
@@ -15880,8 +15909,12 @@ class InventoryService(InventorySourceCollectionMixin):
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
         if not serial and identity_mapping:
             serial = identity_mapping.serial
-        size_bytes = disk.size_bytes if disk else None
-        size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
+        size_bytes = _read_capacity_bytes(disk.size_bytes if disk else None)
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size_bytes"))
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size"))
+        size_human = format_bytes(size_bytes)
         notes = mapping.notes if mapping else None
         if stale_manual_mapping:
             stale_note = "This bay is assigned by hand, but the enclosure reports it empty."
