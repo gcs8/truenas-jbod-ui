@@ -524,14 +524,18 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         mpr_sysctl_locations,
     )
     cam_devices = parse_camcontrol_devlist(normalized_outputs.get("camcontrol devlist -v", ""))
-    members_by_slot = _core_path_members(snapshot.slots, cam_devices, context.disk_lookup_keys)
-    path_counts, path_slots = _path_counts_from_slots(snapshot.slots, members_by_slot)
-    controller_names = sorted(
-        # Only the summary's admitted units, inside the unit bound.
+    # Only the summary's admitted units, inside the unit bound.
+    unit_controller_names = (
         {f"mpr{unit}" for unit in discover_mpr_units_from_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))}
-        | set(path_counts)
         | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
+    members_by_slot = _core_path_members(
+        snapshot.slots, cam_devices, context.disk_lookup_keys, known_controllers=unit_controller_names,
+    )
+    if members_by_slot.limit_reached:
+        fabric_warnings.append(members_by_slot.limit_warning())
+    path_counts, path_slots = _path_counts_from_slots(snapshot.slots, members_by_slot)
+    controller_names = sorted(unit_controller_names | set(path_counts))
 
     controllers: list[dict[str, Any]] = []
     for controller_name in controller_names:
@@ -818,16 +822,12 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                         "controller": member.controller_label,
                         "state": normalize_path_state(member.state),
                         "device_name": member.device_name,
-                        **(
-                            _direct_member_not_read(member, cam_devices) if direct_members
-                            else _multipath_member_not_read(member, observed)
-                        ),
+                        **_path_row_not_read(member, members_by_slot, cam_devices, direct=direct_members),
                     }
-                    for member, observed in zip(
-                        slot_members, slot_members if direct_members else slot.multipath.members, strict=True,
-                    )
+                    for member in slot_members
                 ],
                 "mpr_devices": mpr_device_metrics,
+                **members_by_slot.bay_not_read(slot.slot),
             },
             evidence=["inventory snapshot", *(_slot_path_evidence(slot) if slot_members else _SLOT_MULTIPATH_EVIDENCE)],
         )
@@ -2225,6 +2225,17 @@ def _mpr_count_completeness(
     }
 
 
+# Path projection limits for one fabric build (#1471). Real hardware stays well
+# inside them: a dual-domain disk has 4 paths, a host a handful of HBAs, and a
+# 4,096-bay inventory at 4 paths a bay shares those controllers' few path
+# states. Anything beyond is dropped or not read, and reported.
+MAX_FABRIC_PATH_MEMBERS_PER_BAY = 8
+MAX_FABRIC_CONTROLLERS = 64
+MAX_FABRIC_PATH_NODES = 2048
+PATH_LIMIT_REASON = "path limit reached"
+CONTROLLER_LIMIT_REASON = "controller limit reached"
+
+
 # A CAM controller (SIM) name as `camcontrol devlist -v` prints it: a lowercase
 # FreeBSD driver name (mpr, mps, mpt, isp, umass-sim, mpi3mr, ...) ending in a
 # letter, then a 1-4 digit unit (the unit rule of `admit_mpr_unit_number`). The
@@ -2241,14 +2252,85 @@ def _core_controller_name(value: Any) -> str | None:
     return value if _CORE_CONTROLLER_NAME.fullmatch(value) else None
 
 
-def _multipath_member_not_read(member: MultipathMember, observed: MultipathMember) -> dict[str, Any]:
-    """A controller label the guard refused is recorded as not read."""
-    return {"not_read": ["controller"]} if observed.controller_label and not member.controller_label else {}
+class _CorePathMembers(dict[int, list[MultipathMember]]):
+    """Path members by bay, after the guard and the projection limits.
+
+    `not_read_reasons` and `refused` are keyed by member object identity; the
+    members live for the whole build.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.path_limited: set[int] = set()
+        self.not_read_reasons: dict[int, str] = {}
+        self.refused: set[int] = set()
+
+    @property
+    def limit_reached(self) -> bool:
+        return bool(self.path_limited or self.not_read_reasons)
+
+    def limit_warning(self) -> str:
+        return (
+            f"Storage Fabric path limits reached: {len(self.path_limited)} bays had paths beyond "
+            f"{MAX_FABRIC_PATH_MEMBERS_PER_BAY} per bay or {MAX_FABRIC_PATH_NODES} path nodes, and "
+            f"{len(self.not_read_reasons)} paths were beyond {MAX_FABRIC_CONTROLLERS} controllers; "
+            "those were not read."
+        )
+
+    def row_not_read(self, member: MultipathMember) -> dict[str, Any]:
+        reason = self.not_read_reasons.get(id(member))
+        if reason is not None:
+            return {"not_read": ["controller"], "not_read_reasons": {"controller": reason}}
+        return {"not_read": ["controller"]} if id(member) in self.refused else {}
+
+    def bay_not_read(self, slot: int) -> dict[str, Any]:
+        if slot not in self.path_limited:
+            return {}
+        return {"not_read": ["path_states"], "not_read_reasons": {"path_states": PATH_LIMIT_REASON}}
+
+
+def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) -> None:
+    """Bound members per bay, distinct controllers and distinct path nodes.
+
+    Runs before any graph construction, in bay order, for direct and
+    multipath members alike. Members past a bay's limit, or that would add a
+    path node past the total, are dropped and their bay is marked not read. A
+    controller past the total is not read on that member.
+    """
+    controllers = set(known_controllers)
+    path_nodes: set[tuple[str, str]] = set()
+    for slot, members in result.items():
+        kept: list[MultipathMember] = []
+        for member in members:
+            if len(kept) >= MAX_FABRIC_PATH_MEMBERS_PER_BAY:
+                result.path_limited.add(slot)
+                break
+            controller = normalize_text(member.controller_label)
+            if controller and controller not in controllers:
+                if len(controllers) >= MAX_FABRIC_CONTROLLERS:
+                    refused = id(member) in result.refused
+                    member = member.model_copy(update={"controller_label": None})
+                    if refused:
+                        result.refused.add(id(member))
+                    result.not_read_reasons[id(member)] = CONTROLLER_LIMIT_REASON
+                    controller = None
+                else:
+                    controllers.add(controller)
+            if controller:
+                node = (controller, normalize_path_state(member.state))
+                if node not in path_nodes:
+                    if len(path_nodes) >= MAX_FABRIC_PATH_NODES:
+                        result.path_limited.add(slot)
+                        continue
+                    path_nodes.add(node)
+            kept.append(member)
+        result[slot] = kept
 
 
 def _core_path_members(
     slots: list[SlotView], cam_devices: Any, disk_lookup_keys: tuple[frozenset[str], ...] | None = None,
-) -> dict[int, list[MultipathMember]]:
+    *, known_controllers: set[str] | frozenset[str] = frozenset(),
+) -> _CorePathMembers:
     """Use the inventory's shared-bay rule when no geom lists the disk's paths.
 
     Peers must pass the rule twice: against every API disk the inventory read
@@ -2277,13 +2359,16 @@ def _core_path_members(
                     owners[key] = slot
                 elif owners[key] is not slot:
                     owners[key] = conflicting_owner
-    result: dict[int, list[MultipathMember]] = {}
+    result = _CorePathMembers()
     for slot in slots:
         if slot.multipath and slot.multipath.members:
-            result[slot.slot] = [
-                member.model_copy(update={"controller_label": _core_controller_name(member.controller_label)})
-                for member in slot.multipath.members
-            ]
+            projected = []
+            for member in slot.multipath.members:
+                copied = member.model_copy(update={"controller_label": _core_controller_name(member.controller_label)})
+                if member.controller_label and not copied.controller_label:
+                    result.refused.add(id(copied))
+                projected.append(copied)
+            result[slot.slot] = projected
             continue
         members: list[MultipathMember] = []
         result[slot.slot] = members
@@ -2321,7 +2406,23 @@ def _core_path_members(
                 controller_label=_core_controller_name(cam_devices.controllers.get(name.lower())),
                 state="unknown" if in_use is None else "active" if name == in_use else "standby",
             ))
+        if len(members) > MAX_FABRIC_PATH_MEMBERS_PER_BAY:
+            # Keep the disk's own path and the path in use inside the limit.
+            members.sort(key=lambda member: member.device_name not in {own, in_use})
+    _apply_path_limits(result, set(known_controllers))
     return result
+
+
+def _path_row_not_read(
+    member: MultipathMember, members: _CorePathMembers, cam_devices: Any, *, direct: bool,
+) -> dict[str, Any]:
+    limited = members.row_not_read(member)
+    if not direct:
+        return limited
+    row = _direct_member_not_read(member, cam_devices)
+    if "not_read_reasons" in limited:
+        row["not_read_reasons"] = limited["not_read_reasons"]
+    return row
 
 
 def _direct_member_not_read(member: MultipathMember, cam_devices: Any) -> dict[str, Any]:

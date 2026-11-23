@@ -338,6 +338,95 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
                 # A member that never had a controller keeps its existing shape.
                 self.assertEqual(rows[1], {"controller": None, "state": "passive", "device_name": "da3"})
 
+    def scaled_snapshot(self, snapshot, *, bays, paths, multipath, state=lambda n: "ACTIVE"):
+        """Many bays, each listing many paths on distinct controller names."""
+        template = snapshot.slots[0]
+        slots, keys, cam = [], [], []
+        for bay in range(bays):
+            names = [f"da{bay * paths + index}" for index in range(paths)]
+            raw = {key: value for key, value in template.raw_status.items() if key != "pool_device_name"}
+            raw["device_names"] = names
+            members = [
+                MultipathMember(device_name=name, controller_label=f"hba{bay * paths + index}", state=state(bay * paths + index))
+                for index, name in enumerate(names)
+            ] if multipath else []
+            slots.append(template.model_copy(deep=True, update={
+                "slot": bay, "device_name": names[0], "smart_device_names": [], "raw_status": raw,
+                "multipath": MultipathView(name=f"disk{bay}", device_name=f"multipath/disk{bay}", members=members) if multipath else None,
+            }))
+            keys.append(frozenset({names[0]}))
+            for index, name in enumerate(names):
+                unit = bay * paths + index
+                cam.append(f"scbus{unit} on hba{unit} bus 0:\n<ExampleCo SAME-MODEL 0001> at scbus{unit} target 1 lun 0 ({name},pass{unit})")
+        return snapshot.model_copy(update={"slots": slots}), tuple(keys), "\n".join(cam)
+
+    def assert_within_limits(self, fabric, *, bays):
+        from app.services import sas_fabric
+        self.assertLessEqual(sum(node.kind == "controller" for node in fabric.nodes), sas_fabric.MAX_FABRIC_CONTROLLERS)
+        self.assertLessEqual(sum(node.id.startswith("path:") for node in fabric.nodes), sas_fabric.MAX_FABRIC_PATH_NODES)
+        traces = {trace.id: trace for trace in fabric.traces}
+        for bay in range(bays):
+            self.assertLessEqual(len(traces[f"bay:{bay}"].metrics["path_states"]), sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY)
+        self.assertEqual(sum("path limit" in warning for warning in fabric.warnings), 1)
+
+    async def test_many_bays_with_many_distinct_paths_stay_within_fabric_limits(self):
+        from app.services import sas_fabric
+        system, snapshot, outputs = await self.fixture()
+        bays, paths = 40, 16
+        for multipath in (False, True):
+            with self.subTest(multipath=multipath):
+                scaled, keys, cam = self.scaled_snapshot(snapshot, bays=bays, paths=paths, multipath=multipath)
+                fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+                self.assert_within_limits(fabric, bays=bays)
+                traces = {trace.id: trace for trace in fabric.traces}
+                for bay in range(bays):
+                    metrics = traces[f"bay:{bay}"].metrics
+                    self.assertEqual(len(metrics["path_states"]), sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY)
+                    self.assertIn("path_states", metrics["not_read"])
+                    self.assertEqual(metrics["not_read_reasons"]["path_states"], "path limit reached")
+                rows = [row for trace in fabric.traces if trace.kind == "bay" for row in trace.metrics["path_states"]]
+                # The total includes the controllers mprutil itself reported.
+                self.assertEqual(sum(node.kind == "controller" for node in fabric.nodes), sas_fabric.MAX_FABRIC_CONTROLLERS)
+                named = [row for row in rows if row["controller"]]
+                self.assertEqual(len({row["controller"] for row in named}), sas_fabric.MAX_FABRIC_CONTROLLERS - 2)
+                limited = [row for row in rows if (row.get("not_read_reasons") or {}).get("controller") == "controller limit reached"]
+                self.assertEqual(len(limited), len(rows) - len(named))
+                self.assertEqual(len(rows), bays * sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY)
+                self.assertTrue(all(row["controller"] is None and "controller" in row["not_read"] for row in limited))
+                self.assertLess(len(fabric.model_dump_json()), 2_000_000)
+
+    async def test_distinct_multipath_states_cannot_exceed_the_path_node_limit(self):
+        from app.services import sas_fabric
+        system, snapshot, outputs = await self.fixture()
+        bays, paths = 400, 8
+        scaled, keys, cam = self.scaled_snapshot(snapshot, bays=bays, paths=paths, multipath=True, state=lambda n: f"state{n}")
+        # Reuse a few controllers so the controller limit is not what binds.
+        for slot in scaled.slots:
+            slot.multipath.members = [
+                member.model_copy(update={"controller_label": f"hba{index}"}) for index, member in enumerate(slot.multipath.members)
+            ]
+        fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+        self.assert_within_limits(fabric, bays=bays)
+        self.assertEqual(sum(node.id.startswith("path:") for node in fabric.nodes), sas_fabric.MAX_FABRIC_PATH_NODES)
+        limited = [trace for trace in fabric.traces if trace.kind == "bay" and "path_states" in (trace.metrics.get("not_read") or [])]
+        self.assertTrue(limited)
+        self.assertTrue(all(trace.metrics["not_read_reasons"]["path_states"] == "path limit reached" for trace in limited))
+
+    async def test_two_and_four_path_bays_are_unchanged_by_the_limits(self):
+        system, snapshot, outputs = await self.fixture()
+        for paths in (2, 4):
+            for multipath in (False, True):
+                with self.subTest(paths=paths, multipath=multipath):
+                    scaled, keys, cam = self.scaled_snapshot(snapshot, bays=3, paths=paths, multipath=multipath)
+                    fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+                    self.assertFalse([warning for warning in fabric.warnings if "limit" in warning])
+                    for trace in (trace for trace in fabric.traces if trace.kind == "bay"):
+                        self.assertEqual(len(trace.metrics["path_states"]), paths)
+                        self.assertNotIn("not_read", trace.metrics)
+                        self.assertNotIn("not_read_reasons", trace.metrics)
+                        self.assertTrue(all("not_read_reasons" not in row for row in trace.metrics["path_states"]))
+                        self.assertEqual(len({row["controller"] for row in trace.metrics["path_states"]}), paths)
+
     async def test_other_bay_claim_of_own_direct_device_refuses_the_bay(self):
         system, snapshot, outputs = await self.fixture()
         self.assertEqual(len(self.bay(self.build(system, snapshot, outputs)).metrics["path_states"]), 2)
