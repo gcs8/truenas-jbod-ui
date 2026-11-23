@@ -11854,16 +11854,33 @@
       return;
     }
     if (state.diskInventorySync[mode]) return;
-    const owner = { mode, systemId, result: null };
+    const sequence = state.diskInventorySync.sequence = (state.diskInventorySync.sequence || 0) + 1;
+    const owner = { mode, systemId, sequence, result: null };
     let statusOwner = owner;
     let observationKey = null;
     const observations = state.diskInventorySync.observations ||= new Map();
     const publish = (result) => {
+      if (statusOwner.superseded) return;
       statusOwner.result = result;
       const rows = state.diskInventorySync.statuses ||= [];
-      if (!rows.includes(statusOwner)) rows.push(statusOwner);
-      // Retain bounded recent outcomes, independently of active observer ownership.
-      if (rows.length > 8) rows.splice(0, rows.length - 8);
+      const terminal = (value) => ["SUCCESS", "FAILED", "ABORTED"].includes(value?.state);
+      if (terminal(result)) {
+        const peers = rows.filter((row) => row !== statusOwner && row.systemId === systemId && row.mode === mode);
+        // Outcomes are ordered by this page's admission sequence. TrueNAS job IDs
+        // restart with its middleware, so they only match a watcher to its job.
+        const compare = (row) => statusOwner.sequence - row.sequence;
+        if (peers.some((row) => terminal(row.result) && compare(row) < 0)) {
+          statusOwner.superseded = true;
+        } else {
+          peers.filter((row) => compare(row) > 0).forEach((row) => { row.superseded = true; });
+        }
+        for (let index = rows.length - 1; index >= 0; index -= 1) {
+          if (rows[index].superseded) rows.splice(index, 1);
+        }
+      }
+      if (!statusOwner.superseded && !rows.includes(statusOwner)) rows.push(statusOwner);
+      // Evicted owners must not reappear after a delayed observation or refresh.
+      if (rows.length > 8) rows.splice(0, rows.length - 8).forEach((row) => { row.superseded = true; });
       if (systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) renderDiskInventorySyncStatuses();
     };
     const releaseAdmission = () => {
@@ -11927,9 +11944,10 @@
         }
       }
       if (statusOwner.result !== result) publish(result);
-      if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+      if (!statusOwner.superseded && result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
         try {
-          await refreshSnapshot(true, "manual-refresh");
+          await refreshSnapshot(true, "manual-refresh", () => !statusOwner.superseded
+            && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id));
           publish(result);
         } catch (_error) {
           publish({ ...result, message: `${result.message} The inventory refresh is unavailable; refresh again.` });
