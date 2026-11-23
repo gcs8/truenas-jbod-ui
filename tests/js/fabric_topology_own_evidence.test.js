@@ -9,7 +9,8 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { loadTopology, producerCases } = require("./helpers/fabric_topology");
+const H = require("./helpers/fabric_topology");
+const { loadTopology, producerCases } = H;
 
 const T = loadTopology();
 const FIXTURES = require("../fixtures/sas_fabric/topology_generality.json").fixtures;
@@ -166,6 +167,80 @@ test("lane rates are judged per lane only where the pairing is read, and never p
   // Control: with the census both checks still pass on that fixture.
   const read = model(fixture("wide-x4-sata"));
   assert.equal(checksOf(read, "cable-errors")[0].status, "pass");
+});
+
+// A 12 Gb/s HBA cabled to a 6 Gb/s expander runs at 6: the most both ends
+// support. Not critical, paired or not; unpaired, the comparison is not read.
+test("an HBA faster than its expander, at the expander's maximum, is not a slow lane", () => {
+  const slowExpander = (item, paired) => {
+    const cable = model(item).links.find((link) => link.kind === "controller-expander" && link.lanes);
+    const raw = item.fabric.links.find((link) => link.id === cable.id).reported_lanes;
+    raw.negotiated_rate_gbps = 6;
+    if (paired) raw.lanes = cable.lanes.sourcePhys.map((phy, index) => ({ source_phy: phy, target_phy: cable.lanes.targetPhys[index], negotiated_rate_gbps: 6 }));
+    for (const [id, phys, max] of [[cable.source, cable.lanes.sourcePhys, 12], [cable.target, cable.lanes.targetPhys, 6]]) {
+      const node = item.fabric.nodes.find((entry) => entry.id === id);
+      for (const row of node.raw.phys || node.raw.phy_rows) {
+        if (phys.includes(row.phy)) Object.assign(row, { speed: "6.0 Gbit", negotiated_link_rate: "6.0 Gbit", negotiated_rate_gbps: 6, maximum_rate_gbps: max, maximum_link_rate: `${max}.0 Gbit` });
+      }
+    }
+    return { cable, built: model(item) };
+  };
+  for (const paired of [false, true]) {
+    const { cable, built } = slowExpander(fixture("cascade3-top"), paired);
+    const lanes = checksOf(built, "lanes");
+    assert.ok(!lanes.some((entry) => entry.status === "critical"), `${paired}: ${textOf(lanes)}`);
+    assert.doesNotMatch(textOf(lanes.map((entry) => entry.lines)), /below/, String(paired));
+    assert.ok(!T.cardFor(built, { kind: "link", id: cable.id }).rows.some((row) => row.warn === true || /below/i.test(row.label)), String(paired));
+    if (!paired) assert.match(textOf(lanes), /which PHY pairs with which is not read/);
+  }
+  // Control: paired, a lane below both ends' maximum is still critical.
+  const item = fixture("cascade3-top");
+  const { cable } = slowExpander(item, true);
+  for (const row of item.fabric.nodes.find((entry) => entry.id === cable.target).raw.phys) {
+    if (cable.lanes.targetPhys.includes(row.phy)) Object.assign(row, { maximum_rate_gbps: 12, maximum_link_rate: "12.0 Gbit" });
+  }
+  assert.ok(checksOf(model(item), "lanes").some((entry) => entry.status === "critical"));
+});
+
+// Independent HBA pairs serve different shelves: each shelf is held only
+// against the HBAs its own evidence names, never every HBA of the host.
+test("each enclosure's redundancy is judged against the HBAs that report it", () => {
+  const withIds = () => {
+    const { fabric } = H.eightHbaSixteenShelves();
+    for (const node of fabric.nodes.filter((entry) => entry.kind === "mpr-enclosure")) {
+      const shelf = Number(/SHELF-(\d+)/.exec(node.label)[1]);
+      node.raw = { ...node.raw, logical_id: `5000c5000000${(0xf00 + shelf).toString(16)}` };
+    }
+    return fabric;
+  };
+  const redundancy = (fabric) => checksOf(T.buildTopologyModel(fabric, { width: 1600 }), "redundancy");
+  const intact = redundancy(withIds());
+  assert.equal(intact.length, 1, textOf(intact));
+  assert.equal(intact[0].status, "pass", textOf(intact));
+  assert.doesNotMatch(textOf(intact), /mpr[2-7].*SHELF-0-|no expander via/);
+  // Control: shelf 0 still reports a path via mpr1 for its bays, but no
+  // expander via mpr1 is cabled: that is a finding.
+  const cut = withIds();
+  const lost = cut.nodes.find((entry) => entry.kind === "expander" && entry.controller_id === "controller:mpr1" && cut.links.some((link) => link.source === entry.id && /SHELF-0-B/.test(cut.nodes.find((item) => item.id === link.target)?.label || "")));
+  cut.nodes = cut.nodes.filter((entry) => entry.id !== lost.id && !(entry.kind === "mpr-enclosure" && /SHELF-0-B/.test(entry.label)));
+  cut.links = cut.links.filter((link) => link.source !== lost.id && link.target !== lost.id);
+  const flagged = redundancy(cut);
+  assert.match(textOf(flagged.filter((entry) => entry.status === "warning")), /SHELF-0-A: no expander via mpr1\b/);
+  assert.doesNotMatch(textOf(flagged), /mpr[2-7]/);
+  // A shelf only one HBA reports, in a host with more: whether another HBA
+  // should reach it is not read, not a finding.
+  const single = withIds();
+  for (const bay of single.nodes.filter((entry) => entry.kind === "bay")) {
+    const trace = single.traces.find((entry) => entry.id === bay.id);
+    if (trace?.metrics?.path_states?.some((state) => state.controller === "mpr1")) trace.metrics.path_states = trace.metrics.path_states.filter((state) => state.controller !== "mpr1");
+  }
+  single.links = single.links.filter((link) => !(link.kind === "path-bay" && /path:mpr1:/.test(link.source)));
+  const one = single.nodes.find((entry) => entry.kind === "expander" && entry.controller_id === "controller:mpr1" && single.links.some((link) => link.source === entry.id && /SHELF-0-B/.test(single.nodes.find((item) => item.id === link.target)?.label || "")));
+  single.nodes = single.nodes.filter((entry) => entry.id !== one.id && !(entry.kind === "mpr-enclosure" && /SHELF-0-B/.test(entry.label)));
+  single.links = single.links.filter((link) => link.source !== one.id && link.target !== one.id);
+  const lone = redundancy(single);
+  assert.doesNotMatch(textOf(lone.filter((entry) => entry.status === "warning").map((entry) => entry.lines)), /SHELF-0-A/);
+  assert.match(textOf(lone.filter((entry) => entry.status === "not_read")), /SHELF-0-A/);
 });
 
 test("only established paths and rates are counted as read", () => {

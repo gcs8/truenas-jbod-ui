@@ -286,23 +286,34 @@ function wiringChecks(model, fabric) {
       const flags = [];
       const passes = [];
       const notes = [];
+      const unread = [...incomplete];
       for (const board of boards) {
         const reach = board.chips.map((chip) => [...new Set(chip.rows.map((row) => row.controllerId))]);
         const here = new Set(reach.flat());
-        const missing = controllers.filter((entry) => !here.has(entry.id));
+        // The HBAs this enclosure's own evidence names: those that reach its
+        // expanders, see it as an enclosure, or report a path to its bays.
+        // Another HBA of the host may serve other shelves only.
+        const expected = new Set([...here,
+          ...context.list(board.enclosure.observations).map((entry) => entry.controllerId),
+          ...board.enclosure.group.bays.flatMap((bay) => bay.pathStates.map((state) => state.controllerId))].filter(Boolean));
+        const group = controllers.filter((entry) => expected.has(entry.id));
+        const missing = group.filter((entry) => !here.has(entry.id));
         const described = board.chips.map((chip, index) => `${chip.label} via ${names(reach[index])}`).join("; ");
         let text = "";
         if (!board.chips.length) text = `${board.name}: no expander is reported for it`;
-        else if (missing.length) text = `${board.name}: no expander via ${missing.map((entry) => entry.label).join(", ")} (${described})`;
+        else if (!singlePath && controllers.length > 1 && group.length < 2) {
+          unread.push(`${board.name}: only ${names([...here])} reports it; whether another HBA of this host should reach it is not read`);
+          continue;
+        } else if (missing.length) text = `${board.name}: no expander via ${missing.map((entry) => entry.label).join(", ")} (${described})`;
         else if (board.chips.length === 1) {
           // One expander that every HBA reaches: nothing is miswired. That
           // the expander itself is not doubled is said, not flagged.
           passes.push(`${board.name}: ${described}`);
           if (!singlePath) notes.push(`${board.name} has one expander, reached via ${names([...here])}: the HBA paths are doubled, the expander is not.`);
         }
-        else if (reach.every((ids) => ids.length === controllers.length)) {
-          // Every HBA has a cable to every expander.
-          passes.push(`${board.name}: dual-domain, each of its ${board.chips.length} expanders is reached via ${names(controllers.map((entry) => entry.id))}`);
+        else if (reach.every((ids) => ids.length === group.length)) {
+          // Every HBA of its group has a cable to every expander.
+          passes.push(`${board.name}: dual-domain, each of its ${board.chips.length} expanders is reached via ${names(group.map((entry) => entry.id))}`);
           notes.push(`${board.name}: an expander reached by more than one HBA is one chip with an uplink from each, drawn once.`);
         } else if (reach.every((ids) => ids.length === 1) && here.size === board.chips.length) {
           passes.push(`${board.name}: one expander via each of ${names([...here])}`);
@@ -316,7 +327,7 @@ function wiringChecks(model, fabric) {
       else if (controllers.length < 2) flags.push(`Only ${controllers.length === 1 ? `one HBA (${controllers[0].label})` : "no HBA"} is in the payload: no second path`);
       const firmware = controllers.map((entry) => [entry.label, sas.controllers.get(entry.id)?.firmware || ""]).filter(([, value]) => value);
       if (new Set(firmware.map(([, value]) => value)).size > 1) notes.push(`HBA firmware differs: ${firmware.map(([label, value]) => `${label} ${value}`).join(", ")} (information, not a finding).`);
-      check("redundancy", "Each backplane has an expander via each HBA", flags, incomplete, passes.join("; "), notes);
+      check("redundancy", "Each backplane has an expander via each HBA", flags, unread, passes.join("; "), notes);
     }
 
     // (b) Cascades: on one HBA's side, between boards, in level order.
@@ -774,14 +785,21 @@ function cableRows(model, link) {
     if (link.lanes.targetBasis === "inferred") rows.push({ label: "Far end", value: `inferred: the only linked PHYs of ${context.nodeName(model, link.target)} that are in no port. sysfs has a port on the parent only` });
     else if (!link.lanes.targetPhys.length && parentOnly) rows.push({ label: "Far end", value: `${context.NOT_READ}: sysfs has a port on the parent only` });
     // Each lane's own rate, at the end that is read.
-    const near = unpairedPhys(model, link).filter((item) => item.end === context.nodeName(model, link.source) && item.row);
+    const ends = unpairedPhys(model, link);
+    const near = ends.filter((item) => item.end === context.nodeName(model, link.source) && item.row);
+    // Unpaired, a lane is shown below its maximum only where it is below
+    // the lowest maximum the far end reports too: any pairing agrees (the
+    // mutual capability laneCap uses). Otherwise the comparison is not read.
+    const farMax = ends.filter((item) => item.end === context.nodeName(model, link.target)).map((item) => item.row?.max ?? null);
+    const farFloor = farMax.length && farMax.every((value) => value !== null) ? Math.min(...farMax) : null;
+    const belowBoth = (row) => row.rate !== null && row.max !== null && farFloor !== null && row.rate < Math.min(row.max, farFloor);
     if (near.length) {
       const groups = new Map();
       for (const { row } of near) {
         const key = `${context.rateText(row.rate)}${row.max !== null ? ` (PHY max ${row.max})` : ""}`;
         groups.set(key, [...(groups.get(key) || []), row.phy]);
       }
-      rows.push({ label: "Per lane", value: [...groups].map(([key, phys]) => `PHY ${context.phyRanges(phys)}: ${phys.length > 1 ? "each " : ""}${key}`).join("; "), warn: near.some(({ row }) => row.rate !== null && row.max !== null && row.rate < row.max) });
+      rows.push({ label: "Per lane", value: [...groups].map(([key, phys]) => `PHY ${context.phyRanges(phys)}: ${phys.length > 1 ? "each " : ""}${key}`).join("; "), warn: near.some(({ row }) => belowBoth(row)) });
     }
     if (!link.lanes.rows.length) rows.push({ label: "Pairing", value: `${context.NOT_READ}: which PHY at one end is cabled to which at the other` });
     const slow = slowLanes(model, link);
