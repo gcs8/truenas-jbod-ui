@@ -818,9 +818,14 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                         "controller": member.controller_label,
                         "state": normalize_path_state(member.state),
                         "device_name": member.device_name,
-                        **(_direct_member_not_read(member, cam_devices) if direct_members else {}),
+                        **(
+                            _direct_member_not_read(member, cam_devices) if direct_members
+                            else _multipath_member_not_read(member, observed)
+                        ),
                     }
-                    for member in slot_members
+                    for member, observed in zip(
+                        slot_members, slot_members if direct_members else slot.multipath.members, strict=True,
+                    )
                 ],
                 "mpr_devices": mpr_device_metrics,
             },
@@ -2220,10 +2225,13 @@ def _mpr_count_completeness(
     }
 
 
-# A CORE SAS controller is its driver name and a 1-4 digit unit (the same unit
-# rule as `admit_mpr_unit_number`). The length is checked before any regex.
-_CORE_CONTROLLER_NAME = re.compile(r"(?:mpr|mps)[0-9]{1,4}")
-_CORE_CONTROLLER_NAME_MAX_LENGTH = 7
+# A CAM controller (SIM) name as `camcontrol devlist -v` prints it: a lowercase
+# FreeBSD driver name (mpr, mps, mpt, isp, umass-sim, mpi3mr, ...) ending in a
+# letter, then a 1-4 digit unit (the unit rule of `admit_mpr_unit_number`). The
+# length is checked before any regex. Being a valid path label does not make a
+# controller eligible for MPR diagnostics; those stay keyed by mprutil units.
+_CORE_CONTROLLER_NAME = re.compile(r"[a-z](?:[a-z0-9_-]{0,10}[a-z_])?[0-9]{1,4}")
+_CORE_CONTROLLER_NAME_MAX_LENGTH = 16
 
 
 def _core_controller_name(value: Any) -> str | None:
@@ -2231,6 +2239,11 @@ def _core_controller_name(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > _CORE_CONTROLLER_NAME_MAX_LENGTH:
         return None
     return value if _CORE_CONTROLLER_NAME.fullmatch(value) else None
+
+
+def _multipath_member_not_read(member: MultipathMember, observed: MultipathMember) -> dict[str, Any]:
+    """A controller label the guard refused is recorded as not read."""
+    return {"not_read": ["controller"]} if observed.controller_label and not member.controller_label else {}
 
 
 def _core_path_members(

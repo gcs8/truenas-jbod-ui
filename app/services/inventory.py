@@ -519,6 +519,8 @@ OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
 SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
+# Built snapshots whose ownership evidence is kept for Storage Fabric (#1471).
+SNAPSHOT_DISK_OWNERSHIP_MAX_ENTRIES = 128
 # Output-runaway bound on QuantaStor enclosure choices across all listed
 # storage systems, far above real node and shelf counts. Reaching it is shown on
 # the page with the read and omitted counts (#1307).
@@ -2046,6 +2048,12 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
         self._snapshot_source_publications: dict[str, SourcePublication] = {}
+        # Full API disk ownership evidence of each built snapshot, keyed by the
+        # snapshot's enclosure and build time and taken from the same source
+        # bundle that produced its bays (#1471). In memory only; bounded.
+        self._snapshot_disk_lookup_keys: OrderedDict[
+            tuple[str | None, datetime], tuple[SourcePublication, tuple[frozenset[str], ...]]
+        ] = OrderedDict()
         self._snapshot_publication_generation = 0
         self._snapshot_discovery_lock = asyncio.Lock()
         self._system_retention_lock = asyncio.Lock()
@@ -2194,6 +2202,9 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                 cache_key,
                 self._source_bundle.publication if self._source_bundle is not None else SourcePublication(),
             )
+            ownership_key = (adopted_snapshot.selected_enclosure_id, adopted_snapshot.generated_at)
+            if ownership_key in previous._snapshot_disk_lookup_keys:
+                self._snapshot_disk_lookup_keys[ownership_key] = previous._snapshot_disk_lookup_keys[ownership_key]
             self._touch_snapshot_key(cache_key)
         if previous._canonical_enclosure_options is not None:
             self._canonical_enclosure_options = dict(previous._canonical_enclosure_options)
@@ -3361,7 +3372,7 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             aliases=aliases,
             expander_counter_capability=self._smp_counter_capability,
             expander_counter_reads=self.expander_counter_reads(),
-            disk_lookup_keys=self._sas_fabric_disk_lookup_keys(source_bundle, snapshot.selected_enclosure_id),
+            disk_lookup_keys=self._sas_fabric_disk_lookup_keys(snapshot),
         )
         return fabric.model_copy(
             update={
@@ -3395,49 +3406,36 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                 system=self.system, snapshot=snapshot, ssh_outputs=bundle.ssh_outputs,
                 sources=bundle.sources, warnings=bundle.warnings,
                 command_failures=bundle.ssh_failure_details,
-                disk_lookup_keys=self._sas_fabric_disk_lookup_keys(
-                    bundle, snapshot.selected_enclosure_id, retain=False,
-                ),
+                disk_lookup_keys=self._sas_fabric_disk_lookup_keys(snapshot),
             ).nodes
         ]
 
-    def _sas_fabric_disk_lookup_keys(
-        self, bundle: Any, enclosure_id: str | None, *, retain: bool = True,
-    ) -> tuple[frozenset[str], ...] | None:
+    def _remember_snapshot_disk_lookup_keys(
+        self, snapshot: InventorySnapshot, publication: SourcePublication, keys: Iterable[Iterable[str]],
+    ) -> None:
+        entries = self._snapshot_disk_lookup_keys
+        key = (snapshot.selected_enclosure_id, snapshot.generated_at)
+        entries[key] = (publication, tuple(frozenset(item) for item in keys))
+        entries.move_to_end(key)
+        while len(entries) > SNAPSHOT_DISK_OWNERSHIP_MAX_ENTRIES:
+            entries.popitem(last=False)
+
+    def _sas_fabric_disk_lookup_keys(self, snapshot: InventorySnapshot) -> tuple[frozenset[str], ...] | None:
         """Lookup keys of every API disk, for Storage Fabric peer admission (#1471).
 
         This is the full ownership evidence the enclosure view's bay-peer rule
         reads: all source disks, including unplaced ones and disks on other
-        enclosures, not just the rendered bays. It stays in memory beside the
-        source bundle and never enters a snapshot or payload. ``retain=False``
-        neither reads nor writes service state beyond the bundle's existing
-        entries, so the alias route can call it off the event loop.
+        enclosures. It is the evidence recorded by the build that produced this
+        snapshot, from that build's source publication, so a later source-only
+        refresh cannot pair these bays with newer ownership. A snapshot this
+        service did not build here (or whose record was evicted) has none, and
+        the fabric then admits no alternate path. Read-only: the alias route
+        calls it off the event loop.
         """
-        if self.system.truenas.platform != "core" or not isinstance(bundle, InventorySourceBundle):
+        if self.system.truenas.platform != "core":
             return None
-        cache = bundle.fabric_disk_lookup_keys
-        cached = cache.get(enclosure_id)
-        if cached is not None:
-            return cached
-        ssh_data = ParsedSSHData()
-        if bundle.ssh_collected:
-            ssh_data = (
-                self._parsed_ssh_data_for_enclosure(bundle, enclosure_id)
-                if retain
-                else parse_ssh_outputs(
-                    bundle.ssh_outputs,
-                    self.settings.layout.slot_count,
-                    self.system.truenas.enclosure_filter,
-                    selected_enclosure_id=enclosure_id,
-                )
-            )
-        records = self._build_storage_view_candidate_records(bundle.raw_data, ssh_data, enclosure_id)
-        keys = tuple(frozenset(record.lookup_keys) for record in records)
-        if retain:
-            while len(cache) >= PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES:
-                cache.pop(next(iter(cache)), None)
-            cache[enclosure_id] = keys
-        return keys
+        entry = self._snapshot_disk_lookup_keys.get((snapshot.selected_enclosure_id, snapshot.generated_at))
+        return entry[1] if entry is not None else None
 
     def _sas_fabric_alias_mutation_context(
         self, object_id: str, object_kind: str | None, observed: tuple[Any, ...] | None = None,
@@ -8293,15 +8291,13 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             asyncio.get_running_loop().run_in_executor(None, copy_context().run, mapping_metadata)
         )
         with perf_stage("inventory.disk_retention_accounting"):
-            retention = build_disk_retention_accounting(
-                source_disks=self._build_storage_view_candidate_records(
-                    raw_data,
-                    ssh_data,
-                    resolved_enclosure_id,
-                    bmc_inventory,
-                ),
-                slots=slots,
+            source_disks = self._build_storage_view_candidate_records(
+                raw_data,
+                ssh_data,
+                resolved_enclosure_id,
+                bmc_inventory,
             )
+            retention = build_disk_retention_accounting(source_disks=source_disks, slots=slots)
         if retention.bare_device_mapper_unplaced_count:
             count = retention.bare_device_mapper_unplaced_count
             warnings.append(
@@ -8364,6 +8360,12 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             capabilities=capabilities,
             summary=summary,
         )
+        if self.system.truenas.platform == "core":
+            # Bind the ownership evidence to this build's own source bundle,
+            # never to a later publication (#1471).
+            self._remember_snapshot_disk_lookup_keys(
+                snapshot, source_bundle.publication, (disk.lookup_keys for disk in source_disks),
+            )
         # Do not admit a read that crossed invalidation, even when the ordinary
         # producer later rejects its candidate before publication.
         if (read_generation == self._snapshot_topology_generation
