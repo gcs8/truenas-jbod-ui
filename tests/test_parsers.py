@@ -375,8 +375,8 @@ errors: No known data errors
 
     def test_parse_lsscsi_g_t_extracts_transport_and_sg_devices(self) -> None:
         output = """
-[1:0:1:0]    disk    sas:0x5000cca264d473d5          /dev/sdc   /dev/sg2
-[1:0:26:0]   enclosu sas:0x5003048001c1043f          -          /dev/sg26
+[1:0:1:0]    disk    sas:0x5000c50000008101          /dev/sdc   /dev/sg2
+[1:0:26:0]   enclosu sas:0x500304800000b1ff          -          /dev/sg26
 """.strip()
 
         parsed = parse_lsscsi_devices(output, transport=True)
@@ -386,7 +386,7 @@ errors: No known data errors
         self.assertEqual(parsed[0].block_device, "/dev/sdc")
         self.assertEqual(parsed[0].sg_device, "/dev/sg2")
         self.assertEqual(parsed[0].transport, "sas")
-        self.assertEqual(parsed[0].transport_address, "0x5000cca264d473d5")
+        self.assertEqual(parsed[0].transport_address, "0x5000c50000008101")
         self.assertEqual(parsed[1].device_type, "enclosu")
         self.assertIsNone(parsed[1].block_device)
         self.assertEqual(parsed[1].sg_device, "/dev/sg26")
@@ -428,7 +428,7 @@ errors: No known data errors
     def test_parse_sg_ses_join_filter_extracts_joined_slot_detail(self) -> None:
         output = """
 LSI       SAS3x40           0601
-Primary enclosure logical identifier (hex): 5003048001c1043f
+Primary enclosure logical identifier (hex): 500304800000b1ff
 Slot00 [0,0]  Element type: Array device slot
   Enclosure Status:
     Predicted failure=0, Disabled=0, Swap=0, status: OK
@@ -438,8 +438,8 @@ Slot00 [0,0]  Element type: Array device slot
     phy index: 0
       SAS device type: end device
       target port for: SSP
-      attached SAS address: 0x5003048001c1043f
-      SAS address: 0x5000cca264d473d5
+      attached SAS address: 0x500304800000b1ff
+      SAS address: 0x5000c50000008101
       phy identifier: 0x0
 """.strip()
 
@@ -447,14 +447,14 @@ Slot00 [0,0]  Element type: Array device slot
 
         self.assertIsNotNone(enclosure)
         self.assertEqual(enclosure.ses_device, "/dev/sg26")
-        self.assertEqual(enclosure.enclosure_id, "5003048001c1043f")
+        self.assertEqual(enclosure.enclosure_id, "500304800000b1ff")
         slot = enclosure.slots[0]
         self.assertEqual(slot.status, "OK")
         self.assertEqual(slot.transport_protocol, "SAS")
         self.assertEqual(slot.sas_device_type, "end device")
         self.assertEqual(slot.target_port_protocol, "SSP")
-        self.assertEqual(slot.attached_sas_address, "5003048001c1043f")
-        self.assertEqual(slot.sas_address, "5000cca264d473d5")
+        self.assertEqual(slot.attached_sas_address, "500304800000b1ff")
+        self.assertEqual(slot.sas_address, "5000c50000008101")
         self.assertEqual(slot.phy_identifier, "0x0")
 
     def test_parse_sg_ses_join_filter_accepts_descriptor_variants(self) -> None:
@@ -1060,7 +1060,7 @@ State: DEGRADED
     def test_parse_sg_ses_aes_extracts_scale_front_slots(self) -> None:
         output = """
   LSI       SAS3x40           0601
-  Primary enclosure logical identifier (hex): 5003048001c1043f
+  Primary enclosure logical identifier (hex): 500304800000b1ff
 Additional element status diagnostic page:
   generation code: 0x0
   additional element status descriptor list
@@ -1070,14 +1070,14 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048001c1043f
-          SAS address: 0x5000cca264d473d5
+          attached SAS address: 0x500304800000b1ff
+          SAS address: 0x5000c50000008101
       Element index: 1  eiioe=0
         Transport protocol: SAS
         number of phys: 1, not all phys: 0, device slot number: 1
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048001c1043f
+          attached SAS address: 0x500304800000b1ff
           SAS address: 0x5000cca264ccb7ed
     Element type: SAS expander, subenclosure id: 0 [ti=1]
       Element index: 24  eiioe=0
@@ -1088,12 +1088,12 @@ Additional element status diagnostic page:
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(parsed.ses_device, "/dev/sg27")
-        self.assertEqual(parsed.enclosure_id, "5003048001c1043f")
+        self.assertEqual(parsed.enclosure_id, "500304800000b1ff")
         self.assertEqual(parsed.enclosure_label, "Front 24 Bay")
         self.assertEqual(parsed.layout_rows, 6)
         self.assertEqual(parsed.layout_columns, 4)
         self.assertEqual(parsed.slot_layout, [[5, 11, 17, 23], [4, 10, 16, 22], [3, 9, 15, 21], [2, 8, 14, 20], [1, 7, 13, 19], [0, 6, 12, 18]])
-        self.assertEqual(parsed.slots[0].sas_address, "5000cca264d473d5")
+        self.assertEqual(parsed.slots[0].sas_address, "5000c50000008101")
         self.assertEqual(parsed.slots[1].sas_address, "5000cca264ccb7ed")
         self.assertTrue(parsed.slots[0].present)
 
@@ -2243,7 +2243,7 @@ Slot00 [0,0]  Element type: Array device slot
     def test_parse_sg_ses_aes_marks_empty_rear_slots(self) -> None:
         output = """
   LSI       SAS3x28           0601
-  Primary enclosure logical identifier (hex): 500304801e977aff
+  Primary enclosure logical identifier (hex): 500304800000b2ff
 Additional element status diagnostic page:
   generation code: 0x0
   additional element status descriptor list
@@ -2273,7 +2273,7 @@ Additional element status diagnostic page:
     def test_parse_sg_ses_enclosure_status_extracts_identify_state(self) -> None:
         output = """
   LSI       SAS3x40           0601
-  Primary enclosure logical identifier (hex): 5003048001c1043f
+  Primary enclosure logical identifier (hex): 500304800000b1ff
 Enclosure status diagnostic page:
   INVOP=0, INFO=0, NON-CRIT=0, CRIT=0, UNRECOV=0
   generation code: 0x1
@@ -2528,7 +2528,7 @@ Slot 00  da0  Samsung SSD  SER000  OK
     def test_parse_ssh_outputs_preserves_scale_profile_id_after_ses_merge(self) -> None:
         aes_output = """
   LSI       SAS3x40           0601
-  Primary enclosure logical identifier (hex): 5003048001c1043f
+  Primary enclosure logical identifier (hex): 500304800000b1ff
 Additional element status diagnostic page:
   generation code: 0x0
   additional element status descriptor list
@@ -2538,14 +2538,14 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048001c1043f
-          SAS address: 0x5000cca264d473d5
+          attached SAS address: 0x500304800000b1ff
+          SAS address: 0x5000c50000008101
     Element type: SAS expander, subenclosure id: 0 [ti=1]
       Element index: 24  eiioe=0
 """.strip()
         ec_output = """
   LSI       SAS3x40           0601
-  Primary enclosure logical identifier (hex): 5003048001c1043f
+  Primary enclosure logical identifier (hex): 500304800000b1ff
 Enclosure status diagnostic page:
   INVOP=0, INFO=0, NON-CRIT=0, CRIT=0, UNRECOV=0
   generation code: 0x1
@@ -2568,14 +2568,14 @@ Enclosure status diagnostic page:
             },
             slot_count=24,
             enclosure_filter="",
-            selected_enclosure_id="5003048001c1043f",
+            selected_enclosure_id="500304800000b1ff",
         )
 
         self.assertEqual(len(parsed.ses_enclosures), 1)
         self.assertEqual(parsed.ses_enclosures[0].profile_id, "supermicro-ssg-6048r-front-24")
         self.assertIn(0, parsed.ses_slot_candidates)
         self.assertEqual(parsed.ses_slot_candidates[0]["ses_device"], "/dev/sg27")
-        self.assertEqual(parsed.ses_slot_candidates[0]["attached_sas_address"], "5003048001c1043f")
+        self.assertEqual(parsed.ses_slot_candidates[0]["attached_sas_address"], "500304800000b1ff")
 
     def test_parse_smart_test_results_uses_latest_test(self) -> None:
         results = [
@@ -2849,8 +2849,8 @@ Enclosure status diagnostic page:
     "phy_0": {
       "attached_device_type": "expander device",
       "negotiated_logical_link_rate": "phy enabled; 12 Gbps",
-      "sas_address": "0x5000cca264d473d5",
-      "attached_sas_address": "0x5003048001c1043f"
+      "sas_address": "0x5000c50000008101",
+      "attached_sas_address": "0x500304800000b1ff"
     }
   },
   "scsi_sas_port_1": {
@@ -2872,8 +2872,8 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["form_factor"], "3.5 inches")
         self.assertEqual(parsed["transport_protocol"], "SAS (SPL-4)")
         self.assertEqual(parsed["logical_unit_id"], "0x5000cca264d473d4")
-        self.assertEqual(parsed["sas_address"], "0x5000cca264d473d5")
-        self.assertEqual(parsed["attached_sas_address"], "0x5003048001c1043f")
+        self.assertEqual(parsed["sas_address"], "0x5000c50000008101")
+        self.assertEqual(parsed["attached_sas_address"], "0x500304800000b1ff")
         self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
         self.assertEqual(parsed["bytes_read"], 330638625000000)
         self.assertEqual(parsed["bytes_written"], 111254503000000)
@@ -2887,8 +2887,8 @@ Enclosure status diagnostic page:
   "logical_unit_id": "0x00e04c2020202000error: designator length",
   "scsi_sas_port_0": {
     "phy_0": {
-      "sas_address": "0x5000cca264d473d5error: designator length",
-      "attached_sas_address": "0x5003048001c1043ferror: designator length"
+      "sas_address": "0x5000c50000008101error: designator length",
+      "attached_sas_address": "0x500304800000b1fferror: designator length"
     }
   }
 }
@@ -2898,8 +2898,8 @@ Enclosure status diagnostic page:
 
         self.assertTrue(parsed["available"])
         self.assertEqual(parsed["logical_unit_id"], "0xe04c2020202000")
-        self.assertEqual(parsed["sas_address"], "0x5000cca264d473d5")
-        self.assertEqual(parsed["attached_sas_address"], "0x5003048001c1043f")
+        self.assertEqual(parsed["sas_address"], "0x5000c50000008101")
+        self.assertEqual(parsed["attached_sas_address"], "0x500304800000b1ff")
 
     def test_parse_smartctl_text_enrichment_extracts_ata_cache_health_and_link_metadata(self) -> None:
         output = """

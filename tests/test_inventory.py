@@ -6225,7 +6225,7 @@ Consumers:
                         block_device="/dev/sdc",
                         sg_device="/dev/sg2",
                         transport="sas",
-                        transport_address="0x5000cca264d473d5",
+                        transport_address="0x5000c50000008101",
                     )
                 ],
             )
@@ -6245,7 +6245,7 @@ Consumers:
             self.assertEqual(disk.physical_block_size, 4096)
             self.assertIn("sdc", disk.smart_devices)
             self.assertEqual(disk.raw["sg_device"], "/dev/sg2")
-            self.assertEqual(disk.raw["transport_address"], "0x5000cca264d473d5")
+            self.assertEqual(disk.raw["transport_address"], "0x5000c50000008101")
             self.assertEqual(disk.raw["linux_blockdevice"]["hctl"], "1:0:1:0")
             self.assertEqual(disk.raw["linux_scsi_device"]["sg_device"], "/dev/sg2")
 
@@ -10318,7 +10318,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                     12: {
                         "present": True,
                         "sas_address_hint": "5002538b103e5ee2",
-                        "attached_sas_address": "5003048026b2ff7f",
+                        "attached_sas_address": "500304800000b3ff",
                         "sas_device_type": "end device",
                         "ses_device": "/dev/sg11",
                         "ses_element_id": 12,
@@ -10344,7 +10344,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(slot12.device_name, "sdm")
             self.assertEqual(slot12.serial, "QS999")
             self.assertEqual(slot12.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
-            self.assertEqual(slot12.raw_status.get("attached_sas_address"), "5003048026b2ff7f")
+            self.assertEqual(slot12.raw_status.get("attached_sas_address"), "500304800000b3ff")
             slot8 = next(slot for slot in snapshot.slots if slot.slot == 8)
             self.assertFalse(slot8.present)
             self.assertEqual(slot8.state.value, "empty")
@@ -10859,7 +10859,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                             "storageSystemId": "node-a",
                             "slot": "01",
                             "serialNum": "QS123",
-                            "sasAddress": "5002538b496a5512",
+                            "sasAddress": "5000c50000008102",
                             "enclosureId": "enc-a",
                         }
                     ],
@@ -10895,7 +10895,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             )
 
             aes_output = """  SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Additional element status diagnostic page:
   additional element status descriptor list
     Element type: Array device slot, subenclosure id: 0 [ti=0]
@@ -10904,8 +10904,8 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048026b2ff7f
-          SAS address: 0x5002538b496a5512
+          attached SAS address: 0x500304800000b3ff
+          SAS address: 0x5000c50000008102
           phy identifier: 0x0
 """
             ec_output = """  SMCDRS2U  SAS3x40           0701
@@ -10972,7 +10972,7 @@ Enclosure Status diagnostic page:
             )
 
             aes_output = """  SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Additional element status diagnostic page:
   additional element status descriptor list
     Element type: Array device slot, subenclosure id: 0 [ti=0]
@@ -10981,8 +10981,8 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048026b2ff7f
-          SAS address: 0x5002538b496a5512
+          attached SAS address: 0x500304800000b3ff
+          SAS address: 0x5000c50000008102
           phy identifier: 0x0
 """
             ec_output = """  SMCDRS2U  SAS3x40           0701
@@ -11066,7 +11066,7 @@ Enclosure Status diagnostic page:
             )
 
             aes_output = """  SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Additional element status diagnostic page:
   additional element status descriptor list
     Element type: Array device slot, subenclosure id: 0 [ti=0]
@@ -11075,8 +11075,8 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048026b2ff7f
-          SAS address: 0x5002538b496a5512
+          attached SAS address: 0x500304800000b3ff
+          SAS address: 0x5000c50000008102
           phy identifier: 0x0
 """
             ec_output = """  SMCDRS2U  SAS3x40           0701
@@ -11202,9 +11202,9 @@ Enclosure Status diagnostic page:
                         '"rotation_rate":0,'
                         '"form_factor":{"name":"2.5 inches"},'
                         '"scsi_transport_protocol":{"name":"SAS"},'
-                        '"logical_unit_id":"35002538b496a5510",'
+                        '"logical_unit_id":"35000c50000008100",'
                         '"scsi_sas_port_0":{"phy_0":{'
-                        '"sas_address":"5002538b496a5510",'
+                        '"sas_address":"5000c50000008100",'
                         '"attached_sas_address":"5003048000000001",'
                         '"negotiated_logical_link_rate":"phy enabled; 12 Gbps"'
                         '}}'
@@ -11324,7 +11324,7 @@ Enclosure Status diagnostic page:
                     '"logical_unit_id":"0x5002538b496a53f0",'
                     '"scsi_sas_port_0":{"phy_0":{'
                     '"sas_address":"0x5002538b496a53f0",'
-                    '"attached_sas_address":"0x5003048026b2ff7f"'
+                    '"attached_sas_address":"0x500304800000b3ff"'
                     '}}'
                     '}'
                 ),
@@ -11389,7 +11389,7 @@ Enclosure Status diagnostic page:
 
             self.assertTrue(summary.available)
             self.assertEqual(summary.power_on_hours, 47003)
-            self.assertEqual(summary.attached_sas_address, "0x5003048026b2ff7f")
+            self.assertEqual(summary.attached_sas_address, "0x500304800000b3ff")
             awaited = [call.args for call in service._run_ssh_command.await_args_list]
             self.assertEqual(awaited[0][1], "10.0.0.20")
 
@@ -11714,7 +11714,7 @@ Enclosure Status diagnostic page:
                     '"logical_unit_id":"0x5002538b103e5ee0",'
                     '"scsi_sas_port_0":{"phy_0":{'
                     '"sas_address":"0x5002538b103e5ee0",'
-                    '"attached_sas_address":"0x5003048026b2ff7f"'
+                    '"attached_sas_address":"0x500304800000b3ff"'
                     '}}'
                     '}'
                 ),
@@ -12341,8 +12341,8 @@ Enclosure Status diagnostic page:
                         '"phy_0":{'
                         '"attached_device_type":"expander device",'
                         '"negotiated_logical_link_rate":"phy enabled; 12 Gbps",'
-                        '"sas_address":"0x5000cca264d473d5",'
-                        '"attached_sas_address":"0x5003048001c1043f"'
+                        '"sas_address":"0x5000c50000008101",'
+                        '"attached_sas_address":"0x500304800000b1ff"'
                         '}'
                         '},'
                         '"scsi_self_test_0":{'
@@ -12404,8 +12404,8 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.writeback_cache_enabled, False)
             self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
             self.assertEqual(summary.logical_unit_id, "0x5000cca264d473d4")
-            self.assertEqual(summary.sas_address, "0x5000cca264d473d5")
-            self.assertEqual(summary.attached_sas_address, "0x5003048001c1043f")
+            self.assertEqual(summary.sas_address, "0x5000c50000008101")
+            self.assertEqual(summary.attached_sas_address, "0x500304800000b1ff")
             self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
             self.assertIsNone(summary.message)
             self.assertIn("/usr/sbin/smartctl -x -j /dev/sdc", service.ssh_probe.commands[0])
@@ -12528,7 +12528,7 @@ Enclosure Status diagnostic page:
                         '"attached_device_type":"expander device",'
                         '"negotiated_logical_link_rate":"phy enabled; 12 Gbps",'
                         '"sas_address":"0x5000c5003e82533d",'
-                        '"attached_sas_address":"0x500304801e977aff"'
+                        '"attached_sas_address":"0x500304800000b2ff"'
                         '}'
                         '},'
                         '"scsi_self_test_0":{'
@@ -12586,7 +12586,7 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
             self.assertEqual(summary.logical_unit_id, "0x5000c5003e82533f")
             self.assertEqual(summary.sas_address, "0x5000c5003e82533d")
-            self.assertEqual(summary.attached_sas_address, "0x500304801e977aff")
+            self.assertEqual(summary.attached_sas_address, "0x500304800000b2ff")
             self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
             self.assertIn("/usr/sbin/smartctl -x -j /dev/sdab", service.ssh_probe.commands[0])
             self.assertIn("/usr/sbin/smartctl -x /dev/sdab", service.ssh_probe.commands[1])
@@ -18831,8 +18831,8 @@ Additional element status diagnostic page:
     Element index: 0  eiioe=0
       number of phys: 1, device slot number: 0
       phy index: 0
-        SAS address: 0x5002538b496a5512
-        attached SAS address: 0x5003048026b2ff7f
+        SAS address: 0x5000c50000008102
+        attached SAS address: 0x500304800000b3ff
 """
             ec_off_output = """  SMCDRS2U  SAS3x40           0701
 Enclosure Status diagnostic page:
@@ -18916,7 +18916,7 @@ Enclosure Status diagnostic page:
             )
             discovery_command = service._build_sg_ses_discovery_command()
             aes_output = """  SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Additional element status diagnostic page:
   additional element status descriptor list
     Element type: Array device slot, subenclosure id: 0 [ti=0]
@@ -18925,8 +18925,8 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048026b2ff7f
-          SAS address: 0x5002538b496a5512
+          attached SAS address: 0x500304800000b3ff
+          SAS address: 0x5000c50000008102
           phy identifier: 0x0
 """
             ec_output = """  SMCDRS2U  SAS3x40           0701
@@ -18987,7 +18987,7 @@ Enclosure Status diagnostic page:
             )
             discovery_command = service._build_sg_ses_discovery_command()
             aes_output = """  SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Additional element status diagnostic page:
   additional element status descriptor list
     Element type: Array device slot, subenclosure id: 0 [ti=0]
@@ -18996,8 +18996,8 @@ Additional element status diagnostic page:
         number of phys: 1, not all phys: 0, device slot number: 0
         phy index: 0
           SAS device type: end device
-          attached SAS address: 0x5003048026b2ff7f
-          SAS address: 0x5002538b496a5512
+          attached SAS address: 0x500304800000b3ff
+          SAS address: 0x5000c50000008102
           phy identifier: 0x0
 """
             ec_output = """  SMCDRS2U  SAS3x40           0701

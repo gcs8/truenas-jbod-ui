@@ -1,5 +1,5 @@
   SMCDRS2U  SAS3x40           0701
-  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+  Primary enclosure logical identifier (hex): 500304800000b3ff
 Enclosure Status diagnostic page:
   generation code: 0x0
   status descriptor list
