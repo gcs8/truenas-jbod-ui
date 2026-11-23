@@ -296,6 +296,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_inventory_projection_split",
         "test_inventory_registry_routes",
         "test_inventory_ses_split",
+        "test_inventory_slot_capacity",
         "test_inventory_status_error_text",
         "test_nonroot_cli",
         "test_perf_budgets",

@@ -471,7 +471,7 @@ test("arrow keys move by row across the bay layout", () => {
 test("the empty-bay detail is one line and SMART rows are collapsed behind a summary", () => {
   const source = functionSource("renderLiveSlotDetail");
   assert.match(source, /isEmptyBay\(slot\)\s*\? '<p class="detail-empty-bay">This bay is empty\.<\/p>'/);
-  assert.equal((source.match(/\bkvRow\(/g) || []).length, 4, "only Device, Serial, Pool and Health are always shown");
+  assert.equal((source.match(/\bkvRow\(/g) || []).length, 5, "Device, Serial, Size, Pool and Health are always shown");
   assert.match(source, /smartDetailsDisclosure\(\[/);
   assert.match(functionSource("smartDetailsDisclosure"), /<summary>SMART details<\/summary>/);
   assert.match(source, /state\.detailSmartExpanded = Boolean\(event\.target\.open\)/);

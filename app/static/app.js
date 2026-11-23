@@ -824,7 +824,7 @@
     const summary = occupancy === "present"
       ? [
           slot.model || null,
-          slot.size_human || null,
+          slot.size_human || "Capacity not read yet",
           slot.smart_device_type ? `smartctl -d ${slot.smart_device_type}` : null,
         ].filter(Boolean).join(" • ") || "Matched from live inventory."
       : occupancy === "unknown"
@@ -9587,7 +9587,8 @@
         kvRow("Device", slot.device_name),
         kvRow("Serial", slot.serial, true),
         kvRowIfMeaningful("Model", slot.model),
-        kvRowIfMeaningful("Size", slot.size_human),
+        kvRow("Size", slot.size_human || "not read yet"),
+        kvRowIfMeaningful("Enclosure descriptor", !slot.size_human ? slot.raw_status?.reported_size : null),
         kvRowIfMeaningful(persistentIdLabel(slot), slot.gptid, true),
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
@@ -9740,7 +9741,7 @@
         kvRow("Device", storageViewSlot.device_name),
         kvRow("Serial", storageViewSlot.serial, true),
         kvRowIfMeaningful("Model", storageViewSlot.model),
-        kvRowIfMeaningful("Capacity", storageViewSlot.size_human),
+        kvRow("Capacity", storageViewSlot.size_human || "not read yet"),
         kvRowIfMeaningful(persistentIdLabel(storageViewSlot), storageViewSlot.gptid, true),
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(storageViewSlot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
