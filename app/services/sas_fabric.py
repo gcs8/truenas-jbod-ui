@@ -2216,20 +2216,24 @@ def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, lis
         ))
         if own not in listed:
             continue
-        in_use = normalize_device_name(raw.get("pool_device_name")) or own
+        # Only a hint naming an admitted path establishes current pool usage.
+        # The API's preferred device and a stale hint do not establish it.
+        in_use = normalize_device_name(raw.get("pool_device_name"))
+        if in_use not in {name for name in listed if name == own or name in peers}:
+            in_use = None
         for name in listed:
             if name != own and name not in peers:
                 continue
             members.append(MultipathMember(
                 device_name=name,
                 controller_label=cam_devices.controllers.get(name.lower()),
-                state="active" if name == in_use else "standby",
+                state="unknown" if in_use is None else "active" if name == in_use else "standby",
             ))
     return result
 
 
 def _direct_member_not_read(member: MultipathMember, cam_devices: Any) -> dict[str, Any]:
-    not_read = []
+    not_read = ["state"] if member.state == "unknown" else []
     if not member.controller_label:
         not_read.append("controller")
     if _cam_member_target(cam_devices, member.controller_label or "", member.device_name) is None:

@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import MultipathMember, MultipathView, SlotView
-from app.services.sas_fabric import build_sas_fabric_snapshot
+from app.services.sas_fabric import _cam_member_target, build_sas_fabric_snapshot
+from app.services.parsers import parse_camcontrol_devlist
 from app.services.ssh_probe import SSHCommandResult
 from app.services.truenas_ws import TrueNASRawData
 from tests.inventory_fixtures import build_inventory_service
@@ -31,13 +32,13 @@ def synthetic_outputs() -> dict[str, str]:
             "  0 0001 0001 12.0 1.5 12.0 SAS Initiator"
         )
         outputs[f"mprutil -u {unit} show enclosures"] = f"2 {SHELF} 0008 0002 SES"
-        # Controller-local target 4, intentionally different from either da number.
+        # Distinct controller-local targets, neither equal to its da number.
         outputs[f"mprutil -u {unit} show devices"] = (
-            f"00 4 5000c50000000d0{unit} 0020 0009 SAS Target 12.0 0002 0"
+            f"00 {4 + unit * 8} 5000c50000000d0{unit} 0020 0009 SAS Target 12.0 0002 0"
         )
     outputs["camcontrol devlist -v"] = "\n".join(
         f"scbus{unit} on mpr{unit} bus 0:\n"
-        f"<ExampleCo SAME-MODEL 0001> at scbus{unit} target 4 lun 0 ({device},pass{unit})"
+        f"<ExampleCo SAME-MODEL 0001> at scbus{unit} target {4 + unit * 8} lun 0 ({device},pass{unit})"
         for unit, device in enumerate(("da3", "da11"))
     )
     outputs["sesutil map"] = "".join(
@@ -58,7 +59,7 @@ def synthetic_outputs() -> dict[str, str]:
 
 
 class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
-    async def fixture(self, *, api_device="da11", pool_device="da11"):
+    async def fixture(self, *, api_device="da11", pool_device="da11", pool_label=None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         settings = Settings()
@@ -66,6 +67,8 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         settings.layout.rows = 1
         settings.layout.columns = 2
         outputs = synthetic_outputs()
+        if pool_label:
+            outputs["glabel status"] = f"{pool_label} N/A {pool_device}p1\n"
         system = SystemConfig(
             id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core"),
             ssh=SSHConfig(enabled=True, host="core.example.test", commands=list(outputs)),
@@ -75,7 +78,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
             enclosures=[], disks=[{"name": api_device, "serial": "SANITIZED-DIRECT-DISK"}],
             pools=[{"name": "synthetic-pool", "topology": {"special": [{
                 "type": "MIRROR", "name": "mirror-0", "children": [
-                    {"type": "DISK", "disk": pool_device, "status": "ONLINE"},
+                    {"type": "DISK", "disk": pool_device, "status": "ONLINE", **({"path": f"/dev/{pool_label}"} if pool_label else {})},
                 ],
             }]}}], disk_temperatures={}, smart_test_results=[],
         )
@@ -135,8 +138,8 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         system, snapshot, outputs = await self.fixture()
         for cam, field in (
             ("", "controller"),
-            (outputs["camcontrol devlist -v"].replace("target 4", "target 1234567890"), "target"),
-            (outputs["camcontrol devlist -v"] + "\n" + outputs["camcontrol devlist -v"].replace("target 4", "target 5"), "target"),
+            (re.sub(r"target [0-9]+", "target 1234567890", outputs["camcontrol devlist -v"]), "target"),
+            (outputs["camcontrol devlist -v"] + "\n" + re.sub(r"target [0-9]+", "target 5", outputs["camcontrol devlist -v"]), "target"),
         ):
             with self.subTest(field=field):
                 fabric = self.build(system, snapshot, {**outputs, "camcontrol devlist -v": cam})
@@ -149,6 +152,8 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_other_bay_claim_prevents_borrowing_even_with_same_cam_target(self):
         system, snapshot, outputs = await self.fixture()
+        outputs["camcontrol devlist -v"] = outputs["camcontrol devlist -v"].replace("target 12", "target 4")
+        outputs["mprutil -u 1 show devices"] = outputs["mprutil -u 1 show devices"].replace("00 12 ", "00 4 ")
         snapshot.slots[1] = SlotView(
             slot=1, slot_label="02", row_index=0, column_index=1,
             present=True, device_name="da3", raw_status={"device_names": ["da3"]},
@@ -156,6 +161,88 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         bay = self.bay(self.build(system, snapshot, outputs))
         self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da11"])
         self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
+
+    async def test_other_bay_claim_of_own_direct_device_refuses_the_bay(self):
+        system, snapshot, outputs = await self.fixture()
+        self.assertEqual(len(self.bay(self.build(system, snapshot, outputs)).metrics["path_states"]), 2)
+        for claim in ("device_name", "smart_device_names", "raw_status", "multipath"):
+            with self.subTest(claim=claim):
+                changed = snapshot.model_copy(deep=True)
+                other = changed.slots[1]
+                if claim == "device_name":
+                    other.device_name = "da11"
+                elif claim == "smart_device_names":
+                    other.smart_device_names = ["da11"]
+                elif claim == "raw_status":
+                    other.raw_status["device_names"] = ["da11"]
+                else:
+                    other.multipath = MultipathView(name="other", device_name="multipath/other", members=[
+                        MultipathMember(device_name="da11", controller_label="mpr1", state="ACTIVE"),
+                    ])
+                bay = self.bay(self.build(system, changed, outputs))
+                self.assertEqual(bay.metrics["path_states"], [])
+                self.assertEqual(bay.metrics["mpr_devices"], [])
+
+    async def test_missing_or_stale_usage_hint_keeps_both_states_not_read(self):
+        system, snapshot, outputs = await self.fixture()
+        for hint in (None, "da99"):
+            with self.subTest(hint=hint):
+                changed = snapshot.model_copy(deep=True)
+                changed.slots[0].raw_status.pop("pool_device_name", None)
+                if hint is not None:
+                    changed.slots[0].raw_status["pool_device_name"] = hint
+                fabric = self.build(system, changed, outputs)
+                bay = self.bay(fabric)
+                self.assertEqual(len(bay.metrics["path_states"]), 2)
+                self.assertEqual({row["state"] for row in bay.metrics["path_states"]}, {"unknown"})
+                self.assertTrue(all("state" in row["not_read"] for row in bay.metrics["path_states"]))
+                self.assertEqual({row["state"] for row in bay.metrics["mpr_devices"]}, {"unknown"})
+                self.assertEqual({row["state"] for row in fabric.paths}, {"unknown"})
+
+    async def test_normal_usage_hint_selects_only_the_observed_path(self):
+        system, snapshot, outputs = await self.fixture()
+        for hint in ("da3", "da11"):
+            with self.subTest(hint=hint):
+                snapshot.slots[0].raw_status["pool_device_name"] = hint
+                rows = self.bay(self.build(system, snapshot, outputs)).metrics["path_states"]
+                self.assertEqual({row["device_name"]: row["state"] for row in rows}, {
+                    name: "active" if name == hint else "standby" for name in ("da3", "da11")
+                })
+                self.assertTrue(all("not_read" not in row for row in rows))
+
+    async def test_single_direct_path_state_requires_its_own_usage_hint(self):
+        system, snapshot, outputs = await self.fixture()
+        snapshot.slots[0].raw_status["device_names"] = ["da11"]
+        for hint in ("da11", None, "da99"):
+            with self.subTest(hint=hint):
+                snapshot.slots[0].raw_status["pool_device_name"] = hint
+                bay = self.bay(self.build(system, snapshot, outputs))
+                self.assertEqual(len(bay.metrics["path_states"]), 1)
+                self.assertEqual(len(bay.metrics["mpr_devices"]), 1)
+                self.assertEqual(bay.metrics["path_states"][0]["state"], "active" if hint == "da11" else "unknown")
+
+    async def test_mixed_case_glabel_retains_the_observed_pool_path_hint(self):
+        system, snapshot, outputs = await self.fixture(pool_label="gptid/SYNTHETIC-Mixed-Label")
+        self.assertEqual(snapshot.slots[0].raw_status.get("pool_device_name"), "da11")
+        rows = self.bay(self.build(system, snapshot, outputs)).metrics["path_states"]
+        self.assertEqual({row["device_name"]: row["state"] for row in rows}, {"da3": "standby", "da11": "active"})
+
+    async def test_cam_targets_never_pair_across_controllers(self):
+        system, snapshot, outputs = await self.fixture()
+        cam = parse_camcontrol_devlist(outputs["camcontrol devlist -v"])
+        # Same model/LUN, different targets. The opposite controller cannot
+        # supply this device's target even if its MPR table has that number.
+        for controller, device, target, other in (("mpr0", "da3", 4, "mpr1"), ("mpr1", "da11", 12, "mpr0")):
+            with self.subTest(controller=controller):
+                self.assertEqual(_cam_member_target(cam, controller, device), target)
+                self.assertIsNone(_cam_member_target(cam, other, device))
+        wrong_target = dict(outputs)
+        wrong_target["mprutil -u 1 show devices"] = outputs["mprutil -u 1 show devices"].replace("00 12 ", "00 4 ")
+        bay = self.bay(self.build(system, snapshot, wrong_target))
+        self.assertEqual({row["controller"] for row in bay.metrics["path_states"]}, {"mpr0", "mpr1"})
+        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da3"])
+        normal = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual({row["member_device_name"] for row in normal.metrics["mpr_devices"]}, {"da3", "da11"})
 
     async def test_bay_must_name_own_disk_and_not_infer_from_cam_similarity(self):
         system, snapshot, outputs = await self.fixture()
@@ -207,18 +294,25 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(EXPORT_RENDER_CACHE.clear)
         self.addCleanup(EXPORT_HISTORY_CACHE.clear)
         system, snapshot, outputs = await self.fixture()
-        fabric = self.build(system, snapshot, outputs)
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
-        rendered = await exporter.build_enclosure_snapshot_html(
-            request=build_request(), snapshot=snapshot, sas_fabric=fabric,
-            selected_slot=0, history_window_hours=24, io_chart_mode="total",
-        )
-        match = re.search(r"preloadedSasFabric:\s*(.*),\n", rendered.html)
-        self.assertIsNotNone(match)
-        payload = json.loads(match.group(1))
-        bay = next(trace for trace in payload["traces"] if trace["id"] == "bay:0")
-        self.assertEqual(len(bay["metrics"]["path_states"]), 2)
-        self.assertEqual(len(bay["metrics"]["mpr_devices"]), 2)
+        for hint in ("da11", None, "da99"):
+            with self.subTest(hint=hint):
+                snapshot.slots[0].raw_status["pool_device_name"] = hint
+                fabric = self.build(system, snapshot, outputs)
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    request=build_request(), snapshot=snapshot, sas_fabric=fabric,
+                    selected_slot=0, history_window_hours=24, io_chart_mode="total",
+                )
+                match = re.search(r"preloadedSasFabric:\s*(.*),\n", rendered.html)
+                self.assertIsNotNone(match)
+                payload = json.loads(match.group(1))
+                bay = next(trace for trace in payload["traces"] if trace["id"] == "bay:0")
+                self.assertEqual(len(bay["metrics"]["path_states"]), 2)
+                self.assertEqual(len(bay["metrics"]["mpr_devices"]), 2)
+                self.assertEqual(bay["metrics"], self.bay(fabric).model_dump(mode="json")["metrics"])
+                if hint != "da11":
+                    self.assertEqual({row["state"] for row in bay["metrics"]["path_states"]}, {"unknown"})
+                    self.assertTrue(all("state" in row["not_read"] for row in bay["metrics"]["path_states"]))
 
 
 if __name__ == "__main__":
