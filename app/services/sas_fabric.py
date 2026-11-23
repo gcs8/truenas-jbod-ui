@@ -194,6 +194,10 @@ class SasFabricBuildContext:
     # with their UTC read time, shown until the expander is due for its next
     # read (#1088 review).
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None
+    # Lookup keys of every API disk the inventory read, including unplaced
+    # disks and disks on other enclosures (#1471). Process-local input, never
+    # part of the snapshot or the fabric payload. None means unknown.
+    disk_lookup_keys: tuple[frozenset[str], ...] | None = None
 
 
 class SasFabricBuilder(Protocol):
@@ -245,6 +249,7 @@ def _build_sas_fabric_context(
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
+    disk_lookup_keys: Iterable[Iterable[str]] | None = None,
 ) -> SasFabricBuildContext:
     return SasFabricBuildContext(
         system=system,
@@ -257,6 +262,9 @@ def _build_sas_fabric_context(
         alias_map=_sas_fabric_alias_map(aliases or []),
         expander_counter_capability=expander_counter_capability,
         expander_counter_reads=expander_counter_reads,
+        disk_lookup_keys=(
+            None if disk_lookup_keys is None else tuple(frozenset(keys) for keys in disk_lookup_keys)
+        ),
     )
 
 
@@ -279,6 +287,7 @@ def build_sas_fabric_snapshot(
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
+    disk_lookup_keys: Iterable[Iterable[str]] | None = None,
 ) -> SasFabricSnapshot:
     context = _build_sas_fabric_context(
         system=system,
@@ -290,6 +299,7 @@ def build_sas_fabric_snapshot(
         aliases=aliases,
         expander_counter_capability=expander_counter_capability,
         expander_counter_reads=expander_counter_reads,
+        disk_lookup_keys=disk_lookup_keys,
     )
     return _select_sas_fabric_builder(context).build(context)
 
@@ -502,7 +512,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         mpr_sysctl_locations,
     )
     cam_devices = parse_camcontrol_devlist(normalized_outputs.get("camcontrol devlist -v", ""))
-    members_by_slot = _core_path_members(snapshot.slots, cam_devices)
+    members_by_slot = _core_path_members(snapshot.slots, cam_devices, context.disk_lookup_keys)
     path_counts, path_slots = _path_counts_from_slots(snapshot.slots, members_by_slot)
     controller_names = sorted(
         # Only the summary's admitted units, inside the unit bound.
@@ -2173,8 +2183,34 @@ def _mpr_count_completeness(
     }
 
 
-def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, list[MultipathMember]]:
-    """Use the inventory's shared-bay rule when no geom lists the disk's paths."""
+# A CORE SAS controller is its driver name and a 1-4 digit unit (the same unit
+# rule as `admit_mpr_unit_number`). The length is checked before any regex.
+_CORE_CONTROLLER_NAME = re.compile(r"(?:mpr|mps)[0-9]{1,4}")
+_CORE_CONTROLLER_NAME_MAX_LENGTH = 7
+
+
+def _core_controller_name(value: Any) -> str | None:
+    """A member's controller name, or None (not read) when it is not one."""
+    if not isinstance(value, str) or len(value) > _CORE_CONTROLLER_NAME_MAX_LENGTH:
+        return None
+    return value if _CORE_CONTROLLER_NAME.fullmatch(value) else None
+
+
+def _core_path_members(
+    slots: list[SlotView], cam_devices: Any, disk_lookup_keys: tuple[frozenset[str], ...] | None = None,
+) -> dict[int, list[MultipathMember]]:
+    """Use the inventory's shared-bay rule when no geom lists the disk's paths.
+
+    Peers must pass the rule twice: against every API disk the inventory read
+    (including unplaced disks and other enclosures), exactly as the enclosure
+    view does, and against the rendered bays, so a name another bay claims is
+    not borrowed. Without the API index no peer is admitted.
+    """
+    # Last writer wins, as in inventory's `_index_disk_records`. Each disk's key
+    # set is its owner identity.
+    api_owners: dict[str, frozenset[str]] = {
+        key: keys for keys in (disk_lookup_keys or ()) for key in keys
+    }
     owners: dict[str, Any] = {}
     conflicting_owner = object()
     for slot in slots:
@@ -2194,7 +2230,10 @@ def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, lis
     result: dict[int, list[MultipathMember]] = {}
     for slot in slots:
         if slot.multipath and slot.multipath.members:
-            result[slot.slot] = list(slot.multipath.members)
+            result[slot.slot] = [
+                member.model_copy(update={"controller_label": _core_controller_name(member.controller_label)})
+                for member in slot.multipath.members
+            ]
             continue
         members: list[MultipathMember] = []
         result[slot.slot] = members
@@ -2209,7 +2248,10 @@ def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, lis
             continue
         # The helper requires this bay to name the disk's own path, and rejects
         # peers another disk owns. It is also used by the enclosure view (#902).
-        peers = set(bay_peer_devices(raw, {own.lower()}, owners, slot))
+        api_owner = api_owners.get(own.lower())
+        peers = set(bay_peer_devices(raw, {own.lower()}, owners, slot)).intersection(
+            bay_peer_devices(raw, set(api_owner), api_owners, api_owner)
+        ) if api_owner is not None else set()
         listed = list(dict.fromkeys(
             name for value in names if isinstance(value, str)
             if (name := normalize_device_name(value)) and re.fullmatch(r"da[0-9]+", name)
@@ -2226,7 +2268,7 @@ def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, lis
                 continue
             members.append(MultipathMember(
                 device_name=name,
-                controller_label=cam_devices.controllers.get(name.lower()),
+                controller_label=_core_controller_name(cam_devices.controllers.get(name.lower())),
                 state="unknown" if in_use is None else "active" if name == in_use else "standby",
             ))
     return result
