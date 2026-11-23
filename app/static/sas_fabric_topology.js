@@ -181,7 +181,7 @@
     return own(KIND_PLATFORMS, kind).includes(platform);
   }
 
-  // { kind, contract: "core" | "storage" | "unknown", notice }. Only an exact
+  // { kind, contract: "core" | "sas" | "storage" | "unknown", notice }. Only an exact
   // supported kind on a platform that produces it is recognised; an unknown
   // or conflicting one makes no claim about what was or was not collected.
   function fabricContract(fabric) {
@@ -199,7 +199,7 @@
     if (!kindMatchesPlatform(named, platform)) {
       return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" does not match platform "${platform}": ${noClaim}.` };
     }
-    return { kind: named, contract: core ? "core" : "storage", notice: "" };
+    return { kind: named, contract: core ? "core" : named === "linux_ses" && fabric?.raw?.sas_transport_available === true ? "sas" : "storage", notice: "" };
   }
 
   // complete | partial | not_read, or unknown when the payload does not say.
@@ -343,7 +343,7 @@
 
   // ---- tiers and nodes -------------------------------------------------------
 
-  // mode: "core", "storage" or "unknown" (fabricContract).
+  // mode: "core", "sas", "storage" or "unknown" (fabricContract).
   function tierForNode(item, mode) {
     const kind = String(item.kind || "");
     if (kind === "host") return "host";
@@ -394,7 +394,7 @@
     const notRead = new Set(list(metrics.not_read));
     const facts = [];
     if (item.kind === "controller") {
-      if (core) {
+      if (core || mode === "sas") {
         const board = item.raw?.board;
         if (board) facts.push(String(board));
         const phys = decimal(metrics.phy_count);
@@ -517,7 +517,7 @@
       const target = nodeById.get(item.target);
       if (item.kind === "path-bay") pathBayLinks.push(item);
       const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, mode) && !hiddenByDesign(end, mode));
-      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices"))) {
+      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices") || (mode === "sas" && item.kind === "transport-bay" && ["controller", "expander"].includes(source.kind)))) {
         bayLinks.push(item);
         continue;
       }
@@ -604,7 +604,7 @@
       const found = traces.get(item.id);
       const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
-      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
+      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => window.SasFabricTransport?.pathState(fabric, state) || ({
         controller: String(state.controller_label || state.controller || ""),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
@@ -749,12 +749,12 @@
       const enclosures = tierNodes("enclosures");
       const enclosureStatus = countTier(fabric, "enclosures", enclosures.length, { one: "enclosure", many: "enclosures", none: "no enclosures reported (read complete)" });
       tiers.push({ id: "enclosures", label: "Enclosures", ...enclosureStatus, nodeIds: enclosures.map((entry) => entry.id) });
-    } else if (mode === "unknown") {
-      // No contract: draw the rows the payload has, say nothing about the rest.
+    } else if (mode === "unknown" || mode === "sas") {
+      // Draw supplied rows without inventing read completeness.
       const rowOf = (id, label, members) => {
         if (members.length) tiers.push({ id, label, state: "drawn", note: plural(members.length, "item"), nodeIds: members.map((entry) => entry.id) });
       };
-      rowOf("controllers", "Controllers or sources", controllers);
+      rowOf("controllers", mode === "sas" ? "HBAs" : "Controllers or sources", controllers);
       const expanders = tierNodes("expanders");
       const levels = [...new Set(expanders.map((entry) => entry.level))].sort((left, right) => (left ?? Infinity) - (right ?? Infinity));
       for (const level of levels) {

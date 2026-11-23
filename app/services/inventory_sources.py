@@ -48,6 +48,7 @@ from app.services.core_expander_counters import (
     smp_output_calls,
     smp_output_key,
 )
+from app.services.linux_sas_transport_read import SAS_TRANSPORT_COMMAND, SAS_TRANSPORT_KEY
 from app.services.parsers import (
     CORE_ZPOOL_STATUS_BY_DEVICE_OPTIONAL_COMMAND,
     ParsedSSHData,
@@ -168,6 +169,11 @@ SSH_FAILURE_CONTEXTS_BY_COMMAND: dict[str, dict[str, str]] = {
     "nvme list-subsys -o json": {
         "context": "storage_fabric_linux_nvme_subsystems",
         "context_label": "Linux NVMe subsystem detail",
+        "criticality": "enrichment",
+    },
+    SAS_TRANSPORT_KEY: {
+        "context": "storage_fabric_linux_sas_transport",
+        "context_label": "Linux SAS transport sysfs detail",
         "criticality": "enrichment",
     },
     "enclosure sysfs map": {
@@ -892,6 +898,8 @@ class InventorySourceCollectionMixin:
             commands.append(LINUX_NVME_LIST_SUBSYS_COMMAND)
         if "enclosure sysfs map" not in seen_commands:
             commands.append(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
+        if SAS_TRANSPORT_KEY not in seen_commands:
+            commands.append(SAS_TRANSPORT_COMMAND)
         return commands
 
     def _ssh_inventory_enrichment_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:

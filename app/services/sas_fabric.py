@@ -259,6 +259,18 @@ def _build_sas_fabric_context(
 
 def _select_sas_fabric_builder(context: SasFabricBuildContext) -> SasFabricBuilder:
     builder_key = _select_sas_fabric_builder_key(context.system, context.snapshot)
+    if context.system.truenas.platform in {"scale", "linux"} and builder_key != "linux_ses":
+        from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks
+        from app.services.linux_sas_transport_read import SAS_TRANSPORT_KEY
+
+        transport = parse_sas_transport(context.normalized_outputs.get(SAS_TRANSPORT_KEY, ""))
+        selected_blocks = [
+            (slot.device_name or "").removeprefix("/dev/")
+            for slot in context.snapshot.slots
+            if slot.device_name or slot_occupancy(slot) == "present"
+        ]
+        if transport_matches_selected_blocks(transport, selected_blocks):
+            builder_key = "linux_ses"
     try:
         return _SAS_FABRIC_BUILDER_REGISTRY[builder_key]
     except KeyError as exc:
@@ -1008,7 +1020,11 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         if _slot_ses_devices(slot)
     ]
     platform_label = "TrueNAS SCALE" if system.truenas.platform == "scale" else "Linux"
-    if not slots_with_ses:
+    from app.services.linux_sas_transport import parse_sas_transport
+    from app.services.linux_sas_transport_read import SAS_TRANSPORT_KEY
+
+    transport = parse_sas_transport(context.normalized_outputs.get(SAS_TRANSPORT_KEY, ""))
+    if not slots_with_ses and not (transport.complete and transport.of_kind("sas_host")):
         fabric_warnings.append(
             f"No SES enclosure data was found for this {platform_label} system. "
             "Check that SSH works and that sg_ses is installed on the host (see Troubleshooting)."
@@ -1310,6 +1326,19 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             "fabric_kind": "linux_ses",
         }
     ]
+    from app.services.sas_fabric_linux_sas import enrich_linux_sas_fabric
+
+    transport_raw: dict[str, Any] = {}
+    expanders = enrich_linux_sas_fabric(
+        output=context.normalized_outputs.get(SAS_TRANSPORT_KEY, ""), snapshot=snapshot,
+        nodes=nodes, links=links, traces=traces, controllers=controllers,
+        paths=paths, warnings=fabric_warnings, transport_raw=transport_raw,
+    )
+    if expanders is None and not slots_with_ses:
+        fallback = _build_platform_storage_fabric_snapshot(context)
+        fallback.warnings = _dedupe_strings([*fallback.warnings, *fabric_warnings])
+        fallback.raw.update(transport_raw)
+        return fallback
     aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
         nodes=nodes,
@@ -1323,10 +1352,16 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         for node in nodes.values()
         if node.kind == "ses-enclosure"
     ]
-    fabric_warnings.append(
-        f"{platform_label} Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. "
-        "HBA and expander hop detail is not exposed by this Linux SES evidence."
-    )
+    if expanders is None:
+        fabric_warnings.append(
+            f"{platform_label} Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. "
+            "HBA and expander hop detail is not exposed by this Linux SES evidence."
+        )
+    else:
+        fabric_warnings.append(
+            f"{platform_label} Storage Fabric uses read-only Linux SAS transport sysfs and SES slot evidence. "
+            "Unread attributes and unjoined ports remain not read."
+        )
     return _build_sas_fabric_result(
         available=True,
         system=system,
@@ -1335,7 +1370,7 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         links=links,
         traces=traces,
         controllers=controllers,
-        expanders=[],
+        expanders=expanders or [],
         enclosures=enclosures,
         paths=paths,
         aliases=list(aliases_by_id.values()),
@@ -1344,6 +1379,8 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         raw={
             "fabric_domain": "storage_fabric",
             "fabric_kind": "linux_ses",
+            **({"sas_transport_available": True} if expanders is not None else {}),
+            **transport_raw,
             "ses_devices": sorted(ses_slots),
             "selected_bay_slots": selected_slots,
             "selected_disk_slots": selected_disk_slots,

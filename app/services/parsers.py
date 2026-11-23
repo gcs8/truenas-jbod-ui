@@ -3727,6 +3727,9 @@ def canonicalize_ssh_command(command: str) -> str:
     wrappers and reduce the command to the subcommand shape we care about.
     """
 
+    from app.services.linux_sas_transport_read import SAS_TRANSPORT_COMMAND, SAS_TRANSPORT_KEY
+    if command in {SAS_TRANSPORT_COMMAND, SAS_TRANSPORT_KEY}:
+        return SAS_TRANSPORT_KEY
     smp_key = smp_output_key(command)
     if smp_key:
         return smp_key

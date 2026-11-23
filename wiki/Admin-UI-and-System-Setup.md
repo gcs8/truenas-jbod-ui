@@ -213,6 +213,13 @@ For TrueNAS CORE, the permission preview is the same one-line
 after resolving the service account's middleware user id. For Linux-like
 platforms, the preview remains the generated sudoers content.
 
+SCALE/Linux SAS transport enrichment needs no bootstrap or sudo rule. The app
+automatically runs one fixed, bounded `/usr/bin/python3 -I -c` survey of sysfs
+as the read-only SSH account. Do not grant Python sudo access or add it to the
+standing runtime command list. A command gateway must allow only the exact
+fixed survey in `app/services/linux_sas_transport_read.py`. Missing Python,
+unreadable sysfs or a survey limit leaves the existing SES-only map available.
+
 For VMware ESXi, the Admin service now keeps the setup intentionally narrower:
 
 - the recommended saved SSH user stays `root`

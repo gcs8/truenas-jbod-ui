@@ -16,8 +16,22 @@ selection on the main page.
   expanders, MPR and SES enclosures, backplane zones and bays, plus kernel
   error counts per controller and per link. This is the deepest map.
 - **TrueNAS SCALE and other Linux hosts**: SES enclosure devices seen over SSH
-  (`sg_ses`, `lsscsi`), block devices, pools and vdevs. HBA and expander hops
-  are not shown because Linux SES data does not report them. See
+  (`sg_ses`, `lsscsi`), block devices, pools and vdevs. When readable, Linux SAS
+  transport sysfs adds HBA board/firmware, controller and expander PHY rows,
+  link rates, four PHY error counters, cascades and block-identified disk ports.
+  Parent-side port membership and nested child identity report lane counts,
+  source PHY IDs and rates. Remote PHY IDs, lane pairings and cable width stay
+  not read. Missing or unreadable fields remain not read, never zero. The
+  SES-only warning remains without transport data. Unjoined enclosures stay
+  visible without guessed controller membership. Without SES evidence, SAS
+  transport is used only when every selected named disk has a unique reported
+  block binding and a complete path to its SAS host. NVMe-only and mixed or
+  unmatched storage views retain their existing storage routes; an unrelated
+  HBA does not change the selected view. PHY rows are shared through stable
+  port references instead of repeated in every bay. A 32,768-fact aggregate
+  projection budget includes survey fields, links and repeated bay ancestry;
+  overflow keeps the fallback map and reports transport detail as not read.
+  See
   [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] and
   [[Generic Linux Setup|Generic-Linux-Setup]] for the SSH commands involved.
 - **QuantaStor**: HA node, enclosure, pool, vdev and disk from the REST API,
