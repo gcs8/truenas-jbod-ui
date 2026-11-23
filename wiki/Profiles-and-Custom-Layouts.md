@@ -155,8 +155,8 @@ systems:
   - id: offsite-scale
     label: Offsite SCALE
     enclosure_profiles:
-      "5003048001c1043f": supermicro-ssg-6048r-front-24
-      "500304801e977aff": supermicro-ssg-6048r-rear-12
+      "500304800000b1ff": supermicro-ssg-6048r-front-24
+      "500304800000b2ff": supermicro-ssg-6048r-rear-12
 ```
 
 Create a custom profile when no built-in profile matches the bay count,

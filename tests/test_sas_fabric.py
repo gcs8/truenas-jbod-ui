@@ -4037,7 +4037,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 slot_label="00",
                 row_index=0,
                 column_index=0,
-                enclosure_id="5003048001c1043f",
+                enclosure_id="500304800000b1ff",
                 enclosure_label="Front 24 Bay",
                 enclosure_name="Front 24 Bay",
                 present=True,
@@ -4056,11 +4056,11 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 ssh_ses_element_id=0,
                 ssh_ses_targets=[{"ses_device": "/dev/sg26", "ses_element_id": 0}],
                 mapping_source="scale_sg_ses",
-                raw_status={"ses_device": "/dev/sg26", "enclosure_id": "5003048001c1043f", "sas_device_type": "end device"},
+                raw_status={"ses_device": "/dev/sg26", "enclosure_id": "500304800000b1ff", "sas_device_type": "end device"},
                 sg_device="/dev/sg2",
                 scsi_hctl="1:0:1:0",
                 transport_protocol="sas",
-                attached_sas_address="5003048001c1043f",
+                attached_sas_address="500304800000b1ff",
                 phy_identifier="0x0",
                 target_port_protocol="SSP",
                 logical_unit_id="5000cca264d473d4",
@@ -4072,7 +4072,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 slot_label="01",
                 row_index=0,
                 column_index=1,
-                enclosure_id="5003048001c1043f",
+                enclosure_id="500304800000b1ff",
                 enclosure_label="Front 24 Bay",
                 enclosure_name="Front 24 Bay",
                 present=True,
@@ -4094,7 +4094,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
             selected_system_id="offsite-scale",
             selected_system_label="Offsite SCALE",
             selected_system_platform="scale",
-            selected_enclosure_id="5003048001c1043f",
+            selected_enclosure_id="500304800000b1ff",
             selected_enclosure_label="Front 24 Bay",
             selected_enclosure_name="Front 24 Bay",
         )
@@ -4129,7 +4129,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(traces["bay:0"].metrics["vdev_class"], "data")
         self.assertEqual(traces["bay:0"].metrics["path_states"][0]["logical_block_size"], 512)
         self.assertEqual(traces["bay:0"].metrics["path_states"][0]["smart_device_names"], ["sda"])
-        self.assertEqual(nodes["bay:0"].metrics["attached_sas_address"], "5003048001c1043f")
+        self.assertEqual(nodes["bay:0"].metrics["attached_sas_address"], "500304800000b1ff")
         self.assertEqual(nodes["bay:0"].metrics["phy_identifier"], "0x0")
         self.assertEqual(nodes["bay:0"].metrics["logical_unit_id"], "5000cca264d473d4")
         self.assertEqual(nodes["bay:0"].raw["sas_device_type"], "end device")
@@ -4146,14 +4146,14 @@ class SasFabricSnapshotTests(unittest.TestCase):
         slot.sg_device = "/dev/sg2"
         slot.scsi_hctl = "1:0:1:0"
         slot.transport_protocol = "sas"
-        slot.attached_sas_address = "5003048001c1043f"
+        slot.attached_sas_address = "500304800000b1ff"
         slot.phy_identifier = "0x0"
         slot.target_port_protocol = "SSP"
         expected = {
             "sg_device": "/dev/sg2",
             "scsi_hctl": "1:0:1:0",
             "transport_protocol": "sas",
-            "attached_sas_address": "5003048001c1043f",
+            "attached_sas_address": "500304800000b1ff",
             "phy_identifier": "0x0",
             "target_port_protocol": "SSP",
         }
