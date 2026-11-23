@@ -9294,6 +9294,7 @@ class InventoryService(InventorySourceCollectionMixin):
                         ),
                         "serial_hint": disk.serial,
                         "model_hint": disk.model,
+                        "reported_size_bytes": disk.size_bytes,
                         "reported_size": format_bytes(disk.size_bytes),
                         "storcli_physical_drive": disk.raw,
                         "storcli_slot": disk.raw.get("storcli_slot"),
@@ -9758,6 +9759,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,
                 "model_hint": disk.model if disk else None,
+                "reported_size_bytes": disk.size_bytes if disk else None,
                 "reported_size": format_bytes(disk.size_bytes) if disk and disk.size_bytes else None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
@@ -13658,6 +13660,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "value": drive.health,
                 "serial_hint": drive.serial,
                 "model_hint": drive.model,
+                "reported_size_bytes": drive.size_bytes,
                 "reported_size": format_bytes(drive.size_bytes),
                 "identify_active": bool(drive.raw.get("bmc_identify_active")),
                 "bmc_slot_number": drive.raw.get("bmc_slot_number"),
@@ -13710,6 +13713,7 @@ class InventoryService(InventorySourceCollectionMixin):
             raw_slot_status["serial_hint"] = drive.serial
         if not normalize_text(raw_slot_status.get("model_hint")):
             raw_slot_status["model_hint"] = drive.model
+        raw_slot_status["reported_size_bytes"] = drive.size_bytes
         if not normalize_text(raw_slot_status.get("reported_size")):
             raw_slot_status["reported_size"] = format_bytes(drive.size_bytes)
 
@@ -14202,6 +14206,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_hint": device_names[0] if device_names else None,
                 "serial_hint": normalize_text(entry.get("serial")),
                 "model_hint": normalize_text(entry.get("model")),
+                "reported_size_bytes": _read_capacity_bytes(size_value),
                 "reported_size": (
                     format_bytes(size_value)
                     if isinstance(size_value, int)
@@ -15905,6 +15910,8 @@ class InventoryService(InventorySourceCollectionMixin):
         if not serial and identity_mapping:
             serial = identity_mapping.serial
         size_bytes = _read_capacity_bytes(disk.size_bytes if disk else None)
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size_bytes"))
         if size_bytes is None:
             size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size"))
         size_human = format_bytes(size_bytes)

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from app.config import Settings, StorageViewConfig, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot
+from app.models.domain import EnclosureOption, InventorySnapshot
 from app.route_support import templates
 from app.services.parsers import (
     ParsedSSHData,
@@ -21,8 +21,10 @@ from app.services.public_demo_fixture import (
     build_static_demo_request,
     load_public_demo_fixture,
 )
+from app.services.profile_registry import SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID
 from app.services.sas_fabric import _slot_storage_identity
 from app.services.snapshot_export import SnapshotExportService
+from app.services.supermicro_bmc import BMCDriveRecord, BMCInventory
 from tests.inventory_fixtures import build_inventory_service
 
 
@@ -117,6 +119,50 @@ class SlotCapacityTests(unittest.IsolatedAsyncioTestCase):
         slot = self.slot(None)
         self.service._apply_persisted_slot_details([slot], loaded_entries={"synthetic:synthetic-shelf:0": entry})
         self.assertEqual(slot.size_human, "4 TB")
+
+    def test_esxi_bmc_only_disk_preserves_its_structured_capacity(self):
+        self.service.system.truenas.platform = "esxi"
+        self.service.system.default_profile_id = SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID
+        bmc = BMCInventory(drives=[BMCDriveRecord(
+            controller_id=0, physical_index=0, slot_number=2, enclosure_id="252",
+            serial="SANITIZED-BMC-CAPACITY", size_bytes=4_000_000_000_000, health="ONLINE",
+        )])
+        slots, *_ = self.service._correlate_esxi_host(ParsedSSHData(), [], None, bmc)
+        disk = next(slot for slot in slots if slot.present)
+        self.assertEqual(disk.serial, "SANITIZED-BMC-CAPACITY")
+        self.assertEqual(disk.size_bytes, 4_000_000_000_000)
+        self.assertEqual(disk.size_human, format_bytes(disk.size_bytes))
+
+    def test_serial_matched_bmc_capacity_is_not_lost_behind_ses_descriptor(self):
+        drive = self.service._build_disk_records(
+            [{"name": "da0", "serial": "SANITIZED-CAPACITY", "size": 4_000_000_000_000}],
+            ParsedSSHData(), {}, {},
+        )[0]
+        for text in (None, DESCRIPTOR):
+            with self.subTest(text=text):
+                raw = {"reported_size": text, "present": True}
+                self.service._apply_bmc_serial_match_to_raw_slot_status(raw, drive, None)
+                slot = self.service._build_slot_view(
+                    0, 0, 0, {"id": "synthetic-shelf"}, raw,
+                    None, None, ParsedSSHData(), {}, set(),
+                )
+                self.assertEqual(slot.size_bytes, drive.size_bytes)
+                self.assertEqual(slot.size_human, format_bytes(drive.size_bytes))
+
+    def test_linux_vendor_capacity_preserves_the_numeric_producer_reading(self):
+        ssh = ParsedSSHData(ubntstorage_disks=[{
+            "slot": 1, "node": "sda", "size": 4_000_000_000_000, "state": "ONLINE",
+        }])
+        candidates = self.service._build_linux_vendor_slot_candidates(
+            ssh, EnclosureOption(id="synthetic-shelf", label="Synthetic shelf"),
+        )
+        raw = next(iter(candidates.values()))
+        slot = self.service._build_slot_view(
+            0, 0, 0, {"id": "synthetic-shelf"}, raw,
+            None, None, ParsedSSHData(), {}, set(),
+        )
+        self.assertEqual(slot.size_bytes, 4_000_000_000_000)
+        self.assertEqual(slot.size_human, format_bytes(slot.size_bytes))
 
     def test_cached_bytes_regenerate_capacity_instead_of_restoring_descriptor(self):
         entry = self.service._build_slot_detail_entry(self.slot(None), smart_summary=None, loaded_entries={})
