@@ -16,7 +16,7 @@ from app.services.truenas_ws import TrueNASRawData
 from tests.inventory_fixtures import build_inventory_service
 
 
-SHELF = "5000c50000000f01"
+SHELF = f"5000c500{0xF01:08x}"
 RENDER_FIXTURE = Path(__file__).parent / "fixtures" / "sas_fabric" / "core_direct_paths.json"
 
 
