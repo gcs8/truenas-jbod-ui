@@ -262,6 +262,19 @@ def build_fixture() -> dict:
 
 
 class FabricTopologyFixtureTests(unittest.TestCase):
+    def test_thirteen_generality_fabrics_are_current_real_builder_output(self) -> None:
+        from tests.topology_generality_fixtures import fixtures
+
+        actual = fixtures()
+        expected = json.loads(FIXTURE.with_name("topology_generality.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(actual), 13)
+        self.assertEqual(len({item["id"] for item in actual}), 13)
+        self.assertEqual(expected, {"fixtures": actual})
+        for item in actual:
+            if item["transport"]:
+                self.assertTrue(item["fabric"]["raw"]["sas_transport_ports"])
+                self.assertNotIn("sandbox_transport_ports", item["fabric"]["raw"])
+
     def test_fixture_is_current_builder_output(self) -> None:
         self.assertEqual(json.loads(FIXTURE.read_text(encoding="utf-8")), build_fixture())
 
@@ -330,7 +343,10 @@ class FabricTopologyFixtureTests(unittest.TestCase):
 if __name__ == "__main__":
     import sys
 
-    if sys.argv[1:] == ["--write-fixture"]:
+    if sys.argv[1:] == ["--write-generality-fixture"]:
+        from tests.topology_generality_fixtures import fixtures
+        FIXTURE.with_name("topology_generality.json").write_text(json.dumps({"fixtures": fixtures()}, indent=1) + "\n", encoding="utf-8")
+    elif sys.argv[1:] == ["--write-fixture"]:
         FIXTURE.write_text(json.dumps(build_fixture(), indent=1, sort_keys=True) + "\n", encoding="utf-8")
     else:
         unittest.main()

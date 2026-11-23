@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, "../..");
 function topology() {
   const context = vm.createContext({ window: {} });
   vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
-  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_topology.js"), "utf8"), context);
+  vm.runInContext(require("./helpers/fabric_topology").topologySource(), context);
   return context.window.SasFabricTopology;
 }
 function transport() {
@@ -60,7 +60,8 @@ function renderLanes(fabric) {
 
 test("Linux transport records are drawn rather than classified as uncollected", () => {
   const model = topology().buildTopologyModel(syntheticFabric());
-  assert.equal(model.contract, "sas");
+  // Transport uses the approved renderer's SAS evidence contract.
+  assert.equal(model.contract, "core");
   assert.equal(model.nodes.filter((node) => node.kind === "expander").length, 2);
   assert.ok(model.tiers.some((tier) => tier.label === "Expanders, level 2"));
   assert.ok(!model.tiers.some((tier) => tier.state === "not_collected"));
@@ -126,7 +127,7 @@ test("parent-side lane sets show the remote PHYs as unknown", () => {
   const cascade = model.links.find((link) => link.kind === "expander-expander");
   assert.equal(cascade.lanes.sourcePhys.join(","), "2,3");
   assert.equal(cascade.lanes.targetPhys.length, 0);
-  assert.ok(cascade.labelLines.some((line) => line.includes("?")));
+  assert.ok(cascade.labelLines.some((line) => line.includes("far end not read")));
 });
 
 test("SES-only payloads retain the existing not-collected explanation", () => {
@@ -169,7 +170,9 @@ test("referenced transport PHY rows resolve in topology, Disk Path and Storage L
   const resolved = resolve(fabric, fabric.traces[0].metrics.path_states[0]);
   assert.equal(resolved.phys[0].invalid_dword_count, 9);
   const model = api.buildTopologyModel(fabric);
-  assert.equal(model.bays[0].pathStates[0].transportPhyCount, 1);
+  // The approved model keeps resolved PHY detail on the independently pinnable port.
+  assert.equal(model.bays[0].ports.length, 1);
+  assert.equal(model.bays[0].ports[0].phy.counters.invalid_dword_count, 9);
   const ui = transportRenderers(fabric);
   const trace = fabric.traces[0];
   const seed = ui.branchSeedsForDiskTrace(trace, fabric)[0];

@@ -98,7 +98,8 @@ test("disks without a physical location are never called bays or numbered as bay
   assert.deepEqual([...T.searchTopology(model, "Disk 2").matches].map((item) => item.label), ["Disk 2"]);
   // Control: the CORE producer's bays have a location and keep bay wording.
   const core = T.renderTopology(T.buildTopologyModel(cases.core_cascade.fabric), {});
-  assert.match(core, /Bays 00–03 · 4 bays/);
+  assert.match(core, /Bays 00–03/);
+  assert.ok(T.buildTopologyModel(cases.core_cascade.fabric).groups.every((group) => group.bays.length === 4));
   assert.deepEqual(cellsOf(core).get("bay:3").text, ["03"]);
 });
 
@@ -278,14 +279,14 @@ test("a pinned bay bundle fills the inspector with its source enclosure, bay cou
   const calls = [];
   T.attach(dom.container, dom.search, dom.status, { clearSelection: () => calls.push("clear"), requestRender: () => calls.push("render") });
   const model = T.buildTopologyModel(cases.core_cascade.fabric);
-  const bundle = [...model.links].find((item) => item.bundle && item.source === "mpr-enclosure:controller:mpr1:0003");
+  const bundle = [...model.links].find((item) => item.bundle && item.target === `group:enclosure:${H.sasAddress(0xf02)}` && item.id.startsWith("bundle:mpr-enclosure:controller:mpr1:0003->"));
   T.render(cases.core_cascade.fabric, {});
   dom.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
   assert.ok(calls.includes("render"), "the page redraws its inspector");
   const detail = T.inspectorDetail();
   assert.ok(detail, "the inspector gets the bundle's facts");
-  assert.match(detail.title, /bay bundle/i);
-  assert.match(detail.html, /Source enclosure/);
+  assert.match(detail.title, /enclosure path/i);
+  assert.match(detail.html, /Enclosure/);
   assert.ok(detail.html.includes(H.sasAddress(0xf02)), "the source enclosure is named");
   assert.match(detail.html, /4 bays/);
   assert.match(detail.html, /Bay 04, Bay 05, Bay 06, Bay 07/);
@@ -294,7 +295,7 @@ test("a pinned bay bundle fills the inspector with its source enclosure, bay cou
   dom.handlers.get("click")({ target: dom.element({ topoLink: cascade.id }) });
   assert.match(T.inspectorDetail().html, /x4 · 12 Gb\/s/);
   dom.handlers.get("click")({ target: dom.element({ topoBay: "bay:1" }) });
-  assert.equal(T.inspectorDetail(), null);
+  assert.equal(T.inspectorDetail()?.withPage, true);
 });
 
 // ---- every input record is accounted for ------------------------------
@@ -436,13 +437,13 @@ test("the page's inspector shows a pinned bundle's facts, and Topology selects n
   const model = T.buildTopologyModel(fabric);
   const bundle = [...model.links].find((item) => item.bundle);
   dom.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
-  assert.match(elements.get("fabric-inspector-title").textContent, /bay bundle/i);
-  assert.match(elements.get("fabric-inspector-body").innerHTML, /Bays it carries/);
+  assert.match(elements.get("fabric-inspector-title").textContent, /enclosure path/i);
+  assert.match(elements.get("fabric-inspector-body").innerHTML, /Bays/);
   // A bay the page selects is the drawing's pin; the inventory reaches the search.
   assert.ok(api.setSelectionRef({ kind: "trace", id: "bay:6" }));
   api.renderMap();
   assert.match(elements.get("fabric-map-panel").innerHTML, /data-topology-pin>Pinned: Bay 06/);
-  assert.equal(T.inspectorDetail(), null);
+  assert.equal(T.inspectorDetail()?.withPage, true);
   assert.deepEqual([...T.searchTopology(T.buildTopologyModel(fabric, { inventory: snapshot }), "SANITIZED-TOPO-6").matches].map((item) => item.id), ["bay:6"]);
   // Esc clears the pin and asks the page to clear its selection.
   dom.documentHandlers.find((item) => item.name === "keydown").handler({ key: "Escape", target: { closest: () => null } });
@@ -911,10 +912,11 @@ test("a bay group where only some labels carry a number says how many are number
   assert.deepEqual(heading(model), ["4 bays, 1 numbered: 04"]);
   const html = T.renderTopology(model, {});
   assert.doesNotMatch(html, /Bays 04–04/);
-  assert.match(html, /aria-label="4 bays, 1 numbered: 04 linux-ses: 4 mapped, 4 bays, 1 numbered: 04"/);
+  assert.match(html, /aria-label="4 bays, 1 numbered: 04 linux-ses: 4 mapped"/);
   // Every bay numbered: the range, as before.
   const full = T.buildTopologyModel(cases.core_cascade.fabric, { inventory: cases.core_cascade.snapshot });
-  for (const text of heading(full)) assert.match(text, /^Bays \d+–\d+ · \d+ bays$/, text);
+  for (const text of heading(full)) assert.match(text, /Bays \d+–\d+/, text);
+  assert.ok(full.groups.every((group) => group.bays.length === 4));
 });
 
 // ---- titles stay distinct after every generated suffix ---------------------------
@@ -941,35 +943,22 @@ test("no two boxes with different ids show the same title, also where a generate
     fabric.links.push(H.link(hba.id, item.id, "controller-enclosure"));
   }
   distinct("three boxes", T.buildTopologyModel(fabric));
-  // The real cascade: both mpr0 enclosure views and the first mpr1 view
-  // carry aliases, the last one equal to what the passes generate.
+  // The approved design merges controller observations into physical objects.
+  // Conflicting legacy labels must not make canonical names depend on row order.
   const cascade = JSON.parse(JSON.stringify(cases.core_cascade.fabric));
   for (const item of cascade.nodes) {
-    if (item.id.startsWith("mpr-enclosure:controller:mpr0:")) item.alias = "X";
-    if (item.id === "mpr-enclosure:controller:mpr1:0002") item.alias = "X via mpr0 (mpr-enclosure:controller:mpr0:0002)";
+    if (item.kind === "mpr-enclosure") item.alias = item.controller_id === "controller:mpr0" ? "X" : "Legacy other label";
   }
-  distinct("real cascade with aliases", T.buildTopologyModel(cascade));
-  // A fourth view already carries the number a generated title would get:
-  // the payload's titles are kept as they are, the generated one takes the
-  // next free number, and the order of the payload's nodes changes nothing.
-  const numbered = JSON.parse(JSON.stringify(cascade));
-  const real = "X via mpr0 (mpr-enclosure:controller:mpr0:0002) #2";
-  numbered.nodes.find((item) => item.id === "mpr-enclosure:controller:mpr1:0003").alias = real;
-  const titles = (fabric) => Object.fromEntries([...T.buildTopologyModel(fabric).nodes].filter((item) => item.tier === "enclosures").map((item) => [item.id, item.label]));
-  const forward = titles(numbered);
-  const reversed = JSON.parse(JSON.stringify(numbered));
+  const titles = (fabric) => Object.fromEntries([...T.buildTopologyModel(fabric).nodes]
+    .filter((item) => item.tier === "enclosures").map((item) => [item.id, item.label]));
+  const forward = titles(cascade);
+  const reversed = JSON.parse(JSON.stringify(cascade));
   reversed.nodes.reverse();
   assert.deepEqual(titles(reversed), forward, "the same nodes in reversed order give the same titles");
-  assert.equal(forward["mpr-enclosure:controller:mpr1:0003"], real, "a title from the payload is kept");
-  assert.equal(forward["mpr-enclosure:controller:mpr1:0002"], "X via mpr0 (mpr-enclosure:controller:mpr0:0002)", "a title from the payload is kept");
-  assert.equal(forward["mpr-enclosure:controller:mpr0:0002"], "X via mpr0 (mpr-enclosure:controller:mpr0:0002) #3", "the generated title takes the next free number");
-  assert.ok(Object.values(forward).every((title) => !/#\d+ #\d+$/.test(title)), Object.values(forward).join(" | "));
-  distinct("real numbered alias", T.buildTopologyModel(numbered));
-  distinct("real numbered alias, reversed", T.buildTopologyModel(reversed));
-  // Without the payload's numbered title, the reversed cascade numbers the same box too.
-  const plain = JSON.parse(JSON.stringify(cascade));
-  plain.nodes.reverse();
-  assert.deepEqual(titles(plain), titles(cascade));
+  assert.deepEqual(Object.keys(forward).sort(), [0xf01, 0xf02].map((tag) => `enclosure:${H.sasAddress(tag)}`));
+  assert.equal(new Set(Object.values(forward)).size, 2);
+  distinct("physical alias collision", T.buildTopologyModel(cascade));
+  distinct("physical alias collision, reversed", T.buildTopologyModel(reversed));
 });
 
 // Two pairs of boxes whose generated titles equal each other: each title is

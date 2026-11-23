@@ -1,82 +1,172 @@
-// Storage Fabric "Topology" mode (#937): a wiring diagram of the SAS fabric
-// from the host down to the bays, drawn only from the /api/sas-fabric payload
-// the page already has. Two parts:
-//
-//   - a pure layout model (buildTopologyModel, tracePath, searchTopology,
-//     renderTopology): payload in, tiers, nodes, link routes, labels and an
-//     SVG string out, no DOM. tests/js/fabric_topology_*.test.js load it in
-//     Node the same way the other fabric tests load sas_fabric_view.js;
-//   - a small DOM layer (render, mount, attach, release) that
-//     sas_fabric_view.js calls to draw the mode and to trace a path on hover,
-//     focus, click, search and Esc.
-//
-// Rules: one drawn line per payload link between drawn nodes; links into bays
-// are drawn as one bundle per enclosure and bay group, labelled with the count
-// of payload links it carries. No node, link, lane count, PHY number or rate is
-// ever invented. A tier the payload does not carry says "not read" or "not
-// collected", never an empty tier that looks healthy. Every input record is
-// either drawn or named in a notice. A large bay group is collapsed into a
-// summary block that expands; no bay is ever dropped. A disk whose physical
-// location the producer does not know is never drawn as a bay.
+/* Storage Fabric Topology: payload model and evidence. */
 (function () {
-  "use strict";
+  const context = {};
+"use strict";
 
-  const NOT_COLLECTED = "HBA and expander hops are not collected on this platform.";
-  const NOT_SHOWN = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
+const NOT_COLLECTED = "HBA and expander hops are not collected on this platform.";
+
+const NOT_SHOWN = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
     + "Backplane zones, the CORE multipath groupings (shown instead as path marks on each bay) "
     + "and PHY error counters (Disk Path) are not drawn either.";
-  const NOT_SHOWN_STORAGE = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
+
+const NOT_SHOWN_COUNTERS = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
+    + "The equal slot ranges the payload calls backplane zones are not drawn: they are not boards. "
+    + "The CORE multipath groupings are shown as the port marks on each bay. "
+    + "PHY error counters are in each hover card and in the inspector; Disk Path shows them too.";
+
+const NOT_SHOWN_STORAGE = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
     + "Backplane zones are not drawn either.";
-  const LOCATION_UNKNOWN = "physical location unavailable";
-  // A bay group larger than this is drawn as a summary block until expanded.
-  const BAY_DETAIL_LIMIT = 96;
-  const CELLS_PER_ROW = 24;
-  // A bay cell is a CELL_BOX square on a CELL pitch; its path marks are
-  // MARK px wide on a MARK_PITCH.
-  const CELL = 34;
-  const CELL_BOX = 32;
-  const MARK = 8;
-  const MARK_PITCH = 9;
-  const NODE_W = 184;
-  const NODE_H = 62;
-  // Text is sized at 8 px a character (12-13 px type), 16 px a line; a box
-  // grows to 37 characters and then wraps rather than cutting a fact off.
-  const TEXT_W = 8;
-  const LINE_H = 16;
-  const NODE_MIN_CHARS = 21;
-  const NODE_MAX_CHARS = 37;
-  const TIER_LABEL_CHARS = 16;
-  const TIER_NOTE_CHARS = 20;
-  const BAND_CHARS = 30;
-  const H_GAP = 48;
-  const LEFT = 168;
-  const MARGIN = 16;
-  const CHAR_W = 7;
-  const SUMMARY_W = 300;
-  // An expandable bay group's control row: a 22 px control and its gap.
-  const TOGGLE_H = 26;
-  // The scroll box's border on each side (sas_fabric_topology.css).
-  const SCROLL_BORDER = 1;
-  // Gaps between rows: a 10 px track per link, then its label, 8 px clear of
-  // the tracks above and of the box below.
-  const TRACK = 10;
-  const GAP_PAD = 10;
-  const LABEL_GAP = 8;
-  const LABEL_CLEAR = 8;
-  const JUNCTION = 14;
-  const NAME_LIMIT = 4;
-  // Above this many lines (links that are not bay bundles) the layout skips
-  // its polish steps; see layoutModel. Real systems stay far below it.
-  const SIMPLIFY_ABOVE = 512;
-  const LANE_LINKS = new Set(["controller-expander", "expander-expander"]);
-  const HIDDEN_KINDS = new Set(["pool", "vdev", "backplane"]);
-  const MEMBER_HEALTH = "member-health-not-transport";
-  const CACHE_FRESH = new Set(["hit", "hit-after-wait", "miss", "forced-refresh"]);
-  // Path states as the producers emit them: sas_fabric.py normalize_path_state
-  // (active, passive, fail, missing, unknown), the Linux SES builder (mapped,
-  // unmapped) and the platform builders (present, mixed, or a member health
-  // word, marked by state_basis).
-  const PATH_STATE_TONES = {
+
+const NOT_SHOWN_SHARED = "Pools and vdevs are not drawn here; Impact Map and Disk Path show them. "
+    + "The equal slot ranges the payload calls backplane zones are not drawn: they are not boards. "
+    + "Both head ends are drawn on the one backplane they share, whichever of them this page is on.";
+
+const LOCATION_UNKNOWN = "physical location unavailable";
+
+const BAY_DETAIL_LIMIT = 96;
+
+const CELLS_PER_ROW = 24;
+
+const CELL = 34;
+
+const CELL_BOX = 32;
+
+const MARK = 8;
+
+const MARK_PITCH = 9;
+
+const NODE_W = 184;
+
+const NODE_H = 62;
+
+const TEXT_W = 8;
+
+const LINE_H = 16;
+
+const NODE_MIN_CHARS = 21;
+
+const NODE_MAX_CHARS = 37;
+
+const TIER_LABEL_CHARS = 16;
+
+const TIER_NOTE_CHARS = 20;
+
+const BAND_CHARS = 30;
+
+const H_GAP = 48;
+
+const LEFT = 168;
+
+const MARGIN = 16;
+
+const CHAR_W = 7;
+
+const SUMMARY_W = 300;
+
+const PHYS_CELL_W = 40;
+
+const PHYS_CELL_H = 40;
+
+const PHYS_CELL_MAX = 64;
+
+const PHYS_CELL_MIN = 36;
+
+const PHYS_CELL_NAMED = 60;
+
+const PHYS_CELL_TALL = 54;
+
+const PHYS_GAP = 2;
+
+const GROUP_GAP = 10;
+
+const STACK_GAP = 6;
+
+const CAPTION_H = 20;
+
+const RAIL_CLEAR = 12;
+
+const RAIL_STEP = 16;
+
+const STACK_ROOM = 138;
+
+const DOWN_STEP = 10;
+
+const BUS_STEP = 6;
+
+const BUS_PAD = 7;
+
+const CHIP_GAP = 24;
+
+const LEFT_BOARD = 140;
+
+const BOARD_ROOM = 158;
+
+const PHY_COUNTERS = [
+    ["invalid_dword_count", "invalid dword"],
+    ["running_disparity_error_count", "running disparity"],
+    ["loss_of_dword_synchronization_count", "loss of dword sync"],
+    ["phy_reset_problem_count", "PHY reset problem"],
+  ];
+
+const NOT_READ = "not read";
+
+const PROVISIONAL_PHY_THRESHOLDS = {
+    invalid_dword_count: { warning: 1, critical: 100 },
+    running_disparity_error_count: { warning: 1, critical: 100 },
+    loss_of_dword_synchronization_count: { warning: 1, critical: 10 },
+    phy_reset_problem_count: { warning: 1, critical: 10 },
+  };
+
+const THRESHOLD_NOTE = `Provisional thresholds, per PHY: ${PHY_COUNTERS.map(([key, label]) => `${label} warning from ${PROVISIONAL_PHY_THRESHOLDS[key].warning}, critical from ${PROVISIONAL_PHY_THRESHOLDS[key].critical}`).join("; ")}.`;
+
+const TREND_NOTE = "Trend: not read (one reading). A count rising between readings would be critical.";
+
+const TIER_WORDS = { critical: "Critical", warning: "Warning" };
+
+function worse(...tiers) {
+    return tiers.includes("critical") ? "critical" : tiers.includes("warning") ? "warning" : "";
+  }
+
+function phyTier(row) {
+    if (!row || !row.counters) return "";
+    return worse(...PHY_COUNTERS.map(([key]) => {
+      const count = row.counters[key];
+      const limit = PROVISIONAL_PHY_THRESHOLDS[key];
+      return count === null || count < limit.warning ? "" : count >= limit.critical ? "critical" : "warning";
+    }));
+  }
+
+const TOGGLE_H = 26;
+
+const SCROLL_BORDER = 1;
+
+const TRACK = 10;
+
+const GAP_PAD = 10;
+
+const LABEL_GAP = 8;
+
+const LABEL_CLEAR = 8;
+
+const JUNCTION = 14;
+
+const NAME_LIMIT = 4;
+
+const SIMPLIFY_ABOVE = 512;
+
+const STUB_GROUP_ABOVE = 3;
+
+const LANE_LINKS = new Set(["controller-expander", "expander-expander"]);
+
+const HIDDEN_KINDS = new Set(["pool", "vdev", "backplane"]);
+
+const MEMBER_HEALTH = "member-health-not-transport";
+
+const CACHE_FRESH = new Set(["hit", "hit-after-wait", "miss", "forced-refresh"]);
+
+const STATE_UNREAD = "present, state not read";
+
+const PATH_STATE_TONES = {
     active: "active",
     online: "active",
     optimal: "active",
@@ -87,12 +177,14 @@
     fault: "fault",
     missing: "missing",
     unknown: "unknown",
+    [STATE_UNREAD]: "unknown",
     mapped: "mapped",
     unmapped: "unmapped",
     present: "member",
     mixed: "member",
   };
-  const PATH_CAPTIONS = {
+
+const PATH_CAPTIONS = {
     block: "block device",
     nvme: "NVMe device",
     mdadm: "mdadm member",
@@ -104,21 +196,19 @@
     "quantastor-ha": "Quantastor HA path",
   };
 
-  function list(value) {
+function list(value) {
     return Array.isArray(value) ? value : [];
   }
 
-  function isRecord(value) {
+function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
-  // A table keyed by text from the payload answers for its own keys only, so
-  // a word such as "__proto__" or "constructor" is just an unknown word.
-  function own(table, key) {
+function own(table, key) {
     return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
   }
 
-  function escapeHtml(value) {
+function escapeHtml(value) {
     return String(value ?? "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
@@ -127,44 +217,39 @@
       .replace(/'/g, "&#39;");
   }
 
-  function token(value) {
+function token(value) {
     return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
   }
 
-  function finite(value) {
+function finite(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
-  // The producer sends SAS levels and PHY counts as decimal strings
-  // (sas_fabric_parsers.parse_mpr_expanders) and some counts as integers.
-  // Only plain digits, bounded, are a reading; anything else stays unknown.
-  function decimal(value) {
+function decimal(value) {
     if (typeof value === "number") {
       return Number.isSafeInteger(value) && value >= 0 ? value : null;
     }
     return typeof value === "string" && /^[0-9]{1,9}$/.test(value) ? Number(value) : null;
   }
 
-  function naturalCompare(left, right) {
+function naturalCompare(left, right) {
     return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true, sensitivity: "base" });
   }
 
-  function plural(count, one, many = `${one}s`) {
+function plural(count, one, many = `${one}s`) {
     return `${count} ${count === 1 ? one : many}`;
   }
 
-  function named(values) {
+function named(values) {
     const shown = values.slice(0, NAME_LIMIT).join(", ");
     return values.length > NAME_LIMIT ? `${shown} and ${values.length - NAME_LIMIT} more` : shown;
   }
 
-  // The fabric kinds the producers emit, with the platforms that emit each
-  // (sas_fabric.py: _select_sas_fabric_builder_key and _storage_fabric_kind).
-  // The real CORE builder names no kind and says platform "core"; the
-  // synthetic demo names core_mpr. storage_generic is the builder's fallback
-  // for a platform it does not name.
-  const NAMED_PLATFORMS = new Set(["core", "scale", "linux", "quantastor", "esxi", "ipmi"]);
-  const KIND_PLATFORMS = {
+const PLATFORM_WORDS = { quantastor: "QuantaStor", scale: "TrueNAS SCALE", core: "TrueNAS CORE", linux: "Linux", esxi: "ESXi" };
+
+const NAMED_PLATFORMS = new Set(["core", "scale", "linux", "quantastor", "esxi", "ipmi"]);
+
+const KIND_PLATFORMS = {
     core_mpr: ["core"],
     linux_ses: ["scale", "linux"],
     storage_scale: ["scale"],
@@ -173,18 +258,16 @@
     storage_esxi: ["esxi"],
     storage_bmc: ["ipmi"],
   };
-  const GENERIC_KIND = "storage_generic";
 
-  function kindMatchesPlatform(kind, platform) {
+const GENERIC_KIND = "storage_generic";
+
+function kindMatchesPlatform(kind, platform) {
     if (!platform) return true;
     if (kind === GENERIC_KIND) return !NAMED_PLATFORMS.has(platform);
     return own(KIND_PLATFORMS, kind).includes(platform);
   }
 
-  // { kind, contract: "core" | "sas" | "storage" | "unknown", notice }. Only an exact
-  // supported kind on a platform that produces it is recognised; an unknown
-  // or conflicting one makes no claim about what was or was not collected.
-  function fabricContract(fabric) {
+function fabricContract(fabric) {
     const named = typeof fabric?.raw?.fabric_kind === "string" ? fabric.raw.fabric_kind : "";
     const platform = typeof fabric?.platform === "string" ? fabric.platform : "";
     const noClaim = "it draws the records the payload carries except pools, vdevs and backplane zones, which this view does not draw, and makes no claim about what was or was not collected";
@@ -199,11 +282,10 @@
     if (!kindMatchesPlatform(named, platform)) {
       return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" does not match platform "${platform}": ${noClaim}.` };
     }
-    return { kind: named, contract: core ? "core" : named === "linux_ses" && fabric?.raw?.sas_transport_available === true ? "sas" : "storage", notice: "" };
+    return { kind: named, contract: core ? "core" : "storage", notice: "" };
   }
 
-  // complete | partial | not_read, or unknown when the payload does not say.
-  function readState(fabric, domain) {
+function readState(fabric, domain) {
     const counts = fabric?.raw?.controller_read?.counts;
     if (!isRecord(counts) || counts[domain] === undefined || counts[domain] === null) {
       return "unknown";
@@ -212,8 +294,13 @@
     return value === "complete" || value === "partial" ? value : "not_read";
   }
 
-  // "1, 2, 3, 7" -> "1–3, 7". Only the numbers given; nothing is filled in.
-  function phyRanges(values) {
+function farEnd(lanes) {
+    if (!lanes.targetPhys.length) return lanes.basis === "sysfs_parent_port_membership" ? "↔ far end not read" : "↔ PHY ?";
+    if (!lanes.targetBasis) return `↔ PHY ${phyRanges(lanes.targetPhys)}`;
+    return `↔ PHY ${phyRanges(lanes.targetPhys)}${lanes.targetBasis === "inferred" ? " inferred" : ""}`;
+  }
+
+function phyRanges(values) {
     const numbers = list(values).filter((value) => Number.isInteger(value));
     const ranges = [];
     let start = null;
@@ -235,35 +322,38 @@
     return ranges.join(", ");
   }
 
-  function formatRate(rate) {
+function laneRate(lanes) {
+    if (lanes.rate !== null) return formatRate(lanes.rate);
+    const rates = lanes.rows.map((lane) => lane.rate);
+    if (!rates.length || rates.length !== lanes.count || rates.some((rate) => rate === null)) return formatRate(null);
+    const [low, high] = [Math.min(...rates), Math.max(...rates)];
+    return low === high ? formatRate(low) : `${low}–${high} Gb/s`;
+  }
+
+function formatRate(rate) {
     return rate === null ? "rate not reported" : `${Number(rate)} Gb/s`;
   }
 
-  function nodeLabel(item) {
+function nodeLabel(item) {
     return String(item?.alias || item?.display_label || item?.label || item?.id || "");
   }
 
-  function clip(text, width) {
+function clip(text, width) {
     const value = String(text ?? "");
     const max = Math.max(4, Math.floor((width - 16) / CHAR_W));
     return value.length > max ? `${value.slice(0, max - 1)}…` : value;
   }
 
-  // ---- reading the payload ---------------------------------------------------
-
-  // The fabric bay metric `present` is true, false or "unknown" (#1218); any
-  // other value is unknown too. The model keeps its own tri-state.
-  function bayOccupancy(metrics) {
+function bayOccupancy(metrics) {
     const value = isRecord(metrics) ? metrics.present : undefined;
     return value === true ? "yes" : value === false ? "no" : "unknown";
   }
 
-  function locationKnown(...sources) {
+function locationKnown(...sources) {
     return !sources.some((item) => isRecord(item) && (item.physical_location_known === false || item.virtual_enclosure === true));
   }
 
-  // Collections and members the view can read; what it cannot is named.
-  function readPayload(fabric) {
+function readPayload(fabric) {
     const problems = [];
     if (!isRecord(fabric)) {
       problems.push("the fabric payload is not an object");
@@ -287,9 +377,7 @@
     return { nodes: nodes.items, links: links.items, traces: traces.items, problems, nodesReadable: nodes.readable };
   }
 
-  // The inventory snapshot the page holds, when it belongs to the same system
-  // and enclosure as the fabric payload: serials and disk identities by slot.
-  function inventoryBySlot(fabric, inventory) {
+function inventoryBySlot(fabric, inventory) {
     const slots = new Map();
     if (!isRecord(inventory) || !isRecord(fabric)) return slots;
     const differs = (left, right) => Boolean(left && right && left !== right);
@@ -302,7 +390,7 @@
     return slots;
   }
 
-  function searchTerms(item, trace, slot) {
+function searchTerms(item, trace, slot) {
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const raw = isRecord(item.raw) ? item.raw : {};
     const traced = isRecord(trace?.metrics) ? trace.metrics : {};
@@ -318,9 +406,7 @@
     return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
   }
 
-  // A disk's own identities: serials, SAS addresses and logical unit ids, as
-  // an all-digit query matches them.
-  function identityTerms(item, trace, slot) {
+function identityTerms(item, trace, slot) {
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const raw = isRecord(item.raw) ? item.raw : {};
     const values = [
@@ -331,22 +417,186 @@
     return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
   }
 
-  // The bay number the producer labelled a bay with ("Bay 01" for slot 0
-  // where the chassis counts from 1): plain ASCII digits only, never the
-  // internal index. "" when no supported number can be read.
-  function bayNumberOf(label, inventoryLabel) {
+function bayNumberOf(label, inventoryLabel) {
     const labelled = /^Bay\s+([0-9]+)$/.exec(String(label || ""));
     if (labelled) return labelled[1];
     const fallback = String(inventoryLabel ?? "");
     return /^[0-9]+$/.test(fallback) ? fallback : "";
   }
 
-  // ---- tiers and nodes -------------------------------------------------------
+function sasRate(value) {
+    if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : null;
+    return typeof value === "string" && /^[0-9]{1,3}(\.[0-9]{1,2})?$/.test(value) && Number(value) > 0 ? Number(value) : null;
+  }
 
-  // mode: "core", "sas", "storage" or "unknown" (fabricContract).
-  function tierForNode(item, mode) {
+function text(value) {
+    return typeof value === "string" ? value : "";
+  }
+
+function sasAddressOf(value) {
+    const found = text(value).trim().toLowerCase().replace(/^0x/, "");
+    return /^[0-9a-f]{8,32}$/.test(found) && !/^0+$/.test(found) ? found : "";
+  }
+
+let tailDigits = 4;
+
+function tail(address) {
+    return `…${String(address).slice(-tailDigits)}`;
+  }
+
+function addressTail(fabric) {
+    const all = new Set();
+    for (const item of list(fabric?.nodes)) {
+      if (!isRecord(item)) continue;
+      if (item.kind === "expander") all.add(sasAddressOf(item.raw_id) || sasAddressOf(item.raw?.sas_address));
+      if (item.kind === "controller") all.add(sasAddressOf(item.raw?.sas_address));
+    }
+    all.delete("");
+    let digits = 4;
+    while (digits < 16 && new Set([...all].map((address) => address.slice(-digits))).size < all.size) digits += 1;
+    return digits;
+  }
+
+function protocolOf(...words) {
+    for (const word of words) {
+      const value = text(word).toUpperCase();
+      if (/\bSATA\b|\bSTP\b/.test(value)) return "SATA";
+      if (/\bSAS\b|\bSSP\b/.test(value)) return "SAS";
+    }
+    return "";
+  }
+
+function phyFacts(row) {
+    const measured = row.counter_state === "measured";
+    const counters = {};
+    for (const [key] of PHY_COUNTERS) {
+      const value = row[key];
+      counters[key] = measured && Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+    return {
+      phy: decimal(row.phy),
+      remote: decimal(row.remote_phy),
+      handle: text(row.dev_handle),
+      device: text(row.device),
+      rate: sasRate(row.speed),
+      min: sasRate(row.min),
+      max: sasRate(row.max),
+      counters,
+      counterState: text(row.counter_state) || NOT_READ,
+      counterReason: text(row.counter_reason),
+      errors: Object.values(counters).reduce((sum, value) => sum + (value || 0), 0),
+      measured: Object.values(counters).every((value) => value !== null),
+    };
+  }
+
+function sasIndex(fabric) {
+    const expanders = new Map();
+    const controllers = new Map();
+    for (const item of list(fabric?.expanders)) {
+      if (!isRecord(item) || typeof item.id !== "string" || expanders.has(item.id)) continue;
+      const phys = list(item.phys).filter(isRecord).map(phyFacts).filter((row) => row.phy !== null);
+      const log = isRecord(item.phy_error_counters) ? item.phy_error_counters : null;
+      expanders.set(item.id, {
+        id: item.id,
+        address: text(item.sas_address),
+        handle: text(item.dev_handle),
+        product: text(item.product),
+        reportedLevel: text(item.reported_level),
+        enclosureAddress: text(item.enclosure_sas_address),
+        phys,
+        byPhy: new Map(phys.map((row) => [row.phy, row])),
+        total: decimal(item.num_phys),
+        linked: decimal(item.linked_phys),
+        attached: isRecord(item.device_counts) ? Object.entries(item.device_counts).filter(([, count]) => Number.isSafeInteger(count) && count >= 0) : [],
+        log: log ? {
+          state: text(log.state),
+          reason: text(log.reason) || text(log.message),
+          source: text(log.source),
+          readAt: text(log.read_at),
+          measured: decimal(log.measured_phys),
+          withErrors: decimal(log.phys_with_errors),
+        } : null,
+      });
+    }
+    for (const item of list(fabric?.controllers)) {
+      if (!isRecord(item) || typeof item.id !== "string" || controllers.has(item.id)) continue;
+      controllers.set(item.id, {
+        id: item.id,
+        board: text(item.board),
+        chip: text(item.chip),
+        firmware: text(item.firmware),
+        temperature: text(item.temperature),
+        slot: text(item.pcie_slot),
+        pci: text(item.pci_address),
+        pathCounts: isRecord(item.path_counts) ? Object.entries(item.path_counts).filter(([, count]) => Number.isSafeInteger(count) && count >= 0) : [],
+        sasAddress: text(item.sas_address),
+        // An HBA's PHY rows carry error counters only where the source reads them.
+        phys: list(item.phy_rows).filter(isRecord).map((row) => ({
+          ...(row.counter_state ? phyFacts(row) : { counters: null, measured: false, errors: 0 }),
+          phy: decimal(row.phy),
+          handle: text(row.device_handle),
+          device: text(row.device),
+          disabled: row.disabled === "Y",
+          rate: sasRate(row.speed),
+          min: sasRate(row.min),
+          max: sasRate(row.max),
+        })).filter((row) => row.phy !== null),
+      });
+    }
+    return { expanders, controllers };
+  }
+
+function joinPort(sas, device) {
+    const ids = list(device.expander_ids).filter((id) => typeof id === "string");
+    const found = ids.map((id) => sas.expanders.get(id)).filter(Boolean);
+    const parent = text(device.parent);
+    const expander = found.find((item) => parent && item.handle === parent) || (found.length === 1 && !parent ? found[0] : null);
+    // A source without handles names the expander PHY itself.
+    if (expander && Number.isInteger(device.expander_phy)) {
+      const row = expander.byPhy.get(device.expander_phy);
+      return row ? { expanderId: expander.id, phy: row, why: "", basis: text(device.phy_basis) } : { expanderId: expander.id, phy: null, why: "the expander's PHY table has no row for the PHY this port names" };
+    }
+    if (expander && device.expander_phy === null && !text(device.handle)) return { expanderId: expander.id, phy: null, why: "the source does not say which expander PHY this port is on" };
+    if (!expander) return { expanderId: ids.length === 1 ? ids[0] : "", phy: null, why: "the payload has no PHY table for the port's expander" };
+    const handle = text(device.handle);
+    const rows = handle ? expander.phys.filter((row) => row.handle === handle) : [];
+    if (rows.length !== 1) return { expanderId: expander.id, phy: null, why: rows.length ? "more than one expander PHY reports this device handle" : "no expander PHY reports this device handle" };
+    return { expanderId: expander.id, phy: rows[0], why: "" };
+  }
+
+function rateText(rate) {
+    return rate === null ? `rate ${NOT_READ}` : `${rate} Gb/s`;
+  }
+
+function counterText(row) {
+    return PHY_COUNTERS.filter(([key]) => row.counters[key]).map(([key, label]) => `${row.counters[key]} ${label}`).join(", ");
+  }
+
+function errorDigest(rows) {
+    const bad = rows.filter((row) => row.errors > 0);
+    if (bad.length <= 3) return bad.map((row) => `PHY ${row.phy}: ${counterText(row)}`).join("; ");
+    const spans = PHY_COUNTERS.map(([key, label]) => {
+      const counts = bad.map((row) => row.counters[key] || 0);
+      const [low, high] = [Math.min(...counts), Math.max(...counts)];
+      return high ? `${low === high ? low : `${low}–${high}`} ${label}` : "";
+    }).filter(Boolean);
+    return `PHY ${phyRanges(bad.map((row) => row.phy).sort((a, b) => a - b))} (${bad.length} PHYs), each: ${spans.join(", ")}`;
+  }
+
+function errorSummary(rows, wanted) {
+    if (!rows.length) return { text: NOT_READ, warn: false };
+    const unread = wanted - rows.filter((row) => row.measured).length;
+    const bad = rows.filter((row) => row.errors > 0);
+    const parts = bad.length ? [errorDigest(rows)] : [];
+    if (!bad.length) parts.push(`none on ${plural(rows.filter((row) => row.measured).length, "PHY")}`);
+    if (unread > 0) parts.push(`${plural(unread, "PHY")} ${NOT_READ}`);
+    return { text: parts.join("; "), warn: worse(...bad.map(phyTier)) };
+  }
+
+function tierForNode(item, mode) {
     const kind = String(item.kind || "");
     if (kind === "host") return "host";
+    if (kind === "head") return "heads";
     if (kind === "controller") return "controllers";
     if (kind === "expander") return mode === "storage" ? null : "expanders";
     if (kind === "path") return mode === "core" ? null : "devices";
@@ -355,16 +605,15 @@
     return null;
   }
 
-  // Kinds the view leaves out on purpose; anything else it cannot draw is named.
-  function hiddenByDesign(item, mode) {
+function hiddenByDesign(item, mode) {
     return HIDDEN_KINDS.has(String(item.kind || "")) || (mode === "core" && item.kind === "path");
   }
 
-  function expanderLevel(item) {
+function expanderLevel(item) {
     return decimal(item?.metrics?.sas_level) ?? decimal(item?.raw?.sas_level);
   }
 
-  function countTier(fabric, domain, count, base) {
+function countTier(fabric, domain, count, base) {
     const state = readState(fabric, domain);
     if (count > 0) {
       if (state === "partial") {
@@ -379,7 +628,7 @@
     return { state: "not_read", note: state === "unknown" ? `${base.many}: read not reported` : `${base.many} not read` };
   }
 
-  function pathCaption(item, kind) {
+function pathCaption(item, kind) {
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const raw = isRecord(item.raw) ? item.raw : {};
     const ses = kind === "linux_ses" || raw.source === "linux_ses" || raw.fabric_kind === "linux_ses" || Boolean(metrics.ses_device);
@@ -388,15 +637,18 @@
     return metrics.state_basis === MEMBER_HEALTH ? `${caption} · member health ${item.status}` : `${caption} · ${item.status}`;
   }
 
-  function nodeFacts(item, mode, kind) {
+function nodeFacts(item, mode, kind) {
     const core = mode === "core";
     const metrics = isRecord(item.metrics) ? item.metrics : {};
     const notRead = new Set(list(metrics.not_read));
     const facts = [];
     if (item.kind === "controller") {
-      if (core || mode === "sas") {
-        const board = item.raw?.board;
-        if (board) facts.push(String(board));
+      if (core) {
+        // The board, and the temperature it reports (a reading, no threshold).
+        const board = [item.raw?.board, metrics.temperature].filter((value) => typeof value === "string" && value).join(" · ");
+        if (board) facts.push(board);
+        const address = sasAddressOf(item.raw?.sas_address);
+        if (address) facts.push(`SAS ${tail(address)}`);
         const phys = decimal(metrics.phy_count);
         if (notRead.has("phy_count") || notRead.has("linked_phy_count")) {
           facts.push("PHY table not read");
@@ -419,6 +671,9 @@
         const linked = decimal(metrics.linked_phys);
         facts.push(`${linked === null ? "?" : linked} of ${phys} PHYs linked`);
       }
+      // What the expander says it is, where the source reads that.
+      const product = [text(item.raw?.vendor), text(item.raw?.product), text(item.raw?.revision) ? `rev ${item.raw.revision}` : ""].filter(Boolean).join(" ");
+      if (product) facts.push(product);
     } else if (item.kind === "host") {
       facts.push("host");
     } else if (item.kind === "path") {
@@ -429,13 +684,570 @@
     return facts;
   }
 
-  // ---- model -----------------------------------------------------------------
+function slotIdentities(slot) {
+    const found = new Set();
+    if (!isRecord(slot)) return found;
+    const add = (value) => {
+      if (typeof value === "string" && value.trim()) found.add(value.trim().toLowerCase());
+    };
+    if (isRecord(slot.raw_status)) add(slot.raw_status.enclosure_id);
+    for (const target of list(slot.ssh_ses_targets)) if (isRecord(target)) add(target.enclosure_id);
+    return found;
+  }
 
-  function buildTopologyModel(fabric, options = {}) {
+function inventoryLayout(fabric, inventory) {
+    if (!isRecord(inventory) || !isRecord(fabric)) return null;
+    const differs = (left, right) => Boolean(left && right && left !== right);
+    if (differs(fabric.system_id, inventory.selected_system_id) || differs(fabric.selected_enclosure_id, inventory.selected_enclosure_id)) return null;
+    const rows = list(inventory.layout_rows).filter(Array.isArray).map((row) => row.filter((slot) => Number.isInteger(slot)));
+    if (!rows.length || rows.some((row) => !row.length)) return null;
+    const seen = new Set();
+    for (const slot of rows.flat()) {
+      if (seen.has(slot)) return null;
+      seen.add(slot);
+    }
+    const profile = isRecord(inventory.selected_profile) ? inventory.selected_profile : {};
+    const columns = Math.max(...rows.map((row) => row.length));
+    const groups = list(profile.row_groups).filter((value) => Number.isInteger(value) && value > 0);
+    const even = groups.length > 1 && groups.reduce((sum, value) => sum + value, 0) === columns && rows.every((row) => row.length === columns);
+    return {
+      rows,
+      // Column indexes that start a new column group.
+      breaks: even ? groups.slice(0, -1).reduce((all, value) => [...all, (all[all.length - 1] || 0) + value], []) : [],
+      edgeLabel: profile.latch_edge === "bottom" && typeof profile.edge_label === "string" ? profile.edge_label : "",
+    };
+  }
+
+function physicalEnclosures({ nodes, links, bayLinks, bayRows, payloadNodeIds, inventory, located }) {
+    const observed = nodes.filter((entry) => entry.tier === "enclosures");
+    // A controller's enclosure row names the enclosure by its logical id; a
+    // Linux SES device's row by the enclosure id it reports.
+    const identityOf = (entry) => {
+      const raw = payloadNodeIds.get(entry.id)?.raw;
+      const value = raw?.logical_id || raw?.shared_backplane_id || (raw?.source === "linux_ses" ? raw?.enclosure_id : "");
+      return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : "";
+    };
+    const enclosures = new Map();
+    const unidentified = [];
+    for (const entry of observed) {
+      const identity = identityOf(entry);
+      if (!identity) {
+        unidentified.push(entry);
+        continue;
+      }
+      if (!enclosures.has(identity)) {
+        enclosures.set(identity, { identity, id: `enclosure:${identity}`, canonical: null, observations: [], ses: [], bayIds: new Set(), name: "", inferredBays: 0 });
+      }
+      if (entry.kind === "enclosure") enclosures.get(identity).canonical = entry;
+      else enclosures.get(identity).observations.push(entry);
+    }
+    // A controller's enclosure row without an identity cannot be joined to
+    // anything; only SES devices, which never carry one, are joined below.
+    if (!enclosures.size || unidentified.some((entry) => entry.kind !== "ses-enclosure")) return null;
+    const baysBySource = new Map();
+    for (const link of bayLinks) {
+      if (!baysBySource.has(link.source)) baysBySource.set(link.source, new Set());
+      baysBySource.get(link.source).add(link.target);
+    }
+    const memberOf = new Map();
+    const reported = new Set();
+    let conflict = false;
+    const claim = (bayId, identity, basis) => {
+      const had = memberOf.get(bayId);
+      if (had && had !== identity) conflict = true;
+      else memberOf.set(bayId, identity);
+      if (basis !== "coverage") reported.add(bayId);
+    };
+    // What each controller reports: the bays it sees a disk in.
+    for (const enclosure of enclosures.values()) {
+      if (enclosure.canonical) for (const bayId of baysBySource.get(enclosure.canonical.id) || []) claim(bayId, enclosure.identity, "reported");
+      for (const entry of enclosure.observations) {
+        for (const bayId of baysBySource.get(entry.id) || []) claim(bayId, enclosure.identity, "controller");
+      }
+    }
+    // What the inventory reports for each slot, empty bays included.
+    const slotOf = new Map();
+    for (const item of bayRows) {
+      if (!Number.isInteger(item.slot) || slotOf.has(item.id)) continue;
+      const slot = inventory.get(item.slot);
+      slotOf.set(item.id, slot);
+      const ids = [...slotIdentities(slot)].filter((identity) => enclosures.has(identity));
+      if (ids.length > 1) return null;
+      if (ids.length) claim(item.id, ids[0], "inventory");
+    }
+    // SES devices: by the enclosure the inventory names for the device; else
+    // when every bay the device reports is already in one enclosure; else,
+    // marked as inferred, when the device covers every bay known to be in one
+    // enclosure and no bay of another.
+    const sesNamed = new Map();
+    for (const slot of inventory.values()) {
+      for (const target of list(slot.ssh_ses_targets)) {
+        if (!isRecord(target) || typeof target.ses_device !== "string" || typeof target.enclosure_id !== "string") continue;
+        if (!sesNamed.has(target.ses_device)) sesNamed.set(target.ses_device, new Set());
+        sesNamed.get(target.ses_device).add(target.enclosure_id.trim().toLowerCase());
+      }
+    }
+    // Every SES device is judged against what the HBAs and the inventory
+    // report, never against another SES device's join.
+    const before = new Map(memberOf);
+    for (const entry of unidentified) {
+      const device = String(payloadNodeIds.get(entry.id)?.raw?.ses_device || entry.rawId || entry.label);
+      const bays = baysBySource.get(entry.id) || new Set();
+      const named = [...(sesNamed.get(device) || [])];
+      let identity = "";
+      let basis = "";
+      if (named.length === 1 && enclosures.has(named[0])) {
+        [identity, basis] = [named[0], "reported"];
+      } else if (named.length) {
+        return null;
+      } else {
+        const seen = new Set([...bays].map((bayId) => before.get(bayId)).filter(Boolean));
+        if (seen.size !== 1) return null;
+        [identity] = [...seen];
+        if ([...bays].every((bayId) => before.get(bayId) === identity)) {
+          basis = "bays";
+        } else {
+          const known = [...before].filter(([, value]) => value === identity).map(([bayId]) => bayId);
+          if (!known.every((bayId) => bays.has(bayId))) return null;
+          basis = "coverage";
+        }
+      }
+      for (const bayId of bays) claim(bayId, identity, basis === "bays" ? "inventory" : basis);
+      enclosures.get(identity).ses.push({ entry, device, basis, bays: bays.size });
+    }
+    if (conflict) return null;
+    const byBay = new Map();
+    for (const item of bayRows) {
+      const identity = memberOf.get(item.id);
+      if (!identity) continue;
+      // A disk without a physical location is never drawn as a bay.
+      if (!located(item)) return null;
+      const enclosure = enclosures.get(identity);
+      enclosure.bayIds.add(item.id);
+      if (!reported.has(item.id)) enclosure.inferredBays += 1;
+      byBay.set(item.id, enclosure);
+    }
+    for (const enclosure of enclosures.values()) {
+      if (!enclosure.bayIds.size) return null;
+      const names = new Set([...enclosure.bayIds].flatMap((bayId) => {
+        const slot = slotOf.get(bayId);
+        const name = isRecord(slot) ? slot.enclosure_name || slot.raw_status?.enclosure_name : "";
+        return typeof name === "string" && name && !/^(none|null)$/i.test(name) ? [name] : [];
+      }));
+      if (names.size === 1) [enclosure.name] = [...names];
+      enclosure.observations.sort((left, right) => naturalCompare(left.id, right.id));
+      enclosure.ses.sort((left, right) => naturalCompare(left.entry.id, right.entry.id));
+      // The lines the payload draws into each controller row: its parents.
+      enclosure.parents = new Map(enclosure.observations.map((entry) => [entry.id, links.filter((link) => link.target === entry.id)]));
+    }
+    return { enclosures: [...enclosures.values()], memberOf: byBay, stacked: false };
+  }
+
+function enclosureName(enclosure) {
+    return enclosure.alias || enclosure.title || enclosure.name || enclosure.identity;
+  }
+
+function stackEnclosures(physical, layout, slotOfBay) {
+    if (!layout || physical.enclosures.length < 1) return false;
+    const owner = new Map();
+    for (const enclosure of physical.enclosures) {
+      for (const bayId of enclosure.bayIds) {
+        const slot = slotOfBay.get(bayId);
+        if (slot === null || slot === undefined || owner.has(slot)) return false;
+        owner.set(slot, enclosure);
+      }
+    }
+    const placed = new Set();
+    const order = [];
+    const rowsOf = new Map(physical.enclosures.map((enclosure) => [enclosure, []]));
+    for (const row of layout.rows) {
+      const owners = new Set(row.map((slot) => owner.get(slot)));
+      if (owners.size !== 1) return false;
+      const [enclosure] = [...owners];
+      // A row of slots no enclosure here owns: not this view's layout.
+      if (!enclosure) return false;
+      if (order[order.length - 1] !== enclosure) {
+        if (order.includes(enclosure)) return false;
+        order.push(enclosure);
+      }
+      rowsOf.get(enclosure).push(row);
+      for (const slot of row) placed.add(slot);
+    }
+    if (placed.size !== owner.size || order.length !== physical.enclosures.length) return false;
+    physical.enclosures = order;
+    for (const enclosure of order) enclosure.layoutRows = rowsOf.get(enclosure);
+    for (const enclosure of order) enclosure.breaks = layout.breaks;
+    physical.stacked = true;
+    physical.edgeLabel = layout.edgeLabel;
+    return true;
+  }
+
+function planNeighbours(context) {
+    const { nodes, nodeById, links, fabric, sas, inventory, hrefFor } = context;
+    const off = nodes.filter((entry) => entry.kind === "expander" && !entry.chipOf && !entry.mergedInto);
+    if (!off.length || !nodes.some((entry) => entry.chipOf)) return;
+    const lanes = links.filter((link) => !link.bundle && LANE_LINKS.has(link.kind));
+    const isOff = new Set(off.map((entry) => entry.id));
+    // Below the boards: a chip's own children (planBoards), then theirs.
+    const queue = off.filter((entry) => entry.below);
+    for (const entry of queue) entry.below = 1;
+    while (queue.length) {
+      const entry = queue.shift();
+      for (const link of lanes) {
+        const target = link.source === entry.id ? nodeById.get(link.target) : null;
+        if (!target || !isOff.has(target.id) || target.below) continue;
+        target.below = entry.below + 1;
+        queue.push(target);
+      }
+    }
+    // Above: what a chip is cabled from, and what that is cabled from.
+    const above = new Map();
+    let frontier = new Set(nodes.filter((entry) => entry.chipOf).map((entry) => entry.id));
+    for (let distance = 1; frontier.size; distance += 1) {
+      const next = new Set();
+      for (const link of lanes) {
+        if (!frontier.has(link.target) || !isOff.has(link.source) || above.has(link.source) || nodeById.get(link.source).below) continue;
+        above.set(link.source, distance);
+        next.add(link.source);
+      }
+      frontier = next;
+    }
+    const census = list(fabric?.raw?.sas_transport_ports).filter((port) => isRecord(port) && typeof port.owner_id === "string");
+    const byIdentity = new Map();
+    for (const item of list(inventory?.enclosures)) {
+      if (!isRecord(item) || typeof item.id !== "string") continue;
+      // A combined view's id is its members' ids joined by "+".
+      for (const part of item.id.toLowerCase().split("+")) if (part.trim() && !byIdentity.has(part.trim())) byIdentity.set(part.trim(), item);
+    }
+    const selected = new Set(String(fabric?.selected_enclosure_id || "").toLowerCase().split("+"));
+    for (const entry of off) {
+      const address = sasAddressOf(entry.rawId);
+      const ports = census.filter((port) => port.owner_id === entry.id && port.remote_kind === "end_device");
+      const identities = [...new Set(ports.map((port) => text(port.enclosure_identifier).toLowerCase()).filter(Boolean))];
+      const found = identities.length === 1 ? byIdentity.get(identities[0]) : !identities.length && address ? byIdentity.get(address) : null;
+      const relation = entry.below === 1 ? "Next in chain" : entry.below ? "Further down the chain" : above.get(entry.id) === 1 ? "Reached through" : above.has(entry.id) ? "Further up the chain" : "Elsewhere in the fabric";
+      entry.address = address;
+      entry.neighbour = {
+        relation,
+        known: Boolean(found),
+        name: found ? text(found.alias) || text(found.label) || `enclosure …${found.id.slice(-4)}` : "enclosure not read",
+        basis: !found ? "" : identities.length === 1 ? "the enclosure id its disks report" : "an enclosure id equal to its SAS address",
+        enclosureId: found ? found.id : "",
+        bays: found && Number.isInteger(found.slot_count) ? found.slot_count : null,
+        // The disks on it: its end devices with a block device, where the payload lists its ports.
+        disks: census.length ? ports.filter((port) => port.has_block).length : null,
+        product: text(sas.expanders.get(entry.id)?.product),
+        href: found && hrefFor && !found.id.toLowerCase().split("+").some((part) => selected.has(part)) ? String(hrefFor(found.id) || "") : "",
+      };
+      entry.viaLine = viaRows([entry], nodeById);
+      entry.aliases = [address, entry.rawId, entry.id, entry.label, entry.neighbour.name].filter(Boolean);
+      entry.label = `${relation}: ${entry.neighbour.name}`;
+      entry.facts = stubFacts(entry, "");
+    }
+  }
+
+function stubFacts(entry, health) {
+    const { neighbour } = entry;
+    const disks = neighbour.disks === null ? "disks not read" : neighbour.bays === null ? `${plural(neighbour.disks, "disk")}, bays not read` : `${neighbour.disks}/${neighbour.bays} disks`;
+    return [
+      [neighbour.product, entry.address ? tail(entry.address) : ""].filter(Boolean).join(" · "),
+      [entry.level === null ? "level not reported" : `level ${entry.level}`, disks].join(" · "),
+      health,
+      neighbour.href ? "open its Topology view ›" : "",
+    ].filter(Boolean);
+  }
+
+function enclosureOfExpander(model, id) {
+    const entry = chipOfNode(model, id);
+    if (!entry) return "";
+    if (entry.chipOf) return enclosureName(model.groupById.get(entry.chipOf)?.enclosure || {}) || "";
+    return entry.neighbour ? entry.neighbour.name : "";
+  }
+
+function neighbourRows(model, entry) {
+    const rows = [];
+    const ids = new Set(list(entry.rows).length ? entry.rows.map((row) => row.id) : [entry.id]);
+    const cables = model.links.filter((link) => LANE_LINKS.has(link.kind));
+    if (entry.neighbour) {
+      const { neighbour } = entry;
+      rows.push({ label: "Enclosure", value: neighbour.known ? `${neighbour.name}: another enclosure of this system, by ${neighbour.basis}. Its bays are on its own page` : `${NOT_READ}: the payload does not say which enclosure this expander is the backplane of` });
+      rows.push({ label: "Disks on it", value: neighbour.disks === null ? `${NOT_READ}: the payload lists no ports for it` : `${neighbour.disks}${neighbour.bays === null ? "; its bay count is not read" : ` of ${plural(neighbour.bays, "bay")}`}` });
+      if (neighbour.health) rows.push({ label: "State", value: neighbour.health, warn: neighbour.tier || false });
+    }
+    const from = [...new Set(cables.filter((link) => ids.has(link.target)).map((link) => neighbourText(model, link.source)))];
+    if (from.length) rows.push({ label: "Upstream", value: from.join("; ") });
+    const to = [...new Set(cables.filter((link) => ids.has(link.source)).map((link) => neighbourText(model, link.target)))];
+    if (to.length) rows.push({ label: "Cascades to", value: to.join("; ") });
+    return rows;
+  }
+
+function neighbourText(model, id) {
+    const entry = chipOfNode(model, id);
+    if (!entry) return id;
+    if (entry.kind !== "expander") return `${entry.label}${entry.kind === "controller" && model.core && !/\bHBA\b/.test(entry.label) ? " (HBA)" : ""}`;
+    const address = entry.address || sasAddressOf(entry.rawId);
+    return `${enclosureOfExpander(model, id) || "enclosure not read"}${address ? ` (${tail(address)})` : ""}${entry.level === null ? "" : `, level ${entry.level}`}`;
+  }
+
+function finishNeighbours(model) {
+    const stubs = model.nodes.filter((entry) => entry.neighbour);
+    for (const entry of stubs) {
+      const cables = model.links.filter((link) => LANE_LINKS.has(link.kind) && (link.source === entry.id || link.target === entry.id));
+      const flags = [...context.flagsOf(model, "node", entry.id), ...cables.flatMap((link) => context.flagsOf(model, "link", link.id))];
+      const tier = worse(...flags.map((item) => item.tier));
+      const record = model.sas.expanders.get(entry.id);
+      const measured = list(record?.phys).filter((row) => row.measured).length;
+      entry.neighbour.tier = tier;
+      entry.neighbour.health = tier ? `${tier}: ${[...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))].join("; ")}` : measured ? "no PHY errors" : "PHY counters not read";
+      entry.facts = stubFacts(entry, entry.neighbour.health);
+    }
+    // More than three under one parent: one stub that lists them.
+    const byParent = new Map();
+    for (const link of model.links) {
+      const target = LANE_LINKS.has(link.kind) ? model.nodeById.get(link.target) : null;
+      if (!target?.neighbour || !target.below) continue;
+      if (!byParent.has(link.source)) byParent.set(link.source, []);
+      byParent.get(link.source).push(link);
+    }
+    for (const [parentId, cables] of byParent) {
+      if (cables.length <= STUB_GROUP_ABOVE) continue;
+      const members = cables.map((link) => model.nodeById.get(link.target));
+      // Everything further down the grouped ones goes with them.
+      const gone = new Set(members.map((entry) => entry.id));
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const link of model.links) {
+          if (!gone.has(link.source) || gone.has(link.target) || !model.nodeById.get(link.target)?.neighbour) continue;
+          gone.add(link.target);
+          grew = true;
+        }
+      }
+      const beyond = gone.size - members.length;
+      const tier = worse(...members.map((entry) => entry.neighbour.tier));
+      const first = members[0];
+      const group = {
+        ...first, id: `stubs:${parentId}`, label: `Next in chain: ${members.length} enclosures`, alias: "", rawId: "", address: "", neighbour: null, stubGroup: members, stubCables: cables,
+        aliases: members.flatMap((entry) => entry.aliases), flagged: "", phyGroups: [], parentUnknown: false, w: NODE_W, h: NODE_H,
+        facts: [
+          `${members.slice(0, STUB_GROUP_ABOVE).map((entry) => entry.neighbour.name).join(", ")}${members.length > STUB_GROUP_ABOVE ? `, +${members.length - STUB_GROUP_ABOVE} more` : ""}`,
+          [tier ? `worst: ${tier}` : "no findings", beyond ? `${plural(beyond, "more expander")} beyond them` : ""].filter(Boolean).join(" · "),
+          "pin it to list them",
+        ],
+      };
+      group.groupTier = tier;
+      const cable = {
+        id: `cables:${parentId}`, kind: "expander-group", source: parentId, target: group.id, status: "", bundle: false, lanes: null, lanesState: "n/a",
+        labelLines: [plural(cables.length, "cable"), [...new Set(cables.map((link) => (link.lanes ? `x${link.lanes.count}` : "lanes not reported")))].join(", ")],
+        memberLinkIds: cables.map((link) => link.id), count: cables.length, cable: cables.some((link) => link.cable), stubCables: cables,
+      };
+      for (const link of cables) link.targetName = model.nodeById.get(link.target).neighbour.name;
+      const dropped = new Set(model.links.filter((link) => gone.has(link.source) || gone.has(link.target)));
+      model.nodes = model.nodes.filter((entry) => !gone.has(entry.id));
+      model.nodes.push(group);
+      model.nodeById.set(group.id, group);
+      model.links = model.links.filter((link) => !dropped.has(link));
+      model.links.push(cable);
+      model.linkById.set(cable.id, cable);
+      for (const [id, items] of model.outgoing) model.outgoing.set(id, items.filter((link) => !dropped.has(link)));
+      for (const [id, items] of model.incoming) model.incoming.set(id, items.filter((link) => !dropped.has(link)));
+      model.outgoing.set(parentId, [...list(model.outgoing.get(parentId)), cable]);
+      model.incoming.set(group.id, [cable]);
+      for (const tier of model.tiers) tier.nodeIds = tier.nodeIds.filter((id) => !gone.has(id));
+      model.tiers.find((tier) => tier.id === `beyond:${first.below}`)?.nodeIds.push(group.id);
+      // The group and its cable carry their members' findings.
+      model.flags.set(`node:${group.id}`, members.flatMap((entry) => context.flagsOf(model, "node", entry.id)));
+      model.flags.set(`link:${cable.id}`, cables.flatMap((link) => context.flagsOf(model, "link", link.id)));
+      model.tiers = model.tiers.filter((tier) => !/^beyond:/.test(tier.id) || tier.nodeIds.length);
+    }
+  }
+
+function adoptLinuxTransport(payload, options = {}) {
+    if (!isRecord(payload) || payload.raw?.sas_transport_available !== true) return null;
+    // With the collector's rows in, every controller is a SAS host: the
+    // collector takes the SES source's stand-in controller out.
+    const hardware = list(payload.nodes).filter((item) => isRecord(item) && typeof item.id === "string" && ["controller", "expander"].includes(item.kind))
+      .map((item) => ({ ...item, raw: isRecord(item.raw) ? item.raw : {} }));
+    if (!hardware.some((item) => item.kind === "controller")) return null;
+    const rename = (id) => (options.prefix && typeof id === "string" ? id.replace(/^(controller|expander):/, `$1:${options.prefix}:`) : id);
+    const resolve = window.SasFabricTransport?.resolveTransportPort;
+    const index = isRecord(payload.raw.sas_transport_port_index) ? payload.raw.sas_transport_port_index : {};
+    const census = list(payload.raw.sas_transport_ports).filter(isRecord);
+    // What each PHY is attached to, by its owner and its sysfs name.
+    const role = new Map();
+    const inPort = new Set();
+    for (const port of census) {
+      const device = port.remote_kind === "expander" ? "SMP Target" : port.remote_kind !== "end_device" ? "Attachment not read" : port.has_block ? "End device (disk outside this view)" : "End device, no block device";
+      for (const name of list(port.phy_names)) {
+        role.set(`${port.owner_id}|${name}`, device);
+        inPort.add(`${port.owner_id}|${name}`);
+      }
+    }
+    // The port rows of this view's bays.
+    const ports = new Map();
+    const owners = new Set();
+    for (const trace of list(payload.traces)) {
+      if (!isRecord(trace)) continue;
+      const rows = list(trace.sas_transport_ports ?? trace.metrics?.sas_transport_ports).filter(isRecord);
+      const mapped = rows.map((row) => {
+        const found = resolve ? resolve(payload, row) : { state: "not_read", phys: [] };
+        const entry = own(index, row.sas_transport_port_id);
+        const ownerId = isRecord(entry) && typeof entry.owner_id === "string" ? entry.owner_id : "";
+        const protocol = protocolOf(row.target_port_protocol, row.transport_protocol);
+        const device = protocol ? `${protocol} Target` : "End device (disk)";
+        const phys = found.state === "read" ? list(found.phys) : [];
+        if (ownerId) owners.add(rename(ownerId));
+        for (const phy of phys) role.set(`${ownerId}|${phy.name}`, device);
+        return {
+          controller: options.label || text(row.controller), state: !text(row.state) || row.state === "unknown" ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),
+          mpr_device: protocol ? device : "", sas_address: text(row.sas_address), expander_ids: ownerId ? [rename(ownerId)] : [],
+          expander_phy: phys.length === 1 && Number.isInteger(phys[0].phy) ? phys[0].phy : null, phy_basis: "",
+        };
+      });
+      if (mapped.length) ports.set(trace.id, mapped);
+    }
+    // Cables: the parent's PHYs as reported; the far end inferred or not read.
+    const links = [];
+    for (const item of list(payload.links)) {
+      if (!isRecord(item) || !LANE_LINKS.has(item.kind)) continue;
+      const lanes = isRecord(item.reported_lanes) ? { ...item.reported_lanes } : null;
+      const child = hardware.find((node) => node.id === item.target);
+      if (lanes && !list(lanes.target_phys).length && census.length && census.every((port) => port.state === "read") && child) {
+        const free = list(child.raw.phys).filter((row) => isRecord(row) && finite(row.negotiated_rate_gbps) !== null && Number.isInteger(row.phy) && !inPort.has(`${child.id}|${row.name}`));
+        if (free.length === lanes.lane_count) {
+          lanes.target_phys = free.map((row) => row.phy).sort((left, right) => left - right);
+          lanes.target_basis = "inferred";
+          for (const row of free) role.set(`${child.id}|${row.name}`, "Cable far end (inferred)");
+        }
+      }
+      links.push({ ...item, id: `${item.kind}:${rename(item.source)}->${rename(item.target)}`, source: rename(item.source), target: rename(item.target), reported_lanes: lanes });
+    }
+    const phyRow = (ownerId, row) => {
+      const measured = row.counter_state === "measured";
+      return {
+        phy: row.phy, name: text(row.name), dev_handle: "", device: role.get(`${ownerId}|${row.name}`) || "",
+        speed: finite(row.negotiated_rate_gbps), min: finite(row.minimum_rate_gbps), max: finite(row.maximum_rate_gbps),
+        ...Object.fromEntries(PHY_COUNTERS.map(([key]) => [key, row[key] ?? null])),
+        counter_state: measured ? "measured" : "not_read", counter_reason: measured ? "" : "sysfs did not return this PHY's counters",
+      };
+    };
+    const controllers = [];
+    const expanders = [];
+    const nodes = [];
+    for (const item of hardware) {
+      const id = rename(item.id);
+      const rows = list(item.kind === "controller" ? item.raw.phy_rows : item.raw.phys).filter(isRecord).map((row) => phyRow(item.id, row));
+      const live = rows.filter((row) => row.speed !== null).length;
+      const raw = { ...item.raw };
+      if (item.kind === "controller") {
+        controllers.push({ id, board: text(item.raw.board), chip: text(item.raw.driver), firmware: text(item.raw.firmware), sas_address: text(item.raw.sas_address), phy_rows: rows.map((row) => ({ ...row, device_handle: "" })) });
+        nodes.push({
+          ...item, id, label: options.label || nodeLabel(item), metrics: { ...(isRecord(item.metrics) ? item.metrics : {}), phy_count: rows.length, linked_phy_count: live },
+          raw: { ...raw, board: [text(item.raw.board), text(item.raw.firmware) ? `fw ${item.raw.firmware}` : ""].filter(Boolean).join(" · ") },
+        });
+        continue;
+      }
+      const address = sasAddressOf(item.raw.sas_address);
+      const measured = rows.filter((row) => row.counter_state === "measured");
+      expanders.push({
+        id, sas_address: address, dev_handle: "", num_phys: rows.length, linked_phys: live, phys: rows,
+        product: [text(item.raw.vendor), text(item.raw.product), text(item.raw.revision) ? `rev ${item.raw.revision}` : ""].filter(Boolean).join(" "),
+        reported_level: text(item.raw.reported_level),
+        phy_error_counters: {
+          state: measured.length ? "available" : "not_read", source: "Linux sas_phy sysfs counters", read_at: null, measured_phys: measured.length, unknown_phys: rows.length - measured.length,
+          phys_with_errors: measured.filter((row) => PHY_COUNTERS.some(([key]) => row[key] > 0)).length,
+        },
+      });
+      nodes.push({
+        ...item, id, label: address ? `Expander ${tail(address)}` : nodeLabel(item), raw_id: address || item.raw_id, controller_id: rename(item.controller_id), raw,
+        metrics: { ...(isRecord(item.metrics) ? item.metrics : {}), num_phys: rows.length, linked_phys: live, not_read: list(item.metrics?.not_read).filter((key) => key !== "linked_phys") },
+      });
+    }
+    return { controllers, expanders, nodes, links, ports, owners, census: census.length > 0, resolved: Boolean(resolve) };
+  }
+
+function withLinuxTransport(fabric) {
+    const adopted = adoptLinuxTransport(fabric);
+    if (!adopted) return null;
+    const nodes = new Map(adopted.nodes.map((node) => [node.id, node]));
+    const lanes = new Map(adopted.links.map((link) => [link.id, link]));
+    return {
+      ...fabric,
+      nodes: list(fabric.nodes).map((item) => nodes.get(item?.id) || item),
+      links: list(fabric.links).map((item) => lanes.get(item?.id) || item),
+      traces: list(fabric.traces).map((trace) => {
+        if (!isRecord(trace) || trace.kind !== "bay") return trace;
+        // A row with no controller is SES detail kept without a path: not a path.
+        const states = list(trace.metrics?.path_states).filter((state) => isRecord(state) && (state.controller || state.controller_label))
+          .map((state) => (state.state === "unknown" && state.source === "linux_sas_transport" ? { ...state, state: STATE_UNREAD } : state));
+        return { ...trace, metrics: { ...(isRecord(trace.metrics) ? trace.metrics : {}), path_states: states, mpr_devices: adopted.ports.get(trace.id) || [] } };
+      }),
+      controllers: adopted.controllers,
+      expanders: adopted.expanders,
+      raw: {
+        ...fabric.raw,
+        // The collector admits only a complete survey of the SAS classes. An
+        // enclosure is another read (SES): complete where it gave rows.
+        controller_read: { counts: { controllers: "complete", expanders: "complete", ...(list(fabric.nodes).some((item) => isRecord(item) && String(item.kind || "").endsWith("enclosure")) ? { enclosures: "complete" } : {}) } },
+        linux_transport: { census: adopted.census, resolved: adopted.resolved },
+      },
+    };
+  }
+
+function deviceShort(name) {
+    return text(name).split("/").pop();
+  }
+
+function expanderInPath(name) {
+    const found = /(?:^|[-/])sas-exp0x([0-9a-f]{16})-phy([0-9]{1,3})(?:-|$)/i.exec(text(name));
+    return found ? { address: found[1].toLowerCase(), phy: Number(found[2]) } : null;
+  }
+
+function notCollectedReason(fabric) {
+    const said = list(fabric?.warnings).filter((item) => typeof item === "string").flatMap((item) => item.split(/(?<=[.;])\s+/))
+      .find((item) => /not exposed|not collected|not available|appear only when/i.test(item));
+    return said ? `${said.charAt(0).toUpperCase()}${said.slice(1)}` : NOT_COLLECTED;
+  }
+
+function headFacts(item, fabric, shared) {
+    const head = headInfo(item, fabric, shared);
+    const facts = [head.system, head.role === "active" ? `active (pool owner): ${head.pool}` : head.role ? `standby: ${head.pool} active on ${head.owner}` : "role not read"];
+    if (head.selected) facts.push("the view this page is on");
+    return facts;
+  }
+
+function headInfo(item, fabric, shared) {
+    const raw = isRecord(item.raw) ? item.raw : {};
+    const label = nodeLabel(item);
+    const pools = list(fabric.nodes).filter((node) => isRecord(node) && node.kind === "pool").map(nodeLabel);
+    const owner = text(raw.pool_owner_label);
+    return {
+      label,
+      owner,
+      // The platform as the payload names it; an unknown one is just "storage system".
+      system: `${own(PLATFORM_WORDS, text(fabric.platform)) || ""} storage system`.trim(),
+      role: owner ? (owner === label ? "active" : "standby") : "",
+      pool: pools.length ? `pool ${pools.join(", ")}` : "pool",
+      fence: text(raw.fence_owner_label),
+      fencing: typeof raw.io_fencing_enabled === "boolean" ? raw.io_fencing_enabled : null,
+      visibleOn: list(raw.visible_on_labels).filter((value) => typeof value === "string"),
+      selected: Boolean(shared.heads.find((head) => head.controller_id === item.id)?.selected),
+    };
+  }
+
+function buildTopologyModel(given, options = {}) {
+    tailDigits = addressTail(given);
+    const fabric = withLinuxTransport(given) || given;
+    tailDigits = Math.max(tailDigits, addressTail(fabric));
+    // Per-head aggregation awaits its own backend contract.
+    const shared = null;
+    // The transport collector's rows are in the payload: HBAs, expanders,
+    // lanes and disk ports are read, so it is drawn and checked as a SAS fabric.
+    const transport = isRecord(fabric?.raw?.linux_transport) ? fabric.raw.linux_transport : null;
     const expanded = isRecord(options.expanded) ? options.expanded : {};
     const contract = fabricContract(fabric);
     const { kind } = contract;
-    const mode = contract.contract;
+    // expanders and lanes: it is drawn and checked as a SAS fabric.
+    const mode = shared?.transport || transport ? "core" : contract.contract;
     const core = mode === "core";
     const payload = readPayload(fabric);
     const skipped = {
@@ -450,6 +1262,7 @@
       else skipped.unsupportedTraces.push(`${trace.kind || "no kind"}: ${trace.id}`);
     }
     const inventory = inventoryBySlot(fabric, options.inventory);
+    const sas = sasIndex(fabric);
 
     const nodes = [];
     const nodeById = new Map();
@@ -476,11 +1289,15 @@
         kind: item.kind,
         tier,
         label: nodeLabel(item),
+        // The operator's own name for it, where one is saved.
+        alias: text(item.alias) || text(item.display_label),
+        peer: false,
         rawId: item.raw_id || "",
         controllerId: typeof item.controller_id === "string" ? item.controller_id : "",
         status: item.status || "",
         level: item.kind === "expander" ? expanderLevel(item) : null,
-        facts: nodeFacts(item, mode, kind),
+        facts: shared && item.raw?.head_end ? headFacts(item, fabric, shared) : nodeFacts(item, mode, kind),
+        head: shared && item.raw?.head_end ? headInfo(item, fabric, shared) : null,
         phyGroups: [],
         parentUnknown: false,
         x: 0,
@@ -502,6 +1319,7 @@
     const pathBayLinks = [];
     const seenLinks = new Set();
     for (const item of payload.links) {
+      if (["enclosure-observation", "enclosure-ses"].includes(item.kind)) continue;
       if (seenLinks.has(item.id)) {
         skipped.duplicateLinks.push(item.id);
         continue;
@@ -517,7 +1335,9 @@
       const target = nodeById.get(item.target);
       if (item.kind === "path-bay") pathBayLinks.push(item);
       const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, mode) && !hiddenByDesign(end, mode));
-      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices") || (mode === "sas" && item.kind === "transport-bay" && ["controller", "expander"].includes(source.kind)))) {
+      // Without SES the collector links a disk's bay to the expander or HBA its port is on.
+      const transportBay = Boolean(transport) && item.kind === "transport-bay" && ["controller", "expander"].includes(source?.kind);
+      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices") || transportBay)) {
         bayLinks.push(item);
         continue;
       }
@@ -534,6 +1354,14 @@
           sourcePhys: list(lanesPayload.source_phys).filter((value) => Number.isInteger(value)),
           targetPhys: list(lanesPayload.target_phys).filter((value) => Number.isInteger(value)),
           rate: finite(lanesPayload.negotiated_rate_gbps),
+          // "inferred" where the far end's PHYs are worked out, not read; and
+          // the basis the source gives for what it did read.
+          targetBasis: text(lanesPayload.target_basis),
+          basis: text(lanesPayload.basis),
+          // Each lane as reported: its PHY at each end and its own rate.
+          rows: list(lanesPayload.lanes).filter(isRecord)
+            .filter((lane) => Number.isInteger(lane.source_phy) && Number.isInteger(lane.target_phy))
+            .map((lane) => ({ source: lane.source_phy, target: lane.target_phy, rate: sasRate(lane.negotiated_rate_gbps) })),
         };
       }
       const laneLink = LANE_LINKS.has(item.kind);
@@ -551,15 +1379,88 @@
         count: 1,
       };
       if (entry.lanesState === "reported") {
-        entry.labelLines = [
-          `x${lanes.count} · ${formatRate(lanes.rate)}`,
-          `PHY ${phyRanges(lanes.sourcePhys) || "?"} ↔ ${phyRanges(lanes.targetPhys) || "?"}`,
-        ];
+        entry.labelLines = [`x${lanes.count} · ${laneRate(lanes)}`, lanes.targetPhys.length && !lanes.targetBasis
+          ? `PHY ${phyRanges(lanes.sourcePhys) || "?"} ↔ ${phyRanges(lanes.targetPhys)}`
+          : lanes.basis || lanes.targetBasis ? `PHY ${phyRanges(lanes.sourcePhys) || "?"} ${farEnd(lanes)}` : `PHY ${phyRanges(lanes.sourcePhys) || "?"} ↔ ?`];
       } else if (entry.lanesState === "not_reported") {
         entry.labelLines = ["lanes not reported"];
       }
       links.push(entry);
       linkById.set(entry.id, entry);
+    }
+
+    // Physical enclosures (CORE): the controller and SES rows of one enclosure
+    // become one node, drawn as the head of its bay block; the lines into a
+    // controller row become that enclosure's paths, drawn below as bundles.
+    const bayLocated = (item) => {
+      const found = traces.get(item.id);
+      const slot = Number.isInteger(item.slot) ? inventory.get(item.slot) : null;
+      return locationKnown(item.metrics, item.raw, found?.kind === "bay" ? found.metrics : null, slot, slot?.raw_status);
+    };
+    const physical = mode !== "unknown"
+      ? physicalEnclosures({ nodes, links, bayLinks, bayRows: bayRows.filter((item) => payloadNodeIds.get(item.id) === item), payloadNodeIds, inventory, located: bayLocated })
+      : null;
+    if (physical) {
+      const consumed = new Set(physical.enclosures.flatMap((enclosure) => [...(enclosure.canonical ? [enclosure.canonical] : []), ...enclosure.observations, ...enclosure.ses.map((ses) => ses.entry)].map((entry) => entry.id)));
+      const parentLinks = new Set(physical.enclosures.flatMap((enclosure) => [...enclosure.parents.values()].flat()));
+      for (const link of links.slice()) {
+        if (!consumed.has(link.source) && !consumed.has(link.target)) continue;
+        links.splice(links.indexOf(link), 1);
+        linkById.delete(link.id);
+        if (!parentLinks.has(link) || consumed.has(link.source)) skipped.unjoined.push(link.id);
+      }
+      for (const enclosure of physical.enclosures) {
+        for (const [id, parents] of enclosure.parents) enclosure.parents.set(id, parents.filter((link) => !consumed.has(link.source)));
+      }
+      for (let index = nodes.length - 1; index >= 0; index -= 1) {
+        if (!consumed.has(nodes[index].id)) continue;
+        nodeById.delete(nodes[index].id);
+        nodes.splice(index, 1);
+      }
+      for (const enclosure of physical.enclosures) {
+        const members = [...(enclosure.canonical ? [enclosure.canonical] : []), ...enclosure.observations, ...enclosure.ses.map((ses) => ses.entry)];
+        // A friendly name saved on any HBA's row for the enclosure names it;
+        // the first row (in the payload's order) is the one the editor saves to.
+        const canonical = enclosure.canonical;
+        enclosure.alias = canonical?.alias || enclosure.observations.map((entry) => entry.alias).find(Boolean) || "";
+        // A row's own label, where it is a name and not the id again.
+        enclosure.title = enclosure.observations.find((entry) => entry.label && entry.label.toLowerCase() !== enclosure.identity && entry.label !== entry.rawId)?.label || "";
+        if (shared) {
+          // One backplane two heads report: named as that, not as a head.
+          const profile = isRecord(options.inventory?.selected_profile) ? options.inventory.selected_profile : {};
+          enclosure.title = "Shared backplane";
+          enclosure.name = text(profile.label);
+          enclosure.sharedBy = shared.heads.map((head) => head.label);
+        }
+        enclosure.sesNames = [...enclosure.ses.map((ses) => ses.device), ...enclosure.observations.filter((entry) => entry.kind === "ses-enclosure" && entry.rawId).map((entry) => entry.rawId)];
+        const mine = canonical || enclosure.observations.find((entry) => !entry.peer) || enclosure.observations[0];
+        enclosure.aliasTarget = { objectId: mine.id, objectKind: mine.kind };
+        const entry = {
+          id: enclosure.id,
+          kind: "enclosure",
+          tier: "enclosures",
+          label: enclosure.alias || enclosure.title || (enclosure.name ? `${enclosure.name} · ${enclosure.identity}` : enclosure.identity),
+          rawId: enclosure.identity,
+          controllerId: "",
+          status: "",
+          level: null,
+          facts: [],
+          phyGroups: [],
+          parentUnknown: false,
+          physical: enclosure,
+          memberIds: members.map((member) => member.id),
+          // What a search may name it by: its rows' own names and ids.
+          aliases: members.flatMap((member) => [member.label, member.rawId, member.id]).filter(Boolean),
+          x: 0,
+          y: 0,
+          w: NODE_W,
+          h: NODE_H,
+        };
+        enclosure.node = entry;
+        nodes.push(entry);
+        nodeById.set(entry.id, entry);
+      }
+      stackEnclosures(physical, inventoryLayout(fabric, options.inventory), new Map(bayRows.map((item) => [item.id, Number.isInteger(item.slot) ? item.slot : null])));
     }
 
     const incoming = new Map();
@@ -599,15 +1500,20 @@
     const groupsByKey = new Map();
     const groupByBay = new Map();
     const bays = [];
+    const controllerNodes = nodes.filter((entry) => entry.kind === "controller");
     for (const item of bayRows) {
       if (payloadNodeIds.get(item.id) !== item) continue;
       const found = traces.get(item.id);
       const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
-      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => window.SasFabricTransport?.pathState(fabric, state) || ({
-        controller: String(state.controller_label || state.controller || ""),
+      // A path names its controller by label or by the tail of its id.
+      const ownerOf = (named) => controllerNodes.find((entry) => entry.label === named || entry.id === `controller:${named}`)?.label || named;
+      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
+        controller: ownerOf(String(state.controller_label || state.controller || "")),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
+        device: text(state.device_name),
+        raw: state,
       }));
       const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id));
       const slot = Number.isInteger(item.slot) ? item.slot : null;
@@ -626,27 +1532,92 @@
         terms: searchTerms(item, trace, inventorySlot),
         identities: identityTerms(item, trace, inventorySlot),
         pathStates,
+        ports: [],
         sources: [...(baySources.get(item.id) || [])].sort(naturalCompare),
         x: 0,
         y: 0,
         w: CELL_BOX,
       };
+      // One port per path: the path's state and, where the payload has the
+      // HBA's device row for it, its SAS address and its expander PHY. A
+      // path that reports the disk's own SAS data (Linux SES) carries that:
+      // the address the disk's port is attached to, the disk's PHY, its SCSI
+      // address. Each value is the payload's; none is derived.
+      const devices = list(trace?.metrics?.mpr_devices).filter(isRecord);
+      const taken = new Set();
+      const port = (state, device) => {
+        const joined = device ? joinPort(sas, device)
+          : { expanderId: "", phy: null, why: core ? "the payload has no port row for this path, so its expander and PHY are not matched" : "the payload has no expander PHY table for this path" };
+        const named = state ? state.controller : String(device.controller || "");
+        const owner = controllerNodes.find((entry) => entry.label === named || entry.id === `controller:${named}`);
+        const raw = state?.raw || {};
+        const spelled = shared ? expanderInPath(raw.device_name) : null;
+        return {
+          key: `${item.id}#${bay.ports.length}`,
+          bayId: item.id,
+          controller: owner ? owner.label : named,
+          controllerId: owner ? owner.id : "",
+          state: state ? state.state : String(device.state ?? "unknown"),
+          basis: state ? state.basis : "",
+          device: text(device?.member_device_name) || state?.device || "",
+          sasAddress: sasAddressOf(device?.sas_address) || sasAddressOf(raw.sas_address),
+          handle: text(device?.handle),
+          rate: device ? sasRate(device.speed) : null,
+          protocol: protocolOf(device?.mpr_device, raw.target_port_protocol, raw.sas_device_type === "end device" ? raw.transport_protocol : ""),
+          attached: sasAddressOf(raw.attached_sas_address) || spelled?.address || "",
+          // The expander PHY the device path spells out, where it does.
+          pathPhy: !sasAddressOf(raw.attached_sas_address) && spelled ? spelled.phy : null,
+          diskPhy: sasAddressOf(raw.sas_address) ? text(raw.phy_identifier) : "",
+          hctl: text(raw.scsi_hctl),
+          sg: sasAddressOf(raw.sas_address) ? text(raw.sg_device) : "",
+          expanderId: joined.expanderId,
+          phy: joined.phy,
+          phyBasis: joined.basis || "",
+          why: joined.why,
+        };
+      };
+      for (const state of pathStates) {
+        const index = devices.findIndex((device, at) => !taken.has(at) && String(device.controller || "") === state.controller);
+        if (index >= 0) taken.add(index);
+        bay.ports.push(port(state, index >= 0 ? devices[index] : null));
+      }
+      devices.forEach((device, at) => {
+        if (!taken.has(at)) bay.ports.push(port(null, device));
+      });
+      bay.protocol = [...new Set(bay.ports.map((item) => item.protocol).filter(Boolean))].join("/");
+      bay.heads = list(metrics.heads).filter(isRecord);
       bays.push(bay);
-      const key = `${bay.sources.join("|")}#${located ? "located" : "logical"}`;
+      // A bay of a physical enclosure is in that enclosure's block, with or
+      // without a disk; any other bay is grouped by the nodes that link to it.
+      const enclosure = physical?.memberOf.get(item.id) || null;
+      const key = enclosure ? enclosure.id : `${bay.sources.join("|")}#${located ? "located" : "logical"}`;
       if (!groupsByKey.has(key)) {
-        const id = `group:${bay.sources.join("|") || "unlinked"}${located ? "" : ":logical"}`;
-        groupsByKey.set(key, { id, enclosureIds: bay.sources, locationKnown: located, bays: [] });
+        const id = enclosure ? `group:${enclosure.id}` : `group:${bay.sources.join("|") || "unlinked"}${located ? "" : ":logical"}`;
+        groupsByKey.set(key, { id, enclosureIds: enclosure ? [enclosure.id] : bay.sources, locationKnown: located, bays: [], enclosure });
       }
       groupsByKey.get(key).bays.push(bay);
     }
     const groups = [];
+    const controllerLabels = nodes.filter((entry) => entry.kind === "controller").map((entry) => entry.label);
+    const viewLayout = inventoryLayout(fabric, options.inventory);
+    const viewSlots = new Set(viewLayout ? viewLayout.rows.flat() : []);
     for (const raw of groupsByKey.values()) {
       raw.bays.sort((left, right) => (left.slot ?? Infinity) - (right.slot ?? Infinity) || naturalCompare(left.label, right.label));
       const expandKey = `topology:${raw.id}`;
       const collapsed = raw.bays.length > BAY_DETAIL_LIMIT && !own(expanded, expandKey);
       // Path state counts per controller, keyed by payload text: Maps.
-      const summary = { bays: raw.bays.length, withDisk: 0, empty: 0, unknown: 0, pathStates: new Map() };
+      const summary = { bays: raw.bays.length, withDisk: 0, empty: 0, unknown: 0, noPath: 0, pathStates: new Map() };
       for (const bay of raw.bays) {
+        // In an enclosure block the marks are in HBA order in every cell.
+        if (raw.enclosure) {
+          const rank = (state) => {
+            const index = controllerLabels.indexOf(state.controller);
+            return index < 0 ? controllerLabels.length : index;
+          };
+          bay.pathStates = bay.pathStates.map((state, index) => ({ state, index })).sort((left, right) => rank(left.state) - rank(right.state) || left.index - right.index).map((item) => item.state);
+          bay.ports = bay.ports.map((state, index) => ({ state, index })).sort((left, right) => rank(left.state) - rank(right.state) || left.index - right.index).map((item) => item.state);
+          if (bay.occupancy === "yes" && !bay.pathStates.length) summary.noPath += 1;
+        }
         if (bay.occupancy === "yes") summary.withDisk += 1;
         else if (bay.occupancy === "no") summary.empty += 1;
         else summary.unknown += 1;
@@ -660,8 +1631,18 @@
       // A disk without a physical location, and a bay whose label carries no
       // number, is drawn with its own label, so its cell is as wide as the
       // longest such label in the group.
+      // The enclosure view's rows for this block, top row first, each cell
+      // with its column in the view: a physical enclosure's own rows, and
+      // for any other group of located bays the rows its bays are in. The
+      // bays of every platform follow the enclosure view's grid.
+      let rows = null;
+      const bySlot = new Map(raw.bays.map((bay) => [bay.slot, bay]));
+      const gridRows = raw.enclosure ? raw.enclosure.layoutRows : raw.locationKnown && raw.bays.every((bay) => viewSlots.has(bay.slot)) ? viewLayout.rows : null;
+      if (gridRows) {
+        rows = gridRows.map((row) => row.map((slot, column) => ({ bay: bySlot.get(slot), column })).filter((cell) => cell.bay)).filter((row) => row.length);
+      }
       const labelled = raw.bays.filter((bay) => !raw.locationKnown || !bay.number);
-      const cellWidth = Math.max(CELL_BOX, ...labelled.map((bay) => bay.label.length * CHAR_W + 12));
+      const cellWidth = Math.max(rows ? PHYS_CELL_W : CELL_BOX, ...labelled.map((bay) => bay.label.length * CHAR_W + 12));
       for (const bay of raw.bays) bay.w = cellWidth;
       const group = {
         id: raw.id,
@@ -670,7 +1651,11 @@
         locationKnown: raw.locationKnown,
         bayIds: raw.bays.map((bay) => bay.bayId),
         bays: raw.bays,
-        cells: collapsed ? [] : raw.bays,
+        enclosure: raw.enclosure || null,
+        breakColumns: rows ? list(raw.enclosure ? raw.enclosure.breaks : viewLayout?.breaks) : [],
+        paths: [],
+        rows: collapsed ? null : rows,
+        cells: collapsed ? [] : rows ? rows.flat().map((cell) => cell.bay) : raw.bays,
         cellWidth,
         collapsed,
         expandable: raw.bays.length > BAY_DETAIL_LIMIT,
@@ -681,13 +1666,88 @@
         w: 0,
         h: 0,
       };
+      if (raw.enclosure) raw.enclosure.group = group;
       groups.push(group);
       for (const bay of raw.bays) groupByBay.set(bay.bayId, group);
     }
     const groupById = new Map(groups.map((group) => [group.id, group]));
 
+    // A physical enclosure: one bundle per path, from the node the payload
+    // links to the controller's enclosure row (its expander) into the block.
+    // It carries that payload link and the row's links to the bays it sees a
+    // disk in. A row no line leads to has a path with no line, which the
+    // block says. SES rows are named in the block; no line is drawn for one.
+    for (const enclosure of physical ? physical.enclosures : []) {
+      const group = enclosure.group;
+      for (const observation of enclosure.observations) {
+        const carried = group.bays.filter((bay) => bay.sources.includes(observation.id));
+        const bayLinksHere = carried.flatMap((bay) => list(bayLinkIds.get(`${observation.id}->${bay.bayId}`)));
+        // A row that links only some bays links the ones it sees a disk in;
+        // a row that links every bay says nothing by that, so its disks are
+        // the bays that hold one. Told from the links, not from the row's kind.
+        const seen = carried.length === group.bays.length ? carried.filter((bay) => bay.occupancy === "yes") : carried;
+        const path = {
+          id: observation.id,
+          label: nodeById.get(observation.controllerId)?.label || observation.label,
+          controllerId: observation.controllerId,
+          handle: String(payloadNodeIds.get(observation.id)?.raw?.enc_handle || ""),
+          bayIds: new Set(seen.map((bay) => bay.bayId)),
+          linkIds: [],
+          sourceIds: [],
+        };
+        enclosure.parents.get(observation.id).forEach((parent, index) => {
+          const entry = {
+            id: `bundle:${observation.id}->${group.id}${index ? `:${index + 1}` : ""}`,
+            kind: "bay-bundle",
+            source: parent.source,
+            target: group.id,
+            via: observation.id,
+            status: "",
+            bundle: true,
+            lanes: null,
+            lanesState: "n/a",
+            labelLines: [plural(group.bays.length, "bay"), `${plural(seen.length, "disk")} seen`],
+            memberLinkIds: [parent.id, ...bayLinksHere],
+            count: seen.length,
+          };
+          links.push(entry);
+          linkById.set(entry.id, entry);
+          if (!incoming.has(group.id)) incoming.set(group.id, []);
+          if (!outgoing.has(parent.source)) outgoing.set(parent.source, []);
+          incoming.get(group.id).push(entry);
+          outgoing.get(parent.source).push(entry);
+          path.linkIds.push(entry.id);
+          path.sourceIds.push(parent.source);
+        });
+        group.paths.push(path);
+      }
+      for (const ses of enclosure.ses) ses.linkIds = group.bays.flatMap((bay) => list(bayLinkIds.get(`${ses.entry.id}->${bay.bayId}`)));
+      enclosure.node.groupId = group.id;
+      enclosure.node.parentUnknown = group.paths.some((path) => !path.linkIds.length);
+    }
+    if (physical) {
+      planBoards(physical, { nodes, nodeById, links, linkById, incoming, outgoing, controllerNodes });
+      for (const enclosure of physical.enclosures) enclosure.node.facts = enclosureFacts(enclosure, enclosure.group, nodeById);
+    }
+    // An enclosure not drawn as a board (no layout rows to stack it by) still
+    // has its expanders: the ones its paths come through, for the checks.
+    if (physical && !physical.boards) {
+      for (const enclosure of physical.enclosures) {
+        const sources = [...new Set(enclosure.group.paths.flatMap((path) => path.sourceIds))].map((id) => nodeById.get(id)).filter((entry) => entry?.kind === "expander");
+        enclosure.group.chipIds = sources.map((entry) => entry.id);
+        for (const entry of sources) {
+          entry.rows = [entry];
+          entry.address = sasAddressOf(entry.rawId);
+        }
+      }
+    }
+    // Expanders on no board of this view: the enclosures before and after
+    // this one in the chain, each drawn as a compact stub.
+    planNeighbours({ nodes, nodeById, links, fabric, sas, inventory: options.inventory, hrefFor: typeof options.enclosureHref === "function" ? options.enclosureHref : null });
+
     // One bundle line per (source, bay group), carrying the payload link ids.
     for (const group of groups) {
+      if (group.enclosure) continue;
       for (const sourceId of group.enclosureIds) {
         const memberLinkIds = group.bays.flatMap((bay) => list(bayLinkIds.get(`${sourceId}->${bay.bayId}`)));
         const entry = {
@@ -724,6 +1784,8 @@
       note: hosts.length ? "" : "host not in the payload",
       nodeIds: hosts.map((entry) => entry.id),
     });
+    const headEnds = tierNodes("heads");
+    if (headEnds.length) tiers.push({ id: "heads", label: "Head ends", state: "drawn", note: plural(headEnds.length, "storage system"), nodeIds: headEnds.map((entry) => entry.id) });
     const controllers = tierNodes("controllers");
     if (core) {
       const status = countTier(fabric, "controllers", controllers.length, { one: "HBA", many: "HBAs", none: "no HBAs reported" });
@@ -736,25 +1798,34 @@
         const levels = [...new Set(expanders.map((entry) => entry.level))].sort((left, right) => (left ?? Infinity) - (right ?? Infinity));
         for (const level of levels) {
           const members = expanders.filter((entry) => entry.level === level);
+          for (const entry of members) entry.tier = `expanders:${level ?? "unknown"}`;
+          // An expander drawn as a chip on its board has no row of its own,
+          // and one reached through a board stands below the boards.
+          const inRow = members.filter((entry) => !entry.chipOf && !entry.below);
+          if (!inRow.length) continue;
+          // A row of nothing but stubs is named for what they are to this view.
+          const stubs = inRow.every((entry) => entry.neighbour);
+          const upstream = stubs && inRow.every((entry) => /^(Reached through|Further up)/.test(entry.neighbour.relation));
           tiers.push({
             id: `expanders:${level ?? "unknown"}`,
-            label: level === null ? "Expanders, level not reported" : `Expanders, level ${level}`,
+            label: upstream ? "Upstream" : stubs ? "Other enclosures" : level === null ? "Expanders, level not reported" : `Expanders, level ${level}`,
             state: expanderStatus.state,
-            note: expanderStatus.state === "partial" ? expanderStatus.note : plural(members.length, "expander"),
-            nodeIds: members.map((entry) => entry.id),
+            note: expanderStatus.state === "partial" ? expanderStatus.note : stubs ? `${plural(inRow.length, "enclosure")}${upstream ? " this one is reached through" : ""}${level === null ? "" : `, level ${level}`}` : plural(inRow.length, "expander"),
+            nodeIds: inRow.map((entry) => entry.id),
           });
-          for (const entry of members) entry.tier = `expanders:${level ?? "unknown"}`;
         }
       }
       const enclosures = tierNodes("enclosures");
       const enclosureStatus = countTier(fabric, "enclosures", enclosures.length, { one: "enclosure", many: "enclosures", none: "no enclosures reported (read complete)" });
-      tiers.push({ id: "enclosures", label: "Enclosures", ...enclosureStatus, nodeIds: enclosures.map((entry) => entry.id) });
-    } else if (mode === "unknown" || mode === "sas") {
-      // Draw supplied rows without inventing read completeness.
+      // Physical enclosures are the heads of their bay blocks: no row of their own.
+      if (!physical) tiers.push({ id: "enclosures", label: "Enclosures", ...enclosureStatus, nodeIds: enclosures.map((entry) => entry.id) });
+      else physical.status = enclosureStatus;
+    } else if (mode === "unknown") {
+      // No contract: draw the rows the payload has, say nothing about the rest.
       const rowOf = (id, label, members) => {
         if (members.length) tiers.push({ id, label, state: "drawn", note: plural(members.length, "item"), nodeIds: members.map((entry) => entry.id) });
       };
-      rowOf("controllers", mode === "sas" ? "HBAs" : "Controllers or sources", controllers);
+      rowOf("controllers", "Controllers or sources", controllers);
       const expanders = tierNodes("expanders");
       const levels = [...new Set(expanders.map((entry) => entry.level))].sort((left, right) => (left ?? Infinity) - (right ?? Infinity));
       for (const level of levels) {
@@ -767,12 +1838,12 @@
     } else {
       tiers.push({
         id: "controllers",
-        label: "Source",
+        label: shared ? "Head ends" : "Source",
         state: controllers.length ? "drawn" : "none",
-        note: controllers.length ? plural(controllers.length, "source") : "no source reported",
+        note: controllers.length ? plural(controllers.length, shared ? "storage system" : "source") : "no source reported",
         nodeIds: controllers.map((entry) => entry.id),
       });
-      tiers.push({ id: "not-collected", label: "HBAs and expanders", state: "not_collected", note: NOT_COLLECTED, nodeIds: [] });
+      tiers.push({ id: "not-collected", label: shared ? "Controllers and expanders" : "HBAs and expanders", state: "not_collected", note: shared ? notCollectedReason(fabric) : NOT_COLLECTED, nodeIds: [] });
       const devices = tierNodes("devices");
       if (devices.length) {
         tiers.push({
@@ -784,13 +1855,16 @@
         });
       }
       const enclosures = tierNodes("enclosures");
-      tiers.push({
-        id: "enclosures",
-        label: "Enclosures",
-        state: enclosures.length ? "drawn" : "none",
-        note: enclosures.length ? plural(enclosures.length, "enclosure") : "no enclosure reported",
-        nodeIds: enclosures.map((entry) => entry.id),
-      });
+      if (physical) physical.status = { state: "drawn", note: plural(enclosures.length, "enclosure") };
+      else {
+        tiers.push({
+          id: "enclosures",
+          label: "Enclosures",
+          state: enclosures.length ? "drawn" : "none",
+          note: enclosures.length ? plural(enclosures.length, "enclosure") : "no enclosure reported",
+          nodeIds: enclosures.map((entry) => entry.id),
+        });
+      }
     }
     const located = bays.filter((bay) => bay.locationKnown).length;
     const logical = bays.length - located;
@@ -798,13 +1872,43 @@
     if (located && logical) bayNote = `${plural(located, "bay")}; ${plural(logical, "disk")} without a physical location`;
     else if (logical) bayNote = `${plural(logical, "disk")}; ${LOCATION_UNKNOWN}`;
     else if (located) bayNote = plural(located, "bay");
-    tiers.push({
-      id: "bays",
-      label: logical && !located ? "Disks" : logical ? "Bays and disks" : "Bays",
-      state: bays.length ? "drawn" : "none",
-      note: bayNote,
-      nodeIds: groups.map((group) => group.id),
-    });
+    if (physical?.stacked) {
+      // One row per enclosure, in the enclosure view's order, top first; the
+      // first block's head is above its bays and the last one's below, so the
+      // bay rows of the blocks sit together as they do in the enclosure view.
+      const last = physical.enclosures.length - 1;
+      physical.enclosures.forEach((enclosure, index) => {
+        const group = enclosure.group;
+        group.stack = true;
+        group.headAt = index === last && last > 0 && !group.expandable ? "bottom" : "top";
+        group.caption = index === last ? physical.edgeLabel : "";
+        tiers.push({
+          id: `bays:${enclosure.id}`,
+          label: shared ? "Shared backplane" : enclosure.board ? "Backplane" : "Enclosure",
+          state: physical.status.state === "partial" ? "partial" : "drawn",
+          note: physical.status.state === "partial" ? physical.status.note : bayRange(group).toLowerCase(),
+          nodeIds: [group.id],
+          stack: true,
+        });
+      });
+      const rest = groups.filter((group) => !group.enclosure);
+      if (rest.length) {
+        tiers.push({ id: "bays", label: "Other bays", state: "drawn", note: plural(rest.reduce((sum, group) => sum + group.bayIds.length, 0), "bay"), nodeIds: rest.map((group) => group.id) });
+      }
+      const depths = [...new Set(nodes.filter((entry) => entry.below).map((entry) => entry.below))].sort((left, right) => left - right);
+      for (const depth of depths) {
+        const members = nodes.filter((entry) => entry.below === depth);
+        tiers.push({ id: `beyond:${depth}`, label: depth === 1 ? "Beyond this backplane" : "Further down", state: "drawn", note: `${plural(members.length, "enclosure")} reached through ${depth === 1 ? "it" : "those above"}`, nodeIds: members.map((entry) => entry.id) });
+      }
+    } else {
+      tiers.push({
+        id: "bays",
+        label: physical ? "Enclosures and bays" : logical && !located ? "Disks" : logical ? "Bays and disks" : "Bays",
+        state: bays.length ? "drawn" : "none",
+        note: physical ? `${physical.status.state === "partial" ? physical.status.note : plural(physical.enclosures.length, "enclosure")}; ${bayNote}` : bayNote,
+        nodeIds: groups.map((group) => group.id),
+      });
+    }
     if (payload.problems.length && !payload.nodesReadable) {
       // Node entries could not all be read: nothing drawn is a measured zero.
       for (const tier of tiers) {
@@ -833,7 +1937,8 @@
       outgoing.set(link.source, list(outgoing.get(link.source)).filter((item) => item !== link));
     }
     for (const entry of nodes) {
-      if (["expanders", "enclosures", "devices", "controllers"].includes(entry.tier.replace(/:.*$/, "")) && !list(incoming.get(entry.id)).length) {
+      if (entry.physical) continue;
+      if (["expanders", "enclosures", "devices", "controllers", "heads"].includes(entry.tier.replace(/:.*$/, "")) && !list(incoming.get(entry.id)).length) {
         entry.parentUnknown = true;
       }
     }
@@ -854,6 +1959,25 @@
       incoming,
       outgoing,
       parts: modelParts(fabric, core),
+      physical,
+      shared,
+      transport,
+      tailDigits,
+      // The role of the head end each path's source belongs to: its own
+      // label without transport, its HBA's label with it.
+      roleOf: new Map(shared ? nodes.filter((entry) => entry.head).flatMap((entry) => {
+        const info = shared.heads.find((head) => head.controller_id === entry.id);
+        return [[info?.hba_label || entry.label, { role: entry.head.role, head: entry.label }]];
+      }) : []),
+      warnings: list(fabric?.warnings).filter((item) => typeof item === "string"),
+      // What a path's upper end is called here.
+      sideWord: core ? "HBA" : shared ? "head" : "source",
+      sas,
+      // The system's other enclosures, as the inventory of this scope names them.
+      otherEnclosures: inventory.size ? list(options.inventory?.enclosures).filter((item) => isRecord(item) && item.id !== fabric.selected_enclosure_id).map((item) => text(item.label) || text(item.id)).filter(Boolean) : [],
+      portByKey: new Map(bays.flatMap((bay) => bay.ports.map((port) => [port.key, port]))),
+      checks: [],
+      flags: new Map(),
       contract: mode,
       notices: [],
       counts: { bayNodes: bayRows.length, baysPlaced: groups.reduce((total, group) => total + group.bayIds.length, 0) },
@@ -862,6 +1986,13 @@
       height: 0,
     };
     if (contract.notice) model.notices.push(contract.notice);
+    // Bays with a place in the chassis but no rows to lay them out by: said,
+    // because the order drawn is then the bay numbers', not the chassis's.
+    if (inventory.size && !viewLayout && bays.some((bay) => bay.locationKnown)) {
+      model.notices.push("The inventory gives no layout rows for this enclosure: its bays are drawn in bay-number order, not as they sit in the chassis.");
+    }
+
+    if (transport && !transport.resolved) model.notices.push("The transport port helper (sas_fabric_transport.js) is not loaded: each disk's expander PHY is not read.");
     if (payload.problems.length) {
       model.notices.push(`Payload not readable: ${payload.problems.join("; ")}. What could not be read is not drawn.`);
     }
@@ -882,6 +2013,13 @@
     if (notDrawn.length) {
       model.notices.push(`Not drawn: ${notDrawn.join("; ")}.`);
     }
+    for (const enclosure of physical ? physical.enclosures : []) {
+      const inferred = enclosure.ses.filter((ses) => ses.basis === "coverage").map((ses) => ses.device);
+      if (inferred.length) {
+        model.notices.push(`${named(inferred)} ${inferred.length === 1 ? "is" : "are"} shown with enclosure ${enclosure.identity} because ${inferred.length === 1 ? "it reports" : "they report"} every bay the HBAs see a disk in there and none of another enclosure: `
+          + `the payload does not name the SES device's enclosure, so this is inferred${enclosure.inferredBays ? `, and so is the place of ${plural(enclosure.inferredBays, "bay")} no HBA reports a disk in` : ""}.`);
+      }
+    }
     // One notice per large bay group, collapsed or drawn in full, so that
     // expanding or collapsing a shelf does not move the drawing on the page.
     for (const group of groups) {
@@ -892,16 +2030,244 @@
         ? `${what} are shown as a summary block; expand it to draw each one.`
         : `${what} are drawn in full; collapse them to a summary block to shorten the drawing.`);
     }
-    layoutModel(model, options);
+    context.unmatchedTargets(model);
+    context.wiringChecks(model, fabric);
+    model.transportNote = context.transportNote(model);
+    finishNeighbours(model);
+    // What the payload reports beyond a box's own lines, for its name, the
+    // trace line and the hover card: SAS detail where the payload has it, and
+    // the wiring checks' flags.
+    for (const entry of model.nodes) {
+      const detailed = entry.kind === "controller" ? core && sas.controllers.has(entry.id) : entry.kind === "expander" && (sas.expanders.has(entry.id) || Boolean(entry.reported) || Boolean(entry.stubGroup));
+      const rows = detailed ? context.cardFor(model, { kind: "node", id: entry.id }).rows : context.flagRows(model, "node", entry.id);
+      entry.extra = rows.filter((row) => !entry.facts.includes(row.value)).map((row) => `${row.label}: ${row.value}`);
+      entry.flagged = entry.stubGroup ? entry.groupTier : context.flagTier(model, "node", entry.id);
+    }
+    for (const bay of bays) {
+      bay.extra = [
+        ...bay.ports.filter((port) => port.phy || port.sasAddress).map((port) => `via ${port.controller}: ${context.portBrief(port)}`).filter((line, index, all) => all.indexOf(line) === index),
+        ...context.flagRows(model, "bay", bay.bayId).map((row) => `${row.label}: ${row.value}`),
+      ];
+      bay.flagged = context.flagTier(model, "bay", bay.bayId);
+    }
+    context.layoutModel(model, options);
     model.box = { width: Number(options.width) || 0, height: Number(options.height) || 0 };
     return model;
   }
 
-  function scopeOf(fabric) {
+function planBoards(physical, context) {
+    const { nodes, nodeById, links, linkById, outgoing, controllerNodes } = context;
+    if (!physical.stacked) return false;
+    const order = (entry) => {
+      const index = controllerNodes.findIndex((item) => item.id === entry.controllerId);
+      return index < 0 ? controllerNodes.length : index;
+    };
+    const plans = [];
+    const claimed = new Set();
+    for (const enclosure of physical.enclosures) {
+      const group = enclosure.group;
+      const rows = [];
+      for (const path of group.paths) {
+        const row = path.sourceIds.length === 1 ? nodeById.get(path.sourceIds[0]) : null;
+        if (row?.kind !== "expander") continue;
+        path.rowId = row.id;
+        if (!rows.includes(row)) rows.push(row);
+      }
+      const chips = [];
+      if (rows.length) {
+        // Every path comes through an expander row no other enclosure has.
+        if (group.paths.some((path) => !path.rowId) || rows.some((row) => claimed.has(row.id))) return false;
+        // The same expander as another HBA sees it (one row per host, one
+        // SAS address) is a row of the same chip, whether or not a path of
+        // this view's bays was joined through it.
+        const addresses = new Set(rows.map((row) => sasAddressOf(row.rawId)).filter(Boolean));
+        for (const twin of nodes) {
+          if (twin.kind !== "expander" || rows.includes(twin) || claimed.has(twin.id) || !addresses.has(sasAddressOf(twin.rawId))) continue;
+          if (rows.some((row) => row.controllerId === twin.controllerId && sasAddressOf(row.rawId) === sasAddressOf(twin.rawId))) continue;
+          rows.push(twin);
+        }
+        rows.forEach((row) => claimed.add(row.id));
+        rows.sort((left, right) => order(left) - order(right) || naturalCompare(left.id, right.id));
+        const byAddress = new Map();
+        for (const row of rows) {
+          const address = sasAddressOf(row.rawId) || row.rawId || row.label;
+          if (!byAddress.has(address)) byAddress.set(address, []);
+          byAddress.get(address).push(row);
+        }
+        for (const [address, members] of byAddress) {
+          // One row per HBA: two rows of one address on one HBA are not one chip.
+          if (new Set(members.map((row) => row.controllerId)).size !== members.length) return false;
+          chips.push({ address, rows: members });
+        }
+      } else {
+        const counts = new Map();
+        for (const bay of group.bays) {
+          for (const port of bay.ports) {
+            if (!port.attached || port.expanderId) continue;
+            if (!counts.has(port.attached)) counts.set(port.attached, []);
+            counts.get(port.attached).push(port);
+          }
+        }
+        if (!counts.size) return false;
+        // In the order of the heads that name them, then by address.
+        const first = (ports) => Math.min(...ports.map((port) => controllerNodes.findIndex((entry) => entry.label === port.controller)).map((index) => (index < 0 ? controllerNodes.length : index)));
+        for (const [address, ports] of [...counts].sort((left, right) => first(left[1]) - first(right[1]) || naturalCompare(left[0], right[0]))) {
+          chips.push({ address, rows: [], reportedBy: ports.length, fromPath: ports.every((port) => port.pathPhy !== null), namedBy: [...new Set(ports.map((port) => port.controller).filter(Boolean))] });
+        }
+      }
+      plans.push({ enclosure, chips });
+    }
+    if (!plans.length) return false;
+    const busLinks = links.filter((link) => link.bundle);
+    for (const { enclosure, chips } of plans) {
+      const group = enclosure.group;
+      group.chipIds = [];
+      for (const chip of chips) {
+        let primary = chip.rows[0];
+        if (!primary) {
+          // Known only from its disks: each reports this address as the one
+          // its port is attached to. Its own PHY table and its uplink are
+          // not in the payload.
+          primary = {
+            id: `expander:reported:${enclosure.identity}:${chip.address}`, kind: "expander", tier: "expanders", label: "", alias: "", rawId: chip.address,
+            controllerId: "", status: "", level: null, facts: [], phyGroups: [], parentUnknown: false, reported: chip.reportedBy, fromPath: chip.fromPath, namedBy: chip.namedBy,
+            x: 0, y: 0, w: NODE_W, h: NODE_H,
+          };
+          nodes.push(primary);
+          nodeById.set(primary.id, primary);
+          const disks = group.bays.filter((bay) => bay.ports.some((port) => port.attached === chip.address && !port.expanderId));
+          for (const bay of disks) {
+            for (const port of bay.ports) {
+              if (port.attached !== chip.address || port.expanderId) continue;
+              port.expanderId = primary.id;
+              port.why = "the expander's PHY table is not in the payload";
+              port.fromPath = port.pathPhy !== null;
+            }
+          }
+          const bus = {
+            id: `bus:${primary.id}`, kind: "bay-bundle", source: primary.id, target: group.id, via: null, status: "", bundle: true, bus: true, reported: true,
+            lanes: null, lanesState: "n/a", labelLines: [], memberLinkIds: [], count: disks.length,
+          };
+          links.push(bus);
+          linkById.set(bus.id, bus);
+          outgoing.set(primary.id, [bus]);
+          primary.busId = bus.id;
+        }
+        const rows = chip.rows.length ? chip.rows : [primary];
+        const rowIds = rows.map((row) => row.id);
+        const rest = primary.facts.filter((fact) => !/^level /.test(fact));
+        const alias = rows.map((row) => row.alias).find(Boolean) || "";
+        primary.rows = rows;
+        primary.address = chip.address;
+        primary.viaLine = chip.rows.length ? viaRows(rows, nodeById)
+          : chip.fromPath ? `from device path${chip.namedBy.length ? ` (${chip.namedBy.join(", ")})` : ""}` : `attached address of ${plural(chip.reportedBy, "disk port")}`;
+        primary.aliases = [chip.address, ...rows.flatMap((row) => [row.label, row.rawId, row.id])].filter(Boolean);
+        primary.label = alias || `Expander ${tail(chip.address)}`;
+        primary.facts = [primary.viaLine, chip.address, ...(chip.rows.length ? rest : ["PHY table not read"])];
+        for (const row of rows) {
+          row.chipOf = group.id;
+          if (row !== primary) row.mergedInto = primary.id;
+        }
+        for (const path of group.paths) if (rowIds.includes(path.rowId)) path.chipId = primary.id;
+        // One bus per chip: the first of its rows' bundles is the one drawn.
+        const buses = chip.rows.length ? busLinks.filter((link) => rowIds.includes(link.source) && link.target === group.id) : [linkById.get(primary.busId)];
+        buses.forEach((link, index) => {
+          link.bus = true;
+          link.labelLines = [];
+          if (index) link.busOf = buses[0].id;
+        });
+        if (buses[0]) buses[0].rowIds = rowIds;
+        primary.busId = buses[0]?.id || "";
+        group.chipIds.push(primary.id);
+      }
+      enclosure.node.label = `${enclosureName(enclosure)} · ${bayRange(group).toLowerCase()}`;
+      enclosure.board = true;
+    }
+    for (const link of links) {
+      if (link.bundle || link.lanesState === "n/a") continue;
+      const target = nodeById.get(link.target);
+      // A chip's cable to an expander that is on no board of this view (the
+      // backplane of another enclosure): that expander stands below the
+      // boards, reached by a rail like any other cable.
+      const down = Boolean(nodeById.get(link.source)?.chipOf) && target?.kind === "expander" && !target.chipOf;
+      if (!target?.chipOf && !down) continue;
+      if (down) target.below = true;
+      // A cable: beside a rail its label is three short lines.
+      link.cable = true;
+      if (link.lanesState === "reported") {
+        link.labelLines = [`x${link.lanes.count} · ${laneRate(link.lanes)}`, `PHY ${phyRanges(link.lanes.sourcePhys) || "?"}`, farEnd(link.lanes)];
+      }
+    }
+    physical.boards = true;
+    return true;
+  }
+
+function viaRows(rows, nodeById) {
+    const name = (row) => nodeById.get(row.controllerId)?.label || "an HBA not reported";
+    const level = (row) => (row.level === null || row.level === undefined ? "level not reported" : `level ${row.level}`);
+    if (new Set(rows.map(level)).size === 1) return `via ${rows.map(name).join(" + ")}, ${level(rows[0])}`;
+    return `via ${rows.map((row) => `${name(row)} (${level(row)})`).join(" + ")}`;
+  }
+
+function chipOfNode(model, id) {
+    const entry = model.nodeById.get(id);
+    return entry?.mergedInto ? model.nodeById.get(entry.mergedInto) : entry || null;
+  }
+
+function nodeName(model, id) {
+    const entry = chipOfNode(model, id);
+    if (!entry) return id;
+    // A stub is named as the expander it is, with its enclosure.
+    if (entry.neighbour) return `${entry.address ? `Expander ${tail(entry.address)}` : "Expander"} (${entry.neighbour.name})`;
+    return entry.label;
+  }
+
+function viaText(controller, level) {
+    return `via ${controller || "an HBA not reported"}, level ${level === null || level === undefined ? "not reported" : level}`;
+  }
+
+function bayRange(group) {
+    const numbers = group.bays.map((bay) => bay.number).filter(Boolean).sort((left, right) => Number(left) - Number(right));
+    if (!numbers.length || numbers.length < group.bays.length) return "Bays";
+    return numbers[0] === numbers[numbers.length - 1] ? `Bay ${numbers[0]}` : `Bays ${numbers[0]}–${numbers[numbers.length - 1]}`;
+  }
+
+function enclosureFacts(enclosure, group, nodeById) {
+    const { summary } = group;
+    const facts = [];
+    const occupied = `${summary.withDisk} of ${summary.bays} with a disk${summary.unknown ? ` · ${summary.unknown} occupancy not read` : ""}`;
+    const inferred = enclosure.ses.some((ses) => ses.basis === "coverage");
+    const ses = list(enclosure.sesNames).length ? `SES ${enclosure.sesNames.join(", ")}${inferred ? " (joined by bay coverage, not reported)" : ""}` : "";
+    const states = context.pathSummary(summary);
+    const without = summary.noPath ? `${plural(summary.noPath, "disk")} with no path reported` : "";
+    if (enclosure.board) {
+      // A board: its chips say how it is reached; the head keeps its identity.
+      const shown = enclosureName(enclosure);
+      if (enclosure.sharedBy) facts.push(`one backplane, reported by ${enclosure.sharedBy.join(" and ")}`);
+      facts.push([shown !== enclosure.name ? enclosure.name : "", shown !== enclosure.identity && !enclosure.sharedBy ? enclosure.identity : ""].filter(Boolean).join(" · "));
+      facts.push(ses);
+      facts.push([occupied, without].filter(Boolean).join(" · "));
+      if (states) facts.push(states);
+      return facts.filter(Boolean);
+    }
+    const paths = group.paths.map((path) => {
+      const through = path.sourceIds.map((id) => {
+        const source = nodeById.get(id);
+        return source ? `${source.kind === "expander" ? "expander " : ""}${source.label}` : id;
+      });
+      return `${path.label} via ${through.length ? through.join(" and ") : "a parent link not reported"}`;
+    });
+    facts.push([bayRange(group), occupied, ses].filter(Boolean).join(" · "));
+    if (paths.length) facts.push(paths.join(" · "));
+    if (states || without) facts.push([states, without].filter(Boolean).join(" · "));
+    return facts;
+  }
+
+function scopeOf(fabric) {
     return isRecord(fabric) ? `${fabric.system_id ?? ""}\u0000${fabric.selected_enclosure_id ?? ""}` : "";
   }
 
-  function modelParts(fabric, core) {
+function modelParts(fabric, core) {
     const parts = [];
     for (const [name, source] of Object.entries(isRecord(fabric?.sources) ? fabric.sources : {})) {
       let state = "ok";
@@ -929,2072 +2295,186 @@
     return parts;
   }
 
-  // ---- layout ----------------------------------------------------------------
-  //
-  // Rows are the tiers. Every row's order is chosen by barycentre sweeps and
-  // the candidate with the fewest line crossings wins. The widest row is
-  // spread across the available width; every other row sits under or over the
-  // items it links to. Each link then gets its own track in the gap above its
-  // child, so no two links share a track; a link that skips a row runs down a
-  // free corridor between that row's boxes; and its label sits on its own
-  // drop, clear of the boxes above and below.
-
-  // Wrap text to lines of at most `max` characters at spaces; a single word
-  // longer than that is shortened (its whole text stays in the item's name).
-  // With `whole`, a long word is broken over lines instead of shortened.
-  function wrap(text, max, whole = false) {
-    return wrapWords(String(text ?? "").split(/\s+/).filter(Boolean), max, whole);
-  }
-
-  // The same, for words already split; a word may hold a space it keeps.
-  function wrapWords(given, max, whole = false) {
-    const words = given.flatMap((word) => (whole && word.length > max ? word.match(new RegExp(`.{1,${max}}`, "g")) : [word]));
-    const lines = [];
-    let line = "";
-    for (const word of words) {
-      const piece = word.length > max ? `${word.slice(0, max - 1)}…` : word;
-      if (!line) line = piece;
-      else if (line.length + 1 + piece.length <= max) line = `${line} ${piece}`;
-      else {
-        lines.push(line);
-        line = piece;
-      }
-    }
-    if (line) lines.push(line);
-    return lines;
-  }
-
-  function sizeNode(entry) {
-    const parts = [entry.label, ...entry.facts];
-    if (entry.phyGroups.length) parts.push(`PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}`);
-    if (entry.parentUnknown && entry.kind !== "host") parts.push("parent link not reported");
-    const longest = Math.max(...parts.map((part) => String(part).length));
-    const chars = Math.min(NODE_MAX_CHARS, Math.max(NODE_MIN_CHARS, longest));
-    entry.titleLines = wrap(entry.label, chars, entry.wholeTitle).length || 1;
-    entry.lines = parts.flatMap((part, index) => wrap(part, chars, index === 0 && entry.wholeTitle));
-    entry.w = Math.max(entry.w, Math.max(...entry.lines.map((line) => line.length)) * TEXT_W + 20);
-    entry.h = Math.max(NODE_H, 14 + entry.lines.length * LINE_H + 8);
-  }
-
-  // Two boxes in one tier never show the same title unless they are the same
-  // item: first the whole name, then the HBA it hangs off, then its id.
-  function distinctTitles(model) {
-    const title = (entry) => entry.lines.slice(0, entry.titleLines).join(" ");
-    const generated = new Set();
-    for (let pass = 0; pass < 3; pass += 1) {
-      const byTitle = new Map();
-      for (const entry of model.nodes) {
-        const key = `${entry.tier}\u0000${title(entry)}`;
-        if (!byTitle.has(key)) byTitle.set(key, []);
-        byTitle.get(key).push(entry);
-      }
-      const clashes = [...byTitle.values()].filter((group) => group.length > 1);
-      if (!clashes.length) return;
-      for (const entry of clashes.flat()) {
-        const via = model.nodeById.get(entry.controllerId)?.label;
-        if (pass === 0) entry.wholeTitle = true;
-        else if (pass === 1 && via && via !== entry.label) entry.label = `${entry.label} via ${via}`;
-        else if (pass === 2) entry.label = `${entry.label} (${entry.id})`;
-        generated.add(entry);
-        sizeNode(entry);
-      }
-    }
-    // A generated title can equal another box's title. Titles the payload
-    // gave are taken first, then every box in identifier order keeps its
-    // title or gets the next free number, checked against every title in
-    // its tier: the payload's order changes nothing, and a real " #2" stays.
-    const key = (item) => `${item.tier}\u0000${title(item)}`;
-    const byId = (left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
-    const order = [...model.nodes.filter((entry) => !generated.has(entry)).sort(byId), ...[...generated].sort(byId)];
-    const taken = new Set();
-    for (const entry of order) {
-      if (taken.has(key(entry))) {
-        const base = entry.label;
-        entry.wholeTitle = true;
-        for (let number = 2; taken.has(key(entry)); number += 1) {
-          entry.label = `${base} #${number}`;
-          sizeNode(entry);
-        }
-      }
-      taken.add(key(entry));
-    }
-  }
-
-  function groupText(group) {
-    const lines = [{ text: groupHeading(group), title: true }];
-    const summary = pathSummary(group.summary);
-    if (group.collapsed) {
-      lines.push({ text: `${group.summary.withDisk} with a disk · ${group.summary.empty} empty · ${group.summary.unknown} not read` });
-      lines.push({ text: summary || "no path state in payload" });
-    } else if (summary) {
-      lines.push({ text: summary });
-    }
-    return lines;
-  }
-
-  function groupSize(group) {
-    const texts = groupText(group);
-    // An expandable group's control sits at its top left in both states,
-    // its text below the control.
-    group.textTop = group.expandable ? TOGGLE_H : 0;
-    if (group.collapsed) {
-      const width = Math.max(SUMMARY_W, ...texts.map((line) => line.text.length * TEXT_W + 20));
-      group.lines = texts.flatMap((line) => wrap(line.text, Math.floor((width - 20) / TEXT_W)).map((text) => ({ ...line, text })));
-      group.headH = 10 + group.textTop + group.lines.length * LINE_H;
-      return [width, group.headH + 10];
-    }
-    const count = group.cells.length;
-    const pitch = group.cellWidth + (CELL - CELL_BOX);
-    const perRow = pitch === CELL ? CELLS_PER_ROW : Math.max(1, Math.floor((CELLS_PER_ROW * CELL) / pitch));
-    const columns = Math.max(1, Math.min(perRow, count));
-    const rows = Math.max(1, Math.ceil(count / perRow));
-    group.perRow = perRow;
-    group.pitch = pitch;
-    // An unlinked or logical group is wide enough to say so in full.
-    const minimum = Math.max(NODE_W, texts[0].text.length * TEXT_W + 20);
-    const width = Math.max(minimum, columns * pitch + 16);
-    group.lines = texts.flatMap((line) => wrap(line.text, Math.floor((width - 20) / TEXT_W)).map((text) => ({ ...line, text })));
-    group.headH = 12 + group.textTop + group.lines.length * LINE_H;
-    return [width, group.headH + rows * CELL + 10];
-  }
-
-  function centreOf(item) {
-    return item.x + item.w / 2;
-  }
-
-  // Isotonic placement: keep the order, stay as close as possible to each
-  // desired left edge, keep `gap` between neighbours and stay in [lo, hi].
-  function placeRow(items, desired, gap, lo, hi) {
-    const offsets = [];
-    let offset = 0;
-    for (const item of items) {
-      offsets.push(offset);
-      offset += item.w + gap;
-    }
-    const blocks = [];
-    items.forEach((item, index) => {
-      blocks.push({ sum: desired[index] - offsets[index], count: 1, start: index });
-      while (blocks.length > 1) {
-        const last = blocks[blocks.length - 1];
-        const previous = blocks[blocks.length - 2];
-        if (previous.sum / previous.count <= last.sum / last.count) break;
-        previous.sum += last.sum;
-        previous.count += last.count;
-        blocks.pop();
-      }
-    });
-    const lastIndex = items.length - 1;
-    const upper = Math.max(lo, hi - offsets[lastIndex] - items[lastIndex].w);
-    for (const [index, block] of blocks.entries()) {
-      const end = index + 1 < blocks.length ? blocks[index + 1].start : items.length;
-      const value = Math.min(upper, Math.max(lo, block.sum / block.count));
-      for (let position = block.start; position < end; position += 1) items[position].x = value + offsets[position];
-    }
-  }
-
-  function linkWidth(link) {
-    return link.labelLines.length ? Math.max(...link.labelLines.map((line) => line.length)) * TEXT_W + 14 : JUNCTION;
-  }
-
-  function linkHeight(link) {
-    return link.labelLines.length ? link.labelLines.length * 15 + 5 : JUNCTION;
-  }
-
-  function properCross(p, q, r, s) {
-    const d = (q[0] - p[0]) * (s[1] - r[1]) - (q[1] - p[1]) * (s[0] - r[0]);
-    if (Math.abs(d) < 1e-9) return false;
-    const t = ((r[0] - p[0]) * (s[1] - r[1]) - (r[1] - p[1]) * (s[0] - r[0])) / d;
-    const u = ((r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0])) / d;
-    return t > 0.01 && t < 0.99 && u > 0.01 && u < 0.99;
-  }
-
-  // Work counters: every loop of the layout adds what it did, so a test can
-  // bound the cost by counting, not timing.
-  function tick(work, key, count = 1) {
-    work[key] = (work[key] || 0) + count;
-    work.total += count;
-  }
-
-  function lowerBound(values, value, key = (item) => item) {
-    let lo = 0;
-    let hi = values.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (key(values[mid]) < value) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo;
-  }
-
-  // The drawn segments of the links, split into horizontal, vertical and
-  // other pieces, each with its order in the drawing.
-  function segmentsOf(links) {
-    const horizontals = [];
-    const verticals = [];
-    const others = [];
-    let order = 0;
-    for (const link of links) {
-      const points = link.points || [];
-      for (let index = 0; index + 1 < points.length; index += 1) {
-        const [a, b] = [points[index], points[index + 1]];
-        const segment = { link, a, b, order: order += 1 };
-        if (a[1] === b[1] && a[0] !== b[0]) horizontals.push(segment);
-        else if (a[0] === b[0] && a[1] !== b[1]) verticals.push(segment);
-        else if (a[0] !== b[0] || a[1] !== b[1]) others.push(segment);
-      }
-    }
-    return { horizontals, verticals, others };
-  }
-
-  // Every horizontal and vertical piece of different links whose closed
-  // extents meet, found by one sweep down the drawing (the work is the
-  // pieces, their sorting and the pairs found, not every pair of pieces).
-  function meetingPairs(segments, work) {
-    const events = [];
-    for (const segment of segments.verticals) {
-      const [top, bottom] = [Math.min(segment.a[1], segment.b[1]), Math.max(segment.a[1], segment.b[1])];
-      events.push({ y: top, kind: 0, segment }, { y: bottom, kind: 2, segment });
-    }
-    for (const segment of segments.horizontals) events.push({ y: segment.a[1], kind: 1, segment });
-    events.sort((left, right) => left.y - right.y || left.kind - right.kind);
-    tick(work, "crossingWork", events.length * Math.max(1, Math.ceil(Math.log2(events.length + 1))));
-    const active = [];
-    const pairs = [];
-    const xOf = (segment) => segment.a[0];
-    for (const event of events) {
-      const { segment } = event;
-      if (event.kind === 0) {
-        active.splice(lowerBound(active, xOf(segment), xOf), 0, segment);
-      } else if (event.kind === 2) {
-        for (let index = lowerBound(active, xOf(segment), xOf); index < active.length; index += 1) {
-          if (active[index] === segment) {
-            active.splice(index, 1);
-            break;
-          }
-        }
-      } else {
-        const [left, right] = [Math.min(segment.a[0], segment.b[0]), Math.max(segment.a[0], segment.b[0])];
-        for (let index = lowerBound(active, left, xOf); index < active.length && xOf(active[index]) <= right; index += 1) {
-          tick(work, "crossingWork");
-          if (active[index].link !== segment.link) pairs.push([segment, active[index]]);
-        }
-      }
-    }
-    return pairs;
-  }
-
-  // Proper crossings between the drawn segments of different links.
-  function countCrossings(links, work) {
-    const segments = segmentsOf(links);
-    let count = 0;
-    for (const [horizontal, vertical] of meetingPairs(segments, work)) {
-      const [first, second] = horizontal.order < vertical.order ? [horizontal, vertical] : [vertical, horizontal];
-      if (properCross(first.a, first.b, second.a, second.b)) count += 1;
-    }
-    // A piece that is neither horizontal nor vertical (routes never make
-    // one) is checked against every other piece.
-    const all = [...segments.horizontals, ...segments.verticals, ...segments.others].sort((left, right) => left.order - right.order);
-    for (const other of segments.others) {
-      tick(work, "crossingWork", all.length);
-      for (const segment of all) {
-        if (segment.link === other.link || (segments.others.includes(segment) && segment.order <= other.order)) continue;
-        const [first, second] = segment.order < other.order ? [segment, other] : [other, segment];
-        if (properCross(first.a, first.b, second.a, second.b)) count += 1;
-      }
-    }
-    return count;
-  }
-
-  // Where a vertical piece of one link crosses a horizontal piece of another:
-  // the vertical continues, the horizontal is drawn with a small gap.
-  function crossingMarks(links, work) {
-    const marks = [];
-    const pairs = meetingPairs(segmentsOf(links), work).sort(([h1, v1], [h2, v2]) => h1.order - h2.order || v1.order - v2.order);
-    for (const [{ link: under, a, b }, { link: over, a: c, b: d }] of pairs) {
-      const [left, right] = [Math.min(a[0], b[0]), Math.max(a[0], b[0])];
-      const [top, bottom] = [Math.min(c[1], d[1]), Math.max(c[1], d[1])];
-      if (c[0] > left + 1 && c[0] < right - 1 && a[1] > top + 1 && a[1] < bottom - 1) marks.push({ x: c[0], y: a[1], over: over.id, under: under.id });
-    }
-    return marks;
-  }
-
-  // Row orders to try: the starting order and every barycentre sweep after it.
-  function orderCandidates(rows, links, rowIndex, work, sweeps = 8) {
-    const parents = new Map();
-    const children = new Map();
-    for (const link of links) {
-      if (!parents.has(link.target)) parents.set(link.target, []);
-      if (!children.has(link.source)) children.set(link.source, []);
-      parents.get(link.target).push(link.source);
-      children.get(link.source).push(link.target);
-    }
-    let order = rows.map((row) => row.items.slice());
-    const snapshot = () => order.map((items) => items.slice());
-    const candidates = [snapshot()];
-    tick(work, "orderWork", links.length);
-    const position = () => {
-      const result = new Map();
-      for (const items of order) items.forEach((item, index) => result.set(item.id, (index + 0.5) / items.length));
-      tick(work, "orderWork", result.size);
-      return result;
-    };
-    for (let iteration = 0; iteration < sweeps; iteration += 1) {
-      const down = iteration % 2 === 0;
-      const sequence = down ? order.map((_, index) => index).slice(1) : order.map((_, index) => index).reverse().slice(1);
-      for (const r of sequence) {
-        const at = position();
-        const neighbours = down ? parents : children;
-        const key = new Map(order[r].map((item) => {
-          const ids = list(neighbours.get(item.id)).filter((id) => (down ? rowIndex.get(id) < r : rowIndex.get(id) > r));
-          tick(work, "orderWork", 1 + list(neighbours.get(item.id)).length);
-          return [item.id, ids.length ? ids.reduce((sum, id) => sum + at.get(id), 0) / ids.length : at.get(item.id)];
-        }));
-        tick(work, "orderWork", order[r].length * Math.max(1, Math.ceil(Math.log2(order[r].length + 1))));
-        order[r] = order[r].slice().sort((left, right) => key.get(left.id) - key.get(right.id));
-      }
-      candidates.push(snapshot());
-    }
-    return candidates;
-  }
-
-  // Horizontal placement for one order. The widest row is spread across the
-  // width; the rows under it are placed under their parents; then, from the
-  // bottom row up, every parent is centred over the span of all its direct
-  // children (in any row below), as near that span's midpoint as the order
-  // and the gaps between boxes allow. Where the drawing's edges keep a parent
-  // outside its children's span, that pass runs again without the edges and
-  // the drawing grows (it scrolls) instead.
-  function placeRows(rows, links, rowIndex, available, work) {
-    const parents = new Map();
-    const children = new Map();
-    for (const link of links) {
-      if (rowIndex.get(link.target) <= rowIndex.get(link.source)) continue;
-      if (!parents.has(link.target)) parents.set(link.target, []);
-      if (!children.has(link.source)) children.set(link.source, []);
-      parents.get(link.target).push(link.source);
-      children.get(link.source).push(link.target);
-    }
-    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
-    const rowWidth = (row) => row.items.reduce((sum, item) => sum + item.w, 0) + Math.max(0, row.items.length - 1) * H_GAP;
-    const content = Math.max(NODE_W, ...rows.map(rowWidth), ...rows.map((row) => row.bandWidth || 0));
-    const width = Math.max(available, LEFT + content + MARGIN);
-    const lo = LEFT;
-    const hi = width - MARGIN;
-    let anchor = 0;
-    rows.forEach((row, index) => {
-      if (rowWidth(row) >= rowWidth(rows[anchor])) anchor = index;
-    });
-    const spread = (row) => {
-      const extra = Math.max(0, hi - lo - rowWidth(row));
-      const step = row.items.length ? extra / row.items.length : 0;
-      let x = lo + step / 2;
-      return row.items.map((item) => {
-        const left = x;
-        x += item.w + H_GAP + step;
-        return left;
-      });
-    };
-    for (const row of rows) spread(row).forEach((x, index) => { row.items[index].x = x; });
-    const place = (r, wanted, bounds = [lo, hi]) => {
-      const row = rows[r];
-      if (!row.items.length) return;
-      tick(work, "placeWork", row.items.length);
-      placeRow(row.items, row.items.map((item) => wanted(item) ?? item.x), H_GAP, bounds[0], bounds[1]);
-    };
-    for (let r = anchor + 1; r < rows.length; r += 1) {
-      place(r, (item) => {
-        const ids = list(parents.get(item.id)).filter((id) => byId.has(id));
-        return ids.length ? ids.reduce((sum, id) => sum + centreOf(byId.get(id)), 0) / ids.length - item.w / 2 : null;
-      });
-    }
-    const overChildren = (item) => {
-      const ids = list(children.get(item.id)).filter((id) => byId.has(id));
-      if (!ids.length) return null;
-      const left = Math.min(...ids.map((id) => byId.get(id).x));
-      const right = Math.max(...ids.map((id) => byId.get(id).x + byId.get(id).w));
-      return (left + right) / 2 - item.w / 2;
-    };
-    for (let r = rows.length - 2; r >= 0; r -= 1) place(r, overChildren);
-    tick(work, "placeWork", links.length);
-    if (!spanViolations(links, byId, rowIndex)) return width;
-    tick(work, "placeWork", links.length);
-    for (let r = rows.length - 2; r >= 0; r -= 1) place(r, overChildren, [-Infinity, Infinity]);
-    const items = [...byId.values()];
-    const shift = Math.max(0, lo - Math.min(...items.map((item) => item.x)));
-    for (const item of items) item.x += shift;
-    return Math.max(width, Math.max(...items.map((item) => item.x + item.w)) + MARGIN);
-  }
-
-  // Parents whose centre is outside the span of their direct children.
-  function spanViolations(links, byId, rowIndex) {
-    const spans = new Map();
-    for (const link of links) {
-      if (rowIndex.get(link.target) <= rowIndex.get(link.source)) continue;
-      const child = byId.get(link.target);
-      const span = spans.get(link.source) || [Infinity, -Infinity];
-      spans.set(link.source, [Math.min(span[0], child.x), Math.max(span[1], child.x + child.w)]);
-    }
-    let count = 0;
-    for (const [id, [left, right]] of spans) {
-      const centre = centreOf(byId.get(id));
-      if (centre < left - 0.5 || centre > right + 0.5) count += 1;
-    }
-    return count;
-  }
-
-  // Routes, tracks and labels for one placement. Returns the drawing height.
-  function routeLinks(model, rows, links, rowIndex, width) {
-    const { work } = model;
-    tick(work, "routePasses");
-    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
-    const gaps = rows.map(() => ({ horizontals: [], labels: [], verticals: [] }));
-    // Each item's links out and in, collected once.
-    const outOf = new Map();
-    const inTo = new Map();
-    for (const link of links) {
-      if (!outOf.has(link.source)) outOf.set(link.source, []);
-      if (!inTo.has(link.target)) inTo.set(link.target, []);
-      outOf.get(link.source).push(link);
-      inTo.get(link.target).push(link);
-    }
-    tick(work, "routeWork", links.length + byId.size);
-    // Exits: spread on the parent's bottom edge in the order of their targets.
-    const exits = new Map();
-    const arrivals = new Map();
-    for (const item of byId.values()) {
-      const out = list(outOf.get(item.id)).sort((a, b) => centreOf(byId.get(a.target)) - centreOf(byId.get(b.target)));
-      out.forEach((link, index) => exits.set(link, item.x + item.w * (index + 1) / (out.length + 1)));
-      const into = list(inTo.get(item.id)).sort((a, b) => centreOf(byId.get(a.source)) - centreOf(byId.get(b.source)));
-      arrivals.set(item.id, into);
-      tick(work, "routeWork", (out.length + into.length) * Math.max(1, Math.ceil(Math.log2(out.length + into.length + 1))));
-    }
-    // The exits that leave into each gap, sorted, for the drop and corridor searches.
-    const exitsInto = rows.map(() => []);
-    for (const link of links) {
-      const below = rowIndex.get(link.source) + 1;
-      if (below < rows.length) exitsInto[below].push(exits.get(link));
-    }
-    for (const xs of exitsInto) xs.sort((a, b) => a - b);
-    // Drops: spread on the child's top edge, kept 10 px from every exit in the
-    // same gap and from the labels of other drops.
-    const drops = new Map();
-    rows.forEach((row, r) => {
-      const exitXs = exitsInto[r];
-      // The drops placed so far in this gap, sorted by x, and the widest half label.
-      const taken = [];
-      let widest = 0;
-      const clear = (x, half) => {
-        const at = lowerBound(exitXs, x);
-        tick(work, "dropWork", 1 + Math.ceil(Math.log2(exitXs.length + taken.length + 2)));
-        if ((at < exitXs.length && exitXs[at] - x < TRACK) || (at > 0 && x - exitXs[at - 1] < TRACK)) return false;
-        const reach = Math.max(TRACK, widest + 4, half + 4);
-        for (let index = lowerBound(taken, x - reach, (other) => other.x); index < taken.length && taken[index].x <= x + reach; index += 1) {
-          tick(work, "dropWork");
-          const other = taken[index];
-          if (Math.abs(other.x - x) < Math.max(TRACK, other.half + 4, half + 4)) return false;
-        }
-        return true;
-      };
-      for (const item of row.items) {
-        const into = arrivals.get(item.id) || [];
-        into.forEach((link, index) => {
-          const ideal = item.x + item.w * (index + 1) / (into.length + 1);
-          const half = link.labelLines.length ? linkWidth(link) / 2 : JUNCTION / 2;
-          let best = ideal;
-          for (let step = 0; step <= item.w; step += 2) {
-            const options = [ideal - step, ideal + step].filter((x) => x >= item.x + 10 && x <= item.x + item.w - 10);
-            const found = options.find((x) => clear(x, half));
-            if (found !== undefined) {
-              best = found;
-              break;
-            }
-          }
-          drops.set(link, best);
-          taken.splice(lowerBound(taken, best, (other) => other.x), 0, { x: best, half });
-          widest = Math.max(widest, half);
-        });
-      }
-    });
-    // Vertical sizes: tracks per gap, label band, row heights.
-    const spans = links.map((link) => {
-      const from = rowIndex.get(link.source);
-      const to = rowIndex.get(link.target);
-      return { link, from, to, skip: to > from + 1, up: to <= from };
-    });
-    for (const span of spans) {
-      const first = Math.min(span.from + 1, rows.length - 1);
-      gaps[first].horizontals.push({ span, part: "first" });
-      if (span.skip || span.up) gaps[span.to].horizontals.push({ span, part: "last" });
-      gaps[span.to].labels.push(span.link);
-    }
-    let y = MARGIN + 8;
-    rows.forEach((row, r) => {
-      if (r > 0) {
-        const gap = gaps[r];
-        gap.top = y;
-        gap.trackTop = y + GAP_PAD;
-        const labelH = Math.max(0, ...gap.labels.map(linkHeight));
-        y += GAP_PAD + gap.horizontals.length * TRACK + LABEL_GAP + labelH + LABEL_CLEAR;
-        y = Math.max(y, gap.top + 32);
-      }
-      row.y = y;
-      const height = Math.max(row.items.length ? Math.max(...row.items.map((item) => item.h)) : 36, row.labelH || 0, row.bandH || 0);
-      row.height = height;
-      for (const item of row.items) item.y = y;
-      row.tier.y = y;
-      row.tier.h = height;
-      y += height;
-    });
-    const height = y + MARGIN + (spans.some((span) => span.up) ? 40 : 0);
-    // A "not read" or "not collected" band and its note: placed where no
-    // straight drop has to pass, and an obstacle for every corridor.
-    rows.forEach((row, r) => {
-      row.band = null;
-      if (!row.bandLines) return;
-      const avoid = spans
-        .filter((span) => (span.skip && span.from < r && span.to > r) || (span.up && span.from < r))
-        .flatMap((span) => (span.up ? [width - MARGIN - 4] : [exits.get(span.link), drops.get(span.link)]));
-      const fits = (x) => x + row.bandW <= width - MARGIN && avoid.every((v) => v < x - 16 || v > x + row.bandW + 16);
-      const x = [LEFT, ...avoid.map((v) => v + 17).sort((a, b) => a - b)].find(fits) ?? LEFT;
-      row.band = { id: `band:${row.tier.id}`, x, y: row.y, w: row.bandW, h: row.height };
-    });
-    // Corridors for links that skip rows: a free x through every row and label
-    // band in between, 10 px from every other vertical there.
-    const corridors = [];
-    const dropsInto = rows.map(() => []);
-    for (const link of links) dropsInto[rowIndex.get(link.target)]?.push(drops.get(link));
-    const verticalsIn = (r) => [...(exitsInto[r] || []), ...(dropsInto[r] || [])];
-    for (const span of spans) {
-      if (!span.skip && !span.up) continue;
-      const exit = exits.get(span.link);
-      const drop = drops.get(span.link);
-      const top = span.up ? span.from + 1 : span.from + 1;
-      const bottom = span.up ? rows.length : span.to;
-      const blocked = [];
-      for (let r = top; r < bottom; r += 1) {
-        for (const item of rows[r]?.items || []) blocked.push([item.x - 12, item.x + item.w + 12]);
-        if (rows[r]?.band) blocked.push([rows[r].band.x - 12, rows[r].band.x + rows[r].band.w + 12]);
-        for (const link of gaps[r]?.labels || []) {
-          const x = drops.get(link);
-          const half = linkWidth(link) / 2;
-          blocked.push([x - half - 8, x + half + 8]);
-        }
-      }
-      for (let r = top; r <= Math.min(bottom, rows.length - 1); r += 1) {
-        for (const x of verticalsIn(r)) if (x !== exit && x !== drop) blocked.push([x - TRACK, x + TRACK]);
-      }
-      for (const other of corridors) if (other.top <= bottom && other.bottom >= top) blocked.push([other.x - TRACK, other.x + TRACK]);
-      const target = span.up ? width - MARGIN - 4 : (exit + drop) / 2;
-      // Never through the tier label column on the left.
-      const free = (candidate) => {
-        tick(work, "corridorWork", 1 + blocked.length);
-        return candidate >= LEFT + 4 && candidate <= width - 4 && blocked.every(([left, right]) => candidate <= left || candidate >= right);
-      };
-      // Straight down under the drop or the exit when that is free: one bend fewer.
-      let x = span.up ? null : [drop, exit].find(free) ?? null;
-      for (let step = 0; step <= width && x === null; step += 2) {
-        for (const candidate of [target - step, target + step]) {
-          if (free(candidate)) {
-            x = candidate;
-            break;
-          }
-        }
-      }
-      span.corridor = x === null ? width - 4 : x;
-      corridors.push({ x: span.corridor, top, bottom });
-    }
-    // Tracks: one per horizontal, ordered in each gap to cross as little as possible.
-    rows.forEach((row, r) => {
-      const gap = gaps[r];
-      if (!gap.horizontals.length) return;
-      const ends = gap.horizontals.map((piece) => {
-        const { span, part } = piece;
-        const into = part === "first" ? exits.get(span.link) : span.corridor;
-        const out = part === "first" && !span.skip && !span.up ? drops.get(span.link) : part === "first" ? span.corridor : drops.get(span.link);
-        return { piece, into, out, lo: Math.min(into, out), hi: Math.max(into, out) };
-      });
-      // cost(a, b): crossings when track a lies above track b. Inserting an
-      // end at each position in turn changes the total by one pair, so each
-      // insertion is linear and a gap is quadratic in its lines.
-      const cost = (a, b) => {
-        tick(model.work, "trackCosts");
-        return (b.into > a.lo && b.into < a.hi ? 1 : 0) + (a.out > b.lo && a.out < b.hi ? 1 : 0);
-      };
-      const ordered = [];
-      for (const end of ends.sort((a, b) => a.lo - b.lo)) {
-        let total = 0;
-        for (const other of ordered) total += cost(end, other);
-        let bestIndex = 0;
-        let bestCost = total;
-        for (let index = 0; index < ordered.length; index += 1) {
-          total += cost(ordered[index], end) - cost(end, ordered[index]);
-          if (total < bestCost) {
-            bestCost = total;
-            bestIndex = index + 1;
-          }
-        }
-        ordered.splice(bestIndex, 0, end);
-      }
-      ordered.forEach((end, index) => {
-        end.piece.y = gap.trackTop + index * TRACK;
-        end.piece.span[end.piece.part] = end.piece.y;
-      });
-    });
-    // Points and labels.
-    for (const span of spans) {
-      const { link } = span;
-      const parent = byId.get(link.source);
-      const child = byId.get(link.target);
-      const exit = exits.get(link);
-      const drop = drops.get(link);
-      const start = parent.y + parent.h;
-      if (span.skip || span.up) {
-        link.points = [[exit, start], [exit, span.first], [span.corridor, span.first], [span.corridor, span.last], [drop, span.last], [drop, child.y]];
-      } else {
-        link.points = [[exit, start], [exit, span.first], [drop, span.first], [drop, child.y]];
-      }
-      // Drop repeated points and the middle of three in a straight line.
-      const points = link.points.filter((point, index, all) => index === 0 || point[0] !== all[index - 1][0] || point[1] !== all[index - 1][1]);
-      link.points = points.filter((point, index, all) => {
-        if (index === 0 || index === all.length - 1) return true;
-        const [a, b] = [all[index - 1], all[index + 1]];
-        return !((a[0] === point[0] && point[0] === b[0]) || (a[1] === point[1] && point[1] === b[1]));
-      });
-      const w = linkWidth(link);
-      const h = linkHeight(link);
-      link.labelBox = { x: drop - w / 2, y: child.y - LABEL_CLEAR - h, w, h };
-    }
-    return height;
-  }
-
-  function tierLines(tier) {
-    // "level 1" stays on one line: a number never sits alone on a line.
-    const words = String(tier.label ?? "").split(/\s+/).filter(Boolean);
-    const joined = words.reduce((all, word) => {
-      if (/^[0-9]+$/.test(word) && all.length) all[all.length - 1] = `${all[all.length - 1]} ${word}`;
-      else all.push(word);
-      return all;
-    }, []);
-    tier.labelLines = wrapWords(joined, TIER_LABEL_CHARS);
-    tier.noteLines = wrap(tier.note, TIER_NOTE_CHARS);
-    return 10 + (tier.labelLines.length + tier.noteLines.length) * 17;
-  }
-
-  // Each link's HBA: the controller it hangs off, for its line colour.
-  function assignChains(model) {
-    const chainOf = new Map();
-    const controllers = model.nodes.filter((entry) => entry.kind === "controller");
-    controllers.forEach((entry) => chainOf.set(entry.id, entry.id));
-    const pending = controllers.map((entry) => entry.id);
-    while (pending.length) {
-      const id = pending.shift();
-      for (const link of list(model.outgoing.get(id))) {
-        if (!chainOf.has(link.target)) {
-          chainOf.set(link.target, chainOf.get(id));
-          pending.push(link.target);
-        }
-      }
-    }
-    for (const link of model.links) {
-      link.chain = model.nodeById.get(link.target)?.kind === "controller" ? link.target : chainOf.get(link.source) || null;
-    }
-    const drawn = new Set(model.links.map((link) => link.chain));
-    model.chains = controllers.map((entry) => entry.id).filter((id) => drawn.has(id));
-    // More chains than looks: every chain is still drawn and in the legend,
-    // and the page names the chains that share a colour and line pattern.
-    if (model.chains.length > CHAIN_LOOKS) {
-      const byLook = new Map();
-      model.chains.forEach((id, index) => {
-        const look = index % CHAIN_LOOKS;
-        if (!byLook.has(look)) byLook.set(look, []);
-        byLook.get(look).push(model.nodeById.get(id)?.label || id);
-      });
-      const shared = [...byLook.values()].filter((names) => names.length > 1)
-        .map((names) => (names.length > 2 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names.join(" and ")));
-      // Every group is named: at most one per look, so the list stays short.
-      model.notices.push(`${model.chains.length} chains are drawn and there are ${CHAIN_LOOKS} line looks, so these chains share a colour and line pattern: `
-        + `${shared.join("; ")}. Every chain is drawn and in the legend; hover or focus a line to trace its chain.`);
-    }
-  }
-
-  function layoutModel(model, options = {}) {
-    const available = Math.max(0, Number(options.width) || 0);
-    // Work counters, so a test can bound the cost by counting, not timing.
-    model.work = { total: 0, trackCosts: 0, routePasses: 0, candidates: 0 };
-    for (const entry of model.nodes) sizeNode(entry);
-    distinctTitles(model);
-    const rows = model.tiers.map((tier) => ({
-      tier,
-      items: tier.id === "bays" ? model.groups : tier.nodeIds.map((id) => model.nodeById.get(id)).filter(Boolean),
-    }));
-    for (const group of model.groups) [group.w, group.h] = groupSize(group);
-    for (const row of rows) {
-      row.labelH = tierLines(row.tier);
-      const missing = !row.items.length && (row.tier.state === "not_read" || row.tier.state === "not_collected" || row.tier.state === "none");
-      row.bandLines = missing ? wrap(row.tier.note, BAND_CHARS) : null;
-      row.bandW = missing ? Math.max(NODE_W, ...row.bandLines.map((line) => line.length * TEXT_W + 24)) : 0;
-      row.bandH = missing ? 14 + row.bandLines.length * LINE_H : 0;
-      row.bandWidth = row.bandW;
-    }
-    // A child with several labelled arrivals is wide enough for them side by
-    // side, and a child with several parents wide enough that every parent's
-    // centre can sit over it (a bay group: as wide as its enclosures).
-    for (const item of [...model.nodes, ...model.groups]) {
-      const into = list(model.incoming.get(item.id));
-      if (into.length > 1) item.w = Math.max(item.w, into.reduce((sum, link) => sum + linkWidth(link) + 12, 12));
-      const parents = into.map((link) => model.nodeById.get(link.source)).filter(Boolean);
-      if (parents.length > 1) {
-        const row = parents.reduce((sum, parent) => sum + parent.w, 0) + (parents.length - 1) * H_GAP;
-        const needed = item.tier === "bays" ? row : row - (parents[0].w + parents[parents.length - 1].w) / 2 + 40;
-        item.w = Math.max(item.w, needed);
-      }
-    }
-    const rowIndex = new Map();
-    rows.forEach((row, index) => row.items.forEach((item) => rowIndex.set(item.id, index)));
-    const links = model.links.filter((link) => rowIndex.has(link.source) && rowIndex.has(link.target) && link.source !== link.target);
-    // The order that keeps every parent over its children wins; then the one
-    // with the fewest crossings; then the shortest sideways runs.
-    const byId = new Map(rows.flatMap((row) => row.items.map((item) => [item.id, item])));
-    // A drawing with more lines than SIMPLIFY_ABOVE skips the polish: one
-    // ordering pass instead of the candidate-order search, and no crossing
-    // gaps. Every device and every line is still drawn, and the page says so.
-    const lines = links.filter((link) => !link.bundle).length;
-    model.simplified = lines > SIMPLIFY_ABOVE;
-    // The order drawn last time for this scope is tried first and kept on a
-    // tie, so expanding a shelf does not reorder the drawing under the operator.
-    // Its ranks are read once per tier.
-    const previous = isRecord(options.previousOrder) ? options.previousOrder : null;
-    const previousCandidate = () => rows.map((row) => {
-      const known = list(own(previous, row.tier.id));
-      const ranks = new Map(known.map((id, index) => [id, index]));
-      tick(model.work, "orderWork", known.length + row.items.length * Math.max(1, Math.ceil(Math.log2(row.items.length + 1))));
-      const rank = (item) => ranks.get(item.id) ?? known.length;
-      return row.items.slice().sort((left, right) => rank(left) - rank(right));
-    });
-    let candidates;
-    if (model.simplified) {
-      candidates = [previous ? previousCandidate() : orderCandidates(rows, links, rowIndex, model.work, 1).pop()];
-    } else {
-      candidates = orderCandidates(rows, links, rowIndex, model.work);
-      if (previous) candidates.unshift(previousCandidate());
-    }
-    model.work.candidates = candidates.length;
-    let best = null;
-    for (const [number, candidate] of candidates.entries()) {
-      if (candidates.length === 1) {
-        best = { candidate };
-        break;
-      }
-      rows.forEach((row, index) => {
-        row.items = candidate[index];
-      });
-      const width = placeRows(rows, links, rowIndex, available, model.work);
-      routeLinks(model, rows, links, rowIndex, width);
-      const violations = spanViolations(links, byId, rowIndex);
-      const score = countCrossings(links, model.work);
-      const length = links.reduce((sum, link) => sum + link.points.reduce((total, point, index, all) => total + (index ? Math.abs(point[0] - all[index - 1][0]) : 0), 0), 0);
-      tick(model.work, "scoreWork", links.length);
-      const kept = previous && number === 0 ? 0 : 1;
-      const better = !best || violations < best.violations
-        || (violations === best.violations && (score < best.score
-          || (score === best.score && (kept < best.kept || (kept === best.kept && length < best.length - 0.5)))));
-      if (better) best = { violations, score, kept, length, candidate };
-    }
-    rows.forEach((row, index) => {
-      row.items = best ? best.candidate[index] : row.items;
-    });
-    model.width = placeRows(rows, links, rowIndex, available, model.work);
-    model.height = routeLinks(model, rows, links, rowIndex, model.width);
-    // No coordinate is ever NaN: a link that could not be routed is named.
-    for (const link of links) {
-      if (link.points && !link.points.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) {
-        link.points = null;
-        link.labelBox = null;
-        model.notices.push(`Not drawn: ${linkName(model, link)} could not be routed.`);
-      }
-    }
-    if (model.simplified) {
-      model.crossings = null;
-      model.crossingMarks = [];
-      model.notices.push(`The drawing was simplified because of its size (${lines} lines, more than ${SIMPLIFY_ABOVE}): every device and every line is drawn, `
-        + "but two steps were skipped: the search for the row order with the fewest crossings (the rows keep one ordering pass) and the crossing gaps.");
-    } else {
-      model.crossings = countCrossings(links, model.work);
-      model.crossingMarks = crossingMarks(links, model.work);
-    }
-    model.bands = [];
-    model.tiers.forEach((tier, index) => {
-      tier.order = rows[index].items.map((item) => item.id);
-      tier.band = rows[index].band ? { ...rows[index].band, lines: rows[index].bandLines } : null;
-      if (tier.band) model.bands.push(tier.band);
-    });
-    for (const group of model.groups) {
-      group.cells.forEach((bay, index) => {
-        bay.x = group.x + 8 + (index % group.perRow) * group.pitch;
-        bay.y = group.y + group.headH + Math.floor(index / group.perRow) * CELL;
-      });
-    }
-    assignChains(model);
-  }
-
-  // ---- path trace and search -------------------------------------------------
-
-  function emptyPath() {
-    return { nodes: new Set(), links: new Set(), groups: new Set(), bays: new Set() };
-  }
-
-  function walkUp(model, id, path) {
-    const pending = [id];
-    while (pending.length) {
-      const current = pending.pop();
-      for (const link of list(model.incoming.get(current))) {
-        if (path.links.has(link.id)) continue;
-        path.links.add(link.id);
-        if (!path.nodes.has(link.source)) {
-          path.nodes.add(link.source);
-          pending.push(link.source);
-        }
-      }
-    }
-  }
-
-  function walkDown(model, id, path) {
-    const pending = [id];
-    while (pending.length) {
-      const current = pending.pop();
-      for (const link of list(model.outgoing.get(current))) {
-        if (path.links.has(link.id)) continue;
-        path.links.add(link.id);
-        if (link.bundle) {
-          const group = model.groupById.get(link.target);
-          path.groups.add(link.target);
-          for (const bay of list(group?.bays)) {
-            if (bay.sources.includes(link.source)) path.bays.add(bay.bayId);
-          }
-          continue;
-        }
-        if (!path.nodes.has(link.target)) {
-          path.nodes.add(link.target);
-          pending.push(link.target);
-        }
-      }
-    }
-  }
-
-  function bayPath(model, bayId, path) {
-    const bay = model.bayById.get(bayId);
-    const group = model.groupByBay.get(bayId);
-    if (!bay || !group) return path;
-    path.bays.add(bayId);
-    path.groups.add(group.id);
-    for (const sourceId of bay.sources) {
-      path.links.add(`bundle:${sourceId}->${group.id}`);
-      path.nodes.add(sourceId);
-      walkUp(model, sourceId, path);
-    }
-    return path;
-  }
-
-  // ref: { kind: "node" | "bay" | "link" | "group", id }. The whole path the
-  // item lies on: up to the host and down to the bays.
-  function tracePath(model, ref, path = emptyPath()) {
-    if (!model || !ref) return path;
-    if (ref.kind === "bay") return bayPath(model, ref.id, path);
-    if (ref.kind === "group") {
-      const group = model.groupById.get(ref.id);
-      for (const bayId of list(group?.bayIds)) bayPath(model, bayId, path);
-      return path;
-    }
-    if (ref.kind === "link") {
-      const link = model.linkById.get(ref.id);
-      if (!link) return path;
-      path.links.add(link.id);
-      path.nodes.add(link.source);
-      walkUp(model, link.source, path);
-      if (link.bundle) {
-        const group = model.groupById.get(link.target);
-        path.groups.add(link.target);
-        for (const bay of list(group?.bays)) if (bay.sources.includes(link.source)) path.bays.add(bay.bayId);
-      } else {
-        path.nodes.add(link.target);
-        walkDown(model, link.target, path);
-      }
-      return path;
-    }
-    if (!model.nodeById.has(ref.id)) {
-      return model.bayById.has(ref.id) ? bayPath(model, ref.id, path) : path;
-    }
-    path.nodes.add(ref.id);
-    walkUp(model, ref.id, path);
-    walkDown(model, ref.id, path);
-    return path;
-  }
-
-  // "bay N" is a bay number and matches only bays with a physical location.
-  // A query of digits alone matches bay numbers first, then the serials and
-  // SAS addresses of disks and the identities of nodes that contain it. Any
-  // other text matches labels, disk names, serials, disk and expander SAS
-  // addresses.
-  function searchTopology(model, query) {
-    const text = String(query ?? "").trim().toLowerCase();
-    const result = { query: text, matches: [], path: emptyPath() };
-    if (!model || !text) return result;
-    const bayOnly = /^bay\s*([0-9]+)$/.exec(text);
-    const digits = /^[0-9]+$/.test(text) ? text : "";
-    const wanted = bayOnly ? bayOnly[1] : digits;
-    const found = new Set();
-    const addBay = (bay) => {
-      if (found.has(bay.bayId)) return;
-      found.add(bay.bayId);
-      const group = model.groupByBay.get(bay.bayId);
-      result.matches.push({ id: bay.bayId, kind: "bay", label: bay.label, groupId: group?.id || "", collapsed: Boolean(group?.collapsed) });
-      bayPath(model, bay.bayId, result.path);
-    };
-    if (wanted) {
-      for (const bay of model.bays) {
-        if (bay.locationKnown && bay.number !== "" && Number(bay.number) === Number(wanted)) addBay(bay);
-      }
-    }
-    if (bayOnly) return result;
-    for (const bay of model.bays) {
-      const hit = digits
-        ? bay.identities.some((value) => value.includes(text))
-        : bay.label.toLowerCase().includes(text) || bay.terms.some((value) => value.includes(text));
-      if (hit) addBay(bay);
-    }
-    for (const entry of model.nodes) {
-      if (entry.kind === "host") continue;
-      // Digits match what the payload names a node by, not the view's own ids.
-      const names = digits ? [entry.label, entry.rawId] : [entry.label, entry.rawId, entry.id];
-      if (names.some((value) => value && String(value).toLowerCase().includes(text))) {
-        result.matches.push({ id: entry.id, kind: "node", label: entry.label, groupId: "", collapsed: false });
-        tracePath(model, { kind: "node", id: entry.id }, result.path);
-      }
-    }
-    return result;
-  }
-
-  // ---- SVG rendering ---------------------------------------------------------
-
-  // Path marks differ by shape as well as colour (at least 8 px, centred on
-  // cx, cy); an open shape is a state with something missing or unknown.
-  const MARK_SHAPES = {
-    active: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="4"`,
-    standby: (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="4" fill="none"`,
-    fault: (cx, cy) => `<path d="M${cx - 4} ${cy - 4}L${cx + 4} ${cy + 4}M${cx + 4} ${cy - 4}L${cx - 4} ${cy + 4}" fill="none"`,
-    missing: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8" fill="none"`,
-    mapped: (cx, cy) => `<path d="M${cx} ${cy - 4.5}L${cx + 4.5} ${cy}L${cx} ${cy + 4.5}L${cx - 4.5} ${cy}Z"`,
-    unmapped: (cx, cy) => `<path d="M${cx} ${cy - 4.5}L${cx + 4.5} ${cy}L${cx} ${cy + 4.5}L${cx - 4.5} ${cy}Z" fill="none"`,
-    unknown: (cx, cy) => `<rect x="${cx - 4}" y="${cy - 4}" width="8" height="8" rx="2"`,
-    member: (cx, cy) => `<path d="M${cx} ${cy - 4}L${cx + 4.5} ${cy + 4}L${cx - 4.5} ${cy + 4}Z"`,
-    other: (cx, cy) => `<path d="M${cx - 4.5} ${cy - 4}L${cx + 4.5} ${cy - 4}L${cx} ${cy + 4}Z" fill="none"`,
-  };
-
-  const LEGEND = {
-    "is-lanes-reported": ["line", "lanes reported by both ends: count, rate, PHYs at each end"],
-    "is-lanes-unreported": ["line", "lanes not reported: the link is in the payload, its lanes are not"],
-    "is-plain-link": ["line", "link between a host, source, device and enclosure (no lane data kept)"],
-    "is-bundle": ["line", "bay bundle: the count of enclosure-to-bay links it carries"],
-    "is-on-path": ["line", "traced path (hover, focus, search or pin)"],
-    "mark-parent-unknown": ["mark", "parent link not reported"],
-    "mark-not-read": ["mark", "dashed band: not read (not collected, or the read failed), or read, but its completeness not reported"],
-    "bay-yes": ["bay", "bay with a disk"],
-    "bay-no": ["bay", "empty bay"],
-    "bay-unknown": ["bay", "occupancy not read"],
-    "path-active": ["shape", "path active (filled circle)"],
-    "path-standby": ["shape", "path passive or standby (ring)"],
-    "path-fault": ["shape", "path failed (cross)"],
-    "path-missing": ["shape", "path missing (open square)"],
-    "path-mapped": ["shape", "mapped by SES, no path state (diamond)"],
-    "path-unmapped": ["shape", "no SES mapping (open diamond)"],
-    "path-unknown": ["shape", "path state unknown (square)"],
-    "path-member": ["shape", "member health, not a path state (triangle)"],
-    "path-other": ["shape", "path state not recognised (open triangle)"],
-    "path-more": ["text", "+N: more paths than the cell can draw; the cell's name lists every path"],
-  };
-
-  // The basis is read before the word: member health is never a transport
-  // or SES state, whatever word it uses.
-  function pathTone(state, basis = "") {
-    if (basis === MEMBER_HEALTH) return "member";
-    return own(PATH_STATE_TONES, String(state || "").toLowerCase()) || "other";
-  }
-
-  function markShape(tone, cx, cy, state) {
-    return `${MARK_SHAPES[tone](cx, cy)} class="topo-path-mark path-${tone}" data-path-state="${escapeHtml(state)}"></${tone === "active" || tone === "standby" ? "circle" : tone === "missing" || tone === "unknown" ? "rect" : "path"}>`;
-  }
-
-  function onPathClass(path, set, id) {
-    if (!path) return "";
-    return path[set].has(id) ? " is-on-path" : " is-dim";
-  }
-
-  function linkStyle(link) {
-    if (link.bundle) return "is-bundle";
-    if (link.lanesState === "reported") return "is-lanes-reported";
-    if (link.lanesState === "not_reported") return "is-lanes-unreported";
-    return "is-plain-link";
-  }
-
-  function linkName(model, link) {
-    const source = model.nodeById.get(link.source)?.label || link.source;
-    const group = model.groupById.get(link.target);
-    const target = model.nodeById.get(link.target)?.label || (group ? (group.locationKnown ? "bay group" : "disk group") : link.target);
-    return `Link ${source} to ${target}`;
-  }
-
-  function linkDescription(model, link) {
-    const parts = [linkName(model, link)];
-    if (link.lanesState === "reported") {
-      parts.push(plural(link.lanes.count, "lane"), formatRate(link.lanes.rate));
-      parts.push(`PHYs ${link.lanes.sourcePhys.join(", ") || "not listed"} to PHYs ${link.lanes.targetPhys.join(", ") || "not listed"}`);
-    } else if (link.lanesState === "not_reported") {
-      parts.push("lanes not reported");
-    } else if (link.bundle) {
-      parts.push(`${link.count} enclosure-to-bay ${link.count === 1 ? "link" : "links"}`);
-    }
-    return parts.join(", ");
-  }
-
-  // Each HBA chain's look: one of four palette colours and one of eight line
-  // patterns. The first eight chains differ in pattern, so a chain never
-  // depends on colour alone there; any two of the first sixteen differ in
-  // colour, pattern or both.
-  const CHAIN_COLOURS = 4;
-  const CHAIN_DASHES = 8;
-  const CHAIN_LOOKS = CHAIN_COLOURS * CHAIN_DASHES;
-  function chainStyle(index) {
-    return { colour: (index + Math.floor(index / CHAIN_DASHES)) % CHAIN_COLOURS, dash: index % CHAIN_DASHES };
-  }
-
-  function chainClass(index) {
-    if (index < 0) return " chain-none";
-    const style = chainStyle(index);
-    return ` chain-${index} chain-colour-${style.colour} chain-dash-${style.dash}`;
-  }
-
-  function renderLink(model, link, path, used) {
-    if (!link.points) return { line: "", label: "" };
-    const style = linkStyle(link);
-    used.add(style);
-    const highlight = onPathClass(path, "links", link.id) + (pinnedRef(path, "link", link.id) ? " is-pinned" : "");
-    const points = link.points.map(([x, y]) => `${Math.round(x)},${Math.round(y)}`).join(" ");
-    const name = linkDescription(model, link);
-    const chain = chainClass(link.chain ? model.chains.indexOf(link.chain) : -1);
-    const line = `<polyline class="topo-link ${style}${chain}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title style="display:none">${escapeHtml(name)}</title></polyline>`;
-    const box = link.labelBox;
-    let body;
-    if (link.labelLines.length) {
-      body = `<rect class="topo-label-box" x="${Math.round(box.x)}" y="${Math.round(box.y)}" width="${Math.round(box.w)}" height="${Math.round(box.h)}" rx="7"></rect>`
-        + link.labelLines.map((text, index) => `<text class="topo-label-text" x="${Math.round(box.x + box.w / 2)}" y="${Math.round(box.y + 14 + index * 15)}" text-anchor="middle">${escapeHtml(text)}</text>`).join(" ");
-    } else {
-      body = `<circle class="topo-junction" cx="${Math.round(box.x + box.w / 2)}" cy="${Math.round(box.y + box.h / 2)}" r="6"></circle>`;
-    }
-    const labelName = [link.labelLines.join(" "), name].filter(Boolean).join(", ");
-    const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}" data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(labelName)}"><title style="display:none">${escapeHtml(labelName)}</title>${body}</g>`;
-    return { line, label };
-  }
-  function visibleName(lines, title) {
-    const visible = lines.join(" ");
-    return title === visible || title.startsWith(`${visible}, `) ? title : [visible, title].filter(Boolean).join(", ");
-  }
-  function nodeTitle(entry) {
-    const phys = entry.phyGroups.length ? `PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}` : "";
-    return [entry.label, ...entry.facts, phys, entry.parentUnknown && entry.kind !== "host" ? "parent link not reported" : ""].filter(Boolean).join(", ");
-  }
-
-  function renderNode(entry, path, used) {
-    const highlight = onPathClass(path, "nodes", entry.id) + (pinnedRef(path, "node", entry.id) ? " is-pinned" : "");
-    const title = nodeTitle(entry);
-    if (entry.parentUnknown && entry.kind !== "host") used.add("mark-parent-unknown");
-    const text = entry.lines.map((line, index) => `<text class="topo-node-${index < entry.titleLines ? "title" : "fact"}" x="${entry.x + 10}" y="${entry.y + 20 + index * LINE_H}">${escapeHtml(line)}</text>`).join(" ");
-    const unknown = entry.parentUnknown && entry.kind !== "host" ? " mark-parent-unknown" : "";
-    return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(visibleName(entry.lines, title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
-  }
-  function bayTitle(bay) {
-    const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
-    const paths = bay.pathStates.length
-      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}`).join(", ")}`
-      : "no path state in payload";
-    return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
-  }
-  // How many marks fit in a cell, keeping room for a "+N" count when needed.
-  function marksFor(bay) {
-    const fit = Math.max(1, Math.floor((bay.w - 4) / MARK_PITCH));
-    if (bay.pathStates.length <= fit) return { shown: bay.pathStates, more: 0 };
-    const shown = bay.pathStates.slice(0, Math.max(1, fit - 1));
-    return { shown, more: bay.pathStates.length - shown.length };
-  }
-  function renderBayCell(bay, path, used) {
-    const highlight = onPathClass(path, "bays", bay.bayId) + (pinnedRef(path, "bay", bay.bayId) ? " is-pinned" : "");
-    used.add(`bay-${bay.occupancy}`);
-    const hook = bay.traceId ? `data-fabric-trace="${escapeHtml(bay.traceId)}"` : `data-fabric-node="${escapeHtml(bay.bayId)}"`;
-    const { shown, more } = marksFor(bay);
-    const markY = bay.y + CELL_BOX - 8;
-    const marks = shown.map((state, index) => {
-      const tone = pathTone(state.state, state.basis);
-      used.add(`path-${tone}`);
-      return markShape(tone, bay.x + 2 + MARK / 2 + index * MARK_PITCH, markY, state.state);
-    }).join("");
-    let count = "";
-    if (more) {
-      used.add("path-more");
-      count = `<text class="topo-path-more" x="${bay.x + bay.w - 2}" y="${markY + 4}" text-anchor="end">+${more}</text>`;
-    }
-    const title = bayTitle(bay);
-    // A bay label with no supported number is shown as the producer wrote it.
-    const shownLabel = bay.locationKnown ? bay.number || bay.label : bay.label;
-    const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
-    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(visibleName([shownLabel, more ? `+${more}` : ""].filter(Boolean), title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number} ${marks} ${count}</g>`;
-  }
-
-  function pathSummary(summary) {
-    return [...summary.pathStates.entries()]
-      .sort(([left], [right]) => naturalCompare(left, right))
-      .map(([name, states]) => `${name}: ${[...states.entries()].map(([state, count]) => `${count} ${state}`).join(", ")}`)
-      .join(" · ");
-  }
-
-  function groupHeading(group) {
-    if (!group.locationKnown) {
-      return `Disks, ${LOCATION_UNKNOWN} · ${plural(group.bayIds.length, "disk")}`;
-    }
-    const count = plural(group.bayIds.length, "bay");
-    if (!group.enclosureIds.length) return `No enclosure link · ${count}`;
-    const numbers = group.bays.map((bay) => bay.number).filter(Boolean).sort((left, right) => Number(left) - Number(right));
-    const span = numbers.length > 1 && numbers[0] !== numbers[numbers.length - 1] ? `${numbers[0]}–${numbers[numbers.length - 1]}` : numbers[0];
-    // Only some labels carry a number: say how many, never a range for all.
-    if (numbers.length && numbers.length < group.bayIds.length) return `${count}, ${numbers.length} numbered: ${span}`;
-    const range = numbers.length ? `Bays ${numbers[0]}–${numbers[numbers.length - 1]}` : "Bays";
-    return `${range} · ${count}`;
-  }
-
-  // Where a bay group's expand or collapse control is drawn: the same place
-  // on the group in both states.
-  function toggleBox(group) {
-    return { x: group.x + 10, y: group.y + 4, w: 160, h: 22 };
-  }
-
-  function renderGroup(model, group, path, used) {
-    const highlight = path ? (path.groups.has(group.id) ? " is-on-path" : " is-dim") : "";
-    if (!group.enclosureIds.length) used.add("mark-not-read");
-    const parts = [`<rect class="topo-group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="8"></rect>`,
-      ...group.lines.map((line, index) => `<text class="topo-node-${line.title ? "title" : "fact"}" x="${group.x + 10}" y="${group.y + (group.textTop || 0) + 18 + index * LINE_H}">${escapeHtml(line.text)}</text>`)];
-    const summaryText = pathSummary(group.summary);
-    const cells = group.cells.map((bay) => renderBayCell(bay, path, used)).join("");
-    let toggle = "";
-    if (group.expandable) {
-      const label = group.collapsed ? `Draw all ${group.bayIds.length} ${group.locationKnown ? "bays" : "disks"}` : "Collapse to a summary";
-      const { x, y } = toggleBox(group);
-      toggle = `<g class="topo-expand" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(group.expandKey)}" aria-expanded="${group.collapsed ? "false" : "true"}" aria-label="${escapeHtml(label)}"><rect x="${x}" y="${y}" width="160" height="22" rx="6"></rect><text class="topo-label-text" x="${x + 80}" y="${y + 15}" text-anchor="middle">${escapeHtml(label)}</text></g>`;
-    }
-    const name = visibleName(group.lines.map((line) => line.text), `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`);
-    return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join(" ")}${cells}${toggle}</g>`;
-  }
-
-  function renderTier(tier, model) {
-    const y = tier.y ?? 0;
-    const missing = tier.state === "not_read" || tier.state === "not_collected" || tier.state === "none";
-    const tone = tier.state === "drawn" ? "ok" : token(tier.state);
-    const labelLines = tier.labelLines || [tier.label];
-    const noteLines = tier.noteLines || [tier.note];
-    const label = `<g class="topo-tier"><title style="display:none">${escapeHtml(visibleName([...labelLines, ...noteLines], [tier.label, tier.note].filter(Boolean).join(" ")))}</title>`
-      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join(" ") + " "
-      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join(" ")
-      + "</g>";
-    let band = "";
-    if (missing && tier.band) {
-      const { x, w, h, lines } = tier.band;
-      band = `<g class="topo-missing-tier mark-not-read tone-${tone}" data-topo-band="${escapeHtml(tier.id)}"><rect x="${Math.round(x)}" y="${y}" width="${Math.round(w)}" height="${h}" rx="8"></rect>`
-        + lines.map((line, index) => `<text class="topo-node-fact" x="${Math.round(x) + 12}" y="${y + 22 + index * LINE_H}">${escapeHtml(line)}</text>`).join("") + "</g>";
-    }
-    return label + band;
-  }
-
-  // view: { pin: ref, hover: ref, query }. Hover wins while it lasts; a pin is
-  // newer than the search it was made after, and typing a search clears it.
-  function activePath(model, view = {}) {
-    let path = null;
-    if (view.hover) path = tracePath(model, view.hover);
-    else if (view.pin) path = tracePath(model, view.pin);
-    else if (view.query) {
-      const found = searchTopology(model, view.query);
-      path = found.matches.length ? found.path : null;
-    }
-    if (path) path.pin = view.pin || null;
-    return path;
-  }
-
-  // The pinned item itself: what the page's inspector shows as selected.
-  function pinnedRef(path, kind, id) {
-    return Boolean(path?.pin && path.pin.kind === kind && path.pin.id === id);
-  }
-
-  function refLabel(model, ref) {
-    if (!ref) return "";
-    if (ref.kind === "link") {
-      const link = model.linkById.get(ref.id);
-      return link ? linkDescription(model, link) : "";
-    }
-    if (ref.kind === "bay") {
-      const bay = model.bayById.get(ref.id);
-      return bay ? bayTitle(bay) : "";
-    }
-    const entry = model.nodeById.get(ref.id);
-    if (entry) return nodeTitle(entry);
-    const group = model.groupById.get(ref.id);
-    return group ? groupHeading(group) : "";
-  }
-
-  // The sentence under the drawing for what is hovered or focused and what is
-  // pinned. The sentences the band is measured with are written by this
-  // function too, so the wording is in one place.
-  function traceSentence(model, view = {}) {
-    if (view.hover) return `Tracing: ${refLabel(model, view.hover)}.${view.pin ? " Pinned item kept; Esc clears." : ""}`;
-    if (view.pin) return `Pinned: ${refLabel(model, view.pin)}. Esc clears.`;
-    return DEFAULT_HINT;
-  }
-
-  // Every sentence the band can show in this drawing, which the band is
-  // measured with: it is as tall as the tallest of them at any width. No
-  // count or length stands in for drawn height, so none is left out and there
-  // is no limit: the count follows the drawing. The only sentence left out is
-  // a plain trace, which is the start of its own held-pin trace.
-  function traceSentences(model, view = {}) {
-    // What a pointer or keyboard can reach in this drawing: bays inside a
-    // collapsed shelf are not drawn, so their sentences belong to the drawing
-    // that shows the shelf in full.
-    const reachable = [];
-    for (const link of model.links) if (link.points) reachable.push({ kind: "link", id: link.id });
-    for (const entry of model.nodes) reachable.push({ kind: "node", id: entry.id });
-    for (const group of model.groups) {
-      reachable.push({ kind: "group", id: group.id });
-      for (const bay of group.cells) reachable.push({ kind: "bay", id: bay.bayId });
-    }
-    // Any item that can be pinned gives every trace its held-pin form.
-    const pin = reachable.find((ref) => ref.kind !== "group") || view.pin || null;
-    const kept = new Set([traceSentence(model)]);
-    // A pin this drawing does not show (a bay inside a collapsed shelf).
-    if (view.pin && !reachable.some((ref) => sameRef(ref, view.pin))) kept.add(traceSentence(model, { pin: view.pin }));
-    for (const ref of reachable) {
-      kept.add(traceSentence(model, { hover: ref, pin }));
-      // A group is not pinned: a click on it pins nothing.
-      if (ref.kind !== "group") kept.add(traceSentence(model, { pin: ref }));
-    }
-    return [...kept];
-  }
-
-  // Legend words for what this payload has: bays, disks without a physical
-  // location, or both.
-  function legendText(model, style, text) {
-    const located = model.bays.some((bay) => bay.locationKnown);
-    const logical = model.bays.some((bay) => !bay.locationKnown);
-    if (!logical) return text;
-    const words = located
-      ? { "is-bundle": "bundle: the count of links to bays or disks it carries", "bay-yes": "bay with a disk, or a disk", "bay-no": "empty bay" }
-      : { "is-bundle": "disk bundle: the count of links to disks it carries", "bay-yes": "disk present", "bay-no": "no disk" };
-    return own(words, style) || text;
-  }
-
-  // The search row's label and placeholder for what this payload has.
-  function searchHelp(model) {
-    const located = Boolean(model?.bays.some((bay) => bay.locationKnown));
-    const expanders = Boolean(model?.nodes.some((entry) => entry.kind === "expander"));
-    const things = [located ? "bay" : "", "disk", expanders ? "expander" : ""].filter(Boolean);
-    const label = `Find a ${things.length > 1 ? `${things.slice(0, -1).join(", ")} or ${things[things.length - 1]}` : things[0]}`;
-    const placeholder = located ? "Bay number, disk name, serial or SAS address" : "Disk name, serial or SAS address";
-    return { label, placeholder };
-  }
-
-  function legendSwatch(style, shape) {
-    if (shape === "shape") {
-      const tone = style.replace(/^path-/, "");
-      return `<svg class="fabric-topology-swatch swatch-shape" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">${markShape(tone, 6, 6, tone)}</svg>`;
-    }
-    if (shape === "text") {
-      return '<span class="fabric-topology-swatch swatch-text" aria-hidden="true">+N</span>';
-    }
-    return `<span class="fabric-topology-swatch swatch-${shape} ${style}" aria-hidden="true"></span>`;
-  }
-
-  function renderTopology(model, view = {}) {
-    const path = activePath(model, view);
-    // The traced-path entry is listed whatever is traced, so hover, focus,
-    // search and a pin never change the legend's height above the drawing.
-    const used = new Set(["is-on-path"]);
-    const lines = [];
-    const labels = [];
-    for (const link of model.links) {
-      const rendered = renderLink(model, link, path, used);
-      lines.push(rendered.line);
-      labels.push(rendered.label);
-    }
-    const tiers = model.tiers.map((tier) => renderTier(tier, model)).join("");
-    // At a crossing the horizontal line has a small gap and the vertical one
-    // runs through it: a short background stroke, then the vertical again as
-    // two pieces that both start at the crossing centre, so every line pattern
-    // (each starts with a dash) is painted through the centre.
-    const chainIndex = new Map(model.chains.map((id, index) => [id, index]));
-    const crossings = list(model.crossingMarks).map((mark) => {
-      const over = model.linkById.get(mark.over);
-      if (!over) return "";
-      const cross = onPathClass(path, "links", over.id);
-      const chain = chainClass(over.chain ? chainIndex.get(over.chain) ?? -1 : -1);
-      const x = Math.round(mark.x);
-      const y = Math.round(mark.y);
-      const piece = (end) => `<line class="topo-link topo-cross-over ${linkStyle(over)}${chain}${cross}" data-topo-cross="${escapeHtml(over.id)}" x1="${x}" y1="${y}" x2="${x}" y2="${end}"></line>`;
-      return `<line class="topo-cross-gap" x1="${x - 7}" y1="${y}" x2="${x + 7}" y2="${y}"></line>${piece(y - 9)}${piece(y + 9)}`;
-    }).join("");
-    if (model.tiers.some((tier) => tier.state === "not_read" || tier.state === "not_collected")) used.add("mark-not-read");
-    const nodes = model.nodes.map((entry) => renderNode(entry, path, used)).join("");
-    const groups = model.groups.map((group) => renderGroup(model, group, path, used)).join("");
-    const svgLabel = `Storage Fabric topology: ${model.tiers.map((tier) => `${tier.label} ${tier.note}`).join("; ")}`;
-    // The drawing at its own size; mount adds room around it when the view
-    // kept on the screen needs it.
-    const fullW = Math.ceil(model.width);
-    const fullH = Math.ceil(model.height);
-    // Fit: the whole drawing scaled into the box it was laid out for, never enlarged.
-    const box = model.box || {};
-    const scale = view.fit ? Math.min(1, box.width ? box.width / fullW : 1, box.height ? box.height / fullH : 1) : 1;
-    const shownW = Math.max(1, Math.floor(fullW * scale));
-    const shownH = Math.max(1, Math.floor(fullH * scale));
-    const svg = `<svg class="fabric-topology-svg${view.fit ? " is-fitted" : ""}" role="group" aria-label="${escapeHtml(svgLabel)}" width="${shownW}" height="${shownH}" viewBox="0 0 ${fullW} ${fullH}">`
-      + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-crossings">${crossings}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
-    const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${token(part.state)}"${part.title ? ` title="${escapeHtml(part.title)}"` : ""}>${escapeHtml(part.label)}: ${escapeHtml(part.state)}</span>`).join("");
-    const source = model.core ? "HBA" : model.contract === "storage" ? "source" : "controller or source";
-    const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><svg class="fabric-topology-swatch swatch-chain" width="28" height="8" viewBox="0 0 28 8" aria-hidden="true"><line class="topo-link is-lanes-reported${chainClass(index)}" x1="0" y1="4" x2="28" y2="4"></line></svg>${escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this ${source} down`)}</span>`).join("");
-    const legend = chains + Object.entries(LEGEND)
-      .filter(([style]) => used.has(style))
-      .map(([style, [shape, text]]) => `<span class="fabric-topology-legend-item" data-topology-legend="${style}">${legendSwatch(style, shape)}${escapeHtml(legendText(model, style, text))}</span>`)
-      .join("");
-    const fitControl = `<button class="button secondary small fabric-topology-fit" type="button" data-topology-fit="${view.fit ? "actual" : "fit"}" aria-pressed="${view.fit ? "true" : "false"}">${view.fit ? "Actual size" : "Fit"}</button>`;
-    const wide = !view.fit && box.width && fullW > box.width + 1
-      ? `<p class="fabric-topology-wide-notice subtle" data-topology-wide-notice>The drawing is ${fullW} px wide, wider than its box (${Math.round(box.width)} px): scroll sideways for the rest, or choose Fit.</p>`
-      : "";
-    const smallest = 12 * scale;
-    const fitNotice = scale < 1
-      ? `<p class="fabric-topology-fit-notice warning-item muted compact" data-topology-fit-notice>Fitted to ${Math.round(scale * 100)}% of its size: its smallest text is ${smallest.toFixed(1)} px, under 12 px. Choose Actual size to read it.</p>`
-      : "";
-    const notices = model.notices.map((text) => `<div class="warning-item muted compact">${escapeHtml(text)}</div>`).join("");
-    return `<div class="fabric-topology" data-topology-kind="${escapeHtml(model.kind)}">`
-      + `<div class="fabric-topology-parts" aria-label="Part status">${parts}</div>`
-      + `<div class="fabric-topology-legend" aria-label="Legend">${legend}</div>`
-      + notices
-      + `<div class="fabric-topology-bar">${fitControl}${wide}</div>`
-      + fitNotice
-      // The drawing, its trace band and the footer share a block: the band
-      // sticks inside it, so it never rises over Fit or the notices above
-      // the drawing (#1378).
-      + `<div class="fabric-topology-stage"><div class="fabric-topology-scroll">${svg}</div>`
-      // Below the drawing: hover text that wraps to more lines never moves
-      // the drawing, and a label, from under the pointer. The band is held as
-      // tall as the tallest sentence the drawing can show, measured in the
-      // empty box after the sentence, so its height stays the same.
-      + `<div class="fabric-topology-trace" data-topology-trace><p class="fabric-topology-pin subtle" data-topology-pin>${escapeHtml(traceSentence(model, { pin: view.pin }))}</p>`
-      + `<div class="fabric-topology-trace-measure" data-topology-measure aria-hidden="true"></div></div>`
-      + `<p class="fabric-topology-not-shown subtle">${escapeHtml(model.core ? NOT_SHOWN : NOT_SHOWN_STORAGE)}</p></div>`
-      + "</div>";
-  }
-
-  // The facts of a pinned link for the page's inspector: a bay bundle names its
-  // source enclosure and the bays it carries; a lane link its lanes.
-  function linkDetail(model, linkId) {
-    const link = model?.linkById.get(linkId);
-    if (!link) return null;
-    const source = model.nodeById.get(link.source);
-    const row = (label, value) => `<div class="kv-row"><span class="kv-label">${escapeHtml(label)}</span><span class="kv-value">${escapeHtml(value)}</span></div>`;
-    if (link.bundle) {
-      const group = model.groupById.get(link.target);
-      const carried = list(group?.bays).filter((bay) => bay.sources.includes(link.source));
-      const unit = group?.locationKnown ? "bay" : "disk";
-      // Only the numbers the payload's labels carry: a bay without one is
-      // counted, never read as 0.
-      const numbered = carried.filter((bay) => bay.number !== "").map((bay) => Number(bay.number)).sort((a, b) => a - b);
-      const unnumbered = carried.length - numbered.length;
-      const described = [`${carried.length} ${unit}s`];
-      if (group?.locationKnown && numbered.length) described.push(`numbers ${phyRanges(numbered)}`);
-      const counted = group?.locationKnown && unnumbered
-        ? `; ${plural(unnumbered, "bay")} whose ${unnumbered === 1 ? "label carries" : "labels carry"} no number`
-        : "";
-      const names = carried.length <= 48 ? carried.map((bay) => bay.label).join(", ") : `${described.join(", ")}${counted}`;
-      return {
-        title: `Selected ${unit} bundle`,
-        html: `<div class="kv-grid">${row("Source enclosure", source ? `${source.label} (${source.id})` : link.source)}`
-          + `${row(group?.locationKnown ? "Bays" : "Disks", plural(link.count, unit))}`
-          + `${row(`${group?.locationKnown ? "Bays" : "Disks"} it carries`, names || "none")}</div>`,
-      };
-    }
-    const target = model.nodeById.get(link.target);
-    const rows = [row("From", source?.label || link.source), row("To", target?.label || link.target), row("Kind", link.kind.replace(/-/g, " "))];
-    if (link.lanesState === "reported") {
-      rows.push(row("Lanes", link.labelLines[0]), row("PHYs", link.labelLines[1].replace(/^PHY /, "")));
-    } else if (link.lanesState === "not_reported") {
-      rows.push(row("Lanes", "not reported"));
-    }
-    return { title: "Selected link", html: `<div class="kv-grid">${rows.join("")}</div>` };
-  }
-
-  // ---- DOM layer (browser only) ----------------------------------------------
-
-  const live = {
-    model: null, pin: null, hover: null, query: "", scope: null, fit: false, scroll: { left: 0, top: 0 },
-    container: null, input: null, status: null, hooks: {},
-    // Why the next mount chooses the scroll position: "open",
-    // { expand: group id, control: where its expand control was on the page
-    // when it was in view, else null (keep) } or null (keep).
-    firstView: null, expandedKeys: null, refocusFit: false, quiet: null,
-    // scroll, actualScroll and restoreScroll are in drawing coordinates: the
-    // offsets held before Fit, and those to restore on Actual size. room: the
-    // space mount added before the drawing's left and top edges, so a view
-    // kept in place there stays reachable. The inner width last measured
-    // after a mount.
-    actualScroll: null, restoreScroll: null, measuredWidths: new Set(), room: { left: 0, top: 0 },
-    // The drawing's root that the last mount put in place, until release.
-    mounted: null,
-    // The sentences the last render's band can show: { sentences, key }.
-    trace: null,
-  };
-  const DEFAULT_HINT = "Hover or focus anything to trace its path; click or press Enter to pin it; Esc clears.";
-
-  function scrollBox(container) {
-    const box = container?.querySelector?.(".fabric-topology-scroll");
-    return box && typeof box === "object" ? box : null;
-  }
-
-  function refExists(model, ref) {
-    if (!model || !ref) return false;
-    if (ref.kind === "link") return model.linkById.has(ref.id);
-    if (ref.kind === "bay") return model.bayById.has(ref.id);
-    if (ref.kind === "group") return model.groupById.has(ref.id);
-    return model.nodeById.has(ref.id);
-  }
-
-  function sameRef(left, right) {
-    return Boolean(left && right && left.kind === right.kind && left.id === right.id);
-  }
-
-  // The page's selection ({ kind: "trace" | "node", id }) as a drawn item.
-  function refFromSelection(model, selection) {
-    if (!model || !selection) return null;
-    if (model.bayById.has(selection.id)) return { kind: "bay", id: selection.id };
-    const bay = selection.kind === "trace" ? model.bays.find((item) => item.traceId === selection.id) : null;
-    if (bay) return { kind: "bay", id: bay.bayId };
-    return model.nodeById.has(selection.id) ? { kind: "node", id: selection.id } : null;
-  }
-
-  function clearInput() {
-    live.query = "";
-    if (live.input) live.input.value = "";
-    if (live.status) Object.assign(live.status, { textContent: "", title: "" });
-  }
-
-  // The bay groups drawn in full, from the page's expanded list.
-  function expandedKeys(options) {
-    const expanded = isRecord(options.expanded) ? options.expanded : {};
-    return new Set(Object.keys(expanded).filter((key) => key.startsWith("topology:") && expanded[key]));
-  }
-
-  // The box's place on the page, where the browser can say.
-  function boxRect(box) {
-    const rect = typeof box?.getBoundingClientRect === "function" ? box.getBoundingClientRect() : null;
-    return rect && Number.isFinite(rect.left) && Number.isFinite(rect.top) ? { left: rect.left, top: rect.top } : { left: 0, top: 0 };
-  }
-
-  function render(fabric, options = {}) {
-    listen();
-    const previous = live.model;
-    const sameScope = live.scope !== null && previous?.scope === scopeOf(fabric);
-    const previousOrder = sameScope ? Object.fromEntries(previous.tiers.map((tier) => [tier.id, tier.order || []])) : null;
-    // The layout takes the scroll box's inner width: the box drawn last time
-    // (scroll bar and borders already taken off), or before there is one,
-    // the page's width for it less the box's two borders.
-    const box = scrollBox(live.container);
-    const measured = Number(box?.clientWidth) || 0;
-    const width = measured > 0 ? measured : Math.max(0, (Number(options.width) || 0) - 2 * SCROLL_BORDER);
-    // Fit takes the box's inner height (its limit less both borders, floored): nothing left to scroll.
-    const height = Math.max(0, Math.floor((Number(options.height) || 0) - 2 * SCROLL_BORDER));
-    const model = buildTopologyModel(fabric, { ...options, width, height, previousOrder });
-    // The page replaces the map on every render: keep the drawing's scroll
-    // position for the same scope, and start a new scope at the origin.
-    const keys = expandedKeys(options);
-    if (live.scope === null || model.scope !== live.scope) {
-      if (live.scope !== null) {
-        live.pin = null;
-        clearInput();
-      }
-      live.scroll = { left: 0, top: 0 };
-      live.firstView = "open";
-    } else {
-      // With the box's settled height, which a redraw that keeps the view
-      // keeps too.
-      if (box) live.scroll = { left: (Number(box.scrollLeft) || 0) - live.room.left, top: (Number(box.scrollTop) || 0) - live.room.top, height: Number(box.clientHeight) || 0 };
-      // Back from Fit: the offsets the drawing had before it was fitted.
-      if (live.restoreScroll) live.scroll = live.restoreScroll;
-      // A shelf expanded or collapsed: keep its control where the operator
-      // saw it on the screen when it was in view, else keep the shelf in view.
-      const toggled = [...model.groups].find((group) => keys.has(group.expandKey) !== Boolean(live.expandedKeys?.has(group.expandKey)));
-      const before = toggled && previous?.groupById.get(toggled.id);
-      const clientHeight = Number(box?.clientHeight) || 0;
-      if (toggled && before && live.firstView === null) {
-        const control = toggleBox(before);
-        const visible = Boolean(box) && measured > 0 && clientHeight > 0
-          && control.x >= live.scroll.left && control.x + control.w <= live.scroll.left + measured
-          && control.y >= live.scroll.top && control.y + control.h <= live.scroll.top + clientHeight;
-        const rect = boxRect(box);
-        live.firstView = {
-          expand: toggled.id,
-          control: visible ? { x: rect.left + control.x - live.scroll.left, y: rect.top + control.y - live.scroll.top } : null,
-        };
-      }
-    }
-    live.restoreScroll = null;
-    live.expandedKeys = keys;
-    live.scope = model.scope;
-    live.model = model;
-    if (options.selection !== undefined) {
-      const selected = refFromSelection(model, options.selection);
-      if (selected) live.pin = selected;
-      else if (live.pin?.kind !== "link") live.pin = null;
-    }
-    if (!refExists(model, live.pin)) live.pin = null;
-    live.hover = null;
-    // The sentences this drawing's band can show, for its one measure.
-    const sentences = traceSentences(model, { pin: live.pin });
-    live.trace = { sentences, key: JSON.stringify(sentences) };
-    updateSearchStatus();
-    const help = searchHelp(model);
-    if (live.input) {
-      live.input.placeholder = help.placeholder;
-      const label = live.input.labels?.[0];
-      if (label) label.textContent = help.label;
-    }
-    return renderTopology(model, { pin: live.pin, query: live.query, fit: live.fit });
-  }
-
-  // Where the scroll box starts on the first view: with the host and every
-  // HBA inside it when they fit its width. Every later redraw keeps its view.
-  function firstViewLeft(model, width) {
-    const top = model.nodes.filter((entry) => entry.kind === "host" || entry.kind === "controller");
-    const span = top.length ? [Math.min(...top.map((entry) => entry.x)), Math.max(...top.map((entry) => entry.x + entry.w))] : null;
-    const fits = span && span[1] - span[0] <= width;
-    let range = [0, Math.max(0, model.width - width)];
-    if (fits) range = [Math.max(range[0], span[1] - width), Math.min(range[1], span[0])];
-    const wanted = span ? (span[0] + span[1]) / 2 - width / 2 : 0;
-    return Math.round(Math.min(range[1], Math.max(range[0], wanted)));
-  }
-
-  // Room around the drawing so the view at drawing offsets (left, top) is
-  // reachable: before its left or top edge where they are negative, after
-  // its right or bottom edge where the view reaches past them. Mount sizes
-  // it every time, so room no later view needs is given back. boxHeight:
-  // the box's height to size for, else its height as it is.
-  function sizeRoom(box, left, top, boxHeight = null) {
-    const svg = box.querySelector?.(".fabric-topology-svg");
-    const model = live.model;
-    if (!svg || typeof svg.setAttribute !== "function" || !model || live.fit) return { left: 0, top: 0 };
-    const room = { left: Math.max(0, Math.ceil(-left)), top: Math.max(0, Math.ceil(-top)) };
-    const right = Math.max(Math.ceil(model.width), Math.ceil(left + (Number(box.clientWidth) || 0)));
-    const bottom = Math.max(Math.ceil(model.height), Math.ceil(top + (boxHeight ?? (Number(box.clientHeight) || 0))));
-    const width = right + room.left;
-    const height = bottom + room.top;
-    svg.setAttribute("width", String(width));
-    svg.setAttribute("height", String(height));
-    svg.setAttribute("viewBox", `${-room.left} ${-room.top} ${width} ${height}`);
-    return room;
-  }
-
-  // A redraw that keeps the view at drawing offsets (left, top) of a box that
-  // was `kept` px tall, where that view needs room after the new drawing:
-  // the room for the box as tall as it was (its own limit wins where the
-  // window got smaller), then the page put back where it was. Returns the
-  // box height the room is then sized for: the box gets shorter only by what
-  // the page can lose below its scroll position, and only for a view at or
-  // above the drawing's top edge. A view below it needs the box at its
-  // height for the offset to stay reachable.
-  function keepView(box, left, top, kept, page) {
-    sizeRoom(box, left, top, kept);
-    const settled = Number(box.clientHeight) || 0;
-    if (!page) return settled;
-    if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
-      window.scrollTo(page.x, page.y);
-    }
-    if (top > 0) return settled;
-    // At its top nothing holds the page back; else what its scroll range
-    // has beyond its scroll position, nothing where the page cannot say.
-    const y = Number(window.scrollY) || 0;
-    if (y <= 0) return 0;
-    const root = typeof document !== "undefined" ? document.documentElement : null;
-    const slackOf = () => {
-      const range = Number(root?.scrollHeight) - (Number(root?.clientHeight) || Number(window.innerHeight) || 0);
-      return Number.isFinite(range) ? Math.max(0, Math.floor(range - y)) : 0;
-    };
-    const slack = slackOf();
-    // No slack: nothing to give back, so the box's own height is not read.
-    if (!slack) return Math.max(0, settled);
-    // A box at a limit that is not a whole pixel gives back the fraction less than the slack (its
-    // clientHeight is rounded up), and below the limit it is whole: give back the rest in this redraw.
-    const tall = Number(typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect()?.height : NaN);
-    if (!Number.isFinite(tall) || tall === Math.round(tall)) return Math.max(0, settled - slack);
-    sizeRoom(box, left, top, settled - slack);
-    return Math.max(0, (Number(box.clientHeight) || 0) - slackOf());
-  }
-
-  // After the page has put the drawing in place: set its scroll position,
-  // and give focus back to Fit after a Fit click. pageScroll: the page's own
-  // scroll position ({ x, y }) from before this redraw, when the caller keeps
-  // one to put back; without it a kept control is aimed at the page as it
-  // is, and a kept view keeps its offsets and the box's height.
-  function mount(container, pageScroll = null) {
-    const box = scrollBox(container);
-    if (box) {
-      const reason = live.firstView;
-      live.firstView = null;
-      const width = Number(box.clientWidth) || live.model?.box?.width || 0;
-      const page = pageScroll && Number.isFinite(pageScroll.x) && Number.isFinite(pageScroll.y) ? pageScroll : null;
-      // Offsets in drawing coordinates: negative ones lie before its edge.
-      let left = live.scroll.left;
-      let top = live.scroll.top;
-      // The box height the room is sized for at the end; null: as it is then.
-      let height = null;
-      const group = reason?.expand ? live.model?.groupById.get(reason.expand) : null;
-      // The room is sized exactly for the view at the end, also when putting
-      // the page back throws, so no room sized on the way outlives an error.
-      try {
-        if (reason?.control && group && !live.fit) {
-          // The shelf's expand control where it was on the screen: both
-          // offsets, and the box's own move on the page, taken into account.
-          // The room changes the drawing's height, so the box's own height
-          // (up to its limit) and the page around it can still change: aim
-          // again from where the box settled, and size the room for that.
-          const control = toggleBox(group);
-          const aim = () => {
-            const rect = boxRect(box);
-            left = rect.left + control.x - reason.control.x;
-            top = rect.top + control.y - reason.control.y;
-          };
-          aim();
-          if (page) {
-            // The box is never taller than the window, so room of one window
-            // height after the aimed view lets it reach its height limit. While
-            // that room is there the page is as long as it gets, and its own
-            // scroll position, lost while the shorter drawing was in place,
-            // can be put back before the control is aimed at for good.
-            const roomToHeightLimit = Number(window.innerHeight) || 0;
-            sizeRoom(box, left, top + roomToHeightLimit);
-            if (typeof window.scrollTo === "function" && (window.scrollX !== page.x || window.scrollY !== page.y)) {
-              window.scrollTo(page.x, page.y);
-            }
-          } else {
-            sizeRoom(box, left, top);
-          }
-          aim();
-        } else {
-          if (reason === "open" && live.model && !live.fit && width) {
-            left = firstViewLeft(live.model, width);
-            top = 0;
-          }
-          // A redraw that keeps the view (a pin, a selection, a search, a
-          // refresh, a shelf whose control was out of view) moves neither the
-          // page nor the drawing. The new drawing is in place at its own size,
-          // so the box is for now only as tall as that drawing: where the kept
-          // view, with the box as tall as it was, reaches past the drawing's
-          // bottom edge, the room is first sized for that box. Any other
-          // redraw sizes the room once and reads nothing of the page.
-          const kept = reason === "open" ? 0 : Number(live.scroll.height) || 0;
-          if (kept > 0 && live.model && !live.fit && Math.ceil(top + kept) > Math.ceil(live.model.height)) {
-            height = keepView(box, left, top, kept, page);
-          }
-        }
-      } finally {
-        live.room = sizeRoom(box, left, top, height);
-        left += live.room.left;
-        top += live.room.top;
-        if (box.scrollLeft !== left) box.scrollLeft = left;
-        if (box.scrollTop !== top) box.scrollTop = top;
-      }
-      // The box's inner width differs from the width the drawing was laid
-      // out for (a scroll bar came or went): lay it out once more.
-      // Once per inner width while Topology is shown, so a scroll bar that comes and goes cannot loop.
-      const inner = Number(box.clientWidth) || 0;
-      const root = container.querySelector?.(".fabric-topology") || null;
-      live.mounted = root;
-      if (inner > 0 && root && live.model && Math.abs(inner - (live.model.box?.width || 0)) >= 1 && !live.measuredWidths.has(inner)
-        && typeof window.setTimeout === "function") {
-        live.measuredWidths.add(inner);
-        cancelWidthTimer();
-        globals.widthTimer = window.setTimeout(() => {
-          globals.widthTimer = null;
-          // Only for the root still in place: a later redraw measured its own.
-          if (live.mounted === root && live.container?.querySelector?.(".fabric-topology") === root) live.hooks.requestRender?.();
-        }, 0);
-      }
-    }
-    if (live.refocusFit) {
-      live.refocusFit = false;
-      container?.querySelector?.("[data-topology-fit]")?.focus?.({ preventScroll: true });
-    }
-  }
-
-  // A focused item scrolls clear of the band at the band's own height: one
-  // observer follows the band in place and writes its whole height to the
-  // topology root, where the items' scroll margin reads it. Until then, and
-  // in a browser without ResizeObserver, the reserved height is the margin.
-  const bandWatch = { observer: null, band: null, measurer: null };
-
-  function onBandResize(entries) {
-    for (const entry of entries) {
-      // The empty measurer is 1em by 1lh (stylesheet): a new font resizes it, also when the band keeps its size.
-      if (entry?.target && entry.target === bandWatch.measurer) { holdBand(bandWatch.band); continue; }
-      const height = Number(entry?.borderBoxSize?.[0]?.blockSize);
-      const root = entry?.target?.closest?.(".fabric-topology");
-      if (root?.style && Number.isFinite(height) && height > 0) root.style.setProperty("--topology-trace-height", `${Math.ceil(height)}px`);
-      // A new width, or a font that changed without one, is measured here;
-      // the band's own height changing is not.
-      if (entry?.target !== bandWatch.band) continue;
-      const inline = Number(entry?.borderBoxSize?.[0]?.inlineSize);
-      holdBand(entry.target, Number.isFinite(inline) && inline > 0 ? inline : hold.width);
-    }
-  }
-
-  // The band's height, held: every sentence the drawing can show is laid out
-  // once in the band's own measurer, at the band's width with the visible
-  // sentence's rules, the tallest is read, rounded up (never down, so no
-  // sentence is taller than the band) and held, and the measurer is emptied.
-  // A measure is kept per band width, font, line height, resolution and font
-  // load for the same sentences; hover, focus and a pin that keeps the same
-  // sentences change only the visible text and measure nothing. The cache
-  // holds a few widths, not sentences: every sentence is measured.
-  const hold = { key: null, width: null, gen: 0, cache: new Map(), band: null, px: null, resolution: null };
-  const HOLD_WIDTHS = 8;
-
-  function holdKey(band, width) {
-    const para = band.querySelector?.("[data-topology-pin]");
-    const style = para && typeof window.getComputedStyle === "function" ? window.getComputedStyle(para) : null;
-    return `${width}|${style?.font || ""}|${style?.lineHeight || ""}|${Number(window.devicePixelRatio) || 1}|${hold.gen}`;
-  }
-
-  // width: the band's own from its observer, else read once (a new band's may differ).
-  function holdBand(band, width = 0) {
-    const measurer = band?.querySelector?.("[data-topology-measure]");
-    if (!measurer || !band.style || !live.trace) return;
-    if (hold.key !== live.trace.key) hold.cache.clear();
-    hold.key = live.trace.key;
-    if (!(width > 0)) {
-      // A new band first takes the page's height, so the read lays the page
-      // out as long as it was; a wrong one is replaced below, before mount.
-      if (hold.band !== band && hold.px !== null) putHold(band, hold.px);
-      width = Number(band.getBoundingClientRect?.()?.width) || 0;
-    }
-    hold.width = width > 0 ? width : null;
-    if (!hold.width) return;
-    const key = holdKey(band, width);
-    let px = hold.cache.get(key);
-    if (px === undefined) {
-      px = measureBand(measurer, live.trace.sentences);
-      if (px === null) return;
-      hold.cache.set(key, px);
-      if (hold.cache.size > HOLD_WIDTHS) hold.cache.delete(hold.cache.keys().next().value);
-    }
-    putHold(band, px);
-  }
-
-  function putHold(band, px) {
-    if (hold.band === band && hold.px === px) return;
-    Object.assign(hold, { band, px });
-    band.style.setProperty("--topology-trace-held", `${px}px`);
-  }
-
-  // Lays the sentences out as text, reads the tallest once and empties the
-  // measurer in the same task, so they are never painted, found or read out.
-  function measureBand(measurer, sentences) {
-    const doc = measurer.ownerDocument || (typeof document !== "undefined" ? document : null);
-    if (typeof doc?.createElement !== "function") return null;
-    const items = typeof doc.createDocumentFragment === "function" ? doc.createDocumentFragment() : null;
-    for (const text of sentences) {
-      const line = doc.createElement("p");
-      line.className = "fabric-topology-pin subtle";
-      line.textContent = text;
-      if (items) items.appendChild(line);
-      else measurer.appendChild(line);
-    }
-    if (items) measurer.appendChild(items);
-    const height = Number(measurer.getBoundingClientRect?.()?.height);
-    measurer.textContent = "";
-    return Number.isFinite(height) && height > 0 ? Math.ceil(height) : null;
-  }
-
-  // A font that loads, or a new resolution, can change every sentence's
-  // height: measure the band in place again.
-  function remeasure() {
-    hold.gen += 1;
-    const band = live.container?.querySelector?.("[data-topology-trace]");
-    if (band) holdBand(band);
-  }
-
-  function onResolution() {
-    watchResolution();
-    remeasure();
-  }
-
-  function watchResolution() {
-    hold.resolution?.removeEventListener?.("change", onResolution);
-    hold.resolution = null;
-    if (typeof window.matchMedia !== "function") return;
-    hold.resolution = window.matchMedia(`(resolution: ${Number(window.devicePixelRatio) || 1}dppx)`);
-    hold.resolution?.addEventListener?.("change", onResolution);
-  }
-
-  function watchBand(container) {
-    if (typeof window.ResizeObserver !== "function") return;
-    const band = container?.querySelector?.("[data-topology-trace]") || null;
-    if (band === bandWatch.band) return;
-    unwatchBand();
-    if (!band) return;
-    if (!bandWatch.observer) bandWatch.observer = new window.ResizeObserver(onBandResize);
-    bandWatch.observer.observe(band, { box: "border-box" });
-    bandWatch.band = band;
-    bandWatch.measurer = band.querySelector?.("[data-topology-measure]") || null;
-    if (bandWatch.measurer) bandWatch.observer.observe(bandWatch.measurer);
-  }
-
-  function unwatchBand() {
-    bandWatch.observer?.disconnect();
-    Object.assign(bandWatch, { band: null, measurer: null });
-  }
-
-  // Leaving the mode: no pin, hover or search carries over, and the view's
-  // document and window listeners are removed.
-  function release() {
-    unwatchBand();
-    Object.assign(hold, { key: null, width: null, band: null, px: null });
-    hold.cache.clear();
-    live.pin = null;
-    live.hover = null;
-    live.quiet = null;
-    live.scope = null;
-    live.firstView = null;
-    live.scroll = { left: 0, top: 0 };
-    live.actualScroll = null;
-    live.restoreScroll = null;
-    live.measuredWidths = new Set();
-    live.mounted = null;
-    live.room = { left: 0, top: 0 };
-    cancelWidthTimer();
-    clearInput();
-    unlisten();
-  }
-
-  function view() {
-    return { pin: live.pin, hover: live.hover, query: live.query };
-  }
-
-  // The model the last render drew.
-  function drawnModel() {
-    return live.model;
-  }
-
-  function inspectorDetail() {
-    return live.pin?.kind === "link" ? linkDetail(live.model, live.pin.id) : null;
-  }
-
-  function refFromElement(element) {
-    const target = element?.closest?.("[data-topo-link], [data-topo-bay], [data-topo-node], [data-topo-group]");
-    if (!target || !target.closest(".fabric-topology")) return null;
-    if (target.dataset.topoLink) return { kind: "link", id: target.dataset.topoLink };
-    if (target.dataset.topoBay) return { kind: "bay", id: target.dataset.topoBay };
-    if (target.dataset.topoNode) return { kind: "node", id: target.dataset.topoNode };
-    return { kind: "group", id: target.dataset.topoGroup };
-  }
-
-  function applyHighlight() {
-    const root = live.container?.querySelector?.(".fabric-topology");
-    if (!root || !live.model) return;
-    const path = activePath(live.model, { hover: live.hover, pin: live.pin, query: live.query });
-    const mark = (selector, set, key) => {
-      root.querySelectorAll(selector).forEach((element) => {
-        const id = element.getAttribute(key);
-        element.classList.toggle("is-on-path", Boolean(path && path[set].has(id)));
-        element.classList.toggle("is-dim", Boolean(path && !path[set].has(id)));
-      });
-    };
-    mark("[data-topo-node]", "nodes", "data-topo-node");
-    mark("[data-topo-link]", "links", "data-topo-link");
-    mark("[data-topo-cross]", "links", "data-topo-cross");
-    mark("[data-topo-bay]", "bays", "data-topo-bay");
-    mark("[data-topo-group]", "groups", "data-topo-group");
-    // The line under the legend names what is traced in full, so text a box
-    // had to shorten is readable on hover and on keyboard focus alike.
-    const pin = root.querySelector("[data-topology-pin]");
-    if (pin) pin.textContent = traceSentence(live.model, { hover: live.hover, pin: live.pin });
-  }
-
-  function updateSearchStatus() {
-    if (!live.status) return;
-    const text = searchStatusText();
-    Object.assign(live.status, { textContent: text, title: text });
-  }
-
-  // One line under the search (a longer one ends in an ellipsis; the title has it all).
-  function searchStatusText() {
-    if (!live.query) return "";
-    const found = searchTopology(live.model, live.query);
-    if (!found.matches.length) return `No match for "${live.query}".`;
-    const names = found.matches.slice(0, 6).map((item) => `${item.label}${item.collapsed ? " (inside a collapsed block)" : ""}`);
-    const more = found.matches.length > names.length ? `, and ${found.matches.length - names.length} more` : "";
-    return `${found.matches.length} ${found.matches.length === 1 ? "match" : "matches"}: ${names.join(", ")}${more}.`;
-  }
-
-  // One document Esc handler and one window resize handler for the page,
-  // however often the view is attached; added while Topology is shown and
-  // removed when it is left.
-  const globals = { listening: false, timer: null, widthTimer: null };
-
-  function cancelWidthTimer() {
-    if (globals.widthTimer !== null && typeof window.clearTimeout === "function") window.clearTimeout(globals.widthTimer);
-    globals.widthTimer = null;
-  }
-
-  function onEscape(event) {
-    if (event.key !== "Escape" || !live.container?.querySelector?.(".fabric-topology")) return;
-    if (event.target?.closest?.("[data-fabric-alias-form]")) return;
-    // The item that has focus stays quiet until focus or the pointer moves
-    // to an item: the page puts focus back on it after the redraw.
-    live.quiet = refFromElement(event.target) || live.hover || live.pin;
-    live.pin = null;
-    live.hover = null;
-    clearInput();
-    applyHighlight();
-    // Esc clears the drawing's pin and the inspector's selection together.
-    live.hooks.clearSelection?.();
-    live.hooks.requestRender?.();
-  }
-
-  function onResize() {
-    // The layout takes the box's width: lay it out again when that changes.
-    if (globals.timer !== null) window.clearTimeout(globals.timer);
-    globals.timer = window.setTimeout(() => {
-      globals.timer = null;
-      if (live.container?.querySelector?.(".fabric-topology")) live.hooks.requestRender?.();
-    }, 200);
-  }
-
-  function listen() {
-    if (globals.listening) return;
-    if (typeof document !== "undefined" && typeof document.addEventListener === "function") document.addEventListener("keydown", onEscape);
-    if (typeof window.addEventListener === "function") window.addEventListener("resize", onResize);
-    if (typeof document !== "undefined") document.fonts?.addEventListener?.("loadingdone", remeasure);
-    watchResolution();
-    globals.listening = true;
-  }
-
-  function unlisten() {
-    if (!globals.listening) return;
-    if (typeof document !== "undefined" && typeof document.removeEventListener === "function") document.removeEventListener("keydown", onEscape);
-    if (typeof window.removeEventListener === "function") window.removeEventListener("resize", onResize);
-    if (typeof document !== "undefined") document.fonts?.removeEventListener?.("loadingdone", remeasure);
-    hold.resolution?.removeEventListener?.("change", onResolution);
-    hold.resolution = null;
-    if (globals.timer !== null && typeof window.clearTimeout === "function") window.clearTimeout(globals.timer);
-    globals.timer = null;
-    globals.listening = false;
-  }
-
-  // hooks: { clearSelection(), requestRender() } from the page, so a link pin,
-  // a typed search and Esc keep the page's inspector selection in step.
-  function attach(container, searchInput, searchStatus, hooks = {}) {
-    if (!container) return;
-    Object.assign(live, { container, input: searchInput || null, status: searchStatus || null, hooks: hooks || {} });
-    listen();
-    if (container.dataset?.topologyAttached) return;
-    if (container.dataset) container.dataset.topologyAttached = "true";
-    const hover = (event) => {
-      if (live.container !== container) return;
-      const ref = refFromElement(event.target);
-      if (!ref) return;
-      if (live.quiet && event.type === "focusin" && sameRef(ref, live.quiet)) return;
-      live.quiet = null;
-      live.hover = ref;
-      applyHighlight();
-    };
-    const leave = (event) => {
-      if (live.container !== container || !live.hover) return;
-      live.hover = refFromElement(event.relatedTarget);
-      applyHighlight();
-    };
-    container.addEventListener("mouseover", hover);
-    container.addEventListener("focusin", hover);
-    container.addEventListener("mouseout", leave);
-    container.addEventListener("focusout", leave);
-    container.addEventListener("click", (event) => {
-      if (live.container !== container) return;
-      if (event.target?.closest?.("[data-topology-fit]")) {
-        // Fit puts the fitted drawing at offsets 0/0; Actual size goes back
-        // to the offsets held before Fit.
-        const box = scrollBox(container);
-        if (!live.fit) live.actualScroll = { left: (Number(box?.scrollLeft) || 0) - live.room.left, top: (Number(box?.scrollTop) || 0) - live.room.top };
-        else live.restoreScroll = live.actualScroll;
-        live.fit = !live.fit;
-        live.refocusFit = true;
-        live.hooks.requestRender?.();
-        return;
-      }
-      const element = event.target?.closest?.("[data-topo-link], [data-topo-bay], [data-topo-node]");
-      const ref = refFromElement(element);
-      if (!ref) return;
-      live.quiet = null;
-      live.pin = ref;
-      applyHighlight();
-      if (ref.kind === "link") {
-        // A link is not a page selection: the inspector shows its facts.
-        live.hooks.clearSelection?.();
-        live.hooks.requestRender?.();
-      }
-    });
-    container.addEventListener("keydown", (event) => {
-      const element = event.target?.closest?.(".fabric-topology [role=\"button\"]");
-      if (!element || (event.key !== "Enter" && event.key !== " ")) return;
-      event.preventDefault();
-      element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-    });
-    if (searchInput) {
-      searchInput.addEventListener("input", () => {
-        live.query = searchInput.value.trim();
-        const hadPin = Boolean(live.pin);
-        if (live.query) live.pin = null;
-        updateSearchStatus();
-        applyHighlight();
-        if (hadPin && live.query) {
-          live.hooks.clearSelection?.();
-          live.hooks.requestRender?.();
-        }
-      });
-    }
-  }
-
+  Object.defineProperties(context, {
+    NOT_COLLECTED: { configurable: true, get: () => NOT_COLLECTED },
+    NOT_SHOWN: { configurable: true, get: () => NOT_SHOWN },
+    NOT_SHOWN_COUNTERS: { configurable: true, get: () => NOT_SHOWN_COUNTERS },
+    NOT_SHOWN_STORAGE: { configurable: true, get: () => NOT_SHOWN_STORAGE },
+    NOT_SHOWN_SHARED: { configurable: true, get: () => NOT_SHOWN_SHARED },
+    LOCATION_UNKNOWN: { configurable: true, get: () => LOCATION_UNKNOWN },
+    BAY_DETAIL_LIMIT: { configurable: true, get: () => BAY_DETAIL_LIMIT },
+    CELLS_PER_ROW: { configurable: true, get: () => CELLS_PER_ROW },
+    CELL: { configurable: true, get: () => CELL },
+    CELL_BOX: { configurable: true, get: () => CELL_BOX },
+    MARK: { configurable: true, get: () => MARK },
+    MARK_PITCH: { configurable: true, get: () => MARK_PITCH },
+    NODE_W: { configurable: true, get: () => NODE_W },
+    NODE_H: { configurable: true, get: () => NODE_H },
+    TEXT_W: { configurable: true, get: () => TEXT_W },
+    LINE_H: { configurable: true, get: () => LINE_H },
+    NODE_MIN_CHARS: { configurable: true, get: () => NODE_MIN_CHARS },
+    NODE_MAX_CHARS: { configurable: true, get: () => NODE_MAX_CHARS },
+    TIER_LABEL_CHARS: { configurable: true, get: () => TIER_LABEL_CHARS },
+    TIER_NOTE_CHARS: { configurable: true, get: () => TIER_NOTE_CHARS },
+    BAND_CHARS: { configurable: true, get: () => BAND_CHARS },
+    H_GAP: { configurable: true, get: () => H_GAP },
+    LEFT: { configurable: true, get: () => LEFT },
+    MARGIN: { configurable: true, get: () => MARGIN },
+    CHAR_W: { configurable: true, get: () => CHAR_W },
+    SUMMARY_W: { configurable: true, get: () => SUMMARY_W },
+    PHYS_CELL_W: { configurable: true, get: () => PHYS_CELL_W },
+    PHYS_CELL_H: { configurable: true, get: () => PHYS_CELL_H },
+    PHYS_CELL_MAX: { configurable: true, get: () => PHYS_CELL_MAX },
+    PHYS_CELL_MIN: { configurable: true, get: () => PHYS_CELL_MIN },
+    PHYS_CELL_NAMED: { configurable: true, get: () => PHYS_CELL_NAMED },
+    PHYS_CELL_TALL: { configurable: true, get: () => PHYS_CELL_TALL },
+    PHYS_GAP: { configurable: true, get: () => PHYS_GAP },
+    GROUP_GAP: { configurable: true, get: () => GROUP_GAP },
+    STACK_GAP: { configurable: true, get: () => STACK_GAP },
+    CAPTION_H: { configurable: true, get: () => CAPTION_H },
+    RAIL_CLEAR: { configurable: true, get: () => RAIL_CLEAR },
+    RAIL_STEP: { configurable: true, get: () => RAIL_STEP },
+    STACK_ROOM: { configurable: true, get: () => STACK_ROOM },
+    DOWN_STEP: { configurable: true, get: () => DOWN_STEP },
+    BUS_STEP: { configurable: true, get: () => BUS_STEP },
+    BUS_PAD: { configurable: true, get: () => BUS_PAD },
+    CHIP_GAP: { configurable: true, get: () => CHIP_GAP },
+    LEFT_BOARD: { configurable: true, get: () => LEFT_BOARD },
+    BOARD_ROOM: { configurable: true, get: () => BOARD_ROOM },
+    PHY_COUNTERS: { configurable: true, get: () => PHY_COUNTERS },
+    NOT_READ: { configurable: true, get: () => NOT_READ },
+    PROVISIONAL_PHY_THRESHOLDS: { configurable: true, get: () => PROVISIONAL_PHY_THRESHOLDS },
+    THRESHOLD_NOTE: { configurable: true, get: () => THRESHOLD_NOTE },
+    TREND_NOTE: { configurable: true, get: () => TREND_NOTE },
+    TIER_WORDS: { configurable: true, get: () => TIER_WORDS },
+    worse: { configurable: true, get: () => worse },
+    phyTier: { configurable: true, get: () => phyTier },
+    TOGGLE_H: { configurable: true, get: () => TOGGLE_H },
+    SCROLL_BORDER: { configurable: true, get: () => SCROLL_BORDER },
+    TRACK: { configurable: true, get: () => TRACK },
+    GAP_PAD: { configurable: true, get: () => GAP_PAD },
+    LABEL_GAP: { configurable: true, get: () => LABEL_GAP },
+    LABEL_CLEAR: { configurable: true, get: () => LABEL_CLEAR },
+    JUNCTION: { configurable: true, get: () => JUNCTION },
+    NAME_LIMIT: { configurable: true, get: () => NAME_LIMIT },
+    SIMPLIFY_ABOVE: { configurable: true, get: () => SIMPLIFY_ABOVE },
+    STUB_GROUP_ABOVE: { configurable: true, get: () => STUB_GROUP_ABOVE },
+    LANE_LINKS: { configurable: true, get: () => LANE_LINKS },
+    HIDDEN_KINDS: { configurable: true, get: () => HIDDEN_KINDS },
+    MEMBER_HEALTH: { configurable: true, get: () => MEMBER_HEALTH },
+    CACHE_FRESH: { configurable: true, get: () => CACHE_FRESH },
+    STATE_UNREAD: { configurable: true, get: () => STATE_UNREAD },
+    PATH_STATE_TONES: { configurable: true, get: () => PATH_STATE_TONES },
+    PATH_CAPTIONS: { configurable: true, get: () => PATH_CAPTIONS },
+    list: { configurable: true, get: () => list },
+    isRecord: { configurable: true, get: () => isRecord },
+    own: { configurable: true, get: () => own },
+    escapeHtml: { configurable: true, get: () => escapeHtml },
+    token: { configurable: true, get: () => token },
+    finite: { configurable: true, get: () => finite },
+    decimal: { configurable: true, get: () => decimal },
+    naturalCompare: { configurable: true, get: () => naturalCompare },
+    plural: { configurable: true, get: () => plural },
+    named: { configurable: true, get: () => named },
+    PLATFORM_WORDS: { configurable: true, get: () => PLATFORM_WORDS },
+    NAMED_PLATFORMS: { configurable: true, get: () => NAMED_PLATFORMS },
+    KIND_PLATFORMS: { configurable: true, get: () => KIND_PLATFORMS },
+    GENERIC_KIND: { configurable: true, get: () => GENERIC_KIND },
+    kindMatchesPlatform: { configurable: true, get: () => kindMatchesPlatform },
+    fabricContract: { configurable: true, get: () => fabricContract },
+    readState: { configurable: true, get: () => readState },
+    farEnd: { configurable: true, get: () => farEnd },
+    phyRanges: { configurable: true, get: () => phyRanges },
+    laneRate: { configurable: true, get: () => laneRate },
+    formatRate: { configurable: true, get: () => formatRate },
+    nodeLabel: { configurable: true, get: () => nodeLabel },
+    clip: { configurable: true, get: () => clip },
+    bayOccupancy: { configurable: true, get: () => bayOccupancy },
+    locationKnown: { configurable: true, get: () => locationKnown },
+    readPayload: { configurable: true, get: () => readPayload },
+    inventoryBySlot: { configurable: true, get: () => inventoryBySlot },
+    searchTerms: { configurable: true, get: () => searchTerms },
+    identityTerms: { configurable: true, get: () => identityTerms },
+    bayNumberOf: { configurable: true, get: () => bayNumberOf },
+    sasRate: { configurable: true, get: () => sasRate },
+    text: { configurable: true, get: () => text },
+    sasAddressOf: { configurable: true, get: () => sasAddressOf },
+    tailDigits: { configurable: true, get: () => tailDigits, set: (value) => { tailDigits = value; } },
+    tail: { configurable: true, get: () => tail },
+    addressTail: { configurable: true, get: () => addressTail },
+    protocolOf: { configurable: true, get: () => protocolOf },
+    phyFacts: { configurable: true, get: () => phyFacts },
+    sasIndex: { configurable: true, get: () => sasIndex },
+    joinPort: { configurable: true, get: () => joinPort },
+    rateText: { configurable: true, get: () => rateText },
+    counterText: { configurable: true, get: () => counterText },
+    errorDigest: { configurable: true, get: () => errorDigest },
+    errorSummary: { configurable: true, get: () => errorSummary },
+    tierForNode: { configurable: true, get: () => tierForNode },
+    hiddenByDesign: { configurable: true, get: () => hiddenByDesign },
+    expanderLevel: { configurable: true, get: () => expanderLevel },
+    countTier: { configurable: true, get: () => countTier },
+    pathCaption: { configurable: true, get: () => pathCaption },
+    nodeFacts: { configurable: true, get: () => nodeFacts },
+    slotIdentities: { configurable: true, get: () => slotIdentities },
+    inventoryLayout: { configurable: true, get: () => inventoryLayout },
+    physicalEnclosures: { configurable: true, get: () => physicalEnclosures },
+    enclosureName: { configurable: true, get: () => enclosureName },
+    stackEnclosures: { configurable: true, get: () => stackEnclosures },
+    planNeighbours: { configurable: true, get: () => planNeighbours },
+    stubFacts: { configurable: true, get: () => stubFacts },
+    enclosureOfExpander: { configurable: true, get: () => enclosureOfExpander },
+    neighbourRows: { configurable: true, get: () => neighbourRows },
+    neighbourText: { configurable: true, get: () => neighbourText },
+    finishNeighbours: { configurable: true, get: () => finishNeighbours },
+    adoptLinuxTransport: { configurable: true, get: () => adoptLinuxTransport },
+    withLinuxTransport: { configurable: true, get: () => withLinuxTransport },
+    deviceShort: { configurable: true, get: () => deviceShort },
+    expanderInPath: { configurable: true, get: () => expanderInPath },
+    notCollectedReason: { configurable: true, get: () => notCollectedReason },
+    headFacts: { configurable: true, get: () => headFacts },
+    headInfo: { configurable: true, get: () => headInfo },
+    buildTopologyModel: { configurable: true, get: () => buildTopologyModel },
+    planBoards: { configurable: true, get: () => planBoards },
+    viaRows: { configurable: true, get: () => viaRows },
+    chipOfNode: { configurable: true, get: () => chipOfNode },
+    nodeName: { configurable: true, get: () => nodeName },
+    viaText: { configurable: true, get: () => viaText },
+    bayRange: { configurable: true, get: () => bayRange },
+    enclosureFacts: { configurable: true, get: () => enclosureFacts },
+    scopeOf: { configurable: true, get: () => scopeOf },
+    modelParts: { configurable: true, get: () => modelParts },
+  });
+  window.SasFabricTopologyLayout(context);
+  window.SasFabricTopologyUI(context);
   window.SasFabricTopology = {
     NOT_COLLECTED,
     BAY_DETAIL_LIMIT,
     buildTopologyModel,
-    tracePath,
-    searchTopology,
-    renderTopology,
-    pathTone,
-    chainStyle,
-    searchHelp,
-    linkDetail,
-    render,
+    tracePath: context.tracePath,
+    searchTopology: context.searchTopology,
+    renderTopology: context.renderTopology,
+    pathTone: context.pathTone,
+    chainStyle: context.chainStyle,
+    searchHelp: context.searchHelp,
+    linkDetail: context.linkDetail,
+    cardFor: context.cardFor,
+    detailFor: context.detailFor,
+    boardLabel: context.boardLabel,
+    composeInspector: context.composeInspector,
+    render: context.render,
     // After the drawing is in place: the band's height is held first, so
     // the page is as long as it stays when mount puts the view and the page
     // back; then the band is followed.
     mount: (container, ...rest) => {
-      holdBand(container?.querySelector?.("[data-topology-trace]"));
-      mount(container, ...rest);
-      watchBand(container);
+      context.holdBand(container?.querySelector?.("[data-topology-trace]"));
+      context.mount(container, ...rest);
+      context.watchBand(container);
     },
-    release,
-    view,
-    drawnModel,
-    inspectorDetail,
-    attach,
+    release: context.release,
+    view: context.view,
+    drawnModel: context.drawnModel,
+    inspectorDetail: context.inspectorDetail,
+    attach: context.attach,
   };
 })();

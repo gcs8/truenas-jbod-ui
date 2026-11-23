@@ -21,7 +21,7 @@ const NOT_COLLECTED = "HBA and expander hops are not collected on this platform.
 function loadTopology() {
   assert.ok(fs.existsSync(TOPOLOGY_PATH), "app/static/sas_fabric_topology.js must exist");
   const sandbox = vm.createContext({ window: {} });
-  vm.runInContext(fs.readFileSync(TOPOLOGY_PATH, "utf8"), sandbox);
+  vm.runInContext(require("./helpers/fabric_topology").topologySource(), sandbox);
   const api = sandbox.window.SasFabricTopology;
   assert.ok(api, "the file must publish window.SasFabricTopology");
   return api;
@@ -267,9 +267,12 @@ test("a link with reported lanes is labelled with lane count, PHYs at both ends 
   const model = T.buildTopologyModel(reported.fabric);
   const item = model.linkById.get(`controller-expander:${reported.hba.id}->${reported.exp.id}`);
   assert.equal(item.lanesState, "reported");
-  assert.deepEqual({ ...item.lanes, sourcePhys: [...item.lanes.sourcePhys], targetPhys: [...item.lanes.targetPhys] },
-    { count: 4, sourcePhys: [0, 1, 2, 3], targetPhys: [32, 33, 34, 35], rate: 12 });
-  assert.deepEqual([...item.labelLines], ["x4 · 12 Gb/s", "PHY 0–3 ↔ 32–35"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(item.lanes)), {
+    count: 4, sourcePhys: [0, 1, 2, 3], targetPhys: [32, 33, 34, 35], rate: 12,
+    basis: "both_endpoints", targetBasis: "",
+    rows: [0, 1, 2, 3].map((source) => ({ source, target: source + 32, rate: 12 })),
+  });
+  assert.deepEqual([...item.labelLines], ["x4 · 12 Gb/s", "PHY 0–3 ↔ PHY 32–35"]);
   // The HBA groups its PHYs by the wide port the payload reports.
   const hba = model.nodeById.get(reported.hba.id);
   assert.deepEqual([...hba.phyGroups].map((group) => `${[...group.phys].join(",")}>${group.target}`), [`0,1,2,3>${reported.exp.id}`]);
@@ -279,7 +282,7 @@ test("a link with reported lanes is labelled with lane count, PHYs at both ends 
   const rateless = oneHbaOneExpander({ reported: noRate });
   const rateModel = T.buildTopologyModel(rateless.fabric);
   const rateLink = rateModel.linkById.get(`controller-expander:${rateless.hba.id}->${rateless.exp.id}`);
-  assert.deepEqual([...rateLink.labelLines], ["x2 · rate not reported", "PHY 4–5 ↔ 8–9"]);
+  assert.deepEqual([...rateLink.labelLines], ["x2 · rate not reported", "PHY 4–5 ↔ PHY 8–9"]);
   assert.equal(rateLink.lanes.rate, null);
 
   const plain = oneHbaOneExpander();

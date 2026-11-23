@@ -3708,7 +3708,7 @@
 
   function aliasScopeLabel(kind) {
     const kindName = String(kind || "").toLowerCase();
-    if (["bay", "backplane", "ses-enclosure", "mpr-enclosure", "storage-enclosure", "expander"].includes(kindName)) {
+    if (["bay", "enclosure", "backplane", "ses-enclosure", "mpr-enclosure", "storage-enclosure", "expander"].includes(kindName)) {
       return "Enclosure";
     }
     return "System";
@@ -3848,7 +3848,7 @@
     }
   }
 
-  function renderInspector(fabric) {
+  function renderInspector(fabric, pageOnly = false) {
     const trace = selectedTrace();
     const node = selectedNode();
     if (!fabric) {
@@ -3856,10 +3856,10 @@
       elements.inspectorBody.innerHTML = "No fabric data loaded.";
       return;
     }
-    const topologyDetail = state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
+    const topologyDetail = !pageOnly && state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
     if (topologyDetail) {
-      elements.inspectorTitle.textContent = topologyDetail.title;
-      elements.inspectorBody.innerHTML = topologyDetail.html;
+      window.SasFabricTopology.composeInspector(topologyDetail, { nodes: nodeMap(fabric), renderAliasRow,
+        renderPage: () => renderInspector(fabric, true), title: elements.inspectorTitle, body: elements.inspectorBody });
       return;
     }
     if (trace) {
@@ -4405,6 +4405,7 @@
           expanded: state.expandedSlotLists,
           selection: currentSelectionRef(),
           inventory: state.snapshot,
+          enclosureHref: (id) => { const params = selectedParams({ includeMode: true }); params.set("enclosure_id", id); return `/sas-fabric?${params}`; },
           width: elements.mapPanel.clientWidth,
           // The box's height limit (78vh in the stylesheet), not rounded.
           height: (window.innerHeight || 0) * 0.78,

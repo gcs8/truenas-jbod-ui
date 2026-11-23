@@ -205,7 +205,7 @@ function fakePage(T0 = null, settings = {}) {
       removeEventListener: (name) => fontHandlers.delete(name),
     },
   };
-  const T = T0 ? T0({ window, document }) : loadSource(fs.readFileSync(SOURCE_PATH, "utf8"), { window, document });
+  const T = T0 ? T0({ window, document }) : loadSource(H.topologySource(), { window, document });
   T.attach(container, null, null, {});
   const page = {
     T,
@@ -266,7 +266,7 @@ function fakePage(T0 = null, settings = {}) {
 
 // A topology view whose sentence builder records every list it returns.
 function recorded(calls) {
-  const source = fs.readFileSync(SOURCE_PATH, "utf8");
+  const source = H.topologySource();
   assert.equal(source.split(BUILDER).length - 1, 1, "the sentence builder is one function");
   const wrapped = source.replace(BUILDER, "function traceSentences(model, view = {}) { const made = traceSentencesBuilt(model, view); calls.lists.push(made); return made; }\n  function traceSentencesBuilt(model, view = {}) {");
   return (context) => loadSource(wrapped, { ...context, calls });
@@ -303,6 +303,8 @@ function producible(page, fabric, options) {
     handlers.get("click")({ target: element(ref) });
     see();
   }
+  // Force a pin instead of toggling off the sole item in a host-only drawing.
+  page.escape();
   if (pinnable.length) handlers.get("click")({ target: element(pinnable[0]) });
   visit();
   sentences.delete("");
@@ -427,8 +429,12 @@ test("every sentence the band shows, through hover, focus, a pin and a held pin,
   }
   const page = fakePage();
   page.draw(widePort(), { width: 1100 });
-  assert.ok(page.lastFill().some((text) => text.includes("PHYs 24, 25, 26, 27, 28, 29, 30, 31 to PHYs 0, 1, 2, 3, 4, 5, 6, 7. Pinned item kept; Esc clears.")),
-    "the wide port's whole PHY list is measured");
+  const api = H.loadTopology();
+  const model = api.buildTopologyModel(widePort());
+  const cable = model.links.find((link) => link.lanes?.count === 8);
+  const full = JSON.stringify(api.cardFor(model, { kind: "link", id: cable.id }));
+  assert.match(full, /24–31/);
+  assert.match(full, /0–7/); // Full SAS detail moved to the one hover card, not the short trace band.
 });
 
 test("the held height is the tallest laid-out sentence the drawing can show, rounded up: a sample by length would miss it", () => {
@@ -657,8 +663,8 @@ test("a host-only fabric with a long host label: the host's held-pin focus sente
 });
 
 test("the band's sentences are written once: a change to the wording changes the visible sentence and the measured ones alike", () => {
-  const source = fs.readFileSync(SOURCE_PATH, "utf8");
-  for (const words of ["Tracing: ", "Pinned: ", " Pinned item kept; Esc clears.", ". Esc clears."]) {
+  const source = H.topologySource();
+  for (const words of ["Tracing: ", "Pinned: ", " Pinned item kept; Esc clears.", ". Click it again, click the background or press Esc to clear."]) {
     assert.equal(source.split(words).length - 1, 1, `${JSON.stringify(words)} is written once`);
   }
   const changed = source.replace("Tracing: ", "Following: ").replace(" Pinned item kept; Esc clears.", " The pin stays; Esc clears it.");
@@ -684,10 +690,10 @@ test("hover, focus, a pin and Esc write only the visible sentence's text and rea
       return true;
     },
   });
-  const marks = new Set(["[data-topo-node]", "[data-topo-link]", "[data-topo-cross]", "[data-topo-bay]", "[data-topo-group]"]);
+  const marks = new Set(["[data-topo-node]", "[data-topo-link]", "[data-topo-cross]", "[data-topo-bay]", "[data-topo-group]", "[data-topo-port]"]);
   const root = new Proxy({}, {
     get(target, key) {
-      if (key === "querySelector") return (selector) => { if (selector !== "[data-topology-pin]") log.push(`query ${selector}`); return selector === "[data-topology-pin]" ? pin : null; };
+      if (key === "querySelector") return (selector) => { if (!["[data-topology-pin]", "[data-topology-tip]", "[data-topology-clear]"].includes(selector)) log.push(`query ${selector}`); return selector === "[data-topology-pin]" ? pin : null; };
       if (key === "querySelectorAll") return (selector) => { if (!marks.has(selector)) log.push(`query all ${selector}`); return []; };
       log.push(`root get ${String(key)}`);
       return undefined;

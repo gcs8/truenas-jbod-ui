@@ -57,6 +57,8 @@ const UI_SOURCES = {
     "app/static/app.js",
     "app/static/app_smart_formatters.js",
     "app/static/sas_fabric_view.js",
+    "app/static/sas_fabric_topology_layout.js",
+    "app/static/sas_fabric_topology_ui.js",
     "app/static/sas_fabric_topology.js",
     "app/static/sas_fabric_transport.js",
     "admin_service/static/admin.js",
