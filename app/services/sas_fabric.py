@@ -348,6 +348,13 @@ def _build_sas_fabric_result(
             if node is not None:
                 node.raw.update(provenance)
         available = available or any(_slot_has_disk(slot) for slot in location_unknown_slots)
+    if nodes is not None and links is not None and traces is not None:
+        from app.services.sas_fabric_enclosures import project_enclosures
+        project_enclosures(nodes, links, traces, snapshot)
+        _apply_sas_fabric_aliases(nodes=nodes, traces=traces, controllers=controllers or [], paths=paths or [],
+                                 aliases=_sas_fabric_alias_map(aliases or []))
+        enclosures = [_node_raw_for_payload(node) for node in nodes.values()
+                      if node.kind in {"enclosure", "mpr-enclosure", "ses-enclosure", "storage-enclosure"}]
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
@@ -424,7 +431,8 @@ def _add_backplane_zone_nodes(
     nodes: dict[str, SasFabricNode],
     snapshot: InventorySnapshot,
 ) -> dict[int, dict[str, Any]]:
-    backplane_zones = _backplane_zones_for_slots([slot for slot in snapshot.slots if slot.physical_location_known])
+    # Geometry is not hardware evidence. Never fabricate boards from quarters.
+    backplane_zones: dict[int, dict[str, Any]] = {}
     for zone in backplane_zones.values():
         add_node(
             nodes,
@@ -751,10 +759,6 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ]
             )
             bay_related_links.append(link.id)
-            # Direct paths require CAM identity. Do not use the legacy location
-            # fallback when their controller-local target was not read.
-            if direct_members and _cam_member_target(cam_devices, controller_name, member.device_name) is None:
-                continue
             mpr_context = _add_mpr_member_trace_context(
                 nodes=nodes,
                 links=links,
@@ -771,6 +775,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 slot_location_numbers=_slot_location_number_candidates(slot),
                 slot_ses_number=_parse_mpr_slot_number((slot.raw_status or {}).get("ses_slot_number")),
                 diagnostics=mpr_kernel_diagnostics,
+                own_evidence=direct_members,
             )
             if mpr_context:
                 bay_related_nodes.extend(mpr_context["node_ids"])
@@ -962,6 +967,11 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         **({"units_over_controller_limit": len(omitted_units)} if omitted_units else {}),
         "unread_phy_tables": sum(unread_tables.values()),
     }
+    if members_by_slot.not_read_reasons:
+        controller_read["counts"]["controllers"] = "partial"
+    if (members_by_slot.path_limited or members_by_slot.ownership_limited
+            or any(not member.controller_label for members in members_by_slot.values() for member in members)):
+        controller_read["counts"]["paths"] = "partial"
     # Without controller data the bays, pools and vdevs the inventory already
     # knows are still drawn; the warning above says what could not be read.
     inventory_drawn = any(node.kind in {"bay", "pool", "vdev"} for node in nodes.values())
@@ -2280,11 +2290,9 @@ PATH_EVIDENCE_REASON = "path evidence not from this bay view's read"
 def fabric_path_evidence(ssh_outputs: Mapping[str, str | None]) -> str:
     """Digest of the CAM and mprutil replies that direct paths are read from."""
     digest = hashlib.sha256()
-    for command, output in sorted(
-        (canonicalize_ssh_command(command), output)
-        for command, output in ssh_outputs.items()
-        if output is not None
-    ):
+    canonical = {canonicalize_ssh_command(command): output
+                 for command, output in ssh_outputs.items() if output is not None}
+    for command, output in sorted(canonical.items()):
         if command == "camcontrol devlist -v" or command.startswith("mprutil "):
             for part in (command, output):
                 encoded = part.encode("utf-8", "surrogatepass")

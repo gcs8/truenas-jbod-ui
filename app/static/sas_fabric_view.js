@@ -2163,7 +2163,7 @@
 
   function backplaneZoneForSlot(slotNumber, fabric) {
     const zoneNode = Array.from(nodeMap(fabric).values()).find((node) => (
-      node.kind === "backplane" && sortedSlots(node.related_slots).includes(Number(slotNumber))
+      node.kind === "enclosure" && sortedSlots(node.related_slots).includes(Number(slotNumber))
     ));
     if (zoneNode) {
       const slots = sortedSlots(zoneNode.related_slots);
@@ -2178,20 +2178,7 @@
         range: zoneNode.raw?.range || (slots.length ? `Bays ${formatSlotLabel(start)}-${formatSlotLabel(end)}` : "Bays n/a"),
       };
     }
-    const slotCount = Math.max(layoutSlotCount(fabric), Number(slotNumber) + 1, 1);
-    const zoneCount = slotCount >= 4 ? 4 : 1;
-    const zoneSize = Math.max(1, Math.ceil(slotCount / zoneCount));
-    const zoneIndex = Math.min(zoneCount - 1, Math.floor(Number(slotNumber) / zoneSize));
-    const start = zoneIndex * zoneSize;
-    const end = Math.min(slotCount - 1, start + zoneSize - 1);
-    return {
-      id: `backplane:${zoneIndex}`,
-      index: zoneIndex,
-      label: `Backplane Zone ${zoneIndex + 1}`,
-      rawLabel: `Backplane Zone ${zoneIndex + 1}`,
-      slots: Array.from({ length: end - start + 1 }, (_, index) => start + index),
-      range: `Bays ${formatSlotLabel(start)}-${formatSlotLabel(end)}`,
-    };
+    return { id: "", index: null, label: "Enclosure not read", rawLabel: "Enclosure not read", slots: [], range: "Membership not read" };
   }
 
   function formatLinkSpeed(value) {
@@ -2974,6 +2961,7 @@
     const mprDevices = list(trace.metrics?.mpr_devices);
     const controller = seed.controller || controllerNameFromId(seed.controller_id);
     const stateName = classToken(seed.state || seed.pathState?.state || seed.pathNode?.status || seed.mprDevice?.state);
+    if (list(seed.pathState?.not_read).includes("controller")) return null;
     if (seed.mprDevice) {
       return seed.mprDevice;
     }
@@ -2986,10 +2974,22 @@
       || null;
   }
 
-  // A named path with no MPR row of its own, in a bay where other paths have
-  // rows: nothing in the bay trace is this port's own detail.
+  function ownDirectPath(seed, trace) {
+    return Boolean(seed.device_name) && list(trace.evidence).includes("sesutil map shared bay");
+  }
+
   function branchPortNotRead(seed, mprDevice, trace) {
-    return Boolean(seed.device_name) && !mprDevice && list(trace.metrics?.mpr_devices).length > 0;
+    return Boolean(seed.device_name) && !mprDevice && (ownDirectPath(seed, trace) || list(trace.metrics?.mpr_devices).length > 0);
+  }
+
+  // Bay-level reachability is not a path identity, for cards or faults.
+  function branchControllerContext(seed, mprDevice, trace, fabric) {
+    const unread = list(seed.pathState?.not_read).includes("controller");
+    const name = unread ? null : seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id);
+    const id = name ? `controller:${name}` : "";
+    const node = unread ? null : nodeMap(fabric).get(id) || seed.controllerNode
+      || (ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (item) => item?.kind === "controller"));
+    return { unread, name, id, node };
   }
 
   function firstTraceNode(trace, fabric, predicate) {
@@ -3113,17 +3113,17 @@
   }
 
   function diskPathBranchEvidence(seed, trace, fabric) {
-    const nodes = nodeMap(fabric);
     const mprDevice = branchMprDevice(seed, trace);
-    const controllerName = seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id) || "controller";
+    const controller = branchControllerContext(seed, mprDevice, trace, fabric);
+    const controllerName = controller.name;
     const stateName = seed.state || seed.pathState?.state || seed.pathNode?.status || mprDevice?.state || "unknown";
-    const controllerId = controllerName ? `controller:${controllerName}` : seed.controller_id;
-    const controllerNode = nodes.get(controllerId) || seed.controllerNode || firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
+    const controllerId = controller.id;
+    const controllerNode = controller.node;
     const controllerDiagnostics = controllerNode?.metrics?.kernel_diagnostics || controllerNode?.raw?.kernel_diagnostics;
     const linkDiagnostics = mprDevice?.diagnostics;
     const diagnostics = Number(linkDiagnostics?.event_count || 0) ? linkDiagnostics : controllerDiagnostics;
     const scopeLabel = [
-      controllerName,
+      controllerName || "not read",
       stateName,
       mprDevice?.member_device_name || seed.device_name,
     ].filter(Boolean).join(" ");
@@ -3145,25 +3145,26 @@
       metrics: {},
     };
     const mprDevice = branchMprDevice(seed, trace);
-    const controllerName = seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id) || "controller";
+    const controller = branchControllerContext(seed, mprDevice, trace, fabric);
+    const controllerName = controller.name;
     const stateName = seed.state || seed.pathState?.state || seed.pathNode?.status || mprDevice?.state || "unknown";
-    const controllerId = controllerName ? `controller:${controllerName}` : seed.controller_id;
-    const controllerNode = nodes.get(controllerId) || seed.controllerNode || firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
+    const controllerId = controller.id;
+    const controllerNode = controller.node;
     const pathId = seed.pathState?.path_id || seed.pathNode?.id || (controllerName && stateName ? `path:${controllerName}:${classToken(stateName)}` : null);
-    const pathNode = nodes.get(pathId) || seed.pathNode || firstTraceNode(trace, fabric, (node) => (
+    const pathNode = controller.unread ? null : nodes.get(pathId) || seed.pathNode || (ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (node) => (
       node?.kind === "path" && (!controllerId || node.controller_id === controllerId)
-    ));
+    )));
     const pathNodeId = pathNode?.id && nodes.has(pathNode.id) ? pathNode.id : "";
     const pathTraceId = !pathNodeId && pathId && traceById(pathId, fabric) ? pathId : "";
     const expanderId = list(mprDevice?.expander_ids)[0];
     // A named path without its own MPR row borrows no sibling port's expander
     // or controller enclosure; its port detail is not read.
     const portNotRead = !linuxSes && !storageFabric && branchPortNotRead(seed, mprDevice, trace);
-    const expanderNode = nodes.get(expanderId) || seed.expanderNode || (portNotRead ? null : firstTraceNode(trace, fabric, (node) => (
+    const expanderNode = nodes.get(expanderId) || (ownDirectPath(seed, trace) ? null : seed.expanderNode) || (portNotRead || ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (node) => (
       node?.kind === "expander" && (!controllerId || node.controller_id === controllerId)
     )));
     const enclosureNode = nodes.get(mprDevice?.enclosure_id) || firstTraceNode(trace, fabric, (node) => (
-      ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind)
+      ["enclosure", "mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind)
       && !(portNotRead && node.kind === "mpr-enclosure")
       && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
@@ -3203,8 +3204,8 @@
     const branchDiagnostics = Number(linkDiagnostics?.event_count || 0) ? linkDiagnostics : controllerDiagnostics;
     const poolTitle = displayLabel(poolNode) || slot?.pool_name || trace.metrics?.pool_name;
     const vdevTitle = displayLabel(vdevNode) || slot?.vdev_name || trace.metrics?.vdev_name;
-    const sourceTitle = displayLabel(controllerNode) || controllerName;
-    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || controllerName;
+    const sourceTitle = displayLabel(controllerNode) || controllerName || "not read";
+    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || controllerName || "not read";
     const pathContext = compactDeviceLabel(mprDevice?.member_device_name || seed.device_name || fullDeviceName, 42);
     const branchHeaderContext = [
       pathTitle && pathTitle !== sourceTitle ? pathTitle : null,
@@ -3342,7 +3343,7 @@
           ["Enclosure", slot?.enclosure_name],
         ],
         hoverFacts: [
-          ["Zone slots", location.physical ? formatSlots(zone.slots, 999) : null],
+          ["Enclosure bays", location.physical ? formatSlots(zone.slots, 999) : null],
           ["SES targets", list(slot?.ssh_ses_targets).map((target) => `${target.ses_device}:${target.ses_element_id}`).join(", ")],
           ["SES device", slot?.ssh_ses_device],
           ["Mapping source", slot?.mapping_source],

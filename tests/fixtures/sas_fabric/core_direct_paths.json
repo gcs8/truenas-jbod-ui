@@ -63,84 +63,79 @@
     "enclosures": [
       {
         "alias": null,
-        "controller_id": "controller:mpr0",
         "device_count": 1,
         "display_label": null,
-        "enc_handle": "0002",
-        "fabric_scope": "selected_enclosure",
-        "id": "mpr-enclosure:controller:mpr0:0002",
-        "kind": "mpr-enclosure",
+        "id": "enclosure:5000c50000000f01",
+        "kind": "enclosure",
         "label": "5000c50000000f01",
+        "legacy_alias_ids": [
+          "mpr-enclosure:controller:mpr0:0002",
+          "mpr-enclosure:controller:mpr1:0002"
+        ],
         "logical_id": "5000c50000000f01",
+        "observations": [
+          {
+            "controller_id": "controller:mpr0",
+            "device_count": 1,
+            "enc_handle": "0002",
+            "fabric_scope": "selected_enclosure",
+            "id": "mpr-enclosure:controller:mpr0:0002",
+            "logical_id": "5000c50000000f01",
+            "metrics": {
+              "device_count": 1,
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure": true,
+              "slots": "2"
+            },
+            "selected_bay_count": 2,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure_candidate": true,
+            "sep_handle": "0008",
+            "slots": "2",
+            "type": "SES",
+            "unit": 0
+          },
+          {
+            "controller_id": "controller:mpr1",
+            "device_count": 1,
+            "enc_handle": "0002",
+            "fabric_scope": "selected_enclosure",
+            "id": "mpr-enclosure:controller:mpr1:0002",
+            "logical_id": "5000c50000000f01",
+            "metrics": {
+              "device_count": 1,
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure": true,
+              "slots": "2"
+            },
+            "selected_bay_count": 2,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure_candidate": true,
+            "sep_handle": "0008",
+            "slots": "2",
+            "type": "SES",
+            "unit": 1
+          }
+        ],
         "raw_id": "5000c50000000f01",
-        "related_slots": [
-          0
-        ],
-        "selected_bay_count": 2,
-        "selected_disk_count": 1,
-        "selected_disk_slots": [
-          0
-        ],
-        "selected_enclosure_candidate": true,
-        "sep_handle": "0008",
-        "slots": "2",
-        "status": null,
-        "type": "SES",
-        "unit": 0
-      },
-      {
-        "alias": null,
-        "controller_id": "controller:mpr1",
-        "device_count": 1,
-        "display_label": null,
-        "enc_handle": "0002",
-        "fabric_scope": "selected_enclosure",
-        "id": "mpr-enclosure:controller:mpr1:0002",
-        "kind": "mpr-enclosure",
-        "label": "5000c50000000f01",
-        "logical_id": "5000c50000000f01",
-        "raw_id": "5000c50000000f01",
-        "related_slots": [
-          0
-        ],
-        "selected_bay_count": 2,
-        "selected_disk_count": 1,
-        "selected_disk_slots": [
-          0
-        ],
-        "selected_enclosure_candidate": true,
-        "sep_handle": "0008",
-        "slots": "2",
-        "status": null,
-        "type": "SES",
-        "unit": 1
-      },
-      {
-        "alias": null,
-        "display_label": null,
-        "id": "ses:/dev/ses0",
-        "kind": "ses-enclosure",
-        "label": "/dev/ses0",
-        "raw_id": "/dev/ses0",
         "related_slots": [
           0,
           1
         ],
-        "ses_device": "/dev/ses0",
-        "status": null
-      },
-      {
-        "alias": null,
-        "display_label": null,
-        "id": "ses:/dev/ses1",
-        "kind": "ses-enclosure",
-        "label": "/dev/ses1",
-        "raw_id": "/dev/ses1",
-        "related_slots": [
-          0,
-          1
-        ],
-        "ses_device": "/dev/ses1",
         "status": null
       }
     ],
@@ -274,36 +269,6 @@
     ],
     "links": [
       {
-        "evidence": [
-          "profile slot layout"
-        ],
-        "id": "backplane-bay:backplane:0->bay:0:0",
-        "kind": "backplane-bay",
-        "related_slots": [
-          0
-        ],
-        "reported_lanes": null,
-        "slot": 0,
-        "source": "backplane:0",
-        "status": null,
-        "target": "bay:0"
-      },
-      {
-        "evidence": [
-          "profile slot layout"
-        ],
-        "id": "backplane-bay:backplane:0->bay:1:1",
-        "kind": "backplane-bay",
-        "related_slots": [
-          1
-        ],
-        "reported_lanes": null,
-        "slot": 1,
-        "source": "backplane:0",
-        "status": null,
-        "target": "bay:1"
-      },
-      {
         "evidence": [],
         "id": "bay-pool:bay:0->pool:synthetic-pool:0",
         "kind": "bay-pool",
@@ -374,9 +339,71 @@
       },
       {
         "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-bay:enclosure:5000c50000000f01->bay:0:0",
+        "kind": "enclosure-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "bay:0"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-bay:enclosure:5000c50000000f01->bay:1:1",
+        "kind": "enclosure-bay",
+        "related_slots": [
+          1
+        ],
+        "reported_lanes": null,
+        "slot": 1,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "bay:1"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-ses:enclosure:5000c50000000f01->ses:/dev/ses0",
+        "kind": "enclosure-ses",
+        "related_slots": [
+          0,
+          1
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "ses:/dev/ses0"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-ses:enclosure:5000c50000000f01->ses:/dev/ses1",
+        "kind": "enclosure-ses",
+        "related_slots": [
+          0,
+          1
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "ses:/dev/ses1"
+      },
+      {
+        "evidence": [
           "mprutil -u 0 show devices"
         ],
-        "id": "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+        "id": "expander-enclosure:expander:controller:mpr0:5000c50000000e00->enclosure:5000c50000000f01",
         "kind": "expander-enclosure",
         "related_slots": [
           0
@@ -385,13 +412,13 @@
         "slot": null,
         "source": "expander:controller:mpr0:5000c50000000e00",
         "status": null,
-        "target": "mpr-enclosure:controller:mpr0:0002"
+        "target": "enclosure:5000c50000000f01"
       },
       {
         "evidence": [
           "mprutil -u 1 show devices"
         ],
-        "id": "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+        "id": "expander-enclosure:expander:controller:mpr1:5000c50000000e01->enclosure:5000c50000000f01",
         "kind": "expander-enclosure",
         "related_slots": [
           0
@@ -400,7 +427,7 @@
         "slot": null,
         "source": "expander:controller:mpr1:5000c50000000e01",
         "status": null,
-        "target": "mpr-enclosure:controller:mpr1:0002"
+        "target": "enclosure:5000c50000000f01"
       },
       {
         "evidence": [],
@@ -432,30 +459,15 @@
         "evidence": [
           "mprutil -u 0 show devices"
         ],
-        "id": "mpr-enclosure-bay:mpr-enclosure:controller:mpr0:0002->bay:0:0",
+        "id": "mpr-enclosure-bay:enclosure:5000c50000000f01->bay:0:0",
         "kind": "mpr-enclosure-bay",
         "related_slots": [
           0
         ],
         "reported_lanes": null,
         "slot": 0,
-        "source": "mpr-enclosure:controller:mpr0:0002",
+        "source": "enclosure:5000c50000000f01",
         "status": "standby",
-        "target": "bay:0"
-      },
-      {
-        "evidence": [
-          "mprutil -u 1 show devices"
-        ],
-        "id": "mpr-enclosure-bay:mpr-enclosure:controller:mpr1:0002->bay:0:0",
-        "kind": "mpr-enclosure-bay",
-        "related_slots": [
-          0
-        ],
-        "reported_lanes": null,
-        "slot": 0,
-        "source": "mpr-enclosure:controller:mpr1:0002",
-        "status": "active",
         "target": "bay:0"
       },
       {
@@ -581,39 +593,6 @@
       }
     ],
     "nodes": [
-      {
-        "alias": null,
-        "controller_id": null,
-        "display_label": null,
-        "evidence": [
-          "profile slot layout"
-        ],
-        "id": "backplane:0",
-        "kind": "backplane",
-        "label": "Backplane Zone 1",
-        "metrics": {
-          "slot_count": 2,
-          "slot_range": "Bays 00-01",
-          "zone": 1
-        },
-        "raw": {
-          "id": "backplane:0",
-          "index": 0,
-          "label": "Backplane Zone 1",
-          "range": "Bays 00-01",
-          "slots": [
-            0,
-            1
-          ]
-        },
-        "raw_id": null,
-        "related_slots": [
-          0,
-          1
-        ],
-        "slot": null,
-        "status": null
-      },
       {
         "alias": null,
         "controller_id": null,
@@ -775,6 +754,104 @@
         ],
         "slot": null,
         "status": "online"
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "SES enclosure logical id",
+          "mprutil -u 0 show enclosures",
+          "mprutil -u 0 show devices",
+          "mprutil -u 1 show enclosures",
+          "mprutil -u 1 show devices"
+        ],
+        "id": "enclosure:5000c50000000f01",
+        "kind": "enclosure",
+        "label": "5000c50000000f01",
+        "metrics": {
+          "device_count": 1,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true,
+          "slots": "2"
+        },
+        "raw": {
+          "device_count": 1,
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0002",
+            "mpr-enclosure:controller:mpr1:0002"
+          ],
+          "logical_id": "5000c50000000f01",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "device_count": 1,
+              "enc_handle": "0002",
+              "fabric_scope": "selected_enclosure",
+              "id": "mpr-enclosure:controller:mpr0:0002",
+              "logical_id": "5000c50000000f01",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 2,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "2"
+              },
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure_candidate": true,
+              "sep_handle": "0008",
+              "slots": "2",
+              "type": "SES",
+              "unit": 0
+            },
+            {
+              "controller_id": "controller:mpr1",
+              "device_count": 1,
+              "enc_handle": "0002",
+              "fabric_scope": "selected_enclosure",
+              "id": "mpr-enclosure:controller:mpr1:0002",
+              "logical_id": "5000c50000000f01",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 2,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "2"
+              },
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure_candidate": true,
+              "sep_handle": "0008",
+              "slots": "2",
+              "type": "SES",
+              "unit": 1
+            }
+          ]
+        },
+        "raw_id": "5000c50000000f01",
+        "related_slots": [
+          0,
+          1
+        ],
+        "slot": null,
+        "status": null
       },
       {
         "alias": null,
@@ -966,98 +1043,6 @@
         "controller_id": "controller:mpr0",
         "display_label": null,
         "evidence": [
-          "mprutil -u 0 show enclosures",
-          "mprutil -u 0 show devices"
-        ],
-        "id": "mpr-enclosure:controller:mpr0:0002",
-        "kind": "mpr-enclosure",
-        "label": "5000c50000000f01",
-        "metrics": {
-          "device_count": 1,
-          "selected_bay_count": 2,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure": true,
-          "slots": "2"
-        },
-        "raw": {
-          "controller_id": "controller:mpr0",
-          "device_count": 1,
-          "enc_handle": "0002",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0002",
-          "logical_id": "5000c50000000f01",
-          "selected_bay_count": 2,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "0008",
-          "slots": "2",
-          "type": "SES",
-          "unit": 0
-        },
-        "raw_id": "5000c50000000f01",
-        "related_slots": [
-          0
-        ],
-        "slot": null,
-        "status": null
-      },
-      {
-        "alias": null,
-        "controller_id": "controller:mpr1",
-        "display_label": null,
-        "evidence": [
-          "mprutil -u 1 show enclosures",
-          "mprutil -u 1 show devices"
-        ],
-        "id": "mpr-enclosure:controller:mpr1:0002",
-        "kind": "mpr-enclosure",
-        "label": "5000c50000000f01",
-        "metrics": {
-          "device_count": 1,
-          "selected_bay_count": 2,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure": true,
-          "slots": "2"
-        },
-        "raw": {
-          "controller_id": "controller:mpr1",
-          "device_count": 1,
-          "enc_handle": "0002",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr1:0002",
-          "logical_id": "5000c50000000f01",
-          "selected_bay_count": 2,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "0008",
-          "slots": "2",
-          "type": "SES",
-          "unit": 1
-        },
-        "raw_id": "5000c50000000f01",
-        "related_slots": [
-          0
-        ],
-        "slot": null,
-        "status": null
-      },
-      {
-        "alias": null,
-        "controller_id": "controller:mpr0",
-        "display_label": null,
-        "evidence": [
           "sesutil map shared bay",
           "camcontrol devlist -v"
         ],
@@ -1122,10 +1107,11 @@
           "SES enclosure device"
         ],
         "id": "ses:/dev/ses0",
-        "kind": "ses-enclosure",
+        "kind": "ses-device",
         "label": "/dev/ses0",
         "metrics": {},
         "raw": {
+          "enclosure_id": "enclosure:5000c50000000f01",
           "ses_device": "/dev/ses0"
         },
         "raw_id": "/dev/ses0",
@@ -1144,10 +1130,11 @@
           "SES enclosure device"
         ],
         "id": "ses:/dev/ses1",
-        "kind": "ses-enclosure",
+        "kind": "ses-device",
         "label": "/dev/ses1",
         "metrics": {},
         "raw": {
+          "enclosure_id": "enclosure:5000c50000000f01",
           "ses_device": "/dev/ses1"
         },
         "raw_id": "/dev/ses1",
@@ -1305,25 +1292,24 @@
         "kind": "bay",
         "label": "Bay 00",
         "link_ids": [
-          "backplane-bay:backplane:0->bay:0:0",
           "host-controller:host->controller:mpr0",
           "controller-path:controller:mpr0->path:mpr0:standby",
           "path-bay:path:mpr0:standby->bay:0:0",
           "path-expander:path:mpr0:standby->expander:controller:mpr0:5000c50000000e00",
-          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
-          "mpr-enclosure-bay:mpr-enclosure:controller:mpr0:0002->bay:0:0",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->enclosure:5000c50000000f01",
+          "mpr-enclosure-bay:enclosure:5000c50000000f01->bay:0:0",
           "host-controller:host->controller:mpr1",
           "controller-path:controller:mpr1->path:mpr1:active",
           "path-bay:path:mpr1:active->bay:0:0",
           "path-expander:path:mpr1:active->expander:controller:mpr1:5000c50000000e01",
-          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
-          "mpr-enclosure-bay:mpr-enclosure:controller:mpr1:0002->bay:0:0",
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->enclosure:5000c50000000f01",
           "ses-bay:ses:/dev/ses0->bay:0:0",
           "ses-bay:ses:/dev/ses1->bay:0:0",
           "bay-pool:bay:0->pool:synthetic-pool:0",
           "pool-vdev:pool:synthetic-pool->vdev:synthetic-pool/mirror-0:0",
           "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00",
-          "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01"
+          "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01",
+          "enclosure-bay:enclosure:5000c50000000f01->bay:0:0"
         ],
         "metrics": {
           "device_name": "da11",
@@ -1332,7 +1318,7 @@
               "controller": "mpr0",
               "diagnostics": {},
               "enclosure_handle": "0002",
-              "enclosure_id": "mpr-enclosure:controller:mpr0:0002",
+              "enclosure_id": "enclosure:5000c50000000f01",
               "expander_ids": [
                 "expander:controller:mpr0:5000c50000000e00"
               ],
@@ -1349,7 +1335,7 @@
               "controller": "mpr1",
               "diagnostics": {},
               "enclosure_handle": "0002",
-              "enclosure_id": "mpr-enclosure:controller:mpr1:0002",
+              "enclosure_id": "enclosure:5000c50000000f01",
               "expander_ids": [
                 "expander:controller:mpr1:5000c50000000e01"
               ],
@@ -1381,15 +1367,13 @@
         "node_ids": [
           "host",
           "bay:0",
-          "backplane:0",
           "controller:mpr0",
           "path:mpr0:standby",
           "expander:controller:mpr0:5000c50000000e00",
-          "mpr-enclosure:controller:mpr0:0002",
+          "enclosure:5000c50000000f01",
           "controller:mpr1",
           "path:mpr1:active",
           "expander:controller:mpr1:5000c50000000e01",
-          "mpr-enclosure:controller:mpr1:0002",
           "ses:/dev/ses0",
           "ses:/dev/ses1",
           "pool:synthetic-pool",
@@ -1411,15 +1395,15 @@
         "kind": "bay",
         "label": "Bay 01",
         "link_ids": [
-          "backplane-bay:backplane:0->bay:1:1",
           "ses-bay:ses:/dev/ses0->bay:1:1",
           "ses-bay:ses:/dev/ses1->bay:1:1",
           "host-controller:host->controller:mpr0",
           "host-controller:host->controller:mpr1",
           "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00",
-          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->enclosure:5000c50000000f01",
           "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01",
-          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002"
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->enclosure:5000c50000000f01",
+          "enclosure-bay:enclosure:5000c50000000f01->bay:1:1"
         ],
         "metrics": {
           "device_name": null,
@@ -1432,15 +1416,13 @@
         "node_ids": [
           "host",
           "bay:1",
-          "backplane:0",
           "ses:/dev/ses0",
           "ses:/dev/ses1",
           "controller:mpr0",
           "controller:mpr1",
           "expander:controller:mpr0:5000c50000000e00",
           "expander:controller:mpr1:5000c50000000e01",
-          "mpr-enclosure:controller:mpr0:0002",
-          "mpr-enclosure:controller:mpr1:0002"
+          "enclosure:5000c50000000f01"
         ],
         "slots": [
           1
@@ -1461,7 +1443,7 @@
           "host-controller:host->controller:mpr0",
           "controller-path:controller:mpr0->path:mpr0:standby",
           "path-expander:path:mpr0:standby->expander:controller:mpr0:5000c50000000e00",
-          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->enclosure:5000c50000000f01",
           "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00"
         ],
         "metrics": {
@@ -1476,7 +1458,7 @@
           "controller:mpr0",
           "path:mpr0:standby",
           "expander:controller:mpr0:5000c50000000e00",
-          "mpr-enclosure:controller:mpr0:0002"
+          "enclosure:5000c50000000f01"
         ],
         "slots": [
           0
@@ -1497,7 +1479,7 @@
           "host-controller:host->controller:mpr1",
           "controller-path:controller:mpr1->path:mpr1:active",
           "path-expander:path:mpr1:active->expander:controller:mpr1:5000c50000000e01",
-          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->enclosure:5000c50000000f01",
           "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01"
         ],
         "metrics": {
@@ -1512,7 +1494,7 @@
           "controller:mpr1",
           "path:mpr1:active",
           "expander:controller:mpr1:5000c50000000e01",
-          "mpr-enclosure:controller:mpr1:0002"
+          "enclosure:5000c50000000f01"
         ],
         "slots": [
           0

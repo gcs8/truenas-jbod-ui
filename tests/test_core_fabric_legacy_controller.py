@@ -642,7 +642,7 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
                 if devices is not None:
                     outputs["mprutil show devices"] = devices
                 fabric = _core_fabric(outputs, selected=SELECTED_ENCLOSURE)
-                [enclosure] = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
+                [enclosure] = [node for node in fabric.nodes if node.kind == "enclosure"]
                 self.assertEqual(enclosure.metrics["device_count"], expected)
                 self.assertEqual(enclosure.raw["device_count"], expected)
                 self.assertEqual(enclosure.metrics.get("not_read", []), ["device_count"] if expected is None else [])
@@ -851,7 +851,7 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
     def test_blank_sep_handle_enclosure_as_printed_is_read(self) -> None:
         fabric = self.healthy("blank_sep_unknown_enclosure")
         self.assertEqual(fabric.raw["controller_read"]["lists"]["mpr0"]["enclosures"], "read")
-        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "enclosure")], [1])
         [parsed] = parse_mpr_enclosures(_printed_enclosure(BLANK_HANDLE, "Unknown"))
         self.assertEqual((parsed["sep_handle"], parsed["enc_handle"], parsed["type"]), (None, "0010", "Unknown"))
         # Control: an SES enclosure keeps both handles.
@@ -866,7 +866,7 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
         self.assertEqual((len(fabric.expanders), len(fabric.enclosures)), (1, 1))
         [controller] = self.kind_metrics(fabric, "controller")
         self.assertEqual((controller["phy_count"], controller["linked_phy_count"]), (2, 1))
-        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "enclosure")], [1])
 
     def test_second_listed_controller_supplied_only_by_show_all(self) -> None:
         fabric = self.healthy("show_all_second_unit")
@@ -896,7 +896,7 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
         }
         fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
         # Text under another label is ignored: no second device, no unread expander table.
-        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "mpr-enclosure")], [1])
+        self.assertEqual([metrics["device_count"] for metrics in self.kind_metrics(fabric, "enclosure")], [1])
         [expander] = self.kind_metrics(fabric, "expander")
         self.assertEqual(expander["linked_phys"], 1)
         self.assertEqual(fabric.warnings, [])
@@ -908,7 +908,7 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
         outputs = {"mprutil -u 0 show all": _show_all().replace("Devices:\n" + devices, "Devices:\n\n")}
         fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
         self.assertEqual(fabric.raw["controller_read"]["lists"].get("mpr0", {}).get("devices"), "not_read")
-        [enclosure] = self.kind_metrics(fabric, "mpr-enclosure")
+        [enclosure] = self.kind_metrics(fabric, "enclosure")
         self.assertEqual((enclosure["device_count"], enclosure["not_read"]), (None, ["device_count"]))
 
     def test_discovery_line_in_place_of_a_phy_row_is_recognised(self) -> None:
@@ -966,7 +966,7 @@ class CoreFabricShapeAdmissionTests(unittest.TestCase):
                 self.assertEqual(read["lists"]["mpr0"]["enclosures"], "unreadable")
                 self.assertEqual(read["counts"]["enclosures"], "partial")
                 # No enclosure appears that the reply did not print.
-                self.assertEqual([node.id for node in fabric.nodes if node.kind == "mpr-enclosure"], [])
+                self.assertEqual([node.id for node in fabric.nodes if node.kind == "enclosure"], [])
         # Controls: every blank-SEP type mprutil prints still reads, with its own handle and type.
         for kind in ("Unknown", "Direct Attached SGPIO", "Expander SGPIO", "Direct Attached GPIO"):
             with self.subTest(kind):
@@ -999,7 +999,7 @@ class CoreFabricShapeAdmissionTests(unittest.TestCase):
                 text = _show_all().replace("Enclosures:\n", f"{label}\n{DEVICES_HEADING}{other_device}\nEnclosures:\n")
                 fabric = _core_fabric({"mprutil -u 0 show all": text}, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
                 # The unknown label's row is never counted.
-                self.assertEqual([n.metrics["device_count"] for n in fabric.nodes if n.kind == "mpr-enclosure"], [1])
+                self.assertEqual([n.metrics["device_count"] for n in fabric.nodes if n.kind == "enclosure"], [1])
                 self.assertEqual(fabric.warnings, [])
 
     def test_discovery_line_stands_for_the_phy_at_its_own_position(self) -> None:

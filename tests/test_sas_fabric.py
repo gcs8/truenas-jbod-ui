@@ -3357,7 +3357,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "with_ses": False,
                 # No mprutil output was observed, so no controller is invented (#1219).
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "host",
                     "pool:Tank%20Main",
@@ -3400,7 +3399,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "platform": "scale",
                 "with_ses": True,
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "controller:linux-ses",
                     "host",
@@ -3440,7 +3438,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "platform": "quantastor",
                 "with_ses": False,
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "controller:storage-v2:4ffb4b40f69f088abe6c90de4105cdd636e63fd2d13479ba4e1719c038f33a1d",
                     "host",
@@ -3768,8 +3765,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 SasFabricAlias(
                     system_id="archive-core",
                     enclosure_id="enc-60",
-                    object_id="backplane:0",
-                    object_kind="backplane",
+                    object_id="enclosure:50030480090c4f7f",
+                    object_kind="enclosure",
                     label="Front-left backplane",
                 ),
             ],
@@ -3786,10 +3783,11 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(controllers["controller:mpr0"]["display_label"], "Archive left HBA")
         self.assertEqual(traces["path:mpr0:fail"].display_label, "Bad-cable path")
         self.assertEqual(paths["path:mpr0:fail"]["display_label"], "Bad-cable path")
-        self.assertEqual(nodes["backplane:0"].label, "Backplane Zone 1")
-        self.assertEqual(nodes["backplane:0"].display_label, "Front-left backplane")
-        self.assertIn("backplane:0", traces["bay:0"].node_ids)
-        self.assertEqual({alias.object_id for alias in fabric.aliases}, {"controller:mpr0", "path:mpr0:fail", "backplane:0"})
+        enclosure_id = "enclosure:50030480090c4f7f"
+        self.assertEqual(nodes[enclosure_id].label, "50030480090c4f7f")
+        self.assertEqual(nodes[enclosure_id].display_label, "Front-left backplane")
+        self.assertIn(enclosure_id, traces["bay:0"].node_ids)
+        self.assertEqual({alias.object_id for alias in fabric.aliases}, {"controller:mpr0", "path:mpr0:fail", enclosure_id})
 
     def test_core_snapshot_builds_traceable_dual_hba_path_graph(self) -> None:
         slot = SlotView(
@@ -3857,8 +3855,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         links = {link.id: link for link in fabric.links}
         mpr0_expander_id = "expander:controller:mpr0:50030480090c4f7f"
         mpr1_expander_id = "expander:controller:mpr1:50030480090c8f7f"
-        mpr0_enclosure_id = "mpr-enclosure:controller:mpr0:0002"
-        mpr1_enclosure_id = "mpr-enclosure:controller:mpr1:0012"
+        mpr0_enclosure_id = "enclosure:50030480090c4f7f"
+        mpr1_enclosure_id = mpr0_enclosure_id
         mpr0_path_expander_link = f"path-expander:path:mpr0:fail->{mpr0_expander_id}"
         mpr1_path_expander_link = f"path-expander:path:mpr1:active->{mpr1_expander_id}"
         mpr0_expander_enclosure_link = f"expander-enclosure:{mpr0_expander_id}->{mpr0_enclosure_id}"
@@ -3982,8 +3980,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         bay_slots = list(range(24))
         mpr0_selected_expander = "expander:controller:mpr0:50030480090c4f7f"
         mpr1_selected_expander = "expander:controller:mpr1:50030480090c4fff"
-        mpr0_selected_enclosure = "mpr-enclosure:controller:mpr0:0002"
-        mpr1_selected_enclosure = "mpr-enclosure:controller:mpr1:0012"
+        mpr0_selected_enclosure = "enclosure:50030480090c4f7f"
+        mpr1_selected_enclosure = mpr0_selected_enclosure
 
         self.assertTrue(fabric.available)
         self.assertEqual(fabric.paths, [])
@@ -4622,7 +4620,7 @@ class FabricPathRegressionTests(unittest.TestCase):
         self.assertEqual(fabric.paths[0]["alias"], "Exact name")
         traces = {t.id: t for t in fabric.traces}
         self.assertEqual(set(traces["bay:0"].node_ids), {
-            "host", controller_id, path_id, enclosure_id, "backplane:0", "bay:0", "pool:Pool", "vdev:Pool/mirror",
+            "host", controller_id, path_id, enclosure_id, "bay:0", "pool:Pool", "vdev:Pool/mirror",
         })
         self.assertEqual(set(traces[path_id].node_ids), {"host", controller_id, path_id})
         expected_edges = {("host", controller_id), (controller_id, path_id), (path_id, enclosure_id)}

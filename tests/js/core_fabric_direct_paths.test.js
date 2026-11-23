@@ -29,7 +29,7 @@ function page(mode, data = payload) {
   const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
   assert.ok(end > 0);
   vm.runInContext(`${source.slice(0, end)}
-    window.directPathTest = { renderMap, state, branchSeedsForDiskTrace, branchMprDevice, renderDiskPathBranch };
+    window.directPathTest = { renderMap, state, branchSeedsForDiskTrace, branchMprDevice, renderDiskPathBranch, diskPathBranchEvidence };
   })();`, sandbox);
   const api = sandbox.window.directPathTest;
   api.state.mode = mode;
@@ -78,6 +78,56 @@ test("Topology retains the direct disk's two observed controller paths", () => {
   }
 });
 
+test("an explicitly unread controller never borrows a bay HBA, path or fault", () => {
+  const data = structuredClone(payload);
+  const trace = data.fabric.traces.find((item) => item.id === "bay:0");
+  const member = trace.metrics.path_states.find((row) => row.device_name === "da11");
+  member.controller = null;
+  member.not_read = ["controller", "target"];
+  trace.metrics.mpr_devices = trace.metrics.mpr_devices.filter((row) => row.member_device_name !== "da11");
+  const { api } = page("disk", data);
+  const seed = api.branchSeedsForDiskTrace(trace, data.fabric).find((row) => row.device_name === "da11");
+  const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+  const hba = rendered.split('disk-path-kind">HBA')[1].split('disk-path-card-cell')[0];
+  assert.match(hba, /not read/);
+  assert.doesNotMatch(hba, /mpr0|controller:mpr|firmware|16\.00/);
+  assert.doesNotMatch(rendered.match(/<small>([^<]*)<\/small>/)[1], /mpr0|controller active/);
+  assert.doesNotMatch(api.diskPathBranchEvidence(seed, trace, data.fabric), /mpr0|controller active da11/);
+});
+
+test("direct ports with zero MPR rows never refill an expander from enclosure scope", () => {
+  const data = structuredClone(payload);
+  const trace = data.fabric.traces.find((item) => item.id === "bay:0");
+  trace.metrics.mpr_devices = [];
+  const { api } = page("disk", data);
+  for (const seed of api.branchSeedsForDiskTrace(trace, data.fabric)) {
+    const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+    assert.match(rendered, /Speed<\/em>not read/);
+    for (const node of data.fabric.nodes.filter((row) => row.kind === "expander")) {
+      assert.ok(!rendered.includes(node.id), node.id);
+    }
+  }
+});
+
+test("a direct port with no matched expander never refills from the bay", () => {
+  const data = structuredClone(payload);
+  const trace = data.fabric.traces.find((item) => item.id === "bay:0");
+  trace.metrics.mpr_devices.forEach((row) => { row.expander_ids = []; });
+  const { api } = page("disk", data);
+  for (const seed of api.branchSeedsForDiskTrace(trace, data.fabric)) {
+    const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+    for (const node of data.fabric.nodes.filter((row) => row.kind === "expander")) {
+      assert.ok(!rendered.includes(node.id), node.id);
+    }
+  }
+});
+
+for (const mode of ["disk", "impact"]) {
+  test(`${mode} never invents a backplane zone`, () => {
+    assert.doesNotMatch(page(mode).html, /Backplane Zone/);
+  });
+}
+
 // Four direct paths, two per controller, with MPR rows for only one path on
 // each controller: the producer rows asserted by
 // test_four_direct_paths_with_partial_mpr_rows_keep_their_own_rows.
@@ -120,7 +170,9 @@ test("Disk Path never draws a sibling port's device or SAS address on a path wit
     }
     // Nor the sibling port's expander or MPR enclosure: not read for this path.
     for (const row of trace.metrics.mpr_devices) {
-      assert.ok(!rendered.includes(row.enclosure_id), row.enclosure_id);
+      // The physical enclosure is bay-level evidence shared by all paths.
+      // Only a controller-local enclosure must be withheld from an unread port.
+      if (!row.enclosure_id.startsWith("enclosure:")) assert.ok(!rendered.includes(row.enclosure_id), row.enclosure_id);
       for (const expanderId of row.expander_ids) {
         assert.match(branches[row.member_device_name].html, new RegExp(expanderId.split(":").pop()));
         assert.doesNotMatch(rendered, new RegExp(expanderId.split(":").pop()));

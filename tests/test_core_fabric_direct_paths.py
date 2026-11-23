@@ -448,6 +448,93 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da3", "da11"])
 
+    async def test_direct_row_rejects_conflicting_target_even_when_named(self):
+        system, snapshot, outputs = await self.fixture()
+        outputs["mprutil -u 0 show devices"] = "00 5 5000c50000000d00 0020 0009 SAS Target da3 12.0 0002 0"
+        bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
+        self.assertEqual(len(bay.metrics["path_states"]), 2)
+
+    async def test_direct_row_never_joins_by_position_without_target(self):
+        system, snapshot, outputs = await self.fixture()
+        # Simulate parsed rows because the normal text format requires a target.
+        from unittest.mock import patch
+        original = sas_fabric._parse_unit_data
+        parsed = original(sas_fabric._canonical_outputs(outputs))
+        parsed[0]["devices"][0]["target"] = None
+        with patch.object(sas_fabric, "_parse_unit_data", return_value=parsed):
+            bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
+
+    async def test_member_expander_is_only_its_controller_local_parent(self):
+        system, snapshot, outputs = await self.fixture()
+        outputs["mprutil -u 0 show expanders"] = (
+            "1 5000c50000000eff 000a 0001 0002 1\n"
+            + outputs["mprutil -u 0 show expanders"]
+        )
+        fabric = self.build(system, snapshot, outputs)
+        row = next(row for row in self.bay(fabric).metrics["mpr_devices"] if row["member_device_name"] == "da3")
+        self.assertEqual(row["expander_ids"], ["expander:controller:mpr0:5000c50000000e00"])
+        outputs["mprutil -u 0 show devices"] = outputs["mprutil -u 0 show devices"].replace("0020 0009", "0020 000b")
+        unknown = next(row for row in self.bay(self.build(system, snapshot, outputs)).metrics["mpr_devices"] if row["member_device_name"] == "da3")
+        self.assertEqual(unknown["expander_ids"], [])
+
+    async def test_withheld_member_counts_are_partial_not_exact_zero(self):
+        system, snapshot, outputs = await self.fixture()
+        unread = self.build(system, snapshot, {**outputs, "camcontrol devlist -v": ""})
+        self.assertEqual(unread.raw["controller_read"]["counts"]["paths"], "partial")
+        limit = sas_fabric.MAX_FABRIC_CONTROLLERS
+        changed = {**outputs, "mprutil show adapters": "\n".join(
+            f"/dev/mpr{unit} SAS3008 Synthetic 16.00.12.00" for unit in range(limit)
+        ), "camcontrol devlist -v": outputs["camcontrol devlist -v"].replace("on mpr1 bus", f"on mpr{limit} bus")}
+        counts = self.build(system, snapshot, changed).raw["controller_read"]["counts"]
+        self.assertEqual(counts["controllers"], "partial")
+        self.assertEqual(counts["paths"], "partial")
+
+    async def test_path_digest_collapses_command_aliases_with_last_writer_wins(self):
+        system, snapshot, outputs = await self.fixture()
+        duplicate = {**outputs, "/sbin/camcontrol devlist -v": outputs["camcontrol devlist -v"]}
+        self.assertEqual(fabric_path_evidence(duplicate), fabric_path_evidence(outputs))
+        self.assertEqual(fabric_path_evidence({**duplicate, "camcontrol devlist -v": "ignored"}),
+                         fabric_path_evidence(outputs))
+        bay = self.bay(self.build(system, snapshot, duplicate, coherent=False))
+        self.assertEqual(len(bay.metrics["mpr_devices"]), 2)
+
+    async def test_four_multipath_members_same_location_keep_every_own_target_row(self):
+        system, snapshot, outputs = await self.fixture()
+        members = []
+        for unit, names in enumerate((("da3", "da4"), ("da11", "da12"))):
+            controller = f"mpr{unit}"
+            outputs[f"mprutil -u {unit} show devices"] += (
+                f"\n01 {5 + unit * 8} 5000c50000000d1{unit} 0021 000a SAS Target 6.0 0002 0"
+            )
+            outputs[f"mprutil -u {unit} show expanders"] += f"\n1 5000c50000000e1{unit} 000a 0001 0002 1"
+            outputs["camcontrol devlist -v"] += (
+                f"\nscbus{unit} on {controller} bus 0:\n"
+                f"<ExampleCo SAME-MODEL 0001> at scbus{unit} target {5 + unit * 8} lun 0 ({names[1]},pass{20 + unit})"
+            )
+            members.extend(MultipathMember(device_name=name, controller_label=controller, state="ACTIVE") for name in names)
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=members)
+        bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual(len(bay.metrics["path_states"]), 4)
+        self.assertEqual({row["member_device_name"] for row in bay.metrics["mpr_devices"]}, {"da3", "da4", "da11", "da12"})
+        self.assertTrue(all(len(row["expander_ids"]) == 1 for row in bay.metrics["mpr_devices"]))
+
+    async def test_real_enclosure_key_merges_hba_handles_and_covers_empty_bays(self):
+        system, snapshot, outputs = await self.fixture()
+        outputs["mprutil -u 1 show enclosures"] = outputs["mprutil -u 1 show enclosures"].replace("0002", "0007")
+        outputs["mprutil -u 1 show devices"] = outputs["mprutil -u 1 show devices"].replace("0002", "0007")
+        outputs["mprutil -u 1 show expanders"] = outputs["mprutil -u 1 show expanders"].replace("0002", "0007")
+        fabric = self.build(system, snapshot, outputs)
+        boards = [node for node in fabric.nodes if node.kind == "enclosure"]
+        self.assertEqual([node.id for node in boards], [f"enclosure:{SHELF}"])
+        self.assertEqual(boards[0].related_slots, [0, 1])
+        self.assertIsNone(boards[0].controller_id)
+        self.assertEqual({link.target for link in fabric.links if link.kind == "enclosure-bay"}, {"bay:0", "bay:1"})
+        self.assertFalse([node for node in fabric.nodes if node.kind == "backplane"])
+        self.assertNotIn("Backplane Zone", fabric.model_dump_json())
+        self.assertEqual({row["enclosure_id"] for row in self.bay(fabric).metrics["mpr_devices"]}, {boards[0].id})
+
     async def test_same_disk_alias_listed_by_ses_is_an_alternate_path(self):
         alias_disk = {"name": "da11", "devname": "da3", "serial": "SANITIZED-DIRECT-DISK"}
         system, snapshot, outputs = await self.fixture(pool_device="da11", api_disk=alias_disk)

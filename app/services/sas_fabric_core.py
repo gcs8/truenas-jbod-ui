@@ -198,6 +198,7 @@ def _add_mpr_member_trace_context(
     slot_location_numbers: list[int] | None = None,
     slot_ses_number: int | None = None,
     diagnostics: dict[str, Any] | None = None,
+    own_evidence: bool = False,
 ) -> dict[str, Any]:
     device_context = _lookup_mpr_device_context(
         trace_index,
@@ -205,6 +206,7 @@ def _add_mpr_member_trace_context(
         member_device_name,
         member_target=member_target,
         member_target_rejected=member_target_rejected,
+        own_evidence=own_evidence,
         slot_enclosure_ids=slot_enclosure_ids,
         slot_location_numbers=slot_location_numbers,
         slot_ses_number=slot_ses_number,
@@ -228,6 +230,14 @@ def _add_mpr_member_trace_context(
     enc_handle = str(device_context.get("enclosure_handle") or "")
     enclosure_id = trace_index.get("enclosures", {}).get((controller_id, enc_handle))
     expander_ids = list(trace_index.get("expanders", {}).get((controller_id, enc_handle), []))
+    if own_evidence or member_target is not None:
+        # Handles are controller-local. A bay may contain several expanders.
+        parent = _mpr_handle(device_context.get("parent"))
+        expander_ids = [node_id for node_id in expander_ids
+                        if node_id in nodes and parent is not None
+                        and _mpr_handle(nodes[node_id].raw.get("dev_handle")) == parent]
+        if len(expander_ids) != 1:
+            expander_ids = []
 
     node_ids: list[str] = []
     path_link_ids: list[str] = []
@@ -339,6 +349,7 @@ def _lookup_mpr_device_context(
     *,
     member_target: int | None = None,
     member_target_rejected: bool = False,
+    own_evidence: bool = False,
     slot_enclosure_ids: list[str] | None = None,
     slot_location_numbers: list[int] | None = None,
     slot_ses_number: int | None = None,
@@ -354,6 +365,11 @@ def _lookup_mpr_device_context(
             return None
         context = devices.get(key)
         if context:
+            row_target = _parse_mpr_target(context.get("target"))
+            if member_target_rejected or (member_target is not None and row_target is not None and row_target != member_target):
+                return None
+            if _mpr_target_rejected(context.get("target")):
+                return None
             # A named member on this controller is independent identity evidence.
             # Only that match can establish SES N -> MPR N-1; never infer it
             # from a nameless neighbouring SAS target or a shared SAS address.
@@ -369,13 +385,13 @@ def _lookup_mpr_device_context(
             location = _parse_mpr_slot_number(context.get("slot"))
             handle_location = (controller_name, enc_handle, location)
             handle_locations = trace_index.get("devices_by_handle_location", {})
-            if handle_location in handle_locations and handle_locations[handle_location] is None:
+            if member_target is None and handle_location in handle_locations and handle_locations[handle_location] is None:
                 return None
             location_key = (controller_name, context.get("enclosure_key"), location)
             locations = trace_index.get("devices_by_location", {})
             # An exact name cannot override contradictory occupants at its own
             # provider location, including an independently proven SES offset.
-            if location_key in locations and locations[location_key] is None:
+            if member_target is None and location_key in locations and locations[location_key] is None:
                 return None
             if slot_location_numbers and location not in slot_location_numbers:
                 if slot_ses_number is None or slot_ses_number <= 0 or location != slot_ses_number - 1:
@@ -403,14 +419,12 @@ def _lookup_mpr_device_context(
             if named_occupants and member_names and not named_occupants.intersection(member_names):
                 return None
             location = _parse_mpr_slot_number(context.get("slot"))
-            for key, index_name in (
-                ((controller_name, enc_handle, location), "devices_by_handle_location"),
-                ((controller_name, context.get("enclosure_key"), location), "devices_by_location"),
-            ):
-                occupants = trace_index.get(index_name, {})
-                if key in occupants and occupants[key] is None:
-                    return None
+            # Several ports of one disk share the bay coordinate. A unique
+            # controller-local CAM target is stronger than that location.
             return context
+    if own_evidence:
+        # Direct paths require a readable matching target or an exact name.
+        return None
     if member_target_rejected:
         # CAM printed a target for this member that is not a target number:
         # that is evidence, not absence, so position alone cannot join a row.
