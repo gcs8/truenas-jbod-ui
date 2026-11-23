@@ -23,9 +23,9 @@ from urllib.parse import urlencode
 from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener, urlopen as _urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# Three minutes allows long restored-dataset refreshes without hiding a stuck
-# refresh indefinitely. Operators can select a larger explicit budget when needed.
-DEFAULT_READINESS_TIMEOUT_SECONDS = 180.0
+# Allow the application's 300-second background refresh plus scheduling margin.
+# This remains a finite tooling budget, not an application deadline change.
+DEFAULT_READINESS_TIMEOUT_SECONDS = 330.0
 READINESS_TIMEOUT_ENV = "PERF_HARNESS_READINESS_TIMEOUT_SECONDS"
 ERROR_BODY_LIMIT = 1024
 RESPONSE_READ_CHUNK_SIZE = 64 * 1024
@@ -894,7 +894,8 @@ def main() -> int:
     parser.add_argument(
         "--readiness-timeout-seconds", type=float,
         default=os.environ.get(READINESS_TIMEOUT_ENV, DEFAULT_READINESS_TIMEOUT_SECONDS),
-        help=f"Safe-read readiness deadline in seconds, including requests and waits. Default 180; env {READINESS_TIMEOUT_ENV}.",
+        help=("Safe-read readiness deadline in seconds, including requests and waits. "
+              f"Default {DEFAULT_READINESS_TIMEOUT_SECONDS:g}; env {READINESS_TIMEOUT_ENV}."),
     )
     parser.add_argument("--smart-slot-count", type=int, default=8, help="How many slots to include in the smart batch probe.")
     parser.add_argument(
