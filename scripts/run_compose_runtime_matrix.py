@@ -50,6 +50,7 @@ MATRIX_CONTAINER_NAMES = {
 }
 SYNTHETIC_BACKUP_PASSPHRASE = "synthetic-compose-matrix-backup-passphrase"
 SCHEDULER_WAIT_SECONDS = 90
+COMMAND_TIMEOUT_SECONDS = 300
 MAPPING_WAIT_SECONDS = 30
 SUCCESS_MARKER = (
     "compose_runtime_matrix=ok variants=8 ui_alias_cycles=5 "
@@ -268,13 +269,20 @@ def _run(
     *,
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        check=True,
-        env=_child_environment(),
-        capture_output=capture_output,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            list(command),
+            check=True,
+            env=_child_environment(),
+            capture_output=capture_output,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # Commands and their output can contain local paths or credentials.
+        raise RuntimeError(
+            f"Matrix command exceeded its {COMMAND_TIMEOUT_SECONDS}-second deadline."
+        ) from None
 
 
 def _read_app_owned_json(path: Path) -> dict[str, object]:
@@ -698,6 +706,10 @@ def _http_failure_context(url: str, method: str, body: bytes) -> str:
     return context
 
 
+class MatrixHTTPStatusError(RuntimeError):
+    """An unexpected status with only allowlisted HTTP diagnostic context."""
+
+
 def _require_status(
     url: str,
     expected: int,
@@ -715,7 +727,7 @@ def _require_status(
         origin=origin,
     )
     if status != expected:
-        raise RuntimeError(
+        raise MatrixHTTPStatusError(
             f"Unexpected HTTP status for matrix route: expected {expected}, got {status}. "
             f"{_http_failure_context(url, method, body)}"
         )
@@ -937,9 +949,12 @@ def _wait_mapping_inventory(ports: Ports) -> None:
     url = (f"http://127.0.0.1:{ports.ui}/api/inventory"
            "?system_id=matrix-live&enclosure_id=matrix-shelf&force=true")
     deadline = time.monotonic() + MAPPING_WAIT_SECONDS
+    last_http_context = "No HTTP response was received."
     while time.monotonic() < deadline:
         try:
-            snapshot = _json_object(_require_status(url, 200, authenticated=True), "Mapping inventory")
+            body = _require_status(url, 200, authenticated=True)
+            last_http_context = f"Last HTTP status 200. {_http_failure_context(url, 'GET', body)}"
+            snapshot = _json_object(body, "Mapping inventory")
             sources = snapshot.get("sources")
             api = sources.get("api") if isinstance(sources, dict) else None
             slots = snapshot.get("slots")
@@ -951,12 +966,15 @@ def _wait_mapping_inventory(ports: Ports) -> None:
                     and slot.get("present") is False and slot.get("identity_state") == "known"
                     and slot.get("presence_known") is not False):
                 return
+        except MatrixHTTPStatusError as exc:
+            last_http_context = str(exc)
         except (RuntimeError, OSError):
-            # No arbitrary transport/server prose in the timeout diagnostic.
+            # Preserve the last safe HTTP context, never arbitrary exception prose.
             pass
         time.sleep(0.25)
     raise RuntimeError("Synthetic mapping inventory did not become ready before the deadline: "
-                       "expected live API evidence, selected enclosure layout and known-empty bay.")
+                       "expected live API evidence, selected enclosure layout and known-empty bay. "
+                       + last_http_context)
 
 
 def _start_history(prefix: Sequence[str]) -> None:
