@@ -430,14 +430,22 @@ class PinnedStateFolderTests(_FetchWorkspaceBase):
         helper = _Process(self, _HELPER)
         answered: list[str | None] = []
 
-        def replaced_before_removal(real, path, *args, **kwargs):
-            # Another process that takes the state-folder lock moves the checked
-            # workspace away and puts a different directory under its name.
-            helper.send("replace-locked", str(self.state_dir / STATE_LOCK_NAME), str(self.state_dir / victim), str(moved))
-            answered.append(helper.line(1.0))  # it must still be waiting for the lock
-            return real(path, *args, **kwargs)
+        real_rename = service._rename_noreplace_in
 
-        with self._hook("rmdir", victim, replaced_before_removal):
+        def replaced_before_removal(root, source, target):
+            # Another process that takes the state-folder lock tries to move the
+            # checked workspace while its quarantine rename is still protected.
+            if source == victim:
+                helper.send(
+                    "replace-locked",
+                    str(self.state_dir / STATE_LOCK_NAME),
+                    str(self.state_dir / victim),
+                    str(moved),
+                )
+                answered.append(helper.line(1.0))  # it must still be waiting for the lock
+            return real_rename(root, source, target)
+
+        with mock.patch.object(service, "_rename_noreplace_in", replaced_before_removal):
             self.fetch()
         self.assertEqual(answered, [None], "the removal was not serialised with other lock holders")
         self.assertEqual(helper.line(10), "ok")
@@ -485,6 +493,67 @@ class PinnedStateFolderTests(_FetchWorkspaceBase):
         self.assertTrue((self.state_dir / victim).is_dir(), "a directory put under the name was removed")
         self.assertTrue(moved.is_dir())
         self.assertTrue(any("unrecognised-layout=1" in line for line in logs), logs)
+
+    def test_a_workspace_swapped_after_its_identity_check_is_not_removed(self) -> None:
+        victim = "backup-fetch-victim"
+        self.abandoned_workspace(victim)
+        moved = self.root / "moved-away"
+        replacement_identity: list[tuple[int, int]] = []
+
+        def replaced_after_identity(real, path, *args, **kwargs):
+            checked = real(path, *args, **kwargs)
+            os.rename(self.state_dir / victim, moved)
+            replacement = self.state_dir / victim
+            replacement.mkdir(mode=0o700)
+            metadata = replacement.lstat()
+            replacement_identity.append((metadata.st_dev, metadata.st_ino))
+            return checked
+
+        with self._hook("stat", victim, replaced_after_identity), self._logged() as logs:
+            self.fetch()
+        self.assertTrue(moved.is_dir(), "the checked workspace was not parked by the hook")
+        remaining = [
+            entry.lstat()
+            for entry in self.state_dir.iterdir()
+            if entry.is_dir() and not entry.is_symlink()
+        ]
+        self.assertTrue(
+            any((entry.st_dev, entry.st_ino) in replacement_identity for entry in remaining),
+            "the replacement directory was removed by name",
+        )
+        self.assertTrue(any("unrecognised-layout=1" in line for line in logs), logs)
+
+    def test_fetch_destination_stays_under_the_pinned_workspace(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        parked = self.root / "state-parked"
+
+        def swapped_while_creating_destination(real, path, *args, **kwargs):
+            workspace = next(
+                entry
+                for entry in self.state_dir.iterdir()
+                if entry.name.startswith(service.FETCH_WORKSPACE_PREFIX)
+            )
+            outside_workspace = elsewhere / workspace.name
+            outside_workspace.mkdir(mode=0o700)
+            self.state_dir.rename(parked)
+            self.state_dir.symlink_to(elsewhere, target_is_directory=True)
+            try:
+                return real(path, *args, **kwargs)
+            finally:
+                self.state_dir.unlink()
+                parked.rename(self.state_dir)
+
+        data: bytes | None = None
+        try:
+            with self._hook("open", "archive", swapped_while_creating_destination):
+                data = self.fetch()
+        except FileNotFoundError:
+            pass
+        self.assertEqual(list(elsewhere.rglob("archive")), [], "the fetch followed the swapped ancestor")
+        if data is None:
+            self.fail("the pinned workspace did not receive the fetched bytes")
+        self.assertEqual(hashlib.sha256(data).hexdigest(), self.remote.sha256)
 
     def test_an_empty_workspace_without_its_fetch_marker_is_left_in_place(self) -> None:
         empty = self.state_dir / "backup-fetch-empty"
