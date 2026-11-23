@@ -73,6 +73,7 @@ def _local_tz() -> ZoneInfo | None:
 
 def build_scheduler(policy: BackupPolicy) -> Any:
     from app.config import _derive_runtime_layout_paths
+    from app.services.json_state_budget import read_json_state
     from history_service.backup_scheduler.service import (
         BackupScheduler,
         SchedulerPaths,
@@ -133,7 +134,10 @@ def build_scheduler(policy: BackupPolicy) -> Any:
         app_gid=_app_gid(),
         config_groups=config_group_keys(DEFAULT_BACKUP_GROUP_KEYS, HISTORY_DB_KEY),
         full_groups=list(DEFAULT_BACKUP_GROUP_KEYS),
-        snapshot_config=lambda: snapshot_config_files(hashed),
+        snapshot_config=lambda: snapshot_config_files(
+            hashed,
+            read_json_state=read_json_state,
+        ),
         local_tz=_local_tz(),
     )
 

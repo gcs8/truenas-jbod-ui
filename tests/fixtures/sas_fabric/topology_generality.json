@@ -7673,7 +7673,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 3814,
+     "sas_transport_projected_facts": 2406,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-4:0",
@@ -15802,7 +15802,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 3574,
+     "sas_transport_projected_facts": 2422,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-4:0",
@@ -22860,7 +22860,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 2966,
+     "sas_transport_projected_facts": 2326,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-4:0",
@@ -30346,7 +30346,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 3056,
+     "sas_transport_projected_facts": 2032,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-2:0",
@@ -36777,7 +36777,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 2544,
+     "sas_transport_projected_facts": 1968,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-2:0",
@@ -46601,7 +46601,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 4138,
+     "sas_transport_projected_facts": 3114,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-2:0",
@@ -53972,7 +53972,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 2944,
+     "sas_transport_projected_facts": 1920,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-6:0",
@@ -59824,7 +59824,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 2296,
+     "sas_transport_projected_facts": 1400,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-1:0",
@@ -62723,7 +62723,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 1052,
+     "sas_transport_projected_facts": 540,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-3:0",
@@ -67245,7 +67245,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 2126,
+     "sas_transport_projected_facts": 974,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-5:0",
@@ -71307,7 +71307,7 @@
        "state": "read"
       }
      },
-     "sas_transport_projected_facts": 1528,
+     "sas_transport_projected_facts": 760,
      "sas_transport_ports": [
       {
        "id": "sas-port:port-8:0",

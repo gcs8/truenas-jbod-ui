@@ -282,6 +282,8 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual(port_phys(result, ports[0])[0]["invalid_dword_count"], 9)
         self.assertEqual(len(result.paths), 1)
         self.assertEqual(result.paths[0]["state"], "unknown")
+        self.assertEqual(result.paths[0].get("sas_transport_port_ids"), [ports[0]["sas_transport_port_id"]])
+        self.assertEqual(result.raw["sas_transport_port_index"][ports[0]["sas_transport_port_id"]]["state"], "read")
         self.assertIn(ports[0]["path_id"], trace.node_ids)
         self.assertEqual(len(ports[0]["expander_ids"]), 2)
         self.assertIn(cascade.id, trace.link_ids)
@@ -452,22 +454,24 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
     def test_control_character_is_not_read_only_for_the_affected_attribute(self):
         from app.services.linux_sas_transport import parse_sas_transport
 
-        payload = deepcopy(self.payload)
-        host = next(row for row in payload["rows"] if row["kind"] == "scsi_host")
-        host["attrs"]["board_name"] = "Synthetic\x01HBA"
-        data = parse_sas_transport(json.dumps(payload))
-        self.assertTrue(data.complete, data.reason)
-        decoded = data.of_kind("scsi_host")[0]
-        self.assertIsNone(decoded.attrs["board_name"])
-        self.assertIn("board_name", decoded.not_read)
-        self.assertEqual(decoded.attrs["proc_name"], "mpt3sas")
-        self.assertEqual(host["attrs"]["board_name"], "Synthetic\x01HBA")  # input unchanged
-        result = fabric(json.dumps(payload))
-        self.assertIsNone(result.controllers[0]["board"])
-        self.assertEqual(len(result.expanders), 2)
-        self.assertEqual(
-            len(next(trace for trace in result.traces if trace.id == "bay:0").metrics["sas_transport_ports"]), 1
-        )
+        for character in ("\x01", "\x7f", "\u0085", "\u202e", "\u200d"):
+            with self.subTest(character=repr(character)):
+                payload = deepcopy(self.payload)
+                host = next(row for row in payload["rows"] if row["kind"] == "scsi_host")
+                host["attrs"]["board_name"] = "Synthetic" + character + "HBA"
+                data = parse_sas_transport(json.dumps(payload))
+                self.assertTrue(data.complete, data.reason)
+                decoded = data.of_kind("scsi_host")[0]
+                self.assertIsNone(decoded.attrs["board_name"])
+                self.assertIn("board_name", decoded.not_read)
+                self.assertEqual(decoded.attrs["proc_name"], "mpt3sas")
+                self.assertEqual(host["attrs"]["board_name"], "Synthetic" + character + "HBA")
+                result = fabric(json.dumps(payload))
+                self.assertIsNone(result.controllers[0]["board"])
+                self.assertEqual(len(result.expanders), 2)
+                self.assertEqual(
+                    len(next(trace for trace in result.traces if trace.id == "bay:0").metrics["sas_transport_ports"]), 1
+                )
 
     def test_cumulative_attribute_read_cap_is_independent_of_output_cap(self):
         payload = run_survey(self.root, {"read_bytes = 0": "read_bytes = MAX_BYTES - 1"})
@@ -668,6 +672,118 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
             DISK,
         )
 
+    def test_two_shelves_of_102_bays_admit_two_level_cascade(self):
+        from app.services.linux_sas_transport import parse_sas_transport
+        from app.services import sas_fabric_linux_sas as projection
+
+        payload, slots = shared_port_survey(self.payload, disks=204, phys=204)
+        shared = next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")
+        owner = shared["path"].rsplit("/", 1)[0]
+        payload["rows"].remove(shared)
+        for number in range(204):
+            port = deepcopy(shared)
+            port.update(name=f"port-2:1:{number}", path=owner + f"/port-2:1:{number}")
+            port["attrs"]["num_phys"] = "1"
+            end_name = f"end_device-2:1:{number}"
+            end_path = port["path"] + "/" + end_name
+            phy = next(row for row in payload["rows"] if row["kind"] == "sas_phy" and row["name"] == f"phy-2:1:{number}")
+            phy["links"] = {"port": port["path"]}
+            port["links"] = {phy["name"]: phy["path"], end_name: end_path}
+            for row in payload["rows"]:
+                if row["kind"] in {"sas_end_device", "sas_device"} and row["name"] == end_name:
+                    old = row["path"]
+                    row["path"] = end_path
+                    row["links"] = {key: value.replace(old, end_path) for key, value in row["links"].items()}
+            payload["rows"].append(port)
+        output = json.dumps(payload)
+        data = parse_sas_transport(output)
+        self.assertTrue(data.complete, data.reason)
+        result = self.selection_fabric("scale", slots, output)
+        self.assertIs(result.raw.get("sas_transport_available"), True)
+        # Two expanders, not the PCI prefix or intervening port components.
+        row_facts = sum(1 + len(row.attrs) + len(row.links) for row in data.rows)
+        # The host-wide port census (#1471) charges one record per port and its PHY lists.
+        census_facts = sum(18 + 3 * sum(name.startswith("phy-") for name in row.links) for row in data.of_kind("sas_port"))
+        self.assertEqual(result.raw["sas_transport_projected_facts"], row_facts + census_facts + 204 * (16 + 16 * 2))
+        self.assertLess(len(result.model_dump_json().encode()), 1_500_000)
+        self.assertEqual(len(result.paths[0]["slots"]), 204)
+        for trace in result.traces:
+            if trace.kind == "bay":
+                self.assertEqual(len(trace.metrics["sas_transport_ports"]), 1)
+        # A longer PCI prefix costs no more ancestry references.
+        longer = deepcopy(payload)
+        for row in longer["rows"]:
+            row["path"] = row["path"].replace("/sys/devices/", "/sys/devices/pci0000:01/bridge/bridge/bridge/")
+            row["links"] = {
+                key: value.replace("/sys/devices/", "/sys/devices/pci0000:01/bridge/bridge/bridge/")
+                for key, value in row["links"].items()
+            }
+        self.assertEqual(
+            projection._projected_facts(parse_sas_transport(json.dumps(longer)), SimpleNamespace(slots=slots)),
+            result.raw["sas_transport_projected_facts"],
+        )
+
+    def test_row_and_per_disk_charges_independently_refuse_before_allocation(self):
+        from unittest.mock import patch
+        from app.services.linux_sas_transport import parse_sas_transport
+        from app.services import sas_fabric_linux_sas as projection
+
+        host = deepcopy(next(row for row in self.payload["rows"] if row["kind"] == "sas_host"))
+        phy_rows = [
+            {"kind": "sas_phy", "name": f"phy-2:{i}", "path": f"/sys/devices/host2/phy-2:{i}",
+             "attrs": {"field_" + chr(97 + j): "0" for j in range(14)}, "links": {}}
+            for i in range(2200)
+        ]
+        cases = (
+            ({"version": 1, "complete": True, "rows": [host, *phy_rows]}, []),
+            ({"version": 1, "complete": True, "rows": [host]}, [SimpleNamespace(device_name=None)] * 2049),
+        )
+        for payload, slots in cases:
+            with self.subTest(rows=len(payload["rows"]), slots=len(slots)):
+                output = json.dumps(payload)
+                data = parse_sas_transport(output)
+                self.assertTrue(data.complete, data.reason)  # reaches projection, not the parser cap
+                snapshot = SimpleNamespace(slots=slots)
+                self.assertIsNone(projection._projected_facts(data, snapshot))
+                warnings, raw = [], {}
+                with patch.object(projection, "_Projection") as allocate:
+                    result = projection.enrich_linux_sas_fabric(
+                        output=output, snapshot=snapshot, nodes={}, links={}, traces={}, controllers=[], paths=[],
+                        warnings=warnings, transport_raw=raw,
+                    )
+                allocate.assert_not_called()
+                self.assertIsNone(result)
+                self.assertEqual(raw["sas_transport_reason"], "projection_budget")
+                self.assertEqual(len(warnings), 1)
+                control = SimpleNamespace(slots=slots[:1])
+                small = parse_sas_transport(json.dumps({**payload, "rows": payload["rows"][:2]}))
+                self.assertIsNotNone(projection._projected_facts(small, control))
+
+    def test_refused_port_index_is_not_marked_read(self):
+        payload = deepcopy(self.payload)
+        port = next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")
+        port["attrs"]["num_phys"] = "2"
+        result = fabric(json.dumps(payload))
+        metric = next(trace for trace in result.traces if trace.id == "bay:0").metrics["sas_transport_ports"][0]
+        ref = result.raw["sas_transport_port_index"][metric["sas_transport_port_id"]]
+        self.assertEqual(ref["state"], "not_read")
+        self.assertEqual(ref["phy_names"], [])
+        self.assertEqual(result.paths[0].get("sas_transport_port_ids"), [ref["id"]])
+
+    def test_reported_lanes_rechecks_remote_attachment_at_helper_boundary(self):
+        from dataclasses import replace
+        from app.services.linux_sas_transport import parse_sas_transport
+        from app.services.sas_fabric_linux_sas import _reported_lanes
+
+        data = parse_sas_transport(json.dumps(self.payload))
+        remote = next(row for row in data.of_kind("sas_expander") if row.name == "expander-2:1")
+        port = next(row for row in data.of_kind("sas_port") if row.path == remote.owner_path)
+        phys = {row.path: row for row in data.of_kind("sas_phy")}
+        self.assertIsNotNone(_reported_lanes(port, remote, phys, FRONT, REAR))
+        for bad in (replace(remote, path=remote.path.replace("port-2:0:1", "port-2:0:9")),
+                    replace(remote, name="expander-2:9")):
+            self.assertIsNone(_reported_lanes(port, bad, phys, FRONT, REAR))
+
     def test_shared_port_projection_bounds_response_and_phy_allocations(self):
         from unittest.mock import patch
         from app.services import sas_fabric_linux_sas as projection
@@ -735,7 +851,7 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
     def test_no_ses_budget_refusal_preserves_platform_routes(self):
         from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks
 
-        payload, slots = shared_port_survey(self.payload, disks=200, phys=256)
+        payload, slots = shared_port_survey(self.payload, disks=1500, phys=256)
         slots = [slot.model_copy(update={"ssh_ses_device": None}) for slot in slots]
         output = json.dumps(payload)
         self.assertTrue(
@@ -874,13 +990,27 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
                 column_index=1,
                 present=True,
                 device_name="nvme0n1",
+                smart_device_names=["/dev/nvme0n1"],
                 transport_protocol="nvme",
             ),
         ]
         for platform in ("linux", "scale"):
-            with self.subTest(platform=platform):
-                result = self.assert_same_selected_routes(platform, slots, json.dumps(self.payload))
-                self.assertIn("nvme", {path["path_type"] for path in result.paths})
+            for device_name in ("nvme0n1", None):
+                with self.subTest(platform=platform, device_name=device_name):
+                    selected = [slots[0], slots[1].model_copy(update={"device_name": device_name})]
+                    result = self.assert_same_selected_routes(platform, selected, json.dumps(self.payload))
+                    self.assertIn("nvme", {path["path_type"] for path in result.paths})
+        from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks
+
+        self.assertFalse(transport_matches_selected_blocks(parse_sas_transport(json.dumps(self.payload)), ["sdz", ""]))
+        # The typed helper itself must refuse an empty primary name, even for
+        # a constructed row that could not pass the wire parser's link grammar.
+        from dataclasses import replace
+
+        data = parse_sas_transport(json.dumps(self.payload))
+        rows = tuple(replace(row, links={**row.links, "": next(iter(row.links.values()))})
+                     if row.kind == "sas_end_device" else row for row in data.rows)
+        self.assertFalse(transport_matches_selected_blocks(replace(data, rows=rows), ["sdz", ""]))
 
     def test_empty_selection_does_not_admit_unrelated_transport_hardware(self):
         for platform in ("linux", "scale"):

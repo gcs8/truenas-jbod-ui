@@ -49,6 +49,20 @@ python scripts/build_perf_baseline.py --check
 
 Review fixture and baseline changes together. The write command validates measured values against authoritative hard ceilings before replacing the checked artifact, so an oversized bundle exits nonzero and leaves the existing baseline untouched. Do not raise a ceiling only to make CI pass. Explain why the payload or cache contract changed and retain useful headroom.
 
+## API harness readiness and baseline comparison
+
+The API harness defaults to a readiness budget of 330 seconds, allowing the
+application's 300-second background refresh plus scheduling margin. Override
+it with `--readiness-timeout-seconds` or
+`PERF_HARNESS_READINESS_TIMEOUT_SECONDS`. This changes only the harness budget,
+not the application's refresh limit or the allowed retry operations.
+
+`snapshot_export_estimate` measures a warm estimate after readiness has been
+established. Use `snapshot_export_estimate_workflow` for a like-for-like
+comparison against older baselines whose estimate row included refresh recovery
+and busy waits. The workflow row includes prerequisite and estimate requests;
+separate readiness rows explain that wait without counting it as warm latency.
+
 ## Active performance semantics
 
 - Selection and focus updates must not rebuild a stable enclosure grid.

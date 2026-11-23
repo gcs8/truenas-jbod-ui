@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -42,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
 from types import MappingProxyType
-from typing import Any
+from typing import Any, BinaryIO
 
 import yaml
 
@@ -76,6 +77,7 @@ from history_service.backup_archive.settings import PROVIDERS
 from history_service.backup_archive.transport import (
     ArchiveDownloadTooLargeError,
     ArchivePublicationUncertainError,
+    DescriptorDownloadDestination,
     LocalDirectoryTarget,
     StoredObject,
     open_target,
@@ -112,6 +114,7 @@ _FETCH_WORKSPACE_FILE = "archive"
 # Made by the fetch that created the workspace, before anyone else can look at
 # it: an empty directory proves nothing about who made it, this file does.
 _FETCH_WORKSPACE_MARKER = "fetch-workspace"
+_FETCH_WORKSPACE_QUARANTINE_PREFIX = f"{FETCH_WORKSPACE_PREFIX}quarantine-"
 # Every process sharing the state folder holds this file lock while it makes
 # and locks a fetch workspace, and while it removes one, so a scan never sees a
 # workspace its creator has not locked yet and nothing is swapped mid-removal.
@@ -1685,9 +1688,13 @@ class BackupScheduler:
             raise ArtifactNotFoundError("The target holding this copy is no longer configured.")
         workspace = self._new_fetch_workspace()
         try:
+            destination = DescriptorDownloadDestination(
+                workspace.descriptor,
+                _FETCH_WORKSPACE_FILE,
+            )
             local = workspace.path / _FETCH_WORKSPACE_FILE
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local, limit=record.size + 1)
+                size, digest = remote.get(record.name, destination, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
@@ -1738,7 +1745,12 @@ class BackupScheduler:
         except BaseException:
             os.close(root)
             raise
-        return _FetchWorkspace(root=root, name=name, descriptor=held, path=self.paths.state_dir / name)
+        return _FetchWorkspace(
+            root=root,
+            name=name,
+            descriptor=held,
+            path=self.paths.state_dir / name,
+        )
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
@@ -1932,6 +1944,7 @@ def _remove_stale_keeper_scratch(state_dir: Path) -> None:
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 )
+_RENAME_NOREPLACE = 1
 _STATE_FOLDER_REFUSED = (
     "Backup fetch refused: the scheduler state folder is not a private directory of the scheduler account "
     "(a real directory, not a link, owned by it and not writable by others)."
@@ -1945,7 +1958,7 @@ class _FetchWorkspace:
     root: int  # the state folder, opened once
     name: str
     descriptor: int  # the workspace directory; holds its ``flock`` while the fetch runs
-    path: Path  # for the transport and the caller; never used for removal
+    path: Path  # for callers after descriptor-relative destination creation
 
 
 @dataclass
@@ -2033,13 +2046,35 @@ def _make_fetch_workspace(root: int) -> tuple[str, int]:
     raise FileExistsError(errno.EEXIST, "No unused fetch workspace name was found.")
 
 
-def _remove_fetch_workspace(root: int, name: str, descriptor: int) -> None:
-    """Empty the checked workspace through its descriptor, then remove its name.
+def _rename_noreplace_in(root: int, source: str, target: str) -> None:
+    """Rename one entry inside ``root`` without replacing another name."""
 
-    Call with the state-folder lock held, which every process takes before it
-    makes or removes a workspace, and with ``descriptor`` open on the checked
-    directory. Only the fetched file and the marker are removed, and only from
-    that directory; the name is removed only while it still names it.
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(root, os.fsencode(source), root, os.fsencode(target), _RENAME_NOREPLACE) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source, target)
+
+
+def _remove_fetch_workspace(root: int, name: str, descriptor: int) -> None:
+    """Empty, detach and remove the checked workspace through pinned names.
+
+    Call with the state-folder lock held, which every scheduler process takes
+    before it makes or removes a workspace. A process that ignores the lock can
+    still replace ``name`` after the identity check, so removal first renames it
+    without replacement to an unpredictable quarantine name under ``root``.
+    The quarantine entry must still be the opened directory before its final
+    ``rmdir``. A swapped-in directory is retained under that name, never removed.
     """
 
     checked = os.fstat(descriptor)
@@ -2049,7 +2084,19 @@ def _remove_fetch_workspace(root: int, name: str, descriptor: int) -> None:
     current = os.stat(name, dir_fd=root, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (checked.st_dev, checked.st_ino):
         raise _WorkspaceMoved(errno.ESTALE, "The workspace name no longer names the checked directory.")
-    os.rmdir(name, dir_fd=root)
+    for _ in range(100):
+        quarantine = f"{_FETCH_WORKSPACE_QUARANTINE_PREFIX}{secrets.token_hex(8)}"
+        try:
+            _rename_noreplace_in(root, name, quarantine)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(errno.EEXIST, "No unused fetch workspace quarantine name was found.")
+    detached = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+    if (detached.st_dev, detached.st_ino) != (checked.st_dev, checked.st_ino):
+        raise _WorkspaceMoved(errno.ESTALE, "The detached workspace is not the checked directory.")
+    os.rmdir(quarantine, dir_fd=root)
 
 
 def _reclaim_fetch_workspaces(state_dir: Path, *, owner: int | None) -> _FetchReclaim:
@@ -2192,13 +2239,26 @@ class ConfigFileSnapshot(dict[str, Any]):
         self.files = MappingProxyType(dict(files))
 
 
-def snapshot_config_files(paths: Mapping[str, Path]) -> ConfigFileSnapshot:
+_JSON_STATE_SNAPSHOT_KEYS = frozenset({"mappings", "sas_fabric_aliases"})
+
+
+def snapshot_config_files(
+    paths: Mapping[str, Path],
+    *,
+    read_json_state: Callable[[BinaryIO, str], bytes],
+) -> ConfigFileSnapshot:
     """Capture once for both hashing and export; missing documents remain hashed."""
 
     snapshot: dict[str, Any] = {}
     files: dict[Path, bytes | None] = {}
     for logical, path in paths.items():
-        content = path.read_bytes() if path.exists() else None
+        if not path.exists():
+            content = None
+        elif logical in _JSON_STATE_SNAPSHOT_KEYS:
+            with path.open("rb") as source:
+                content = read_json_state(source, path.name)
+        else:
+            content = path.read_bytes()
         files[path.absolute()] = content
         if content is None:
             snapshot[logical] = None

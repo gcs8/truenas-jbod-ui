@@ -7,9 +7,10 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "../..");
-function topology() {
+function topology(transportApi) {
   const context = vm.createContext({ window: {} });
   vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
+  if (transportApi) context.window.SasFabricTransport = transportApi;
   vm.runInContext(require("./helpers/fabric_topology").topologySource(), context);
   return context.window.SasFabricTopology;
 }
@@ -150,11 +151,11 @@ function referencedTransportFabric() {
   return fabric;
 }
 
-function transportRenderers(fabric) {
+function transportRenderers(fabric, transportApi = transport()) {
   const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
   const elements = new Map();
   const context = vm.createContext({ URLSearchParams,
-    window: { location: { search: "" }, SasFabricTopology: topology(), SasFabricTransport: transport(), SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
+    window: { location: { search: "" }, SasFabricTopology: topology(), SasFabricTransport: transportApi, SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "" }); return elements.get(id); }, querySelectorAll: () => [] },
   });
   const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
@@ -170,7 +171,9 @@ test("referenced transport PHY rows resolve in topology, Disk Path and Storage L
   const resolved = resolve(fabric, fabric.traces[0].metrics.path_states[0]);
   assert.equal(resolved.phys[0].invalid_dword_count, 9);
   const model = api.buildTopologyModel(fabric);
-  // The approved model keeps resolved PHY detail on the independently pinnable port.
+  assert.equal(model.bays[0].pathStates[0].transportPhyCount, 1);
+  assert.match(api.renderTopology(model), /1 reported PHY rows/);
+  // The approved model also keeps resolved PHY detail on the independently pinnable port.
   assert.equal(model.bays[0].ports.length, 1);
   assert.equal(model.bays[0].ports[0].phy.counters.invalid_dword_count, 9);
   const ui = transportRenderers(fabric);
@@ -193,6 +196,93 @@ test("dangling or contradictory transport PHY references remain not read", () =>
   changed.raw.sas_transport_port_index[metric.sas_transport_port_id].phy_names.push("phy-missing");
   assert.equal(resolve(changed, metric).state, "not_read");
   assert.equal(resolve(changed, metric).phys.length, 0);
+});
+
+const invalidReferences = {
+  "missing index": (f) => { delete f.raw.sas_transport_port_index; },
+  "missing entry": (f, m) => { delete f.raw.sas_transport_port_index[m.sas_transport_port_id]; },
+  "id mismatch": (f, m, p) => { p.id = "other-port"; },
+  "refused index": (f, m, p) => { p.state = "not_read"; },
+  "missing owner": (f, m, p) => { p.owner_id = "missing"; },
+  "wrong owner kind": (f, m, p) => { const owner = f.nodes.find((n) => n.id === p.owner_id); owner.kind = "bay"; },
+  "duplicate names": (f, m, p) => { p.phy_names.push(p.phy_names[0]); },
+  "extra name": (f, m, p) => { p.phy_names.push("phy-missing"); },
+  "extra duplicate row": (f, m, p) => {
+    const owner = f.nodes.find((n) => n.id === p.owner_id);
+    owner.raw.phys.push({ ...owner.raw.phys[0] });
+  },
+  "duplicate owner rows": (f, m, p) => {
+    p.phy_names.push("phy-missing");
+    const owner = f.nodes.find((n) => n.id === p.owner_id);
+    owner.raw.phys.push({ ...owner.raw.phys[0] });
+  },
+  "empty names forced read": (f, m, p) => { p.phy_names = []; p.state = "read"; },
+  "non-string name": (f, m, p) => {
+    p.phy_names = [7]; f.nodes.find((n) => n.id === p.owner_id).raw.phys[0].name = 7;
+  },
+  "oversized membership": (f, m, p) => {
+    const owner = f.nodes.find((n) => n.id === p.owner_id);
+    owner.raw.phys = Array.from({ length: 257 }, (_, i) => ({ ...owner.raw.phys[0], name: `phy-${i}` }));
+    p.phy_names = owner.raw.phys.map((row) => row.name);
+  },
+  "inherited special id": (f, m, p) => {
+    m.sas_transport_port_id = "__proto__"; f.paths[0].sas_transport_port_ids = ["__proto__"];
+    f.raw.sas_transport_port_index = Object.create({ __proto__: { ...p, id: "__proto__" } });
+  },
+  "non-string id": (f, m, p) => {
+    m.sas_transport_port_id = 7; p.id = 7;
+    f.raw.sas_transport_port_index = { 7: p }; f.paths[0].sas_transport_port_ids = [7];
+  },
+};
+
+for (const [name, mutate] of Object.entries(invalidReferences)) {
+  test(`unread transport reference: ${name}, shared resolver and all renderers`, () => {
+    const fabric = referencedTransportFabric();
+    const metric = fabric.traces[0].metrics.path_states[0];
+    mutate(fabric, metric, fabric.raw.sas_transport_port_index[metric.sas_transport_port_id]);
+    const port = transport().resolveTransportPort(fabric, metric);
+    assert.equal(port.state, "not_read");
+    assert.equal(port.phys.length, 0);
+    const api = topology();
+    const model = api.buildTopologyModel(fabric);
+    assert.equal(model.bays.find((bay) => bay.bayId === "bay:0").pathStates[0].transportPhyCount, null);
+    assert.match(api.renderTopology(model), /PHY rows not read/);
+    const ui = transportRenderers(fabric);
+    const trace = fabric.traces[0];
+    const branch = ui.renderDiskPathBranch(ui.branchSeedsForDiskTrace(trace, fabric)[0], trace, fabric, 0);
+    assert.match(branch, /Port PHYs<\/em>Not read/);
+    assert.doesNotMatch(branch, /invalid dword 9/);
+    const lanes = ui.renderLanesMode(fabric);
+    assert.match(lanes, /PHY rows not read/);
+    assert.doesNotMatch(lanes, /0 reported PHY rows/);
+  });
+}
+
+test("consumers do not trust PHY rows carried by an unread resolver result", () => {
+  const fabric = referencedTransportFabric();
+  const unread = { ...transport(), resolveTransportPort: () => ({ state: "not_read", phys: [{ phy: 99, counter_state: "measured", invalid_dword_count: 987 }] }) };
+  // Exercise the real pathState consumer with its resolver guard separately
+  // from the view consumers, whose boundary is the shared module API.
+  const ui = transportRenderers(fabric, unread);
+  const trace = fabric.traces[0];
+  const branch = ui.renderDiskPathBranch(ui.branchSeedsForDiskTrace(trace, fabric)[0], trace, fabric, 0);
+  assert.match(branch, /Port PHYs<\/em>Not read/);
+  assert.doesNotMatch(branch, /invalid dword 987/);
+  assert.match(ui.renderLanesMode(fabric), /PHY rows not read/);
+});
+
+test("dropped port ids still say not read in all transport consumers", () => {
+  const fabric = referencedTransportFabric();
+  delete fabric.traces[0].metrics.path_states[0].sas_transport_port_id;
+  delete fabric.paths[0].sas_transport_port_ids;
+  const api = topology();
+  assert.match(api.renderTopology(api.buildTopologyModel(fabric)), /PHY rows not read/);
+  const ui = transportRenderers(fabric);
+  const trace = fabric.traces[0];
+  const branch = ui.renderDiskPathBranch(ui.branchSeedsForDiskTrace(trace, fabric)[0], trace, fabric, 0);
+  assert.match(branch, /Port PHYs<\/em>Not read/);
+  assert.doesNotMatch(branch, /invalid dword 9/);
+  assert.match(ui.renderLanesMode(fabric), /PHY rows not read/);
 });
 
 test("transport copy does not claim that reported expander detail is unexposed", () => {

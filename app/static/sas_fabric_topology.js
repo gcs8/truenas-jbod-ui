@@ -1515,6 +1515,9 @@ function buildTopologyModel(given, options = {}) {
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
         device: text(state.device_name),
+        // Its port's reported PHY rows through the shared resolver: a count
+        // only where the reference resolves; otherwise not read (#1494).
+        transportPhyCount: window.SasFabricTransport?.pathState?.(fabric, state)?.transportPhyCount,
         raw: state,
       }));
       const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id));

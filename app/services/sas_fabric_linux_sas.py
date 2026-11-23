@@ -28,6 +28,14 @@ def _projected_facts(data: SasTransportData, snapshot: Any) -> int | None:
             facts += 18 + 3 * sum(name.startswith("phy-") for name in row.links)
         if facts > MAX_PROJECTED_TRANSPORT_FACTS:
             return None
+    # Count only admitted expander ancestors, as build_hardware does. The PCI
+    # prefix and port components create no repeated expander references.
+    depths = {row.path: 0 for row in data.of_kind("sas_host")}
+    ports = {row.path: row for row in data.of_kind("sas_port")}
+    for row in sorted(data.of_kind("sas_expander"), key=lambda item: len(item.path)):
+        port = ports.get(row.owner_path)
+        if port and port.owner_path in depths and port.links.get(row.name) == row.path:
+            depths[row.path] = depths[port.owner_path] + 1
     by_block = defaultdict(list)
     for row in data.of_kind("sas_end_device"):
         for block in row.links:
@@ -37,7 +45,9 @@ def _projected_facts(data: SasTransportData, snapshot: Any) -> int | None:
         # site conservatively, even when a later identity join is refused.
         facts += 16
         for row in by_block.get((slot.device_name or "").removeprefix("/dev/"), []):
-            facts += 16 * row.path.count("/")
+            port = ports.get(row.owner_path)
+            if port and port.links.get(row.name) == row.path:
+                facts += 16 * depths.get(port.owner_path, 0)
         if facts > MAX_PROJECTED_TRANSPORT_FACTS:
             return None
     return facts
@@ -89,6 +99,8 @@ def _reported_lanes(
     # mpt3sas exposes a downstream port on the parent, not a reverse port on
     # the child expander. The nested remote object identifies the attachment;
     # reciprocal PHY/port membership establishes only the parent-side PHY set.
+    # Keep this helper boundary check as defence in depth. build_hardware's
+    # port selection is authoritative for admitting the graph's parent edge.
     if remote.owner_path != port.path or port.links.get(remote.name) != remote.path:
         return None
     local = _port_phys(port, phys)

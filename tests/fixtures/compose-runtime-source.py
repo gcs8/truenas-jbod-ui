@@ -54,7 +54,16 @@ def check(port):
         try:
             with connect(f"ws://127.0.0.1:{port}/websocket", open_timeout=1, close_timeout=1) as connection:
                 connection.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
-                if json.loads(connection.recv(timeout=1)) == {"msg": "connected", "session": "compose-runtime"}:
+                if json.loads(connection.recv(timeout=1)) != {"msg": "connected", "session": "compose-runtime"}:
+                    continue
+                connection.send(json.dumps({"msg": "method", "id": "auth", "method": "auth.login_with_api_key",
+                                            "params": ["synthetic-compose-source-key"]}))
+                if json.loads(connection.recv(timeout=1)) != {"msg": "result", "id": "auth", "result": True}:
+                    continue
+                connection.send(json.dumps({"msg": "method", "id": "enclosures", "method": "enclosure.query"}))
+                if json.loads(connection.recv(timeout=1)) == {
+                    "msg": "result", "id": "enclosures", "result": RESPONSES["enclosure.query"],
+                }:
                     return
         except (OSError, TimeoutError):
             time.sleep(0.1)

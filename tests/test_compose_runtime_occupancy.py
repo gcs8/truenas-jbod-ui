@@ -247,6 +247,43 @@ class ComposeRuntimeSourceTests(unittest.TestCase):
         self.assertIn("error", connection.replies[2])
         self.assertEqual(connection.replies[3]["result"][0]["elements"], [{"slot": 1, "status": "Not installed"}])
 
+    def test_readiness_check_requires_authenticated_enclosure_reply(self):
+        from unittest.mock import Mock
+
+        connection = Mock()
+        connection.recv.side_effect = [
+            json.dumps({"msg": "connected", "session": "compose-runtime"}),
+            json.dumps({"msg": "result", "id": "auth", "result": True}),
+            json.dumps({"msg": "result", "id": "enclosures", "result": self.source.RESPONSES["enclosure.query"]}),
+        ]
+        with patch.object(self.source, "connect") as connect:
+            connect.return_value.__enter__.return_value = connection
+            self.source.check(19443)
+        sent = [json.loads(call.args[0]) for call in connection.send.call_args_list]
+        self.assertEqual([item.get("method") for item in sent], [None, "auth.login_with_api_key", "enclosure.query"])
+        self.assertEqual(connection.recv.call_count, 3)
+
+    def test_readiness_check_refuses_invalid_authenticated_replies(self):
+        from unittest.mock import Mock
+
+        connected = {"msg": "connected", "session": "compose-runtime"}
+        authenticated = {"msg": "result", "id": "auth", "result": True}
+        for replies in (
+            [connected, {"msg": "result", "id": "auth", "result": False}],
+            [connected, authenticated, {"msg": "result", "id": "enclosures", "result": []}],
+        ):
+            with self.subTest(replies=replies):
+                connection = Mock()
+                connection.recv.side_effect = [json.dumps(reply) for reply in replies]
+                clock = Mock()
+                clock.monotonic.side_effect = [0, 0, 16]
+                with (patch.object(self.source, "connect") as connect,
+                      patch.object(self.source, "time", clock),
+                      self.assertRaisesRegex(RuntimeError, "Synthetic mapping source did not become ready")):
+                    connect.return_value.__enter__.return_value = connection
+                    self.source.check(19443)
+                self.assertEqual(connection.recv.call_count, len(replies))
+
     def test_runtime_source_launch_is_detached_then_readiness_checked_as_inherited_user(self):
         from unittest.mock import call
 

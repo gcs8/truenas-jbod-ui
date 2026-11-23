@@ -1671,10 +1671,15 @@ function renderPort(model, bay, port, path, used) {
       + `<rect class="topo-port-hit" x="${Math.round(port.x - port.hitW / 2)}" y="${top}" width="${port.hitW}" height="${bottom - top}" rx="3"></rect>${stub}${markShape(tone, port.x, port.y, port.state)}</g>`;
   }
 
+function phyRowsText(state) {
+    if (state.transportPhyCount === undefined) return "";
+    return state.transportPhyCount === null ? "; PHY rows not read" : `; ${state.transportPhyCount} reported PHY rows`;
+  }
+
 function bayTitle(bay) {
     const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
-      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === context.MEMBER_HEALTH ? "member health " : ""}${state.state}`).join(", ")}`
+      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === context.MEMBER_HEALTH ? "member health " : ""}${state.state}${phyRowsText(state)}`).join(", ")}`
       : "no path state in payload";
     return [bay.label, bay.locationKnown ? "" : context.LOCATION_UNKNOWN, occupancy, bay.deviceName, bay.protocol === "SATA" ? "SATA: one port" : bay.protocol, paths, ...context.list(bay.extra)].filter(Boolean).join(", ");
   }
