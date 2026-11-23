@@ -24,6 +24,7 @@ const build = (fixture, width = 1150, change = (fabric) => fabric) => {
 };
 // The renderer runs in its own context, so its arrays are another realm's: compare as JSON.
 const same = (actual, expected, message) => assert.equal(JSON.stringify(actual), JSON.stringify(expected), message);
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const decode = (text) => text.replace(/<[^>]*>/g, " ").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 
 // Everything the page can say about a model: the drawing's text and names,
@@ -122,7 +123,7 @@ test("a three-level cascade: each enclosure's page shows the others as stubs, in
     same(model.links.filter((link) => link.lanes).map((link) => link.lanes.count), [4, 4, 4], `${id}: three x4 cables`);
     for (const stub of model.nodes.filter((entry) => entry.neighbour)) {
       assert.match(stub.neighbour.href, /^view\?enclosure=5bbb/, `${id}: ${stub.label} links to its enclosure's view`);
-      assert.match(T.renderTopology(model, {}), new RegExp(`<a class="topo-node[^"]*topo-stub[^>]*href="${stub.neighbour.href.replace(/[?]/g, "\\?")}"`), `${id}: the stub is a link`);
+      assert.match(T.renderTopology(model, {}), new RegExp(`<a class="topo-node[^"]*topo-stub[^>]*href="${escapeRegExp(stub.neighbour.href)}"`), `${id}: the stub is a link`);
     }
   }
   // The Friendly Label names the neighbour where one is saved; the label where not.
