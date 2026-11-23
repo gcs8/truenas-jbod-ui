@@ -27,7 +27,11 @@ selection on the main page.
   transport is used only when every selected named disk has a unique reported
   block binding and a complete path to its SAS host. NVMe-only and mixed or
   unmatched storage views retain their existing storage routes; an unrelated
-  HBA does not change the selected view. See
+  HBA does not change the selected view. PHY rows are shared through stable
+  port references instead of repeated in every bay. A 32,768-fact aggregate
+  projection budget includes survey fields, links and repeated bay ancestry;
+  overflow keeps the fallback map and reports transport detail as not read.
+  See
   [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] and
   [[Generic Linux Setup|Generic-Linux-Setup]] for the SSH commands involved.
 - **QuantaStor**: HA node, enclosure, pool, vdev and disk from the REST API,

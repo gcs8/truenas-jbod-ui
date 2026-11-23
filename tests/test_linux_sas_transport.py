@@ -112,6 +112,63 @@ class SyntheticSasTree:
             raise ValueError("Only observed downstream nesting is modelled")
 
 
+def shared_port_survey(payload, disks=16, phys=64):
+    """Invented adversarial shape: many end devices share one wide port."""
+    payload = deepcopy(payload)
+    rows = payload["rows"]
+    end = next(row for row in rows if row["kind"] == "sas_end_device")
+    phy = next(row for row in rows if row["kind"] == "sas_phy" and row["name"] == "phy-2:1:7")
+    device = next(row for row in rows if row["kind"] == "sas_device" and row["name"].startswith("end_device"))
+    port = next(row for row in rows if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")
+    owner = port["path"].rsplit("/", 1)[0]
+    payload["rows"] = [
+        row
+        for row in rows
+        if row["kind"] != "sas_end_device"
+        and not (row["kind"] == "sas_device" and row["name"].startswith("end_device"))
+        and not (row["kind"] == "sas_phy" and row["path"].rsplit("/", 1)[0] == owner)
+    ]
+    port["attrs"]["num_phys"] = str(phys)
+    port["links"] = {}
+    slots = []
+    for number in range(phys):
+        row = deepcopy(phy)
+        row["name"] = f"phy-2:1:{number}"
+        row["path"] = owner + "/" + row["name"]
+        row["attrs"]["phy_identifier"] = str(number)
+        row["links"] = {"port": port["path"]}
+        port["links"][row["name"]] = row["path"]
+        payload["rows"].append(row)
+    for number in range(disks):
+        row = deepcopy(end)
+        row["name"] = f"end_device-2:1:{number}"
+        row["path"] = port["path"] + "/" + row["name"]
+        block = f"sdz{number}"
+        row["links"] = {block: row["path"] + "/target2:0:0/2:0:0:0/block/" + block}
+        port["links"][row["name"]] = row["path"]
+        detail = deepcopy(device)
+        detail.update(name=row["name"], path=row["path"])
+        payload["rows"].extend((row, detail))
+        slots.append(
+            SlotView(
+                slot=number,
+                slot_label=str(number),
+                row_index=0,
+                column_index=number,
+                present=True,
+                device_name=block,
+                ssh_ses_device="/dev/sg9",
+            )
+        )
+    return payload, slots
+
+
+def port_phys(result, metric):
+    ref = result.raw["sas_transport_port_index"][metric["sas_transport_port_id"]]
+    owner = next(node for node in result.nodes if node.id == ref["owner_id"])
+    return [row for row in owner.raw.get("phys", owner.raw.get("phy_rows", [])) if row["name"] in ref["phy_names"]]
+
+
 def fabric(output: str):
     slot = SlotView(
         slot=0,
@@ -222,7 +279,7 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual(ports[0]["member_device_name"], "sdz")
         self.assertEqual(ports[0]["bay_identifier"], 7)  # not misused as a slot offset
         self.assertEqual(ports[0]["sas_address"], DISK)
-        self.assertEqual(ports[0]["expander_phys"][0]["invalid_dword_count"], 9)
+        self.assertEqual(port_phys(result, ports[0])[0]["invalid_dword_count"], 9)
         self.assertEqual(len(result.paths), 1)
         self.assertEqual(result.paths[0]["state"], "unknown")
         self.assertIn(ports[0]["path_id"], trace.node_ids)
@@ -542,6 +599,69 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
             ],
             DISK,
         )
+
+    def test_shared_port_projection_bounds_response_and_phy_allocations(self):
+        from unittest.mock import patch
+        from app.services import sas_fabric_linux_sas as projection
+
+        payload, slots = shared_port_survey(self.payload)
+        with patch.object(projection, "_phy", wraps=projection._phy) as allocate:
+            result = self.selection_fabric("scale", slots, json.dumps(payload))
+        encoded = result.model_dump_json().encode()
+        self.assertLess(len(encoded), 350_000)
+        self.assertLessEqual(allocate.call_count, sum(row["kind"] == "sas_phy" for row in payload["rows"]))
+        refs = set()
+        for trace in result.traces:
+            if trace.kind != "bay":
+                continue
+            metric = trace.metrics["sas_transport_ports"][0]
+            self.assertNotIn("expander_phys", metric)
+            refs.add(metric["sas_transport_port_id"])
+            self.assertEqual(len(port_phys(result, metric)), 64)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(len(result.raw["sas_transport_port_index"]), 1)
+        again = self.selection_fabric("scale", slots, json.dumps(payload))
+        self.assertEqual(result.raw["sas_transport_port_index"], again.raw["sas_transport_port_index"])
+
+    def test_shared_port_phy_materialization_is_linear(self):
+        from unittest.mock import patch
+        from app.services import sas_fabric_linux_sas as projection
+
+        payload, slots = shared_port_survey(self.payload, disks=8, phys=32)
+        with patch.object(projection, "_phy", wraps=projection._phy) as allocate:
+            self.selection_fabric("scale", slots, json.dumps(payload))
+        self.assertEqual(allocate.call_count, sum(row["kind"] == "sas_phy" for row in payload["rows"]))
+
+    def test_projection_fact_budget_boundary_preserves_fallback(self):
+        from unittest.mock import patch
+        from app.services import sas_fabric_linux_sas as projection
+
+        payload, slots = shared_port_survey(self.payload, disks=3, phys=8)
+        output = json.dumps(payload)
+        control = self.selection_fabric("scale", slots, output)
+        facts = control.raw.get("sas_transport_projected_facts", 0)
+        self.assertGreater(facts, 0)
+        baseline = self.selection_fabric("scale", slots, "")
+        with patch.object(projection, "MAX_PROJECTED_TRANSPORT_FACTS", facts, create=True):
+            exact = self.selection_fabric("scale", slots, output)
+        self.assertIs(exact.raw["sas_transport_available"], True)
+        with (
+            patch.object(projection, "MAX_PROJECTED_TRANSPORT_FACTS", facts - 1, create=True),
+            patch.object(projection, "_phy", wraps=projection._phy) as allocate,
+        ):
+            refused = self.selection_fabric("scale", slots, output)
+        self.assertEqual(allocate.call_count, 0)  # refuse before expanding facts
+        self.assertEqual(refused.raw.get("sas_transport_state"), "not_read")
+        self.assertEqual(refused.raw.get("sas_transport_reason"), "projection_budget")
+        self.assertFalse(refused.raw.get("sas_transport_available", False))
+        warnings = [warning for warning in refused.warnings if "projection budget" in warning]
+        self.assertEqual(len(warnings), 1)
+        self.assertLess(len(warnings[0]), 200)
+        self.assertEqual(refused.controllers, baseline.controllers)
+        self.assertEqual(refused.paths, baseline.paths)
+        self.assertEqual([link.model_dump() for link in refused.links], [link.model_dump() for link in baseline.links])
+        self.assertEqual(refused.expanders, [])
+        self.assertNotIn("sas_transport_port_index", refused.raw)
 
     def selection_fabric(self, platform, slots, output):
         return build_sas_fabric_snapshot(

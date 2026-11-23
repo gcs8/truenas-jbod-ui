@@ -129,6 +129,61 @@ test("SES-only payloads retain the existing not-collected explanation", () => {
   assert.ok(model.tiers.some((tier) => tier.state === "not_collected"));
 });
 
+function referencedTransportFabric() {
+  const fabric = syntheticFabric();
+  const port = { controller: "host2", state: "unknown", path_id: "path:host2:sysfs", member_device_name: "sdz", sas_transport_port_id: "sas-port:port-2:1:2" };
+  fabric.raw.sas_transport_port_index = { "sas-port:port-2:1:2": { id: "sas-port:port-2:1:2", owner_id: "expander:rear", phy_names: ["phy-2:1:7"], state: "read" } };
+  const rear = fabric.nodes.find((node) => node.id === "expander:rear");
+  rear.controller_id = "controller:host2";
+  rear.raw.phys = [{ name: "phy-2:1:7", phy: 7, negotiated_rate_gbps: 12, counter_state: "measured", invalid_dword_count: 9, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 }];
+  fabric.nodes.push({ id: "bay:0", kind: "bay", label: "Bay 00", slot: 0, related_slots: [0], raw: {}, metrics: { present: true, device_name: "sdz" } });
+  fabric.traces.push({ id: "bay:0", kind: "bay", label: "Bay 00", slots: [0], node_ids: ["host", "controller:host2", "expander:rear", "ses:sg9", "bay:0"], link_ids: [], metrics: { device_name: "sdz", path_states: [port] } });
+  fabric.controllers = [{ id: "controller:host2", name: "host2" }];
+  fabric.paths = [{ id: "path:host2:sysfs", controller: "host2", state: "unknown", count: 1, slots: [0], sas_transport_port_ids: [port.sas_transport_port_id] }];
+  return fabric;
+}
+
+function transportRenderers(fabric) {
+  const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
+  const elements = new Map();
+  const context = vm.createContext({ URLSearchParams,
+    window: { location: { search: "" }, SasFabricTopology: topology(), SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
+    document: { getElementById(id) { if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "" }); return elements.get(id); }, querySelectorAll: () => [] },
+  });
+  const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
+  vm.runInContext(source.slice(0, end) + "\nwindow.testApi = { branchSeedsForDiskTrace, renderDiskPathBranch, renderLanesMode };\n})();", context);
+  return context.window.testApi;
+}
+
+test("referenced transport PHY rows resolve in topology, Disk Path and Storage Lanes", () => {
+  const fabric = referencedTransportFabric();
+  const api = topology();
+  assert.equal(typeof api.resolveTransportPort, "function");
+  const resolved = api.resolveTransportPort(fabric, fabric.traces[0].metrics.path_states[0]);
+  assert.equal(resolved.phys[0].invalid_dword_count, 9);
+  const model = api.buildTopologyModel(fabric);
+  assert.equal(model.bays[0].pathStates[0].transportPhyCount, 1);
+  const ui = transportRenderers(fabric);
+  const trace = fabric.traces[0];
+  const seed = ui.branchSeedsForDiskTrace(trace, fabric)[0];
+  const branch = ui.renderDiskPathBranch(seed, trace, fabric, 0);
+  assert.ok(branch.includes("invalid dword 9"));
+  assert.ok(ui.renderLanesMode(fabric).includes("1 reported PHY rows"));
+});
+
+test("dangling or contradictory transport PHY references remain not read", () => {
+  const fabric = referencedTransportFabric();
+  const api = topology();
+  assert.equal(typeof api.resolveTransportPort, "function");
+  const metric = fabric.traces[0].metrics.path_states[0];
+  delete fabric.raw.sas_transport_port_index[metric.sas_transport_port_id];
+  assert.equal(api.resolveTransportPort(fabric, metric).state, "not_read");
+  const changed = referencedTransportFabric();
+  changed.raw.sas_transport_port_index[metric.sas_transport_port_id].phy_names.push("phy-missing");
+  assert.equal(api.resolveTransportPort(changed, metric).state, "not_read");
+  assert.equal(api.resolveTransportPort(changed, metric).phys.length, 0);
+});
+
 test("transport copy does not claim that reported expander detail is unexposed", () => {
   const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
   const start = source.indexOf("  function buildFabricViewCopy(");

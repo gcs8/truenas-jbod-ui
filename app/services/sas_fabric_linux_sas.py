@@ -14,6 +14,30 @@ from app.models.domain import (
 from app.services.linux_sas_transport import SasTransportData, SasTransportRow, parse_sas_transport
 
 EVIDENCE = ["Linux SAS transport sysfs"]
+# Aggregate scalar/link/reference work, including repeated bay ancestry. Check
+# before allocating projection rows or mutating the existing SES graph.
+MAX_PROJECTED_TRANSPORT_FACTS = 32768
+
+
+def _projected_facts(data: SasTransportData, snapshot: Any) -> int | None:
+    facts = 0
+    for row in data.rows:
+        facts += 1 + len(row.attrs) + len(row.links)
+        if facts > MAX_PROJECTED_TRANSPORT_FACTS:
+            return None
+    by_block = defaultdict(list)
+    for row in data.of_kind("sas_end_device"):
+        for block in row.links:
+            by_block[block].append(row)
+    for slot in snapshot.slots:
+        # The path is bounded by the parser. Charge every retained reference
+        # site conservatively, even when a later identity join is refused.
+        facts += 16
+        for row in by_block.get((slot.device_name or "").removeprefix("/dev/"), []):
+            facts += 16 * row.path.count("/")
+        if facts > MAX_PROJECTED_TRANSPORT_FACTS:
+            return None
+    return facts
 
 
 def _phy(row: SasTransportRow) -> dict[str, Any]:
@@ -93,11 +117,17 @@ def enrich_linux_sas_fabric(
     controllers: list,
     paths: list,
     warnings: list[str],
+    transport_raw: dict[str, Any],
 ) -> list[dict[str, Any]] | None:
     data = parse_sas_transport(output)
     if not data.complete or not data.of_kind("sas_host"):
         if output:
             warnings.append("Linux SAS transport sysfs detail was not read as a complete survey.")
+        return None
+    facts = _projected_facts(data, snapshot)
+    if facts is None:
+        transport_raw.update(sas_transport_state="not_read", sas_transport_reason="projection_budget")
+        warnings.append("Linux SAS transport projection budget exceeded; detail not read. Existing inventory retained.")
         return None
     projection = _Projection(data, nodes, links)
     projection.build_hardware()
@@ -126,6 +156,7 @@ def enrich_linux_sas_fabric(
             node.controller_id = None
             node.raw["controller_ids"] = []
     projection.attach_bays(snapshot, traces, warnings)
+    transport_raw.update(sas_transport_port_index=projection.port_facts, sas_transport_projected_facts=facts)
     for controller_id in sorted(projection.controller_ids):
         controller = nodes[controller_id]
         if not controller.related_slots:
@@ -138,6 +169,7 @@ def enrich_linux_sas_fabric(
             "count": len(controller.related_slots),
             "slots": controller.related_slots,
             "source": "linux_sas_transport",
+            "sas_transport_port_ids": sorted(projection.controller_ports[controller_id]),
         }
         paths.append(path)
         nodes[path_id] = SasFabricNode(
@@ -184,6 +216,8 @@ class _Projection:
         self.ports = data.of_kind("sas_port")
         self.devices = {row.path: row for row in data.of_kind("sas_device")}
         self.host_details = {row.name: row for row in data.of_kind("scsi_host")}
+        self.port_facts: dict[str, dict[str, Any]] = {}
+        self.controller_ports: dict[str, set[str]] = defaultdict(set)
         self.phys_by_owner: dict[str, list[SasTransportRow]] = defaultdict(list)
         for row in sorted(self.phys.values(), key=lambda item: item.name):
             self.phys_by_owner[row.owner_path].append(row)
@@ -348,8 +382,17 @@ class _Projection:
                 chain_nodes, chain_links = self.chain(owner_id)
                 if not chain_nodes:
                     continue
-                phys = _port_phys(port, self.phys)
+                ref = "sas-port:" + port.name
+                if ref not in self.port_facts:
+                    phys = _port_phys(port, self.phys)
+                    self.port_facts[ref] = {
+                        "id": ref,
+                        "owner_id": owner_id,
+                        "phy_names": [item.name for item in (phys or [])],
+                        "state": "read" if phys else "not_read",
+                    }
                 controller_id = chain_nodes[1]
+                self.controller_ports[controller_id].add(ref)
                 ses_detail = dict(trace.metrics.get("path_states", [{}])[0]) if trace.metrics.get("path_states") else {}
                 metric = {
                     **ses_detail,
@@ -364,7 +407,7 @@ class _Projection:
                     "phy_identifier": device.phy if device else None,
                     "port": port.name,
                     "expander_ids": [item for item in chain_nodes if item in self.expander_ids],
-                    "expander_phys": [_phy(item) for item in (phys or [])],
+                    "sas_transport_port_id": ref,
                     "source": "linux_sas_transport",
                 }
                 port_rows.append(metric)

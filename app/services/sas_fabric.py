@@ -1328,10 +1328,11 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
     ]
     from app.services.sas_fabric_linux_sas import enrich_linux_sas_fabric
 
+    transport_raw: dict[str, Any] = {}
     expanders = enrich_linux_sas_fabric(
         output=context.normalized_outputs.get(SAS_TRANSPORT_KEY, ""), snapshot=snapshot,
         nodes=nodes, links=links, traces=traces, controllers=controllers,
-        paths=paths, warnings=fabric_warnings,
+        paths=paths, warnings=fabric_warnings, transport_raw=transport_raw,
     )
     aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
@@ -1374,6 +1375,7 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             "fabric_domain": "storage_fabric",
             "fabric_kind": "linux_ses",
             **({"sas_transport_available": True} if expanders is not None else {}),
+            **transport_raw,
             "ses_devices": sorted(ses_slots),
             "selected_bay_slots": selected_slots,
             "selected_disk_slots": selected_disk_slots,

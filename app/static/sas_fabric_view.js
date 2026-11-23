@@ -1838,16 +1838,18 @@
     return `${slots.length} inventory ${slots.length === 1 ? "entry" : "entries"}, ${disks} confirmed disk${disks === 1 ? "" : "s"}`;
   }
 
-  function renderPathButton(path, { compact = false } = {}) {
+  function renderPathButton(path, { compact = false, fabric = state.fabric } = {}) {
     const trace = traceById(path.id);
     const selected = state.selectedTraceId === path.id;
     const slots = sortedSlots(path.slots || trace?.slots);
     const related = selected || selectionTouchesSlots(slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
+    const portFacts = list(path.sas_transport_port_ids).map((id) => window.SasFabricTopology?.resolveTransportPort?.(fabric, id));
+    const phyNote = portFacts.map((port) => port?.state === "read" ? `${port.phys.length} reported PHY rows` : "PHY rows not read").join(" / ");
     return `
       <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
-        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
+        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}"${phyNote ? ` title="${escapeHtml(phyNote)}"` : ""}>
           <span>${escapeHtml(path.controller_label || path.controller || "path")}</span>
           <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
           <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
@@ -1949,7 +1951,7 @@
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.paths)}</span>
-            <div class="fabric-path-grid">${paths.length ? paths.map((path) => renderPathButton(path, { compact: true })).join("") : '<span class="fabric-empty-note">No path states reported</span>'}</div>
+            <div class="fabric-path-grid">${paths.length ? paths.map((path) => renderPathButton(path, { compact: true, fabric })).join("") : '<span class="fabric-empty-note">No path states reported</span>'}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.expanders)}</span>
@@ -3153,6 +3155,7 @@
       ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
+    const transportPort = window.SasFabricTopology?.resolveTransportPort?.(fabric, seed.pathState);
     const sesNodes = list(trace.node_ids)
       .map((nodeId) => nodes.get(nodeId))
       .filter((node) => sesNodeTouchesSlot(node, slotNumber));
@@ -3264,6 +3267,8 @@
         ],
         hoverFacts: [
           ["Path state", stateName],
+          ["Port PHYs", seed.pathState?.sas_transport_port_id ? (transportPort?.state === "read" ? transportPort.phys.map((phy) => phy.phy).join(", ") : "Not read") : null],
+          ["Port PHY counters", transportPort?.phys.map(expanderPhyErrorText).filter(Boolean).join(" / ")],
           ["Member device", mprDevice?.member_device_name || seed.device_name],
           ["Disk identity", [seed.pathState?.model, seed.pathState?.serial, seed.pathState?.size_human].filter(Boolean).join(" / ")],
           ["SAS / LUN", seed.pathState?.sas_address || seed.pathState?.logical_unit_id],
