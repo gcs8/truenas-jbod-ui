@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Callable
 from unittest.mock import patch
 
-from history_service.store import HistoryStore
+from history_service import store as store_module
+from history_service.store import HistoryStore, VALIDATED_MEMBER_CHANGED_MESSAGE
 from history_service.system_backup import SystemBackupService
 from tests import test_import_validated_member as validated
 from tests import test_restore_refusal_cleanup as refusal
@@ -78,9 +79,27 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
                 passphrase=refusal.PASSPHRASE,
             )
 
-    def _assert_refused_unchanged(self, refused: Exception) -> None:
-        self.assertTrue(self.publication_seen, "history publication was never reached")
-        self.assertIn(validated.CONTENT_REASON, str(refused))
+    def _rewrite_metric_in_place(self, path: Path, *, suffix: str) -> None:
+        replacement = self.root / f"changed-private-copy-{suffix}.sqlite3"
+        shutil.copyfile(path, replacement)
+        with sqlite3.connect(replacement) as connection:
+            connection.execute("UPDATE metric_samples SET value_integer = 777")
+            connection.commit()
+        replacement_bytes = replacement.read_bytes()
+        self.assertEqual(len(replacement_bytes), path.stat().st_size)
+        with path.open("r+b") as handle:
+            handle.write(replacement_bytes)
+            handle.truncate()
+
+    def _assert_refused_unchanged(
+        self,
+        refused: Exception,
+        *,
+        publication_seen: bool | None = True,
+    ) -> None:
+        if publication_seen is not None:
+            self.assertIs(self.publication_seen, publication_seen)
+        self.assertEqual(str(refused), VALIDATED_MEMBER_CHANGED_MESSAGE)
         self.assertEqual(refusal._dump(self.live), self.original_dump)
         self.assertEqual(refusal._metric_rows(self.live), self.original_rows)
 
@@ -102,19 +121,92 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
 
     def test_private_copy_changed_after_checks_is_refused(self) -> None:
         def rewrite_in_place(temp_path: Path, descriptor: int) -> None:
-            replacement = self.root / "changed-private-copy.sqlite3"
-            shutil.copyfile(temp_path, replacement)
-            with sqlite3.connect(replacement) as connection:
-                connection.execute("UPDATE metric_samples SET value_integer = 777")
-                connection.commit()
-            replacement_bytes = replacement.read_bytes()
-            self.assertEqual(len(replacement_bytes), os.fstat(descriptor).st_size)
-            with open(temp_path, "r+b") as handle:
-                handle.write(replacement_bytes)
-                handle.truncate()
+            self._rewrite_metric_in_place(temp_path, suffix="before-publish")
+            self.assertEqual(temp_path.stat().st_size, os.fstat(descriptor).st_size)
             SystemBackupService._validate_history_member(temp_path)
 
         with self.assertRaises(ValueError) as refused:
             self._import(rewrite_in_place)
         self._assert_refused_unchanged(refused.exception)
         self.assertNotIn(777, [row[2] for row in refusal._metric_rows(self.live)])
+
+    def test_private_copy_changed_during_member_checks_is_refused(self) -> None:
+        real_check = SystemBackupService._check_history_structure
+
+        def check_then_change(connection: sqlite3.Connection, **kwargs) -> None:
+            real_check(connection, **kwargs)
+            database_path = str(connection.execute("PRAGMA database_list").fetchone()[2])
+            if database_path.endswith(".restore"):
+                connection.execute("UPDATE metric_samples SET value_integer = 777")
+                connection.commit()
+
+        with (
+            patch.object(SystemBackupService, "_check_history_structure", check_then_change),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self._assert_refused_unchanged(refused.exception, publication_seen=None)
+
+    def test_live_file_rewritten_after_rename_is_rolled_back(self) -> None:
+        real_rename = HistoryStore._rename_at2
+        changed = False
+
+        def rename_then_change(source_path: Path, target_path: Path, *, flags: int) -> None:
+            nonlocal changed
+            real_rename(source_path, target_path, flags=flags)
+            if target_path == self.live and not changed:
+                changed = True
+                self._rewrite_metric_in_place(target_path, suffix="after-rename")
+
+        with (
+            patch.object(HistoryStore, "_rename_at2", side_effect=rename_then_change),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(changed, "the post-rename rewrite hook did not run")
+        self._assert_refused_unchanged(refused.exception)
+
+    def test_live_file_linked_after_rename_is_rolled_back(self) -> None:
+        real_rename = HistoryStore._rename_at2
+        alias = self.root / "published-copy-alias.sqlite3"
+        linked = False
+
+        def rename_then_link(source_path: Path, target_path: Path, *, flags: int) -> None:
+            nonlocal linked
+            real_rename(source_path, target_path, flags=flags)
+            if target_path == self.live and not linked:
+                linked = True
+                os.link(target_path, alias)
+
+        with (
+            patch.object(HistoryStore, "_rename_at2", side_effect=rename_then_link),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(linked, "the post-rename link hook did not run")
+        self._assert_refused_unchanged(refused.exception)
+
+    def test_metadata_change_during_hash_is_refused(self) -> None:
+        real_hash = store_module.hash_descriptor
+        metadata_changed = False
+
+        def hash_then_touch(descriptor, metadata, *, changed):
+            nonlocal metadata_changed
+            digest = real_hash(descriptor, metadata, changed=changed)
+            private_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if not metadata_changed and private_path.name.endswith(".restore"):
+                metadata_changed = True
+                current = private_path.stat()
+                os.utime(
+                    private_path,
+                    ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000),
+                )
+            return digest
+
+        with (
+            patch.object(store_module, "hash_descriptor", side_effect=hash_then_touch),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(metadata_changed, "the hash-time metadata hook did not run")
+        self._assert_refused_unchanged(refused.exception, publication_seen=None)
