@@ -168,7 +168,10 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unverified_ses_or_unknown_physical_bay_does_not_supply_paths(self):
         system, snapshot, outputs = await self.fixture()
-        for field, value in (("ssh_ses_targets", []), ("physical_location_known", False), ("present", False)):
+        for field, value in (
+            ("ssh_ses_targets", []), ("physical_location_known", False), ("present", False),
+            ("presence_known", False),
+        ):
             with self.subTest(field=field):
                 changed = snapshot.model_copy(deep=True)
                 setattr(changed.slots[0], field, value)
