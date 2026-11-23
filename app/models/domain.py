@@ -524,11 +524,13 @@ class SasFabricReportedLane(BaseModel):
 
 
 class SasFabricReportedLanes(BaseModel):
-    """Lanes both endpoints of one link report, reconciled row for row.
+    """Lanes reported at both ends of one link.
 
-    These are reported PHY pairs, not cable count, physical cable width,
-    active-lane health or topology completeness. A link carries this only when
-    every endpoint row agrees; missing or contradictory rows leave it null.
+    CORE reconciles reciprocal PHY pairs row for row. Linux sysfs can instead
+    report reciprocal port membership: the two PHY sets and lane count are
+    known, but wide-port pairings are not, so ``lanes`` is empty for that basis.
+    These are not cable count, physical cable width, active-lane health or
+    topology completeness. Missing or contradictory membership leaves it null.
     """
 
     basis: str

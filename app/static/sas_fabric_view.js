@@ -473,12 +473,13 @@
   function buildFabricViewCopy(fabric, platformLabel) {
     const kind = fabricKind(fabric);
     const linuxSes = kind === "linux_ses";
+    const linuxSas = linuxSes && fabric?.raw?.sas_transport_available === true;
     if (linuxSes) {
       return {
         kind: "linux_ses",
         storageFabric: true,
         eyebrow: `${platformLabel} / Storage Fabric`,
-        pageSummary: "Linux SES SG-device, enclosure, storage, and bay mapping for the selected live enclosure.",
+        pageSummary: linuxSas ? "Read-only Linux SAS transport, HBA, expander, PHY and SES bay evidence." : "Linux SES SG-device, enclosure, storage, and bay mapping for the selected live enclosure.",
         refresh: "Refresh Storage Fabric",
         statusBase: "STORAGE",
         unavailableMap: "No Linux SES-backed Storage Fabric map is available for this selection yet.",
@@ -491,7 +492,7 @@
         modes: {
           lanes: {
             title: "Storage Lanes",
-            subtitle: "Host, Linux SES source, SG enclosure devices, storage objects, and mapped bays aligned by enclosure path.",
+            subtitle: linuxSas ? "Observed HBA, expander and end-device paths with SES bay mapping." : "Host, Linux SES source, SG enclosure devices, storage objects, and mapped bays aligned by enclosure path.",
           },
           impact: {
             title: "Impact Map",
@@ -499,7 +500,7 @@
           },
           trace: {
             title: "Physical Trace",
-            subtitle: "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
+            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
           },
           disk: {
             title: "Disk Path",
@@ -507,15 +508,15 @@
           },
         },
         summary: {
-          controllers: ["Sources", "Linux SES source"],
-          paths: ["Storage Paths", "SG device groups"],
-          expanders: ["Transport Detail", "not exposed"],
+          controllers: linuxSas ? ["HBAs", "Linux SAS transport"] : ["Sources", "Linux SES source"],
+          paths: ["Storage Paths", linuxSas ? "observed block-device paths" : "SG device groups"],
+          expanders: linuxSas ? ["Expanders", "sysfs PHYs and counters"] : ["Transport Detail", "not exposed"],
           enclosures: ["Enclosures", "SG enclosure objects"],
         },
         laneStages: {
-          controller: "Source",
-          paths: "SES Paths",
-          expanders: "Transport Detail",
+          controller: linuxSas ? "HBA" : "Source",
+          paths: linuxSas ? "SAS Paths" : "SES Paths",
+          expanders: linuxSas ? "Expanders" : "Transport Detail",
           enclosures: "SG Enclosures",
           bays: "Mapped Bays",
         },

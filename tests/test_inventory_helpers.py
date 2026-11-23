@@ -1306,7 +1306,8 @@ class InventoryHelpersTests(unittest.TestCase):
 
             commands = service._linux_storage_enrichment_probe_commands(command_results)
 
-            self.assertEqual(len(commands), 2)
+            self.assertEqual(len(commands), 3)
+            self.assertEqual(canonicalize_ssh_command(commands[2]), "sas transport sysfs")
             self.assertIn("nvme list-subsys -o json", commands[0])
             self.assertIn("|| true", commands[0])
             self.assertEqual(canonicalize_ssh_command(commands[0]), "nvme list-subsys -o json")

@@ -99,6 +99,21 @@ rules for the supported `smartctl` forms.
 The app also reads `/sys/class/enclosure` without sudo. Those bindings can map
 SATA drives when SES AES pages report one shared SAS address for every bay.
 
+Storage Fabric also discovers SAS transport detail through one fixed
+`/usr/bin/python3 -I -c` sysfs survey as the read-only account. It reads
+`sas_host`, SCSI host board/firmware, `sas_expander`, `sas_port`, `sas_phy`,
+`sas_device` bay/enclosure identifiers and `sas_end_device` block bindings.
+It needs no sudo or SMP utilities, installs nothing, and writes nothing. Do not
+add Python to sudoers or to the standing SSH commands. Restricted command
+gateways must allow only `SAS_TRANSPORT_COMMAND` from
+`app/services/linux_sas_transport_read.py`.
+
+Reads are bounded to 4096 rows, 2048 entries per directory, 32768 directory
+visits, 512 bytes per attribute, 2 MiB for attribute/output bytes and 10 seconds.
+A refused survey keeps the SES-only map and warning; unlinked, `Unknown`,
+missing or denied PHY values stay not read rather than zero. Bay identifiers
+are retained as reported, never used to guess an offset into the SES bay map.
+
 Use the complete generated SCALE policy in
 [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It includes bounded rules for
 `sg_ses -p aes`, `sg_ses -p ec`, `sg_ses --join --filter`, identify on and off,
