@@ -1266,3 +1266,42 @@ test("the trace band's reserved height is the whole band at every breakpoint, un
   assert.equal(Math.max(...forms.map((text) => lines(text, 1481 - 466))), 1, "one line just above 1480 px, with the margin");
   assert.equal(Math.max(...forms.map((text) => lines(text, 1478 - 466))), 2, "the margin is used up just below 1480 px");
 });
+
+// Board views (inventory layout rows): a port's target, its bay's box and a
+// label never overlap, and a bay's name leads with the words it shows (#1471,
+// #1465). Checked on every board the synthetic fabrics draw.
+test("in a board, port marks never overlap their bay, another bay or a label, and a bay's name leads with its text", () => {
+  const T = H.loadTopology();
+  const rects = (html, open) => [...html.matchAll(new RegExp(`<g class="${open}[^"]*"([^>]*)>([\\s\\S]*?)</g>`, "g"))].map((match) => {
+    const box = /<rect\b[^>]*\bx="([-\d.]+)" y="([-\d.]+)" width="([\d.]+)" height="([\d.]+)"/.exec(match[2]);
+    // A bus junction is a circle.
+    const dot = box ? null : /<circle\b[^>]*\bcx="([-\d.]+)" cy="([-\d.]+)" r="([\d.]+)"/.exec(match[2]);
+    const [x, y, w, h] = box ? box.slice(1).map(Number) : [Number(dot[1]) - Number(dot[3]), Number(dot[2]) - Number(dot[3]), 2 * Number(dot[3]), 2 * Number(dot[3])];
+    return { name: /aria-label="([^"]*)"/.exec(match[1])?.[1] || "", body: match[2], x, y, w, h };
+  });
+  const overlap = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const decode = (text) => text.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const { fabric } = H.producerCases().core_cascade;
+  const inventory = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, layout_rows: [[0, 1, 2, 3], [4, 5, 6, 7]] };
+  const { fixtures: generality } = JSON.parse(fs.readFileSync(path.join(H.ROOT, "tests/fixtures/sas_fabric/topology_generality.json"), "utf8"));
+  const cases = [["core cascade as two boards", fabric, { inventory }], ...generality.map((item) => [item.id, item.fabric, item.options])];
+  let boards = 0;
+  for (const [name, given, options] of cases) {
+    for (const width of [1150, 3372]) {
+      const html = T.renderTopology(T.buildTopologyModel(JSON.parse(JSON.stringify(given)), { ...JSON.parse(JSON.stringify(options || {})), width }), {});
+      const ports = rects(html, "topo-port");
+      if (!ports.length) continue;
+      boards += 1;
+      const bays = rects(html, "topo-bay");
+      const labels = rects(html, "topo-link-label");
+      for (const port of ports) {
+        for (const other of [...bays, ...labels]) assert.equal(overlap(port, other), 0, `${name} @${width}: a port overlaps ${other.name.slice(0, 60)}`);
+      }
+      for (const bay of bays) {
+        const visible = [...bay.body.matchAll(/<text\b[^>]*>([^<]*)<\/text>(\s*)/g)].map((match) => decode(match[1]) + match[2]).join("").trim().replace(/\s+/g, " ");
+        assert.ok(decode(bay.name).startsWith(visible), `${name} @${width}: "${visible}" leads "${decode(bay.name).slice(0, 80)}"`);
+      }
+    }
+  }
+  assert.ok(boards >= 4, `${boards} board drawings checked`);
+});

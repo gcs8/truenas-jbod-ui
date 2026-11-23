@@ -1663,13 +1663,19 @@ function renderPort(model, bay, port, path, used) {
     const controller = model.nodes.find((entry) => entry.kind === "controller" && entry.label === port.controller);
     const chain = chainClass(controller ? model.chains.indexOf(controller.id) : -1);
     const name = context.cardText(context.cardFor(model, { kind: "port", id: port.key }));
-    const edge = port.flip ? bay.y : bay.y + bay.h;
-    const far = port.busY ?? edge;
-    const [top, bottom] = port.flip ? [far, port.y + 7] : [port.y - 7, far];
-    const stub = port.busY === null || port.busY === undefined ? "" : `<line class="topo-link topo-port-stub${chain}" x1="${port.x}" y1="${port.flip ? port.y - 5 : port.y + 5}" x2="${port.x}" y2="${port.busY}"></line>`;
+    // The port's target is its mark's band only: never over its bay's box,
+    // the bus or a label on the bus. Its stub to the bus is drawn beside it,
+    // not inside it, and follows its highlight (the stylesheet's "+").
+    const stub = port.busY === null || port.busY === undefined ? "" : `<line class="topo-link topo-port-stub${chain}" x1="${port.x}" y1="${port.flip ? port.y - 5 : port.y + 5}" x2="${port.x}" y2="${port.busY}" aria-hidden="true"></line>`;
     return `<g class="topo-port${flagged ? ` is-flagged tier-${flagged}` : ""}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${context.escapeHtml(port.key)}" data-topo-port="${context.escapeHtml(port.key)}" aria-label="${context.escapeHtml(name)}">`
-      + `<rect class="topo-port-hit" x="${Math.round(port.x - port.hitW / 2)}" y="${top}" width="${port.hitW}" height="${bottom - top}" rx="3"></rect>${stub}${markShape(tone, port.x, port.y, port.state)}</g>`;
+      + `<rect class="topo-port-hit" x="${Math.round(port.x - port.hitW / 2)}" y="${port.y - PORT_HALF}" width="${port.hitW}" height="${2 * PORT_HALF}" rx="3"></rect>${markShape(tone, port.x, port.y, port.state)}</g>${stub}`;
   }
+
+// Half the height of a port's band at the open edge of its cell; the cell's
+// own box stops short of it (PORT_BAND), so the two targets never overlap.
+const PORT_HALF = 7;
+
+const PORT_BAND = 19;
 
 function phyRowsText(state) {
     if (state.transportPhyCount === undefined) return "";
@@ -1698,6 +1704,8 @@ function renderBayCell(bay, path, used) {
     const separate = Boolean(bay.spread);
     const { shown, more } = separate ? { shown: [], more: 0 } : marksFor(bay);
     const height = bay.h || context.CELL_BOX;
+    // In a board the edge band of the cell holds its port marks, not the bay.
+    const band = bay.spread ? PORT_BAND : 0;
     const markY = bay.y + height - (bay.spread ? 11 : 8);
     // In an enclosure block the marks are spread across the cell, in HBA order.
     const markX = (index) => (bay.spread && !more
@@ -1723,9 +1731,9 @@ function renderBayCell(bay, path, used) {
     // A tall cell says SAS or SATA beside the bay number.
     const numberText = shownLabel && bay.tag ? `${shownLabel} · ${bay.tag}` : shownLabel;
     const number = (shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + down + (bay.spread ? 16 : 14)}" text-anchor="middle">${context.escapeHtml(numberText)}</text>` : "")
-      + (bay.short ? `<text class="topo-bay-device" x="${bay.x + bay.w / 2}" y="${bay.y + down + 31}" text-anchor="middle">${context.escapeHtml(bay.short)}</text>` : "");
+      + (bay.short ? ` <text class="topo-bay-device" x="${bay.x + bay.w / 2}" y="${bay.y + down + 31}" text-anchor="middle">${context.escapeHtml(bay.short)}</text>` : "");
     const badge = flagged ? flagBadge(bay.x + bay.w - 6, bay.y + (bay.flip ? height - 6 : 7), true, flagged) : "";
-    return `<g class="topo-bay bay-${bay.occupancy} state-${context.token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${flagged ? ` is-flagged tier-${flagged}` : ""}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${context.escapeHtml(bay.bayId)}" aria-label="${context.escapeHtml(visibleName([numberText, bay.short || "", more ? `+${more}` : ""].filter(Boolean), title))}"><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${height}" rx="3"></rect>${number} ${marks} ${count}${badge}</g>`;
+    return `<g class="topo-bay bay-${bay.occupancy} state-${context.token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${flagged ? ` is-flagged tier-${flagged}` : ""}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${context.escapeHtml(bay.bayId)}" aria-label="${context.escapeHtml(visibleName([numberText, bay.short || "", more ? `+${more}` : ""].filter(Boolean), title))}"><rect x="${bay.x}" y="${bay.flip ? bay.y + band : bay.y}" width="${bay.w}" height="${height - band}" rx="3"></rect>${number} ${marks} ${count}${badge}</g>`;
   }
 
 function pathSummary(summary) {

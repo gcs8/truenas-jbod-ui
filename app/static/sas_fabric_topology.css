@@ -639,8 +639,12 @@ body.fabric-topology-mode .fabric-page-shell {
   stroke-dasharray: none;
 }
 
-.fabric-topology-svg .topo-port.is-on-path .topo-port-stub {
+.fabric-topology-svg .topo-port.is-on-path + .topo-port-stub {
   stroke: var(--selected);
+}
+
+.fabric-topology-svg .topo-port.is-dim + .topo-port-stub {
+  opacity: 0.3;
 }
 
 .fabric-topology-svg .topo-port.is-on-path > .topo-port-hit {
@@ -743,10 +747,12 @@ body.fabric-topology-mode .fabric-page-shell {
   color: var(--surface);
 }
 
+/* The page's fault red reaches only 4.24:1 against any palette text, so the
+   badge keeps the red as its border on a deep red fill under the page text. */
 .fabric-topology-check.is-critical .fabric-topology-check-status {
   border-color: var(--fault);
-  background: var(--fault);
-  color: var(--surface);
+  background: color-mix(in srgb, var(--fault) 35%, var(--surface));
+  color: var(--text);
 }
 
 .fabric-topology-check.is-not-read .fabric-topology-check-status {
