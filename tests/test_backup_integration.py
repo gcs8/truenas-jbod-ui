@@ -1524,6 +1524,7 @@ class CapturedConfigSchedulerTests(SchedulerTestBase):
     def setUp(self) -> None:
         super().setUp()
         from app.config import get_settings
+        from app.services.json_state_budget import read_json_state
         from history_service.backup_scheduler.service import BackupScheduler, snapshot_config_files
         from history_service.config import HistorySettings
         from history_service.system_backup import SystemBackupService
@@ -1551,7 +1552,10 @@ class CapturedConfigSchedulerTests(SchedulerTestBase):
         self.after_snapshot = lambda: None
 
         def snapshot():
-            captured = snapshot_config_files(self.hashed)
+            captured = snapshot_config_files(
+                self.hashed,
+                read_json_state=read_json_state,
+            )
             self.after_snapshot()
             return captured
 
@@ -1599,7 +1603,59 @@ class CapturedConfigSchedulerTests(SchedulerTestBase):
                 documents[logical] = json.loads(text) if logical == "mappings" else yaml.safe_load(text)
         return documents
 
+    def test_config_snapshot_budgets_only_the_mapping_and_alias_json(self) -> None:
+        from history_service.backup_scheduler.service import snapshot_config_files
+
+        alias_path = self.root / "sas_fabric_aliases.json"
+        alias_bytes = b'{"version":1,"sas_fabric_aliases":{}}\n'
+        alias_path.write_bytes(alias_bytes)
+        overrides_path = self.root / "runtime_overrides.json"
+        overrides_bytes = b'{"app":{}}\n'
+        overrides_path.write_bytes(overrides_bytes)
+        calls: list[str] = []
+
+        def budgeted_reader(source, name):
+            calls.append(name)
+            return source.read()
+
+        captured = snapshot_config_files(
+            {
+                "config": self.config_path,
+                "runtime_overrides": overrides_path,
+                "mappings": self.mapping_path,
+                "sas_fabric_aliases": alias_path,
+            },
+            read_json_state=budgeted_reader,
+        )
+        self.assertEqual(calls, [self.mapping_path.name, alias_path.name])
+        self.assertEqual(captured.files[self.mapping_path.absolute()], self.mapping_path.read_bytes())
+        self.assertEqual(captured.files[alias_path.absolute()], alias_bytes)
+        self.assertEqual(captured.files[overrides_path.absolute()], overrides_bytes)
+
+    def test_config_snapshot_refuses_mapping_and_alias_over_the_shared_budget(self) -> None:
+        from app.services import json_state_budget
+        from history_service.backup_scheduler.service import snapshot_config_files
+
+        alias_path = self.root / "sas_fabric_aliases.json"
+        alias_path.write_text('{"version":1,"sas_fabric_aliases":{}}')
+        for logical, path in (
+            ("mappings", self.mapping_path),
+            ("sas_fabric_aliases", alias_path),
+        ):
+            with (
+                self.subTest(logical=logical),
+                patch.object(json_state_budget, "MAX_JSON_STATE_FILE_ITEMS", 2),
+                self.assertRaises(json_state_budget.JsonStateFileTooLarge) as refused,
+            ):
+                snapshot_config_files(
+                    {logical: path},
+                    read_json_state=json_state_budget.read_json_state,
+                )
+            self.assertEqual(refused.exception.name, path.name)
+            self.assertEqual(refused.exception.unit, "keys and values")
+
     def test_captured_bytes_preserve_formatting_volatile_fields_and_deleted_document(self) -> None:
+        from app.services.json_state_budget import read_json_state
         from history_service.backup_archive.journal import canonical_config_hash
         from history_service.backup_scheduler.service import snapshot_config_files
 
@@ -1607,7 +1663,12 @@ class CapturedConfigSchedulerTests(SchedulerTestBase):
         mapping_bytes = b'{ "version": 1, "slot_mappings": {}, "updated_at": "captured" }\n'
         self.config_path.write_bytes(config_bytes)
         self.mapping_path.write_bytes(mapping_bytes)
-        expected_hash = canonical_config_hash(snapshot_config_files(self.hashed))
+        expected_hash = canonical_config_hash(
+            snapshot_config_files(
+                self.hashed,
+                read_json_state=read_json_state,
+            )
+        )
 
         def replace_after_snapshot():
             self.config_path.write_text("systems: []\nupdated_at: replaced\n")
@@ -1804,8 +1865,11 @@ class ProductionPathCaptureTests(unittest.TestCase):
             original_capture = scheduler_service.snapshot_config_files
             state: dict[str, Any] = {"armed": True}
 
-            def capture(paths):
-                result = original_capture(paths)
+            def capture(paths, *, read_json_state=None):
+                if read_json_state is None:
+                    result = original_capture(paths)
+                else:
+                    result = original_capture(paths, read_json_state=read_json_state)
                 state["capture"] = result
                 self.assertEqual(set(result), {"config", "runtime_overrides", "profiles", "mappings", "sas_fabric_aliases"})
                 if state["armed"]:
@@ -2024,6 +2088,26 @@ class ProductionPathCaptureTests(unittest.TestCase):
             self.assertEqual(members["config_file"], layout["config_file"].read_bytes())
             self.assertEqual(members["mapping_file"], Path(state["redirected"]["mapping_file"]).read_bytes())
             self.assertEqual(dict(scheduler.backup_service._captured_config_files), {})
+
+    def test_budget_reader_refusal_preserves_the_pending_config_change(self):
+        from app.services.json_state_budget import JsonStateFileTooLarge
+
+        refused = JsonStateFileTooLarge("slot_mappings.json", 8, "keys and values")
+        with patch(
+            "app.services.json_state_budget.read_json_state",
+            side_effect=refused,
+        ) as budget_reader:
+            with self.built() as (scheduler, _state, _layout, _raw, clock):
+                change = scheduler.journal.append("mapping.save", "synthetic-over-budget")
+                self.due(scheduler, clock)
+                self.assertEqual(scheduler.catalog.list(), [])
+                self.assertEqual(scheduler.journal.last_backup(), (None, None))
+                self.assertEqual(
+                    [entry.change_id for entry in scheduler.journal.pending()],
+                    [change.change_id],
+                )
+        self.assertEqual(budget_reader.call_count, 1)
+        self.assertEqual(budget_reader.call_args.args[1], "slot_mappings.json")
 
     def test_invalid_captured_settings_preserve_journal_and_retry_live_generation(self):
         def initial(layout, raw):

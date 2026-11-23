@@ -2014,7 +2014,7 @@
   function bayTitle(bay) {
     const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
-      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}`).join(", ")}`
+      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}${state.transportPhyCount === undefined ? "" : state.transportPhyCount === null ? "; PHY rows not read" : `; ${state.transportPhyCount} reported PHY rows`}`).join(", ")}`
       : "no path state in payload";
     return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
   }

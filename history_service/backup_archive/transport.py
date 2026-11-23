@@ -133,6 +133,17 @@ class ArchivePublicationUncertainError(ArchiveTransportError):
         self.stored = stored
 
 
+@dataclass(frozen=True, slots=True)
+class DescriptorDownloadDestination:
+    """One new file created relative to a directory descriptor."""
+
+    directory: int
+    name: str
+
+
+DownloadDestination = Path | DescriptorDownloadDestination
+
+
 @runtime_checkable
 class ArchiveTarget(Protocol):
     provider: str
@@ -146,7 +157,7 @@ class ArchiveTarget(Protocol):
 
     def delete(self, name: str) -> None: ...
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]: ...
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]: ...
 
     def test(self) -> dict[str, Any]: ...
 
@@ -298,11 +309,30 @@ def _check_readback(label: str, expected_size: int, expected_sha: str, size: int
 
 
 @contextmanager
-def _download_destination(local_path: Path) -> Iterator[BinaryIO]:
-    """Create ``local_path`` exclusively (0600, no symlink follow); remove it on failure."""
+def _download_destination(local_path: DownloadDestination) -> Iterator[BinaryIO]:
+    """Create one private destination exclusively; remove it on failure."""
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(local_path, flags, 0o600)
+    if isinstance(local_path, DescriptorDownloadDestination):
+        if local_path.name in {"", ".", ".."} or "/" in local_path.name or "\\" in local_path.name:
+            raise ValueError("A descriptor-relative download destination must be one file name.")
+        descriptor = os.open(
+            local_path.name,
+            flags,
+            0o600,
+            dir_fd=local_path.directory,
+        )
+
+        def remove() -> None:
+            os.unlink(local_path.name, dir_fd=local_path.directory)
+
+    else:
+        path = Path(local_path)
+        descriptor = os.open(path, flags, 0o600)
+
+        def remove() -> None:
+            os.unlink(path)
+
     try:
         with os.fdopen(descriptor, "wb") as handle:
             yield handle
@@ -310,7 +340,7 @@ def _download_destination(local_path: Path) -> Iterator[BinaryIO]:
             os.fsync(handle.fileno())
     except BaseException:
         try:
-            os.unlink(local_path)
+            remove()
         except FileNotFoundError:
             pass
         raise
@@ -333,7 +363,7 @@ class _TargetBase:
     def delete(self, name: str) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:  # pragma: no cover - abstract
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:  # pragma: no cover - abstract
         """Stream object ``name`` into a new private file; return (size, sha256).
 
         With ``limit``, fail once more than ``limit`` bytes arrive.
@@ -547,9 +577,9 @@ class LocalDirectoryTarget(_TargetBase):
                 )
         return results
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:
         path = self._object_path(name, create_parents=False)
-        with _open_local_source(path) as (source, _size), _download_destination(Path(local_path)) as target:
+        with _open_local_source(path) as (source, _size), _download_destination(local_path) as target:
             return _copy_stream(source, target.write, limit)
 
     def delete(self, name: str) -> None:
@@ -678,11 +708,11 @@ class FtpTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         digest = hashlib.sha256()
         size = 0
-        with _download_destination(Path(local_path)) as target:
+        with _download_destination(local_path) as target:
             def write(chunk: bytes) -> None:
                 nonlocal size
                 size += len(chunk)
@@ -888,9 +918,9 @@ class SftpTarget(_TargetBase):
                 )
                 results.append(RemoteObject(name=child, size=int(entry.st_size or 0), modified=modified))
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
-        with self._sftp.open(path, "rb") as remote, _download_destination(Path(local_path)) as target:
+        with self._sftp.open(path, "rb") as remote, _download_destination(local_path) as target:
             return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
@@ -1063,9 +1093,9 @@ class SmbTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
-        with self._client.open_file(path, mode="rb") as remote, _download_destination(Path(local_path)) as target:
+        with self._client.open_file(path, mode="rb") as remote, _download_destination(local_path) as target:
             return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
@@ -1411,11 +1441,11 @@ class S3Target(_TargetBase):
                 )
         return sorted(results, key=lambda item: item.name)
 
-    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
+    def get(self, name: str, local_path: DownloadDestination, *, limit: int | None = None) -> tuple[int, str]:
         validate_object_name(name)
         body = self._client.get_object(Bucket=self._bucket, Key=self._key(name))["Body"]
         try:
-            with _download_destination(Path(local_path)) as target:
+            with _download_destination(local_path) as target:
                 return _copy_stream(body, target.write, limit)
         finally:
             close = getattr(body, "close", None)
