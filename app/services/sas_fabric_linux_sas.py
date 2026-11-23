@@ -8,7 +8,6 @@ from typing import Any
 from app.models.domain import (
     SasFabricLink,
     SasFabricNode,
-    SasFabricReportedLane,
     SasFabricReportedLanes,
     SasFabricTrace,
 )
@@ -56,36 +55,31 @@ def _port_phys(port: SasTransportRow, phys: dict[str, SasTransportRow]) -> list[
 def _reported_lanes(
     port: SasTransportRow,
     remote: SasTransportRow,
-    ports: list[SasTransportRow],
     phys: dict[str, SasTransportRow],
     source_address: str | None,
     target_address: str | None,
 ) -> SasFabricReportedLanes | None:
-    backlinks = [item for item in ports if item.owner_path == remote.path and port.owner_path in item.links.values()]
-    if len(backlinks) != 1:
+    # mpt3sas exposes a downstream port on the parent, not a reverse port on
+    # the child expander. The nested remote object identifies the attachment;
+    # reciprocal PHY/port membership establishes only the parent-side PHY set.
+    if remote.owner_path != port.path or port.links.get(remote.name) != remote.path:
         return None
-    local, peer = _port_phys(port, phys), _port_phys(backlinks[0], phys)
-    if not local or not peer or len(local) != len(peer):
+    local = _port_phys(port, phys)
+    if not local:
         return None
-    rates = [row.negotiated_rate_gbps for row in (*local, *peer)]
+    rates = [row.negotiated_rate_gbps for row in local]
     rate = rates[0] if rates[0] is not None and len(set(rates)) == 1 else None
-    # A wide port reports the sets at either end, not the lane-to-lane wiring.
-    # Keep lanes empty rather than fabricating a sorted zip of PHY pairs.
-    pairs = []
-    if len(local) == 1:
-        source_phy, target_phy = local[0].phy, peer[0].phy
-        assert source_phy is not None and target_phy is not None
-        pairs = [SasFabricReportedLane(source_phy=source_phy, target_phy=target_phy, negotiated_rate_gbps=rate)]
     return SasFabricReportedLanes(
-        basis="sysfs_reciprocal_port_membership",
+        basis="sysfs_parent_port_membership",
         lane_count=len(local),
         source_phys=[row.phy for row in local if row.phy is not None],
-        target_phys=[row.phy for row in peer if row.phy is not None],
-        lanes=pairs,
+        # No child-side port census or lane pairing is exposed by this source.
+        target_phys=[],
+        lanes=[],
         negotiated_rate_gbps=rate,
         source_sas_address=source_address,
         attached_sas_address=target_address,
-        evidence=list(EVIDENCE),
+        evidence=[*EVIDENCE, "parent-side PHY membership; target PHYs and lane pairings not read"],
     )
 
 
@@ -296,7 +290,7 @@ class _Projection:
                     parent_id, key, "controller-expander" if parent_id in self.controller_ids else "expander-expander"
                 )
                 link.reported_lanes = _reported_lanes(
-                    port, row, self.ports, self.phys, self.nodes[parent_id].raw.get("sas_address"), raw["sas_address"]
+                    port, row, self.phys, self.nodes[parent_id].raw.get("sas_address"), raw["sas_address"]
                 )
                 self.nodes[key].raw.update(
                     parent_id=parent_id,
@@ -325,6 +319,7 @@ class _Projection:
             for block in row.links:
                 by_block[block].append(row)
         owners = Counter(slot.device_name.removeprefix("/dev/") for slot in snapshot.slots if slot.device_name)
+        unmatched_count = 0
         for slot in snapshot.slots:
             key = f"bay:{slot.slot}"
             bay, trace = self.nodes.get(key), traces.get(key)
@@ -400,6 +395,9 @@ class _Projection:
                 {**detail, "controller": None, "path_id": None} for detail in trace.metrics.get("path_states", [])
             ]
             if block and not port_rows:
-                warnings.append(
-                    f"Bay {slot.slot}: SAS transport end-device port was not read or could not be joined by block identity."
-                )
+                unmatched_count += 1
+        if unmatched_count:
+            warnings.append(
+                f"Linux SAS transport: {unmatched_count} disk bays have an end-device port not read "
+                "or not joined by block identity. SES evidence is retained without guessed controller membership."
+            )

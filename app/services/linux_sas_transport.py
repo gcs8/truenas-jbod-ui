@@ -103,10 +103,16 @@ def _row(value: Any) -> SasTransportRow:
     if any(
         not isinstance(key, str)
         or re.fullmatch(r"[a-z_]{1,64}", key) is None
-        or (item is not None and (not isinstance(item, str) or len(item) > 512 or any(ord(c) < 32 for c in item)))
+        or (item is not None and (not isinstance(item, str) or len(item) > 512))
         for key, item in attrs.items()
     ):
         raise ValueError("row_attributes")
+    # A bad firmware string is one unread field, not a failed topology census.
+    # Preserve structural/type refusal above and do not mutate the source row.
+    attrs = {
+        key: None if isinstance(item, str) and any(ord(c) < 32 or ord(c) == 127 for c in item) else item
+        for key, item in attrs.items()
+    }
     if any(
         not isinstance(key, str) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}", key) is None or not _path(item)
         for key, item in links.items()

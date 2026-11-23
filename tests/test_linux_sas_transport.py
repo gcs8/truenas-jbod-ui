@@ -31,7 +31,7 @@ COUNTERS = (
 
 
 class SyntheticSasTree:
-    """Kernel-shaped class links, transport objects, port backlinks and targets."""
+    """Synthetic mpt3sas-shaped class links, downstream ports and targets."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -69,15 +69,14 @@ class SyntheticSasTree:
         self.add("sas_end_device", self.disk)
         (self.disk / "target2:0:0/2:0:0:0/block/sdz").mkdir(parents=True)
         self.port(self.host / "port-2:0", self.front, [self.phy(self.host, f"phy-2:{i}", i, HOST) for i in range(2)])
-        self.port(
-            self.front / "port-2:0:0", self.host, [self.phy(self.front, f"phy-2:0:{i}", i, FRONT) for i in range(2)]
-        )
+        # Incoming PHYs have no invented reverse sas_port toward the parent.
+        for i in range(2):
+            self.phy(self.front, f"phy-2:0:{i}", i, FRONT)
         self.port(
             self.front / "port-2:0:1", self.rear, [self.phy(self.front, f"phy-2:0:{i}", i, FRONT) for i in (2, 3)]
         )
-        self.port(
-            self.rear / "port-2:1:0", self.front, [self.phy(self.rear, f"phy-2:1:{i}", i, REAR) for i in range(2)]
-        )
+        for i in range(2):
+            self.phy(self.rear, f"phy-2:1:{i}", i, REAR)
         self.port(self.rear / "port-2:1:2", self.disk, [self.phy(self.rear, "phy-2:1:7", 7, REAR, invalid="9")])
         self.phy(self.rear, "phy-2:1:8", 8, REAR, rate="Unknown", invalid="Invalid argument")
 
@@ -110,7 +109,7 @@ class SyntheticSasTree:
             (obj / phy.name).symlink_to(phy)
             (phy / "port").symlink_to(obj)
         if remote.parent != obj:
-            (obj / remote.name).symlink_to(remote)
+            raise ValueError("Only observed downstream nesting is modelled")
 
 
 def fabric(output: str):
@@ -212,7 +211,9 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         cascade = next(link for link in result.links if link.kind == "expander-expander")
         self.assertEqual(cascade.reported_lanes.lane_count, 2)
         self.assertEqual(cascade.reported_lanes.source_phys, [2, 3])
-        self.assertEqual(cascade.reported_lanes.target_phys, [0, 1])
+        self.assertEqual(cascade.reported_lanes.target_phys, [])
+        self.assertEqual(cascade.reported_lanes.basis, "sysfs_parent_port_membership")
+        self.assertEqual(cascade.reported_lanes.attached_sas_address, REAR)
         self.assertEqual(cascade.reported_lanes.negotiated_rate_gbps, 12)
         self.assertEqual(cascade.reported_lanes.lanes, [])
         trace = next(trace for trace in result.traces if trace.id == "bay:0")
@@ -279,11 +280,143 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
                 self.assertEqual(result.expanders, [])
                 self.assertTrue(any("not exposed" in text for text in result.warnings))
 
+    def test_parent_port_reports_cascade_lanes_without_invented_reverse_ports(self):
+        from app.services.linux_sas_transport import parse_sas_transport
+
+        data = parse_sas_transport(json.dumps(self.payload))
+        self.assertEqual(len(data.of_kind("sas_port")), 3)  # HBA + cascade + disk
+        self.assertFalse(
+            any(
+                "host2" in row.links or "expander-2:0" in row.links
+                for row in data.of_kind("sas_port")
+                if row.name != "port-2:0"
+            )
+        )
+        result = fabric(json.dumps(self.payload))
+        for kind, address, phys in (("controller-expander", FRONT, [0, 1]), ("expander-expander", REAR, [2, 3])):
+            link = next(link for link in result.links if link.kind == kind)
+            self.assertIsNotNone(link.reported_lanes)
+            lanes = link.reported_lanes
+            assert lanes is not None
+            self.assertEqual(lanes.basis, "sysfs_parent_port_membership")
+            self.assertEqual(lanes.lane_count, 2)
+            self.assertEqual(lanes.source_phys, phys)
+            self.assertEqual(lanes.target_phys, [])  # not read, never guessed
+            self.assertEqual(lanes.lanes, [])
+            self.assertEqual(lanes.attached_sas_address, address)
+            self.assertEqual(lanes.negotiated_rate_gbps, 12)
+
+    def test_contradictory_parent_port_does_not_report_lane_metadata(self):
+        for mutation in ("foreign_owner", "wrong_port", "duplicate_phy", "missing_phy"):
+            with self.subTest(mutation=mutation):
+                payload = deepcopy(self.payload)
+                port = next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:0:1")
+                phy = next(row for row in payload["rows"] if row["kind"] == "sas_phy" and row["name"] == "phy-2:0:2")
+                if mutation == "foreign_owner":
+                    phy["path"] = phy["path"].replace("/expander-2:0/", "/expander-2:9/")
+                    port["links"][phy["name"]] = phy["path"]
+                elif mutation == "wrong_port":
+                    phy["links"]["port"] = port["path"].replace("port-2:0:1", "port-2:0:9")
+                elif mutation == "duplicate_phy":
+                    phy["attrs"]["phy_identifier"] = "3"
+                else:
+                    payload["rows"].remove(phy)
+                link = next(link for link in fabric(json.dumps(payload)).links if link.kind == "expander-expander")
+                self.assertIsNone(link.reported_lanes)
+
+    def test_control_character_is_not_read_only_for_the_affected_attribute(self):
+        from app.services.linux_sas_transport import parse_sas_transport
+
+        payload = deepcopy(self.payload)
+        host = next(row for row in payload["rows"] if row["kind"] == "scsi_host")
+        host["attrs"]["board_name"] = "Synthetic\x01HBA"
+        data = parse_sas_transport(json.dumps(payload))
+        self.assertTrue(data.complete, data.reason)
+        decoded = data.of_kind("scsi_host")[0]
+        self.assertIsNone(decoded.attrs["board_name"])
+        self.assertIn("board_name", decoded.not_read)
+        self.assertEqual(decoded.attrs["proc_name"], "mpt3sas")
+        self.assertEqual(host["attrs"]["board_name"], "Synthetic\x01HBA")  # input unchanged
+        result = fabric(json.dumps(payload))
+        self.assertIsNone(result.controllers[0]["board"])
+        self.assertEqual(len(result.expanders), 2)
+        self.assertEqual(
+            len(next(trace for trace in result.traces if trace.id == "bay:0").metrics["sas_transport_ports"]), 1
+        )
+
+    def test_cumulative_attribute_read_cap_is_independent_of_output_cap(self):
+        payload = run_survey(self.root, {"read_bytes = 0": "read_bytes = MAX_BYTES - 1"})
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["reason"], "byte_budget")
+        self.assertEqual(payload["rows"], [])
+
+    def test_running_output_cap_is_independent_of_final_encoded_size(self):
+        payload = run_survey(self.root, {"output_bytes = 0": "output_bytes = MAX_BYTES"})
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["reason"], "output_budget")
+        self.assertEqual(payload["rows"], [])
+
+    def test_final_encoded_output_cap_checks_envelope_not_just_rows(self):
+        payload = run_survey(
+            self.root,
+            {
+                'return {"version": 1, "complete": True, "rows": rows}': 'return {"version": 1, "complete": True, "rows": rows, "padding": " " * MAX_BYTES}'
+            },
+        )
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["reason"], "output_budget")
+        self.assertEqual(payload["rows"], [])
+
+    def test_parser_byte_limit_refuses_otherwise_valid_json(self):
+        from app.services.linux_sas_transport import MAX_TRANSPORT_BYTES, parse_sas_transport
+
+        self.assertTrue(parse_sas_transport(json.dumps(self.payload)).complete)
+        for padding in (" " * MAX_TRANSPORT_BYTES, "\u00e9" * (MAX_TRANSPORT_BYTES // 2)):
+            payload = {**self.payload, "padding": padding}
+            output = json.dumps(payload, ensure_ascii=False)
+            self.assertGreater(len(output.encode("utf-8")), MAX_TRANSPORT_BYTES)
+            if padding.startswith("\u00e9"):
+                self.assertLess(len(output), MAX_TRANSPORT_BYTES)
+            self.assertIsInstance(json.loads(output), dict)
+            decoded = parse_sas_transport(output)
+            self.assertFalse(decoded.complete)
+            self.assertEqual(decoded.reason, "byte_budget")
+
+    def test_unmatched_bay_warnings_are_one_bounded_build_summary(self):
+        slots = [
+            SlotView(
+                slot=i,
+                slot_label=str(i),
+                row_index=0,
+                column_index=i,
+                device_name=f"dm-{i}",
+                present=True,
+                ssh_ses_device="/dev/sg9",
+                enclosure_id=REAR,
+            )
+            for i in range(128)
+        ]
+        result = build_sas_fabric_snapshot(
+            system=SystemConfig(truenas=TrueNASConfig(platform="scale")),
+            snapshot=InventorySnapshot(slots=slots, refresh_interval_seconds=30, selected_enclosure_id=REAR),
+            ssh_outputs={KEY: json.dumps(self.payload)},
+        )
+        summary = [warning for warning in result.warnings if "end-device port" in warning]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("128", summary[0])
+        self.assertLess(len(summary[0]), 256)
+        enclosure = next(node for node in result.nodes if node.kind == "ses-enclosure")
+        self.assertIsNone(enclosure.controller_id)
+        self.assertEqual(enclosure.raw["controller_ids"], [])
+        self.assertEqual(enclosure.related_slots, list(range(128)))
+
     def test_no_reciprocal_backlink_keeps_parent_but_not_reported_lanes(self):
         payload = deepcopy(self.payload)
+        # Without a reverse port, a missing parent-side membership is still
+        # not read. The positive no-backlink case is covered separately.
         for row in payload["rows"]:
-            if row["kind"] == "sas_port" and row["name"] == "port-2:1:0":
-                row["links"].pop("expander-2:0")
+            if row["kind"] == "sas_port" and row["name"] == "port-2:0:1":
+                row["links"].pop("phy-2:0:2")
         result = fabric(json.dumps(payload))
         cascade = next(link for link in result.links if link.kind == "expander-expander")
         self.assertIsNone(cascade.reported_lanes)

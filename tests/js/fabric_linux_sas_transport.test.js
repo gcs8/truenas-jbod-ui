@@ -23,10 +23,33 @@ function syntheticFabric(available = true) {
     links: [link("host", "controller:host2", "host-controller"),
       link("controller:host2", "expander:front", "controller-expander"),
       link("expander:front", "expander:rear", "expander-expander", {
-        reported_lanes: { basis: "sysfs_reciprocal_port_membership", lane_count: 2,
-          source_phys: [2, 3], target_phys: [0, 1], lanes: [], negotiated_rate_gbps: 12 },
+        reported_lanes: { basis: "sysfs_parent_port_membership", lane_count: 2,
+          source_phys: [2, 3], target_phys: [], lanes: [], negotiated_rate_gbps: 12 },
       }), link("expander:rear", "ses:sg9", "expander-ses-enclosure")], traces: [],
   };
+}
+
+function renderLanes(fabric) {
+  const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
+  const extract = (name) => {
+    const start = source.indexOf(`  function ${name}(`);
+    const end = source.indexOf("\n  function ", start + 10);
+    assert.ok(start >= 0 && end > start);
+    return source.slice(start, end);
+  };
+  const context = vm.createContext({
+    fabricViewCopy: () => ({ laneStages: { controller: "HBA", paths: "Paths", expanders: "Expanders", enclosures: "Enclosures", bays: "Bays" } }),
+    nodeMap: (value) => new Map(value.nodes.map((node) => [node.id, node])), list: (value) => Array.isArray(value) ? value : [],
+    displayLabel: (node) => node?.label || "", sortFabricNodesForLane: (value) => value,
+    sortedSlots: (value) => value || [], selectionTouchesNode: () => false, selectionTouchesSlots: () => false,
+    escapeHtml: String, renderNodeButton: () => "", nodeMeta: () => "", renderPathButton: () => "",
+    renderNodeGrid: (nodes) => nodes.map((node) => node.id).join(" "), laneListEmptyText: () => "empty",
+    aggregateDiskNoun: () => "bay", renderBayChips: (slots) => `bays:${slots.join(",")}`, fabricCountPhrase: () => "", hostDiskSummary: () => "",
+    inventoryBaySlots: (value) => value.nodes.filter((node) => node.kind === "bay").map((node) => node.slot),
+    renderLanesWithoutController: () => "", fabricCountsUnvouched: () => false,
+  });
+  vm.runInContext(extract("renderUnattachedInventory") + "\n" + extract("renderLanesMode") + "\nthis.render = renderLanesMode;", context);
+  return context.render(fabric);
 }
 
 test("Linux transport records are drawn rather than classified as uncollected", () => {
@@ -76,6 +99,28 @@ test("shared observed SES membership appears in each matching controller lane", 
   vm.runInContext(source.slice(start, end) + "\nthis.render = renderLanesMode;", context);
   const html = context.render(fabric);
   assert.equal((html.match(/ses:sg9/g) || []).length, 2);
+});
+
+test("unjoined SES enclosures remain in an unaffiliated Storage Lanes group", () => {
+  const fabric = syntheticFabric();
+  const ses = fabric.nodes.find((node) => node.kind === "ses-enclosure");
+  ses.controller_id = null;
+  ses.raw.controller_ids = [];
+  fabric.nodes.push({ id: "bay:0", kind: "bay", label: "Bay 00", slot: 0, related_slots: [0], metrics: {}, raw: {} });
+  const html = renderLanes(fabric);
+  assert.equal((html.match(/ses:sg9/g) || []).length, 1);
+  assert.ok(html.includes("Controller attachment not read"));
+  assert.ok(html.includes("bays:0"));
+  assert.ok(!html.includes("controller:linux-ses"));
+});
+
+test("parent-side lane sets show the remote PHYs as unknown", () => {
+  const fabric = syntheticFabric();
+  const model = topology().buildTopologyModel(fabric);
+  const cascade = model.links.find((link) => link.kind === "expander-expander");
+  assert.equal(cascade.lanes.sourcePhys.join(","), "2,3");
+  assert.equal(cascade.lanes.targetPhys.length, 0);
+  assert.ok(cascade.labelLines.some((line) => line.includes("?")));
 });
 
 test("SES-only payloads retain the existing not-collected explanation", () => {

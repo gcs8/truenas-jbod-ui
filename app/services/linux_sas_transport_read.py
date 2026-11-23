@@ -125,8 +125,8 @@ def collect():
             attrs = {field: read(entry + "/" + field) for field in FIELDS[kind]}
             links = {}
             if kind == "sas_port":
-                # phys and remote objects are immediate children only. This
-                # includes the kernel's explicit upstream backlink.
+                # PHY membership and downstream remote objects are immediate
+                # children only; no upstream expander port is assumed.
                 for child in listing(obj):
                     if re.fullmatch(r"(?:phy|expander|end_device)-[0-9]+(?::[0-9]+){1,2}|host[0-9]+", child):
                         links[child] = public_path(resolved(obj + "/" + child))

@@ -1998,6 +1998,17 @@
   // not reported), bays no controller lane claims are still drawn, without
   // guessing which controller or path they hang off.
   function renderUnattachedInventory(fabric, copy, claimedSlots) {
+    if (fabric?.raw?.sas_transport_available === true) {
+      const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "ses-enclosure" && !node.controller_id && !list(node.raw?.controller_ids).length));
+      const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
+      if (!enclosures.length && !slots.length) return "";
+      return `
+        <section class="fabric-dedicated-lane">
+          <div class="warning-item muted compact">Controller attachment not read. SES enclosure and bay evidence is retained without guessed HBA membership.</div>
+          <div class="fabric-stage"><span class="fabric-stage-title">${escapeHtml(copy.laneStages.enclosures)}</span><div class="fabric-node-grid">${renderNodeGrid(enclosures, 8, "No unaffiliated enclosures reported")}</div></div>
+          <div class="fabric-stage"><span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span><div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div></div>
+        </section>`;
+    }
     if (fabric.platform !== "core" || !fabricCountsUnvouched(fabric)) return "";
     const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
     if (!slots.length) return "";

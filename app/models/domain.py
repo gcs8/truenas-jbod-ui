@@ -524,11 +524,12 @@ class SasFabricReportedLane(BaseModel):
 
 
 class SasFabricReportedLanes(BaseModel):
-    """Lanes reported at both ends of one link.
+    """Reported lane evidence with its endpoint provenance in ``basis``.
 
-    CORE reconciles reciprocal PHY pairs row for row. Linux sysfs can instead
-    report reciprocal port membership: the two PHY sets and lane count are
-    known, but wide-port pairings are not, so ``lanes`` is empty for that basis.
+    CORE reconciles reciprocal PHY pairs row for row. Linux sysfs reports
+    parent-port membership and nested child identity, so only ``source_phys``
+    and its count/rate are read. ``target_phys`` and ``lanes`` stay empty,
+    meaning not read, rather than invented remote PHY IDs or pairings.
     These are not cable count, physical cable width, active-lane health or
     topology completeness. Missing or contradictory membership leaves it null.
     """
@@ -538,7 +539,7 @@ class SasFabricReportedLanes(BaseModel):
     source_phys: list[int] = Field(default_factory=list)
     target_phys: list[int] = Field(default_factory=list)
     lanes: list[SasFabricReportedLane] = Field(default_factory=list)
-    # Set only when every lane reports the same negotiated rate.
+    # Set only when every lane at the stated basis reports the same rate.
     negotiated_rate_gbps: float | None = None
     source_sas_address: str | None = None
     attached_sas_address: str | None = None
