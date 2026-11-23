@@ -2334,7 +2334,7 @@ Enclosure status diagnostic page:
 
     def test_parse_sesutil_show_assigns_24_bay_profile_metadata(self) -> None:
         output = """
-ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+ses2:  <LSI SAS3x40 0601>; ID: 5000c500ee000001
 Desc  Device  Model  Serial  Status
 Slot 00  da0  Samsung SSD  SER000  OK
 Slot 06  -  -  -  Not installed
@@ -2445,14 +2445,14 @@ Slot 01  da0  Example Disk  SYNTH0002  OK
         ses_map = """
 ses2:
   Enclosure Name: LSI SAS3x40
-  Enclosure ID: 50030480090c4f7f
+  Enclosure ID: 5000c500ee000001
   Element 0, Type: Array Device Slot
     Status: OK
     Description: Slot00
     Device Names: da0, pass0
 """.strip()
         ses_show = """
-ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+ses2:  <LSI SAS3x40 0601>; ID: 5000c500ee000001
 Desc  Device  Model  Serial  Status
 Slot 00  da0  Samsung SSD  SER000  OK
 """.strip()
@@ -2507,7 +2507,7 @@ Slot 00  da0  Samsung SSD  SER000  OK
 
     def test_parse_ssh_outputs_show_only_candidates_omit_empty_overlay_fields(self) -> None:
         ses_show = """
-ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+ses2:  <LSI SAS3x40 0601>; ID: 5000c500ee000001
 Desc  Device  Model  Serial  Status
 Slot 00  da0  Samsung SSD  SER000  OK
 """.strip()
@@ -3027,7 +3027,7 @@ Read Cache is:        Enabled
 Writeback Cache is:   Disabled
     negotiated logical link rate: phy enabled; 12 Gbps
     SAS address = 0x5000cca23b713c81
-    attached SAS address = 0x500304801f715f3f
+    attached SAS address = 0x5000c500ee000003
 """.strip()
 
         parsed = parse_smartctl_text_enrichment(output)
@@ -3038,7 +3038,7 @@ Writeback Cache is:   Disabled
         self.assertEqual(parsed["read_cache_enabled"], True)
         self.assertEqual(parsed["writeback_cache_enabled"], False)
         self.assertEqual(parsed["sas_address"], "0x5000cca23b713c81")
-        self.assertEqual(parsed["attached_sas_address"], "0x500304801f715f3f")
+        self.assertEqual(parsed["attached_sas_address"], "0x5000c500ee000003")
         self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
 
     def test_parse_smartctl_text_enrichment_strips_scsi_identifier_error_suffixes(self) -> None:
@@ -3046,7 +3046,7 @@ Writeback Cache is:   Disabled
 Transport protocol:   SCSI
 Logical Unit id:      0x00e04c2020202000error: designator length
     SAS address = 0x5000cca23b713c81error: designator length
-    attached SAS address = 0x500304801f715f3ferror: designator length
+    attached SAS address = 0x5000c500ee000003error: designator length
 """.strip()
 
         parsed = parse_smartctl_text_enrichment(output)
@@ -3054,7 +3054,7 @@ Logical Unit id:      0x00e04c2020202000error: designator length
         self.assertTrue(parsed["available"])
         self.assertEqual(parsed["logical_unit_id"], "0xe04c2020202000")
         self.assertEqual(parsed["sas_address"], "0x5000cca23b713c81")
-        self.assertEqual(parsed["attached_sas_address"], "0x500304801f715f3f")
+        self.assertEqual(parsed["attached_sas_address"], "0x5000c500ee000003")
 
     def test_parse_linux_inventory_helpers_extract_useful_structures(self) -> None:
         lsblk_payload = """

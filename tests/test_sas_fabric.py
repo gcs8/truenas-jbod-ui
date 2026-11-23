@@ -228,7 +228,7 @@ mpr1 Adapter:
 # and device lists' in hexadecimal ("%04x"): 0018 below is 0012 in those lists.
 MPR0_EXPANDERS = """
 Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
-36       50030480090c4f7f 0009      0001   0002      1
+36       5000c500ee000001 0009      0001   0002      1
   0 1 000a 12.0 1.5 12.0 End Device
   1 2 000b 12.0 1.5 12.0 No Device
 """.strip()
@@ -243,13 +243,13 @@ Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
 
 MPR0_ENCLOSURES = """
 Slots Logical ID       SEPHandle EncHandle Type
-36    50030480090c4f7f 0008      0002     SES
+36    5000c500ee000001 0008      0002     SES
 """.strip()
 
 
 MPR1_ENCLOSURES = """
 Slots Logical ID       SEPHandle EncHandle Type
-36    50030480090c4f7f 0018      0012     SES
+36    5000c500ee000001 0018      0012     SES
 """.strip()
 
 
@@ -339,9 +339,9 @@ ARCHIVE_CORE_BAD_CABLE_DMESG = (FIXTURES_DIR / "archive_core_bad_cable_dmesg.txt
 
 MPR0_EXPANDERS_WITH_UNRELATED = """
 Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
-36       50030480090c4f7f 0009      0001   0002      1
+36       5000c500ee000001 0009      0001   0002      1
   0 1 000a 6.0 1.5 12.0 End Device
-36       500304801f715f3f 000b      0001   0004      1
+36       5000c500ee000003 000b      0001   0004      1
   0 1 000d 12.0 1.5 12.0 End Device
 """.strip()
 
@@ -357,15 +357,15 @@ Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
 
 MPR0_ENCLOSURES_WITH_UNRELATED = """
 Slots Logical ID       SEPHandle EncHandle Type
-24    50030480090c4f7f 0008      0002     SES
-60    500304801f715f3f 000a      0004     SES
+24    5000c500ee000001 0008      0002     SES
+60    5000c500ee000003 000a      0004     SES
 """.strip()
 
 
 MPR1_ENCLOSURES_WITH_UNRELATED = """
 Slots Logical ID       SEPHandle EncHandle Type
-24    50030480090c4f7f 0018      0012     SES
-60    500304801f715f3f 001a      0014     SES
+24    5000c500ee000001 0018      0012     SES
+60    5000c500ee000003 001a      0014     SES
 """.strip()
 
 
@@ -1272,7 +1272,7 @@ Adapter     Chip           Board Name        Firmware
         expanders = parse_mpr_expanders(MPR0_EXPANDERS)
 
         self.assertEqual([row["unit"] for row in adapters], ["0", "1"])
-        self.assertEqual(expanders[0]["sas_address"], "50030480090c4f7f")
+        self.assertEqual(expanders[0]["sas_address"], "5000c500ee000001")
         # The header reports 36 PHYs and only two rows follow: the table was
         # not read whole, so its linked count and device tally are unknown.
         self.assertEqual(len(expanders[0]["phys"]), 2)
@@ -1544,13 +1544,13 @@ Adapter     Chip           Board Name        Firmware
             present=True,
             state=SlotState.healthy,
             device_name="da5",
-            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 5},
+            raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": 5},
         )
 
         self.assertEqual(_slot_location_number_candidates(slot), [5])
 
     def test_mpr_location_lookup_returns_the_exact_bay_not_its_neighbour(self) -> None:
-        enclosure_key = _identifier_lookup_key("50030480090c4f7f")
+        enclosure_key = _identifier_lookup_key("5000c500ee000001")
         assert enclosure_key is not None
         trace_index = {
             "devices": {},
@@ -1567,14 +1567,14 @@ Adapter     Chip           Board Name        Firmware
             present=True,
             state=SlotState.healthy,
             device_name="da5",
-            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 5},
+            raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": 5},
         )
 
         context = _lookup_mpr_device_context(
             trace_index,
             "mpr0",
             "da5",
-            slot_enclosure_ids=["50030480090c4f7f"],
+            slot_enclosure_ids=["5000c500ee000001"],
             slot_location_numbers=_slot_location_number_candidates(slot),
         )
 
@@ -1596,7 +1596,7 @@ Adapter     Chip           Board Name        Firmware
             present=True,
             state=SlotState.healthy,
             device_name="da60",
-            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 1},
+            raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": 1},
             multipath=MultipathView(
                 name="mpath0",
                 device_name="multipath/disk0",
@@ -3713,7 +3713,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
             present=True,
             state=SlotState.healthy,
             device_name="da0",
-            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 1},
+            raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": 1},
             multipath=MultipathView(
                 name="mpath0",
                 device_name="multipath/disk0",
@@ -3805,7 +3805,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
             health="ONLINE",
             ssh_ses_device="/dev/ses4",
             ssh_ses_targets=[{"ses_device": "/dev/ses8"}],
-            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 1},
+            raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": 1},
             multipath=MultipathView(
                 name="mpath0",
                 device_name="multipath/disk0",
@@ -3855,7 +3855,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         nodes = {node.id: node for node in fabric.nodes}
         traces = {trace.id: trace for trace in fabric.traces}
         links = {link.id: link for link in fabric.links}
-        mpr0_expander_id = "expander:controller:mpr0:50030480090c4f7f"
+        mpr0_expander_id = "expander:controller:mpr0:5000c500ee000001"
         mpr1_expander_id = "expander:controller:mpr1:50030480090c8f7f"
         mpr0_enclosure_id = "mpr-enclosure:controller:mpr0:0002"
         mpr1_enclosure_id = "mpr-enclosure:controller:mpr1:0012"
@@ -3944,7 +3944,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 serial=f"SATA{slot:02d}" if slot in disk_devices else None,
                 ssh_ses_device="/dev/ses2",
                 ssh_ses_targets=[{"ses_device": "/dev/ses3"}],
-                raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": slot},
+                raw_status={"enclosure_id": "5000c500ee000001", "ses_slot_number": slot},
             )
             for slot in range(24)
         ]
@@ -3954,7 +3954,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
             selected_system_id="archive-core",
             selected_system_label="The Archive",
             selected_system_platform="core",
-            selected_enclosure_id="50030480090c4f7f",
+            selected_enclosure_id="5000c500ee000001",
             selected_enclosure_label="Front 24 Bay",
         )
         system = SystemConfig(
@@ -3980,20 +3980,20 @@ class SasFabricSnapshotTests(unittest.TestCase):
         nodes = {node.id: node for node in fabric.nodes}
         traces = {trace.id: trace for trace in fabric.traces}
         bay_slots = list(range(24))
-        mpr0_selected_expander = "expander:controller:mpr0:50030480090c4f7f"
+        mpr0_selected_expander = "expander:controller:mpr0:5000c500ee000001"
         mpr1_selected_expander = "expander:controller:mpr1:50030480090c4fff"
         mpr0_selected_enclosure = "mpr-enclosure:controller:mpr0:0002"
         mpr1_selected_enclosure = "mpr-enclosure:controller:mpr1:0012"
 
         self.assertTrue(fabric.available)
         self.assertEqual(fabric.paths, [])
-        self.assertEqual(fabric.raw["selected_enclosure_keys"], ["50030480090c4f7f"])
+        self.assertEqual(fabric.raw["selected_enclosure_keys"], ["5000c500ee000001"])
         self.assertEqual(fabric.raw["selected_disk_slots"], [0, 6, 12, 18])
         self.assertIn(mpr0_selected_expander, nodes)
         self.assertIn(mpr1_selected_expander, nodes)
         self.assertIn(mpr0_selected_enclosure, nodes)
         self.assertIn(mpr1_selected_enclosure, nodes)
-        self.assertNotIn("expander:controller:mpr0:500304801f715f3f", nodes)
+        self.assertNotIn("expander:controller:mpr0:5000c500ee000003", nodes)
         self.assertNotIn("expander:controller:mpr1:500304801f715fbf", nodes)
         self.assertNotIn("mpr-enclosure:controller:mpr0:0004", nodes)
         self.assertNotIn("mpr-enclosure:controller:mpr1:0014", nodes)
