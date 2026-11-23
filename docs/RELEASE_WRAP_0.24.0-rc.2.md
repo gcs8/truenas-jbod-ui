@@ -50,7 +50,7 @@ It is not a registry publication or deployment.
 | Docs/wiki/public-demo gate | yes | Release notes, source diff, metadata, privacy, public documentation, screenshot manifest and prerelease policy checks pass. Public demo deferred: prerelease. No public screenshot or external wiki bytes changed. Wrap-only final head requires its own exact-head CI. | Pass | |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked | |
 | GHCR publish verification | yes | [Release workflow](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45070295617) completed on merge `5d485296313ef94f70cf6b915323ff38f1d5016d`. Annotated `v0.24.0-rc.2` targets that merge; its tree equals qualified head `c41b77f105eaba91f2e608d38c26108ff60bba80`. GitHub prerelease is published, not draft. Fixed version aliases, `dev`, `sha-5d48529` and the full source-SHA alias resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:283fa755b23971efe23c7d2d198184a9abfc9fa80ea90aa8b68dba345a7bce5f`, with the exact merge revision and version labels. SHA aliases copy identical release-built manifest bytes, not another build. Stable/latest pointers remain v0.23.0. | Pass | |
-| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Full deployed-state crawl, delayed idle observation and independent final readback pass. Secondary-installation acceptance remains pending; no complete deployment-gate claim. | Blocked | |
+| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Full deployed-state crawl, delayed idle observation and independent final readback pass. Secondary-installation acceptance is blocked by host unreachability before staging; no backup/helper action or rollback occurred there. No complete deployment-gate claim. | Blocked | |
 | Post-release reopen | yes | Publication, deployment and final validation must precede reopen. | Blocked | |
 
 ## Crawl and human-view disposition
@@ -197,9 +197,13 @@ retained logs were not empty or wholly clean. Final combined output contains
 no traceback headers or access-log 5xx, but does include platform remote-error
 records and a history-pass failure. Its structured event identifies `smart_read` and
 `source_error_reply` with `HistorySourceError`; the native final helper verifies
-healthy, unpaused history with no recovery required. The predecessor contains
-the same broad log templates, but historical method/cause equivalence is not
-claimed. An initial
+healthy, unpaused history with no recovery required. The retained rc.1 accepted crawl already contains `TrueNASAPIError`
+exception records; its initial post-adoption observation also contains a
+`HistorySourceError` pass failure. These are pre-existing failure families,
+not first seen in rc.2. Old logging lacks the current method/category and
+stage/kind attribution, so exact cause equivalence or an equal-duration error
+rate is not claimed. The later rc.1 crawl's absence of a history-pass failure
+does not erase that initial baseline failure. An initial
 stdout-only log projection was rejected because container stderr held the actual
 log lines; retained combined output supplied the corrected classification.
 
@@ -225,7 +229,12 @@ History and Admin emitted no direct-call limiter series, not a measured zero
 load. History memory sampling recorded no OOM kills. Charged cgroup peak reached
 the configured limit and max events occurred; it is explicitly not described
 as wholly below the limit. Detailed deployment measurements remain in restricted
-evidence. Memory sampling covered history only. Final UI/history readback retains
+evidence. The rc.1 final readback already reached the same charged-memory
+limit with no OOM; at-limit pressure is not first seen in rc.2. The sampled
+anonymous-memory peak is higher in rc.2, but the observation lengths, active
+coverage and live data differ. This is an explicit measured increase, not a
+controlled regression or leak diagnosis. rc.1 max-event accounting is not
+available in the cited scalar receipt. Memory sampling covered history only. Final UI/history readback retains
 the original post-adoption container IDs, exact image, zero restarts, two fence
 locks and unchanged configuration/helper/receipt hashes. Temporary Admin and
 operation-owned key-copy directories are absent; owned samplers exited zero.
@@ -258,11 +267,24 @@ were posted and read back on #1103, #1110 and #1114; these also remain open.
 
 ## Phase B acceptance remains partial
 
-The second authorized validation target could not be resolved through the
-current inventory. No connection, staging, coordination probe or activation
-was attempted there. Resolving that target and completing its helper/examination
-acceptance remain required; success on the first installation does not satisfy
-that independent branch.
+The second authorized validation target is **Blocked: host unreachable;
+owner to check**. Its recorded external address is explicitly authorized;
+absence from the homelab inventory is not an authorization blocker.
+
+The inherited coordination procedure read the shared-service checkpoint and
+completed its local process scan. Bounded SSH connection attempts for the
+remote scan and service-age read timed out, native status 255, before remote
+authentication or staging. Their retained receipt-completion timestamps are
+`2026-11-23T00:52:35Z` and `2026-11-23T00:52:50Z`; these are local log-file
+completion anchors, not packet-capture timestamps. Independent reachability
+checks confirmed the target unavailable.
+
+No directory or script was staged there; backup, helper update/verify, browser
+examination and Admin authentication checks were not started. There is nothing
+to roll back. No further retry, network, route or VPN change was made. This
+branch requires the owner to restore reachability before a later authorized
+continuation. The first installation's verified result is preserved and was
+not replayed.
 
 This is a FULL-mode wrap with explicit Blocked gates, not a completed release
 acceptance or a narrow-mode deferral. No final promotion, stable-tag movement,
