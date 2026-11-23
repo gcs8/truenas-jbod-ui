@@ -1087,7 +1087,9 @@ function adoptLinuxTransport(payload, options = {}) {
     const owners = new Set();
     for (const trace of list(payload.traces)) {
       if (!isRecord(trace)) continue;
-      const rows = list(trace.sas_transport_ports ?? trace.metrics?.sas_transport_ports).filter(isRecord);
+      // A path state that names its transport port is that port's row too.
+      const rows = list(trace.sas_transport_ports ?? trace.metrics?.sas_transport_ports
+        ?? list(trace.metrics?.path_states).filter((row) => isRecord(row) && typeof row.sas_transport_port_id === "string")).filter(isRecord);
       const mapped = rows.map((row) => {
         const found = resolve ? resolve(payload, row) : { state: "not_read", phys: [] };
         const entry = own(index, row.sas_transport_port_id);
@@ -1577,7 +1579,7 @@ function buildTopologyModel(given, options = {}) {
         };
       };
       for (const state of pathStates) {
-        const index = devices.findIndex((device, at) => !taken.has(at) && String(device.controller || "") === state.controller);
+        const index = devices.findIndex((device, at) => !taken.has(at) && ownerOf(String(device.controller || "")) === state.controller);
         if (index >= 0) taken.add(index);
         bay.ports.push(port(state, index >= 0 ? devices[index] : null));
       }

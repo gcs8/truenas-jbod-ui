@@ -1985,7 +1985,8 @@ function renderTopology(model, view = {}) {
     const shownH = Math.max(1, Math.floor(fullH * scale));
     const svg = `<svg class="fabric-topology-svg${view.fit ? " is-fitted" : ""}" role="group" aria-label="${context.escapeHtml(svgLabel)}" width="${shownW}" height="${shownH}" viewBox="0 0 ${fullW} ${fullH}">`
       + `<g class="topo-tiers">${tiers}</g><g class="topo-lines">${lines.join("")}</g><g class="topo-crossings">${crossings}</g><g class="topo-nodes">${nodes}${groups}</g><g class="topo-lines topo-cables">${cables.join("")}</g><g class="topo-labels">${labels.join("")}</g></svg>`;
-    const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${context.token(part.state)}"${part.title ? ` aria-label="${context.escapeHtml(part.title)}"` : ""}>${context.escapeHtml(part.label)}: ${context.escapeHtml(part.state)}</span>`).join("");
+    const partName = (part) => (part.title ? ` aria-label="${context.escapeHtml(part.title)}"` : "");
+    const parts = model.parts.map((part) => `<span class="fabric-topology-part tone-${context.token(part.state)}"${partName(part)}>${context.escapeHtml(part.label)}: ${context.escapeHtml(part.state)}</span>`).join("");
     const source = model.core ? "HBA" : model.contract === "storage" ? "source" : "controller or source";
     const chains = model.chains.map((id, index) => `<span class="fabric-topology-legend-item" data-topology-legend="chain-${index}"><svg class="fabric-topology-swatch swatch-chain" width="28" height="8" viewBox="0 0 28 8" aria-hidden="true"><line class="topo-link is-lanes-reported${chainClass(index)}" x1="0" y1="4" x2="28" y2="4"></line></svg>${context.escapeHtml(`${model.nodeById.get(id)?.label || id}: every line from this ${source} down`)}</span>`).join("");
     const legend = chains + Object.entries(LEGEND)

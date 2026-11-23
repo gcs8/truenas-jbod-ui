@@ -431,10 +431,14 @@ test("every sentence the band shows, through hover, focus, a pin and a held pin,
   page.draw(widePort(), { width: 1100 });
   const api = H.loadTopology();
   const model = api.buildTopologyModel(widePort());
-  const cable = model.links.find((link) => link.lanes?.count === 8);
-  const full = JSON.stringify(api.cardFor(model, { kind: "link", id: cable.id }));
-  assert.match(full, /24–31/);
-  assert.match(full, /0–7/); // Full SAS detail moved to the one hover card, not the short trace band.
+  // The cascade's wide port (PHYs 24-31 down to 0-7), not the HBA's cable.
+  const cables = model.links.filter((link) => link.lanes?.count === 8 && link.lanes.sourcePhys[0] === 24);
+  assert.equal(cables.length, 2, "one level-1 to level-2 cable per HBA");
+  for (const cable of cables) {
+    // Full SAS detail moved to the one hover card, not the short trace band.
+    const card = api.cardFor(model, { kind: "link", id: cable.id });
+    assert.match(card.rows.find((row) => row.label === "PHYs").value, /^24–31 at .+ ↔ 0–7 at .+$/);
+  }
 });
 
 test("the held height is the tallest laid-out sentence the drawing can show, rounded up: a sample by length would miss it", () => {
@@ -655,7 +659,10 @@ test("a host-only fabric with a long host label: the host's held-pin focus sente
   const page = fakePage();
   const { sentences } = producible(page, fabric, { width: 1100 });
   const host = { kind: "node", id: "host", key: "topoNode" };
+  // A click on the pinned item clears it (approved design), so start unpinned.
+  page.escape();
   page.handlers.get("click")({ target: page.element(host) });
+  assert.match(page.pin.textContent, /^Pinned: synthetic-host-/);
   page.handlers.get("focusin")({ target: page.element(host) });
   assert.match(page.pin.textContent, /^Tracing: synthetic-host-(?:segment-){30}end.*\. Pinned item kept; Esc clears\.$/);
   assert.ok(page.lastFill().includes(page.pin.textContent));

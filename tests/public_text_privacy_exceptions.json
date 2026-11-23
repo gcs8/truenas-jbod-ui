@@ -351,6 +351,14 @@
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
+  "tests/fixtures/sas_fabric/topology_generality.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:a9adc806bff6a724301a8597f6bb5b1da61a90096278581d13d033aac86f297e": 4831
+      }
+    },
+    "reason": "Synthetic builder output for the 13 invented Topology generality fabrics; every SAS identifier comes from the generator's patterned seeds (5aaa..., 5bbb..., 5eee...), and exact detector counts are pinned. No captured device identity is used."
+  },
   "tests/js/admin_bootstrap_platform_copy.test.js": {
     "findings": {
       "private_posix_host_path": {
@@ -390,6 +398,14 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/js/fabric_topology_generality.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:e6084cc484de75ace2c26b9940ec211d47466869fa876cc590a196c39a24dce8": 1
+      }
+    },
+    "reason": "Invented Topology generality test: one patterned synthetic expander address from the fixture generator's seeds; exact detector count is pinned."
   },
   "tests/js/mapping_health_accessibility.test.js": {
     "findings": {
@@ -665,6 +681,14 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/topology_generality_fixtures.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:3ce106caae4884eef4477a3403dd0a9e0fa143d420933dc4f041c1688ffde6c5": 29
+      }
+    },
+    "reason": "Synthetic generator for the 13 invented Topology generality fabrics: patterned SAS address seeds only (5aaa..., 5bbb..., 5fff...); exact detector counts are pinned."
   },
   "wiki/Advanced-Configuration.md": {
     "findings": {

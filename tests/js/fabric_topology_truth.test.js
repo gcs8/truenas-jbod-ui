@@ -288,12 +288,15 @@ test("a pinned bay bundle fills the inspector with its source enclosure, bay cou
   assert.match(detail.title, /enclosure path/i);
   assert.match(detail.html, /Enclosure/);
   assert.ok(detail.html.includes(H.sasAddress(0xf02)), "the source enclosure is named");
-  assert.match(detail.html, /4 bays/);
-  assert.match(detail.html, /Bay 04, Bay 05, Bay 06, Bay 07/);
+  // Approved enclosure-path wording: the enclosure's bay count and range, and
+  // the bays this path reports a disk in.
+  assert.match(detail.html, /Bays in the enclosure<\/span><span class="kv-value">4 \(Bays 04–07\)</);
+  assert.match(detail.html, /Disks this path reports<\/span><span class="kv-value">4: bays 4–7</);
   // A physical link reports its lanes; a node or bay pin leaves the inspector to the page.
   const cascade = [...model.links].find((item) => item.kind === "expander-expander");
   dom.handlers.get("click")({ target: dom.element({ topoLink: cascade.id }) });
-  assert.match(T.inspectorDetail().html, /x4 · 12 Gb\/s/);
+  // Approved cable wording: lane count, then lanes per negotiated rate.
+  assert.match(T.inspectorDetail().html, /Lanes<\/span><span class="kv-value">4: 4 at 12 Gb\/s</);
   dom.handlers.get("click")({ target: dom.element({ topoBay: "bay:1" }) });
   assert.equal(T.inspectorDetail()?.withPage, true);
 });
@@ -826,13 +829,15 @@ test("a pinned link's facts leave the inspector when the selected scope has no f
   panel.handlers.get("click")({ target: dom.element({ topoLink: bundle.id }) });
   const pinned = T.inspectorDetail();
   assert.ok(pinned, "the bundle is pinned");
-  assert.equal(body.innerHTML, pinned.html, "the inspector shows the pinned link");
+  // Approved design: every pinnable item's inspector starts with its Friendly Label section.
+  assert.match(body.innerHTML, /^<section class="fabric-inspector-section"><h4>Friendly Label<\/h4>/);
+  assert.ok(body.innerHTML.endsWith(pinned.html), "the inspector shows the pinned link");
   // The operator stays in Topology and selects a system whose fabric is not available.
   page.state.fabric = { ...fabric, system_id: "synthetic-other", available: false };
   page.render();
   assert.equal(T.inspectorDetail(), null, "the pin is gone with the scope it belonged to");
   assert.notEqual(title.textContent, pinned.title);
-  assert.notEqual(body.innerHTML, pinned.html, "the other scope's link facts are not shown");
+  assert.ok(!body.innerHTML.includes(pinned.html), "the other scope's link facts are not shown");
   assert.equal(T.view().pin, null);
   // Back on the first system nothing is pinned.
   page.state.fabric = fabric;
@@ -912,11 +917,15 @@ test("a bay group where only some labels carry a number says how many are number
   assert.deepEqual(heading(model), ["4 bays, 1 numbered: 04"]);
   const html = T.renderTopology(model, {});
   assert.doesNotMatch(html, /Bays 04–04/);
-  assert.match(html, /aria-label="4 bays, 1 numbered: 04 linux-ses: 4 mapped"/);
+  // Approved design: a path names its controller by the drawn label, and the
+  // group's accessible name no longer repeats its heading (#1465).
+  assert.match(html, /aria-label="4 bays, 1 numbered: 04 Linux SES: 4 mapped"/);
   // Every bay numbered: the range, as before.
   const full = T.buildTopologyModel(cases.core_cascade.fabric, { inventory: cases.core_cascade.snapshot });
-  for (const text of heading(full)) assert.match(text, /Bays \d+–\d+/, text);
-  assert.ok(full.groups.every((group) => group.bays.length === 4));
+  // Approved design: a physical enclosure's title is its name; the bay range
+  // and count follow on the next line.
+  assert.deepEqual([...full.groups].map((group) => group.lines[1].text), ["Bays 00–03 · 4 of 4", "Bays 04–07 · 4 of 4"]);
+  assert.ok([...full.groups].every((group) => group.bays.length === 4 && !group.lines.some((line) => /numbered/.test(line.text))));
 });
 
 // ---- titles stay distinct after every generated suffix ---------------------------

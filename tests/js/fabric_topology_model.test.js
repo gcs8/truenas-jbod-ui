@@ -272,7 +272,7 @@ test("a link with reported lanes is labelled with lane count, PHYs at both ends 
     basis: "both_endpoints", targetBasis: "",
     rows: [0, 1, 2, 3].map((source) => ({ source, target: source + 32, rate: 12 })),
   });
-  assert.deepEqual([...item.labelLines], ["x4 · 12 Gb/s", "PHY 0–3 ↔ PHY 32–35"]);
+  assert.deepEqual([...item.labelLines], ["x4 · 12 Gb/s", "PHY 0–3 ↔ 32–35"]);
   // The HBA groups its PHYs by the wide port the payload reports.
   const hba = model.nodeById.get(reported.hba.id);
   assert.deepEqual([...hba.phyGroups].map((group) => `${[...group.phys].join(",")}>${group.target}`), [`0,1,2,3>${reported.exp.id}`]);
@@ -282,7 +282,7 @@ test("a link with reported lanes is labelled with lane count, PHYs at both ends 
   const rateless = oneHbaOneExpander({ reported: noRate });
   const rateModel = T.buildTopologyModel(rateless.fabric);
   const rateLink = rateModel.linkById.get(`controller-expander:${rateless.hba.id}->${rateless.exp.id}`);
-  assert.deepEqual([...rateLink.labelLines], ["x2 · rate not reported", "PHY 4–5 ↔ PHY 8–9"]);
+  assert.deepEqual([...rateLink.labelLines], ["x2 · rate not reported", "PHY 4–5 ↔ 8–9"]);
   assert.equal(rateLink.lanes.rate, null);
 
   const plain = oneHbaOneExpander();
