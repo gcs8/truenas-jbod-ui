@@ -11812,9 +11812,9 @@
       if (terminal(result)) {
         const peers = rows.filter((row) => row !== statusOwner && row.systemId === systemId && row.mode === mode);
         // Full syncs are ordered by the job itself, never by request timing.
-        // Synchronous multipath operations have no job IDs and use admission order.
-        const compare = (row) => mode === "full"
-          ? (Number.isInteger(result.job_id) && Number.isInteger(row.result?.job_id) ? result.job_id - row.result.job_id : 0)
+        // Outcomes without a job ID (a failed POST, synchronous multipath) use admission order.
+        const compare = (row) => mode === "full" && Number.isInteger(result.job_id) && Number.isInteger(row.result?.job_id)
+          ? result.job_id - row.result.job_id
           : statusOwner.sequence - row.sequence;
         if (peers.some((row) => terminal(row.result) && compare(row) < 0)) {
           statusOwner.superseded = true;

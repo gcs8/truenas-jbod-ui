@@ -229,8 +229,10 @@ test("an older refresh completion cannot republish success over a newer failure"
       assert.equal(h.statuses.at(-1).kind, "error");
       assert.match(h.statuses.at(-1).text, /New job error/);
       assert.equal(h.state.diskInventorySync.statuses.length, 1);
+      const rendered = h.statuses.length;
       finish(refreshFails ? new Error("Synthetic refresh unavailable.") : undefined);
       await older;
+      assert.equal(h.statuses.length, rendered, "a retired owner must not render again");
       assert.equal(h.statuses.at(-1).kind, "error");
       assert.match(h.statuses.at(-1).text, /New job error/);
       assert.doesNotMatch(h.statuses.at(-1).text, /Older inventory|refresh is unavailable/);
@@ -348,6 +350,56 @@ test("job recency wins even when the older job is returned to a later request", 
   assert.equal(h.statuses.at(-1).kind, "info");
   assert.doesNotMatch(h.statuses.at(-1).text, /Old job/);
   assert.match(h.statuses.at(-1).text, /New job succeeded/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("a successful full sync replaces an earlier failure that has no job id", async () => {
+  const postError = Object.assign(new Error("HTTP 500 upstream"), { status: 500 });
+  const h = harness([postError, { state: "SUCCESS", job_id: 20, message: "Job 20 re-read inventory." }]);
+  await h.context.run("full", "system-a");
+  assert.equal(h.statuses.at(-1).kind, "error");
+  await h.context.run("full", "system-a");
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /HTTP 500/);
+  assert.match(h.statuses.at(-1).text, /Job 20 re-read inventory/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("an older failure without a job id cannot hide a newer successful job", async () => {
+  let reject;
+  const postAnswer = new Promise((_resolve, fail) => { reject = fail; });
+  const h = harness([postAnswer, { state: "SUCCESS", job_id: 20, message: "Job 20 re-read inventory." }]);
+  const older = h.context.run("full", "system-a");
+  await Promise.resolve();
+  // Admission normally serializes POSTs; release it here to pin ordering when the old failure lands last.
+  delete h.state.diskInventorySync.full;
+  await h.context.run("full", "system-a");
+  reject(Object.assign(new Error("HTTP 504 gateway timeout"), { status: 504 }));
+  await older;
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /HTTP 504/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+  assert.equal(h.state.diskInventorySync.statuses[0].result.job_id, 20);
+});
+
+test("an older job's success cannot hide a newer failure that has no job id", async () => {
+  const h = harness([
+    { state: "UNKNOWN", job_id: 17, message: "Old job state unknown." },
+    Object.assign(new Error("HTTP 500 upstream"), { status: 500 }),
+    { state: "SUCCESS", job_id: 17, message: "Old job succeeded." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const older = h.context.run("full", "system-a");
+  await observing;
+  await h.context.run("full", "system-a");
+  resume();
+  await older;
+  assert.equal(h.refreshes.length, 0, "a superseded success must not start a new inventory refresh");
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /HTTP 500/);
+  assert.doesNotMatch(h.statuses.at(-1).text, /Old job succeeded/);
   assert.equal(h.state.diskInventorySync.statuses.length, 1);
 });
 
