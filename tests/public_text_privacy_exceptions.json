@@ -399,6 +399,14 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/js/core_fabric_direct_paths.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:9bbf2346da88d87f62ed9480eda8c73fa66883cf47e0ef7c816746ce58ccd37f": 2
+      }
+    },
+    "reason": "One invented second-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
+  },
   "tests/js/fabric_topology_generality.test.js": {
     "findings": {
       "sas_wwn_identifier": {
@@ -406,6 +414,14 @@
       }
     },
     "reason": "Invented Topology generality test: one patterned synthetic expander address from the fixture generator's seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_own_evidence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:e6dac837cac425653f0ba125123f4b65020d32ed66115172f8476456e758b57b": 2
+      }
+    },
+    "reason": "Two patterned synthetic expander addresses from the Topology generality fixture seeds; exact detector count is pinned."
   },
   "tests/js/mapping_health_accessibility.test.js": {
     "findings": {
@@ -614,7 +630,7 @@
         "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
       },
       "sas_wwn_identifier": {
-        "sha256:2864d5c4c8e6ae4703e2249953d1a13b9b78485dddfd086dfe561fef5f638e7e": 57
+        "sha256:6df162229ae2a86b0867c5dfee09eed22ac8390c6d1709d2015a0607e2b798a1": 53
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -793,10 +809,10 @@
   "tests/test_core_fabric_direct_paths.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:6b8305c06ed8862cbbcbcaa91fda9d152eabcc02427c28823ed5c38bca0262ca": 3
+        "sha256:ac5ba46418456cbc2c544a0256fd17b8e32f1bbcd089e800b4d330b9bb3f51a0": 14
       }
     },
-    "reason": "Three invented CORE enclosure-path regression identifiers, using the same synthetic prefix and numeric seeds as the fixture builder; no captured value is used."
+    "reason": "Invented CORE enclosure-path and multipath regression identifiers, using the same synthetic prefix and numeric seeds as the fixture builder; no captured value is used."
   },
   "tests/test_core_fabric_legacy_controller.py": {
     "findings": {
