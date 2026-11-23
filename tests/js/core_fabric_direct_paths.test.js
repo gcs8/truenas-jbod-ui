@@ -128,6 +128,29 @@ for (const mode of ["disk", "impact"]) {
   });
 }
 
+test("a direct seed without a graph path uses only its own header fields", () => {
+  const { data, trace } = fourPathPayload();
+  const { api } = page("disk", data);
+  const seed = api.branchSeedsForDiskTrace(trace, data.fabric).find((row) => row.device_name === "da12");
+  const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+  assert.match(rendered.match(/<small>([^<]*)<\/small>/)[1], /^mpr1 standby \/ da12$/);
+  const hba = rendered.split('disk-path-kind">HBA')[1].split('disk-path-card-cell')[0];
+  assert.doesNotMatch(hba, /16\.00|data-fabric-node|data-fabric-trace/);
+  assert.equal(api.branchMprDevice(seed, trace), null);
+});
+
+test("a direct seed without a controller says controller not read in its header", () => {
+  const { data, trace } = fourPathPayload();
+  const own = trace.metrics.path_states.find((row) => row.device_name === "da12");
+  own.controller = null;
+  own.not_read = ["controller", "target"];
+  const { api } = page("disk", data);
+  const seed = api.branchSeedsForDiskTrace(trace, data.fabric).find((row) => row.device_name === "da12");
+  const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+  assert.match(rendered.match(/<small>([^<]*)<\/small>/)[1], /^controller not read standby \/ da12$/);
+  assert.doesNotMatch(rendered.match(/<small>([^<]*)<\/small>/)[1], /mpr[01]/);
+});
+
 // Four direct paths, two per controller, with MPR rows for only one path on
 // each controller: the producer rows asserted by
 // test_four_direct_paths_with_partial_mpr_rows_keep_their_own_rows.

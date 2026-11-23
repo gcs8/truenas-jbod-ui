@@ -2987,8 +2987,11 @@
     const unread = list(seed.pathState?.not_read).includes("controller");
     const name = unread ? null : seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id);
     const id = name ? `controller:${name}` : "";
-    const node = unread ? null : nodeMap(fabric).get(id) || seed.controllerNode
-      || (ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (item) => item?.kind === "controller"));
+    const direct = ownDirectPath(seed, trace);
+    const ownState = seed.pathState?.state;
+    const ownPath = nodeMap(fabric).get(seed.pathState?.path_id || (name && ownState ? `path:${name}:${classToken(ownState)}` : ""));
+    const node = unread || (direct && !ownPath) ? null : nodeMap(fabric).get(id) || seed.controllerNode
+      || (direct ? null : firstTraceNode(trace, fabric, (item) => item?.kind === "controller"));
     return { unread, name, id, node };
   }
 
@@ -3205,7 +3208,8 @@
     const poolTitle = displayLabel(poolNode) || slot?.pool_name || trace.metrics?.pool_name;
     const vdevTitle = displayLabel(vdevNode) || slot?.vdev_name || trace.metrics?.vdev_name;
     const sourceTitle = displayLabel(controllerNode) || controllerName || "not read";
-    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || controllerName || "not read";
+    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || (ownDirectPath(seed, trace)
+      ? `${controllerName || "controller not read"} ${seed.pathState?.state || "state not read"}` : controllerName || "not read");
     const pathContext = compactDeviceLabel(mprDevice?.member_device_name || seed.device_name || fullDeviceName, 42);
     const branchHeaderContext = [
       pathTitle && pathTitle !== sourceTitle ? pathTitle : null,
@@ -3264,7 +3268,7 @@
           ["Capabilities", iocFacts.ioccapabilities],
         ],
         status: controllerNode?.status || stateName,
-        nodeId: controllerNode?.id || controllerId,
+        nodeId: controllerNode?.id || "",
       }),
       renderDiskPathCard({
         kind: labels.path,
