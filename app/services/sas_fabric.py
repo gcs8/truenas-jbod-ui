@@ -2202,7 +2202,7 @@ def _core_path_members(slots: list[SlotView], cam_devices: Any) -> dict[int, lis
         raw = slot.raw_status or {}
         names = raw.get("device_names")
         if (
-            not slot.present or not slot.physical_location_known or not _slot_ses_devices(slot)
+            slot_occupancy(slot) != "present" or not slot.physical_location_known or not _slot_ses_devices(slot)
             or not own or not re.fullmatch(r"da[0-9]+", own)
             or not isinstance(names, list) or owners.get(own.lower()) is not slot
         ):
