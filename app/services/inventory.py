@@ -873,6 +873,19 @@ def parse_size_to_bytes(value: Any) -> int | None:
     return int(number * (base ** power))
 
 
+def _read_capacity_bytes(value: Any) -> int | None:
+    """Accept a capacity reading, never a substring of an SES descriptor."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    text = value.strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?\s*(?:[KMGTPE](?:iB|B)?|B)?", text, re.IGNORECASE):
+        return None
+    size_bytes = parse_size_to_bytes(text)
+    return size_bytes if size_bytes is not None and size_bytes > 0 else None
+
+
 def build_lunid_alias_tiers(value: str | None, platform: str) -> tuple[str | None, set[str]]:
     """Split lunid aliases into the exact identity and its shifted neighbors."""
     exact = normalize_hex_identifier(value)
@@ -5660,6 +5673,17 @@ class InventoryService(InventorySourceCollectionMixin):
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
                     continue
+                if field_name == "size_bytes":
+                    cached_value = _read_capacity_bytes(cached_value)
+                    if cached_value is None:
+                        continue
+                elif field_name == "size_human":
+                    # Older writers saved free-form SES text as a disk size.
+                    cached_bytes = _read_capacity_bytes(entry.slot_fields.get("size_bytes"))
+                    if cached_bytes is not None:
+                        cached_value = format_bytes(cached_bytes)
+                    elif _read_capacity_bytes(cached_value) is None:
+                        continue
                 if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
                     continue
                 if field_name in ("smart_device_names", "device_name") and quantastor:
@@ -15880,8 +15904,10 @@ class InventoryService(InventorySourceCollectionMixin):
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
         if not serial and identity_mapping:
             serial = identity_mapping.serial
-        size_bytes = disk.size_bytes if disk else None
-        size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
+        size_bytes = _read_capacity_bytes(disk.size_bytes if disk else None)
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size"))
+        size_human = format_bytes(size_bytes)
         notes = mapping.notes if mapping else None
         if stale_manual_mapping:
             stale_note = "This bay is assigned by hand, but the enclosure reports it empty."
