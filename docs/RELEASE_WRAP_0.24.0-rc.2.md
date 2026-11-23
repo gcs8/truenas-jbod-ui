@@ -49,8 +49,8 @@ It is not a registry publication or deployment.
 | Snapshot/export/offline artifact gate | yes | Restored estimate, Auto HTML and explicit ZIP exports and both offline renders carried with original receipt/input proof from 8c9ace94ec82638cc89d516841d9ba161daf3428. Native setup also repeated this path: HTTP 200, zero external requests and console errors. Private partially redacted artifacts not published. | Pass | |
 | Docs/wiki/public-demo gate | yes | Release notes, source diff, metadata, privacy, public documentation, screenshot manifest and prerelease policy checks pass. Public demo deferred: prerelease. No public screenshot or external wiki bytes changed. Wrap-only final head requires its own exact-head CI. | Pass | |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked | |
-| GHCR publish verification | yes | Not authorized in this preparation phase. No image published. | Blocked | |
-| Deployment refresh/sniff tests | yes | Not authorized in this preparation phase. No installation adopted the candidate. | Blocked | |
+| GHCR publish verification | yes | [Release workflow](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45070295617) completed on merge `5d485296313ef94f70cf6b915323ff38f1d5016d`. Annotated `v0.24.0-rc.2` targets that merge; its tree equals qualified head `c41b77f105eaba91f2e608d38c26108ff60bba80`. GitHub prerelease is published, not draft. Fixed version aliases, `dev`, `sha-5d48529` and the full source-SHA alias resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:283fa755b23971efe23c7d2d198184a9abfc9fa80ea90aa8b68dba345a7bce5f`, with the exact merge revision and version labels. SHA aliases copy identical release-built manifest bytes, not another build. Stable/latest pointers remain v0.23.0. | Pass | |
+| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Full deployed-state crawl, delayed idle observation and independent final readback pass. Secondary-installation acceptance is blocked by host unreachability before staging; no backup/helper action or rollback occurred there. No complete deployment-gate claim. | Blocked | |
 | Post-release reopen | yes | Publication, deployment and final validation must precede reopen. | Blocked | |
 
 ## Crawl and human-view disposition
@@ -121,3 +121,171 @@ Exact-cut CI Preflight run 45042241558 passes all 24 expected jobs and CodeQL
 are recorded separately on the current PR head before promotion. No narrow-beta
 deferrals apply. No merge, tag, publication, deployment, stable-channel promotion
 or external wiki action occurred in phase A.
+
+## Phase B publication and exact-merge CI
+
+The published source is merge `5d485296313ef94f70cf6b915323ff38f1d5016d`.
+Its tree, `73a6961b1ba38c05e75dac6b5b38227da8b1be08`, equals the qualified
+release head's tree. The release workflow built the published image above;
+it is distinct from the local phase-A QA image.
+
+[Main CI run 45068384634](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45068384634)
+failed on attempt one. Python 3.14 shard 1 ran 1,846 tests with two skips and
+one error in `test_trickled_headers_and_chunk_metadata_obey_whole_response_deadline`,
+headers/status-200 subtest. The post-close `recv(1)` assertion received
+`ConnectionResetError` rather than EOF. The accepted test-only diagnosis is
+RST rather than FIN when a client closes with unread bytes. The failed native
+result remains retained; it is not relabelled a pass. A separate test correction
+is outside this immutable release cut.
+
+The two Python summaries and public-demo aggregate also failed downstream.
+The Python 3.12 summary had verified all 7,048 test identities exactly once;
+its final matrix-result predicate failed because of the 3.14 shard, not a
+separately observed 3.12 test failure.
+
+The four failed jobs were rerun under the authorized continuation. Attempt
+two completed successfully with 23 successful jobs and one expected Changelog
+skip. Nineteen successful executions were retained from attempt one; only the
+four failed jobs executed again. GitHub assigns new job IDs in the attempt-two
+view even to retained jobs, so execution provenance was reconciled by original
+start/completion timestamps and conclusions, not job IDs alone. No application
+source, release tree, test assertion or deadline changed in this lane.
+[Main CodeQL](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45068384579)
+completed successfully for both languages on the same merge, attempt one.
+
+| Main CI job | Attempt-two result | Execution evidence |
+| --- | --- | --- |
+| Python unittest shard (3.14, 1) | success | rerun on attempt 2 |
+| Changelog entry | skipped | expected skip; not executed |
+| Fixture browser specs (leg 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 4) | success | successful execution retained from attempt 1 |
+| Hardened, interrupted and segmented upgrade smoke | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.14, 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 1) | success | successful execution retained from attempt 1 |
+| Production container smoke | success | successful execution retained from attempt 1 |
+| Diff hygiene | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 2) | success | successful execution retained from attempt 1 |
+| Fixture browser specs (leg 4) | success | successful execution retained from attempt 1 |
+| Admin clean-room browser QA | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 4) | success | successful execution retained from attempt 1 |
+| JavaScript syntax and npm lock | success | successful execution retained from attempt 1 |
+| Run routing | success | successful execution retained from attempt 1 |
+| Image-only upgrade smoke | success | successful execution retained from attempt 1 |
+| Bounded Ruff | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 3) | success | successful execution retained from attempt 1 |
+| Python unittest shard (3.12, 1) | success | successful execution retained from attempt 1 |
+| Python compile and unittest (3.12) | success | rerun on attempt 2 |
+| Python compile and unittest (3.14) | success | rerun on attempt 2 |
+| Checked-in public demo artifact | success | rerun on attempt 2 |
+
+## Phase B deployed-state crawl and issue disposition
+
+The first authorized validation installation adopted the release-built digest
+through the tagged helper, with update and independent verify both returning
+zero. Backup checksums and predecessor recovery receipt were retained. Placement
+counts and identities matched the admitted predecessor, with no duplicate or
+unplaced regression, and the helper reported intact durable history. The two fenced
+services were healthy, with unchanged Compose inputs and no restart or OOM.
+
+The complete examination request/status multiset matches the predecessor,
+including its existing validation refusals, with no transport exception or
+HTTP 5xx.
+This is parity, not a claim that every endpoint returned success. Initial
+retained logs were not empty or wholly clean. Final combined output contains
+no traceback headers or access-log 5xx, but does include platform remote-error
+records and a history-pass failure. Its structured event identifies `smart_read` and
+`source_error_reply` with `HistorySourceError`; the native final helper verifies
+healthy, unpaused history with no recovery required. The retained rc.1 accepted crawl already contains `TrueNASAPIError`
+exception records; its initial post-adoption observation also contains a
+`HistorySourceError` pass failure. These are pre-existing failure families,
+not first seen in rc.2. Old logging lacks the current method/category and
+stage/kind attribution, so exact cause equivalence or an equal-duration error
+rate is not claimed. The later rc.1 crawl's absence of a history-pass failure
+does not erase that initial baseline failure. An initial
+stdout-only log projection was rejected because container stderr held the actual
+log lines; retained combined output supplied the corrected classification.
+
+The full deployed-state read-only crawl completed 42 chunks in 42 attempts,
+with native exit zero, the Admin chunk last, and independent Admin absence
+readback after cleanup. It covered 40 targets and 1,021 records: 850 done,
+130 not-applicable, two previewed and 39 listed. Listed states were not
+exercised. Native captures total 1,832 across 390/1600/1920/3840. No unknown
+errors, blocked requests or admitted writes were reported. All 42 native logs,
+exit receipts, safety predicates and exact capture identities were reconciled.
+There are 458 captured target/state pairs, exactly one capture at each width.
+
+The delayed post-crawl observation passed at least 30 minutes after the last chunk,
+while the middleware was idle in two consecutive samples. Retained sessions
+and alerts were unchanged, and no new failed-alert mail was recorded. The net
+retained mail-job count changed during the crawl window; this is not a count
+of new sends and its cause is not attributed. A separate post-adoption
+delayed observation also passed. No session-only rollback was performed.
+
+Retained middleware observations include failed Admin reads kept as missing
+observations. Directly observed UI peaks remain within their reported budgets.
+History and Admin emitted no direct-call limiter series, not a measured zero
+load. History memory sampling recorded no OOM kills. Charged cgroup peak reached
+the configured limit and max events occurred; it is explicitly not described
+as wholly below the limit. Detailed deployment measurements remain in restricted
+evidence. The rc.1 final readback already reached the same charged-memory
+limit with no OOM; at-limit pressure is not first seen in rc.2. The sampled
+anonymous-memory peak is higher in rc.2, but the observation lengths, active
+coverage and live data differ. This is an explicit measured increase, not a
+controlled regression or leak diagnosis. rc.1 max-event accounting is not
+available in the cited scalar receipt. Memory sampling covered history only. Final UI/history readback retains
+the original post-adoption container IDs, exact image, zero restarts, two fence
+locks and unchanged configuration/helper/receipt hashes. Temporary Admin and
+operation-owned key-copy directories are absent; owned samplers exited zero.
+
+All 310 findings retain existing issue classifications: 160 main-page
+label-in-name occurrences under #1110; 72 heat-spread errors, 32 contrast
+errors and 46 healthy-temperature alarm warnings under #1103. Compared with
+phase A, the error-occurrence multiset includes 20 additional known heat-spread
+and six additional known main-page label occurrences. This is not described as
+zero added error identities. State eligibility and live data differ between
+the deployed installation and disposable qualification stack. Topology itself
+has no findings under the narrowed rule.
+
+Actual deployed Topology human-view covered unpinned, pinned-node,
+pinned-bundle and reported-lane states at 1600 and 3840. Native SVG title
+metadata remains present; native hover appearance is owner-only and is not
+claimed. Direct accepted-baseline comparisons preserve the existing sticky
+trace-band overlay, scroll boundaries and source wrapping. The missing proxy
+sign-in block shifts the deployed content vertically and changes which graph
+region intersects that existing band. No new independent geometry defect was
+identified. Main face families and readable History/Admin captures were also
+reviewed; screenshot slices do not establish hidden content or write behavior.
+
+The release's 129 covered PRs yielded 137 distinct actual-issue references;
+three required follow-ups were added. All 140 received exact-readback release
+notices. No blanket closure was performed: issue-specific negative boundaries,
+restore workflows and owner checks are not established by a generic read-only
+crawl. Follow-ups #1461, #1463 and #1465 remain open. Three further observations
+were posted and read back on #1103, #1110 and #1114; these also remain open.
+
+## Phase B acceptance remains partial
+
+The second authorized validation target is **Blocked: host unreachable;
+owner to check**. Its recorded external address is explicitly authorized;
+absence from the homelab inventory is not an authorization blocker.
+
+The inherited coordination procedure read the shared-service checkpoint and
+completed its local process scan. Bounded SSH connection attempts for the
+remote scan and service-age read timed out, native status 255, before remote
+authentication or staging. Their retained receipt-completion timestamps are
+`2026-11-23T00:52:35Z` and `2026-11-23T00:52:50Z`; these are local log-file
+completion anchors, not packet-capture timestamps. Independent reachability
+checks confirmed the target unavailable.
+
+No directory or script was staged there; backup, helper update/verify, browser
+examination and Admin authentication checks were not started. There is nothing
+to roll back. No further retry, network, route or VPN change was made. This
+branch requires the owner to restore reachability before a later authorized
+continuation. The first installation's verified result is preserved and was
+not replayed.
+
+This is a FULL-mode wrap with explicit Blocked gates, not a completed release
+acceptance or a narrow-mode deferral. No final promotion, stable-tag movement,
+production activation or external wiki publication is claimed.
