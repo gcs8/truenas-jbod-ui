@@ -2792,6 +2792,7 @@
        3
       ],
       "source_sas_address": null,
+      "target_basis": null,
       "target_phys": [
        32,
        33,
@@ -2858,6 +2859,7 @@
        3
       ],
       "source_sas_address": null,
+      "target_basis": null,
       "target_phys": [
        32,
        33,
@@ -3231,6 +3233,7 @@
        31
       ],
       "source_sas_address": "5000c50000000e01",
+      "target_basis": null,
       "target_phys": [
        0,
        1,
@@ -3296,6 +3299,7 @@
        31
       ],
       "source_sas_address": "5000c50000000e11",
+      "target_basis": null,
       "target_phys": [
        0,
        1,

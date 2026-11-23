@@ -292,6 +292,74 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
             self.assertTrue(set(item.link_ids) <= link_ids)
         self.assertNotIn("controller:linux-ses", node_ids)
 
+    def test_port_census_includes_cables_and_disks_outside_selected_bays(self):
+        result = fabric(json.dumps(self.payload))
+        census = result.raw.get("sas_transport_ports", [])
+        self.assertEqual(len(census), 3, "all ports, not only the one selected disk's port")
+        by_id = {row["id"]: row for row in census}
+        cable = by_id["sas-port:port-2:0:1"]
+        self.assertEqual(cable["owner_id"], result.expanders[0]["id"])
+        self.assertEqual(cable["remote_id"], result.expanders[1]["id"])
+        self.assertEqual(cable["remote_kind"], "expander")
+        self.assertEqual(cable["phys"], [2, 3])
+        self.assertEqual(cable["phy_names"], ["phy-2:0:2", "phy-2:0:3"])
+        self.assertEqual(cable["state"], "read")
+        disk = by_id["sas-port:port-2:1:2"]
+        self.assertEqual((disk["remote_kind"], disk["has_block"]), ("end_device", True))
+        self.assertEqual((disk["bay_identifier"], disk["enclosure_identifier"]), (7, REAR))
+        self.assertEqual(disk["phys"], [7])
+        # No selected primary block binding: the host-wide census is still the
+        # same evidence, not invented from selected bay ordinals.
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0,
+                        present=True, device_name="unjoined", ssh_ses_device="/dev/sg9", enclosure_id=REAR)
+        unjoined = self.selection_fabric("scale", [slot], json.dumps(self.payload))
+        self.assertEqual(unjoined.raw.get("sas_transport_ports"), census)
+        self.assertEqual(unjoined.raw["sas_transport_port_index"], {})
+        reversed_payload = deepcopy(self.payload)
+        reversed_payload["rows"].reverse()
+        self.assertEqual(fabric(json.dumps(reversed_payload)).raw.get("sas_transport_ports"), census)
+
+    def test_census_refuses_ambiguous_target_and_incoherent_phy_membership(self):
+        for mutation in ("wrong_remote", "two_remotes", "missing_phy", "foreign_owner"):
+            payload = deepcopy(self.payload)
+            port = next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")
+            if mutation == "wrong_remote":
+                port["links"]["end_device-2:1:2"] = port["path"] + "/end_device-2:1:9"
+            elif mutation == "two_remotes":
+                port["links"]["end_device-2:1:9"] = port["path"] + "/end_device-2:1:9"
+            elif mutation == "missing_phy":
+                port["links"].pop("phy-2:1:7")
+            else:
+                port["path"] = port["path"].replace("expander-2:1", "expander-2:9")
+            with self.subTest(mutation=mutation):
+                census = fabric(json.dumps(payload)).raw.get("sas_transport_ports", [])
+                self.assertEqual(len(census), 3)
+                row = next(row for row in census if row["id"] == "sas-port:port-2:1:2")
+                if mutation in {"wrong_remote", "two_remotes"}:
+                    self.assertEqual(row["remote_kind"], "not_read")
+                    self.assertIsNone(row["enclosure_identifier"])
+                    self.assertIsNone(row["has_block"])
+                else:
+                    self.assertEqual(row["state"], "not_read")
+                    self.assertEqual(row["phys"], [])
+
+    def test_sysfs_far_end_basis_roundtrips_as_not_read_without_invented_phys(self):
+        from app.models.domain import SasFabricSnapshot
+
+        result = fabric(json.dumps(self.payload))
+        for link in result.links:
+            if link.kind not in {"controller-expander", "expander-expander"}:
+                continue
+            self.assertIsNotNone(link.reported_lanes)
+            assert link.reported_lanes is not None
+            value = link.reported_lanes.model_dump()
+            self.assertEqual(value.get("target_basis"), "not_read")
+            self.assertEqual(value["target_phys"], [])
+            self.assertEqual(value["lanes"], [])
+        again = SasFabricSnapshot.model_validate_json(result.model_dump_json())
+        self.assertEqual(again.raw.get("sas_transport_ports"), result.raw.get("sas_transport_ports"))
+        self.assertEqual([link.reported_lanes for link in again.links], [link.reported_lanes for link in result.links])
+
     def test_unknown_and_einval_are_not_zero_but_measured_zero_is_kept(self):
         from app.services.linux_sas_transport import parse_sas_transport
 
@@ -662,6 +730,7 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual([link.model_dump() for link in refused.links], [link.model_dump() for link in baseline.links])
         self.assertEqual(refused.expanders, [])
         self.assertNotIn("sas_transport_port_index", refused.raw)
+        self.assertNotIn("sas_transport_ports", refused.raw)
 
     def test_no_ses_budget_refusal_preserves_platform_routes(self):
         from app.services.linux_sas_transport import parse_sas_transport, transport_matches_selected_blocks

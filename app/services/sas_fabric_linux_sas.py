@@ -23,6 +23,9 @@ def _projected_facts(data: SasTransportData, snapshot: Any) -> int | None:
     facts = 0
     for row in data.rows:
         facts += 1 + len(row.attrs) + len(row.links)
+        if row.kind == "sas_port":
+            # One bounded census record, including both PHY-name and number lists.
+            facts += 18 + 3 * sum(name.startswith("phy-") for name in row.links)
         if facts > MAX_PROJECTED_TRANSPORT_FACTS:
             return None
     by_block = defaultdict(list)
@@ -99,6 +102,7 @@ def _reported_lanes(
         source_phys=[row.phy for row in local if row.phy is not None],
         # No child-side port census or lane pairing is exposed by this source.
         target_phys=[],
+        target_basis="not_read",
         lanes=[],
         negotiated_rate_gbps=rate,
         source_sas_address=source_address,
@@ -131,6 +135,7 @@ def enrich_linux_sas_fabric(
         return None
     projection = _Projection(data, nodes, links)
     projection.build_hardware()
+    projection.build_port_census()
     if not projection.controller_ids:
         return None
     # SES remains the bay/containment evidence, not a pretend HBA. Replace only
@@ -156,7 +161,8 @@ def enrich_linux_sas_fabric(
             node.controller_id = None
             node.raw["controller_ids"] = []
     projection.attach_bays(snapshot, traces, warnings)
-    transport_raw.update(sas_transport_port_index=projection.port_facts, sas_transport_projected_facts=facts)
+    transport_raw.update(sas_transport_port_index=projection.port_facts, sas_transport_projected_facts=facts,
+                         sas_transport_ports=projection.port_census)
     for controller_id in sorted(projection.controller_ids):
         controller = nodes[controller_id]
         if not controller.related_slots:
@@ -217,6 +223,7 @@ class _Projection:
         self.devices = {row.path: row for row in data.of_kind("sas_device")}
         self.host_details = {row.name: row for row in data.of_kind("scsi_host")}
         self.port_facts: dict[str, dict[str, Any]] = {}
+        self.port_census: list[dict[str, Any]] = []
         self.controller_ports: dict[str, set[str]] = defaultdict(set)
         self.phys_by_owner: dict[str, list[SasTransportRow]] = defaultdict(list)
         for row in sorted(self.phys.values(), key=lambda item: item.name):
@@ -336,6 +343,38 @@ class _Projection:
                 )
                 self.parents[key], self.parent_links[key] = parent_id, link.id
         self.hardware_ids = self.controller_ids | self.expander_ids
+
+    def build_port_census(self) -> None:
+        """Every surveyed port, including unjoined/ambiguous ports as not read.
+
+        These are host-wide observations, not selected-bay membership. A far
+        end must match its explicit link name, path and nested owner. PHY
+        membership is independently qualified by the existing reciprocal guard.
+        """
+        remotes = {row.path: row for row in self.data.rows if row.kind in {"sas_expander", "sas_end_device"}}
+        for port in sorted(self.ports, key=lambda row: tuple(int(part) for part in row.name[5:].split(":"))):
+            owner_id = self.by_path.get(port.owner_path)
+            members = _port_phys(port, self.phys) if owner_id else None
+            attached = [(name, path) for name, path in port.links.items() if not name.startswith("phy-")]
+            remote = remotes.get(attached[0][1]) if len(attached) == 1 else None
+            if remote is not None and (remote.name != attached[0][0] or remote.owner_path != port.path):
+                remote = None
+            device = self.devices.get(remote.path) if remote is not None else None
+            self.port_census.append({
+                "id": "sas-port:" + port.name,
+                "owner_id": owner_id,
+                "state": "read" if members else "not_read",
+                "phy_names": [row.name for row in (members or [])],
+                "phys": [row.phy for row in (members or [])],
+                "remote_kind": "expander" if remote and remote.kind == "sas_expander"
+                               else "end_device" if remote else "not_read",
+                "remote_id": self.by_path.get(remote.path) if remote else None,
+                "remote_sas_address": device.sas_address if device else None,
+                "has_block": bool(remote.links) if remote and remote.kind == "sas_end_device" else None,
+                "bay_identifier": device.bay_identifier if device else None,
+                "enclosure_identifier": device.enclosure_identifier if device else None,
+                "target_basis": "reported" if remote else "not_read",
+            })
 
     def chain(self, owner_id: str) -> tuple[list[str], list[str]]:
         node_ids, link_ids = [owner_id], []

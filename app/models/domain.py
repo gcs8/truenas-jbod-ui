@@ -538,6 +538,8 @@ class SasFabricReportedLanes(BaseModel):
     lane_count: int
     source_phys: list[int] = Field(default_factory=list)
     target_phys: list[int] = Field(default_factory=list)
+    # Far-end provenance is independent of the parent-side membership basis.
+    target_basis: Literal["reported", "inferred", "not_read"] | None = None
     lanes: list[SasFabricReportedLane] = Field(default_factory=list)
     # Set only when every lane at the stated basis reports the same rate.
     negotiated_rate_gbps: float | None = None
