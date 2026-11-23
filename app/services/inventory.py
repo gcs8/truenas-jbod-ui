@@ -15744,7 +15744,7 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
         pool_path_device = None
         if zpool:
             pool_label = normalize_gptid(zpool.raw_path or zpool.raw_name)
-            pool_path_device = normalize_device_name(ssh_data.glabel.gptid_to_device.get(pool_label, pool_label))
+            pool_path_device = normalize_device_name(ssh_data.glabel.gptid_to_device.get((pool_label or "").lower(), pool_label))
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
             # A bay peer may supply direct membership, not SSH-only geom inference.
