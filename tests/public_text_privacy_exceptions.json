@@ -742,6 +742,14 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/fixtures/sas_fabric/core_direct_paths.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:0465a1ff9bddb833cb4169b99f7549f37a7bc6ede7c84e1d5003dd5ae52dc2c9": 82
+      }
+    },
+    "reason": "Invented CORE direct-path builder fixture: five SAS identifiers from the test's synthetic enclosure, expander and disk seeds. Exact values and counts are pinned; no captured device identity is used."
+  },
   "tests/fixtures/sas_fabric/core_no_controller_fabric.json": {
     "findings": {
       "sas_wwn_identifier": {
