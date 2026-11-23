@@ -21,7 +21,7 @@
   }
   function pathState(fabric, state) {
     const result = { controller: String(state.controller_label || state.controller || ""), state: String(state.state ?? "unknown"), basis: String(state.state_basis ?? "") };
-    if (state.sas_transport_port_id) {
+    if (state.sas_transport_port_id || fabric?.raw?.sas_transport_available === true) {
       const port = resolveTransportPort(fabric, state);
       result.transportPhyCount = port.state === "read" ? port.phys.length : null;
     }
