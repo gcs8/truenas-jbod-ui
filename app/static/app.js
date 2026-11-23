@@ -11824,7 +11824,7 @@
         if (state.diskInventorySync.displayOwner === owner) {
           setStatus(formatDiskInventorySyncResult(result), failed ? "error" : "info");
         }
-        if (!["WAITING", "RUNNING"].includes(result?.state) || !Number.isInteger(result?.job_id)) break;
+        if (!["WAITING", "RUNNING", "UNKNOWN"].includes(result?.state) || !Number.isInteger(result?.job_id)) break;
         await new Promise((resolve) => window.setTimeout(resolve, 5000));
         if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
         try {
@@ -11832,7 +11832,8 @@
             method: "GET", readUiAuth: true,
           });
         } catch (_error) {
-          result = { state: "UNKNOWN", message: "The disk sync job's state is unknown. You can start a new sync; TrueNAS will queue it." };
+          result = { state: "UNKNOWN", job_id: result?.job_id,
+            message: "The disk sync job's state is unknown. Checking again; TrueNAS will queue a new sync if requested." };
         }
       }
       if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {

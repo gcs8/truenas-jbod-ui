@@ -6207,14 +6207,8 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             # A deadline is not a failed observation. Retain the last known
             # active state instead of attempting a doomed near-zero-budget read.
             if remaining > 0:
-                state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(15.0, remaining))
+                state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(50.0, remaining))
             elapsed = self._disk_inventory_sync_elapsed(started)
-            if state == "UNKNOWN":
-                return DiskInventorySyncResult(
-                    mode=DiskInventorySyncMode.full, state=state, job_id=job_id,
-                    elapsed_seconds=elapsed,
-                    message=f"Disk sync job {job_id}'s state is unknown. You can check again or start a new sync.",
-                )
             if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
                 self._disk_inventory_sync_active_job_id = None
                 break
@@ -6227,7 +6221,9 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                     timed_out=True,
                     error=error,
                     message=(
-                        (f"TrueNAS disk sync job {job_id} is waiting in the disk.sync_all queue. "
+                        (f"Disk sync job {job_id}'s state is unknown. You can check again or start a new sync. "
+                         if state == "UNKNOWN" else
+                         f"TrueNAS disk sync job {job_id} is waiting in the disk.sync_all queue. "
                          if state == "WAITING" else
                          f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. ") +
                         "Check the job in the TrueNAS UI, then refresh here when it finishes."

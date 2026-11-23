@@ -71,8 +71,8 @@ class DiskSyncStatusTests(unittest.IsolatedAsyncioTestCase):
         async def run(command, **kwargs):
             commands.append(command)
             timeouts.append(kwargs.get("timeout_seconds"))
-            if len(commands) <= 3:
-                self.clock[0] += kwargs.get("timeout_seconds") or 15
+            if "core.get_jobs" in command and ',17]]' in command:
+                self.clock[0] += kwargs["timeout_seconds"]
                 return failed("SSH command timed out.")
             return ok("18") if "call disk.sync_all" in command else ok(job_payload(18, "SUCCESS"))
         self.service._run_ssh_command = run
@@ -168,6 +168,118 @@ class DiskSyncStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown", result.message.lower())
         self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
         self.assertFalse(any("call disk.sync_all" in command for command in runner.commands))
+
+    async def test_new_job_polling_accepts_eight_second_status_reads_until_success(self):
+        self.service.settings.app.disk_inventory_sync_timeout_seconds = 180
+        self.service.system.ssh.timeout_seconds = 15
+        self.service.settings.app.disk_inventory_sync_poll_interval_seconds = 5
+        timeouts = []
+        reads = []
+
+        async def run(command, **kwargs):
+            if command.endswith("call disk.sync_all"):
+                return ok("18")
+            timeout = kwargs["timeout_seconds"]
+            timeouts.append(timeout)
+            self.clock[0] += min(8.0, timeout)
+            if timeout < 8:
+                return failed("SSH command timed out.")
+            reads.append(self.clock[0])
+            return ok(job_payload(18, "SUCCESS" if len(reads) == 4 else "RUNNING"))
+
+        self.service._run_ssh_command = run
+        result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+        self.assertEqual(result.state, "SUCCESS")
+        self.assertEqual(result.elapsed_seconds, 47.0)
+        self.assertEqual(len(reads), 4)
+        self.assertTrue(all(timeout >= 15 for timeout in timeouts), timeouts)
+        self.assertIsNone(self.service._disk_inventory_sync_active_job_id)
+
+    async def test_new_job_polling_retries_unknown_observations_until_success(self):
+        self.service.settings.app.disk_inventory_sync_timeout_seconds = 180
+        runner = RecordingSSHRunner([
+            ok("18"), *[failed("temporary status read failure")] * 3,
+            ok(job_payload(18, "SUCCESS")),
+        ])
+        self.service._run_ssh_command = runner
+        result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+        self.assertEqual(result.state, "SUCCESS")
+        self.assertEqual(sum(command.endswith("call disk.sync_all") for command in runner.commands), 1)
+        self.assertEqual(self.sleeps, [0.5, 1.0, 2.0])
+
+    async def test_unknown_new_job_is_observed_until_deadline_not_reported_running(self):
+        self.service.settings.app.disk_inventory_sync_timeout_seconds = 20
+        commands = []
+        timeouts = []
+
+        async def run(command, **kwargs):
+            commands.append(command)
+            if command.endswith("call disk.sync_all"):
+                return ok("18")
+            self.assertGreaterEqual(kwargs["timeout_seconds"], min(15, 20 - self.clock[0]))
+            timeouts.append(kwargs["timeout_seconds"])
+            self.clock[0] += kwargs["timeout_seconds"]
+            return failed("SSH command timed out.")
+
+        self.service._run_ssh_command = run
+        result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+        self.assertEqual(result.state, "UNKNOWN")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.elapsed_seconds, 20.0)
+        self.assertIn("state is unknown", result.message)
+        self.assertNotIn("still running", result.message)
+        self.assertEqual(self.service._disk_inventory_sync_active_job_id, 18)
+        self.assertEqual(sum(command.endswith("call disk.sync_all") for command in commands), 1)
+        self.assertGreaterEqual(len(timeouts), 2)
+
+    async def test_previous_failed_error_reaches_the_new_post_response_notice(self):
+        from app import main, routes
+        from app.models.domain import DiskInventorySyncRequest
+        self.service._disk_inventory_sync_active_job_id = 17
+        self.service._run_ssh_command = RecordingSSHRunner([
+            ok(job_payload(17, "FAILED", "UNIQUE constraint failed: storage_disk.disk_identifier")),
+            ok("18"), ok(job_payload(18, "SUCCESS")),
+        ])
+        route = next(route for route in main.app.routes
+                     if getattr(route, "path", "") == "/api/systems/{system_id}/disk-inventory-sync"
+                     and "POST" in getattr(route, "methods", set()))
+        registry = SimpleNamespace(has_system=lambda _id: True, get_service=lambda _id: self.service)
+        with patch.object(routes, "get_inventory_registry", return_value=registry), patch.object(routes, "add_perf_metadata"):
+            response = await route.endpoint(system_id="sync-contract", payload=DiskInventorySyncRequest(mode="full", confirm=True))
+        body = json.loads(response.body)
+        self.assertEqual(body["state"], "SUCCESS")
+        self.assertEqual(body["job_id"], 18)
+        self.assertIn("job 17 failed", body["message"])
+        self.assertIn("UNIQUE constraint failed: storage_disk.disk_identifier", body["message"])
+
+    async def test_non_da_duplicate_rows_do_not_trigger_core_multipath_advice(self):
+        for names in (("ada0", "ada1"), ("nvd0", "nvd1"), ("multipath/disk1", "multipath/disk2")):
+            with self.subTest(names=names):
+                self.source_bundle()
+                for row, name in zip(self.service._source_bundle.raw_data.disks, names):
+                    row["name"] = name
+                runner = RecordingSSHRunner([ok("18"), ok(job_payload(18, "SUCCESS"))])
+                self.service._run_ssh_command = runner
+                result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+                self.assertEqual(result.state, "SUCCESS")
+                self.assertTrue(runner.commands[0].endswith("call disk.sync_all"))
+                self.assertNotIn("Sync multipath table", result.message)
+
+    async def test_failed_status_read_clears_previous_progress_observation(self):
+        first = json.loads(job_payload(17, "RUNNING"))[0]
+        first["progress"] = {"percent": 77, "description": "Synthetic old progress"}
+        self.service._run_ssh_command = RecordingSSHRunner([
+            ok(json.dumps([first])), *[failed("SSH command timed out.")] * 3,
+        ])
+        observed = await self.service._disk_sync_status_result(CORE_MIDCLT, 17, budget=50)
+        self.assertIn("77%", observed.message)
+        self.assertIn("Synthetic old progress", observed.message)
+        unknown = await self.service._disk_sync_status_result(CORE_MIDCLT, 18, budget=50)
+        self.assertEqual(unknown.state, "UNKNOWN")
+        self.assertIsNone(self.service._disk_inventory_sync_state.observation,
+                          "a failed read must not retain another job's progress")
+        self.assertNotIn("77%", unknown.message)
+        self.assertNotIn("Synthetic old progress", unknown.message)
 
     async def test_expired_poll_budget_keeps_last_active_state_without_another_read(self):
         self.service.settings.app.disk_inventory_sync_timeout_seconds = 2

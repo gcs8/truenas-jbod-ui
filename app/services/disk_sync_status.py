@@ -149,9 +149,13 @@ class DiskSyncStatusMixin:
             remaining = deadline - self._disk_inventory_sync_clock()
             if remaining <= 0:
                 break
-            # Reserve the remaining retries and backoff inside this read budget.
+            # Retries must not shorten a normally valid SSH status read. Only
+            # the caller's remaining request budget can cap the command timeout.
             backoff = (0.5, 1.0, 0.0)[attempt]
-            timeout = max(0.01, (remaining - sum((0.5, 1.0)[attempt:])) / (3 - attempt))
+            timeout = max(
+                float(self.system.ssh.timeout_seconds),
+                (remaining - sum((0.5, 1.0)[attempt:])) / (3 - attempt),
+            )
             try:
                 job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
                 async with asyncio.timeout(min(remaining, timeout)):

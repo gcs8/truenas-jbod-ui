@@ -58,11 +58,17 @@ test("running response stays neutral until the real job fails with its error", a
 });
 
 test("unknown old status allows another full sync and no failure styling", async () => {
-  const h = harness([{ state: "UNKNOWN", job_id: 17, message: "Previous job state is unknown. You can start a new sync." }]);
+  const h = harness([
+    { state: "UNKNOWN", job_id: 17, message: "Previous job state is unknown. You can start a new sync." },
+    { state: "SUCCESS", job_id: 17, message: "Inventory re-read." },
+  ]);
   await h.context.run("full", "system-a");
+  assert.ok(h.statuses.some(row => row.text.includes("unknown") && row.kind === "info"));
   assert.equal(h.statuses.at(-1).kind, "info");
   assert.equal(h.state.diskInventorySync.inFlight, false);
-  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[1].options.method, "GET");
+  assert.equal(h.refreshes.length, 1);
 });
 
 test("multipath prerequisite is guidance and does not poll or refresh", async () => {
@@ -77,11 +83,34 @@ test("status-read transport failure becomes unknown, not a failed sync", async (
   const h = harness([
     { state: "WAITING", job_id: 17, message: "Job 17 is queued." },
     new Error("temporary status timeout"),
+    { state: "SUCCESS", job_id: 17, message: "Inventory re-read." },
   ]);
   await h.context.run("full", "system-a");
-  assert.match(h.statuses.at(-1).text, /state is unknown/);
+  assert.ok(h.statuses.some(row => row.text.includes("state is unknown") && row.kind === "info"));
   assert.equal(h.statuses.at(-1).kind, "info");
   assert.equal(h.requests.filter(row => row.options.method === "POST").length, 1);
+  assert.equal(h.requests.length, 3);
+  assert.match(h.requests[2].url, /job_id=17$/);
+  assert.equal(h.refreshes.length, 1);
+});
+
+test("unknown known-job observations remain bounded and never resubmit POST", async () => {
+  const h = harness(Array.from({ length: 721 }, () => ({
+    state: "UNKNOWN", job_id: 17, message: "State is unknown.",
+  })));
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 721);
+  assert.equal(h.requests.filter(row => row.options.method === "POST").length, 1);
+  assert.ok(h.requests.slice(1).every(row => row.options.method === "GET" && row.url.endsWith("job_id=17")));
+  assert.ok(h.statuses.every(row => row.kind === "info"));
+  assert.equal(h.state.diskInventorySync.inFlight, false);
+});
+
+test("unknown without a job id ends observation without a write replay", async () => {
+  const h = harness([{ state: "UNKNOWN", message: "No job id is available." }]);
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.statuses.at(-1).kind, "info");
 });
 
 test("multipath remains available while a full sync request owns its button", async () => {
