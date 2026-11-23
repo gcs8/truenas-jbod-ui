@@ -333,23 +333,59 @@ test("a superseded owner stays retired after newer outcomes leave the bounded li
     "retired owners cannot return when the replacement is no longer in the list");
 });
 
-test("job recency wins even when the older job is returned to a later request", async () => {
+test("a later request wins even when its job id is lower", async () => {
   const h = harness([
-    { state: "UNKNOWN", job_id: 18, message: "New job state unknown." },
-    { state: "FAILED", job_id: 17, message: "Old job failed.", error: "Old job error." },
-    { state: "SUCCESS", job_id: 18, message: "New job succeeded." },
+    { state: "UNKNOWN", job_id: 18, message: "Earlier request state unknown." },
+    { state: "FAILED", job_id: 17, message: "Later request failed.", error: "Later request error." },
+    { state: "SUCCESS", job_id: 18, message: "Earlier request succeeded." },
   ]);
   let reached, resume;
   const observing = new Promise(resolve => { reached = resolve; });
   h.context.window.setTimeout = fn => { resume = fn; reached(); };
-  const newer = h.context.run("full", "system-a");
+  const earlier = h.context.run("full", "system-a");
   await observing;
   await h.context.run("full", "system-a");
   resume();
-  await newer;
+  await earlier;
+  assert.equal(h.refreshes.length, 0, "a superseded success must not start a new inventory refresh");
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.doesNotMatch(h.statuses.at(-1).text, /Earlier request/);
+  assert.match(h.statuses.at(-1).text, /Later request error/);
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("job ids restarting after a middleware restart cannot hide a newer success", async () => {
+  const h = harness([
+    { state: "FAILED", job_id: 1700, message: "Job 1700 failed.", error: "Pre-restart error." },
+    { state: "SUCCESS", job_id: 17, message: "Job 17 re-read inventory." },
+  ]);
+  await h.context.run("full", "system-a");
+  assert.equal(h.statuses.at(-1).kind, "error");
+  await h.context.run("full", "system-a");
   assert.equal(h.statuses.at(-1).kind, "info");
-  assert.doesNotMatch(h.statuses.at(-1).text, /Old job/);
-  assert.match(h.statuses.at(-1).text, /New job succeeded/);
+  assert.doesNotMatch(h.statuses.at(-1).text, /Pre-restart error|Job 1700/);
+  assert.match(h.statuses.at(-1).text, /Job 17 re-read inventory/);
+  assert.equal(h.refreshes.length, 1, "the newer success must refresh the inventory");
+  assert.equal(h.state.diskInventorySync.statuses.length, 1);
+});
+
+test("a pre-restart job finishing late cannot hide a newer success with a lower job id", async () => {
+  const h = harness([
+    { state: "UNKNOWN", job_id: 1700, message: "Job 1700 state unknown." },
+    { state: "SUCCESS", job_id: 17, message: "Job 17 re-read inventory." },
+    { state: "FAILED", job_id: 1700, message: "Job 1700 failed.", error: "Pre-restart error." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const earlier = h.context.run("full", "system-a");
+  await observing;
+  await h.context.run("full", "system-a");
+  resume();
+  await earlier;
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /Pre-restart error/);
+  assert.match(h.statuses.at(-1).text, /Job 17 re-read inventory/);
   assert.equal(h.state.diskInventorySync.statuses.length, 1);
 });
 
