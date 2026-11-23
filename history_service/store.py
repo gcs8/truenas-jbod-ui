@@ -2848,17 +2848,21 @@ class HistoryStore:
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
                     if source_connection is not None:
                         source_connection.backup(restore_connection)
-                    validation_content = (
-                        self._hash_private_publication_descriptor(temp_fd)
-                        if validated_content is not None
-                        else None
-                    )
                     # Gate the exact bytes about to be published (#1189); a
                     # refusal leaves only the private temp copy, which the
                     # finally below discards.
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    if validated_content is not None:
+                        # Recount before the validation hash: the counters are
+                        # derived from the checked data and must be part of the
+                        # exact bytes that every later hash must match (#1449).
+                        self._recount_restored_table_counts(restore_connection)
+                        restore_connection.commit()
+                        validation_content = self._hash_private_publication_descriptor(temp_fd)
+                    else:
+                        validation_content = None
                     # An import's member checks run again on the copy that is
                     # published, not only on the file validated earlier (#1422).
                     # The timestamp bound below is not part of them, so it
@@ -2874,22 +2878,22 @@ class HistoryStore:
                         require_restored_timestamps_within(
                             restore_connection, rollback_allowance
                         )
-                    if (
-                        validation_content is not None
-                        and self._hash_private_publication_descriptor(temp_fd)
-                        != validation_content
-                    ):
-                        raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
-                    # The backup's counters are outside input that sizes
-                    # index builds; replace them with real counts (#1093).
-                    self._recount_restored_table_counts(restore_connection)
-                    restore_connection.commit()
+                    if validated_content is None:
+                        # The backup's counters are outside input that sizes
+                        # index builds; replace them with real counts (#1093).
+                        self._recount_restored_table_counts(restore_connection)
+                        restore_connection.commit()
 
                 publish_content = (
                     self._hash_private_publication_descriptor(temp_fd)
-                    if validated_content is not None
+                    if validation_content is not None
                     else None
                 )
+                if (
+                    validation_content is not None
+                    and publish_content != validation_content
+                ):
+                    raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
                 publish_descriptor = temp_fd
                 temp_fd = None
@@ -2904,7 +2908,7 @@ class HistoryStore:
                         temp_path,
                         self.file_path,
                         temp_descriptor=publish_descriptor,
-                        expected_content=publish_content,
+                        expected_content=validation_content,
                     )
                 for suffix in ("-shm", "-wal"):
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)

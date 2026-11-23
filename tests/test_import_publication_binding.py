@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Callable
 from unittest.mock import patch
@@ -103,6 +104,11 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
         self.assertEqual(refusal._dump(self.live), self.original_dump)
         self.assertEqual(refusal._metric_rows(self.live), self.original_rows)
 
+    def _assert_refused_absent(self, refused: Exception) -> None:
+        self.assertTrue(self.publication_seen, "history publication was never reached")
+        self.assertEqual(str(refused), VALIDATED_MEMBER_CHANGED_MESSAGE)
+        self.assertFalse(os.path.lexists(self.live), "a refused first publication left live history")
+
     def test_clean_private_copy_is_published(self) -> None:
         self._import(None)
         self.assertTrue(self.publication_seen)
@@ -147,6 +153,35 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
             self._import(None)
         self._assert_refused_unchanged(refused.exception, publication_seen=None)
 
+    def test_private_copy_changed_before_publish_hash_is_refused(self) -> None:
+        real_hash = HistoryStore._hash_private_publication_descriptor
+        changed = False
+
+        def rewrite_before_publish_hash(descriptor: int) -> tuple[int, str]:
+            nonlocal changed
+            connection = sys._getframe(1).f_locals.get("restore_connection")
+            if isinstance(connection, sqlite3.Connection):
+                try:
+                    connection.execute("SELECT 1")
+                except sqlite3.ProgrammingError:
+                    if not changed:
+                        changed = True
+                        private_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+                        self._rewrite_metric_in_place(private_path, suffix="before-publish-hash")
+            return real_hash(descriptor)
+
+        with (
+            patch.object(
+                HistoryStore,
+                "_hash_private_publication_descriptor",
+                staticmethod(rewrite_before_publish_hash),
+            ),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(changed, "the pre-publish rewrite hook did not run")
+        self._assert_refused_unchanged(refused.exception, publication_seen=None)
+
     def test_live_file_rewritten_after_rename_is_rolled_back(self) -> None:
         real_rename = HistoryStore._rename_at2
         changed = False
@@ -185,6 +220,78 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
             self._import(None)
         self.assertTrue(linked, "the post-rename link hook did not run")
         self._assert_refused_unchanged(refused.exception)
+
+    def test_live_path_swapped_during_post_rename_hash_is_refused(self) -> None:
+        real_hash = HistoryStore._hash_private_publication_descriptor
+        original_copy = self.root / "original-live-copy.sqlite3"
+        parked = self.root / "published-copy-parked.sqlite3"
+        shutil.copyfile(self.live, original_copy)
+        swapped = False
+
+        def hash_then_swap_path(descriptor: int) -> tuple[int, str]:
+            nonlocal swapped
+            digest = real_hash(descriptor)
+            descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if descriptor_path == self.live and not swapped:
+                swapped = True
+                os.replace(self.live, parked)
+                os.replace(original_copy, self.live)
+            return digest
+
+        with (
+            patch.object(
+                HistoryStore,
+                "_hash_private_publication_descriptor",
+                staticmethod(hash_then_swap_path),
+            ),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(swapped, "the live-path swap hook did not run")
+        self.assertEqual(str(refused.exception), VALIDATED_MEMBER_CHANGED_MESSAGE)
+        self.assertEqual(refusal._dump(self.live), self.original_dump)
+        self.assertEqual(refusal._metric_rows(self.live), self.original_rows)
+
+    def test_absent_live_file_rewritten_after_rename_is_removed(self) -> None:
+        self.live.unlink()
+        real_rename = HistoryStore._rename_at2
+        changed = False
+
+        def rename_then_change(source_path: Path, target_path: Path, *, flags: int) -> None:
+            nonlocal changed
+            real_rename(source_path, target_path, flags=flags)
+            if target_path == self.live and not changed:
+                changed = True
+                self._rewrite_metric_in_place(target_path, suffix="absent-after-rename")
+
+        with (
+            patch.object(HistoryStore, "_rename_at2", side_effect=rename_then_change),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(changed, "the absent-target rewrite hook did not run")
+        self._assert_refused_absent(refused.exception)
+
+    def test_absent_live_file_linked_after_rename_is_removed(self) -> None:
+        self.live.unlink()
+        real_rename = HistoryStore._rename_at2
+        alias = self.root / "absent-published-copy-alias.sqlite3"
+        linked = False
+
+        def rename_then_link(source_path: Path, target_path: Path, *, flags: int) -> None:
+            nonlocal linked
+            real_rename(source_path, target_path, flags=flags)
+            if target_path == self.live and not linked:
+                linked = True
+                os.link(target_path, alias)
+
+        with (
+            patch.object(HistoryStore, "_rename_at2", side_effect=rename_then_link),
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._import(None)
+        self.assertTrue(linked, "the absent-target link hook did not run")
+        self._assert_refused_absent(refused.exception)
 
     def test_metadata_change_during_hash_is_refused(self) -> None:
         real_hash = store_module.hash_descriptor
