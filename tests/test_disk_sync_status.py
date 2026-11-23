@@ -169,6 +169,29 @@ class DiskSyncStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
         self.assertFalse(any("call disk.sync_all" in command for command in runner.commands))
 
+    async def test_expired_poll_budget_keeps_last_active_state_without_another_read(self):
+        self.service.settings.app.disk_inventory_sync_timeout_seconds = 2
+        for state in ("RUNNING", "WAITING"):
+            with self.subTest(state=state):
+                self.clock[0] = 0.0
+                self.service._disk_inventory_sync_active_job_id = None
+                commands = []
+
+                async def run(command, **kwargs):
+                    commands.append(command)
+                    if command.endswith("call disk.sync_all"):
+                        return ok("17")
+                    self.clock[0] += 0.02
+                    if kwargs["timeout_seconds"] < 0.02:
+                        return failed("status read deadline expired")
+                    return ok(job_payload(17, state))
+                self.service._run_ssh_command = run
+                result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+                self.assertEqual(result.state, state)
+                self.assertTrue(result.timed_out)
+                self.assertEqual(len(commands), 2, "deadline expiry must not issue a near-zero-budget read")
+                self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
+
     async def test_inflight_request_does_not_mislabel_its_waiting_job_running(self):
         self.service._disk_inventory_sync_active_job_id = 17
         self.service._run_ssh_command = RecordingSSHRunner([ok(job_payload(17, "WAITING"))])

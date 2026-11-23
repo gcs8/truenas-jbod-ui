@@ -6201,9 +6201,13 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
         timeout_seconds: int,
         poll_interval: float,
     ) -> DiskInventorySyncResult:
+        state, error = "UNKNOWN", None
         while True:
-            remaining = max(0.01, timeout_seconds - (self._disk_inventory_sync_clock() - started))
-            state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(15.0, remaining))
+            remaining = timeout_seconds - (self._disk_inventory_sync_clock() - started)
+            # A deadline is not a failed observation. Retain the last known
+            # active state instead of attempting a doomed near-zero-budget read.
+            if remaining > 0:
+                state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(15.0, remaining))
             elapsed = self._disk_inventory_sync_elapsed(started)
             if state == "UNKNOWN":
                 return DiskInventorySyncResult(
@@ -6229,7 +6233,8 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                         "Check the job in the TrueNAS UI, then refresh here when it finishes."
                     ),
                 )
-            await self._disk_inventory_sync_sleep(poll_interval)
+            await self._disk_inventory_sync_sleep(min(
+                poll_interval, max(0.0, timeout_seconds - (self._disk_inventory_sync_clock() - started))))
 
         if state == "SUCCESS":
             message = "TrueNAS re-read its disk inventory. Refresh to see the updated bays."
