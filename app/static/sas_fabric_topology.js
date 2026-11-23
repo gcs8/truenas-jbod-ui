@@ -163,6 +163,14 @@ const CACHE_FRESH = new Set(["hit", "hit-after-wait", "miss", "forced-refresh"])
 
 const STATE_UNREAD = "present, state not read";
 
+// A path state the payload did not read, on any platform: no state, CORE's
+// "unknown" or a `not_read` naming the state, or the Linux transport's text.
+function isUnreadState(state) {
+    const value = String(state?.state ?? "").trim();
+    const notRead = [...list(state?.not_read), ...list(state?.raw?.not_read)];
+    return !value || value.toLowerCase() === "unknown" || value === STATE_UNREAD || notRead.includes("state");
+  }
+
 const PATH_STATE_TONES = {
     active: "active",
     online: "active",
@@ -1112,7 +1120,7 @@ function adoptLinuxTransport(payload, options = {}) {
         if (ownerId) owners.add(rename(ownerId));
         for (const phy of phys) role.set(`${ownerId}|${phy.name}`, device);
         return {
-          controller: options.label || text(row.controller), state: !text(row.state) || row.state === "unknown" ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),
+          controller: options.label || text(row.controller), state: isUnreadState(row) ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),
           mpr_device: protocol ? device : "", sas_address: text(row.sas_address), expander_ids: ownerId ? [rename(ownerId)] : [],
           expander_phy: phys.length === 1 && Number.isInteger(phys[0].phy) ? phys[0].phy : null, phy_basis: "",
         };
@@ -2410,6 +2418,7 @@ function modelParts(fabric, core) {
     MEMBER_HEALTH: { configurable: true, get: () => MEMBER_HEALTH },
     CACHE_FRESH: { configurable: true, get: () => CACHE_FRESH },
     STATE_UNREAD: { configurable: true, get: () => STATE_UNREAD },
+    isUnreadState: { configurable: true, get: () => isUnreadState },
     PATH_STATE_TONES: { configurable: true, get: () => PATH_STATE_TONES },
     PATH_CAPTIONS: { configurable: true, get: () => PATH_CAPTIONS },
     list: { configurable: true, get: () => list },

@@ -145,26 +145,35 @@ function wiringChecks(model, fabric) {
       severity = "critical";
       const flags = [];
       const lines = [];
-      let known = false;
+      const unread = [];
+      let read = 0;
+      let total = 0;
       for (const entry of controllers) {
         const states = model.bays.flatMap((bay) => bay.pathStates.filter((state) => state.controllerId === entry.id));
         if (!states.length) continue;
-        const blank = states.every((state) => state.state === context.STATE_UNREAD);
-        if (!blank) known = true;
-        const text = blank ? `${entry.label}: ${context.plural(states.length, "path")} present; active or standby is not read` : `${entry.label}: ${stateCounts(states.map((state) => state.state))}`;
+        // Only states the payload read are counted or judged; the rest are
+        // not read, whatever the platform calls them.
+        const known = states.filter((state) => !context.isUnreadState(state));
+        total += states.length;
+        read += known.length;
+        const blind = states.length - known.length;
+        if (blind) unread.push(known.length ? `${entry.label}: ${blind} of ${context.plural(states.length, "path")}: active or standby is not read` : `${entry.label}: ${context.plural(states.length, "path")} present; active or standby is not read`);
+        if (!known.length) continue;
+        const text = `${entry.label}: ${stateCounts(known.map((state) => state.state))}`;
         lines.push(text);
-        const bad = states.filter((state) => ["fault", "missing"].includes(context.pathTone(state.state, state.basis))).length;
+        const bad = known.filter((state) => ["fault", "missing"].includes(context.pathTone(state.state, state.basis))).length;
         if (!bad) continue;
         flags.push(text);
         flag("node", entry.id, `${context.plural(bad, "disk path")} failed or missing via ${entry.label}`, "critical");
       }
-      model.checks.push({
-        id: "path-states",
-        title: model.core ? "Disk path states per HBA side" : model.shared ? "Disk states per head end" : "Disk path states per source",
-        status: flags.length ? "critical" : lines.length && known ? "pass" : "not_read",
-        lines: lines.length ? lines : ["no path state is in the payload"],
-        notes: lines.length && !known && model.transport ? ["The Linux SAS transport classes say a path exists, not whether it is active."] : [],
-      });
+      const title = model.core ? "Disk path states per HBA side" : model.shared ? "Disk states per head end" : "Disk path states per source";
+      const notes = total && !read && model.transport ? ["The Linux SAS transport classes say a path exists, not whether it is active."] : [];
+      // Never a pass with a state not read: a mix is partial, none read is not read.
+      const parts = [];
+      if (flags.length) parts.push(["critical", lines]);
+      if (unread.length) parts.push(["not_read", read && !flags.length ? [`Partial: ${read} of ${context.plural(total, "path state")} read, none failed or missing (${lines.join("; ")})`, ...unread] : unread]);
+      if (!parts.length) parts.push(lines.length ? ["pass", lines] : ["not_read", ["no path state is in the payload"]]);
+      parts.forEach(([status, entries], index) => model.checks.push({ id: index ? `path-states:${status}` : "path-states", title, status, lines: entries, notes: index === parts.length - 1 ? notes : [] }));
     };
 
     // Two head ends on one backplane: what the two say of each bay is checked

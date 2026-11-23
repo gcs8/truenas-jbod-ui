@@ -243,6 +243,42 @@ test("each enclosure's redundancy is judged against the HBAs that report it", ()
   assert.match(textOf(lone.filter((entry) => entry.status === "not_read")), /SHELF-0-A/);
 });
 
+// A CORE direct path without a pool-usage hint has state "unknown" and
+// not_read ["state"]: its state is not read on any platform, and a check of
+// path states with none read is NOT READ, never PASS; a mix is partial.
+test("path states the payload did not read are never a passing path-state check", () => {
+  const states = (change) => {
+    const data = structuredClone(DIRECT);
+    change(data.fabric.traces.find((entry) => entry.id === "bay:0").metrics.path_states);
+    return checksOf(T.buildTopologyModel(data.fabric, { inventory: data.snapshot }), "path-states");
+  };
+  const control = states(() => {});
+  assert.deepEqual(plain(control.map((entry) => entry.status)), ["pass"], textOf(control));
+  const cases = {
+    "producer shape": (rows) => rows.forEach((row) => Object.assign(row, { state: "unknown", not_read: ["state"] })),
+    "unknown only": (rows) => rows.forEach((row) => { row.state = "unknown"; delete row.not_read; }),
+    "not_read only": (rows) => rows.forEach((row) => { row.not_read = ["state"]; }),
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    const found = states(change);
+    assert.deepEqual(plain(found.map((entry) => entry.status)), ["not_read"], `${name}: ${textOf(found)}`);
+    assert.match(textOf(found), /active or standby is not read/, name);
+    assert.doesNotMatch(textOf(found), /\b1 (unknown|standby|active)\b/, name);
+  }
+  // A mix: what was read is reported, as partial, and never as a pass.
+  const mixed = states((rows) => Object.assign(rows.find((row) => row.device_name === "da3"), { state: "unknown", not_read: ["state"] }));
+  assert.ok(!mixed.some((entry) => entry.status === "pass"), textOf(mixed));
+  assert.match(textOf(mixed), /Partial: 1 of 2 path states read/);
+  assert.match(textOf(mixed), /mpr1: 1 active/);
+  assert.match(textOf(mixed), /mpr0: 1 path present; active or standby is not read/);
+  // A read failure is still critical beside the unread rest.
+  const failed = states((rows) => {
+    Object.assign(rows.find((row) => row.device_name === "da3"), { state: "unknown", not_read: ["state"] });
+    rows.find((row) => row.device_name === "da11").state = "fail";
+  });
+  assert.deepEqual(plain(failed.map((entry) => entry.status)), ["critical", "not_read"], textOf(failed));
+});
+
 test("only established paths and rates are counted as read", () => {
   const ports = checksOf(model(fixture("dual-domain-linux")), "ports");
   assert.match(textOf(ports), /a path via another HBA is not read for 8 disks/);
