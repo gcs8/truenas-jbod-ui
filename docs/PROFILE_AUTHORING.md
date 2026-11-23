@@ -230,8 +230,8 @@ systems:
     label: Offsite SCALE
     default_profile_id: supermicro-ssg-6048r-front-24
     enclosure_profiles:
-      "5003048001c1043f": supermicro-ssg-6048r-front-24
-      "500304801e977aff": supermicro-ssg-6048r-rear-12
+      "500304800000b1ff": supermicro-ssg-6048r-front-24
+      "500304800000b2ff": supermicro-ssg-6048r-rear-12
 ```
 
 The selection order is:
