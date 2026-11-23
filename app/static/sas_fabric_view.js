@@ -2974,14 +2974,22 @@
     const mprDevices = list(trace.metrics?.mpr_devices);
     const controller = seed.controller || controllerNameFromId(seed.controller_id);
     const stateName = classToken(seed.state || seed.pathState?.state || seed.pathNode?.status || seed.mprDevice?.state);
-    return seed.mprDevice
-      || mprDevices.find((device) => (
-        device.controller === controller
-        && classToken(device.state) === stateName
-        && (!seed.device_name || device.member_device_name === seed.device_name)
-      ))
-      || mprDevices.find((device) => device.controller === controller)
+    if (seed.mprDevice) {
+      return seed.mprDevice;
+    }
+    // A seed that names its device takes only that member's own row: another
+    // port on the same controller is a different path (#1471).
+    const ownRow = (device) => device.controller === controller
+      && (!seed.device_name || device.member_device_name === seed.device_name);
+    return mprDevices.find((device) => ownRow(device) && classToken(device.state) === stateName)
+      || (seed.device_name ? mprDevices.find(ownRow) : mprDevices.find((device) => device.controller === controller))
       || null;
+  }
+
+  // A named path with no MPR row of its own, in a bay where other paths have
+  // rows: nothing in the bay trace is this port's own detail.
+  function branchPortNotRead(seed, mprDevice, trace) {
+    return Boolean(seed.device_name) && !mprDevice && list(trace.metrics?.mpr_devices).length > 0;
   }
 
   function firstTraceNode(trace, fabric, predicate) {
@@ -3148,11 +3156,16 @@
     const pathNodeId = pathNode?.id && nodes.has(pathNode.id) ? pathNode.id : "";
     const pathTraceId = !pathNodeId && pathId && traceById(pathId, fabric) ? pathId : "";
     const expanderId = list(mprDevice?.expander_ids)[0];
-    const expanderNode = nodes.get(expanderId) || seed.expanderNode || firstTraceNode(trace, fabric, (node) => (
+    // A named path without its own MPR row borrows no sibling port's expander
+    // or controller enclosure; its port detail is not read.
+    const portNotRead = !linuxSes && !storageFabric && branchPortNotRead(seed, mprDevice, trace);
+    const expanderNode = nodes.get(expanderId) || seed.expanderNode || (portNotRead ? null : firstTraceNode(trace, fabric, (node) => (
       node?.kind === "expander" && (!controllerId || node.controller_id === controllerId)
-    ));
+    )));
     const enclosureNode = nodes.get(mprDevice?.enclosure_id) || firstTraceNode(trace, fabric, (node) => (
-      ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
+      ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind)
+      && !(portNotRead && node.kind === "mpr-enclosure")
+      && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
     const transportPort = window.SasFabricTransport?.resolveTransportPort?.(fabric, seed.pathState);
@@ -3257,7 +3270,7 @@
         title: pathTitle,
         subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "no per-disk path", 42),
         facts: [
-          [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : formatLinkSpeed(mprDevice?.speed)],
+          [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : portNotRead ? "not read" : formatLinkSpeed(mprDevice?.speed)],
           [linuxSes ? "Block SG" : "PHY", linuxSes ? seed.pathState?.sg_device : storageFabric ? null : expanderPhy?.phy],
           [linuxSes ? "HCTL" : "Remote", linuxSes ? seed.pathState?.scsi_hctl : storageFabric ? null : expanderPhy?.remote_phy],
           [linuxSes ? "Transport" : "Handle", linuxSes ? [seed.pathState?.transport_protocol, seed.pathState?.target_port_protocol].filter(Boolean).join(" / ") : storageFabric ? null : mprDevice?.handle],

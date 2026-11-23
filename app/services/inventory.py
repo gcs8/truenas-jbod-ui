@@ -150,6 +150,7 @@ from app.services.sas_fabric import (
     attach_fabric_disk_ownership,
     build_sas_fabric_snapshot,
     fabric_disk_ownership,
+    fabric_path_evidence,
     storage_node_legacy_alias_ids,
 )
 from app.services.core_expander_counters import (
@@ -8323,9 +8324,13 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             summary=summary,
         )
         if self.system.truenas.platform == "core":
-            # This build's own API disk ownership rides on its snapshot object
-            # and is freed with it; never serialized, never a later bundle's (#1471).
-            attach_fabric_disk_ownership(snapshot, fabric_disk_ownership(disk.lookup_keys for disk in source_disks))
+            # This build's own API disk ownership, and a digest of the CAM and
+            # mprutil replies it read, ride on its snapshot object and are freed
+            # with it; never serialized, never a later bundle's (#1471).
+            attach_fabric_disk_ownership(snapshot, fabric_disk_ownership(
+                (disk.lookup_keys for disk in source_disks),
+                path_evidence=fabric_path_evidence(source_bundle.ssh_outputs),
+            ))
         # Do not admit a read that crossed invalidation, even when the ordinary
         # producer later rejects its candidate before publication.
         if (read_generation == self._snapshot_topology_generation
