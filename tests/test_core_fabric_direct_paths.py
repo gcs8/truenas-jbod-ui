@@ -16,7 +16,7 @@ from app.models.domain import MultipathMember, MultipathView, SlotView
 from app.services import sas_fabric
 from app.services.sas_fabric import (
     FabricDiskOwnership, _cam_member_target, _core_path_members, attach_fabric_disk_ownership,
-    build_sas_fabric_snapshot, fabric_disk_ownership, snapshot_fabric_disk_ownership,
+    build_sas_fabric_snapshot, fabric_disk_ownership, fabric_path_evidence, snapshot_fabric_disk_ownership,
 )
 from app.services.parsers import parse_camcontrol_devlist
 from app.services.ssh_probe import SSHCommandResult
@@ -66,7 +66,7 @@ def synthetic_outputs() -> dict[str, str]:
 
 
 class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
-    async def fixture(self, *, api_device="da11", pool_device="da11", pool_label=None, extra_disks=()):
+    async def fixture(self, *, api_device="da11", pool_device="da11", pool_label=None, extra_disks=(), api_disk=None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         settings = Settings()
@@ -82,7 +82,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         )
         client = AsyncMock()
         client.fetch_all.return_value = TrueNASRawData(
-            enclosures=[], disks=[{"name": api_device, "serial": "SANITIZED-DIRECT-DISK"}, *extra_disks],
+            enclosures=[], disks=[api_disk or {"name": api_device, "serial": "SANITIZED-DIRECT-DISK"}, *extra_disks],
             pools=[{"name": "synthetic-pool", "topology": {"special": [{
                 "type": "MIRROR", "name": "mirror-0", "children": [
                     {"type": "DISK", "disk": pool_device, "status": "ONLINE", **({"path": f"/dev/{pool_label}"} if pool_label else {})},
@@ -104,7 +104,16 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.slots[0].pool_name, "synthetic-pool")
         return system, snapshot, outputs
 
-    def build(self, system, snapshot, outputs):
+    def build(self, system, snapshot, outputs, *, coherent=True):
+        """Build as if the snapshot had been read from these outputs.
+
+        `coherent=False` keeps the snapshot's own recorded build evidence, so
+        outputs that differ from it model a later source read.
+        """
+        ownership = snapshot_fabric_disk_ownership(snapshot)
+        if coherent and ownership is not None:
+            snapshot = snapshot.model_copy()
+            attach_fabric_disk_ownership(snapshot, replace(ownership, path_evidence=fabric_path_evidence(outputs)))
         return build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs=outputs)
 
     def bay(self, fabric):
@@ -205,7 +214,9 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.model_dump(mode="json"), payload)
         bay = self.bay(self.build(system, reloaded, outputs))
         self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da11"])
-        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
+        # Nor can it show which CAM/MPR read it came from: those are not read.
+        self.assertIsNone(bay.metrics["path_states"][0]["controller"])
+        self.assertEqual(bay.metrics["mpr_devices"], [])
         fabric = self.build(system, snapshot, outputs)
         serialized = json.dumps(payload) + snapshot.model_dump_json() + fabric.model_dump_json() + repr(snapshot)
         for marker in ("_fabric_disk_ownership", "FabricDiskOwnership"):
@@ -300,6 +311,167 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         # Evidence from another build is never borrowed by a snapshot it did
         # not produce: an unknown snapshot reads as no ownership evidence.
         self.assertIsNone(snapshot_fabric_disk_ownership(type(snapshot).model_validate(snapshot.model_dump())))
+
+    async def test_source_only_refresh_never_draws_newer_cam_or_mpr_evidence_on_a_cached_bay(self):
+        system, snapshot, outputs = await self.fixture(api_device="da3", pool_device="da3")
+        service = self.inventory_service
+        ports = lambda fabric: [(row["device_name"], row["controller"]) for row in self.bay(fabric).metrics["path_states"]]  # noqa: E731
+        self.assertEqual(ports(await service.get_sas_fabric_snapshot()), [("da3", "mpr0"), ("da11", "mpr1")])
+        # Publication B: SES no longer co-lists da11, an independent API disk
+        # owns it, and CAM reports it on another controller with a new address.
+        moved_address = f"5000c500{0xD0B:08x}"
+        newer = dict(outputs)
+        newer["sesutil map"] = outputs["sesutil map"].split("ses1:")[0]
+        newer["camcontrol devlist -v"] = outputs["camcontrol devlist -v"].replace("on mpr1 bus", "on mpr2 bus")
+        newer["mprutil show adapters"] = outputs["mprutil show adapters"] + "\n/dev/mpr2 SAS3008 Synthetic 16.00.12.00"
+        for subcommand in ("adapter", "expanders", "enclosures", "devices"):
+            newer[f"mprutil -u 2 show {subcommand}"] = outputs[f"mprutil -u 1 show {subcommand}"].replace("mpr1", "mpr2")
+        newer["mprutil -u 2 show devices"] = newer["mprutil -u 2 show devices"].replace(f"5000c500{0xD01:08x}", moved_address)
+        raw = copy.deepcopy(service.truenas_client.fetch_all.return_value)
+        raw.disks = [*raw.disks, {"name": "da11", "serial": "SANITIZED-INDEPENDENT-DISK"}]
+        service.truenas_client.fetch_all.return_value = raw
+        service.system.ssh.commands = list(newer)
+        service.ssh_probe.run_planned_commands.return_value = [
+            SSHCommandResult(command=command, ok=True, stdout=output, exit_code=0) for command, output in newer.items()
+        ]
+        before = service._source_bundle.publication
+        self.assertIsNotNone(await service._background_source_bundle_refresh())
+        self.assertNotEqual(service._source_bundle.publication, before)
+        cached = await service.get_snapshot()
+        self.assertEqual(cached.generated_at, snapshot.generated_at)
+        mixed = await service.get_sas_fabric_snapshot()
+        self.assertEqual((mixed.snapshot_cache_state, mixed.source_cache_state), ("hit", "hit"))
+        bay = self.bay(mixed)
+        # The cached bay keeps its own SES and ownership facts; CAM/MPR from a
+        # different read cannot be tied to it, so they are not read.
+        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da3", "da11"])
+        for row in bay.metrics["path_states"]:
+            self.assertIsNone(row["controller"])
+            self.assertIn("controller", row["not_read"])
+            self.assertIn("target", row["not_read"])
+            self.assertEqual(row["not_read_reasons"]["controller"], sas_fabric.PATH_EVIDENCE_REASON)
+        self.assertEqual(bay.metrics["mpr_devices"], [])
+        self.assertFalse([link for link in mixed.links if link.kind == "path-bay" and link.slot == 0])
+        self.assertNotIn(moved_address, json.dumps(bay.model_dump(mode="json")))
+        self.assertFalse([node.id for node in mixed.nodes if node.id.startswith("path:mpr2:")])
+        self.assertEqual(sum("not from the read" in warning for warning in mixed.warnings), 1)
+        bundle, snapshots, _known = service._sas_fabric_alias_observation()
+        observed = {node.id for node in service._observed_sas_fabric_nodes(bundle, snapshots)}
+        self.assertFalse([node for node in observed if node.startswith("path:mpr2:")])
+        # Coherent control: a forced rebuild from publication B.
+        coherent = await service.get_sas_fabric_snapshot(force_refresh=True)
+        self.assertEqual(ports(coherent), [("da3", "mpr0")])
+        self.assertEqual([row["member_device_name"] for row in self.bay(coherent).metrics["mpr_devices"]], ["da3"])
+
+    async def test_direct_cam_and_mpr_evidence_must_be_the_snapshot_build_read(self):
+        system, snapshot, outputs = await self.fixture()
+        moved = {**outputs, "camcontrol devlist -v": outputs["camcontrol devlist -v"].replace("on mpr1 bus", "on mpr2 bus")}
+        for coherent in (True, False):
+            with self.subTest(coherent=coherent):
+                fabric = self.build(system, snapshot, moved, coherent=coherent)
+                rows = self.bay(fabric).metrics["path_states"]
+                if coherent:
+                    self.assertEqual({row["controller"] for row in rows}, {"mpr0", "mpr2"})
+                    self.assertTrue(all("not_read" not in row for row in rows))
+                else:
+                    self.assertEqual([row["controller"] for row in rows], [None, None])
+                    self.assertTrue(all({"controller", "target"} <= set(row["not_read"]) for row in rows))
+                    self.assertEqual(self.bay(fabric).metrics["mpr_devices"], [])
+        # Unchanged evidence from a newer read is the same evidence.
+        same = self.build(system, snapshot, dict(outputs), coherent=False)
+        self.assertEqual({row["member_device_name"] for row in self.bay(same).metrics["mpr_devices"]}, {"da3", "da11"})
+
+    async def test_adapter_summary_units_count_against_the_controller_limit(self):
+        system, snapshot, outputs = await self.fixture()
+        limit = sas_fabric.MAX_FABRIC_CONTROLLERS
+        for units in (limit, limit + 1):
+            with self.subTest(units=units):
+                changed = {**outputs, "mprutil show adapters": "\n".join(
+                    f"/dev/mpr{unit} SAS3008 Synthetic 16.00.12.00" for unit in range(units)
+                )}
+                # The highest unit also reports its own expander and enclosure.
+                last = units - 1
+                for subcommand in ("adapter", "expanders", "enclosures", "devices"):
+                    changed[f"mprutil -u {last} show {subcommand}"] = outputs[f"mprutil -u 1 show {subcommand}"].replace("mpr1", f"mpr{last}")
+                fabric = self.build(system, snapshot, changed)
+                controller_ids = [node.id for node in fabric.nodes if node.kind == "controller"]
+                self.assertEqual(len(controller_ids), limit)
+                self.assertEqual(len(fabric.controllers), limit)
+                limited = [warning for warning in fabric.warnings if "controller limit" in warning]
+                payload = fabric.model_dump_json()
+                read = fabric.raw["controller_read"]
+                if units == limit:
+                    self.assertFalse(limited)
+                    self.assertNotIn("units_over_controller_limit", read)
+                    self.assertIn(f"mpr{limit - 1}", {row["controller"] for row in read["units"]})
+                else:
+                    self.assertEqual(len(limited), 1)
+                    self.assertIn("1 ", limited[0])
+                    omitted = f"controller:mpr{limit}"
+                    # The graph leaves it out everywhere and says how many.
+                    self.assertNotIn(omitted, controller_ids)
+                    self.assertNotIn(omitted, {controller["id"] for controller in fabric.controllers})
+                    self.assertFalse([link.id for link in fabric.links if omitted in (link.source, link.target)])
+                    self.assertFalse([trace.id for trace in fabric.traces if omitted in trace.node_ids])
+                    self.assertFalse([node.id for node in fabric.nodes if node.controller_id == omitted])
+                    self.assertNotIn(omitted, payload)
+                    self.assertEqual(read.get("units_over_controller_limit"), 1)
+                    self.assertEqual(read["counts"]["controllers"], "partial")
+                    # Collection results still report the unit as read.
+                    self.assertIn({"controller": f"mpr{limit}", "result": "read"}, read["units"])
+                # The bay's own paths keep their controllers inside the limit.
+                self.assertEqual(
+                    {row["controller"] for row in self.bay(fabric).metrics["path_states"]}, {"mpr0", "mpr1"},
+                )
+                self.assertTrue({link.target for link in fabric.links if link.kind == "host-controller"} <= set(controller_ids))
+
+    async def test_four_direct_paths_with_partial_mpr_rows_keep_their_own_rows(self):
+        system, snapshot, outputs = await self.fixture()
+        changed = snapshot.model_copy(deep=True)
+        changed.slots[0].raw_status["device_names"] = ["da3", "da4", "da11", "da12"]
+        cam = "\n".join(
+            f"scbus{unit} on mpr{unit} bus 0:\n"
+            + "\n".join(
+                f"<ExampleCo SAME-MODEL 0001> at scbus{unit} target {target} lun 0 ({device},pass{target})"
+                for device, target in devices
+            )
+            for unit, devices in enumerate(((("da3", 4), ("da4", 5)), (("da11", 12), ("da12", 13))))
+        )
+        fabric = self.build(system, changed, {**outputs, "camcontrol devlist -v": cam})
+        bay = self.bay(fabric)
+        # Mirrored by the rendered Disk Path test in core_fabric_direct_paths.test.js.
+        self.assertEqual(bay.metrics["path_states"], [
+            {"controller": "mpr0", "state": "standby", "device_name": "da3"},
+            {"controller": "mpr0", "state": "standby", "device_name": "da4"},
+            {"controller": "mpr1", "state": "active", "device_name": "da11"},
+            {"controller": "mpr1", "state": "standby", "device_name": "da12"},
+        ])
+        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da3", "da11"])
+
+    async def test_same_disk_alias_listed_by_ses_is_an_alternate_path(self):
+        alias_disk = {"name": "da11", "devname": "da3", "serial": "SANITIZED-DIRECT-DISK"}
+        system, snapshot, outputs = await self.fixture(pool_device="da11", api_disk=alias_disk)
+        ownership = snapshot_fabric_disk_ownership(snapshot)
+        self.assertEqual(ownership.owners["da3"], ownership.owners["da11"])
+        self.assertEqual(snapshot.slots[0].raw_status.get("pool_device_name"), "da11")
+        bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual(
+            {(row["device_name"], row["controller"], row["state"]) for row in bay.metrics["path_states"]},
+            {("da3", "mpr0", "standby"), ("da11", "mpr1", "active")},
+        )
+        self.assertEqual({row["member_device_name"] for row in bay.metrics["mpr_devices"]}, {"da3", "da11"})
+        # Another bay's claim still wins over the alias.
+        own = snapshot.slots[0].device_name
+        alias = ({"da3", "da11"} - {own}).pop()
+        claimed = snapshot.model_copy(deep=True)
+        claimed.slots[1].raw_status["device_names"] = [alias]
+        bay = self.bay(self.build(system, claimed, outputs))
+        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], [own])
+        # A later, independent API owner of the alias wins too (last writer).
+        independent = snapshot.model_copy()
+        attach_fabric_disk_ownership(independent, fabric_disk_ownership([{"da3", "da11"}, {alias}]))
+        bay = self.bay(self.build(system, independent, outputs))
+        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], [own])
 
     async def test_mixed_cam_controllers_keep_existing_multipath_links(self):
         system, _snapshot, _outputs = await self.fixture()

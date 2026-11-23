@@ -502,16 +502,36 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         mpr_sysctl_locations,
     )
     cam_devices = parse_camcontrol_devlist(normalized_outputs.get("camcontrol devlist -v", ""))
-    # Only the summary's admitted units, inside the unit bound.
-    unit_controller_names = (
+    # Only the summary's admitted units, inside the unit bound, and inside the
+    # build's controller limit: units past it are left out everywhere below.
+    unit_controller_names, omitted_units = _budget_unit_controllers(
         {f"mpr{unit}" for unit in discover_mpr_units_from_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))}
         | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
+    # The graph draws only admitted units; collection results below still
+    # report every unit that was read.
+    graph_unit_data = {
+        unit: payload for unit, payload in unit_data.items() if _mpr_controller_name_for_unit(unit) in unit_controller_names
+    }
+    if omitted_units:
+        fabric_warnings.append(
+            f"Storage Fabric controller limit reached: {len(omitted_units)} controller "
+            f"{'unit' if len(omitted_units) == 1 else 'units'} beyond {MAX_FABRIC_CONTROLLERS} "
+            f"{'was' if len(omitted_units) == 1 else 'were'} not read."
+        )
+    ownership = snapshot_fabric_disk_ownership(snapshot)
     members_by_slot = _core_path_members(
-        snapshot.slots, cam_devices, snapshot_fabric_disk_ownership(snapshot), known_controllers=unit_controller_names,
+        snapshot.slots, cam_devices, ownership, known_controllers=unit_controller_names,
+        path_evidence_read=_snapshot_path_evidence_read(ownership, normalized_outputs),
     )
     if members_by_slot.limit_reached:
         fabric_warnings.append(members_by_slot.limit_warning())
+    if members_by_slot.evidence_unread_bays:
+        fabric_warnings.append(
+            f"Storage Fabric direct path controllers and MPR rows were not read for "
+            f"{len(members_by_slot.evidence_unread_bays)} bays: the CAM and mprutil replies are not from the read "
+            "their bay view was built from."
+        )
     if members_by_slot.ownership_limited:
         fabric_warnings.append(
             f"Storage Fabric alternate paths were not read for {len(members_by_slot.ownership_limited)} bays: "
@@ -523,13 +543,13 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
     controllers: list[dict[str, Any]] = []
     for controller_name in controller_names:
         # The unnumbered fallback has no observed unit; never derive one from its name.
-        legacy_unit = controller_name == _LEGACY_MPR_CONTROLLER_NAME and _LEGACY_MPR_UNIT_KEY in unit_data
+        legacy_unit = controller_name == _LEGACY_MPR_CONTROLLER_NAME and _LEGACY_MPR_UNIT_KEY in graph_unit_data
         unit = None if legacy_unit else _mpr_unit_from_text(controller_name)
         summary_row = next((row for row in adapter_summary if row.get("unit") == unit), None) if unit is not None else None
         if legacy_unit:
-            parsed_unit = unit_data[_LEGACY_MPR_UNIT_KEY]
+            parsed_unit = graph_unit_data[_LEGACY_MPR_UNIT_KEY]
         else:
-            parsed_unit = unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
+            parsed_unit = graph_unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
         detail = parsed_unit.get("adapter_detail", {}) if parsed_unit else {}
         iocfacts = parsed_unit.get("iocfacts", {}) if parsed_unit else {}
         pci_info = pci_inventory.get(controller_name, {})
@@ -652,11 +672,11 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         nodes=nodes,
         links=links,
         controllers=controllers,
-        unit_data=unit_data,
+        unit_data=graph_unit_data,
         selected_enclosure_keys=selected_enclosure_keys,
     )
     mpr_trace_index = _build_mpr_trace_index(
-        unit_data=unit_data,
+        unit_data=graph_unit_data,
         controllers=controllers,
         diagnostics=mpr_kernel_diagnostics,
     )
@@ -914,7 +934,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             unit_data,
             unit_reads,
             # Summary rows and units that were not read leave the counts short too.
-            rejected_units=rejected_units + rejected_summary_rows + summary_units_over_limit,
+            rejected_units=rejected_units + rejected_summary_rows + summary_units_over_limit + len(omitted_units),
             controllers_seen=bool(controller_names),
             paths_seen=bool(paths),
         ),
@@ -926,6 +946,8 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         # past the summary's unit bound: counts only, never the text.
         "rejected_summary_rows": rejected_summary_rows,
         "summary_units_over_limit": summary_units_over_limit,
+        # Read units the graph left out at the controller limit: a count only.
+        **({"units_over_controller_limit": len(omitted_units)} if omitted_units else {}),
         "unread_phy_tables": sum(unread_tables.values()),
     }
     # Without controller data the bays, pools and vdevs the inventory already
@@ -2209,9 +2231,34 @@ _FABRIC_OWNERSHIP_ATTRIBUTE = "_fabric_disk_ownership"
 class FabricDiskOwnership:
     owners: Mapping[str, int] | None
     over_limit: bool = False
+    # Digest of the CAM and mprutil replies the snapshot was built from. Direct
+    # path controller, target and MPR rows are read only from those replies.
+    path_evidence: str | None = None
 
 
-def fabric_disk_ownership(disk_keys: Iterable[Iterable[str]]) -> FabricDiskOwnership:
+# Direct-path CAM/MPR evidence from another read than the bay snapshot's own.
+PATH_EVIDENCE_REASON = "path evidence not from this bay view's read"
+
+
+def fabric_path_evidence(ssh_outputs: Mapping[str, str | None]) -> str:
+    """Digest of the CAM and mprutil replies that direct paths are read from."""
+    digest = hashlib.sha256()
+    for command, output in sorted(
+        (canonicalize_ssh_command(command), output)
+        for command, output in ssh_outputs.items()
+        if output is not None
+    ):
+        if command == "camcontrol devlist -v" or command.startswith("mprutil "):
+            for part in (command, output):
+                encoded = part.encode("utf-8", "surrogatepass")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+    return digest.hexdigest()
+
+
+def fabric_disk_ownership(
+    disk_keys: Iterable[Iterable[str]], *, path_evidence: str | None = None,
+) -> FabricDiskOwnership:
     """Index each disk's `daN` names by disk ordinal; stop at the limit."""
     owners: dict[str, int] = {}
     for ordinal, keys in enumerate(disk_keys):
@@ -2222,9 +2269,9 @@ def fabric_disk_ownership(disk_keys: Iterable[Iterable[str]]) -> FabricDiskOwner
             if not _CORE_DA_DEVICE.fullmatch(name):
                 continue
             if name not in owners and len(owners) >= MAX_FABRIC_OWNERSHIP_DEVICE_KEYS:
-                return FabricDiskOwnership(owners=None, over_limit=True)
+                return FabricDiskOwnership(owners=None, over_limit=True, path_evidence=path_evidence)
             owners[name] = ordinal  # last writer wins, as in `_index_disk_records`
-    return FabricDiskOwnership(owners=owners)
+    return FabricDiskOwnership(owners=owners, path_evidence=path_evidence)
 
 
 def attach_fabric_disk_ownership(snapshot: InventorySnapshot, ownership: FabricDiskOwnership) -> None:
@@ -2253,6 +2300,19 @@ def _core_controller_name(value: Any) -> str | None:
     return value if _CORE_CONTROLLER_NAME.fullmatch(value) else None
 
 
+def _snapshot_path_evidence_read(ownership: FabricDiskOwnership | None, normalized_outputs: Mapping[str, str]) -> bool:
+    """Whether these CAM/mprutil replies are the ones the bay snapshot was built from."""
+    if ownership is None or ownership.path_evidence is None:
+        return False
+    return ownership.path_evidence == fabric_path_evidence(normalized_outputs)
+
+
+def _budget_unit_controllers(names: set[str]) -> tuple[set[str], set[str]]:
+    """Admit mprutil units lowest first up to the controller limit; return (admitted, omitted)."""
+    ordered = sorted(names, key=lambda name: -1 if name == _LEGACY_MPR_CONTROLLER_NAME else int(name[3:]))
+    return set(ordered[:MAX_FABRIC_CONTROLLERS]), set(ordered[MAX_FABRIC_CONTROLLERS:])
+
+
 class _CorePathMembers(dict[int, list[MultipathMember]]):
     """Path members by bay, after the guard and the projection limits.
 
@@ -2266,6 +2326,9 @@ class _CorePathMembers(dict[int, list[MultipathMember]]):
         self.not_read_reasons: dict[int, str] = {}
         self.refused: set[int] = set()
         self.ownership_limited: set[int] = set()
+        # Direct members whose CAM/MPR evidence is from another read.
+        self.evidence_unread: set[int] = set()
+        self.evidence_unread_bays: set[int] = set()
 
     @property
     def limit_reached(self) -> bool:
@@ -2334,7 +2397,7 @@ def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) ->
 
 def _core_path_members(
     slots: list[SlotView], cam_devices: Any, ownership: FabricDiskOwnership | None = None,
-    *, known_controllers: set[str] | frozenset[str] = frozenset(),
+    *, known_controllers: set[str] | frozenset[str] = frozenset(), path_evidence_read: bool = True,
 ) -> _CorePathMembers:
     """Use the inventory's shared-bay rule when no geom lists the disk's paths.
 
@@ -2392,13 +2455,18 @@ def _core_path_members(
         # The helper requires this bay to name the disk's own path, and rejects
         # peers another disk owns. It is also used by the enclosure view (#902).
         api_owner = api_owners.get(own.lower())
-        peers = set(bay_peer_devices(raw, {own.lower()}, owners, slot)).intersection(
-            bay_peer_devices(raw, set(api_owner), api_owners, api_owner)
-        ) if api_owner is not None else set()
         listed = list(dict.fromkeys(
             name for value in names if isinstance(value, str)
             if (name := normalize_device_name(value)) and _CORE_DA_DEVICE.fullmatch(name)
         ))
+        # The API disk's own other `daN` name (a proven alias of this disk) is
+        # a path as well as a name no API disk owns. Both must still be
+        # unclaimed by every other rendered bay.
+        api_peers = {
+            *bay_peer_devices(raw, set(api_owner), api_owners, api_owner),
+            *(name for name in listed if name != own and name.lower() in api_owner),
+        } if api_owner is not None else set()
+        peers = set(bay_peer_devices(raw, {own.lower()}, owners, slot)).intersection(api_peers)
         if own not in listed:
             continue
         if ownership is not None and ownership.over_limit and len(listed) > 1:
@@ -2411,11 +2479,15 @@ def _core_path_members(
         for name in listed:
             if name != own and name not in peers:
                 continue
-            members.append(MultipathMember(
+            member = MultipathMember(
                 device_name=name,
-                controller_label=_core_controller_name(cam_devices.controllers.get(name.lower())),
+                controller_label=_core_controller_name(cam_devices.controllers.get(name.lower())) if path_evidence_read else None,
                 state="unknown" if in_use is None else "active" if name == in_use else "standby",
-            ))
+            )
+            if not path_evidence_read:
+                result.evidence_unread.add(id(member))
+                result.evidence_unread_bays.add(slot.slot)
+            members.append(member)
         if len(members) > MAX_FABRIC_PATH_MEMBERS_PER_BAY:
             # Keep the disk's own path and the path in use inside the limit.
             members.sort(key=lambda member: member.device_name not in {own, in_use})
@@ -2429,6 +2501,10 @@ def _path_row_not_read(
     limited = members.row_not_read(member)
     if not direct:
         return limited
+    if id(member) in members.evidence_unread:
+        row = _direct_member_not_read(member, None)
+        row["not_read_reasons"] = {field: PATH_EVIDENCE_REASON for field in ("controller", "target")}
+        return row
     row = _direct_member_not_read(member, cam_devices)
     if "not_read_reasons" in limited:
         row["not_read_reasons"] = limited["not_read_reasons"]
@@ -2439,7 +2515,7 @@ def _direct_member_not_read(member: MultipathMember, cam_devices: Any) -> dict[s
     not_read = ["state"] if member.state == "unknown" else []
     if not member.controller_label:
         not_read.append("controller")
-    if _cam_member_target(cam_devices, member.controller_label or "", member.device_name) is None:
+    if cam_devices is None or _cam_member_target(cam_devices, member.controller_label or "", member.device_name) is None:
         not_read.append("target")
     return {"not_read": not_read} if not_read else {}
 
