@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -36,12 +38,12 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
 from types import MappingProxyType
-from typing import Any
+from typing import Any, BinaryIO
 
 import yaml
 
@@ -75,6 +77,7 @@ from history_service.backup_archive.settings import PROVIDERS
 from history_service.backup_archive.transport import (
     ArchiveDownloadTooLargeError,
     ArchivePublicationUncertainError,
+    DescriptorDownloadDestination,
     LocalDirectoryTarget,
     StoredObject,
     open_target,
@@ -100,6 +103,22 @@ KEEPER_SCRATCH_PREFIX = "keeper-check-"
 # (size, sha256), or None for a read that did not complete.
 _LocalReads = dict[str, tuple[int, str] | None]
 KEEPER_SCRATCH_HEADROOM_BYTES = 64 * 1024 * 1024
+# Verify and download read a remote copy into a ``backup-fetch-*`` directory
+# under the state directory (#1290). One whose clean-up failed is reclaimed by
+# a later fetch once it is shown to be this account's, unused and of the
+# expected layout; anything else is left in place, and a fetch is refused while
+# this many such directories (each may hold a full copy) are left.
+FETCH_WORKSPACE_PREFIX = "backup-fetch-"
+MAX_ABANDONED_FETCH_WORKSPACES = 4
+_FETCH_WORKSPACE_FILE = "archive"
+# Made by the fetch that created the workspace, before anyone else can look at
+# it: an empty directory proves nothing about who made it, this file does.
+_FETCH_WORKSPACE_MARKER = "fetch-workspace"
+_FETCH_WORKSPACE_QUARANTINE_PREFIX = f"{FETCH_WORKSPACE_PREFIX}quarantine-"
+# Every process sharing the state folder holds this file lock while it makes
+# and locks a fetch workspace, and while it removes one, so a scan never sees a
+# workspace its creator has not locked yet and nothing is swapped mid-removal.
+_FETCH_STATE_LOCK_FILE = ".backup-fetch.lock"
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
@@ -118,6 +137,14 @@ class ArtifactNotFoundError(LookupError):
 
 class ArchiveIntegrityError(RuntimeError):
     """A copy's bytes do not match its catalogued size and SHA-256."""
+
+
+class FetchWorkspaceError(RuntimeError):
+    """A remote copy cannot be fetched into the state folder safely (#1290)."""
+
+
+class FetchWorkspaceLimitError(FetchWorkspaceError):
+    """Too many abandoned fetch workspaces are left to make another copy (#1290)."""
 
 
 def _utcnow() -> datetime:
@@ -1659,23 +1686,71 @@ class BackupScheduler:
         target = self.policy.target(record.location)
         if target is None:
             raise ArtifactNotFoundError("The target holding this copy is no longer configured.")
-        workspace = Path(tempfile.mkdtemp(prefix="backup-fetch-", dir=self.paths.state_dir))
+        workspace = self._new_fetch_workspace()
         try:
-            local = workspace / "archive"
+            destination = DescriptorDownloadDestination(
+                workspace.descriptor,
+                _FETCH_WORKSPACE_FILE,
+            )
+            local = workspace.path / _FETCH_WORKSPACE_FILE
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local, limit=record.size + 1)
+                size, digest = remote.get(record.name, destination, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
             yield record, local
         finally:
             try:
-                for child in workspace.iterdir():
-                    child.unlink(missing_ok=True)
-                workspace.rmdir()
-            except OSError as exc:
+                with _state_folder_lock(workspace.root):
+                    _remove_fetch_workspace(workspace.root, workspace.name, workspace.descriptor)
+            except (OSError, FetchWorkspaceError) as exc:
                 # Never let clean-up replace the result of the read and comparison (#1202).
+                # A later fetch reclaims the directory once this lock is gone (#1290).
                 logger.error("Backup fetch workspace could not be removed (%s).", type(exc).__name__)
+            finally:
+                os.close(workspace.descriptor)
+                os.close(workspace.root)
+
+    def _new_fetch_workspace(self) -> _FetchWorkspace:
+        """Reclaim abandoned fetch workspaces, then make and lock a new one (#1290).
+
+        The state folder is opened once and everything below happens relative
+        to that descriptor, under the state-folder file lock. The returned
+        workspace descriptor holds an exclusive ``flock`` on the new directory
+        for as long as the fetch uses it; the lock ends with the descriptor or
+        the process, which is how a later scan tells a live fetch from
+        abandoned work. Refuses with ``FetchWorkspaceLimitError``, before any
+        copy is made, while ``MAX_ABANDONED_FETCH_WORKSPACES`` or more
+        abandoned directories could not be reclaimed.
+        """
+
+        root = _open_state_folder(self.paths.state_dir)
+        try:
+            with _state_folder_lock(root):
+                found = _reclaim_fetch_workspaces_in(root, owner=os.geteuid())
+                left = sum(found.left.values())
+                if found.reclaimed or left:
+                    reasons = ", ".join(f"{reason}={count}" for reason, count in sorted(found.left.items())) or "none"
+                    logger.warning(
+                        "Backup fetch workspaces: reclaimed %d, left %d in place (%s), %d in use.",
+                        found.reclaimed, left, reasons, found.in_use,
+                    )
+                if left >= MAX_ABANDONED_FETCH_WORKSPACES:
+                    raise FetchWorkspaceLimitError(
+                        f"Backup fetch refused: {left} abandoned fetch workspaces could not be reclaimed "
+                        f"(limit {MAX_ABANDONED_FETCH_WORKSPACES}). The scheduler log names the reasons; "
+                        "remove them from the scheduler state folder."
+                    )
+                name, held = _make_fetch_workspace(root)
+        except BaseException:
+            os.close(root)
+            raise
+        return _FetchWorkspace(
+            root=root,
+            name=name,
+            descriptor=held,
+            path=self.paths.state_dir / name,
+        )
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
@@ -1844,20 +1919,258 @@ def _remove_stale_keeper_scratch(state_dir: Path) -> None:
     Keeper checks run one at a time under the job reservation and remove their
     own scratch directory, so any directory found here was left by a killed or
     interrupted run. Only plain directories owned by this process's user are
-    removed; symlinks and other owners are left alone.
+    removed; symlinks and other owners are left alone. The state folder is
+    opened once and every look and removal is relative to that descriptor, so
+    a path swapped later cannot point the removal elsewhere (#1290).
     """
 
     owner = os.geteuid() if hasattr(os, "geteuid") else None
-    for entry in Path(state_dir).iterdir():
-        if not entry.name.startswith(KEEPER_SCRATCH_PREFIX):
+    root = os.open(state_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        with os.scandir(root) as entries:
+            names = [entry.name for entry in entries if entry.name.startswith(KEEPER_SCRATCH_PREFIX)]
+        for name in names:
+            try:
+                metadata = os.stat(name, dir_fd=root, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode) or (owner is not None and metadata.st_uid != owner):
+                continue
+            shutil.rmtree(name, dir_fd=root)
+    finally:
+        os.close(root)
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+_RENAME_NOREPLACE = 1
+_STATE_FOLDER_REFUSED = (
+    "Backup fetch refused: the scheduler state folder is not a private directory of the scheduler account "
+    "(a real directory, not a link, owned by it and not writable by others)."
+)
+
+
+@dataclass
+class _FetchWorkspace:
+    """One live fetch's workspace, held through descriptors (#1290)."""
+
+    root: int  # the state folder, opened once
+    name: str
+    descriptor: int  # the workspace directory; holds its ``flock`` while the fetch runs
+    path: Path  # for callers after descriptor-relative destination creation
+
+
+@dataclass
+class _FetchReclaim:
+    """What one scan of ``backup-fetch-*`` entries did (#1290)."""
+
+    reclaimed: int = 0
+    in_use: int = 0
+    left: dict[str, int] = field(default_factory=dict)  # abandoned but kept, by reason
+
+
+class _WorkspaceMoved(OSError):
+    """The workspace name no longer names the directory that was checked."""
+
+
+def _open_state_folder(state_dir: Path) -> int:
+    """Open the state folder once, without following a link, and check it is private.
+
+    Every later look, creation and removal of fetch workspaces is relative to
+    the returned descriptor, so swapping the folder (or any folder above it)
+    for a link afterwards cannot move them anywhere else.
+    """
+
+    try:
+        root = os.open(state_dir, _DIRECTORY_OPEN_FLAGS)
+    except OSError as exc:
+        raise FetchWorkspaceError(_STATE_FOLDER_REFUSED) from exc
+    try:
+        metadata = os.fstat(root)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise FetchWorkspaceError(_STATE_FOLDER_REFUSED)
+    except BaseException:
+        os.close(root)
+        raise
+    return root
+
+
+@contextlib.contextmanager
+def _state_folder_lock(root: int) -> Iterator[None]:
+    """Hold the state folder's fetch lock, shared by every process using the folder."""
+
+    lock = os.open(
+        _FETCH_STATE_LOCK_FILE,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+        dir_fd=root,
+    )
+    try:
+        metadata = os.fstat(lock)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise FetchWorkspaceError(_STATE_FOLDER_REFUSED)
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the descriptor closes
+        yield
+    finally:
+        os.close(lock)
+
+
+def _make_fetch_workspace(root: int) -> tuple[str, int]:
+    """Make, lock and mark a new workspace in ``root``; call with the state-folder lock held."""
+
+    for _ in range(100):
+        name = f"{FETCH_WORKSPACE_PREFIX}{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=root)
+        except FileExistsError:
             continue
         try:
-            metadata = os.lstat(entry)
+            held = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=root)
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                os.close(os.open(_FETCH_WORKSPACE_MARKER, marker_flags | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=held))
+            except BaseException:
+                os.close(held)
+                raise
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.rmdir(name, dir_fd=root)  # still empty: the marker is the last step
+            raise
+        return name, held
+    raise FileExistsError(errno.EEXIST, "No unused fetch workspace name was found.")
+
+
+def _rename_noreplace_in(root: int, source: str, target: str) -> None:
+    """Rename one entry inside ``root`` without replacing another name."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(root, os.fsencode(source), root, os.fsencode(target), _RENAME_NOREPLACE) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source, target)
+
+
+def _remove_fetch_workspace(root: int, name: str, descriptor: int) -> None:
+    """Empty, detach and remove the checked workspace through pinned names.
+
+    Call with the state-folder lock held, which every scheduler process takes
+    before it makes or removes a workspace. A process that ignores the lock can
+    still replace ``name`` after the identity check, so removal first renames it
+    without replacement to an unpredictable quarantine name under ``root``.
+    The quarantine entry must still be the opened directory before its final
+    ``rmdir``. A swapped-in directory is retained under that name, never removed.
+    """
+
+    checked = os.fstat(descriptor)
+    for child in (_FETCH_WORKSPACE_FILE, _FETCH_WORKSPACE_MARKER):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(child, dir_fd=descriptor)
+    current = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (checked.st_dev, checked.st_ino):
+        raise _WorkspaceMoved(errno.ESTALE, "The workspace name no longer names the checked directory.")
+    for _ in range(100):
+        quarantine = f"{_FETCH_WORKSPACE_QUARANTINE_PREFIX}{secrets.token_hex(8)}"
+        try:
+            _rename_noreplace_in(root, name, quarantine)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(errno.EEXIST, "No unused fetch workspace quarantine name was found.")
+    detached = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+    if (detached.st_dev, detached.st_ino) != (checked.st_dev, checked.st_ino):
+        raise _WorkspaceMoved(errno.ESTALE, "The detached workspace is not the checked directory.")
+    os.rmdir(quarantine, dir_fd=root)
+
+
+def _reclaim_fetch_workspaces(state_dir: Path, *, owner: int | None) -> _FetchReclaim:
+    """Open the state folder, take its lock and reclaim abandoned workspaces (#1290)."""
+
+    root = _open_state_folder(state_dir)
+    try:
+        with _state_folder_lock(root):
+            return _reclaim_fetch_workspaces_in(root, owner=owner)
+    finally:
+        os.close(root)
+
+
+def _reclaim_fetch_workspaces_in(root: int, *, owner: int | None) -> _FetchReclaim:
+    """Remove abandoned ``backup-fetch-*`` directories whose state is established (#1290).
+
+    Call with the state-folder lock held. Unlike keeper checks, fetches run
+    concurrently, so a directory is removed only when it is a plain directory
+    owned by ``owner``, its lock can be taken (no live fetch holds it) and it
+    holds nothing but the fetched file and the creator's marker, at least one
+    of them. Every other entry with the prefix is left untouched and counted
+    by reason; in-use directories are counted separately.
+    """
+
+    result = _FetchReclaim()
+    with os.scandir(root) as entries:
+        names = [entry.name for entry in entries if entry.name.startswith(FETCH_WORKSPACE_PREFIX)]
+    for name in names:
+        outcome = _reclaim_fetch_workspace(root, name, owner)
+        if outcome == "reclaimed":
+            result.reclaimed += 1
+        elif outcome == "in-use":
+            result.in_use += 1
+        elif outcome is not None:
+            result.left[outcome] = result.left.get(outcome, 0) + 1
+    return result
+
+
+def _reclaim_fetch_workspace(root: int, name: str, owner: int | None) -> str | None:
+    try:
+        descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=root)
+    except FileNotFoundError:
+        return None  # removed meanwhile
+    except OSError as exc:
+        return "not-a-directory" if exc.errno in (errno.ELOOP, errno.ENOTDIR) else "unreadable"
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "not-a-directory"
+        if owner is not None and metadata.st_uid != owner:
+            return "other-owner"
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "in-use"
+        try:
+            names = os.listdir(descriptor)
+            # An empty directory proves nothing about who made it (#1290).
+            if not names or any(
+                child not in (_FETCH_WORKSPACE_FILE, _FETCH_WORKSPACE_MARKER)
+                or not stat.S_ISREG(os.stat(child, dir_fd=descriptor, follow_symlinks=False).st_mode)
+                for child in names
+            ):
+                return "unrecognised-layout"
+            _remove_fetch_workspace(root, name, descriptor)
         except FileNotFoundError:
-            continue
-        if not stat.S_ISDIR(metadata.st_mode) or (owner is not None and metadata.st_uid != owner):
-            continue
-        shutil.rmtree(entry)
+            return None
+        except _WorkspaceMoved:
+            return "unrecognised-layout"  # the name now points somewhere else
+        except OSError:
+            return "removal-failed"
+        return "reclaimed"
+    finally:
+        os.close(descriptor)
 
 
 def _scratch_free_bytes(path: Path) -> int:
@@ -1926,13 +2239,26 @@ class ConfigFileSnapshot(dict[str, Any]):
         self.files = MappingProxyType(dict(files))
 
 
-def snapshot_config_files(paths: Mapping[str, Path]) -> ConfigFileSnapshot:
+_JSON_STATE_SNAPSHOT_KEYS = frozenset({"mappings", "sas_fabric_aliases"})
+
+
+def snapshot_config_files(
+    paths: Mapping[str, Path],
+    *,
+    read_json_state: Callable[[BinaryIO, str], bytes],
+) -> ConfigFileSnapshot:
     """Capture once for both hashing and export; missing documents remain hashed."""
 
     snapshot: dict[str, Any] = {}
     files: dict[Path, bytes | None] = {}
     for logical, path in paths.items():
-        content = path.read_bytes() if path.exists() else None
+        if not path.exists():
+            content = None
+        elif logical in _JSON_STATE_SNAPSHOT_KEYS:
+            with path.open("rb") as source:
+                content = read_json_state(source, path.name)
+        else:
+            content = path.read_bytes()
         files[path.absolute()] = content
         if content is None:
             snapshot[logical] = None

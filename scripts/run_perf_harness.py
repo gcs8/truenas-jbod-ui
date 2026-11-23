@@ -4,24 +4,151 @@ import argparse
 import base64
 import concurrent.futures
 import csv
+import io
 import json
 import math
 import re
 import statistics
+import os
 import subprocess
 import stat
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from pathlib import Path
-from typing import Any, Callable
-from urllib.error import HTTPError
+from typing import Any, Callable, cast
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener, urlopen as _urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BUSY_RETRY_ATTEMPTS = 3
-BUSY_RETRY_MAX_SECONDS = 5
+# Allow the application's 300-second background refresh plus scheduling margin.
+# This remains a finite tooling budget, not an application deadline change.
+DEFAULT_READINESS_TIMEOUT_SECONDS = 330.0
+READINESS_TIMEOUT_ENV = "PERF_HARNESS_READINESS_TIMEOUT_SECONDS"
+ERROR_BODY_LIMIT = 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
+_DEFAULT_HTTPS_CONTEXT = getattr(HTTPSHandler(), "_context")
+SAFE_GET_PATHS = frozenset({
+    "/api/inventory", "/api/storage-views", "/api/mappings/export",
+    "/api/history/status", "/healthz",
+})
+SAFE_POST_PATHS = frozenset({
+    "/api/export/enclosure-snapshot/estimate", "/api/slots/smart-batch",
+})
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Apply one absolute budget to every receive, including HTTP framing."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._deadline = deadline
+        self._source: Any = None
+        self._source = sock.makefile("rb", buffering=0)
+
+    def readable(self) -> bool:
+        return not self.closed
+
+    def readinto(self, buffer: Any) -> int | None:
+        if self.closed:
+            raise ValueError("read from closed response")
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("readiness deadline exceeded")
+        self._sock.settimeout(remaining)
+        count = self._source.readinto(memoryview(buffer)[:RESPONSE_READ_CHUNK_SIZE])
+        if time.monotonic() >= self._deadline:
+            raise TimeoutError("readiness deadline exceeded")
+        return count
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                if self._source is not None:
+                    self._source.close()
+            finally:
+                super().close()
+
+
+class _DeadlineSocket:
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        if mode != "rb":
+            raise ValueError("response reader requires binary read mode")
+        reader = _DeadlineSocketReader(self._sock, self._deadline)
+        try:
+            return io.BufferedReader(reader, buffer_size=RESPONSE_READ_CHUNK_SIZE)
+        except BaseException:
+            reader.close()
+            raise
+
+
+def urlopen(request: Request, *, timeout: float) -> Any:
+    # This attribute is local request metadata, never an HTTP header. Keeping
+    # the budget in this opener also preserves it across urllib redirects.
+    deadline = getattr(request, "_readiness_deadline", None)
+    if deadline is None:
+        return _urlopen(request, timeout=timeout)
+
+    def connection_factory(connection_type: Any) -> Any:
+        def connect(host: str, **kwargs: Any) -> Any:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("readiness deadline exceeded")
+            kwargs["timeout"] = min(kwargs["timeout"], remaining)
+            connection = connection_type(host, **kwargs)
+            connection.response_class = lambda sock, *args, **options: HTTPResponse(
+                cast(Any, _DeadlineSocket(sock, deadline)), *args, **options,
+            )
+            return connection
+        return connect
+
+    class DeadlineHTTPHandler(HTTPHandler):
+        def http_open(self, req: Request) -> Any:
+            return self.do_open(connection_factory(HTTPConnection), req)
+
+    class DeadlineHTTPSHandler(HTTPSHandler):
+        def https_open(self, req: Request) -> Any:
+            return self.do_open(connection_factory(HTTPSConnection), req, context=_DEFAULT_HTTPS_CONTEXT)
+
+    # Retain urllib's proxy, redirect and error handlers and the default
+    # certificate-verifying HTTPS context; replace only response socket reads.
+    opener = build_opener(DeadlineHTTPHandler(), DeadlineHTTPSHandler(context=_DEFAULT_HTTPS_CONTEXT))
+    return opener.open(request, timeout=timeout)
+
+
+class ReadinessDeadlineExceeded(RuntimeError):
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(json.dumps(diagnostic, sort_keys=True))
+
+
+def _safe_retry_after(value: str) -> int | None:
+    # Never retain arbitrary header text or parse unbounded integers. A numeric
+    # delay of up to a day is sufficient for this bounded readiness client.
+    if re.fullmatch(r"[0-9]{1,5}", value) is None:
+        return None
+    seconds = int(value)
+    return seconds if seconds <= 86400 else None
+
+
+def _body_category(body: bytes) -> str:
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return "other"
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if detail == "The inventory is still refreshing. Try again in a moment.":
+        return "inventory_refreshing"
+    if detail == "No inventory snapshot is available yet: the first inventory read is still running. Try again in a moment.":
+        return "inventory_initializing"
+    return "other"
 
 
 @dataclass(slots=True)
@@ -54,6 +181,8 @@ class ApiResponse:
     data: dict[str, Any]
     headers: dict[str, str]
     response_bytes: int = 0
+    attempts: int = 1
+    busy_wait_ms: float = 0.0
 
 
 def _read_private_credential(path: Path, label: str) -> str:
@@ -83,7 +212,11 @@ class ApiClient:
         system_id: str | None = None,
         enclosure_id: str | None = None,
         authorization: str | None = None,
+        readiness_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
     ) -> None:
+        if not math.isfinite(readiness_timeout_seconds) or readiness_timeout_seconds <= 0:
+            raise ValueError("readiness timeout must be positive and finite")
+        self.readiness_timeout_seconds = readiness_timeout_seconds
         self.base_url = base_url.rstrip("/")
         self.system_id = system_id
         self.enclosure_id = enclosure_id
@@ -106,25 +239,91 @@ class ApiClient:
         query = urlencode({key: value for key, value in merged.items() if value is not None})
         return f"{self.base_url}{path}" + (f"?{query}" if query else "")
 
-    @staticmethod
-    def _open_json(request: Request) -> ApiResponse:
-        # The app answers 503 with Retry-After while another refresh owns the
-        # snapshot; a client that honours it is the documented contract.
-        for attempt in range(1, BUSY_RETRY_ATTEMPTS + 1):
+    def _open_json(self, request: Request, *, readiness_endpoint: str | None = None) -> ApiResponse:
+        started = time.monotonic()
+        deadline = started + self.readiness_timeout_seconds
+        attempts = 0
+        status = None
+        retry_after = None
+        category = "other"
+        busy_wait_ms = 0.0
+        setattr(request, "_readiness_deadline", deadline if readiness_endpoint is not None else None)
+
+        def exhausted() -> ReadinessDeadlineExceeded:
+            return ReadinessDeadlineExceeded({
+                "reason": "readiness_deadline_exceeded",
+                "endpoint": readiness_endpoint,
+                "status": status,
+                "attempts": attempts,
+                "retry_after_seconds": retry_after,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "body_category": category,
+            })
+
+        def translate_deadline_timeout(exc: TimeoutError | URLError) -> None:
+            nonlocal category
+            # Connection setup and response-body reads can expose either form.
+            # Preserve earlier timeouts and transport failures unrelated to time.
+            timed_out = isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError)
+            if timed_out and readiness_endpoint is not None and time.monotonic() >= deadline:
+                category = "transport_timeout"
+                raise exhausted() from None
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if readiness_endpoint is not None and remaining <= 0:
+                raise exhausted()
+            attempts += 1
             try:
-                with urlopen(request, timeout=120) as response:
+                with urlopen(request, timeout=min(120, remaining) if readiness_endpoint else 120) as response:
+                    status = response.status if isinstance(response, HTTPResponse) else None
                     body = response.read()
+                    if readiness_endpoint is not None and time.monotonic() >= deadline:
+                        status, category = 200, "other"
+                        raise exhausted()
                     return ApiResponse(
                         data=json.loads(body.decode("utf-8")),
                         headers={key.lower(): value for key, value in response.headers.items()},
                         response_bytes=len(body),
+                        attempts=attempts,
+                        busy_wait_ms=busy_wait_ms,
                     )
             except HTTPError as exc:
-                retry_after = (exc.headers or {}).get("Retry-After", "")
-                if exc.code != 503 or not retry_after.isdigit() or attempt == BUSY_RETRY_ATTEMPTS:
+                # All responses, including non-retryable writes, own a stream.
+                # Read only a bounded body and retain only an allowlisted category.
+                try:
+                    status = exc.code
+                    retry_after = _safe_retry_after((exc.headers or {}).get("Retry-After", ""))
+                    if readiness_endpoint is not None:
+                        try:
+                            category = _body_category(exc.read(ERROR_BODY_LIMIT))
+                        except (TimeoutError, URLError) as body_error:
+                            translate_deadline_timeout(body_error)
+                            raise
+                finally:
+                    exc.close()
+                if readiness_endpoint is None or status != 503 or retry_after is None:
                     raise
-                time.sleep(min(int(retry_after), BUSY_RETRY_MAX_SECONDS))
-        raise AssertionError("unreachable")
+                busy_wait_ms = (time.monotonic() - started) * 1000
+            except (TimeoutError, URLError) as exc:
+                translate_deadline_timeout(exc)
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise exhausted() from None
+            # A zero Retry-After must not create a tight polling loop. Never
+            # start another attempt or sleep beyond the remaining budget.
+            time.sleep(min(max(0.1, retry_after), remaining))
+            busy_wait_ms = (time.monotonic() - started) * 1000
+
+    @staticmethod
+    def _safe_read(path: str, values: dict[str, Any] | None, allowed: frozenset[str]) -> str | None:
+        # Force parameters on other reads and read-only POSTs still forbid
+        # replay. Only literal endpoints qualify for bounded diagnostics.
+        values = values or {}
+        if path not in allowed or any(values.get(key) not in (None, False, "false", "0") for key in ("force", "force_refresh")):
+            return None
+        return path
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.get_json_with_headers(path, params=params).data
@@ -135,7 +334,10 @@ class ApiClient:
             method="GET",
             headers=self._headers(),
         )
-        return self._open_json(request)
+        # A busy forced inventory GET is safe to re-issue, unlike a mutation.
+        # Keep the original forced request and its single readiness deadline.
+        endpoint = path if path == "/api/inventory" else self._safe_read(path, params, SAFE_GET_PATHS)
+        return self._open_json(request, readiness_endpoint=endpoint)
 
     def post_json(self, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.post_json_with_headers(path, payload, params=params).data
@@ -153,7 +355,9 @@ class ApiClient:
             method="POST",
             headers=self._headers(content_type="application/json"),
         )
-        return self._open_json(request)
+        safe_payload = self._safe_read(path, payload, SAFE_POST_PATHS)
+        safe_params = self._safe_read(path, params, SAFE_POST_PATHS)
+        return self._open_json(request, readiness_endpoint=safe_payload if safe_params else None)
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -260,11 +464,13 @@ def parse_server_timing(header_value: str | None) -> dict[str, float]:
 def build_request_metrics(response: ApiResponse) -> RequestMetrics:
     stage_totals = parse_server_timing(response.headers.get("server-timing"))
     stage_totals.pop("total", None)
+    metadata = extract_payload_metadata(response.data)
+    metadata.update(busy_replies=response.attempts - 1, busy_wait_ms=response.busy_wait_ms)
     return RequestMetrics(
         stage_totals_ms=stage_totals,
-        request_count=1,
+        request_count=response.attempts,
         response_bytes=response.response_bytes,
-        metadata_counts=extract_payload_metadata(response.data),
+        metadata_counts=metadata,
     )
 
 
@@ -291,7 +497,7 @@ def extract_payload_metadata(payload: Any) -> dict[str, float]:
     return metadata
 
 
-def merge_request_metrics(*metrics: RequestMetrics) -> RequestMetrics:
+def merge_request_metrics(*metrics: RequestMetrics | RunResult) -> RequestMetrics:
     stage_totals: dict[str, float] = {}
     request_count = 0
     response_bytes = 0
@@ -570,6 +776,8 @@ def write_history_files(record_dir: Path, payload: dict[str, Any]) -> dict[str, 
 def render_markdown(
     payload: dict[str, Any],
 ) -> str:
+    if payload.get("status") == "failed":
+        return "# Perf harness failed\n\n```json\n" + json.dumps(payload["failure"], indent=2) + "\n```\n"
     summary = payload["summary"]
     lines = [
         "# Perf Harness Summary",
@@ -611,6 +819,13 @@ def render_markdown(
                     f"- `{metric['label']}` avg `{metric['avg']}` max `{metric['max']}`"
                 )
             metadata_sections.append("")
+
+    if payload.get("readiness"):
+        lines.extend(["", "## Readiness waits", "",
+                      "Inventory setup is excluded from measurements; estimate readiness is excluded from warm timings and included in workflow timings.", ""])
+        for item in payload["readiness"]:
+            lines.append(f"- {item['name']}: {item['duration_ms']:.1f} ms, {item['request_count']} attempts, "
+                         f"{item['metadata_counts'].get('busy_wait_ms', 0):.1f} ms busy recovery")
 
     if stage_sections:
         lines.extend(["", "## Stage Rollups", ""])
@@ -676,6 +891,12 @@ def main() -> int:
     parser.add_argument("--system-id", default=None, help="Optional system id query parameter.")
     parser.add_argument("--enclosure-id", default=None, help="Optional enclosure id query parameter.")
     parser.add_argument("--iterations", type=int, default=3, help="Iterations per workflow.")
+    parser.add_argument(
+        "--readiness-timeout-seconds", type=float,
+        default=os.environ.get(READINESS_TIMEOUT_ENV, DEFAULT_READINESS_TIMEOUT_SECONDS),
+        help=("Safe-read readiness deadline in seconds, including requests and waits. "
+              f"Default {DEFAULT_READINESS_TIMEOUT_SECONDS:g}; env {READINESS_TIMEOUT_ENV}."),
+    )
     parser.add_argument("--smart-slot-count", type=int, default=8, help="How many slots to include in the smart batch probe.")
     parser.add_argument(
         "--smart-batch-max-concurrency",
@@ -723,6 +944,33 @@ def main() -> int:
 
     if (args.username_file is None) != (args.password_file is None):
         parser.error("--username-file and --password-file must be provided together")
+    if not math.isfinite(args.readiness_timeout_seconds) or args.readiness_timeout_seconds <= 0:
+        parser.error("--readiness-timeout-seconds must be positive and finite")
+    try:
+        return _run(args)
+    except ReadinessDeadlineExceeded as exc:
+        # A failed prerequisite is not a passing performance measurement. Keep
+        # its report separate from latest/history successful benchmark records.
+        payload = {"status": "failed", "failure": exc.diagnostic}
+        if not args.no_record:
+            directory = Path(args.record_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "failure.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        rendered = json.dumps(payload, indent=2) if args.format == "json" else render_markdown(payload)
+        _write_output(args.output, rendered)
+        return 1
+
+
+def _write_output(output: str | None, rendered: str) -> None:
+    if output:
+        path = Path(output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered, encoding="utf-8")
+    else:
+        print(rendered)
+
+
+def _run(args: argparse.Namespace) -> int:
     authorization = (
         load_basic_authorization(args.username_file, args.password_file)
         if args.username_file is not None and args.password_file is not None
@@ -733,15 +981,28 @@ def main() -> int:
         system_id=args.system_id,
         enclosure_id=args.enclosure_id,
         authorization=authorization,
+        readiness_timeout_seconds=args.readiness_timeout_seconds,
     )
     results: list[RunResult] = []
+    readiness: list[RunResult] = []
 
-    inventory = client.get_json("/api/inventory", params={"force": "true"})
+    inventory: dict[str, Any] = {}
+
+    def initial_inventory() -> RequestMetrics:
+        nonlocal inventory
+        response = client.get_json_with_headers("/api/inventory", params={"force": "true"})
+        inventory = response.data
+        return build_request_metrics(response)
+
+    # Setup recovery is a prerequisite, not an inventory_force measurement.
+    readiness.append(run_timed("inventory_force_readiness", initial_inventory))
     client.get_json("/api/storage-views")
     mapping_bundle = client.get_json("/api/mappings/export")
     history_status_available = False
     try:
         client.get_json("/api/history/status")
+    except ReadinessDeadlineExceeded:
+        raise
     except Exception:
         history_status_available = False
     else:
@@ -840,7 +1101,24 @@ def main() -> int:
 
     for _ in range(max(1, args.iterations)):
         for name, fn in workflows:
-            results.append(run_timed(name, fn))
+            if name == "snapshot_export_estimate":
+                # The preceding mapping mutation may invalidate the view. Do not
+                # call that recovery a warm estimate, or omit it from workflow time.
+                ready = run_timed("snapshot_export_estimate_readiness", fn)
+                readiness.append(ready)
+                warm = run_timed(name, fn)
+                results.append(warm)
+                combined = merge_request_metrics(ready, warm)
+                results.append(RunResult(
+                    name="snapshot_export_estimate_workflow",
+                    duration_ms=ready.duration_ms + warm.duration_ms,
+                    stage_totals_ms=combined.stage_totals_ms,
+                    request_count=combined.request_count,
+                    response_bytes=combined.response_bytes,
+                    metadata_counts=combined.metadata_counts,
+                ))
+            else:
+                results.append(run_timed(name, fn))
 
     summary = summarize(results)
     git_context = detect_git_context(REPO_ROOT)
@@ -850,6 +1128,9 @@ def main() -> int:
     baseline_payload = load_baseline_payload(record_dir, args.baseline)
     comparison = compare_summary(summary, baseline_payload.get("summary") if baseline_payload else None)
     payload = {
+        "status": "passed",
+        "readiness_timeout_seconds": args.readiness_timeout_seconds,
+        "readiness": [asdict(item) for item in readiness],
         "run_id": f"{int(time.time() * 1000)}",
         "recorded_at": utc_timestamp(),
         "label": args.label or git_context.branch or "manual-run",
@@ -899,12 +1180,7 @@ def main() -> int:
 
     rendered = json.dumps(payload, indent=2) if args.format == "json" else markdown
 
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered, encoding="utf-8")
-    else:
-        print(rendered)
+    _write_output(args.output, rendered)
     return 0
 
 

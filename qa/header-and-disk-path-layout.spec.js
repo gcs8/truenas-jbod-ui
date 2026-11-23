@@ -29,6 +29,9 @@ test.describe("Storage Fabric stale refresh", () => {
 test.describe("SMART browser ownership", () => {
   require("./fixture-suites/smart-browser-ownership")({ test, expect });
 });
+test.describe("ESXi carrier smoke fixtures", () => {
+  require("./fixture-suites/esxi-carrier-smoke")({ test, expect });
+});
 test.describe("Header select widths", () => {
   require("./fixture-suites/header-select-width")({ test, expect });
 });

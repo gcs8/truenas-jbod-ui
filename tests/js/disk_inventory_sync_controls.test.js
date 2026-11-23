@@ -277,7 +277,7 @@ function diskInventorySyncRunHarness(selectedSystemId = "system-a") {
     diskInventorySync: { inFlight: false },
   };
   const fns = loadNamedFunctions(
-    ["diskInventorySyncModeSpec", "formatDiskInventorySyncResult", "runDiskInventorySync"],
+    ["diskInventorySyncModeSpec", "formatDiskInventorySyncResult", "renderDiskInventorySyncStatuses", "runDiskInventorySync"],
     {
       state,
       renderDiskInventorySyncControls() {},

@@ -181,7 +181,7 @@
     return own(KIND_PLATFORMS, kind).includes(platform);
   }
 
-  // { kind, contract: "core" | "storage" | "unknown", notice }. Only an exact
+  // { kind, contract: "core" | "sas" | "storage" | "unknown", notice }. Only an exact
   // supported kind on a platform that produces it is recognised; an unknown
   // or conflicting one makes no claim about what was or was not collected.
   function fabricContract(fabric) {
@@ -199,7 +199,7 @@
     if (!kindMatchesPlatform(named, platform)) {
       return { kind: named, contract: "unknown", notice: `The fabric kind "${named}" does not match platform "${platform}": ${noClaim}.` };
     }
-    return { kind: named, contract: core ? "core" : "storage", notice: "" };
+    return { kind: named, contract: core ? "core" : named === "linux_ses" && fabric?.raw?.sas_transport_available === true ? "sas" : "storage", notice: "" };
   }
 
   // complete | partial | not_read, or unknown when the payload does not say.
@@ -343,7 +343,7 @@
 
   // ---- tiers and nodes -------------------------------------------------------
 
-  // mode: "core", "storage" or "unknown" (fabricContract).
+  // mode: "core", "sas", "storage" or "unknown" (fabricContract).
   function tierForNode(item, mode) {
     const kind = String(item.kind || "");
     if (kind === "host") return "host";
@@ -394,7 +394,7 @@
     const notRead = new Set(list(metrics.not_read));
     const facts = [];
     if (item.kind === "controller") {
-      if (core) {
+      if (core || mode === "sas") {
         const board = item.raw?.board;
         if (board) facts.push(String(board));
         const phys = decimal(metrics.phy_count);
@@ -517,7 +517,7 @@
       const target = nodeById.get(item.target);
       if (item.kind === "path-bay") pathBayLinks.push(item);
       const unsupportedEnd = [sourceItem, targetItem].some((end) => !tierForNode(end, mode) && !hiddenByDesign(end, mode));
-      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices"))) {
+      if (bayIds.has(item.target) && source && (source.tier === "enclosures" || (!core && source.tier === "devices") || (mode === "sas" && item.kind === "transport-bay" && ["controller", "expander"].includes(source.kind)))) {
         bayLinks.push(item);
         continue;
       }
@@ -604,7 +604,7 @@
       const found = traces.get(item.id);
       const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
-      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
+      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => window.SasFabricTransport?.pathState(fabric, state) || ({
         controller: String(state.controller_label || state.controller || ""),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
@@ -749,12 +749,12 @@
       const enclosures = tierNodes("enclosures");
       const enclosureStatus = countTier(fabric, "enclosures", enclosures.length, { one: "enclosure", many: "enclosures", none: "no enclosures reported (read complete)" });
       tiers.push({ id: "enclosures", label: "Enclosures", ...enclosureStatus, nodeIds: enclosures.map((entry) => entry.id) });
-    } else if (mode === "unknown") {
-      // No contract: draw the rows the payload has, say nothing about the rest.
+    } else if (mode === "unknown" || mode === "sas") {
+      // Draw supplied rows without inventing read completeness.
       const rowOf = (id, label, members) => {
         if (members.length) tiers.push({ id, label, state: "drawn", note: plural(members.length, "item"), nodeIds: members.map((entry) => entry.id) });
       };
-      rowOf("controllers", "Controllers or sources", controllers);
+      rowOf("controllers", mode === "sas" ? "HBAs" : "Controllers or sources", controllers);
       const expanders = tierNodes("expanders");
       const levels = [...new Set(expanders.map((entry) => entry.level))].sort((left, right) => (left ?? Infinity) - (right ?? Infinity));
       for (const level of levels) {
@@ -1981,19 +1981,23 @@
     const points = link.points.map(([x, y]) => `${Math.round(x)},${Math.round(y)}`).join(" ");
     const name = linkDescription(model, link);
     const chain = chainClass(link.chain ? model.chains.indexOf(link.chain) : -1);
-    const line = `<polyline class="topo-link ${style}${chain}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title>${escapeHtml(name)}</title></polyline>`;
+    const line = `<polyline class="topo-link ${style}${chain}${highlight}" data-topo-link="${escapeHtml(link.id)}" points="${points}"><title style="display:none">${escapeHtml(name)}</title></polyline>`;
     const box = link.labelBox;
     let body;
     if (link.labelLines.length) {
       body = `<rect class="topo-label-box" x="${Math.round(box.x)}" y="${Math.round(box.y)}" width="${Math.round(box.w)}" height="${Math.round(box.h)}" rx="7"></rect>`
-        + link.labelLines.map((text, index) => `<text class="topo-label-text" x="${Math.round(box.x + box.w / 2)}" y="${Math.round(box.y + 14 + index * 15)}" text-anchor="middle">${escapeHtml(text)}</text>`).join("");
+        + link.labelLines.map((text, index) => `<text class="topo-label-text" x="${Math.round(box.x + box.w / 2)}" y="${Math.round(box.y + 14 + index * 15)}" text-anchor="middle">${escapeHtml(text)}</text>`).join(" ");
     } else {
       body = `<circle class="topo-junction" cx="${Math.round(box.x + box.w / 2)}" cy="${Math.round(box.y + box.h / 2)}" r="6"></circle>`;
     }
-    const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}" data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(name)}"><title>${escapeHtml(name)}</title>${body}</g>`;
+    const labelName = [link.labelLines.join(" "), name].filter(Boolean).join(", ");
+    const label = `<g class="topo-link-label ${style}${highlight}" role="button" tabindex="0" data-fabric-topology-link="${escapeHtml(link.id)}" data-topo-link="${escapeHtml(link.id)}" aria-label="${escapeHtml(labelName)}"><title style="display:none">${escapeHtml(labelName)}</title>${body}</g>`;
     return { line, label };
   }
-
+  function visibleName(lines, title) {
+    const visible = lines.join(" ");
+    return title === visible || title.startsWith(`${visible}, `) ? title : [visible, title].filter(Boolean).join(", ");
+  }
   function nodeTitle(entry) {
     const phys = entry.phyGroups.length ? `PHYs ${entry.phyGroups.map((group) => phyRanges(group.phys)).join(" | ")}` : "";
     return [entry.label, ...entry.facts, phys, entry.parentUnknown && entry.kind !== "host" ? "parent link not reported" : ""].filter(Boolean).join(", ");
@@ -2003,19 +2007,17 @@
     const highlight = onPathClass(path, "nodes", entry.id) + (pinnedRef(path, "node", entry.id) ? " is-pinned" : "");
     const title = nodeTitle(entry);
     if (entry.parentUnknown && entry.kind !== "host") used.add("mark-parent-unknown");
-    const text = entry.lines.map((line, index) => `<text class="topo-node-${index < entry.titleLines ? "title" : "fact"}" x="${entry.x + 10}" y="${entry.y + 20 + index * LINE_H}">${escapeHtml(line)}</text>`).join("");
+    const text = entry.lines.map((line, index) => `<text class="topo-node-${index < entry.titleLines ? "title" : "fact"}" x="${entry.x + 10}" y="${entry.y + 20 + index * LINE_H}">${escapeHtml(line)}</text>`).join(" ");
     const unknown = entry.parentUnknown && entry.kind !== "host" ? " mark-parent-unknown" : "";
-    return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
+    return `<g class="topo-node kind-${token(entry.kind)}${unknown}${highlight}" role="button" tabindex="0" data-fabric-node="${escapeHtml(entry.id)}" data-topo-node="${escapeHtml(entry.id)}" aria-label="${escapeHtml(visibleName(entry.lines, title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${entry.x}" y="${entry.y}" width="${entry.w}" height="${entry.h}" rx="8"></rect>${text}</g>`;
   }
-
   function bayTitle(bay) {
     const occupancy = { yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy];
     const paths = bay.pathStates.length
-      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}`).join(", ")}`
+      ? `paths: ${bay.pathStates.map((state) => `${state.controller || "path"} ${state.basis === MEMBER_HEALTH ? "member health " : ""}${state.state}${state.transportPhyCount === undefined ? "" : state.transportPhyCount === null ? "; PHY rows not read" : `; ${state.transportPhyCount} reported PHY rows`}`).join(", ")}`
       : "no path state in payload";
     return [bay.label, bay.locationKnown ? "" : LOCATION_UNKNOWN, occupancy, bay.deviceName, paths].filter(Boolean).join(", ");
   }
-
   // How many marks fit in a cell, keeping room for a "+N" count when needed.
   function marksFor(bay) {
     const fit = Math.max(1, Math.floor((bay.w - 4) / MARK_PITCH));
@@ -2023,7 +2025,6 @@
     const shown = bay.pathStates.slice(0, Math.max(1, fit - 1));
     return { shown, more: bay.pathStates.length - shown.length };
   }
-
   function renderBayCell(bay, path, used) {
     const highlight = onPathClass(path, "bays", bay.bayId) + (pinnedRef(path, "bay", bay.bayId) ? " is-pinned" : "");
     used.add(`bay-${bay.occupancy}`);
@@ -2044,7 +2045,7 @@
     // A bay label with no supported number is shown as the producer wrote it.
     const shownLabel = bay.locationKnown ? bay.number || bay.label : bay.label;
     const number = shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + 14}" text-anchor="middle">${escapeHtml(shownLabel)}</text>` : "";
-    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(title)}"><title>${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number}${marks}${count}</g>`;
+    return `<g class="topo-bay bay-${bay.occupancy} state-${token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${escapeHtml(bay.bayId)}" aria-label="${escapeHtml(visibleName([shownLabel, more ? `+${more}` : ""].filter(Boolean), title))}"><title style="display:none">${escapeHtml(title)}</title><rect x="${bay.x}" y="${bay.y}" width="${bay.w}" height="${CELL_BOX}" rx="3"></rect>${number} ${marks} ${count}</g>`;
   }
 
   function pathSummary(summary) {
@@ -2087,8 +2088,8 @@
       const { x, y } = toggleBox(group);
       toggle = `<g class="topo-expand" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(group.expandKey)}" aria-expanded="${group.collapsed ? "false" : "true"}" aria-label="${escapeHtml(label)}"><rect x="${x}" y="${y}" width="160" height="22" rx="6"></rect><text class="topo-label-text" x="${x + 80}" y="${y + 15}" text-anchor="middle">${escapeHtml(label)}</text></g>`;
     }
-    const name = `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`;
-    return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join("")}${cells}${toggle}</g>`;
+    const name = visibleName(group.lines.map((line) => line.text), `${groupHeading(group)}${group.collapsed ? `, ${group.summary.withDisk} with a disk, ${summaryText}` : ""}`);
+    return `<g class="topo-group${group.collapsed ? " is-collapsed" : ""}${highlight}" data-topo-group="${escapeHtml(group.id)}" aria-label="${escapeHtml(name)}" role="group">${parts.join(" ")}${cells}${toggle}</g>`;
   }
 
   function renderTier(tier, model) {
@@ -2097,9 +2098,9 @@
     const tone = tier.state === "drawn" ? "ok" : token(tier.state);
     const labelLines = tier.labelLines || [tier.label];
     const noteLines = tier.noteLines || [tier.note];
-    const label = `<g class="topo-tier"><title>${escapeHtml(`${tier.label}: ${tier.note}`)}</title>`
-      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join("")
-      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join("")
+    const label = `<g class="topo-tier"><title style="display:none">${escapeHtml(visibleName([...labelLines, ...noteLines], [tier.label, tier.note].filter(Boolean).join(" ")))}</title>`
+      + labelLines.map((line, index) => `<text class="topo-tier-label" x="${MARGIN}" y="${y + 18 + index * 17}">${escapeHtml(line)}</text>`).join(" ") + " "
+      + noteLines.map((line, index) => `<text class="topo-tier-note tone-${tone}" x="${MARGIN}" y="${y + 18 + (labelLines.length + index) * 17}">${escapeHtml(line)}</text>`).join(" ")
       + "</g>";
     let band = "";
     if (missing && tier.band) {

@@ -239,8 +239,8 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.sync_disk_inventory(DiskInventorySyncMode.full)
 
-        # start + poll@0s + poll@100s + poll@200s (timeout reached, no further poll)
-        self.assertEqual(len(runner.commands), 4)
+        # start + poll@0s + poll@100s; the expired deadline retains that state.
+        self.assertEqual(len(runner.commands), 3)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.state, "RUNNING")
         self.assertEqual(result.job_id, 268071)
@@ -257,7 +257,6 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         runner = RecordingSSHRunner(
             [
                 ok("268071"),
-                ok(job_payload(268071, "RUNNING")),
                 ok(job_payload(268071, "RUNNING")),
                 ok(job_payload(268071, "RUNNING")),
                 ok(job_payload(268071, "SUCCESS")),

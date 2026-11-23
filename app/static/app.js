@@ -171,11 +171,14 @@
       viewSelectionExpanded: false,
       selectedStorageViewIds: [],
       running: false,
+      downloadRetryAtMs: 0,
+      dialogGeneration: 0,
       estimate: {
         loading: false,
         error: null,
         data: null,
         retryNote: null,
+        retryAtMs: 0,
         requestToken: 0,
       },
     },
@@ -824,7 +827,7 @@
     const summary = occupancy === "present"
       ? [
           slot.model || null,
-          slot.size_human || null,
+          slot.size_human || "Capacity not read yet",
           slot.smart_device_type ? `smartctl -d ${slot.smart_device_type}` : null,
         ].filter(Boolean).join(" • ") || "Matched from live inventory."
       : occupancy === "unknown"
@@ -7912,6 +7915,7 @@
     state.export.estimate.error = null;
     state.export.estimate.data = null;
     state.export.estimate.retryNote = null;
+    state.export.estimate.retryAtMs = 0;
   }
 
   function invalidateSnapshotExportEstimateIfBasisChanged(previousBasisKey) {
@@ -8093,6 +8097,10 @@
         : '<p class="snapshot-export-estimate-message">Estimating export size...</p>';
       return;
     }
+    if (estimateState.retryAtMs && !estimateState.data) {
+      exportSnapshotEstimate.innerHTML = `<p class="snapshot-export-estimate-message">${escapeHtml(estimateState.retryNote)}</p>`;
+      return;
+    }
     if (estimateState.error && !estimateState.data) {
       exportSnapshotEstimate.innerHTML = `<p class="snapshot-export-estimate-message warning">${escapeHtml(estimateState.error)}</p>`;
       return;
@@ -8207,6 +8215,7 @@
       syncSnapshotExportDialog();
       return;
     }
+    const retryAtMs = state.export.estimate.retryAtMs || 0;
     const nextToken = state.export.estimate.requestToken + 1;
     state.export.estimate.requestToken = nextToken;
     state.export.estimate.loading = true;
@@ -8221,9 +8230,17 @@
     );
     const superseded = {};
     try {
+      const delayMs = Math.max(0, retryAtMs - Date.now());
+      if (delayMs) {
+        state.export.estimate.retryNote = `The inventory is still refreshing. Trying again in ${Math.ceil(delayMs / 1000)} s.`;
+        syncSnapshotExportDialog();
+        await waitMs(delayMs);
+        if (!isCurrent() || !exportSnapshotDialog.open) return;
+      }
       // A retryable 503 (the inventory is still refreshing) is retried, with
       // the wait shown, while the dialog stays open on the same basis (#1144).
       const estimate = await retryBusyRead(async () => {
+        state.export.estimate.retryAtMs = 0;
         const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot/estimate"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -8249,6 +8266,7 @@
         return isCurrent() ? payload : superseded;
       }, {
         isCurrent: () => isCurrent() && Boolean(exportSnapshotDialog?.open),
+        retryDelayMs: snapshotExportRetryDelayMs,
         onRetry: (attempt, delayMs) => {
           state.export.estimate.retryNote = busyReadRetryMessage(attempt, delayMs);
           syncSnapshotExportDialog();
@@ -8266,12 +8284,19 @@
       if (!isCurrent()) {
         return;
       }
-      state.export.estimate.error = `Live estimate unavailable: ${error.message || error}`;
+      const delayMs = snapshotExportRetryDelayMs(error);
+      if (delayMs !== null) {
+        state.export.estimate.retryAtMs = Date.now() + delayMs;
+        state.export.estimate.retryNote = "The inventory is still refreshing. Retry the estimate when ready.";
+      } else {
+        state.export.estimate.error = `Live estimate unavailable: ${error.message || error}`;
+      }
       state.export.estimate.data = null;
     } finally {
       if (nextToken === state.export.estimate.requestToken) {
         state.export.estimate.loading = false;
-        state.export.estimate.retryNote = null;
+        state.export.estimate.retryNote = state.export.estimate.retryAtMs
+          ? "The inventory is still refreshing. Retry the estimate when ready." : null;
         syncSnapshotExportDialog();
       }
     }
@@ -8346,6 +8371,7 @@
     if (state.export.estimate.error) {
       parts.push(state.export.estimate.error);
     }
+    if (state.export.downloadRetryAtMs) parts.push("The inventory is still refreshing. Retry the download when ready.");
     exportSnapshotNote.textContent = parts.join(" ");
     if (exportSnapshotWindowHint) {
       if (isHistoryAvailable()) {
@@ -8358,6 +8384,8 @@
     if (exportSnapshotConfirm) {
       const estimate = state.export.estimate.data;
       const shouldBlock = Boolean(estimate && !estimate.selected_allowed);
+      exportSnapshotConfirm.textContent = state.export.downloadRetryAtMs ? "Retry download"
+        : state.export.estimate.retryAtMs ? "Retry estimate" : "Download copy";
       exportSnapshotConfirm.disabled = state.export.running || state.export.estimate.loading || shouldBlock;
     }
   }
@@ -8395,6 +8423,7 @@
   }
 
   function closeSnapshotExportDialog() {
+    state.export.dialogGeneration = (state.export.dialogGeneration || 0) + 1;
     if (exportSnapshotDialog && exportSnapshotDialog.open) {
       exportSnapshotDialog.close();
     }
@@ -9587,7 +9616,8 @@
         kvRow("Device", slot.device_name),
         kvRow("Serial", slot.serial, true),
         kvRowIfMeaningful("Model", slot.model),
-        kvRowIfMeaningful("Size", slot.size_human),
+        kvRow("Size", slot.size_human || "not read yet"),
+        kvRowIfMeaningful("Enclosure descriptor", !slot.size_human ? slot.raw_status?.reported_size : null),
         kvRowIfMeaningful(persistentIdLabel(slot), slot.gptid, true),
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
@@ -9740,7 +9770,7 @@
         kvRow("Device", storageViewSlot.device_name),
         kvRow("Serial", storageViewSlot.serial, true),
         kvRowIfMeaningful("Model", storageViewSlot.model),
-        kvRowIfMeaningful("Capacity", storageViewSlot.size_human),
+        kvRow("Capacity", storageViewSlot.size_human || "not read yet"),
         kvRowIfMeaningful(persistentIdLabel(storageViewSlot), storageViewSlot.gptid, true),
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(storageViewSlot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
@@ -11211,6 +11241,12 @@
     return Math.min(Math.max(error.retryAfterSeconds * 1000, 1000), BUSY_READ_RETRY_MAX_DELAY_MS);
   }
 
+  // Export retries must not run earlier than the server's Retry-After.
+  function snapshotExportRetryDelayMs(error) {
+    if (busyReadRetryDelayMs(error) === null) return null;
+    return Math.max(1000, error.retryAfterSeconds * 1000);
+  }
+
   function busyReadRetryMessage(attempt, delayMs) {
     return `The inventory is still refreshing. Trying again in ${Math.round(delayMs / 1000)} s (retry ${attempt} of ${BUSY_READ_RETRY_LIMIT}).`;
   }
@@ -11227,7 +11263,7 @@
       try {
         return await read();
       } catch (error) {
-        const delayMs = busyReadRetryDelayMs(error);
+        const delayMs = (options.retryDelayMs || busyReadRetryDelayMs)(error);
         if (delayMs === null || attempt > BUSY_READ_RETRY_LIMIT || !isCurrent()) throw error;
         if (onRetry) onRetry(attempt, delayMs, error);
         await wait(delayMs);
@@ -11340,17 +11376,31 @@
     if (state.export.running) {
       return;
     }
+    const scopeKey = currentUiScopeKey();
+    const dialogGeneration = state.export.dialogGeneration || 0;
+    const requestBody = JSON.stringify(snapshotExportRequestPayload());
+    const retryAtMs = state.export.downloadRetryAtMs || 0;
     try {
       state.export.running = true;
       syncSnapshotExportDialog();
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = true;
       }
+      const delayMs = Math.max(0, retryAtMs - Date.now());
+      if (delayMs) {
+        setStatus(`The inventory is still refreshing. Trying the download again in ${Math.ceil(delayMs / 1000)} s.`);
+        await waitMs(delayMs);
+        if ((exportSnapshotDialog && !exportSnapshotDialog.open)
+            || dialogGeneration !== (state.export.dialogGeneration || 0)
+            || scopeKey !== currentUiScopeKey()
+            || requestBody !== JSON.stringify(snapshotExportRequestPayload())) return;
+      }
+      state.export.downloadRetryAtMs = 0;
       setStatus("Preparing the offline copy...");
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(snapshotExportRequestPayload()),
+        body: requestBody,
       });
       if (!response.ok) {
         let detail = `Request failed with ${response.status}`;
@@ -11360,7 +11410,10 @@
         } catch (error) {
           // Ignore JSON parsing failures and fall back to the HTTP status.
         }
-        throw new Error(detail);
+        const failure = new Error(detail);
+        failure.status = response.status;
+        failure.retryAfterSeconds = retryAfterSecondsFrom(response);
+        throw failure;
       }
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
@@ -11378,13 +11431,16 @@
       const sizeLabel = formatArtifactSize(response.headers.get("X-Export-Size-Bytes"));
       setStatus(`Exported ${redaction}${packaging} snapshot (${sizeLabel}).`);
     } catch (error) {
-      setStatus(`Snapshot export failed: ${error.message || error}`, "error");
+      const delayMs = snapshotExportRetryDelayMs(error);
+      if (delayMs !== null) {
+        state.export.downloadRetryAtMs = Date.now() + delayMs;
+        setStatus("The inventory is still refreshing. Retry the download when ready.");
+      } else {
+        setStatus(`Snapshot export failed: ${error.message || error}`, "error");
+      }
     } finally {
       state.export.running = false;
       syncSnapshotExportDialog();
-      if (exportSnapshotConfirm) {
-        exportSnapshotConfirm.disabled = false;
-      }
     }
   }
 
@@ -11708,8 +11764,8 @@
         reason: "SSH is off for this system, so the app cannot ask TrueNAS to re-scan its disks.",
       };
     }
-    if (state.diskInventorySync.inFlight) {
-      return { available: false, reason: "A disk re-scan is already running for this system." };
+    if (state.diskInventorySync[mode] || (state.diskInventorySync.inFlight && !state.diskInventorySync.mode)) {
+      return { available: false, reason: "A disk re-scan request is already running for this system." };
     }
     return { available: true, reason: "" };
   }
@@ -11778,6 +11834,16 @@
     return `${result?.message || "Disk re-scan finished."}${summary}${error}`;
   }
 
+  function renderDiskInventorySyncStatuses() {
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id;
+    const rows = (state.diskInventorySync.statuses || []).filter((row) => row.systemId === systemId && row.result);
+    if (!rows.length) return;
+    const failed = (row) => ["FAILED", "ABORTED"].includes(row.result.state);
+    rows.sort((a, b) => Number(failed(b)) - Number(failed(a)));
+    setStatus(rows.map((row) => `${diskInventorySyncModeSpec(row.mode).label}: ${formatDiskInventorySyncResult(row.result)}`).join(" | "),
+      rows.some(failed) ? "error" : "info");
+  }
+
   async function runDiskInventorySync(
     mode,
     systemId = state.selectedSystemId || state.snapshot?.selected_system_id,
@@ -11787,33 +11853,95 @@
       setStatus("Select a system before syncing its TrueNAS disk inventory.", "error");
       return;
     }
+    if (state.diskInventorySync[mode]) return;
+    const owner = { mode, systemId, result: null };
+    let statusOwner = owner;
+    let observationKey = null;
+    const observations = state.diskInventorySync.observations ||= new Map();
+    const publish = (result) => {
+      statusOwner.result = result;
+      const rows = state.diskInventorySync.statuses ||= [];
+      if (!rows.includes(statusOwner)) rows.push(statusOwner);
+      // Retain bounded recent outcomes, independently of active observer ownership.
+      if (rows.length > 8) rows.splice(0, rows.length - 8);
+      if (systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) renderDiskInventorySyncStatuses();
+    };
+    const releaseAdmission = () => {
+      if (state.diskInventorySync[mode] === owner) delete state.diskInventorySync[mode];
+      state.diskInventorySync.inFlight = Boolean(state.diskInventorySync.full || state.diskInventorySync.multipath);
+      renderDiskInventorySyncControls();
+    };
+    state.diskInventorySync[mode] = owner;
     state.diskInventorySync.inFlight = true;
+    state.diskInventorySync.mode = mode;
     renderDiskInventorySyncControls();
     const startedAt = Date.now();
     const showProgress = () => {
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
-      setStatus(`Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s`);
+      publish({ message: `Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s` });
     };
     showProgress();
     const progressTimerId = window.setInterval(showProgress, 1000);
     try {
-      const result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
-        method: "POST",
-        readUiAuth: true,
-        body: JSON.stringify({ mode, confirm: true }),
-      });
-      window.clearInterval(progressTimerId);
-      const succeeded = result?.state === "SUCCESS" && !result?.timed_out;
-      if (succeeded) {
-        await refreshSnapshot(true, "manual-refresh");
+      let result;
+      try {
+        result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
+          method: "POST",
+          readUiAuth: true,
+          body: JSON.stringify({ mode, confirm: true }),
+        });
+      } catch (error) {
+        if (error.status !== 409) throw error;
+        result = typeof error.detail === "object" && error.detail !== null
+          ? error.detail : { state: "UNKNOWN", message: error.detail || error.message };
+      } finally {
+        // Only POST owns admission. Observing an earlier job never fences a new
+        // confirmed request; the backend decides whether that request is busy.
+        releaseAdmission();
       }
-      setStatus(formatDiskInventorySyncResult(result), succeeded ? "info" : "error");
+      window.clearInterval(progressTimerId);
+      if (mode === "full" && Number.isInteger(result?.job_id)) {
+        observationKey = `${systemId}/${result.job_id}`;
+        if (observations.has(observationKey)) {
+          state.diskInventorySync.statuses = state.diskInventorySync.statuses.filter((row) => row !== owner);
+          statusOwner = observations.get(observationKey);
+          publish(result);
+          return;
+        }
+        observations.set(observationKey, owner);
+      }
+      // Observe only. Never replay the POST when a job is queued or running.
+      for (let attempt = 0; attempt < 720; attempt += 1) {
+        if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
+        publish(result);
+        if (!["WAITING", "RUNNING", "UNKNOWN"].includes(result?.state) || !Number.isInteger(result?.job_id)) break;
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
+        try {
+          result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync?job_id=${result.job_id}`, {
+            method: "GET", readUiAuth: true,
+          });
+        } catch (_error) {
+          result = { state: "UNKNOWN", job_id: result?.job_id,
+            message: "The disk sync job's state is unknown. Checking again; TrueNAS will queue a new sync if requested." };
+        }
+      }
+      if (statusOwner.result !== result) publish(result);
+      if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
+        try {
+          await refreshSnapshot(true, "manual-refresh");
+          publish(result);
+        } catch (_error) {
+          publish({ ...result, message: `${result.message} The inventory refresh is unavailable; refresh again.` });
+        }
+      }
     } catch (error) {
       window.clearInterval(progressTimerId);
-      setStatus(`TrueNAS disk inventory sync failed: ${error.message || error}`, "error");
+      publish({ state: "FAILED", message: `TrueNAS disk inventory sync failed: ${error.message || error}` });
     } finally {
-      state.diskInventorySync.inFlight = false;
-      renderDiskInventorySyncControls();
+      window.clearInterval(progressTimerId);
+      releaseAdmission();
+      if (observations.get(observationKey) === owner) observations.delete(observationKey);
     }
   }
 
@@ -12630,7 +12758,11 @@
   }
   if (exportSnapshotConfirm) {
     exportSnapshotConfirm.addEventListener("click", () => {
-      void exportEnclosureSnapshot();
+      if (state.export.estimate.retryAtMs && !state.export.downloadRetryAtMs) {
+        void refreshSnapshotExportEstimate();
+      } else {
+        void exportEnclosureSnapshot();
+      }
     });
   }
   if (exportRedactToggle) {
