@@ -1062,7 +1062,9 @@ test("the unknown-contract notice names what it does not draw, and every other r
   // The real builder's SES payload on a platform that does not produce it.
   const fabric = JSON.parse(JSON.stringify(cases.ses_non_ascii_labels.fabric));
   fabric.platform = "esxi";
-  fabric.nodes.push(H.node("pool:synthetic", "pool"), H.node("vdev:synthetic", "vdev"));
+  // The producer no longer invents zones. Keep an explicit legacy record here
+  // so this unknown-contract filtering test retains its original coverage.
+  fabric.nodes.push(H.node("pool:synthetic", "pool"), H.node("vdev:synthetic", "vdev"), H.node("backplane:legacy", "backplane"));
   const model = T.buildTopologyModel(fabric);
   assert.equal(model.contract, "unknown");
   const notice = [...model.notices].find((text) => /does not match platform/.test(text));

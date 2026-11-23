@@ -354,7 +354,8 @@ def _build_sas_fabric_result(
         _apply_sas_fabric_aliases(nodes=nodes, traces=traces, controllers=controllers or [], paths=paths or [],
                                  aliases=_sas_fabric_alias_map(aliases or []))
         enclosures = [_node_raw_for_payload(node) for node in nodes.values()
-                      if node.kind in {"enclosure", "mpr-enclosure", "ses-enclosure", "storage-enclosure"}]
+                      if node.kind == "enclosure" or (node.kind in {"mpr-enclosure", "ses-enclosure", "storage-enclosure"}
+                                                     and not node.raw.get("physical_enclosure_id"))]
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))

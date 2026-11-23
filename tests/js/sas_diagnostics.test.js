@@ -264,6 +264,8 @@ test("fallback expander panels with identical diagnostics keep distinct table st
   const fabric = { nodes: [] };
   const { diskPathBranchEvidence, diagnosticTableKey, diagnosticTableState, diagnosticEventRows, list } = loadFunctions([
     "diskPathBranchEvidence",
+    "branchControllerContext",
+    "ownDirectPath",
     "diagnosticTableKey",
     "diagnosticTableState",
     "diagnosticEventRows",

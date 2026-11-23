@@ -3855,8 +3855,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         links = {link.id: link for link in fabric.links}
         mpr0_expander_id = "expander:controller:mpr0:50030480090c4f7f"
         mpr1_expander_id = "expander:controller:mpr1:50030480090c8f7f"
-        mpr0_enclosure_id = "enclosure:50030480090c4f7f"
-        mpr1_enclosure_id = mpr0_enclosure_id
+        mpr0_enclosure_id = "mpr-enclosure:controller:mpr0:0002"
+        mpr1_enclosure_id = "mpr-enclosure:controller:mpr1:0012"
         mpr0_path_expander_link = f"path-expander:path:mpr0:fail->{mpr0_expander_id}"
         mpr1_path_expander_link = f"path-expander:path:mpr1:active->{mpr1_expander_id}"
         mpr0_expander_enclosure_link = f"expander-enclosure:{mpr0_expander_id}->{mpr0_enclosure_id}"

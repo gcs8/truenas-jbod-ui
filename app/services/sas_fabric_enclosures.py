@@ -46,13 +46,18 @@ def project_enclosures(
             continue
         physical = board(identity)
         replacements[node.id] = physical.id
-        physical.raw["observations"].append({"id": node.id, **node.raw, "metrics": dict(node.metrics)})
+        physical.raw["observations"].append({"id": node.id, "controller_id": node.controller_id,
+                                             "enc_handle": node.raw.get("enc_handle"), "unit": node.raw.get("unit"),
+                                             "metrics": dict(node.metrics)})
         physical.raw["legacy_alias_ids"].append(node.id)
         physical.evidence = list(dict.fromkeys([*physical.evidence, *node.evidence]))
         if node.alias and physical.alias is None:
             physical.alias = node.alias
             physical.display_label = node.display_label
-        nodes.pop(node.id)
+        node.raw["physical_enclosure_id"] = physical.id
+        link_id = f"enclosure-observation:{physical.id}->{node.id}"
+        links[link_id] = SasFabricLink(id=link_id, source=physical.id, target=node.id,
+                                      kind="enclosure-observation", evidence=["SES enclosure logical id"])
 
     for slot in snapshot.slots:
         if not slot.physical_location_known:
@@ -88,8 +93,7 @@ def project_enclosures(
             continue
         ses_id = node.id
         owner = next(iter(owners))
-        node.kind = "ses-device"
-        node.raw["enclosure_id"] = owner
+        node.raw["physical_enclosure_id"] = owner
         link_id = f"enclosure-ses:{owner}->{ses_id}"
         links[link_id] = SasFabricLink(id=link_id, source=owner, target=ses_id, kind="enclosure-ses",
                                      related_slots=node.related_slots, evidence=["SES enclosure logical id"])
@@ -110,22 +114,10 @@ def project_enclosures(
         if "device_count" in physical.metrics:
             physical.raw["device_count"] = physical.metrics["device_count"]
     nodes.update(by_id)
-    link_replacements: dict[str, str] = {}
-    for old_id, link in list(links.items()):
-        source, target = replacements.get(link.source, link.source), replacements.get(link.target, link.target)
-        if (source, target) == (link.source, link.target):
-            continue
-        links.pop(old_id)
-        link.source, link.target = source, target
-        suffix = f":{link.slot}" if link.slot is not None else ""
-        link.id = f"{link.kind}:{source}->{target}{suffix}"
-        link_replacements[old_id] = link.id
-        if link.id in links:
-            links[link.id].related_slots = sorted(set(links[link.id].related_slots) | set(link.related_slots))
-        else:
-            links[link.id] = link
+    # Controller-local observations and their original links remain intact.
+    # A physical board aggregates them, never replaces path-owned evidence.
     for trace in traces.values():
-        trace.node_ids = list(dict.fromkeys(replacements.get(value, value) for value in trace.node_ids))
-        trace.link_ids = list(dict.fromkeys(link_replacements.get(value, value) for value in trace.link_ids))
         for row in trace.metrics.get("mpr_devices", []):
-            row["enclosure_id"] = replacements.get(row.get("enclosure_id"), row.get("enclosure_id"))
+            identity = replacements.get(row.get("enclosure_id"))
+            if identity:
+                row["physical_enclosure_id"] = identity

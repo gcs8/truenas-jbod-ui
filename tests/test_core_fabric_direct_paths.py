@@ -533,7 +533,12 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({link.target for link in fabric.links if link.kind == "enclosure-bay"}, {"bay:0", "bay:1"})
         self.assertFalse([node for node in fabric.nodes if node.kind == "backplane"])
         self.assertNotIn("Backplane Zone", fabric.model_dump_json())
-        self.assertEqual({row["enclosure_id"] for row in self.bay(fabric).metrics["mpr_devices"]}, {boards[0].id})
+        observed = {node.id for node in fabric.nodes if node.kind == "mpr-enclosure"}
+        self.assertEqual(observed, {"mpr-enclosure:controller:mpr0:0002", "mpr-enclosure:controller:mpr1:0007"})
+        self.assertTrue(all(node.raw.get("physical_enclosure_id") == boards[0].id
+                            for node in fabric.nodes if node.id in observed))
+        self.assertEqual({link.target for link in fabric.links if link.kind == "enclosure-observation"}, observed)
+        self.assertEqual({row["physical_enclosure_id"] for row in self.bay(fabric).metrics["mpr_devices"]}, {boards[0].id})
 
     async def test_same_disk_alias_listed_by_ses_is_an_alternate_path(self):
         alias_disk = {"name": "da11", "devname": "da3", "serial": "SANITIZED-DIRECT-DISK"}
