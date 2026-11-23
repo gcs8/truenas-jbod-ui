@@ -200,7 +200,9 @@ def lifecycle_probe(directory, schedule):
                 start_source()
             else:
                 assert command[-1] == "--check"
+                calls_before = len(producer.CALLS)
                 producer.check(source_port)
+                assert "enclosure.query" in producer.CALLS[calls_before:], "producer check did not answer an enclosure read"
                 events.append([generation, "producer-ready"])
         elif "ps" in command:
             return Mock(stdout="enclosure-ui\nenclosure-history\n")
@@ -335,6 +337,16 @@ class ComposeRuntimeReadinessContractTests(unittest.TestCase):
               self.assertRaisesRegex(RuntimeError, "paired unread")):
             self.matrix._verify_mapping_cycle(Path("synthetic"), self.matrix.VARIANTS[0], self.ports, ())
         unread.assert_called_once_with("http://127.0.0.1:19080")
+        self.assertTrue(all(call.kwargs.get("method", "GET") == "GET" for call in request.call_args_list))
+
+    def test_changed_default_still_reaches_real_paired_source_guard(self):
+        inventory = {"selected_system_id": "another-system", "selected_enclosure_id": None,
+                     "slots": [{"slot": 0, "mapping_revision": "a" * 64}]}
+        with (patch.object(self.matrix, "_require_status", return_value=json.dumps(inventory).encode()) as request,
+              self.assertRaisesRegex(RuntimeError, "Unread mapping source is unavailable; paired refusal check cannot run")):
+            self.matrix._verify_mapping_cycle(Path("synthetic"), self.matrix.VARIANTS[0], self.ports, ())
+        self.assertEqual(len(request.call_args_list), 2)
+        self.assertTrue(request.call_args_list[-1].args[0].endswith("/api/inventory?system_id=matrix-unread"))
         self.assertTrue(all(call.kwargs.get("method", "GET") == "GET" for call in request.call_args_list))
 
     def test_missing_unread_system_cannot_be_substituted_by_live_default(self):
