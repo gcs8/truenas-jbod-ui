@@ -238,18 +238,38 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         cls._class_directory.cleanup()
 
     def setUp(self) -> None:
-        self._import_roots_before = set(
-            Path(tempfile.gettempdir()).glob("truenas-jbod-ui-import-*")
-        )
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
+        # Hard-exiting children cannot clean their import workspaces. Keep them
+        # inside this fixture, including recovery commands in fresh interpreters.
+        self.enterContext(patch.object(tempfile, "tempdir", self._directory.name))
+        self.enterContext(patch.dict(os.environ, {"TMPDIR": self._directory.name}))
 
-    def tearDown(self) -> None:
-        for import_root in (
-            set(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-import-*"))
-            - self._import_roots_before
-        ):
-            shutil.rmtree(import_root, ignore_errors=True)
+    def test_crashing_fixture_restores_shared_temporary_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as shared:
+            shared_root = Path(shared)
+            prefixes = ("truenas-jbod-ui-import-", "truenas-jbod-ui-file-import-")
+            for prefix in prefixes:
+                sentinel = shared_root / (prefix + "unrelated")
+                sentinel.mkdir()
+                (sentinel / "bundle.tar").write_bytes(b"unrelated synthetic bundle")
+            before = _tree_snapshot(shared_root)
+            with patch.object(tempfile, "tempdir", shared), patch.dict(os.environ, {"TMPDIR": shared}):
+                fixture = InterruptedRestoreRecoveryTests()
+                fixture.setUp()
+                try:
+                    pid = os.fork()
+                    if pid == 0:
+                        for prefix in prefixes:
+                            workspace = Path(tempfile.mkdtemp(prefix=prefix))
+                            (workspace / "bundle.tar").write_bytes(b"interrupted synthetic bundle")
+                        os._exit(CRASH_EXIT)
+                    _, status = os.waitpid(pid, 0)
+                    self.assertEqual(os.waitstatus_to_exitcode(status), CRASH_EXIT)
+                finally:
+                    fixture.tearDown()
+                    fixture.doCleanups()
+            self.assertEqual(_tree_snapshot(shared_root), before)
 
     # Fixtures ---------------------------------------------------------------
 
