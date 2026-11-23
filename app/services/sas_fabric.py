@@ -194,10 +194,6 @@ class SasFabricBuildContext:
     # with their UTC read time, shown until the expander is due for its next
     # read (#1088 review).
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None
-    # Lookup keys of every API disk the inventory read, including unplaced
-    # disks and disks on other enclosures (#1471). Process-local input, never
-    # part of the snapshot or the fabric payload. None means unknown.
-    disk_lookup_keys: tuple[frozenset[str], ...] | None = None
 
 
 class SasFabricBuilder(Protocol):
@@ -249,7 +245,6 @@ def _build_sas_fabric_context(
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
-    disk_lookup_keys: Iterable[Iterable[str]] | None = None,
 ) -> SasFabricBuildContext:
     return SasFabricBuildContext(
         system=system,
@@ -262,9 +257,6 @@ def _build_sas_fabric_context(
         alias_map=_sas_fabric_alias_map(aliases or []),
         expander_counter_capability=expander_counter_capability,
         expander_counter_reads=expander_counter_reads,
-        disk_lookup_keys=(
-            None if disk_lookup_keys is None else tuple(frozenset(keys) for keys in disk_lookup_keys)
-        ),
     )
 
 
@@ -287,7 +279,6 @@ def build_sas_fabric_snapshot(
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
     expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
-    disk_lookup_keys: Iterable[Iterable[str]] | None = None,
 ) -> SasFabricSnapshot:
     context = _build_sas_fabric_context(
         system=system,
@@ -299,7 +290,6 @@ def build_sas_fabric_snapshot(
         aliases=aliases,
         expander_counter_capability=expander_counter_capability,
         expander_counter_reads=expander_counter_reads,
-        disk_lookup_keys=disk_lookup_keys,
     )
     return _select_sas_fabric_builder(context).build(context)
 
@@ -518,10 +508,15 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
     members_by_slot = _core_path_members(
-        snapshot.slots, cam_devices, context.disk_lookup_keys, known_controllers=unit_controller_names,
+        snapshot.slots, cam_devices, snapshot_fabric_disk_ownership(snapshot), known_controllers=unit_controller_names,
     )
     if members_by_slot.limit_reached:
         fabric_warnings.append(members_by_slot.limit_warning())
+    if members_by_slot.ownership_limited:
+        fabric_warnings.append(
+            f"Storage Fabric alternate paths were not read for {len(members_by_slot.ownership_limited)} bays: "
+            f"API disks listed more than {MAX_FABRIC_OWNERSHIP_DEVICE_KEYS} device names, so ownership was not read."
+        )
     path_counts, path_slots = _path_counts_from_slots(snapshot.slots, members_by_slot)
     controller_names = sorted(unit_controller_names | set(path_counts))
 
@@ -2199,6 +2194,49 @@ PATH_LIMIT_REASON = "path limit reached"
 CONTROLLER_LIMIT_REASON = "controller limit reached"
 
 
+# API disk ownership for direct-path peer admission (#1471): only normalized
+# `daN` device names, each mapped to its owning disk. It rides on the in-memory
+# snapshot object it was built with, so it is freed with that snapshot, and is
+# never serialized. More names than the limit leave ownership not read for that
+# snapshot: no direct peers, one warning, never a partial set.
+MAX_FABRIC_OWNERSHIP_DEVICE_KEYS = 16384
+OWNERSHIP_LIMIT_REASON = "ownership limit reached"
+_CORE_DA_DEVICE = re.compile(r"da[0-9]{1,5}")
+_FABRIC_OWNERSHIP_ATTRIBUTE = "_fabric_disk_ownership"
+
+
+@dataclass(frozen=True, slots=True)
+class FabricDiskOwnership:
+    owners: Mapping[str, int] | None
+    over_limit: bool = False
+
+
+def fabric_disk_ownership(disk_keys: Iterable[Iterable[str]]) -> FabricDiskOwnership:
+    """Index each disk's `daN` names by disk ordinal; stop at the limit."""
+    owners: dict[str, int] = {}
+    for ordinal, keys in enumerate(disk_keys):
+        for key in keys:
+            if not isinstance(key, str) or len(key) > 7:
+                continue
+            name = key.lower()
+            if not _CORE_DA_DEVICE.fullmatch(name):
+                continue
+            if name not in owners and len(owners) >= MAX_FABRIC_OWNERSHIP_DEVICE_KEYS:
+                return FabricDiskOwnership(owners=None, over_limit=True)
+            owners[name] = ordinal  # last writer wins, as in `_index_disk_records`
+    return FabricDiskOwnership(owners=owners)
+
+
+def attach_fabric_disk_ownership(snapshot: InventorySnapshot, ownership: FabricDiskOwnership) -> None:
+    """Attach to the live snapshot object only; pydantic does not serialize it."""
+    setattr(snapshot, _FABRIC_OWNERSHIP_ATTRIBUTE, ownership)
+
+
+def snapshot_fabric_disk_ownership(snapshot: InventorySnapshot) -> FabricDiskOwnership | None:
+    ownership = vars(snapshot).get(_FABRIC_OWNERSHIP_ATTRIBUTE)
+    return ownership if isinstance(ownership, FabricDiskOwnership) else None
+
+
 # A CAM controller (SIM) name as `camcontrol devlist -v` prints it: a lowercase
 # FreeBSD driver name (mpr, mps, mpt, isp, umass-sim, mpi3mr, ...) ending in a
 # letter, then a 1-4 digit unit (the unit rule of `admit_mpr_unit_number`). The
@@ -2227,6 +2265,7 @@ class _CorePathMembers(dict[int, list[MultipathMember]]):
         self.path_limited: set[int] = set()
         self.not_read_reasons: dict[int, str] = {}
         self.refused: set[int] = set()
+        self.ownership_limited: set[int] = set()
 
     @property
     def limit_reached(self) -> bool:
@@ -2247,9 +2286,12 @@ class _CorePathMembers(dict[int, list[MultipathMember]]):
         return {"not_read": ["controller"]} if id(member) in self.refused else {}
 
     def bay_not_read(self, slot: int) -> dict[str, Any]:
-        if slot not in self.path_limited:
-            return {}
-        return {"not_read": ["path_states"], "not_read_reasons": {"path_states": PATH_LIMIT_REASON}}
+        reasons = {}
+        if slot in self.path_limited:
+            reasons["path_states"] = PATH_LIMIT_REASON
+        if slot in self.ownership_limited:
+            reasons["alternate_paths"] = OWNERSHIP_LIMIT_REASON
+        return {"not_read": list(reasons), "not_read_reasons": reasons} if reasons else {}
 
 
 def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) -> None:
@@ -2291,7 +2333,7 @@ def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) ->
 
 
 def _core_path_members(
-    slots: list[SlotView], cam_devices: Any, disk_lookup_keys: tuple[frozenset[str], ...] | None = None,
+    slots: list[SlotView], cam_devices: Any, ownership: FabricDiskOwnership | None = None,
     *, known_controllers: set[str] | frozenset[str] = frozenset(),
 ) -> _CorePathMembers:
     """Use the inventory's shared-bay rule when no geom lists the disk's paths.
@@ -2301,10 +2343,13 @@ def _core_path_members(
     view does, and against the rendered bays, so a name another bay claims is
     not borrowed. Without the API index no peer is admitted.
     """
-    # Last writer wins, as in inventory's `_index_disk_records`. Each disk's key
-    # set is its owner identity.
+    # Each disk's `daN` name set is its owner identity for the shared rule.
+    by_disk: dict[int, set[str]] = defaultdict(set)
+    for name, ordinal in ((ownership.owners or {}) if ownership is not None else {}).items():
+        by_disk[ordinal].add(name)
+    disk_names = {ordinal: frozenset(names) for ordinal, names in by_disk.items()}
     api_owners: dict[str, frozenset[str]] = {
-        key: keys for keys in (disk_lookup_keys or ()) for key in keys
+        name: disk_names[ordinal] for name, ordinal in ((ownership.owners or {}) if ownership is not None else {}).items()
     }
     owners: dict[str, Any] = {}
     conflicting_owner = object()
@@ -2340,7 +2385,7 @@ def _core_path_members(
         names = raw.get("device_names")
         if (
             slot_occupancy(slot) != "present" or not slot.physical_location_known or not _slot_ses_devices(slot)
-            or not own or not re.fullmatch(r"da[0-9]+", own)
+            or not own or not _CORE_DA_DEVICE.fullmatch(own)
             or not isinstance(names, list) or owners.get(own.lower()) is not slot
         ):
             continue
@@ -2352,10 +2397,12 @@ def _core_path_members(
         ) if api_owner is not None else set()
         listed = list(dict.fromkeys(
             name for value in names if isinstance(value, str)
-            if (name := normalize_device_name(value)) and re.fullmatch(r"da[0-9]+", name)
+            if (name := normalize_device_name(value)) and _CORE_DA_DEVICE.fullmatch(name)
         ))
         if own not in listed:
             continue
+        if ownership is not None and ownership.over_limit and len(listed) > 1:
+            result.ownership_limited.add(slot.slot)
         # Only a hint naming an admitted path establishes current pool usage.
         # The API's preferred device and a stale hint do not establish it.
         in_use = normalize_device_name(raw.get("pool_device_name"))

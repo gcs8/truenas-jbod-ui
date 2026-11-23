@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import MultipathMember, MultipathView, SlotView
-from app.services.sas_fabric import _cam_member_target, _core_path_members, build_sas_fabric_snapshot
+from app.services import sas_fabric
+from app.services.sas_fabric import (
+    FabricDiskOwnership, _cam_member_target, _core_path_members, attach_fabric_disk_ownership,
+    build_sas_fabric_snapshot, fabric_disk_ownership, snapshot_fabric_disk_ownership,
+)
 from app.services.parsers import parse_camcontrol_devlist
 from app.services.ssh_probe import SSHCommandResult
 from app.services.truenas_ws import TrueNASRawData
@@ -94,16 +98,14 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.inventory_service = service
         snapshot = await service.get_snapshot()
         # The process-local API ownership evidence recorded by this build.
-        self.disk_lookup_keys = service._sas_fabric_disk_lookup_keys(snapshot)
-        self.assertIsNotNone(self.disk_lookup_keys)
+        self.assertIsNotNone(snapshot_fabric_disk_ownership(snapshot))
         self.assertEqual(snapshot.slots[0].raw_status["device_names"], ["da3", "da11"])
         self.assertIsNone(snapshot.slots[0].multipath)
         self.assertEqual(snapshot.slots[0].pool_name, "synthetic-pool")
         return system, snapshot, outputs
 
-    def build(self, system, snapshot, outputs, *, disk_lookup_keys=True):
-        keys = self.disk_lookup_keys if disk_lookup_keys is True else disk_lookup_keys
-        return build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs=outputs, disk_lookup_keys=keys)
+    def build(self, system, snapshot, outputs):
+        return build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs=outputs)
 
     def bay(self, fabric):
         return next(trace for trace in fabric.traces if trace.id == "bay:0")
@@ -194,19 +196,23 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_inventory_peer_validation_does_not_admit_raw_ses_peer(self):
         system, snapshot, outputs = await self.fixture()
-        # Rendered bays alone cannot prove a co-listed name is unowned: without
-        # the API ownership evidence, no peer is admitted.
-        bay = self.bay(self.build(system, snapshot, outputs, disk_lookup_keys=None))
-        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da11"])
-        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
-        # The evidence is a builder input, not snapshot or payload data: a
-        # snapshot rebuilt from its payload pairs the same with it.
+        # The ownership evidence lives only on the snapshot object its build
+        # produced. A snapshot rebuilt from its payload has none, so rendered
+        # bays alone cannot prove a co-listed name is unowned: no peer.
         payload = snapshot.model_dump(mode="json")
         reloaded = type(snapshot).model_validate(payload)
-        fabric = self.build(system, reloaded, outputs)
-        self.assertEqual(len(self.bay(fabric).metrics["path_states"]), 2)
+        self.assertIsNone(snapshot_fabric_disk_ownership(reloaded))
         self.assertEqual(reloaded.model_dump(mode="json"), payload)
-        self.assertNotIn("lookup_keys", json.dumps(payload) + fabric.model_dump_json())
+        bay = self.bay(self.build(system, reloaded, outputs))
+        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da11"])
+        self.assertEqual([row["member_device_name"] for row in bay.metrics["mpr_devices"]], ["da11"])
+        fabric = self.build(system, snapshot, outputs)
+        serialized = json.dumps(payload) + snapshot.model_dump_json() + fabric.model_dump_json() + repr(snapshot)
+        for marker in ("_fabric_disk_ownership", "FabricDiskOwnership"):
+            self.assertNotIn(marker, serialized)
+        # Copies of the same build (cache adoption, enclosure views) keep it.
+        for copied in (snapshot.model_copy(), snapshot.model_copy(deep=True), snapshot.model_copy(update={"warnings": ["x"]})):
+            self.assertEqual(len(self.bay(self.build(system, copied, outputs)).metrics["path_states"]), 2)
 
     async def test_invalid_cam_controller_is_not_read_before_direct_projection(self):
         system, snapshot, outputs = await self.fixture()
@@ -214,7 +220,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(length=len(token), suffix=token[-12:]):
                 changed = {**outputs, "camcontrol devlist -v": outputs["camcontrol devlist -v"].replace("on mpr0 bus", f"on {token} bus")}
                 cam = parse_camcontrol_devlist(changed["camcontrol devlist -v"])
-                direct = _core_path_members(snapshot.slots, cam, self.disk_lookup_keys)[0]
+                direct = _core_path_members(snapshot.slots, cam, snapshot_fabric_disk_ownership(snapshot))[0]
                 self.assertIsNone(next(member for member in direct if member.device_name == "da3").controller_label)
                 fabric = self.build(system, snapshot, changed)
                 bay = self.bay(fabric)
@@ -229,7 +235,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         for token in ("mpr0", "mpr9999", "mps2", "mpt0", "mps9", "mpr1"):
             with self.subTest(valid_controller=token):
                 cam = parse_camcontrol_devlist(outputs["camcontrol devlist -v"].replace("on mpr0 bus", f"on {token} bus"))
-                direct = _core_path_members(snapshot.slots, cam, self.disk_lookup_keys)[0]
+                direct = _core_path_members(snapshot.slots, cam, snapshot_fabric_disk_ownership(snapshot))[0]
                 self.assertEqual(next(member for member in direct if member.device_name == "da3").controller_label, token)
 
     async def test_preexisting_multipath_projection_uses_same_controller_guard(self):
@@ -293,7 +299,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("path:mpr0:standby", {node.id for node in service._observed_sas_fabric_nodes(bundle, snapshots)})
         # Evidence from another build is never borrowed by a snapshot it did
         # not produce: an unknown snapshot reads as no ownership evidence.
-        self.assertIsNone(service._sas_fabric_disk_lookup_keys(snapshot.model_copy(update={"generated_at": snapshot.generated_at.replace(year=2000)})))
+        self.assertIsNone(snapshot_fabric_disk_ownership(type(snapshot).model_validate(snapshot.model_dump())))
 
     async def test_mixed_cam_controllers_keep_existing_multipath_links(self):
         system, _snapshot, _outputs = await self.fixture()
@@ -358,7 +364,9 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
             for index, name in enumerate(names):
                 unit = bay * paths + index
                 cam.append(f"scbus{unit} on hba{unit} bus 0:\n<ExampleCo SAME-MODEL 0001> at scbus{unit} target 1 lun 0 ({name},pass{unit})")
-        return snapshot.model_copy(update={"slots": slots}), tuple(keys), "\n".join(cam)
+        scaled = snapshot.model_copy(update={"slots": slots})
+        attach_fabric_disk_ownership(scaled, fabric_disk_ownership(keys))
+        return scaled, tuple(keys), "\n".join(cam)
 
     def assert_within_limits(self, fabric, *, bays):
         from app.services import sas_fabric
@@ -376,7 +384,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         for multipath in (False, True):
             with self.subTest(multipath=multipath):
                 scaled, keys, cam = self.scaled_snapshot(snapshot, bays=bays, paths=paths, multipath=multipath)
-                fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+                fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam})
                 self.assert_within_limits(fabric, bays=bays)
                 traces = {trace.id: trace for trace in fabric.traces}
                 for bay in range(bays):
@@ -405,7 +413,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
             slot.multipath.members = [
                 member.model_copy(update={"controller_label": f"hba{index}"}) for index, member in enumerate(slot.multipath.members)
             ]
-        fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+        fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam})
         self.assert_within_limits(fabric, bays=bays)
         self.assertEqual(sum(node.id.startswith("path:") for node in fabric.nodes), sas_fabric.MAX_FABRIC_PATH_NODES)
         limited = [trace for trace in fabric.traces if trace.kind == "bay" and "path_states" in (trace.metrics.get("not_read") or [])]
@@ -418,7 +426,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
             for multipath in (False, True):
                 with self.subTest(paths=paths, multipath=multipath):
                     scaled, keys, cam = self.scaled_snapshot(snapshot, bays=3, paths=paths, multipath=multipath)
-                    fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam}, disk_lookup_keys=keys)
+                    fabric = self.build(system, scaled, {**outputs, "camcontrol devlist -v": cam})
                     self.assertFalse([warning for warning in fabric.warnings if "limit" in warning])
                     for trace in (trace for trace in fabric.traces if trace.kind == "bay"):
                         self.assertEqual(len(trace.metrics["path_states"]), paths)
@@ -426,6 +434,63 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn("not_read_reasons", trace.metrics)
                         self.assertTrue(all("not_read_reasons" not in row for row in trace.metrics["path_states"]))
                         self.assertEqual(len({row["controller"] for row in trace.metrics["path_states"]}), paths)
+
+    async def test_ownership_is_freed_with_its_snapshot_across_forced_and_rejected_builds(self):
+        import gc
+        import weakref
+
+        system, snapshot, outputs = await self.fixture()
+        service = self.inventory_service
+
+        def live_ownership():
+            gc.collect()
+            return sum(isinstance(item, FabricDiskOwnership) for item in gc.get_objects())
+
+        first = weakref.ref(snapshot)
+        del snapshot
+        baseline = None
+        for round_ in range(6):
+            # A forced, published build replaces the cached snapshot; a build
+            # that is never published is discarded at once.
+            published = await service.get_snapshot(force_refresh=True)
+            self.assertIsNotNone(snapshot_fabric_disk_ownership(published))
+            discarded = await service._build_snapshot(force_source_refresh=True)
+            self.assertIsNotNone(snapshot_fabric_disk_ownership(discarded))
+            del published, discarded
+            count = live_ownership()
+            baseline = count if baseline is None else baseline
+            self.assertEqual(count, baseline, f"ownership grew on round {round_}")
+        gc.collect()
+        self.assertIsNone(first())
+        self.assertLessEqual(baseline, 2)
+        self.assertFalse([
+            name for name, value in vars(service).items()
+            if isinstance(value, dict) and any(isinstance(item, FabricDiskOwnership) for item in value.values())
+        ])
+        self.assertFalse([name for name, value in vars(sas_fabric).items() if isinstance(value, (dict, list, set)) and any(
+            isinstance(item, FabricDiskOwnership) for item in (value.values() if isinstance(value, dict) else value)
+        )])
+
+    async def test_ownership_over_its_limit_admits_no_direct_peer_and_says_so(self):
+        system, snapshot, outputs = await self.fixture()
+        self.assertEqual(len(self.bay(self.build(system, snapshot, outputs)).metrics["path_states"]), 2)
+        keys = [{f"da{index}"} for index in range(sas_fabric.MAX_FABRIC_OWNERSHIP_DEVICE_KEYS)]
+        at_limit = fabric_disk_ownership([*keys, {"da11", "da3"}, {"serial-only", "multipath/disk0"}])
+        self.assertFalse(at_limit.over_limit)
+        over = fabric_disk_ownership([*keys, {"da99999"}])
+        self.assertTrue(over.over_limit)
+        self.assertIsNone(over.owners)
+        # A name the peer rule could never match is not indexed at all.
+        self.assertNotIn("da123456", fabric_disk_ownership([{"da123456", "da1"}]).owners)
+        changed = snapshot.model_copy(deep=True)
+        attach_fabric_disk_ownership(changed, over)
+        fabric = self.build(system, changed, outputs)
+        bay = self.bay(fabric)
+        self.assertEqual([row["device_name"] for row in bay.metrics["path_states"]], ["da11"])
+        self.assertIn("alternate_paths", bay.metrics["not_read"])
+        self.assertEqual(bay.metrics["not_read_reasons"]["alternate_paths"], "ownership limit reached")
+        self.assertEqual(sum("ownership" in warning for warning in fabric.warnings), 1)
+        self.assertNotIn("not_read", self.bay(self.build(system, snapshot, outputs)).metrics)
 
     async def test_other_bay_claim_of_own_direct_device_refuses_the_bay(self):
         system, snapshot, outputs = await self.fixture()
