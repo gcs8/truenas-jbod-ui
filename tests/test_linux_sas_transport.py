@@ -308,6 +308,9 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual(cable["state"], "read")
         disk = by_id["sas-port:port-2:1:2"]
         self.assertEqual((disk["remote_kind"], disk["has_block"]), ("end_device", True))
+        # A far end is "reported" only where one was resolved; otherwise not read.
+        for row in census:
+            self.assertEqual(row["target_basis"], "not_read" if row["remote_kind"] == "not_read" else "reported", row["id"])
         self.assertEqual((disk["bay_identifier"], disk["enclosure_identifier"]), (7, REAR))
         self.assertEqual(disk["phys"], [7])
         # No selected primary block binding: the host-wide census is still the
@@ -322,13 +325,23 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
         self.assertEqual(fabric(json.dumps(reversed_payload)).raw.get("sas_transport_ports"), census)
 
     def test_census_refuses_ambiguous_target_and_incoherent_phy_membership(self):
-        for mutation in ("wrong_remote", "two_remotes", "missing_phy", "foreign_owner"):
+        control = {row["id"]: row for row in fabric(json.dumps(self.payload)).raw["sas_transport_ports"]}
+        self.assertEqual(control["sas-port:port-2:1:2"]["remote_kind"], "end_device")
+        for mutation in ("wrong_remote", "two_remotes", "renamed_remote", "foreign_remote_owner", "missing_phy", "foreign_owner"):
             payload = deepcopy(self.payload)
             port = next(row for row in payload["rows"] if row["kind"] == "sas_port" and row["name"] == "port-2:1:2")
+            end = next(row for row in payload["rows"] if row["kind"] == "sas_end_device" and row["name"] == "end_device-2:1:2")
             if mutation == "wrong_remote":
                 port["links"]["end_device-2:1:2"] = port["path"] + "/end_device-2:1:9"
             elif mutation == "two_remotes":
                 port["links"]["end_device-2:1:9"] = port["path"] + "/end_device-2:1:9"
+            elif mutation == "renamed_remote":
+                # The link names another device than the row at its path.
+                port["links"]["end_device-2:1:9"] = port["links"].pop("end_device-2:1:2")
+            elif mutation == "foreign_remote_owner":
+                # The linked row has the link's name, but another port owns it.
+                end["path"] = end["path"].replace("port-2:1:2/", "port-2:1:9/")
+                port["links"]["end_device-2:1:2"] = end["path"]
             elif mutation == "missing_phy":
                 port["links"].pop("phy-2:1:7")
             else:
@@ -337,10 +350,14 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
                 census = fabric(json.dumps(payload)).raw.get("sas_transport_ports", [])
                 self.assertEqual(len(census), 3)
                 row = next(row for row in census if row["id"] == "sas-port:port-2:1:2")
-                if mutation in {"wrong_remote", "two_remotes"}:
+                if mutation in {"wrong_remote", "two_remotes", "renamed_remote", "foreign_remote_owner"}:
                     self.assertEqual(row["remote_kind"], "not_read")
+                    self.assertEqual(row["target_basis"], "not_read")
+                    self.assertIsNone(row["remote_id"])
                     self.assertIsNone(row["enclosure_identifier"])
                     self.assertIsNone(row["has_block"])
+                    # The PHY membership is unaffected by the far end.
+                    self.assertEqual(row["phys"], control["sas-port:port-2:1:2"]["phys"])
                 else:
                     self.assertEqual(row["state"], "not_read")
                     self.assertEqual(row["phys"], [])

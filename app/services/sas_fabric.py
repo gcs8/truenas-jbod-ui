@@ -143,7 +143,6 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
 )
 
 _INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
-_PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
 _SLOT_MULTIPATH_EVIDENCE = ("multipath members",)
 _LINUX_SES_PATH_EVIDENCE = (
     "lsscsi -g",
@@ -428,32 +427,6 @@ def _add_host_node(
     )
 
 
-def _add_backplane_zone_nodes(
-    nodes: dict[str, SasFabricNode],
-    snapshot: InventorySnapshot,
-) -> dict[int, dict[str, Any]]:
-    # Geometry is not hardware evidence. Never fabricate boards from quarters.
-    backplane_zones: dict[int, dict[str, Any]] = {}
-    for zone in backplane_zones.values():
-        add_node(
-            nodes,
-            SasFabricNode(
-                id=zone["id"],
-                kind="backplane",
-                label=zone["label"],
-                related_slots=zone["slots"],
-                metrics={
-                    "zone": zone["index"] + 1,
-                    "slot_range": zone["range"],
-                    "slot_count": len(zone["slots"]),
-                },
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-                raw=zone,
-            ),
-        )
-    return backplane_zones
-
-
 def _add_pool_vdev_nodes_and_links(
     *,
     slot: SlotView,
@@ -541,9 +514,10 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             f"{'was' if len(omitted_units) == 1 else 'were'} not read."
         )
     ownership = snapshot_fabric_disk_ownership(snapshot)
+    path_evidence_read = _snapshot_path_evidence_read(ownership, normalized_outputs)
     members_by_slot = _core_path_members(
         snapshot.slots, cam_devices, ownership, known_controllers=unit_controller_names,
-        path_evidence_read=_snapshot_path_evidence_read(ownership, normalized_outputs),
+        path_evidence_read=path_evidence_read,
     )
     if members_by_slot.limit_reached:
         fabric_warnings.append(members_by_slot.limit_warning())
@@ -703,14 +677,13 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
     )
     # CAM's per-device target on its own controller is the identity that ties a
     # member disk to its `mprutil show devices` row (#936).
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
+    multipath_detail_unread_bays: set[int] = set()
 
     for slot in snapshot.slots:
         bay_id = f"bay:{slot.slot}"
         bay_related_nodes = ["host", bay_id]
         bay_related_links: list[str] = []
         mpr_device_metrics: list[dict[str, Any]] = []
-        backplane_zone = backplane_zones.get(slot.slot)
         add_node(
             nodes,
             SasFabricNode(
@@ -730,20 +703,17 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=[slot.slot],
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_nodes.append(backplane_zone["id"])
-            bay_related_links.append(backplane_link.id)
         slot_members = members_by_slot[slot.slot]
         direct_members = not (slot.multipath and slot.multipath.members)
+        # Multipath members keep their gmultipath controller, but their port
+        # detail is read only from the CAM/mprutil replies of the bay's read.
+        # Every CORE inventory build records the digest of its replies; only a
+        # recorded mismatch is a later read. A snapshot without that record
+        # was not built from a read in this process (hand-built fixtures).
+        port_detail_read = direct_members or path_evidence_read or ownership is None or ownership.path_evidence is None
+        if not port_detail_read and any(member.controller_label for member in slot_members):
+            multipath_detail_unread_bays.add(slot.slot)
+        paths_per_controller = Counter(normalize_text(member.controller_label) for member in slot_members)
         for member in slot_members:
             controller_name = normalize_text(member.controller_label)
             if not controller_name:
@@ -760,7 +730,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ]
             )
             bay_related_links.append(link.id)
-            mpr_context = _add_mpr_member_trace_context(
+            mpr_context = {} if not port_detail_read else _add_mpr_member_trace_context(
                 nodes=nodes,
                 links=links,
                 trace_index=mpr_trace_index,
@@ -776,7 +746,9 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 slot_location_numbers=_slot_location_number_candidates(slot),
                 slot_ses_number=_parse_mpr_slot_number((slot.raw_status or {}).get("ses_slot_number")),
                 diagnostics=mpr_kernel_diagnostics,
-                own_evidence=direct_members,
+                # Bay position may pick a row only for the one path of this
+                # bay on its controller; otherwise it could be a sibling's.
+                own_evidence=direct_members or paths_per_controller[controller_name] > 1,
             )
             if mpr_context:
                 bay_related_nodes.extend(mpr_context["node_ids"])
@@ -843,7 +815,8 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                         "controller": member.controller_label,
                         "state": normalize_path_state(member.state),
                         "device_name": member.device_name,
-                        **_path_row_not_read(member, members_by_slot, cam_devices, direct=direct_members),
+                        **_path_row_not_read(member, members_by_slot, cam_devices, direct=direct_members,
+                                             evidence_read=port_detail_read),
                     }
                     for member in slot_members
                 ],
@@ -853,6 +826,11 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             evidence=["inventory snapshot", *(_slot_path_evidence(slot) if slot_members else _SLOT_MULTIPATH_EVIDENCE)],
         )
 
+    if multipath_detail_unread_bays:
+        fabric_warnings.append(
+            f"Storage Fabric multipath port details were not read for {len(multipath_detail_unread_bays)} bays: "
+            "the CAM and mprutil replies are not from the read their bay view was built from."
+        )
     fabric_warnings.extend(_scope_mpr_infrastructure(
         nodes=nodes,
         links=links,
@@ -1255,8 +1233,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             evidence=list(_LINUX_SES_PATH_EVIDENCE),
         )
 
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
-
     for slot in snapshot.slots:
         slot_identity = _slot_storage_identity(slot)
         transport_detail = _slot_linux_transport_detail(slot)
@@ -1270,7 +1246,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             *([_link_id(controller_id, path_id, "controller-path")] if path_id else []),
             *([_link_id(path_id, ses_id, "path-ses-enclosure")] if path_id and ses_id else []),
         ]
-        backplane_zone = backplane_zones.get(slot.slot)
         add_node(
             nodes,
             SasFabricNode(
@@ -1308,18 +1283,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
                 },
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=[slot.slot],
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_nodes.append(backplane_zone["id"])
-            bay_related_links.append(backplane_link.id)
         if ses_id:
             ses_link = add_link(
                 links,
@@ -1497,7 +1460,6 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
     controllers_by_name: dict[str, dict[str, Any]] = {}
     paths_by_id: dict[str, dict[str, Any]] = {}
     enclosure_nodes: dict[str, SasFabricNode] = {}
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
 
     for slot in evidence_slots:
         raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
@@ -1643,14 +1605,12 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
         )
 
         bay_id = f"bay:{slot.slot}"
-        backplane_zone = backplane_zones.get(slot.slot)
         bay_related_nodes = _dedupe_strings(
             [
                 "host",
                 controller_id,
                 path_id,
                 enclosure_id,
-                *( [backplane_zone["id"]] if backplane_zone else [] ),
                 bay_id,
             ]
         )
@@ -1686,17 +1646,6 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
                 },
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=slot_numbers,
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_links.append(backplane_link.id)
         enclosure_link = add_link(
             links,
             enclosure_id,
@@ -2542,11 +2491,17 @@ def _core_path_members(
 
 
 def _path_row_not_read(
-    member: MultipathMember, members: _CorePathMembers, cam_devices: Any, *, direct: bool,
+    member: MultipathMember, members: _CorePathMembers, cam_devices: Any, *, direct: bool, evidence_read: bool = True,
 ) -> dict[str, Any]:
     limited = members.row_not_read(member)
     if not direct:
-        return limited
+        if evidence_read or not member.controller_label:
+            return limited
+        # A multipath member's port detail from another read is not this path's.
+        return {
+            "not_read": [*limited.get("not_read", []), "target"],
+            "not_read_reasons": {**limited.get("not_read_reasons", {}), "target": PATH_EVIDENCE_REASON},
+        }
     if id(member) in members.evidence_unread:
         row = _direct_member_not_read(member, None)
         row["not_read_reasons"] = {field: PATH_EVIDENCE_REASON for field in ("controller", "target")}
@@ -3272,34 +3227,6 @@ def _bay_label(slot: SlotView) -> str:
     """
     label = str(slot.slot_label or "").strip()
     return label if label.isdigit() else f"{slot.slot:02d}"
-
-
-def _backplane_zones_for_slots(slots: list[SlotView]) -> dict[int, dict[str, Any]]:
-    labels = {slot.slot: _bay_label(slot) for slot in slots if isinstance(slot.slot, int)}
-    slot_numbers = _snapshot_slot_numbers(slots)
-    if not slot_numbers:
-        return {}
-    slot_count = max(slot_numbers) + 1
-    zone_count = 4 if slot_count >= 4 else 1
-    zone_size = max(1, (slot_count + zone_count - 1) // zone_count)
-    zones_by_slot: dict[int, dict[str, Any]] = {}
-    for zone_index in range(zone_count):
-        start = zone_index * zone_size
-        end = min(slot_count - 1, start + zone_size - 1)
-        zone_slots = [slot for slot in slot_numbers if start <= slot <= end]
-        if not zone_slots:
-            continue
-        zone = {
-            "id": f"backplane:{zone_index}",
-            "index": zone_index,
-            "label": f"Backplane Zone {zone_index + 1}",
-            "slots": zone_slots,
-            "range": f"Bays {labels.get(zone_slots[0], f'{zone_slots[0]:02d}')}-"
-            f"{labels.get(zone_slots[-1], f'{zone_slots[-1]:02d}')}",
-        }
-        for slot in zone_slots:
-            zones_by_slot[slot] = zone
-    return zones_by_slot
 
 
 def _sas_fabric_alias_map(aliases: list[SasFabricAlias]) -> dict[str, SasFabricAlias]:

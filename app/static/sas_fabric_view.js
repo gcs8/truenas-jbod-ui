@@ -42,7 +42,7 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, backplane zone and disk.",
+      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, enclosure and disk.",
     },
   };
 
@@ -500,11 +500,11 @@
           },
           trace: {
             title: "Physical Trace",
-            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
+            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure and disk layers.",
           },
           disk: {
             title: "Disk Path",
-            subtitle: "Pick a bay and render the read-only Linux SES path from host to SG enclosure, backplane zone, and disk.",
+            subtitle: "Pick a bay and render the read-only Linux SES path from host to SG enclosure and disk.",
           },
         },
         summary: {
@@ -2978,8 +2978,10 @@
     return Boolean(seed.device_name) && list(trace.evidence).includes("sesutil map shared bay");
   }
 
+  // A named member's port detail is its own MPR row or not read, whether or
+  // not another path of the bay has a row (the producer's own-evidence rule).
   function branchPortNotRead(seed, mprDevice, trace) {
-    return Boolean(seed.device_name) && !mprDevice && (ownDirectPath(seed, trace) || list(trace.metrics?.mpr_devices).length > 0);
+    return Boolean(seed.device_name) && !mprDevice;
   }
 
   // Bay-level reachability is not a path identity, for cards or faults.

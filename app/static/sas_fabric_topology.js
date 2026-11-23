@@ -1584,7 +1584,7 @@ function buildTopologyModel(given, options = {}) {
       // A path takes only a row its own evidence names: the row of its own
       // member device, or the one row of its controller when that controller
       // has one path and neither names a member. Otherwise not read: never a
-      // sibling path's row (Codex review, #1504).
+      // sibling path's row (#1504).
       const memberOf = (state) => text(state.raw?.member_device_name) || state.device;
       const statesOn = (name) => pathStates.filter((state) => state.controller === name);
       for (const state of pathStates) {

@@ -230,14 +230,14 @@ def _add_mpr_member_trace_context(
     enc_handle = str(device_context.get("enclosure_handle") or "")
     enclosure_id = trace_index.get("enclosures", {}).get((controller_id, enc_handle))
     expander_ids = list(trace_index.get("expanders", {}).get((controller_id, enc_handle), []))
-    if own_evidence or member_target is not None:
-        # Handles are controller-local. A bay may contain several expanders.
-        parent = _mpr_handle(device_context.get("parent"))
-        expander_ids = [node_id for node_id in expander_ids
-                        if node_id in nodes and parent is not None
-                        and _mpr_handle(nodes[node_id].raw.get("dev_handle")) == parent]
-        if len(expander_ids) != 1:
-            expander_ids = []
+    # Handles are controller-local and an enclosure may hold several
+    # expanders: a joined row names only its own parent expander.
+    parent = _mpr_handle(device_context.get("parent"))
+    expander_ids = [node_id for node_id in expander_ids
+                    if node_id in nodes and parent is not None
+                    and _mpr_handle(nodes[node_id].raw.get("dev_handle")) == parent]
+    if len(expander_ids) != 1:
+        expander_ids = []
 
     node_ids: list[str] = []
     path_link_ids: list[str] = []
@@ -423,7 +423,8 @@ def _lookup_mpr_device_context(
             # controller-local CAM target is stronger than that location.
             return context
     if own_evidence:
-        # Direct paths require a readable matching target or an exact name.
+        # Direct paths, and a controller carrying several of this bay's paths,
+        # require a readable matching target or an exact name.
         return None
     if member_target_rejected:
         # CAM printed a target for this member that is not a target number:

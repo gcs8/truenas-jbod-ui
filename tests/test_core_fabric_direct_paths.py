@@ -520,6 +520,95 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row["member_device_name"] for row in bay.metrics["mpr_devices"]}, {"da3", "da4", "da11", "da12"})
         self.assertTrue(all(len(row["expander_ids"]) == 1 for row in bay.metrics["mpr_devices"]))
 
+    def four_multipath_members(self, snapshot, outputs, *, cam_second=True, second_rows=True):
+        """The #1476 shape: two members per HBA, optionally without the second CAM target or MPR row."""
+        members = []
+        for unit, names in enumerate((("da3", "da4"), ("da11", "da12"))):
+            controller = f"mpr{unit}"
+            if second_rows:
+                outputs[f"mprutil -u {unit} show devices"] += (
+                    f"\n01 {5 + unit * 8} 5000c50000000d1{unit} 0021 000a SAS Target 6.0 0002 0"
+                )
+                outputs[f"mprutil -u {unit} show expanders"] += f"\n1 5000c50000000e1{unit} 000a 0001 0002 1"
+            if cam_second:
+                outputs["camcontrol devlist -v"] += (
+                    f"\nscbus{unit} on {controller} bus 0:\n"
+                    f"<ExampleCo SAME-MODEL 0001> at scbus{unit} target {5 + unit * 8} lun 0 ({names[1]},pass{20 + unit})"
+                )
+            members.extend(
+                MultipathMember(device_name=name, controller_label=controller, state="ACTIVE" if name == "da3" else "PASSIVE")
+                for name in names
+            )
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=members)
+
+    def mpr_rows(self, fabric):
+        return {row["member_device_name"]: (row["controller"], row["sas_address"], row["expander_ids"])
+                for row in self.bay(fabric).metrics["mpr_devices"]}
+
+    async def test_multipath_member_without_own_target_never_takes_its_sibling_row(self):
+        # Each HBA printed only its first port row; CAM lacks the second members.
+        system, snapshot, outputs = await self.fixture()
+        self.four_multipath_members(snapshot, outputs, cam_second=False, second_rows=False)
+        rows = self.mpr_rows(self.build(system, snapshot, outputs))
+        # The rows CAM ties to da3 and da11; da4 and da12 share a controller
+        # with them, so bay position cannot pick a row for them.
+        self.assertEqual(rows, {
+            "da3": ("mpr0", "5000c50000000d00", ["expander:controller:mpr0:5000c50000000e00"]),
+            "da11": ("mpr1", "5000c50000000d01", ["expander:controller:mpr1:5000c50000000e01"]),
+        })
+        # Without any CAM reply, no member of a two-path controller is joined.
+        system, snapshot, outputs = await self.fixture()
+        self.four_multipath_members(snapshot, outputs, cam_second=False, second_rows=False)
+        outputs["camcontrol devlist -v"] = ""
+        fabric = self.build(system, snapshot, outputs)
+        self.assertEqual(self.mpr_rows(fabric), {})
+        self.assertEqual([(row["device_name"], row["controller"]) for row in self.bay(fabric).metrics["path_states"]],
+                         [("da3", "mpr0"), ("da4", "mpr0"), ("da11", "mpr1"), ("da12", "mpr1")])
+        # Control: one member per controller still joins its single row.
+        system, snapshot, outputs = await self.fixture()
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name="da3", controller_label="mpr0", state="ACTIVE"),
+            MultipathMember(device_name="da11", controller_label="mpr1", state="PASSIVE")])
+        outputs["camcontrol devlist -v"] = ""
+        self.assertEqual(set(self.mpr_rows(self.build(system, snapshot, outputs))), {"da3", "da11"})
+
+    async def test_multipath_member_expander_is_only_its_row_parent(self):
+        system, snapshot, outputs = await self.fixture()
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name="da3", controller_label="mpr0", state="ACTIVE"),
+            MultipathMember(device_name="da11", controller_label="mpr1", state="PASSIVE")])
+        outputs["camcontrol devlist -v"] = ""
+        outputs["mprutil -u 0 show expanders"] = "1 5000c50000000dff 000a 0001 0002 1\n" + outputs["mprutil -u 0 show expanders"]
+        rows = self.mpr_rows(self.build(system, snapshot, outputs))
+        self.assertEqual(rows["da3"][2], ["expander:controller:mpr0:5000c50000000e00"])
+        self.assertEqual(rows["da11"][2], ["expander:controller:mpr1:5000c50000000e01"])
+
+    async def test_multipath_port_detail_must_be_the_snapshot_build_read(self):
+        system, snapshot, outputs = await self.fixture()
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name="da3", controller_label="mpr0", state="ACTIVE"),
+            MultipathMember(device_name="da11", controller_label="mpr1", state="PASSIVE")])
+        later = dict(outputs)
+        later["mprutil -u 1 show devices"] = later["mprutil -u 1 show devices"].replace("00000d01", "00000d99")
+        fabric = self.build(system, snapshot, later, coherent=False)
+        bay = self.bay(fabric)
+        self.assertEqual(bay.metrics["mpr_devices"], [])
+        self.assertNotIn("5000c50000000d99", fabric.model_dump_json())
+        # The multipath controller labels are the bay view's own; only the
+        # port detail from the other read is withheld.
+        self.assertEqual(bay.metrics["path_states"], [
+            {"controller": "mpr0", "state": "active", "device_name": "da3", "not_read": ["target"],
+             "not_read_reasons": {"target": sas_fabric.PATH_EVIDENCE_REASON}},
+            {"controller": "mpr1", "state": "passive", "device_name": "da11", "not_read": ["target"],
+             "not_read_reasons": {"target": sas_fabric.PATH_EVIDENCE_REASON}},
+        ])
+        self.assertEqual(len([warning for warning in fabric.warnings if "multipath port details" in warning]), 1)
+        # Controls: the same later read built coherently, and an unchanged later read.
+        self.assertEqual(self.mpr_rows(self.build(system, snapshot, later))["da11"][1], "5000c50000000d99")
+        same = self.build(system, snapshot, dict(outputs), coherent=False)
+        self.assertEqual(set(self.mpr_rows(same)), {"da3", "da11"})
+        self.assertFalse([warning for warning in same.warnings if "multipath port details" in warning])
+
     async def test_real_enclosure_key_merges_hba_handles_and_covers_empty_bays(self):
         system, snapshot, outputs = await self.fixture()
         outputs["mprutil -u 1 show enclosures"] = outputs["mprutil -u 1 show enclosures"].replace("0002", "0007")
@@ -539,6 +628,42 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
                             for node in fabric.nodes if node.id in observed))
         self.assertEqual({link.target for link in fabric.links if link.kind == "enclosure-observation"}, observed)
         self.assertEqual({row["physical_enclosure_id"] for row in self.bay(fabric).metrics["mpr_devices"]}, {boards[0].id})
+
+    async def test_enclosure_identity_is_only_one_explicit_logical_id(self):
+        board = f"enclosure:{SHELF}"
+        # A label is not an enclosure identity.
+        system, snapshot, outputs = await self.fixture()
+        for slot in snapshot.slots:
+            slot.enclosure_id = "Front Shelf"
+            slot.raw_status["enclosure_id"] = "Front Shelf"
+        fabric = self.build(system, snapshot, outputs)
+        self.assertEqual([node.id for node in fabric.nodes if node.kind == "enclosure"], [board])
+        self.assertFalse([link.id for link in fabric.links if link.kind == "enclosure-bay"])
+        # Contradictory SES ids on one bay link it to neither board.
+        system, snapshot, outputs = await self.fixture()
+        snapshot.slots[0].raw_status["enclosure_id"] = "5000c50000000f02"
+        fabric = self.build(system, snapshot, outputs)
+        self.assertEqual([node.id for node in fabric.nodes if node.kind == "enclosure"], [board])
+        boards = {node.id: node for node in fabric.nodes if node.kind == "enclosure"}
+        self.assertEqual(boards[board].related_slots, [1])
+        # Control: the agreeing bay is still linked to its board.
+        self.assertEqual({(link.source, link.target) for link in fabric.links if link.kind == "enclosure-bay"},
+                         {(board, "bay:1")})
+
+    async def test_enclosure_metric_the_hbas_disagree_on_is_not_read(self):
+        system, snapshot, outputs = await self.fixture()
+        outputs["mprutil -u 1 show devices"] += "\n00 13 5000c50000000d21 0021 0009 SAS Target 12.0 0002 1"
+        fabric = self.build(system, snapshot, outputs)
+        board = next(node for node in fabric.nodes if node.kind == "enclosure")
+        observed = sorted(row["metrics"]["device_count"] for row in board.raw["observations"])
+        self.assertEqual(observed, [1, 2])
+        self.assertIsNone(board.metrics["device_count"])
+        self.assertIn("device_count", board.metrics["not_read"])
+        # Control: agreeing observations keep the value and are not listed.
+        system, snapshot, outputs = await self.fixture()
+        board = next(node for node in self.build(system, snapshot, outputs).nodes if node.kind == "enclosure")
+        self.assertEqual(board.metrics["device_count"], 1)
+        self.assertNotIn("device_count", board.metrics.get("not_read", []))
 
     async def test_same_disk_alias_listed_by_ses_is_an_alternate_path(self):
         alias_disk = {"name": "da11", "devname": "da3", "serial": "SANITIZED-DIRECT-DISK"}

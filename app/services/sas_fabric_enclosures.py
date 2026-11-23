@@ -102,13 +102,15 @@ def project_enclosures(
     # once per HBA. Individual route measurements remain in observations.
     for physical in by_id.values():
         observed = physical.raw["observations"]
+        unread = {key for row in observed for key in row["metrics"].get("not_read", [])}
         for key in {key for row in observed for key in row["metrics"]} - {"not_read"}:
             values = [row["metrics"].get(key) for row in observed]
             if values and all(value == values[0] for value in values):
                 physical.metrics[key] = values[0]
             else:
+                # The HBAs disagree: the board's value is not read.
                 physical.metrics[key] = None
-        unread = {key for row in observed for key in row["metrics"].get("not_read", [])}
+                unread.add(key)
         if unread:
             physical.metrics["not_read"] = sorted(unread)
         if "device_count" in physical.metrics:

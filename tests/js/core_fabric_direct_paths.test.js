@@ -122,6 +122,33 @@ test("a direct port with no matched expander never refills from the bay", () => 
   }
 });
 
+test("a named multipath member without its own MPR row never takes an expander from the bay", () => {
+  // The producer withholds every row: two paths on one controller and no
+  // CAM target, or port detail from another read. Its enclosure also holds a
+  // second expander that the bay trace lists first.
+  const data = structuredClone(payload);
+  const trace = data.fabric.traces.find((item) => item.id === "bay:0");
+  trace.evidence = ["inventory snapshot", "multipath members"];
+  trace.metrics.mpr_devices = [];
+  const decoy = { ...data.fabric.nodes.find((node) => node.id.startsWith("expander:controller:mpr0:")) };
+  decoy.id = "expander:controller:mpr0:5000c50000000dff";
+  decoy.label = "5000c50000000dff";
+  data.fabric.nodes.push(decoy);
+  trace.node_ids.unshift(decoy.id);
+  const { api } = page("disk", data);
+  const seeds = api.branchSeedsForDiskTrace(trace, data.fabric);
+  assert.deepEqual(Array.from(seeds, (seed) => seed.device_name), ["da3", "da11"]);
+  for (const seed of seeds) {
+    const rendered = api.renderDiskPathBranch(seed, trace, data.fabric, 0);
+    for (const node of data.fabric.nodes.filter((row) => row.kind === "expander")) {
+      assert.ok(!rendered.includes(node.id), `${seed.device_name}: ${node.id}`);
+    }
+    assert.match(rendered, /not read/);
+    // Control: the member keeps its own controller.
+    assert.match(rendered, new RegExp(`data-fabric-node="controller:${seed.controller}"`));
+  }
+});
+
 for (const mode of ["disk", "impact"]) {
   test(`${mode} never invents a backplane zone`, () => {
     assert.doesNotMatch(page(mode).html, /Backplane Zone/);
@@ -209,7 +236,7 @@ test("Disk Path never draws a sibling port's device or SAS address on a path wit
   }
 });
 
-// Codex review of #1504: a partial reply with only the second path's row on a
+// #1504: a partial reply with only the second path's row on a
 // controller. Each Topology port takes only the row that names its own member;
 // a path without one stays not read, never its sibling's device or address.
 test("Topology ports take only their own member's MPR row; a path without one stays not read", () => {
