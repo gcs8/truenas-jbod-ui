@@ -1306,7 +1306,8 @@ class InventoryHelpersTests(unittest.TestCase):
 
             commands = service._linux_storage_enrichment_probe_commands(command_results)
 
-            self.assertEqual(len(commands), 2)
+            self.assertEqual(len(commands), 3)
+            self.assertEqual(canonicalize_ssh_command(commands[2]), "sas transport sysfs")
             self.assertIn("nvme list-subsys -o json", commands[0])
             self.assertIn("|| true", commands[0])
             self.assertEqual(canonicalize_ssh_command(commands[0]), "nvme list-subsys -o json")
@@ -1484,7 +1485,7 @@ class InventoryHelpersTests(unittest.TestCase):
             logical_block_size=512,
             physical_block_size=4096,
             logical_unit_id="5000cca264d473d4",
-            sas_address="5000cca264d473d5",
+            sas_address="5000c50000008101",
         )
 
         summary = InventoryService._fallback_smart_summary(slot, "Detailed SMART JSON is unavailable.")
@@ -1493,7 +1494,7 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(summary.logical_block_size, 512)
         self.assertEqual(summary.physical_block_size, 4096)
         self.assertEqual(summary.logical_unit_id, "5000cca264d473d4")
-        self.assertEqual(summary.sas_address, "5000cca264d473d5")
+        self.assertEqual(summary.sas_address, "5000c50000008101")
 
     def test_correlate_esxi_host_maps_storcli_physical_members(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

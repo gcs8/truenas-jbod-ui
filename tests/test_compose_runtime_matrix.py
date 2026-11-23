@@ -30,6 +30,24 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_run_bounds_a_stalled_synthetic_child(self) -> None:
+        module = self.load_matrix_module()
+        with (patch.object(module, "COMMAND_TIMEOUT_SECONDS", 0.05, create=True),
+              self.assertRaisesRegex(RuntimeError, "Matrix command exceeded its 0.05-second deadline")):
+            module._run((module.sys.executable, "-c", "import time; time.sleep(0.3)"), capture_output=True)
+
+    def test_run_preserves_checked_isolated_subprocess_contract(self) -> None:
+        module = self.load_matrix_module()
+        environment = {"PATH": os.defpath}
+        completed = Mock()
+        with (patch.object(module, "_child_environment", return_value=environment),
+              patch.object(module.subprocess, "run", return_value=completed) as run):
+            self.assertIs(module._run(("synthetic-command",), capture_output=True), completed)
+        self.assertEqual(run.call_args.args, (["synthetic-command"],))
+        self.assertEqual(run.call_args.kwargs.get("timeout"), 300)
+        self.assertEqual(run.call_args.kwargs, {"check": True, "env": environment,
+                                              "capture_output": True, "text": True, "timeout": 300})
+
     def test_matrix_covers_every_supported_sidecar_combination(self) -> None:
         module = self.load_matrix_module()
 

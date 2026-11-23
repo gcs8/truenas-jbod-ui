@@ -20,6 +20,7 @@ import threading
 import unittest
 
 from history_service.backup_archive.catalog import CatalogError, new_artifact_id
+from history_service.backup_archive import transport as archive_transport
 from history_service.backup_archive.transport import FtpTarget, LocalDirectoryTarget
 
 import tests.test_backup_archive_transport as archive_transport_fixtures
@@ -750,7 +751,8 @@ class ReadFailsTarget(LocalDirectoryTarget):
     def get(self, name, local_path, *, limit=None):
         import errno
 
-        local_path.write_bytes(b"partial")
+        with archive_transport._download_destination(local_path) as target:
+            target.write(b"partial")
         # The text is deliberately misleading: the outcome must not come from it.
         raise OSError(errno.EIO, "Readback does not match the catalogued size and SHA-256.")
 

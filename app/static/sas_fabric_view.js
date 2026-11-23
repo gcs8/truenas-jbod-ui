@@ -473,12 +473,13 @@
   function buildFabricViewCopy(fabric, platformLabel) {
     const kind = fabricKind(fabric);
     const linuxSes = kind === "linux_ses";
+    const linuxSas = linuxSes && fabric?.raw?.sas_transport_available === true;
     if (linuxSes) {
       return {
         kind: "linux_ses",
         storageFabric: true,
         eyebrow: `${platformLabel} / Storage Fabric`,
-        pageSummary: "Linux SES SG-device, enclosure, storage, and bay mapping for the selected live enclosure.",
+        pageSummary: linuxSas ? "Read-only Linux SAS transport, HBA, expander, PHY and SES bay evidence." : "Linux SES SG-device, enclosure, storage, and bay mapping for the selected live enclosure.",
         refresh: "Refresh Storage Fabric",
         statusBase: "STORAGE",
         unavailableMap: "No Linux SES-backed Storage Fabric map is available for this selection yet.",
@@ -491,7 +492,7 @@
         modes: {
           lanes: {
             title: "Storage Lanes",
-            subtitle: "Host, Linux SES source, SG enclosure devices, storage objects, and mapped bays aligned by enclosure path.",
+            subtitle: linuxSas ? "Observed HBA, expander and end-device paths with SES bay mapping." : "Host, Linux SES source, SG enclosure devices, storage objects, and mapped bays aligned by enclosure path.",
           },
           impact: {
             title: "Impact Map",
@@ -499,7 +500,7 @@
           },
           trace: {
             title: "Physical Trace",
-            subtitle: "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
+            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
           },
           disk: {
             title: "Disk Path",
@@ -507,15 +508,15 @@
           },
         },
         summary: {
-          controllers: ["Sources", "Linux SES source"],
-          paths: ["Storage Paths", "SG device groups"],
-          expanders: ["Transport Detail", "not exposed"],
+          controllers: linuxSas ? ["HBAs", "Linux SAS transport"] : ["Sources", "Linux SES source"],
+          paths: ["Storage Paths", linuxSas ? "observed block-device paths" : "SG device groups"],
+          expanders: linuxSas ? ["Expanders", "sysfs PHYs and counters"] : ["Transport Detail", "not exposed"],
           enclosures: ["Enclosures", "SG enclosure objects"],
         },
         laneStages: {
-          controller: "Source",
-          paths: "SES Paths",
-          expanders: "Transport Detail",
+          controller: linuxSas ? "HBA" : "Source",
+          paths: linuxSas ? "SAS Paths" : "SES Paths",
+          expanders: linuxSas ? "Expanders" : "Transport Detail",
           enclosures: "SG Enclosures",
           bays: "Mapped Bays",
         },
@@ -1837,16 +1838,18 @@
     return `${slots.length} inventory ${slots.length === 1 ? "entry" : "entries"}, ${disks} confirmed disk${disks === 1 ? "" : "s"}`;
   }
 
-  function renderPathButton(path, { compact = false } = {}) {
+  function renderPathButton(path, { compact = false, fabric = state.fabric } = {}) {
     const trace = traceById(path.id);
     const selected = state.selectedTraceId === path.id;
     const slots = sortedSlots(path.slots || trace?.slots);
     const related = selected || selectionTouchesSlots(slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
+    const portFacts = list(path.sas_transport_port_ids).map((id) => window.SasFabricTransport?.resolveTransportPort?.(fabric, id));
+    const phyNote = portFacts.map((port) => port?.state === "read" ? `${port.phys.length} reported PHY rows` : "PHY rows not read").join(" / ") || (fabric.raw?.sas_transport_available === true ? "PHY rows not read" : "");
     return `
       <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
-        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
+        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}"${phyNote ? ` title="${escapeHtml(phyNote)}"` : ""}>
           <span>${escapeHtml(path.controller_label || path.controller || "path")}</span>
           <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
           <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
@@ -1928,7 +1931,7 @@
       const paths = list(fabric.paths).filter((path) => path.controller === controllerName);
       const expanders = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "expander" && node.controller_id === controllerId));
       const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => (
-        ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && node.controller_id === controllerId
+        ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && (node.controller_id === controllerId || (fabric?.raw?.sas_transport_available === true && list(node.raw?.controller_ids).includes(controllerId)))
       )));
       const laneSlots = new Set(sortedSlots(controller.related_slots || controllerNode?.related_slots));
       paths.forEach((path) => sortedSlots(path.slots).forEach((slot) => laneSlots.add(slot)));
@@ -1948,7 +1951,7 @@
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.paths)}</span>
-            <div class="fabric-path-grid">${paths.length ? paths.map((path) => renderPathButton(path, { compact: true })).join("") : '<span class="fabric-empty-note">No path states reported</span>'}</div>
+            <div class="fabric-path-grid">${paths.length ? paths.map((path) => renderPathButton(path, { compact: true, fabric })).join("") : '<span class="fabric-empty-note">No path states reported</span>'}</div>
           </div>
           <div class="fabric-stage">
             <span class="fabric-stage-title">${escapeHtml(copy.laneStages.expanders)}</span>
@@ -1997,6 +2000,17 @@
   // not reported), bays no controller lane claims are still drawn, without
   // guessing which controller or path they hang off.
   function renderUnattachedInventory(fabric, copy, claimedSlots) {
+    if (fabric?.raw?.sas_transport_available === true) {
+      const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "ses-enclosure" && !node.controller_id && !list(node.raw?.controller_ids).length));
+      const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
+      if (!enclosures.length && !slots.length) return "";
+      return `
+        <section class="fabric-dedicated-lane">
+          <div class="warning-item muted compact">Controller attachment not read. SES enclosure and bay evidence is retained without guessed HBA membership.</div>
+          <div class="fabric-stage"><span class="fabric-stage-title">${escapeHtml(copy.laneStages.enclosures)}</span><div class="fabric-node-grid">${renderNodeGrid(enclosures, 8, "No unaffiliated enclosures reported")}</div></div>
+          <div class="fabric-stage"><span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span><div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div></div>
+        </section>`;
+    }
     if (fabric.platform !== "core" || !fabricCountsUnvouched(fabric)) return "";
     const slots = inventoryBaySlots(fabric).filter((slot) => !claimedSlots.has(slot));
     if (!slots.length) return "";
@@ -3141,6 +3155,7 @@
       ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
+    const transportPort = window.SasFabricTransport?.resolveTransportPort?.(fabric, seed.pathState);
     const sesNodes = list(trace.node_ids)
       .map((nodeId) => nodes.get(nodeId))
       .filter((node) => sesNodeTouchesSlot(node, slotNumber));
@@ -3252,6 +3267,8 @@
         ],
         hoverFacts: [
           ["Path state", stateName],
+          ["Port PHYs", seed.pathState?.sas_transport_port_id || fabric.raw?.sas_transport_available === true ? (transportPort?.state === "read" ? transportPort.phys.map((phy) => phy.phy).join(", ") : "Not read") : null],
+          ["Port PHY counters", transportPort?.state === "read" ? transportPort.phys.map(expanderPhyErrorText).filter(Boolean).join(" / ") : null],
           ["Member device", mprDevice?.member_device_name || seed.device_name],
           ["Disk identity", [seed.pathState?.model, seed.pathState?.serial, seed.pathState?.size_human].filter(Boolean).join(" / ")],
           ["SAS / LUN", seed.pathState?.sas_address || seed.pathState?.logical_unit_id],
