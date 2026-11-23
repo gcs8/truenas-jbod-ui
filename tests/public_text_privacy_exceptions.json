@@ -140,7 +140,7 @@
         "sha256:8af795bbd88a16011c8719477bf18ba19888f88653ffe91ee32c7a99f74d892d": 2
       },
       "sas_wwn_identifier": {
-        "sha256:6a14d3e9357bc3ad09490b292d315eea40e4ce7a33b7330b9ec577328d34cbad": 1
+        "sha256:cb9686da5437270fe6ffc47d73e8ddf548b90c875c0b449dc079efdfde935a6b": 1
       }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
@@ -430,7 +430,7 @@
         "sha256:d5363628e881b66d6825605a543b014632618b3b9bd14cc2cc8bac61f17222ec": 10
       },
       "sas_wwn_identifier": {
-        "sha256:7d33aabd5f337ddf08d57b26bb11daaf32f48f1a28a849f646e9bdf16565d00e": 2
+        "sha256:c790276575cf23a90f09f3966dd6e0335e6055639bddf320350cd7d79b35dcbc": 2
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -506,7 +506,7 @@
         "sha256:1dcbec214c335287b7d5381f812ca247487d70cc969bb1741a9864f840387d35": 108
       },
       "sas_wwn_identifier": {
-        "sha256:fde8a8c53d4bf8d87ef466b60065e198cd25faa767693f956c52b1146f7bc467": 161
+        "sha256:a075025e8dbfe239ee4d7adb2bb9c5a8383a1fbdfe3db407ef4978e19b48f7cf": 161
       }
     },
     "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. Issue 926 adds six literal occurrences of one invented enclosure identifier for dual-path locate-light confirmation; no captured device identity is added."
@@ -528,7 +528,7 @@
         "sha256:39de09fc25e538bb2bb7ccf330b7ffbdfaf157185f2e123cf78e2ddb148909e8": 1
       },
       "sas_wwn_identifier": {
-        "sha256:ba282af2d3f317b8b91ec5b30e6f00e87a92f7567342a1045f13b831186da796": 145
+        "sha256:13c9402a05021632b674dacb0c4eaf0b524a4db26dd750733629c19046d124de": 145
       }
     },
     "reason": "Synthetic or adversarial test literals; exact detector counts are pinned. Issue 926 adds four literal occurrences of one invented enclosure identifier for dual-path locate-light parsing; no captured device identity is added."
@@ -598,7 +598,7 @@
         "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
       },
       "sas_wwn_identifier": {
-        "sha256:6df162229ae2a86b0867c5dfee09eed22ac8390c6d1709d2015a0607e2b798a1": 53
+        "sha256:97e7759a43075543b96926e22fff918a4c9f3355e67775d94f4dfb9baa7cb386": 53
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
