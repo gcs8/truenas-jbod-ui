@@ -50,7 +50,7 @@ It is not a registry publication or deployment.
 | Docs/wiki/public-demo gate | yes | Release notes, source diff, metadata, privacy, public documentation, screenshot manifest and prerelease policy checks pass. Public demo deferred: prerelease. No public screenshot or external wiki bytes changed. Wrap-only final head requires its own exact-head CI. | Pass | |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked | |
 | GHCR publish verification | yes | [Release workflow](https://github.com/gcs8/truenas-jbod-ui/actions/runs/45070295617) completed on merge `5d485296313ef94f70cf6b915323ff38f1d5016d`. Annotated `v0.24.0-rc.2` targets that merge; its tree equals qualified head `c41b77f105eaba91f2e608d38c26108ff60bba80`. GitHub prerelease is published, not draft. Fixed version aliases, `dev`, `sha-5d48529` and the full source-SHA alias resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:283fa755b23971efe23c7d2d198184a9abfc9fa80ea90aa8b68dba345a7bce5f`, with the exact merge revision and version labels. SHA aliases copy identical release-built manifest bytes, not another build. Stable/latest pointers remain v0.23.0. | Pass | |
-| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Secondary-installation acceptance and the complete deployed-state crawl remain pending; no complete deployment-gate claim. | Blocked | |
+| Deployment refresh/sniff tests | yes | First authorized validation installation adopted the published digest through the tagged image-only helper; update and independent verify returned zero. Healthy fenced services, unchanged Compose inputs, retained placement and intact durable history were read back. API request/status parity and the delayed idle observation passed. Full deployed-state crawl, delayed idle observation and independent final readback pass. Secondary-installation acceptance remains pending; no complete deployment-gate claim. | Blocked | |
 | Post-release reopen | yes | Publication, deployment and final validation must precede reopen. | Blocked | |
 
 ## Crawl and human-view disposition
@@ -180,10 +180,90 @@ completed successfully for both languages on the same merge, attempt one.
 | Python compile and unittest (3.14) | success | rerun on attempt 2 |
 | Checked-in public demo artifact | success | rerun on attempt 2 |
 
-## Phase B acceptance in progress
+## Phase B deployed-state crawl and issue disposition
 
-The first helper adoption and delayed idle observation passed. The complete
-42-chunk deployed-state crawl and its final observation remain separate gates.
-Post-publish issue reconciliation, secondary-installation acceptance and final
-wrap validation are not yet complete. No final promotion, stable-tag movement,
+The first authorized validation installation adopted the release-built digest
+through the tagged helper, with update and independent verify both returning
+zero. Backup checksums and predecessor recovery receipt were retained. Placement
+counts and identities matched the admitted predecessor, with no duplicate or
+unplaced regression, and the helper reported intact durable history. The two fenced
+services were healthy, with unchanged Compose inputs and no restart or OOM.
+
+The complete examination request/status multiset matches the predecessor,
+including its existing validation refusals, with no transport exception or
+HTTP 5xx.
+This is parity, not a claim that every endpoint returned success. Initial
+retained logs were not empty or wholly clean. Final combined output contains
+no traceback headers or access-log 5xx, but does include platform remote-error
+records and a history-pass failure. Its structured event identifies `smart_read` and
+`source_error_reply` with `HistorySourceError`; the native final helper verifies
+healthy, unpaused history with no recovery required. The predecessor contains
+the same broad log templates, but historical method/cause equivalence is not
+claimed. An initial
+stdout-only log projection was rejected because container stderr held the actual
+log lines; retained combined output supplied the corrected classification.
+
+The full deployed-state read-only crawl completed 42 chunks in 42 attempts,
+with native exit zero, the Admin chunk last, and independent Admin absence
+readback after cleanup. It covered 40 targets and 1,021 records: 850 done,
+130 not-applicable, two previewed and 39 listed. Listed states were not
+exercised. Native captures total 1,832 across 390/1600/1920/3840. No unknown
+errors, blocked requests or admitted writes were reported. All 42 native logs,
+exit receipts, safety predicates and exact capture identities were reconciled.
+There are 458 captured target/state pairs, exactly one capture at each width.
+
+The delayed post-crawl observation passed at least 30 minutes after the last chunk,
+while the middleware was idle in two consecutive samples. Retained sessions
+and alerts were unchanged, and no new failed-alert mail was recorded. The net
+retained mail-job count changed during the crawl window; this is not a count
+of new sends and its cause is not attributed. A separate post-adoption
+delayed observation also passed. No session-only rollback was performed.
+
+Retained middleware observations include failed Admin reads kept as missing
+observations. Directly observed UI peaks remain within their reported budgets.
+History and Admin emitted no direct-call limiter series, not a measured zero
+load. History memory sampling recorded no OOM kills. Charged cgroup peak reached
+the configured limit and max events occurred; it is explicitly not described
+as wholly below the limit. Detailed deployment measurements remain in restricted
+evidence. Memory sampling covered history only. Final UI/history readback retains
+the original post-adoption container IDs, exact image, zero restarts, two fence
+locks and unchanged configuration/helper/receipt hashes. Temporary Admin and
+operation-owned key-copy directories are absent; owned samplers exited zero.
+
+All 310 findings retain existing issue classifications: 160 main-page
+label-in-name occurrences under #1110; 72 heat-spread errors, 32 contrast
+errors and 46 healthy-temperature alarm warnings under #1103. Compared with
+phase A, the error-occurrence multiset includes 20 additional known heat-spread
+and six additional known main-page label occurrences. This is not described as
+zero added error identities. State eligibility and live data differ between
+the deployed installation and disposable qualification stack. Topology itself
+has no findings under the narrowed rule.
+
+Actual deployed Topology human-view covered unpinned, pinned-node,
+pinned-bundle and reported-lane states at 1600 and 3840. Native SVG title
+metadata remains present; native hover appearance is owner-only and is not
+claimed. Direct accepted-baseline comparisons preserve the existing sticky
+trace-band overlay, scroll boundaries and source wrapping. The missing proxy
+sign-in block shifts the deployed content vertically and changes which graph
+region intersects that existing band. No new independent geometry defect was
+identified. Main face families and readable History/Admin captures were also
+reviewed; screenshot slices do not establish hidden content or write behavior.
+
+The release's 129 covered PRs yielded 137 distinct actual-issue references;
+three required follow-ups were added. All 140 received exact-readback release
+notices. No blanket closure was performed: issue-specific negative boundaries,
+restore workflows and owner checks are not established by a generic read-only
+crawl. Follow-ups #1461, #1463 and #1465 remain open. Three further observations
+were posted and read back on #1103, #1110 and #1114; these also remain open.
+
+## Phase B acceptance remains partial
+
+The second authorized validation target could not be resolved through the
+current inventory. No connection, staging, coordination probe or activation
+was attempted there. Resolving that target and completing its helper/examination
+acceptance remain required; success on the first installation does not satisfy
+that independent branch.
+
+This is a FULL-mode wrap with explicit Blocked gates, not a completed release
+acceptance or a narrow-mode deferral. No final promotion, stable-tag movement,
 production activation or external wiki publication is claimed.
