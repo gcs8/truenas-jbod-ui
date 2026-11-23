@@ -172,6 +172,7 @@
       selectedStorageViewIds: [],
       running: false,
       downloadRetryAtMs: 0,
+      dialogGeneration: 0,
       estimate: {
         loading: false,
         error: null,
@@ -8422,6 +8423,7 @@
   }
 
   function closeSnapshotExportDialog() {
+    state.export.dialogGeneration = (state.export.dialogGeneration || 0) + 1;
     if (exportSnapshotDialog && exportSnapshotDialog.open) {
       exportSnapshotDialog.close();
     }
@@ -11375,6 +11377,7 @@
       return;
     }
     const scopeKey = currentUiScopeKey();
+    const dialogGeneration = state.export.dialogGeneration || 0;
     const requestBody = JSON.stringify(snapshotExportRequestPayload());
     const retryAtMs = state.export.downloadRetryAtMs || 0;
     try {
@@ -11388,6 +11391,7 @@
         setStatus(`The inventory is still refreshing. Trying the download again in ${Math.ceil(delayMs / 1000)} s.`);
         await waitMs(delayMs);
         if ((exportSnapshotDialog && !exportSnapshotDialog.open)
+            || dialogGeneration !== (state.export.dialogGeneration || 0)
             || scopeKey !== currentUiScopeKey()
             || requestBody !== JSON.stringify(snapshotExportRequestPayload())) return;
       }

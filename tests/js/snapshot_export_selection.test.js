@@ -341,6 +341,7 @@ function loadExportEstimateFunctions(state, overrides = {}) {
       "retryAfterSecondsFrom",
       "busyReadRetryDelayMs",
       "busyReadRetryMessage",
+      "snapshotExportRetryDelayMs",
       "retryBusyRead",
       "refreshSnapshotExportEstimate",
     ],

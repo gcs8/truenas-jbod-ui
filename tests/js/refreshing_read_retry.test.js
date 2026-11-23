@@ -408,6 +408,22 @@ test("closing the dialog during a busy download retry does not send another requ
   assert.equal(h.downloads.length, 0);
 });
 
+test("reopening the dialog cannot revive a cancelled download retry", async () => {
+  const h = exportDialogHarness([httpResponse(503, { detail: "Still refreshing." }, "2")]);
+  await h.exportEnclosureSnapshot();
+  let release;
+  h.sandbox.waitMs = () => new Promise(resolve => { release = resolve; });
+  const retry = h.exportEnclosureSnapshot();
+  h.closeSnapshotExportDialog();
+  h.dialog.open = true;
+  release();
+  await retry;
+  assert.equal(h.requests.length, 1, "a reopened dialog cannot authorize the earlier cancelled download");
+  assert.equal(h.dialog.open, true, "the earlier retry must not close the new dialog");
+  assert.equal(h.state.export.running, false);
+  assert.equal(h.downloads.length, 0);
+});
+
 test("a waiting download retry cannot follow a different scope or changed settings", async () => {
   for (const change of ["scope", "settings"]) {
     const h = exportDialogHarness([httpResponse(503, { detail: "Still refreshing." }, "2")]);
