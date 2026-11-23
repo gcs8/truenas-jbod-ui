@@ -2854,6 +2854,15 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
+                    if validated_content is not None:
+                        # Recount before the validation hash: the counters are
+                        # derived from the checked data and must be part of the
+                        # exact bytes that every later hash must match (#1449).
+                        self._recount_restored_table_counts(restore_connection)
+                        restore_connection.commit()
+                        validation_content = self._hash_private_publication_descriptor(temp_fd)
+                    else:
+                        validation_content = None
                     # An import's member checks run again on the copy that is
                     # published, not only on the file validated earlier (#1422).
                     # The timestamp bound below is not part of them, so it
@@ -2869,16 +2878,22 @@ class HistoryStore:
                         require_restored_timestamps_within(
                             restore_connection, rollback_allowance
                         )
-                    # The backup's counters are outside input that sizes
-                    # index builds; replace them with real counts (#1093).
-                    self._recount_restored_table_counts(restore_connection)
-                    restore_connection.commit()
+                    if validated_content is None:
+                        # The backup's counters are outside input that sizes
+                        # index builds; replace them with real counts (#1093).
+                        self._recount_restored_table_counts(restore_connection)
+                        restore_connection.commit()
 
                 publish_content = (
                     self._hash_private_publication_descriptor(temp_fd)
-                    if validated_content is not None
+                    if validation_content is not None
                     else None
                 )
+                if (
+                    validation_content is not None
+                    and publish_content != validation_content
+                ):
+                    raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
                 publish_descriptor = temp_fd
                 temp_fd = None
@@ -2893,7 +2908,7 @@ class HistoryStore:
                         temp_path,
                         self.file_path,
                         temp_descriptor=publish_descriptor,
-                        expected_content=publish_content,
+                        expected_content=validation_content,
                     )
                 for suffix in ("-shm", "-wal"):
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
@@ -4912,7 +4927,14 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
 
             if target_metadata is None:
-                self._publish_absent_target(temp_path, target_path, temp_metadata, target_mode)
+                self._publish_absent_target(
+                    temp_path,
+                    target_path,
+                    temp_metadata,
+                    target_mode,
+                    published_descriptor=temp_descriptor,
+                    expected_content=expected_content,
+                )
                 return
             self._exchange_existing_target(
                 temp_path,
@@ -4920,6 +4942,8 @@ class HistoryStore:
                 temp_metadata,
                 target_metadata,
                 target_mode,
+                published_descriptor=temp_descriptor,
+                expected_content=expected_content,
             )
 
     @staticmethod
@@ -4973,12 +4997,31 @@ class HistoryStore:
             error_number = ctypes.get_errno()
             raise OSError(error_number, os.strerror(error_number), source_path, target_path)
 
+    def _require_published_content(
+        self,
+        target_path: Path,
+        published_descriptor: int,
+        published_metadata: os.stat_result,
+        expected_content: tuple[int, str] | None,
+    ) -> None:
+        if expected_content is None:
+            return
+        if (
+            self._hash_private_publication_descriptor(published_descriptor)
+            != expected_content
+            or not self._path_matches_metadata(target_path, published_metadata)
+        ):
+            raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
+
     def _publish_absent_target(
         self,
         temp_path: Path,
         target_path: Path,
         temp_metadata: os.stat_result,
         target_mode: int | None,
+        *,
+        published_descriptor: int,
+        expected_content: tuple[int, str] | None,
     ) -> None:
         try:
             self._rename_at2(temp_path, target_path, flags=RENAME_NOREPLACE)
@@ -4988,19 +5031,24 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed target path {target_path}.") from exc
             raise
         try:
-            published_metadata = target_path.lstat()
-        except FileNotFoundError as exc:
-            raise ValueError(f"History replacement refuses changed published path {target_path}.") from exc
-        if not self._metadata_identity_matches(published_metadata, temp_metadata):
-            raise ValueError(f"History replacement refuses changed published path {target_path}.")
-        if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
-            self._unlink_owned_path(target_path, temp_metadata)
-            raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
-        try:
+            try:
+                published_metadata = target_path.lstat()
+            except FileNotFoundError as exc:
+                raise ValueError(f"History replacement refuses changed published path {target_path}.") from exc
+            if not self._metadata_identity_matches(published_metadata, temp_metadata):
+                raise ValueError(f"History replacement refuses changed published path {target_path}.")
+            if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
+                raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._require_published_content(
+                target_path,
+                published_descriptor,
+                temp_metadata,
+                expected_content,
+            )
             self._sync_replacement_parents(temp_path, target_path)
         except Exception:
-            # Do not leave an unacknowledged timestamp discoverable as a recent
-            # backup by the collector. Never overwrite a reappeared temp name.
+            # Do not leave unchecked bytes or an unacknowledged timestamp at
+            # the public name. Never overwrite a reappeared temp name.
             if self._path_matches_metadata(target_path, temp_metadata):
                 self._rename_at2(target_path, temp_path, flags=RENAME_NOREPLACE)
                 self._sync_replacement_parents(temp_path, target_path)
@@ -5020,6 +5068,9 @@ class HistoryStore:
         temp_metadata: os.stat_result,
         target_metadata: os.stat_result,
         target_mode: int | None,
+        *,
+        published_descriptor: int,
+        expected_content: tuple[int, str] | None,
     ) -> None:
         self._rename_at2(temp_path, target_path, flags=RENAME_EXCHANGE)
         try:
@@ -5031,6 +5082,12 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed target path {target_path}.")
             if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
                 raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._require_published_content(
+                target_path,
+                published_descriptor,
+                temp_metadata,
+                expected_content,
+            )
             self._sync_replacement_parents(temp_path, target_path)
             self._unlink_owned_path(temp_path, target_metadata)
         except Exception:
