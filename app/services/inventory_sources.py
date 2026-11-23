@@ -284,11 +284,6 @@ class InventorySourceBundle:
     ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
     parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
-    # Every API disk's lookup keys, by selected enclosure, for Storage Fabric
-    # peer admission (#1471). In-memory only; never part of a snapshot.
-    fabric_disk_lookup_keys: dict[str | None, tuple[frozenset[str], ...]] = field(
-        default_factory=dict, repr=False, compare=False,
-    )
     publication: SourcePublication = field(default_factory=SourcePublication, repr=False, compare=False)
 
 # --- Names that stay in app.services.inventory, looked up there at each use ---
