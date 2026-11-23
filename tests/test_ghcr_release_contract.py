@@ -281,10 +281,10 @@ class GHCRReleaseContractTests(unittest.TestCase):
         self.assertNotIn("${{", step["run"], "Pass inputs through env, never interpolate into bash")
 
     def test_release_candidate_event_keeps_the_exact_release_tags_and_dev(self) -> None:
-        code, out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0-rc.1", prerelease=True)
+        code, out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0-rc.2", prerelease=True)
         self.assertEqual(
             (code, tags),
-            (0, [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-rc.1", "0.24.0-rc.1", "dev")]),
+            (0, [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-rc.2", "0.24.0-rc.2", "dev")]),
             out,
         )
 

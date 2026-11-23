@@ -31,13 +31,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-rc.2 - 2026-11-21
+
+### Highlights
+
+- Storage Fabric adds a keyboard-accessible Topology diagram with path tracing, search, pinning and clearer incomplete-evidence states.
+- Inventory, SMART and saved views preserve unknown or unread data instead of inventing healthy, empty or peer-node readings.
+- Backup verification, import publication and history retention now use stronger integrity checks and bounded work.
+- Refreshes, mapping operations and remote backup fetches refuse excess work explicitly instead of growing unbounded queues or retained state.
+- Setup, SSH key handling, browser write-origin checks and failure diagnostics keep stronger identity, permission and privacy boundaries.
 
 ### Upgrade notes
 
 - Last-good SMART values saved by earlier versions are not shown after the
   upgrade, because they do not record which appliance they came from. Each
   bay shows SMART again after its next successful SMART read (#1261).
+
+### Added
+
+- Storage Fabric has a fifth mode, Topology: a wiring diagram of the SAS fabric for the selected enclosure, drawn from the data the page already loads. It shows the host, HBAs, expanders by SAS level, enclosures and bays, with one line per link labelled with lane count, PHY numbers and negotiated rate where the platform reports them; each parent sits over the items it feeds, each HBA's lines have their own colour and line pattern, where two lines cross one of them has a small gap, and every bay shows one mark per path, different in shape for each path state, with member health never drawn as a path state. Hover or keyboard focus traces a path end to end, click pins it and fills the inspector, Esc clears both, and a search box finds a bay by the number the chassis prints (a bay label without a plain number is shown as written), a disk, serial, SAS address or expander, also by an identity made only of digits. The view uses the full page width, opens with the host and HBAs in view, says when the drawing is wider than its box, keeps its scroll position while you select, pin, search, fit and return to actual size, keeps a shelf's expand control in place when you expand or collapse it, and has a Fit control that says when fitted text would be smaller than 12 px. Tiers, lanes and completeness the platform does not report are marked as not reported, an unknown fabric kind, or one its platform does not produce, is named without a claim about what was collected, disks without a known physical location are never drawn as bays, node, link and trace records the view cannot draw (unsupported kinds, missing ends, duplicates, links that point up the tiers) are named on the page, large shelves collapse into a summary block that expands to every bay, chains that share a line look are named, and a drawing of more than 512 lines skips the crossing search and crossing gaps and says so, still drawing every device and line (#1342).
 
 ### Changed
 
@@ -46,6 +58,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   longer resolves dependencies from PyPI on its own. After changing a pin in
   `requirements.txt`, regenerate the lock with the command in its first lines
   (#1181).
+- The main page's pure SMART value formatters now live in their own script, `app/static/app_smart_formatters.js`, which the page loads before `app.js` and the saved offline HTML copy inlines before `app.js`; the formatter code and its output are unchanged (#1367).
 
 ### Security
 
@@ -99,6 +112,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Certificate imports now keep asynchronous file reads and responses bound to
   the editor and TLS target that started them, so later editor state cannot
   receive an earlier import's trust result (#1252).
+- The main UI, admin service and history service now share one browser write-origin decision: a state-changing browser request is accepted on the strength of its own Host header only after that header names exactly one valid host that passes the shared known-host check (an IP address, localhost, or for main and admin a name listed in `ADMIN_ALLOWED_HOSTS`), every Origin and Referer it carries must agree with the accepted origin, and a configured public origin stays authoritative (#1351).
 
 ### Fixed
 
@@ -468,6 +482,109 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the heat-map timeline and the per-row
   SAS port and SATA PHY counters do not yet keep "not read" apart from absent
   (#1249).
+- Storage Fabric Topology: the trace sentence under the drawing now stays at the bottom of the window in a band whose whole height is reserved (one line on wide pages, two up to 1480 px, three at phone width), so it is readable on hover, focus and pin without scrolling and normally does not grow over the item under the pointer; the legend keeps its traced-path entry at all times, so a pin on a narrow page no longer moves the drawing; and a shelf's expand or collapse control keeps its place in the window when the shelf is expanded or collapsed, also in tall windows where the page is briefly too short to stay scrolled (#1365).
+- The Storage Fabric Topology trace band keeps one height on hover, keyboard focus and pin at any window width: it is held at the height of the tallest sentence the drawing can show, measured once per drawing and band width (and again only for a new font or screen resolution) by laying every distinct sentence out, with no limit on their number, in a hidden measurer inside the band that is emptied straight after, and rounded up, never on hover, focus or a pin; this can make the band taller than before while idle on a narrow page, a long link description, such as a wide port listing every PHY, no longer adds a line, and a focused item scrolls clear of the band at its real height (#1371).
+- Storage Fabric Topology: a pin, a selection, a search, a refresh, or an expand or collapse whose control is out of view no longer moves the drawing or the page after a shelf was collapsed; room the drawing no longer needs below its bottom edge is given back only as far as the page can lose it without moving (#1372).
+- The System and Enclosure dropdowns on the Storage Fabric page no longer cut off a selected name at window widths between about 1240 and 1800 pixels: each dropdown's card grows to the width its selected name needs when the header row has room, two names that do not both fit share the shortfall and end in an ellipsis, and on both the Storage Fabric page and the main page hovering either dropdown shows the full selected name (#1379).
+- Storage Fabric no longer shows a plain count such as 0 expanders or 0 enclosures when the CORE controller read did not report whether that list was complete; the summary (also in the page as first served), the Storage Lanes host line and the Disk Path host card now say not reported (or the count with completeness not reported), as the Topology status chips already do, the page status reads PARTIAL with completeness of some controller data was not reported instead of OK, and Storage Lanes still draws the inventory bays no read controller claims, while reported complete, partial and not-read counts keep their text (#1380).
+- Storage Fabric Topology: expanding or collapsing a shelf whose control is out of view in the scroll box now keeps the drawing where it was horizontally as well as vertically, including any room before its left edge, instead of shifting it sideways to the drawing's edge (#1385).
+- The main page Storage Fabric summary and host card now follow the same count rule as the Storage Fabric page: on CORE, a count whose completeness the payload does not report reads as not reported (for example "expanders not reported" or "1 source, completeness not reported") instead of a plain number such as 0, including a CORE payload identified only by its fabric kind, and a CORE read with no controller rows and no controller completeness says the HBA controllers were not reported instead of none reported. Reported zeros and other platforms are unchanged (#1386).
+- On the main page a long system name in the line above the page title now wraps inside the header instead of widening the page so that it scrolls sideways (#1387).
+- Typing a search in the Storage Fabric page's Topology mode no longer scrolls the page at about 1600 px wide. The search status now has a line of its own under the search box, one line high whether empty or not; a status longer than that line ends in an ellipsis and shows its whole text on hover (#1390).
+- Storage Fabric Topology: Fit now scales the drawing into the scroll box's inner height, so it lands at offsets 0/0 instead of 2 px down, and after a collapse the room after the drawing settles in the first redraw that keeps the view where the box's height limit is not a whole pixel, without ever moving the page (#1392).
+- History keeps a failed SMART read owed, and keeps reporting it as degraded, while a pass cannot read the bay occupancy of that scope; the retry is made once occupancy is readable again instead of waiting for the next cadence (#1393).
+- Backups: the status line for a clean-up that did not finish no longer ends in two full stops when the reason, such as the refusal to delete the newest copy that passed its last completed check, already ends a sentence. The retention and catalogue code comments now describe that protected copy by its last completed check, which can be a size-only upload check, instead of calling it the newest verified copy (#1395).
+- History rollups name each hourly and daily bucket from the same SQLite time reading that orders the samples in it, so a sample in the last half millisecond of an hour no longer lands in a different bucket from its neighbours because of how its UTC offset is written. Existing buckets keep their names (#1396).
+- StorCLI drive lists: a drive that only a per-drive entry reports is no longer dropped when the same reply also has a drive table that leaves it out (the reply still does not prove other bays empty), and a malformed or misplaced member of a per-drive row list can no longer replace the serial, temperature or other facts of that entry's drive (#1397).
+- Storage Fabric on CORE now reads every device type that mprutil prints, so an enclosure device count no longer leaves out STP, ATAPI or initiator rows. If a device row cannot be read, the device count shows as not read instead of a short total. A dedicated list or adapter reply that reports a utility error is now treated as not read, the same as its show all section. The adapter PHY counts are now kept only when each PHY row appears in its printed position (#1398).
+- Fixed the synthetic FULL backup benchmark report, which fingerprinted only `system_backup.py`. A new `source_files_sha256` field now records a digest for each module that defines the benchmarked export, including `backup_7z.py`, so a change to any of them shows up in the report. `source_file_sha256` keeps its old meaning (`system_backup.py` only) (#1403).
+- A BMC Redfish reply whose system or SimpleStorage resource has a wrong-typed member the reader uses (a list-valued Model, a numeric SerialNumber, a Devices value that is not an array) now ends as an unusable-response warning instead of an internal error, and a fallback storage resource with such a member adds none of its drives; a Redfish HTTP error reply whose error message is not a string now keeps the typed HTTP failure and the usual inventory warning, without that message, instead of an internal error; a TrueNAS websocket reply that answers a pending call with a non-object error member, or a DDP reply to a batched call with a message kind other than result, now fails that call at once as an unusable reply instead of a remote failure or a wait until the timeout (#1404).
+- Storage Fabric counts an inventory row without a physical location as a disk only when the inventory confirms a disk is present, and otherwise says inventory entries, including in the inventory group's overflow count; the main page Connections map draws the CORE inventory bays that no read controller claims in a separate explained group, each bay once, instead of showing none (#1405).
+- SES status readers now publish a flag such as Predicted failure, Disabled, Swap, Hot spare, Do not remove, Fault sensed or Fault reqstd only when its whole value is 0 or 1; a malformed value like 10 or 1x reads as unknown instead of being shortened to its first digit. Merging two SES paths for the same bay now takes the enclosure path and element number from the same record, so a bay no longer carries a path and element pair that neither path reported, a later merge no longer folds it into a neighbouring bay, and its locate targets name only that bay. An element whose record reported no device path no longer takes another path's device: it keeps its own record's path, or offers no locate target from that record (#1406).
+- Restore: a failed import that is stopped while its rollback deletes the staged history copy no longer leaves a part-deleted copy under the name the restore record lists, so recovery returns the prior configuration and history instead of refusing; restore recovery now refuses a record whose phase, operation or kind fields are lists or objects with its usual explanation instead of an internal type error, and changes nothing; and a history database with a timestamp field longer than 256 bytes is now refused instead of installed, without truncating or dropping rows (direct history-database restore names the table and column; archive restore refuses the bundle's history member), while a failed import still restores the contents of a current history that already holds such a field, bringing back only the over-long fields its rollback snapshot held when it was taken: a rollback copy with any other fails closed, leaves the history as it was and keeps the snapshot for recovery; see #1273, #1287 and #1292 (#1408).
+- History collection keeps SMART retry debt for each bay: a successful read no longer clears the debt of a sibling bay whose occupancy was not read, or of a bay whose SMART summary the reply left out or marked unavailable, so that bay keeps its retry and the collector stays degraded until that bay is read (#1411).
+- CORE controller device lists: a `show devices` row whose speed mprutil prints as `Unk` or `???` is now read with its own enclosure handle and slot instead of taking them from the columns after it, so the device is counted in its own enclosure. Under mprutil's heading a row must end with exactly its speed, enclosure handle, slot and width columns; a row missing one of them (even when a four-digit slot looks like an enclosure handle) now leaves the device list not read whole and withholds the enclosure's device count, instead of placing the device under another enclosure handle. A numeric speed is read in any form read before (any digits with an optional fraction, such as `100` or `012.0`), and a row whose enclosure handle is not four hex digits is not understood. Bare rows printed without the heading must still carry a numeric speed, so one with `Unk`, `???` or no speed column is not understood; a bare row without a width whose speed is a four-digit whole number, which reads equally as a row missing its speed, is now refused instead of read (#1412).
+- Backups: a remote copy's upload check is now read from the provider recorded with that copy at upload, so changing a target's provider no longer presents an older upload as read back; a remote copy made by an earlier version and recorded as read back reads as "provider checksum or read-back" until its own Verify passes. A saved Verify result that reports success beside an outcome other than matched, or beside a malformed outcome, is no longer shown as Verified or as a check that worked, in the list or the details (#1413).
+- Storage Fabric on CORE: an MPR target number is now 1 to 9 ASCII digits, so other scripts' digits are no longer targets and a superscript digit or an over-long digit run no longer stops the fabric build; a target that is printed but not admitted, in the device list or in the CAM list, keeps a bay from taking that device row by position alone, while a row or disk with no target at all still joins by position as before; an expander's enclosure handle, which mprutil prints in decimal while the device and enclosure lists print it in hexadecimal, is read as decimal, so for handles 10 to 9999 an expander keeps its enclosure link and selected-enclosure scope; and a failed controller read names its controller only for a unit of 1 to 4 ASCII digits, so any other unit token is recorded as a fixed rejected-unit reason and counted instead of being copied into the failure list and the snapshot export (#1414).
+- Storage Fabric now says 1 trace, 1 bay and 1 disk for a single trace, bay or disk on the main page summary and on both pages' node descriptions, and the selected-object inspector on both pages labels a bay's rows Present, Health, Pool, Vdev and Device instead of the raw lower-case keys; the values, including unknown presence, are unchanged (#1418).
+- The BMC web inventory now reads up to 64 controllers, 4,096 drives per
+  controller and 8,192 drives in one inventory, and history requests admit up to
+  256 enclosure scopes and 16,384 bays, so a full 1,024-disk expander is read
+  instead of refused. Each BMC reply is read up to 4 MiB, and one inventory's web
+  replies up to 12 MiB together. A reply or request over a limit is still
+  refused, and the message names the limit and the count or size it saw; the row
+  and byte budgets on history reads are unchanged (#1420).
+- Storage Fabric on CORE: an adapter-summary row gives a controller unit only when its device field is exactly the adapter device name, so text before the name or after the unit no longer plans controller reads; the unique-unit list is bounded at 128 controllers, far above real hosts, and rows that are not an adapter device name or units past the bound are counted, not echoed, and shown as a fixed incomplete-read warning with partial counts while every admitted unit is still read; and an expander whose enclosure handle mprutil prints with five decimal digits (10000 and up) is now read, while an expander header line that still cannot be read marks that controller's expander list unreadable and its count partial instead of passing a short list as complete (#1421).
+- QuantaStor disk details no longer show a negative block size, rotation rate, endurance, error count or byte total as a reading: such a value, and a power-on time between -1 and 0 that used to read as a zero-hour lifetime, is now shown as not read, while zeroes and negative Celsius temperatures stay valid. A peer node's device path admitted through a shared disk identity is no longer used as a SMART device on the selected node. Slot details saved by an earlier version no longer bring back a negative block size or rotation rate. QuantaStor SMART reads use only the device paths the current poll reports in rows owned by the disk's own node: a row that names another node in any of its owner fields, or whose owner fields disagree, supplies no path, and an I/O fence ID no longer stands in for the disk's owner; neither a saved device name or path list nor the device name of a saved manual bay assignment is used as a SMART device, and a saved device name is no longer restored. A bay whose current poll reports no device path of its own shows no device name, and the SMART details only a device read supplies show as unknown. Which node such a read is sent to is not changed here (#1426).
+- Storage Fabric at narrow widths: the open kernel fault evidence table on Disk Path now scrolls inside its own box instead of making the whole page scroll sideways at 390 px, and the Topology trace band stays below the drawing until the drawing reaches the bottom of the window, so it no longer covers Fit or the notices above the drawing when the page opens (#1427).
+- The synthetic FULL backup benchmark's owned worker now gives each phase 1 GiB of address space on top of what it inherits from the forked supervisor, instead of a flat 1 GiB, so a large supervisor no longer makes the phase's first child start fail with ENOMEM and read as failed (#1429).
+- The synthetic FULL backup benchmark report now names the extra 1 GiB per phase as `per_phase_address_space_budget_bytes` and records, for each phase, the address space the worker inherited and the address-space limit it actually ran under (null when the phase did not report them). The older `per_process_address_space_limit_bytes` field is kept, equals the budget, and the report states that meaning (#1431).
+- Restore: an import now binds the installed history to the validated member's size and SHA-256 between validation and activation, and ignores or refuses SQLite side files. Validation records the size and SHA-256 of the member it judged, read as a single file; activation copies the staged member through one opened file into a private copy and refuses the import unless that copy has the validated size and SHA-256. SQLite reads that private copy as one file under an exclusive lock: a side file found next to it while the copy is being admitted, up to and just after SQLite's first read, refuses the import, and one that appears after that is ignored. The integrity, required table and column, and timestamp checks run on that copy and only it is installed. A segmented import holds its staged hot database and segments to the validated digests before its restore journal is written, and SQLite side files next to the staged member still refuse the import. These refusals leave the current history unchanged (#1432).
+- Storage Fabric Disk Path: the scrollable recent event sample keeps keyboard focus and its scroll position when the page redraws, for example when a SMART read finishes, instead of dropping focus and jumping back to the start of the table (#1433).
+- Saved disk details now keep the "not read" marker for every stable SMART field, not only power-on time: after a restart a rotation rate, firmware version, block size or link rate that the last read reported but could not read shows as not read, never as absent or as the value from an older read, also when that read returned nothing else readable. Saved files without markers still load (#1437).
+- Mapping export, import preview and the import's pre-check read now read the
+  mapping file on a worker thread, so a slow read no longer stalls other
+  requests; at most two such reads run at once and eight wait, and a burst
+  beyond that is answered "The server is busy. Try again in a moment." (503)
+  instead of queueing in the shared worker pool. A mapping save whose readback
+  could not confirm the mapping file now says the update was published, not
+  that it is visible (#1438).
+- SES discovery no longer runs an elevated `sg_ses` page read on SCSI generic
+  devices that are known not to be enclosures. Before the read it checks each
+  device's peripheral type and INQUIRY data in sysfs, which needs no extra
+  privilege. It skips a device only when both reads succeeded, the INQUIRY data
+  is complete (at least 36 bytes and as long as its header says), its peripheral
+  qualifier is 0, its type matches the sysfs type, and it shows a disk, tape or
+  optical drive without enclosure services. A device with a missing,
+  unreadable, short or contradictory identity is still read. The number of
+  skipped devices is logged, and the "found no usable sg_ses devices" message
+  includes it (#1440).
+- QuantaStor enclosure choices no longer stop silently at 64: the selector lists every shelf up to an output bound of 4096, and when that bound is reached the snapshot page warns with the number of enclosures listed and left out (#1441).
+- Verify and download of a remote backup copy now reclaim earlier fetch workspaces whose clean-up failed, once they are shown to belong to the scheduler account, to be unused, and to hold only the fetched file and its fetch's marker. Anything else is left in place and counted in the scheduler log, and while four or more such workspaces are left a remote fetch is refused with the count instead of keeping another full copy. Remote fetches are also refused when the scheduler state folder is a link, belongs to another account or is writable by others (#1442).
+- SES over SSH: an sg_ses page with more elements or text than the parser accepts (8,192 elements or 4 MiB per page) is no longer dropped as if the device had no enclosure. The page is still refused, and the refresh now shows a warning naming the page, the SES device, the host, its element or character count and the limit, so missing bays from that page are explained; an identify-light readback from such a page is reported as unknown (#1443).
+- Backups: the slot detail cache, the SAS Fabric alias store and the mapping store no longer read a JSON state file of any size in one piece. Each read is limited to 64 MiB and 4,194,304 keys and values, checked before anything is parsed, which admits about 22,000 bays of the largest slot detail entry. A file over the limit is treated like an unreadable one, and a warning names the file; an alias change is refused with that reason. Backup import applies the same limit to those three members and refuses one over it, naming the member, so a backup the application would not load is refused before it is restored. A debug bundle that includes one of these files applies the same limit and refuses the export with that reason. A read of a file that is not a regular file, or that changes size while it is read, is not used, and a file nested more than 128 levels deep is refused before it is parsed, whatever the interpreter's own recursion limit; backup import refuses a member nested too deeply as invalid whether it was extracted to disk or kept in memory. Structural item and nesting counts now scan bytes once with bounded string and escape state, so long escaped strings do not build a per-escape scanning stack and punctuation inside strings does not consume the item budget (#1444).
+- History retention now reads a bounded page of rows in each batch: rows in the
+  day before the cutoff that the exact-time comparison keeps (for example rows a
+  restored database stored with a negative UTC offset) no longer have to be read
+  in full by every batch, a large set of them is swept across passes while the
+  dashboard shows more cleanup pending, and which rows are removed is unchanged.
+  A history restore or import now refuses a database whose event, sample or
+  rollup timestamps retention cannot order (not stored as text, no UTC offset,
+  an invalid one, or text that does not start with its own date), and names the
+  column and count; nothing is restored in that case (#1445).
+- Created synthetic QA restore and Compose smoke credentials with mode `0600`
+  from creation instead of narrowing their permissions after writing them (#1446).
+- History imports are now published only from a single-link private copy whose bytes still match, just before publication, the content that was hashed after validation; a mismatch refuses the import (#1447).
+- Bounded mapping save, clear and import-commit work before it enters the shared
+  worker pool. At most two writes are submitted and eight callers wait; further
+  callers receive the existing busy 503 response with Retry-After. Cancelled
+  waiters submit nothing, and running writes retain admission until completion
+  and still invalidate cached views if they commit after caller cancellation (#1448).
+- Added a startup health warning and an admin key-list warning for configured SSH
+  private keys with unsafe ownership or permissions, including symlinks. Both
+  warnings name the file and explain how to correct it without changing the key (#1450).
+- Kept release-commit source tests independent of an Unreleased changelog heading
+  and isolated encrypted-import cleanup checks from crash-recovery fixtures (#1454).
+- Restored the Compose runtime matrix's successful mapping persistence cycle with
+  an isolated synthetic live occupancy producer, kept unread-bay refusal coverage,
+  and added bounded, sanitized HTTP failure diagnostics. Product mapping guards
+  were unchanged; full runtime qualification remains a separate QA gate (#1456).
+- Fixed Compose runtime-matrix startup and UI restart ordering to wait for the
+  synthetic producer and fresh enclosure inventory before resuming history or
+  persistence checks. Kept unread-source refusal mandatory and exposed fixed
+  mapping failure details in bounded diagnostics (#1458).
+- Corrected the ESXi smoke test to distinguish unread carrier bays from matched
+  disks while preserving physical slot order, carrier layout and populated-drive
+  identity checks, with synthetic browser controls for both occupancy states (#1460).
+- Updated the performance harness to wait for retryable safe reads within a configurable readiness deadline, separate snapshot-estimate readiness from warm timings, include recovery waits and attempts in workflow results, and record bounded failure diagnostics without response bodies or credentials (#1462).
+- Topology link buttons now announce their visible labels before supplementary path details, multiline SVG labels keep word separators, and the accessibility crawl no longer treats new label mismatches as the existing bay-tile issue (#1464).
+- Restored bounded busy-response retries for forced inventory GETs in the
+  performance harness, recorded initial inventory readiness separately, and kept
+  busy recovery time and attempt counts in timed forced-refresh measurements
+  without replaying mutations (#1466).
+- Made Storage Fabric Topology node and bay names start with their visible labels,
+  including shortened path text and extra-path counts, while retaining full titles.
+  Kept group summaries and tier names aligned with their rendered text (#1467).
 
 ### Performance
 
@@ -477,6 +594,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   chunks, capped retained chunks and per-system count bytes with an exact full
   query fallback, and prevented restore races from caching replaced-file counts
   (#1175).
+- Storage Fabric Topology: a redraw that keeps the view no longer reads the scroll box's size on the page when the page has no spare scroll room to give back; nothing on the page moves differently, and a test now counts the geometry reads of each redraw (#1419).
 
 ### Internal
 
@@ -510,6 +628,60 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reports malformed rows, including a row missing an outer pipe, instead of
   skipping them or ending the table there, and rejects "Not enough time" as an
   N/A reason (#1233).
+- A pull request now records its changelog entry as one file in `changelog.d`
+  named for its own number and section, for example `changelog.d/1234.fixed.md`,
+  instead of editing `CHANGELOG.md`, so open pull requests no longer conflict
+  there. `scripts/changelog_fragments.py collect` writes the entries into
+  `CHANGELOG.md` when a release is prepared, appending the number from each file
+  name, and the release tools read the fragments for unreleased work. The gate
+  refuses a fragment named for another pull request, and any change to a
+  fragment already on `main`, release cuts included, unless a maintainer applies
+  `changelog-edit-ok` (#1322).
+- Added `tests.test_source_shape`: source files over 3,000 lines are held to recorded ceilings that only move
+  down, and each import between the `app`, `admin_service` and `history_service` packages must be in a
+  recorded list, so the large modules stop growing while they are split (#1327).
+- Moved the streaming JSON reader for file-backed backup members, its duplicate-key tracker and its field-name helper from `history_service/system_backup.py` into the new module `history_service/backup_json.py`. `system_backup` keeps every name, and backup import behaves as before (#1330).
+- Removed code that could not run and styles nothing used: three SCSI sense checks for ASC 0x4B that an earlier branch already answers, two NVMe arms in the saved-view tile renderer that run after the NVMe carrier branch has already returned, and the unused `.snapshot-banner-facts`, `.snapshot-banner-fact` and `.builder-panel-note` selectors. New tests pin the paths that remain (#1331).
+- Moved the TrueNAS CORE trace, parent, lane and counter projection of the SAS fabric out of `app/services/sas_fabric.py` into the new module `app/services/sas_fabric_core.py`. `sas_fabric.py` still provides every name it had, and fabric output is unchanged (#1332).
+- The history store schema and index helpers now live in `history_service/store_schema.py`. `HistoryStore` keeps every name as a thin method and still owns the connection, the migration lock and every transaction; behaviour, log lines and the migration path are unchanged (#1333).
+- Moved the seven history endpoints of the main web application from `app/routes.py` into `app/history_routes.py`. `build_router` still composes the one router and adds them at their old places, so routes, their order and behaviour are unchanged; see #1328 (#1334).
+- A failure of the owned benchmark worker timeout test now reports the exit code, the runner memory size and how far the worker got, so the next occurrence of the intermittent failure can be diagnosed (#1335).
+- Moved the SMART and NVMe summary readers and their helpers out of `app/services/parsers.py` into the new module `app/services/parsers_smart.py`. `app.services.parsers` re-exports every moved name as the same object, so callers and behaviour are unchanged, and the parser pattern sweep now also reads the new module (#1336).
+- The pure model of the admin Backups page (text scrubbing, ids, labels, the
+  policy, plan and status wording, and the settings payload) moved from
+  `admin_backups.js` into its own static script, `admin_backup_model.js`, which
+  the admin page loads first. Behaviour is unchanged (#1337).
+- Moved the source collection and SSH command planning of `InventoryService` into `app/services/inventory_sources.py`, which the service inherits as a mixin. The moved code is unchanged and `app.services.inventory` keeps every name it had; behaviour does not change (#1338).
+- The changelog entry job now compares a pull request with the base branch as it was merged, so a fragment another pull request merged in the meantime is no longer counted against it, and a later change to such a fragment is no longer missed (#1340).
+- Hardened the changelog tools: the gate and `changelog_fragments.py` print every file name, git argument, git error and argument error on one line, with control and formatting characters, line separators and undecodable bytes written as escapes, so crafted input cannot start a log line of its own, and a fragment whose text holds such a character other than its line breaks is refused. An explicit `--base` or `--head` is resolved to a commit id before any comparison, and a value that is empty, starts with `-` or names no commit is refused with exit 2, so git never reads it as an option. An event payload of the wrong shape, a missing git and a `CHANGELOG.md` that is not UTF-8 end with a fixed message instead of a traceback (#1343).
+- Removed code that no production path reached: the single-disk QuantaStor CLI hint resolver and the slot detail persist helper in the inventory service, and the branches of the backup file and directory restore helpers that wrote targets directly when no import transaction was given. The import transaction is now a required argument of both restore helpers. Tests that used the removed helpers now go through the maintained paths: a SMART detail batch flush, the snapshot slot detail save, and a real import transaction (#1344).
+- Three small history test classes now live in their own modules: the domain
+  and configuration tests in `tests/test_history_domain_config.py` and the
+  backup publication durability tests in `tests/test_history_publication.py`.
+  Their test bodies are unchanged and every moved test keeps its class and
+  method name; only the module part of each test identity changes (#1348).
+- Added a small order-independent placement index that later changes use to replace lookup tables which pick a conflicting row by input order. Nothing uses it yet (#1349).
+- Moved the StorCLI JSON readers (controller info, physical drives, the drive census check and virtual drives) and their helpers out of `app/services/parsers.py` into the new module `app/services/parsers_storcli.py`. `app.services.parsers` re-exports every moved name as the same object, so callers and behaviour are unchanged, and the parser work meters and the regex pattern sweep also cover the new module (#1350).
+- Moved the six SSH key and TLS trust endpoints of the admin service from `admin_service/routes.py` into `admin_service/transport_routes.py`. `build_router` still composes the one router and adds them at their old place, so routes, their order, their OpenAPI description and their behaviour are unchanged; see #1345 (#1352).
+- The thirteen history retention SQL helpers now live in `history_service/store_retention.py`. `HistoryStore` keeps every name as a thin method with the same kind, signature and defaults, and still owns the connection, its locks and every transaction; the SQL text and retention behaviour are unchanged (#1353).
+- The inventory service test builder now lives in `tests/inventory_fixtures.py`, and the inventory helper tests in `tests/test_inventory_helpers.py`. The old suite imports the builder back under the same name. Test bodies are unchanged and every moved test keeps its class and method name; only the module part of each test identity changes (#1357).
+- Three projection steps of the inventory service (the mapping revision tokens attached to each slot, the platform capability cards and the layout frame a correlator draws on) moved into their own stateless module, which receives everything it reads from the service as a getter called where the old code read it; the service keeps each method under its old name and signature, and behaviour, messages and read order are unchanged (#1358).
+- The portable 7z backup operations (archive create and read, listing and extraction checks, the bounded command runner, the terminal password prompt and the failure mapping) now live in their own module behind `SystemBackupService`, which keeps every method name, kind and signature. Behaviour, error text and log lines are unchanged (#1359).
+- The admin page's profile and layout model (bay matrices and their text form,
+  ordering detection, preview rows and drive scale, and the slot label, slot size
+  and list text fields) moved from `admin.js` into its own static script,
+  `admin_profile_model.js`, which the admin page loads before `admin.js`.
+  Behaviour is unchanged (#1366).
+- Added regression tests for the Topology startup render, for an expansion
+  whose shelf control is out of view with room before the drawing's left edge,
+  and for the main page Storage Fabric summary as rendered for a CORE payload
+  whose completeness was not reported (#1391).
+- Changelog collect recovery now says to restore `CHANGELOG.md` and `changelog.d/` together before collecting again, so fragments already deleted are not lost; fragments that start an ordered list item or a blockquote on any line are refused, and the refusal for a tab, soft hyphen, zero-width character or direction mark names the remedy (#1394).
+- The UI coverage crawler binds a live admin state that selects a saved system to that system: before the state's steps run it picks the run's write system or else the first listed one, pins the click to it and admits that system's declared reads, so a live admin crawl with appliance loads no longer ends safety-failed on its own reads, while reads for any other system stay refused and a write system the page does not list is not-applicable (#1407).
+- Added tests that the changelog fragment checker gives its own advice for a zero-width space, an Arabic letter mark and a byte order mark (#1410).
+- Backups: a maintained test now covers the provider a copy records when its remote publication has uncertain directory durability, so the preserved copy keeps its read-back presentation in the list and details and a dropped provider fails a test (#1417).
+- Storage Fabric on CORE: a test now covers an expander header whose parent field is blank and whose enclosure handle takes five decimal digits, so a regression in the fixed-column header form that reads a blank parent fails a test (#1424).
+- Restore rollback now has a test showing that it retires the unconsumed staged hot history database through its recorded, authenticated path. A staged copy replaced before rollback is kept, and rollback reports the integrity refusal instead of unlinking the file (#1425).
 
 ## v0.24.0-rc.1 - 2026-11-11
 

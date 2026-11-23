@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { observeAocCarrier } = require("./esxi-carrier-observer");
 const { waitForSelectedScope, switchSelectedScope } = require("./release-readiness");
 
 const liveApplianceQaEnabled = process.env.PLAYWRIGHT_LIVE_APPLIANCE_QA === "1";
@@ -74,30 +75,13 @@ test.describe("ESXi smoke", () => {
     }
 
     await switchSelectedScope(page, "#system-select", "cryostorage-esxi");
-    await expect(page.locator("#enclosure-select")).toHaveValue("enclosure:supermicro-aoc-slg4-2h8m2");
-    await expect(page.locator(".nvme-carrier-board-image")).toHaveAttribute("src", /aoc-slg4-2h8m2\.jpg$/);
-
-    const enclosureOptions = await page.locator("#enclosure-select option").evaluateAll((options) =>
-      options
-        .map((option) => option.value)
-        .filter((value) => typeof value === "string" && value.length > 0)
-    );
-    expect(enclosureOptions).not.toContain("view:aoc-slg4-2h8m2");
-
-    const tiles = page.locator("#slot-grid .slot-tile");
-    await expect(tiles).toHaveCount(2);
-    await expect(tiles.first()).toContainText("13:1");
-    await expect(tiles.nth(1)).toContainText("13:0");
-
-    await tiles.first().click();
-    await expect(page.locator("#detail-content")).toBeVisible();
-    // A host without StorCLI keeps the carrier layout and says why the drive model is missing.
-    const warnings = (await page.locator("#warning-list").textContent()) || "";
-    await expect(page.locator("#detail-content")).toContainText(
-      /StorCLI is not (installed|available) on this ESXi host/.test(warnings) ? "13:1" : "Samsung SSD 970 EVO 2TB"
-    );
-    await expect(page.locator("#detail-led-controls")).toBeHidden();
-    await expect(page.locator("#detail-smart-note")).toBeVisible();
-    await expect(page.locator(".nvme-carrier-edge-note")).toContainText("M2-1 lower slot");
+    // The built-in AOC profile puts physical bay 01 above bay 00.
+    const carrierTiles = page.locator("#slot-grid .slot-tile");
+    expect(await carrierTiles.evaluateAll(nodes => nodes.map(node => node.dataset.slot))).toEqual(["1", "0"]);
+    await expect(carrierTiles.locator(".storage-view-runtime-card-slot")).toHaveText(["01", "00"]);
+    const upper = await carrierTiles.nth(0).boundingBox();
+    const lower = await carrierTiles.nth(1).boundingBox();
+    expect(upper.y).toBeLessThan(lower.y);
+    await observeAocCarrier(page);
   });
 });

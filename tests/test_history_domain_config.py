@@ -160,9 +160,9 @@ class HistoryDomainTests(unittest.TestCase):
             pool_name="HA-Pool-R10",
             vdev_name="mirror-0",
             health="ONLINE",
-            sas_address="5002538b496a5512",
+            sas_address="5000c50000008102",
         )
-        current = replace(previous, sas_address="5002538b496a5510")
+        current = replace(previous, sas_address="5000c50000008100")
 
         events = build_slot_events(previous, current, "2026-06-12T17:00:25+00:00")
 

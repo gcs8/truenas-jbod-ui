@@ -173,6 +173,7 @@ class DevCheckPlanTests(unittest.TestCase):
                 ("node", "--check", "app/static/app_smart_formatters.js"),
                 ("node", "--check", "app/static/sas_fabric_view.js"),
                 ("node", "--check", "app/static/sas_fabric_topology.js"),
+                ("node", "--check", "app/static/sas_fabric_transport.js"),
                 ("node", "--check", "admin_service/static/admin.js"),
                 ("node", "--check", "admin_service/static/admin_profile_model.js"),
                 ("node", "--check", "history_service/static/dashboard.js"),

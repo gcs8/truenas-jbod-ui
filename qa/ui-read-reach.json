@@ -40,6 +40,7 @@
    "declared_per_state": [
     {"method":"DELETE","path":"/api/slots/{slot}/mapping","class":"app-write","sites":["app/static/app.js#clearMapping"]},
     {"method":"GET","path":"/api/read-ui/auth/verify","class":"forbidden","sites":["app/static/app.js#submitReadUiSignIn"]},
+    {"method":"GET","path":"/api/systems/{system_id}/disk-inventory-sync","class":"appliance-load","sites":["app/static/app.js#runDiskInventorySync"]},
     {"method":"POST","path":"/api/export/enclosure-snapshot","class":"read-heavy","sites":["app/static/app.js#exportEnclosureSnapshot"]},
     {"method":"POST","path":"/api/mappings/import","class":"forbidden","sites":["app/static/app.js#importMappingsFromFile"]},
     {"method":"POST","path":"/api/mappings/import/preview","class":"forbidden","sites":["app/static/app.js#importMappingsFromFile"]},
@@ -53,7 +54,7 @@
   "fabric": {
    "service": "ui",
    "template": "app/templates/sas_fabric.html",
-   "scripts": ["app/static/sas_fabric_topology.js","app/static/sas_fabric_view.js"],
+   "scripts": ["app/static/sas_fabric_transport.js","app/static/sas_fabric_topology.js","app/static/sas_fabric_view.js"],
    "scopes": {
     "enclosure": [
      {"method":"GET","path":"/api/inventory","class":"read","query":["enclosure_id","force","mode","system_id"],"bind":["system_id","enclosure_id"],"sites":["app/static/sas_fabric_view.js#refreshFabric"]},

@@ -230,6 +230,8 @@ class ParsedSSHData:
     # Each answered `/eall/sall` listing: whether its reply was a whole drive census.
     esxi_storcli_drive_lists: dict[str, bool] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # SES pages a reader refused because they exceed the page budget (#1308).
+    ses_page_refusals: list["SESPageRefusal"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -295,6 +297,34 @@ class SESMapSlot:
     # Set when the record that supplied this slot reported no device path, so
     # an enclosure path from another merged record cannot complete it.
     ses_device_unreported: bool = field(default=False, compare=False)
+
+
+SES_PAGE_LABELS = {"aes": "AES page", "ec": "enclosure status page", "join": "joined page"}
+
+
+@dataclass(slots=True, frozen=True)
+class SESPageRefusal:
+    """An `sg_ses` page left out because it exceeds the per-page budget.
+
+    `reason` is "elements" or "characters"; `count` is what the page held and
+    `limit` the budget it exceeded. A refusal is not "no enclosure": the page
+    was read and its evidence was left out (#1308).
+    """
+
+    page: str
+    reason: str
+    count: int
+    limit: int
+    ses_device: str | None = None
+
+    def describe(self, host: str | None = None) -> str:
+        label = SES_PAGE_LABELS.get(self.page, f"{self.page} page")
+        source = self.ses_device or "an SES device"
+        where = f"{source} on {host}" if host else source
+        return (
+            f"{label} from {where} was refused: it has {self.count} {self.reason}, over the limit of "
+            f"{self.limit} per page. Its enclosure evidence is left out of this refresh."
+        )
 
 
 @dataclass(slots=True)
@@ -738,8 +768,14 @@ def _add_ses_device_name(slot: SESMapSlot, name: str) -> None:
     slot.device_names.sort(key=_device_name_sort_key)
 
 
-def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], bool]) -> bool:
+def _ses_input_exceeds_bounds(
+    output: str, element_line: str | Callable[[str], bool]
+) -> tuple[str, int, int] | None:
     """Count element headers line by line, the way the parsers read them.
+
+    Returns None within budget, else (reason, count, limit): "characters" with
+    the text length, or "elements" with the page's whole element count. The
+    count runs to the end only below the text ceiling, so it stays linear.
 
     A pattern is matched against each stripped line, never the whole output: a
     `^\\s*` that can cross line breaks rescans every run of blank lines, which
@@ -747,7 +783,7 @@ def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], b
     """
 
     if len(output) > MAX_SES_OUTPUT_CHARS:
-        return True
+        return "characters", len(output), MAX_SES_OUTPUT_CHARS
     if isinstance(element_line, str):
         element_line_pattern = re.compile(element_line, re.IGNORECASE)
 
@@ -761,9 +797,22 @@ def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], b
         if not stripped or not is_element_line(stripped):
             continue
         element_count += 1
-        if element_count > MAX_SES_ELEMENTS:
-            return True
-    return False
+    if element_count > MAX_SES_ELEMENTS:
+        return "elements", element_count, MAX_SES_ELEMENTS
+    return None
+
+
+def _sg_ses_page_refusal(
+    output: str,
+    element_line: str | Callable[[str], bool],
+    page: str,
+    command: str | None,
+) -> SESPageRefusal | None:
+    exceeded = _ses_input_exceeds_bounds(output, element_line)
+    if exceeded is None:
+        return None
+    reason, count, limit = exceeded
+    return SESPageRefusal(page, reason, count, limit, _extract_sg_ses_device(command))
 
 
 # `sesutil map` prints a bay's four SES status bytes after the status name, for
@@ -1571,7 +1620,7 @@ def _parse_sg_ses_common_field(line: str) -> tuple[str, str | None] | None:
     return None
 
 
-def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure | None:
+def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure | SESPageRefusal | None:
     """
     Parse `sg_ses -p aes /dev/sgN` output into an enclosure/slot record.
 
@@ -1581,8 +1630,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     prettier enclosure APIs available.
     """
 
-    if _ses_input_exceeds_bounds(output, r"^\s*Element index:\s*\d+"):
-        return None
+    refusal = _sg_ses_page_refusal(output, r"^\s*Element index:\s*\d+", "aes", command)
+    if refusal is not None:
+        return refusal
 
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
@@ -1636,7 +1686,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             )
             descriptor_count += 1
             if descriptor_count > MAX_SES_AES_DESCRIPTORS:
-                return None
+                return SESPageRefusal("aes", "elements", descriptor_count, MAX_SES_AES_DESCRIPTORS, ses_device)
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             descriptor_presence_evidence = []
             raw_element_id = int(element_match.group("element"))
@@ -1741,7 +1791,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     return enclosure
 
 
-def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SESMapEnclosure | None:
+def parse_sg_ses_enclosure_status(
+    output: str, command: str | None = None
+) -> SESMapEnclosure | SESPageRefusal | None:
     """
     Parse `sg_ses -p ec /dev/sgN` output into slot status/identify metadata.
 
@@ -1750,8 +1802,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     currently asserted on a given slot after a refresh.
     """
 
-    if _ses_input_exceeds_bounds(output, r"^\s*Element\s+\d+\s+descriptor:"):
-        return None
+    refusal = _sg_ses_page_refusal(output, r"^\s*Element\s+\d+\s+descriptor:", "ec", command)
+    if refusal is not None:
+        return refusal
 
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
@@ -1914,7 +1967,7 @@ def _starts_with_sg_ses_slot_bracket(lowered: str) -> bool:
     return digits_end > 4 and bracket > digits_end and lowered.startswith("[", bracket)
 
 
-def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | None:
+def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | SESPageRefusal | None:
     """
     Parse `sg_ses --join --filter /dev/sgN` output into slot metadata.
 
@@ -1924,8 +1977,9 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     through the same SESMapEnclosure model so AES/EC-only hosts keep working.
     """
 
-    if _ses_input_exceeds_bounds(output, _is_sg_ses_join_element_header):
-        return None
+    refusal = _sg_ses_page_refusal(output, _is_sg_ses_join_element_header, "join", command)
+    if refusal is not None:
+        return refusal
 
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
@@ -3673,6 +3727,9 @@ def canonicalize_ssh_command(command: str) -> str:
     wrappers and reduce the command to the subcommand shape we care about.
     """
 
+    from app.services.linux_sas_transport_read import SAS_TRANSPORT_COMMAND, SAS_TRANSPORT_KEY
+    if command in {SAS_TRANSPORT_COMMAND, SAS_TRANSPORT_KEY}:
+        return SAS_TRANSPORT_KEY
     smp_key = smp_output_key(command)
     if smp_key:
         return smp_key
@@ -4150,6 +4207,11 @@ SSH_OUTPUT_PARSERS = {
 }
 
 
+def _record_ses_page_refusal(parsed: ParsedSSHData, refusal: SESPageRefusal) -> None:
+    parsed.ses_page_refusals.append(refusal)
+    parsed.warnings.append(refusal.describe())
+
+
 def parse_ssh_outputs(
     outputs: dict[str, str],
     slot_count: int,
@@ -4239,21 +4301,27 @@ def parse_ssh_outputs(
         if not command_key.startswith("sg_ses aes /dev/sg"):
             continue
         enclosure = parse_sg_ses_aes(output, command_key)
-        if enclosure:
+        if isinstance(enclosure, SESPageRefusal):
+            _record_ses_page_refusal(parsed, enclosure)
+        elif enclosure:
             parsed.ses_enclosures.append(enclosure)
 
     for command_key, output in normalized_outputs.items():
         if not command_key.startswith("sg_ses join /dev/sg"):
             continue
         enclosure = parse_sg_ses_join_filter(output, command_key)
-        if enclosure:
+        if isinstance(enclosure, SESPageRefusal):
+            _record_ses_page_refusal(parsed, enclosure)
+        elif enclosure:
             parsed.ses_enclosures.append(enclosure)
 
     for command_key, output in normalized_outputs.items():
         if not command_key.startswith("sg_ses ec /dev/sg"):
             continue
         enclosure = parse_sg_ses_enclosure_status(output, command_key)
-        if enclosure:
+        if isinstance(enclosure, SESPageRefusal):
+            _record_ses_page_refusal(parsed, enclosure)
+        elif enclosure:
             parsed.ses_enclosures.append(enclosure)
 
     if parsed.ses_enclosures:

@@ -126,6 +126,13 @@ On the Docker host, keep a dedicated key for this app in:
 
 and mount it read-only into the container, which the compose file already does.
 
+Use a regular private key file, not a symlink. Its owner must be root or the
+UI user (`APP_UID`). On the Docker host use `chmod 600` for owner-only access.
+If the non-root UI needs to read a root-owned key, set its group to the
+application group (`APP_GID`) and use `chmod 640` instead. Do not grant group
+write or any access to other users. Startup and the admin key list report
+unsafe permissions; neither changes the file. This does not apply to `.pub` files.
+
 Example OpenSSH key generation on the Docker host:
 
 ```bash
@@ -660,6 +667,21 @@ list. `sg` numbers can change after a reboot or disk change; a saved
 `/dev/sgN` line can end up reading a disk or CD-ROM. On SCALE and QuantaStor the
 app skips such saved lines and adds one refresh warning that names how many it
 skipped. The sudo rules for those reads are still needed.
+
+The app also runs one fixed `/usr/bin/python3 -I -c` read-only SAS transport
+survey automatically on SCALE and Linux. It reads only the SAS transport
+classes and associated SCSI host attributes in sysfs, without sudo, SMP tools
+or writes. No sudoers or admin bootstrap grant is needed, and Python must not
+be added to sudoers. A restricted SSH command gateway must admit only the exact
+`SAS_TRANSPORT_COMMAND` in `app/services/linux_sas_transport_read.py`, not a
+general Python or shell command. The standing command list stays unchanged.
+
+The survey caps rows at 4096, each directory at 2048 entries, directory visits
+at 32768, each attribute at 512 bytes, total attribute/output bytes at 2 MiB
+and elapsed read time at 10 seconds. A cap or unreadable directory refuses the
+whole transport survey. Missing, denied, unlinked or `Unknown` PHY values stay
+not read, not zero. SES-only visibility and its warning remain when transport
+evidence is absent or refused.
 
 `smartctl` does not need to be added to the standing SSH command list above.
 The app runs it on demand for the selected slot, but the user still needs sudo

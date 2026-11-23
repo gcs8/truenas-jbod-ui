@@ -33,6 +33,12 @@ On the Docker host:
 - private key in `./config/ssh/id_truenas`
 - pinned host keys in `./data/known_hosts` by default
 
+Use a regular private key file owned by root or `APP_UID`. Set mode `0600` for
+owner-only access, or `0640` with group `APP_GID` when the non-root UI needs
+to read a root-owned key. The UI health check and admin key list warn about
+unsafe ownership, permissions or a symlink. Correct the file on the Docker
+host; the app does not change it.
+
 By default the known-hosts location is derived from the runtime layout. Inside
 the default container layout the derived file is `/app/data/known_hosts`. To
 keep pinned keys in a host bind mount instead, set `ssh.known_hosts_path` (top

@@ -72,6 +72,12 @@ from app.config import (
     load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
+from app.services.json_state_budget import (
+    JsonStateFileRefused,
+    JsonStateFileTooLarge,
+    check_json_state,
+    read_json_state,
+)
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry
 from app.services.storage_views import resolve_system_storage_views
@@ -265,6 +271,11 @@ SENSITIVE_GROUP_KEYS: set[str] = {
 }
 STRUCTURED_YAML_GROUP_KEYS = frozenset(
     {CONFIG_FILE_KEY, RUNTIME_OVERRIDES_FILE_KEY, PROFILE_FILE_KEY}
+)
+# Members a store reads back whole after a restore, under the JSON state file
+# budget of app.services.json_state_budget.
+JSON_STATE_GROUP_KEYS = frozenset(
+    {MAPPING_FILE_KEY, SAS_FABRIC_ALIAS_FILE_KEY, SLOT_DETAIL_FILE_KEY}
 )
 
 
@@ -4051,24 +4062,31 @@ class SystemBackupService:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
             try:
                 content = extracted_members[member_key]
+                if group_key in JSON_STATE_GROUP_KEYS:
+                    # The whole-file budget the store applies when it reads
+                    # the restored file, so a member it would refuse is
+                    # refused here (#1286).
+                    self._check_json_state_member(content, str(member_entry["archive_path"]))
                 if group_key == HISTORY_DB_KEY:
                     validated[member_key] = self._validate_history_member(
                         content,
                         integrity_checked=history_integrity_checked,
                     )
-                elif isinstance(content, Path) and group_key == MAPPING_FILE_KEY:
+                # In memory or on disk, the same streaming validator (#1286):
+                # one verdict, whatever the representation.
+                elif group_key == MAPPING_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "slot_mappings",
                         ManualMapping,
                     )
-                elif isinstance(content, Path) and group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "sas_fabric_aliases",
                         SasFabricAlias,
                     )
-                elif isinstance(content, Path) and group_key == SLOT_DETAIL_FILE_KEY:
+                elif group_key == SLOT_DETAIL_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
                         "slot_details",
@@ -4084,6 +4102,14 @@ class SystemBackupService:
                     validator(self._extracted_member_bytes(content))
             except HistorySchemaVersionError as exc:
                 raise ValueError(exc.reason) from exc
+            except JsonStateFileRefused as exc:
+                if isinstance(exc, JsonStateFileTooLarge) and exc.unit == "levels of nesting":
+                    # Preserve the streaming validator's existing depth diagnostic.
+                    raise ValueError(f"Backup bundle selected {group_key} member is invalid.") from exc
+                raise ValueError(
+                    f"Backup bundle member {exc.name} is {exc.detail}, so the application "
+                    "would not load it after a restore."
+                ) from exc
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
@@ -4203,11 +4229,22 @@ class SystemBackupService:
         return digest.hexdigest()
 
     @staticmethod
+    def _check_json_state_member(content: ExtractedMember, name: str) -> None:
+        if isinstance(content, bytes):
+            check_json_state(io.BytesIO(content), name, size=len(content))
+            return
+        with content.open("rb", buffering=0) as source:
+            check_json_state(source, name)
+
+    @staticmethod
     def _validate_streaming_json_member(
-        content: Path,
+        content: ExtractedMember,
         target_key: str,
         model: Any,
     ) -> int:
+        if isinstance(content, bytes):
+            with io.TextIOWrapper(io.BytesIO(content), encoding="utf-8") as source:
+                return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
         with content.open("r", encoding="utf-8", buffering=JSON_STREAM_CHUNK_CHARS) as source:
             return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
 
@@ -4885,7 +4922,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.mapping_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -4900,7 +4939,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.sas_fabric_alias_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -4915,7 +4956,9 @@ class SystemBackupService:
                     if selected else None
                 )
                 content_bytes = (
-                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    self._read_scrubbed_json_file(
+                        snapshot_path, scrubber, Path(app_settings.paths.slot_detail_cache_file).name,
+                    )
                     if snapshot_path is not None else b""
                 )
                 group, members = self._collect_generated_file_group(
@@ -7144,10 +7187,20 @@ class SystemBackupService:
             allow_unicode=False,
         ).encode("utf-8")
 
-    def _read_scrubbed_json_file(self, path: Path, scrubber: DebugScrubber | None) -> bytes:
+    def _read_scrubbed_json_file(
+        self, path: Path, scrubber: DebugScrubber | None, name: str,
+    ) -> bytes:
+        """Read one JSON state file snapshot under the stores' budget (#1286).
+
+        ``name`` is the state file's own name, for the operator-visible
+        refusal. Over budget (bytes, keys and values, or nesting), the
+        snapshot is refused before it is parsed.
+        """
         if not path.exists():
             return b""
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("rb") as source:
+            raw = read_json_state(source, name)
+        payload = json.loads(raw.decode("utf-8"))
         if scrubber is not None:
             payload = scrubber.scrub_payload(payload)
         return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")

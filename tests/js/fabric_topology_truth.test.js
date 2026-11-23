@@ -56,8 +56,8 @@ test("levels and PHY counts the producer sends as decimal strings draw the casca
   assert.equal(level(2).length, 2);
   for (const lower of level(2)) for (const upper of level(1)) assert.ok(lower.y > upper.y, "level 2 is drawn below level 1");
   const html = T.renderTopology(model, {});
-  assert.match(html, />level 1<\/text><text[^>]*>8 of 36 PHYs linked</);
-  assert.match(html, />level 2<\/text><text[^>]*>4 of 36 PHYs linked</);
+  assert.match(html, />level 1<\/text>\s+<text[^>]*>8 of 36 PHYs linked</);
+  assert.match(html, />level 2<\/text>\s+<text[^>]*>4 of 36 PHYs linked</);
   assert.doesNotMatch(html, /level not reported/);
 
   // Strict reader: anything but plain decimal digits stays unknown.
@@ -643,7 +643,7 @@ test("a profile that counts bays from 1 shows the producer's label in the cell, 
   const cells = cellsOf(html);
   assert.deepEqual(cells.get("bay:0").text, ["01"]);
   assert.deepEqual(cells.get("bay:2").text, ["03"]);
-  assert.match(cells.get("bay:0").name, /^Bay 01,/);
+  assert.match(cells.get("bay:0").name, /^01, Bay 01,/);
   assert.doesNotMatch(html, /Bays 0–/);
   assert.deepEqual([...T.searchTopology(model, "1").matches].map((item) => item.id), ["bay:0"]);
   assert.deepEqual([...T.searchTopology(model, "bay 3").matches].map((item) => item.id), ["bay:2"]);
@@ -911,7 +911,7 @@ test("a bay group where only some labels carry a number says how many are number
   assert.deepEqual(heading(model), ["4 bays, 1 numbered: 04"]);
   const html = T.renderTopology(model, {});
   assert.doesNotMatch(html, /Bays 04–04/);
-  assert.match(html, /aria-label="4 bays, 1 numbered: 04"/);
+  assert.match(html, /aria-label="4 bays, 1 numbered: 04 linux-ses: 4 mapped, 4 bays, 1 numbered: 04"/);
   // Every bay numbered: the range, as before.
   const full = T.buildTopologyModel(cases.core_cascade.fabric, { inventory: cases.core_cascade.snapshot });
   for (const text of heading(full)) assert.match(text, /^Bays \d+–\d+ · \d+ bays$/, text);

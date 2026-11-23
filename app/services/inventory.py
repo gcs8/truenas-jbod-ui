@@ -73,6 +73,17 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
+from app.services.disk_sync_status import (
+    DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM,
+    DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES,
+    DiskInventorySyncBusy,
+    DiskInventorySyncUnavailable,
+    DiskSyncStatusMixin,
+    _DiskInventorySyncState,
+    _bounded_middleware_text,
+    _parse_disk_inventory_sync_job as _parse_disk_inventory_sync_job,
+    _parse_disk_inventory_sync_job_id,
+)
 from app.services.inventory_accounting import DiskRetentionAccounting, build_disk_retention_accounting
 from app.services import inventory_projection as _inventory_projection
 from app.services import inventory_sources as _inventory_sources
@@ -168,11 +179,12 @@ from app.services.parsers import (
     fixed_device_sg_ses_reads,  # noqa: F401
     MultipathInfo,
     ParsedSSHData,
+    SESMapEnclosure,
     ZpoolMember,
     _extract_slot_number,
-    _merge_control_targets,
+    _merge_control_targets as _merge_control_targets,
     _merge_ses_enclosures,
-    _ses_enclosures_share_identity,
+    _ses_enclosures_share_identity as _ses_enclosures_share_identity,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     esxi_storcli_fallback_command,  # noqa: F401
@@ -420,24 +432,6 @@ UNIFI_BOOT_MEDIA_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
-# TrueNAS middleware CLI the disk inventory sync action drives over the system's
-# existing SSH channel. CORE installs midclt under /usr/local/bin,
-# SCALE under /usr/bin; other platforms have no TrueNAS middleware to ask.
-DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM: dict[str, str] = {
-    "core": "/usr/local/bin/midclt",
-    "scale": "/usr/bin/midclt",
-}
-DISK_INVENTORY_SYNC_JOB_STATES = frozenset({"WAITING", "RUNNING", "SUCCESS", "FAILED", "ABORTED"})
-DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES = frozenset({"SUCCESS", "FAILED", "ABORTED"})
-DISK_INVENTORY_SYNC_ERROR_MAX_CHARS = 400
-
-
-class DiskInventorySyncUnavailable(TrueNASAPIError):
-    """The requested disk inventory sync mode cannot run on this system."""
-
-
-class DiskInventorySyncBusy(TrueNASAPIError):
-    """Another disk inventory sync is already running for this system."""
 
 
 class LedSessionBusyError(TrueNASAPIError):
@@ -448,66 +442,6 @@ class LedSessionBusyError(TrueNASAPIError):
 
 class LedTargetMovedError(TrueNASAPIError):
     """The remembered SES device now reports a different shelf, so no locate command ran."""
-
-
-@dataclass(slots=True)
-class _DiskInventorySyncState:
-    """Mutable state handed intact to services built by later generations."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    active_job_id: int | None = None
-
-
-def _bounded_middleware_text(value: Any) -> str | None:
-    """Collapse middleware error text to one bounded line for operator display."""
-
-    if value is None:
-        return None
-    text = " ".join(str(value).split())
-    if not text:
-        return None
-    if len(text) > DISK_INVENTORY_SYNC_ERROR_MAX_CHARS:
-        return text[: DISK_INVENTORY_SYNC_ERROR_MAX_CHARS - 3].rstrip() + "..."
-    return text
-
-
-def _parse_disk_inventory_sync_job_id(stdout: str) -> int | None:
-    text = (stdout or "").strip()
-    if not text:
-        return None
-    try:
-        value: Any = json.loads(text)
-    except ValueError:
-        value = text
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _parse_disk_inventory_sync_job(stdout: str, job_id: int) -> tuple[str, str | None]:
-    try:
-        payload = json.loads((stdout or "").strip() or "null")
-    except ValueError as exc:
-        raise TrueNASAPIError(
-            f"TrueNAS returned an unreadable status for disk sync job {job_id}."
-        ) from exc
-    entries = payload if isinstance(payload, list) else [payload]
-    entry = next(
-        (item for item in entries if isinstance(item, dict) and item.get("id") == job_id),
-        None,
-    )
-    if entry is None:
-        raise TrueNASAPIError(f"TrueNAS no longer lists disk sync job {job_id}.")
-    raw_state = entry.get("state")
-    state = raw_state.strip().upper() if isinstance(raw_state, str) else "UNKNOWN"
-    if state not in DISK_INVENTORY_SYNC_JOB_STATES:
-        state = "UNKNOWN"
-    return state, _bounded_middleware_text(entry.get("error"))
-
 
 # smartctl device type the generic-Linux path forces for UniFi boot media, which
 # turns the sudo-run SMART probes into `smartctl -d <type> -x ...` forms. The
@@ -584,7 +518,10 @@ OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
 SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
-QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
+# Output-runaway bound on QuantaStor enclosure choices across all listed
+# storage systems, far above real node and shelf counts. Reaching it is shown on
+# the page with the read and omitted counts (#1307).
+QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 4096
 SNAPSHOT_STATE_MAX_ENTRIES = 64
 # Locate presses each open their own short SSH login, separate from the
 # inventory session (#926). Bound them per host so a burst of presses cannot
@@ -869,6 +806,19 @@ def parse_size_to_bytes(value: Any) -> int | None:
     return int(number * (base ** power))
 
 
+def _read_capacity_bytes(value: Any) -> int | None:
+    """Accept a capacity reading, never a substring of an SES descriptor."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    text = value.strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?\s*(?:[KMGTPE](?:iB|B)?|B)?", text, re.IGNORECASE):
+        return None
+    size_bytes = parse_size_to_bytes(text)
+    return size_bytes if size_bytes is not None and size_bytes > 0 else None
+
+
 def build_lunid_alias_tiers(value: str | None, platform: str) -> tuple[str | None, set[str]]:
     """Split lunid aliases into the exact identity and its shifted neighbors."""
     exact = normalize_hex_identifier(value)
@@ -998,6 +948,20 @@ class _QuantastorCliDiskHints:
     # Batch aggregates retain counts and ordinal sums, never ordinal postings.
     groups: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
     identities: list[dict[str, set[str]]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class QuantaStorEnclosureOptionsRead:
+    """QuantaStor enclosure choices, with the count left out at the bound."""
+
+    options: list[EnclosureOption]
+    read_count: int
+    omitted_count: int
+    limit: int
+
+    @property
+    def incomplete(self) -> bool:
+        return self.omitted_count > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1483,6 +1447,8 @@ async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> Re
 
 MAPPING_READ_MAX_CONCURRENCY = 2
 MAPPING_READ_MAX_WAITERS = 8
+MAPPING_WRITE_MAX_CONCURRENCY = 2
+MAPPING_WRITE_MAX_WAITERS = 8
 
 
 @dataclass(slots=True)
@@ -1492,9 +1458,10 @@ class _MappingReadLoopAdmission:
 
 
 class MappingReadAdmission:
-    """Bound mapping-store reads before they reach the shared default executor.
+    """Bound mapping-store work before it reaches the shared default executor.
 
-    At most ``max_concurrency`` reads hold a worker thread, at most
+    Reused for writes with a separate gate and a post-cancellation commit hook.
+    At most ``max_concurrency`` calls hold a worker thread, at most
     ``max_waiters`` callers wait for a turn, and any further caller is refused
     with the existing busy error (503). A turn is released only when the worker
     finishes, never when its caller is cancelled, because the thread keeps
@@ -1502,14 +1469,20 @@ class MappingReadAdmission:
     the default executor it protects.
     """
 
-    def __init__(self, *, max_concurrency: int, max_waiters: int) -> None:
+    def __init__(
+        self, *, max_concurrency: int, max_waiters: int, reason: str = "mapping-read-admission",
+    ) -> None:
+        self.reason = reason
         self.max_concurrency = max(1, int(max_concurrency))
         self.max_waiters = max(0, int(max_waiters))
         self._loops: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _MappingReadLoopAdmission] = (
             weakref.WeakKeyDictionary()
         )
 
-    async def run(self, read: Callable[[], RetainedResultT]) -> RetainedResultT:
+    async def run(
+        self, read: Callable[[], RetainedResultT], *,
+        on_committed: Callable[[RetainedResultT], None] | None = None,
+    ) -> RetainedResultT:
         loop = asyncio.get_running_loop()
         state = self._loops.setdefault(loop, _MappingReadLoopAdmission())
         if state.running < self.max_concurrency:
@@ -1527,14 +1500,19 @@ class MappingReadAdmission:
                         state.waiters.remove(turn)
                 raise
         else:
-            raise SnapshotStateBusyError(reason="mapping-read-admission")
+            raise SnapshotStateBusyError(reason=self.reason)
         try:
             worker = loop.run_in_executor(None, copy_context().run, read)
         except BaseException:
             self._release(state)
             raise
         worker.add_done_callback(lambda _done: self._release(state))
-        return await _drain_inventory_worker(worker)
+        try:
+            return await _drain_inventory_worker(worker)
+        except asyncio.CancelledError:
+            if on_committed is not None and not worker.cancelled() and worker.exception() is None:
+                on_committed(worker.result())
+            raise
 
     @staticmethod
     def _release(state: _MappingReadLoopAdmission) -> None:
@@ -1549,6 +1527,11 @@ class MappingReadAdmission:
 MAPPING_READ_ADMISSION = MappingReadAdmission(
     max_concurrency=MAPPING_READ_MAX_CONCURRENCY,
     max_waiters=MAPPING_READ_MAX_WAITERS,
+)
+MAPPING_WRITE_ADMISSION = MappingReadAdmission(
+    max_concurrency=MAPPING_WRITE_MAX_CONCURRENCY,
+    max_waiters=MAPPING_WRITE_MAX_WAITERS,
+    reason="mapping-write-admission",
 )
 
 
@@ -1578,20 +1561,11 @@ async def _run_mapping_store_write(
     keeps ownership until the write finishes, even through cancellation, so a
     write is never left running unobserved. A write that commits after its
     caller was cancelled still runs ``on_committed`` (cache invalidation),
-    because that caller will not, and then reports the cancellation.
+    because that caller will not, and then reports the cancellation. Admission
+    is bounded before submission by ``MAPPING_WRITE_ADMISSION``; cancelled
+    waiters submit nothing, and overflow gets the existing busy response.
     """
-    worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, write)
-    cancelled = False
-    while not worker.done():
-        try:
-            await asyncio.wait({worker})
-        except asyncio.CancelledError:
-            cancelled = True
-    if not cancelled:
-        return worker.result()
-    if not worker.cancelled() and worker.exception() is None:
-        on_committed(worker.result())
-    raise asyncio.CancelledError
+    return await MAPPING_WRITE_ADMISSION.run(write, on_committed=on_committed)
 
 
 class SmartDetailBatch:
@@ -1998,7 +1972,7 @@ def slot_detail_collection_binding(system: SystemConfig) -> str:
     return f"sha256:{digest[:32]}"
 
 
-class InventoryService(InventorySourceCollectionMixin):
+class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
     # Class defaults keep partially built services (tests, adapters) readable.
     _smp_counter_capability: str | None = None
     _smp_counter_checked_at = 0.0
@@ -5632,6 +5606,17 @@ class InventoryService(InventorySourceCollectionMixin):
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
                     continue
+                if field_name == "size_bytes":
+                    cached_value = _read_capacity_bytes(cached_value)
+                    if cached_value is None:
+                        continue
+                elif field_name == "size_human":
+                    # Older writers saved free-form SES text as a disk size.
+                    cached_bytes = _read_capacity_bytes(entry.slot_fields.get("size_bytes"))
+                    if cached_bytes is not None:
+                        cached_value = format_bytes(cached_bytes)
+                    elif _read_capacity_bytes(cached_value) is None:
+                        continue
                 if field_name in UNSIGNED_SLOT_DETAIL_FIELDS and self._unsigned_block_size(cached_value) is None:
                     continue
                 if field_name in ("smart_device_names", "device_name") and quantastor:
@@ -6127,23 +6112,36 @@ class InventoryService(InventorySourceCollectionMixin):
         reason = self.disk_inventory_sync_unavailable_reason(mode)
         if reason:
             raise DiskInventorySyncUnavailable(reason)
-        if self._disk_inventory_sync_lock.locked():
-            raise DiskInventorySyncBusy(
-                "A TrueNAS disk inventory sync is already running for this system. "
-                "Wait for it to finish before starting another."
-            )
-        async with self._disk_inventory_sync_lock:
-            midclt = DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM[self.system.truenas.platform]
-            active_job_id = self._disk_inventory_sync_active_job_id
-            if active_job_id is not None:
-                state, _error = await self._get_disk_inventory_sync_job_state(midclt, active_job_id)
-                if state not in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
-                    raise DiskInventorySyncBusy(
-                        f"TrueNAS disk sync job {active_job_id} is still running for this system. "
-                        "Wait for it to finish before starting another."
-                    )
-                self._disk_inventory_sync_active_job_id = None
+        lock = (self._disk_inventory_sync_state.multipath_lock
+                if mode == DiskInventorySyncMode.multipath else self._disk_inventory_sync_lock)
+        if lock.locked():
+            job_id = self._disk_inventory_sync_active_job_id if mode == DiskInventorySyncMode.full else None
+            if job_id is not None:
+                observed = await self.get_disk_inventory_sync_status(job_id)
+                raise DiskInventorySyncBusy(observed.message, result=observed)
+            message = "A TrueNAS disk inventory sync request is already in progress. Its job id is not available yet."
+            raise DiskInventorySyncBusy(message, result=DiskInventorySyncResult(
+                mode=mode, state="BUSY", message=message))
+        async with lock:
             started = self._disk_inventory_sync_clock()
+            midclt = DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM[self.system.truenas.platform]
+            notice = ""
+            active_job_id = self._disk_inventory_sync_active_job_id
+            if mode == DiskInventorySyncMode.full and active_job_id is not None:
+                previous = await self._disk_sync_status_result(
+                    midclt, active_job_id,
+                    budget=min(50.0, max(1, self.settings.app.disk_inventory_sync_timeout_seconds) * 0.4),
+                )
+                if previous.state in {"WAITING", "RUNNING"}:
+                    raise DiskInventorySyncBusy(previous.message, result=previous)
+                if previous.state == "UNKNOWN":
+                    notice = f"The previous disk sync job {active_job_id}'s state is unknown. "
+                elif previous.state in {"FAILED", "ABORTED"}:
+                    notice = previous.message + (f" {previous.error}" if previous.error else "") + " "
+            if mode == DiskInventorySyncMode.full:
+                prerequisite = self._disk_sync_multipath_prerequisite()
+                if prerequisite:
+                    return DiskInventorySyncResult(mode=mode, state="MULTIPATH_REQUIRED", message=notice + prerequisite)
             if mode == DiskInventorySyncMode.multipath:
                 # disk.multipath_sync is synchronous and returns null on success.
                 await self._run_disk_inventory_sync_command(
@@ -6160,6 +6158,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 )
             else:
                 result = await self._run_full_disk_inventory_sync(midclt, started)
+                result.message = notice + result.message
         if result.state == "SUCCESS":
             self.invalidate_snapshot_cache(
                 reason=f"disk_inventory_sync.{mode.value}",
@@ -6199,6 +6198,8 @@ class InventoryService(InventorySourceCollectionMixin):
             start_result = await self._run_disk_inventory_sync_command(
                 [midclt, "call", "disk.sync_all"],
                 failure_prefix="TrueNAS could not start the full disk sync",
+                timeout_seconds=max(0.01, max(1, self.settings.app.disk_inventory_sync_timeout_seconds)
+                                    - (self._disk_inventory_sync_clock() - started)),
             )
             job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
             if job_id is None:
@@ -6224,8 +6225,13 @@ class InventoryService(InventorySourceCollectionMixin):
         timeout_seconds: int,
         poll_interval: float,
     ) -> DiskInventorySyncResult:
+        state, error = "UNKNOWN", None
         while True:
-            state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id)
+            remaining = timeout_seconds - (self._disk_inventory_sync_clock() - started)
+            # A deadline is not a failed observation. Retain the last known
+            # active state instead of attempting a doomed near-zero-budget read.
+            if remaining > 0:
+                state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(50.0, remaining))
             elapsed = self._disk_inventory_sync_elapsed(started)
             if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
                 self._disk_inventory_sync_active_job_id = None
@@ -6239,11 +6245,16 @@ class InventoryService(InventorySourceCollectionMixin):
                     timed_out=True,
                     error=error,
                     message=(
-                        f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. "
+                        (f"Disk sync job {job_id}'s state is unknown. You can check again or start a new sync. "
+                         if state == "UNKNOWN" else
+                         f"TrueNAS disk sync job {job_id} is waiting in the disk.sync_all queue. "
+                         if state == "WAITING" else
+                         f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. ") +
                         "Check the job in the TrueNAS UI, then refresh here when it finishes."
                     ),
                 )
-            await self._disk_inventory_sync_sleep(poll_interval)
+            await self._disk_inventory_sync_sleep(min(
+                poll_interval, max(0.0, timeout_seconds - (self._disk_inventory_sync_clock() - started))))
 
         if state == "SUCCESS":
             message = "TrueNAS re-read its disk inventory. Refresh to see the updated bays."
@@ -6265,12 +6276,8 @@ class InventoryService(InventorySourceCollectionMixin):
         midclt: str,
         job_id: int,
     ) -> tuple[str, str | None]:
-        job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
-        poll_result = await self._run_disk_inventory_sync_command(
-            [midclt, "call", "core.get_jobs", job_filter],
-            failure_prefix=f"TrueNAS could not report disk sync job {job_id}",
-        )
-        return _parse_disk_inventory_sync_job(poll_result.stdout, job_id)
+        return await self._read_disk_sync_job(midclt, job_id, budget=min(
+            20.0, max(1, self.settings.app.disk_inventory_sync_timeout_seconds)))
 
     async def get_system_locator_status(self) -> SystemLocatorStatusView:
         if not self.system.bmc.enabled or self.bmc_service is None:
@@ -9242,6 +9249,7 @@ class InventoryService(InventorySourceCollectionMixin):
                         ),
                         "serial_hint": disk.serial,
                         "model_hint": disk.model,
+                        "reported_size_bytes": disk.size_bytes,
                         "reported_size": format_bytes(disk.size_bytes),
                         "storcli_physical_drive": disk.raw,
                         "storcli_slot": disk.raw.get("storcli_slot"),
@@ -9582,10 +9590,13 @@ class InventoryService(InventorySourceCollectionMixin):
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         enclosure_owner_ids, enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(raw_data)
-        available_enclosures = self._build_quantastor_enclosure_options(
+        options_read = self._read_quantastor_enclosure_options(
             raw_data,
             enclosure_rows_by_owner=enclosure_rows_by_owner,
         )
+        available_enclosures = options_read.options
+        if options_read.incomplete:
+            warnings.append(self._quantastor_enclosure_options_limit_warning(options_read))
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
             available_enclosures,
@@ -9703,6 +9714,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,
                 "model_hint": disk.model if disk else None,
+                "reported_size_bytes": disk.size_bytes if disk else None,
                 "reported_size": format_bytes(disk.size_bytes) if disk and disk.size_bytes else None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
@@ -9741,6 +9753,41 @@ class InventoryService(InventorySourceCollectionMixin):
         *,
         enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] | None = None,
     ) -> list[EnclosureOption]:
+        return self._read_quantastor_enclosure_options(
+            raw_data,
+            enclosure_rows_by_owner=enclosure_rows_by_owner,
+        ).options
+
+    def _quantastor_enclosure_options_limit_warning(self, options_read: QuantaStorEnclosureOptionsRead) -> str:
+        """Page warning for enclosure choices left out at the bound, and a rate-limited log line."""
+
+        summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
+            ("quantastor_enclosure_options", self.system.id, "limit"),
+            (options_read.read_count, options_read.omitted_count, options_read.limit),
+        )
+        if summary is not None:
+            logger.warning(
+                "QuantaStor enclosure options stopped at the limit of %d: %d listed, %d left out "
+                "(operation=quantastor_enclosure_options)%s",
+                options_read.limit,
+                options_read.read_count,
+                options_read.omitted_count,
+                summary.suffix(),
+            )
+        return (
+            f"QuantaStor enclosure list is incomplete: {options_read.read_count} "
+            f"{'enclosure' if options_read.read_count == 1 else 'enclosures'} listed, "
+            f"{options_read.omitted_count} left out at the limit of {options_read.limit}. "
+            "The enclosures left out cannot be selected on this page."
+        )
+
+    def _read_quantastor_enclosure_options(
+        self,
+        raw_data: TrueNASRawData,
+        *,
+        enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> QuantaStorEnclosureOptionsRead:
+        limit = QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES
         profile = self.profile_registry.resolve_for_enclosure(
             self.system,
             None,
@@ -9782,18 +9829,24 @@ class InventoryService(InventorySourceCollectionMixin):
             system_rows_by_id.setdefault(system_id, system_row)
 
         options: list[EnclosureOption] = []
+        omitted_count = 0
         for system_id, system_row in system_rows_by_id.items():
+            owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
+            option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
+            room = limit - len(options)
+            if len(option_rows) > room:
+                # Count the choices beyond the bound without building them.
+                omitted_count += len(option_rows) - max(room, 0)
+                option_rows = option_rows[: max(room, 0)]
+            if not option_rows:
+                continue
             label = normalize_text(
                 system_row.get("name")
                 or system_row.get("hostname")
                 or system_row.get("description")
                 or system_id
             )
-            owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
-            option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
             for enclosure_row in option_rows:
-                if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
-                    break
                 enclosure_id = self._quantastor_hw_enclosure_id(enclosure_row) if enclosure_row else None
                 enclosure_label = (
                     normalize_text(
@@ -9828,9 +9881,12 @@ class InventoryService(InventorySourceCollectionMixin):
                         slot_layout=slot_layout,
                     )
                 )
-            if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
-                break
-        return self._finalize_enclosure_options(options)
+        return QuantaStorEnclosureOptionsRead(
+            options=self._finalize_enclosure_options(options),
+            read_count=len(options),
+            omitted_count=omitted_count,
+            limit=limit,
+        )
 
     @staticmethod
     def _quantastor_hw_enclosure_id(row: dict[str, Any] | None) -> str | None:
@@ -12181,53 +12237,6 @@ class InventoryService(InventorySourceCollectionMixin):
             utcnow() + timedelta(seconds=ttl_seconds),
         )
 
-    @staticmethod
-    def _admit_sg_ses_devices(values: Iterable[object]) -> tuple[list[str], int, int]:
-        """SG device paths in the kernel's form, deduplicated, in numeric order.
-
-        Returns the admitted devices (the lowest indexes, at most the limit),
-        the number of values that are not an SG device path, and the number of
-        devices beyond the limit. A value that is not admitted is counted,
-        never kept or shown.
-        """
-
-        indexes: set[int] = set()
-        rejected = 0
-        for value in values:
-            device = normalize_text(value) if isinstance(value, str) else None
-            if not device:
-                continue
-            match = SG_SES_DEVICE_RE.fullmatch(device)
-            if match is None:
-                rejected += 1
-                continue
-            indexes.add(int(match.group(1)))
-        ordered = sorted(indexes)
-        limit = SG_SES_MAX_DISCOVERED_DEVICES
-        return [f"/dev/sg{index}" for index in ordered[:limit]], rejected, max(0, len(ordered) - limit)
-
-    @staticmethod
-    def _split_sg_ses_discovery_output(stdout: str) -> tuple[list[str], int]:
-        """Discovery lines without the first well-formed skipped-count line, and that count.
-
-        A count line in any other form stays a line for admission, which
-        counts it as not an SG device path.
-        """
-
-        lines: list[str] = []
-        skipped: int | None = None
-        for line in (stdout or "").splitlines():
-            match = SG_SES_DISCOVERY_SKIPPED_RE.fullmatch(line.strip()) if skipped is None else None
-            if match is not None:
-                skipped = int(match.group(1))
-                continue
-            lines.append(line)
-        return lines, skipped or 0
-
-    @classmethod
-    def _parse_sg_ses_discovery_devices(cls, stdout: str) -> list[str]:
-        return cls._admit_sg_ses_devices(cls._split_sg_ses_discovery_output(stdout)[0])[0]
-
     def _log_sg_ses_discovery_admission(self, host: str, rejected: int, beyond_limit: int) -> None:
         summary = ssh_probe_module.SSH_COMMAND_FAILURE_LOG.admit(
             (self.system.id, "sg_ses_discovery_admission", normalize_text(host) or ""),
@@ -12436,6 +12445,12 @@ class InventoryService(InventorySourceCollectionMixin):
                 None,
                 enclosure_sysfs_slots=sysfs_slots,
             )
+            # A page over the parser budget was read and left out: record it
+            # as a failure so it is not mistaken for a device without SES (#1308).
+            host_failures.extend(
+                f"{failure_prefix} {refusal.describe(host)}" for refusal in parsed.ses_page_refusals
+            )
+            host_overlay.ses_page_refusals.extend(parsed.ses_page_refusals)
             if not parsed.ses_enclosures:
                 continue
             self._tag_ses_overlay(parsed, host)
@@ -12479,6 +12494,8 @@ class InventoryService(InventorySourceCollectionMixin):
         best_failures: list[str] = []
         failures: list[str] = []
         incomplete_reads: list[str] = []
+        # Like incomplete reads, a refused page on any host is reported whichever host is selected (#1308).
+        page_refusals: list[str] = []
         successful_overlays: list[ParsedSSHData] = []
 
         for host in hosts:
@@ -12489,6 +12506,10 @@ class InventoryService(InventorySourceCollectionMixin):
                     host,
                     cached_devices,
                     failure_prefix=failure_prefix,
+                )
+                # Keep evidence from this read even if rediscovery finds a different device.
+                page_refusals.extend(
+                    f"{failure_prefix} {refusal.describe(host)}" for refusal in cached_overlay.ses_page_refusals
                 )
                 cached_score = self._score_sg_ses_overlay(cached_overlay)
                 if cached_score > 0 and not cached_failures:
@@ -12514,6 +12535,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 if cached_failures:
                     failures.extend(cached_failures)
                 continue
+            page_refusals.extend(f"{failure_prefix} {refusal.describe(host)}" for refusal in host_overlay.ses_page_refusals)
 
             if host_failures:
                 failures.extend(host_failures)
@@ -12530,10 +12552,15 @@ class InventoryService(InventorySourceCollectionMixin):
                 best_failures = list(host_failures)
 
         if best_score <= 0:
+            for warning in page_refusals:
+                if warning not in failures:
+                    failures.append(warning)
             return ParsedSSHData(), failures, None
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
-        best_failures.extend(warning for warning in incomplete_reads if warning not in best_failures)
+        for warning in (*page_refusals, *incomplete_reads):
+            if warning not in best_failures:
+                best_failures.append(warning)
         return best_overlay, best_failures, best_host
 
     def _scale_expected_ses_missing_failure(self) -> str:
@@ -13085,142 +13112,6 @@ class InventoryService(InventorySourceCollectionMixin):
             target["presence_conflict"] = ses_candidate.get("presence_conflict") is True
 
     @staticmethod
-    def _build_sg_ses_discovery_command() -> str:
-        # Only the elevated AES read needs sudo. Each node's peripheral type
-        # and INQUIRY data are read from sysfs first, unprivileged. A node is
-        # skipped only when both reads succeed and agree: the type is a storage
-        # device; the INQUIRY data is at least the standard 36 bytes and as
-        # long as its header says (additional length + 5); byte 0 equals the
-        # type (peripheral qualifier 0, same type); and byte 6 has EncServ
-        # clear. Anything short, failed or contradictory is read (#1314).
-        # ``od -v`` prints every byte (no ``*`` for repeated lines), and the
-        # split runs with globbing off.
-        types = "|".join(SG_SES_NON_ENCLOSURE_TYPES)
-        script = (
-            "skipped=0; "
-            "for dev in /dev/sg*; do "
-            'id="/sys/class/scsi_generic/${dev##*/}/device"; '
-            'if type=$(cat "$id/type" 2>/dev/null) && inq=$(od -An -tu1 -v -N260 "$id/inquiry" 2>/dev/null); then '
-            f'case "$type" in {types}) '
-            "set -f; set -- $inq; set +f; "
-            'if [ $# -ge 36 ] && [ $# -ge $(($5 + 5)) ] && [ "$1" = "$type" ] && [ $(($7 & 64)) -eq 0 ]; then '
-            "skipped=$((skipped + 1)); continue; fi;; "
-            "esac; "
-            "fi; "
-            'if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; '
-            "done; "
-            'echo "skipped-not-enclosure $skipped"'
-        )
-        return shlex.join(["/bin/sh", "-lc", script])
-
-    @staticmethod
-    def _tag_ses_overlay(ssh_data: ParsedSSHData, host: str) -> None:
-        tagged_host = normalize_text(host)
-        if not tagged_host:
-            return
-
-        for payload in ssh_data.ses_slot_candidates.values():
-            targets = payload.get("ses_targets")
-            if not isinstance(targets, list):
-                continue
-            tagged_targets: list[dict[str, Any]] = []
-            for item in targets:
-                if not isinstance(item, dict):
-                    continue
-                tagged = dict(item)
-                tagged["ssh_host"] = tagged_host
-                tagged_targets.append(tagged)
-            if tagged_targets:
-                payload["ses_targets"] = _merge_control_targets(tagged_targets, [])
-
-        for enclosure in ssh_data.ses_enclosures:
-            enclosure.ssh_host = tagged_host
-            for slot in enclosure.slots.values():
-                tagged_targets: list[dict[str, Any]] = []
-                for item in slot.control_targets:
-                    if not isinstance(item, dict):
-                        continue
-                    tagged = dict(item)
-                    tagged["ssh_host"] = tagged_host
-                    tagged_targets.append(tagged)
-                if tagged_targets:
-                    slot.control_targets = _merge_control_targets(tagged_targets, [])
-
-    @staticmethod
-    def _augment_ses_targets_from_redundant_hosts(
-        authoritative: ParsedSSHData,
-        overlays: list[ParsedSSHData],
-    ) -> ParsedSSHData:
-        authoritative_enclosures = list(authoritative.ses_enclosures)
-        authoritative.ses_enclosures = _merge_ses_enclosures(
-            [
-                *authoritative.ses_enclosures,
-                *[
-                    enclosure
-                    for overlay in overlays
-                    if overlay is not authoritative
-                    for enclosure in overlay.ses_enclosures
-                ],
-            ]
-        )
-        for overlay in overlays:
-            if overlay is authoritative:
-                continue
-            supplemental_candidates: dict[int, dict[str, Any]] = {}
-            for slot, primary in authoritative.ses_slot_candidates.items():
-                # A merged same-host enclosure can retain a slot on another SES path.
-                primary_enclosure = next((enclosure for enclosure in authoritative_enclosures
-                    if enclosure.enclosure_id == primary.get("enclosure_id")
-                    and primary.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
-                if primary_enclosure is None:
-                    continue
-                for payload in overlay.ses_slot_candidates.values():
-                    if not isinstance(payload, dict) or primary.get("ses_slot_number") is None:
-                        continue
-                    other_enclosure = next((enclosure for enclosure in overlay.ses_enclosures
-                        if enclosure.enclosure_id == payload.get("enclosure_id")
-                        and payload.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
-                    if (other_enclosure is None
-                        or not _ses_enclosures_share_identity(primary_enclosure, other_enclosure)
-                        or primary.get("ses_slot_number") != payload.get("ses_slot_number")):
-                        continue
-                    supplemental_candidates[slot] = {
-                        "ses_targets": payload.get("ses_targets", []),
-                        "identify_active": payload.get("identify_active", False),
-                    }
-            if supplemental_candidates:
-                authoritative.ses_slot_candidates = merge_slot_candidate_maps(
-                    authoritative.ses_slot_candidates,
-                    supplemental_candidates,
-                )
-        return authoritative
-
-    @staticmethod
-    def _merge_ses_overlay_data(base: ParsedSSHData, overlay: ParsedSSHData) -> ParsedSSHData:
-        merged = ParsedSSHData(
-            glabel=base.glabel,
-            zpool_members=dict(base.zpool_members),
-            zpool_device_members=dict(base.zpool_device_members),
-            zpool_pool_states=dict(base.zpool_pool_states),
-            multipath_info=dict(base.multipath_info),
-            ses_slot_to_device=dict(base.ses_slot_to_device),
-            camcontrol_models=dict(base.camcontrol_models),
-            camcontrol_controllers=dict(base.camcontrol_controllers),
-            camcontrol_peer_devices=dict(base.camcontrol_peer_devices),
-            ses_slot_candidates=merge_slot_candidate_maps(base.ses_slot_candidates, overlay.ses_slot_candidates),
-            ses_selected_meta=merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
-            ses_enclosures=_merge_ses_enclosures([*base.ses_enclosures, *overlay.ses_enclosures]),
-            linux_blockdevices=list(base.linux_blockdevices),
-            linux_scsi_devices=list(base.linux_scsi_devices) + list(overlay.linux_scsi_devices),
-            linux_mdadm_arrays=dict(base.linux_mdadm_arrays),
-            linux_nvme_subsystems=dict(base.linux_nvme_subsystems),
-            ubntstorage_disks=list(base.ubntstorage_disks),
-            ubntstorage_spaces=list(base.ubntstorage_spaces),
-            unifi_led_states=dict(base.unifi_led_states),
-        )
-        return merged
-
-    @staticmethod
     def _parse_quantastor_cli_json(stdout: str) -> Any | None:
         try:
             return json.loads(stdout)
@@ -13724,6 +13615,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "value": drive.health,
                 "serial_hint": drive.serial,
                 "model_hint": drive.model,
+                "reported_size_bytes": drive.size_bytes,
                 "reported_size": format_bytes(drive.size_bytes),
                 "identify_active": bool(drive.raw.get("bmc_identify_active")),
                 "bmc_slot_number": drive.raw.get("bmc_slot_number"),
@@ -13776,6 +13668,7 @@ class InventoryService(InventorySourceCollectionMixin):
             raw_slot_status["serial_hint"] = drive.serial
         if not normalize_text(raw_slot_status.get("model_hint")):
             raw_slot_status["model_hint"] = drive.model
+        raw_slot_status["reported_size_bytes"] = drive.size_bytes
         if not normalize_text(raw_slot_status.get("reported_size")):
             raw_slot_status["reported_size"] = format_bytes(drive.size_bytes)
 
@@ -14268,6 +14161,7 @@ class InventoryService(InventorySourceCollectionMixin):
                 "device_hint": device_names[0] if device_names else None,
                 "serial_hint": normalize_text(entry.get("serial")),
                 "model_hint": normalize_text(entry.get("model")),
+                "reported_size_bytes": _read_capacity_bytes(size_value),
                 "reported_size": (
                     format_bytes(size_value)
                     if isinstance(size_value, int)
@@ -15970,8 +15864,12 @@ class InventoryService(InventorySourceCollectionMixin):
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
         if not serial and identity_mapping:
             serial = identity_mapping.serial
-        size_bytes = disk.size_bytes if disk else None
-        size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
+        size_bytes = _read_capacity_bytes(disk.size_bytes if disk else None)
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size_bytes"))
+        if size_bytes is None:
+            size_bytes = _read_capacity_bytes(raw_slot_status.get("reported_size"))
+        size_human = format_bytes(size_bytes)
         notes = mapping.notes if mapping else None
         if stale_manual_mapping:
             stale_note = "This bay is assigned by hand, but the enclosure reports it empty."
@@ -16592,7 +16490,8 @@ class InventoryService(InventorySourceCollectionMixin):
                         readback_result.stdout,
                         readback_result.command,
                     )
-                    if enclosure is not None:
+                    # A refused page is unread: the light state stays unknown.
+                    if isinstance(enclosure, SESMapEnclosure):
                         mapped_slot = next(
                             (
                                 candidate

@@ -75,29 +75,41 @@ class PerfHarnessTests(unittest.TestCase):
         ok.headers.items.return_value = []
         ok.__enter__.return_value = ok
         ok.__exit__.return_value = False
-        client = run_perf_harness.ApiClient("http://127.0.0.1:8080")
-        # A busy answer with Retry-After is retried after that delay, capped.
+        client = run_perf_harness.ApiClient("http://127.0.0.1:8080", readiness_timeout_seconds=3)
+        # Safe reads honour Retry-After within their deadline, not an attempt cap.
         with (
-            patch.object(run_perf_harness, "urlopen", side_effect=[busy(), busy(retry_after="60"), ok]) as open_url,
+            patch.object(run_perf_harness, "urlopen", side_effect=[busy(), busy(), ok]) as open_url,
             patch.object(run_perf_harness.time, "sleep") as sleep,
         ):
-            self.assertEqual(client.get_json("/api/inventory", params={"force": "true"}), {"ok": True})
+            self.assertEqual(client.get_json("/api/inventory"), {"ok": True})
         self.assertEqual(open_url.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, run_perf_harness.BUSY_RETRY_MAX_SECONDS])
-        # Retries are bounded, and other failures are never retried.
-        for side_effect, calls in (
-            ([busy()] * run_perf_harness.BUSY_RETRY_ATTEMPTS, run_perf_harness.BUSY_RETRY_ATTEMPTS),
-            ([busy(retry_after=None)], 1),
-            ([busy(code=500)], 1),
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 1])
+        # The final delay is clipped to the remaining budget, then fails clearly.
+        now = [0.0]
+
+        def advance(seconds):
+            now[0] += seconds
+        with (
+            patch.object(run_perf_harness, "urlopen", side_effect=busy(retry_after="60")) as open_url,
+            patch.object(run_perf_harness.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(run_perf_harness.time, "sleep", side_effect=advance) as sleep,
+            self.assertRaises(run_perf_harness.ReadinessDeadlineExceeded),
         ):
+            client.get_json("/api/inventory")
+        self.assertEqual(open_url.call_count, 1)
+        sleep.assert_called_once_with(3)
+        # Other errors, including non-busy forced-read failures, are never replayed.
+        for error, params in ((busy(retry_after=""), None), (busy(code=500), None),
+                              (busy(retry_after=""), {"force": "true"}), (busy(code=500), {"force": "true"})):
             with (
-                self.subTest(calls=calls, first=side_effect[0].code),
-                patch.object(run_perf_harness, "urlopen", side_effect=side_effect) as open_url,
-                patch.object(run_perf_harness.time, "sleep"),
+                self.subTest(code=error.code, params=params),
+                patch.object(run_perf_harness, "urlopen", side_effect=error) as open_url,
+                patch.object(run_perf_harness.time, "sleep") as sleep,
                 self.assertRaises(HTTPError),
             ):
-                client.get_json("/api/inventory")
-            self.assertEqual(open_url.call_count, calls)
+                client.get_json("/api/inventory", params=params)
+            self.assertEqual(open_url.call_count, 1)
+            sleep.assert_not_called()
 
     def test_mapping_import_confirmation_uses_preview_revision_and_digest(self) -> None:
         bundle = {"schema_version": 1, "mappings": []}
