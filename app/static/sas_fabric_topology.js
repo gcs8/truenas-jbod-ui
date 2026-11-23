@@ -108,22 +108,6 @@
     return Array.isArray(value) ? value : [];
   }
 
-  function resolveTransportPort(fabric, metric) {
-    const id = typeof metric === "string" ? metric : metric?.sas_transport_port_id;
-    const unread = { id, state: "not_read", phys: [] };
-    const table = fabric?.raw?.sas_transport_port_index;
-    if (typeof id !== "string" || !isRecord(table) || !own(table, id)) return unread;
-    const port = table[id];
-    if (!isRecord(port) || port.id !== id || port.state !== "read") return unread;
-    const owner = list(fabric.nodes).find((node) => node.id === port.owner_id && ["controller", "expander"].includes(node.kind));
-    const names = list(port.phy_names);
-    if (!owner || !names.length || names.length > 256 || names.some((name) => typeof name !== "string") || new Set(names).size !== names.length) return unread;
-    const wanted = new Set(names);
-    const rows = list(owner.raw?.phys || owner.raw?.phy_rows).filter((row) => isRecord(row) && wanted.has(row.name));
-    if (rows.length !== names.length || new Set(rows.map((row) => row.name)).size !== names.length) return unread;
-    return { id, state: "read", phys: rows };
-  }
-
   function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
@@ -620,13 +604,10 @@
       const found = traces.get(item.id);
       const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
-      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
+      const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => window.SasFabricTransport?.pathState(fabric, state) || ({
         controller: String(state.controller_label || state.controller || ""),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
-        ...(state.sas_transport_port_id ? {
-          transportPhyCount: resolveTransportPort(fabric, state).state === "read" ? resolveTransportPort(fabric, state).phys.length : null,
-        } : {}),
       }));
       const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id));
       const slot = Number.isInteger(item.slot) ? item.slot : null;
@@ -2993,7 +2974,6 @@
   window.SasFabricTopology = {
     NOT_COLLECTED,
     BAY_DETAIL_LIMIT,
-    resolveTransportPort,
     buildTopologyModel,
     tracePath,
     searchTopology,

@@ -1845,7 +1845,7 @@
     const related = selected || selectionTouchesSlots(slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
-    const portFacts = list(path.sas_transport_port_ids).map((id) => window.SasFabricTopology?.resolveTransportPort?.(fabric, id));
+    const portFacts = list(path.sas_transport_port_ids).map((id) => window.SasFabricTransport?.resolveTransportPort?.(fabric, id));
     const phyNote = portFacts.map((port) => port?.state === "read" ? `${port.phys.length} reported PHY rows` : "PHY rows not read").join(" / ");
     return `
       <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
@@ -3155,7 +3155,7 @@
       ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
-    const transportPort = window.SasFabricTopology?.resolveTransportPort?.(fabric, seed.pathState);
+    const transportPort = window.SasFabricTransport?.resolveTransportPort?.(fabric, seed.pathState);
     const sesNodes = list(trace.node_ids)
       .map((nodeId) => nodes.get(nodeId))
       .filter((node) => sesNodeTouchesSlot(node, slotNumber));

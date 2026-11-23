@@ -9,8 +9,14 @@ const vm = require("node:vm");
 const root = path.resolve(__dirname, "../..");
 function topology() {
   const context = vm.createContext({ window: {} });
+  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_topology.js"), "utf8"), context);
   return context.window.SasFabricTopology;
+}
+function transport() {
+  const context = vm.createContext({ window: {} });
+  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
+  return context.window.SasFabricTransport;
 }
 function syntheticFabric(available = true) {
   const node = (id, kind, metrics = {}) => ({ id, kind, label: id, metrics, raw: {}, related_slots: [] });
@@ -147,7 +153,7 @@ function transportRenderers(fabric) {
   const source = fs.readFileSync(path.join(root, "app/static/sas_fabric_view.js"), "utf8");
   const elements = new Map();
   const context = vm.createContext({ URLSearchParams,
-    window: { location: { search: "" }, SasFabricTopology: topology(), SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
+    window: { location: { search: "" }, SasFabricTopology: topology(), SasFabricTransport: transport(), SAS_FABRIC_BOOTSTRAP: { snapshot: { slots: [] }, fabric } },
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "" }); return elements.get(id); }, querySelectorAll: () => [] },
   });
   const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
@@ -158,8 +164,9 @@ function transportRenderers(fabric) {
 test("referenced transport PHY rows resolve in topology, Disk Path and Storage Lanes", () => {
   const fabric = referencedTransportFabric();
   const api = topology();
-  assert.equal(typeof api.resolveTransportPort, "function");
-  const resolved = api.resolveTransportPort(fabric, fabric.traces[0].metrics.path_states[0]);
+  const resolve = transport().resolveTransportPort;
+  assert.equal(typeof resolve, "function");
+  const resolved = resolve(fabric, fabric.traces[0].metrics.path_states[0]);
   assert.equal(resolved.phys[0].invalid_dword_count, 9);
   const model = api.buildTopologyModel(fabric);
   assert.equal(model.bays[0].pathStates[0].transportPhyCount, 1);
@@ -174,14 +181,15 @@ test("referenced transport PHY rows resolve in topology, Disk Path and Storage L
 test("dangling or contradictory transport PHY references remain not read", () => {
   const fabric = referencedTransportFabric();
   const api = topology();
-  assert.equal(typeof api.resolveTransportPort, "function");
+  const resolve = transport().resolveTransportPort;
+  assert.equal(typeof resolve, "function");
   const metric = fabric.traces[0].metrics.path_states[0];
   delete fabric.raw.sas_transport_port_index[metric.sas_transport_port_id];
-  assert.equal(api.resolveTransportPort(fabric, metric).state, "not_read");
+  assert.equal(resolve(fabric, metric).state, "not_read");
   const changed = referencedTransportFabric();
   changed.raw.sas_transport_port_index[metric.sas_transport_port_id].phy_names.push("phy-missing");
-  assert.equal(api.resolveTransportPort(changed, metric).state, "not_read");
-  assert.equal(api.resolveTransportPort(changed, metric).phys.length, 0);
+  assert.equal(resolve(changed, metric).state, "not_read");
+  assert.equal(resolve(changed, metric).phys.length, 0);
 });
 
 test("transport copy does not claim that reported expander detail is unexposed", () => {
