@@ -54,6 +54,29 @@ def busy(*, status=503, retry_after="2", detail=BUSY_DETAIL):
 
 
 class PerfHarnessReadinessTests(unittest.TestCase):
+    def test_default_readiness_budget_exceeds_background_refresh_deadline(self):
+        self.assertEqual(harness.DEFAULT_READINESS_TIMEOUT_SECONDS, 330)
+        self.assertGreater(harness.DEFAULT_READINESS_TIMEOUT_SECONDS, inventory_module.BACKGROUND_REFRESH_DEADLINE_SECONDS)
+        self.assertEqual(harness.ApiClient("https://host.example.test").readiness_timeout_seconds, 330)
+        with (patch.dict(harness.os.environ, {}, clear=True), patch.object(sys, "argv", ["perf"]),
+              patch.object(harness, "_run", return_value=0) as run):
+            self.assertEqual(harness.main(), 0)
+        self.assertEqual(run.call_args.args[0].readiness_timeout_seconds, 330)
+
+    def test_performance_docs_identify_readiness_and_baseline_comparison(self):
+        documentation = (Path(__file__).resolve().parents[1] / "docs/PERFORMANCE_BUDGETS.md").read_text()
+        self.assertIn("`snapshot_export_estimate_workflow`", documentation)
+        self.assertIn("like-for-like", documentation)
+        self.assertIn("330 seconds", documentation)
+
+    def test_retry_after_digit_length_cap_is_independent_of_numeric_cap(self):
+        self.assertEqual(harness._safe_retry_after("00000"), 0)
+        self.assertIsNone(harness._safe_retry_after("000001"))
+
+    def test_retry_after_one_day_cap_is_independent_of_digit_length_cap(self):
+        self.assertEqual(harness._safe_retry_after("86400"), 86400)
+        self.assertIsNone(harness._safe_retry_after("86401"))
+
     def test_forced_inventory_get_recovers_after_two_local_busy_replies(self):
         targets = []
 
@@ -180,6 +203,7 @@ class PerfHarnessReadinessTests(unittest.TestCase):
             latest = records / "latest.json"
             latest.write_text("previous successful measurement")
             result, payload, calls = self.run_inventory_main(directory, clock, stuck=True)
+            self.assertTrue((records / "failure.json").is_file(), "readiness failure record is missing")
             self.assertEqual(payload, json.loads((records / "failure.json").read_text()))
             self.assertEqual(latest.read_text(), "previous successful measurement")
             self.assertFalse((records / "history.jsonl").exists())
@@ -212,7 +236,7 @@ class PerfHarnessReadinessTests(unittest.TestCase):
         with (patch.object(harness, "urlopen", side_effect=open_url),
               patch.object(harness.time, "monotonic", clock.monotonic),
               patch.object(harness.time, "sleep", clock.sleep)):
-            response = harness.ApiClient("https://host.example.test").post_json_with_headers(ESTIMATE, {})
+            response = harness.ApiClient("https://host.example.test", readiness_timeout_seconds=180).post_json_with_headers(ESTIMATE, {})
         self.assertTrue(response.data["selected_allowed"])
         self.assertEqual(calls, 5)
         self.assertEqual(clock.sleeps, [2, 2, 2, 2])
@@ -238,7 +262,7 @@ class PerfHarnessReadinessTests(unittest.TestCase):
               patch.object(harness.time, "monotonic", clock.monotonic),
               patch.object(harness.time, "sleep", clock.sleep)):
             with self.assertRaises(Exception) as caught:
-                harness.ApiClient("https://host.example.test", system_id="SECRET").post_json(ESTIMATE, {})
+                harness.ApiClient("https://host.example.test", system_id="SECRET", readiness_timeout_seconds=180).post_json(ESTIMATE, {})
         diagnostic = getattr(caught.exception, "diagnostic", {})
         self.assertEqual(diagnostic.get("reason"), "readiness_deadline_exceeded")
         self.assertEqual(diagnostic["endpoint"], ESTIMATE)
