@@ -1581,10 +1581,21 @@ function buildTopologyModel(given, options = {}) {
           why: joined.why,
         };
       };
+      // A path takes only a row its own evidence names: the row of its own
+      // member device, or the one row of its controller when that controller
+      // has one path and neither names a member. Otherwise not read: never a
+      // sibling path's row (Codex review, #1504).
+      const memberOf = (state) => text(state.raw?.member_device_name) || state.device;
+      const statesOn = (name) => pathStates.filter((state) => state.controller === name);
       for (const state of pathStates) {
-        const index = devices.findIndex((device, at) => !taken.has(at) && ownerOf(String(device.controller || "")) === state.controller);
-        if (index >= 0) taken.add(index);
-        bay.ports.push(port(state, index >= 0 ? devices[index] : null));
+        const open = devices.map((device, at) => ({ device, at })).filter(({ device, at }) => !taken.has(at) && ownerOf(String(device.controller || "")) === state.controller);
+        const member = memberOf(state);
+        const named = open.filter(({ device }) => text(device.member_device_name));
+        const own = member ? named.filter(({ device }) => text(device.member_device_name) === member) : [];
+        const sole = open.length === 1 && statesOn(state.controller).length === 1 && (!member || !named.length) ? open : [];
+        const found = own.length === 1 ? own[0] : sole[0] || null;
+        if (found) taken.add(found.at);
+        bay.ports.push(port(state, found ? found.device : null));
       }
       devices.forEach((device, at) => {
         if (!taken.has(at)) bay.ports.push(port(null, device));

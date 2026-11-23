@@ -208,3 +208,29 @@ test("Disk Path never draws a sibling port's device or SAS address on a path wit
     assert.match(html, new RegExp(`\\b${name}\\b`));
   }
 });
+
+// Codex review of #1504: a partial reply with only the second path's row on a
+// controller. Each Topology port takes only the row that names its own member;
+// a path without one stays not read, never its sibling's device or address.
+test("Topology ports take only their own member's MPR row; a path without one stays not read", () => {
+  for (const order of ["as given", "rows reversed"]) {
+    const { data, trace } = fourPathPayload();
+    for (const row of trace.metrics.mpr_devices) row.member_device_name = { da3: "da4", da11: "da12" }[row.member_device_name];
+    if (order === "rows reversed") trace.metrics.mpr_devices.reverse();
+    const rows = Object.fromEntries(trace.metrics.mpr_devices.map((row) => [row.member_device_name, row]));
+    const T = loadTopology();
+    const bay = T.buildTopologyModel(data.fabric).bays.find((item) => item.bayId === "bay:0");
+    const ports = Object.fromEntries(bay.ports.map((port) => [port.device, port]));
+    assert.deepEqual(Object.keys(ports).sort(), ["da11", "da12", "da3", "da4"], order);
+    for (const [own, sibling] of [["da4", "da3"], ["da12", "da11"]]) {
+      // Control: the member with its own row keeps its port detail.
+      assert.equal(ports[own].sasAddress, rows[own].sas_address.toLowerCase().replace(/^0x/, ""), `${order}: ${own}`);
+      assert.ok(ports[own].expanderId, `${order}: ${own} keeps its expander`);
+      // The sibling keeps its own name and path state; its port detail is not read.
+      assert.equal(ports[sibling].sasAddress, "", `${order}: ${sibling} borrows no address`);
+      assert.equal(ports[sibling].expanderId, "", `${order}: ${sibling} borrows no expander`);
+      assert.equal(ports[sibling].phy, null, `${order}: ${sibling} borrows no PHY`);
+      assert.equal(ports[sibling].handle, "", `${order}: ${sibling} borrows no handle`);
+    }
+  }
+});
