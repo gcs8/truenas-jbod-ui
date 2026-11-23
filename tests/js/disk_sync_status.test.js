@@ -161,6 +161,26 @@ test("a full failure wins visually even when multipath finishes afterward", asyn
   assert.equal(h.statuses.at(-1).kind, "error");
   assert.match(h.statuses.at(-1).text, /Synthetic full-job error/);
   assert.match(h.statuses.at(-1).text, /Multipath rebuilt/);
+  assert.match(h.statuses.at(-1).text, /^Full disk sync: Disk sync failed/);
+});
+
+test("a later successful full sync replaces its earlier failure, not a multipath failure", async () => {
+  const h = harness([
+    { state: "FAILED", job_id: 17, message: "Earlier full sync failed.", error: "Earlier full error." },
+    { state: "FAILED", message: "Multipath failed.", error: "Multipath error." },
+    { state: "SUCCESS", job_id: 18, message: "New full sync succeeded." },
+    { state: "SUCCESS", message: "New multipath succeeded." },
+  ]);
+  await h.context.run("full", "system-a");
+  await h.context.run("multipath", "system-a");
+  await h.context.run("full", "system-a");
+  assert.doesNotMatch(h.statuses.at(-1).text, /Earlier full/);
+  assert.match(h.statuses.at(-1).text, /^Sync multipath table: Multipath failed/);
+  assert.match(h.statuses.at(-1).text, /New full sync succeeded/);
+  assert.equal(h.statuses.at(-1).kind, "error");
+  await h.context.run("multipath", "system-a");
+  assert.equal(h.statuses.at(-1).kind, "info");
+  assert.doesNotMatch(h.statuses.at(-1).text, /error|failed/);
 });
 
 test("unknown job observation permits a separately requested full sync and keeps observing the old job", async () => {
@@ -196,7 +216,7 @@ test("known running observation defers admission decisions to the backend busy r
   busy.detail = { state: "RUNNING", job_id: 17, message: "Job 17 is still running." };
   const h = harness([
     { state: "RUNNING", job_id: 17, message: "Job 17 is running." },
-    busy,
+    busy, busy,
     { state: "SUCCESS", job_id: 17, message: "Inventory re-read." },
   ]);
   let reached, resume;
@@ -207,10 +227,16 @@ test("known running observation defers admission decisions to the backend busy r
   assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
   await h.context.run("full", "system-a");
   assert.equal(h.requests.length, 2, "busy response must reuse the existing observer, not start another loop");
+  const watcher = h.state.diskInventorySync.observations.get("system-a/17");
+  assert.ok(watcher, "a refused duplicate must retain the accepted job watcher");
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 3, "a third request must not start a second GET loop");
+  assert.equal(h.state.diskInventorySync.observations.get("system-a/17"), watcher);
   resume();
   await first;
-  assert.equal(h.requests.length, 3);
-  assert.equal(h.requests[2].options.method, "GET");
+  assert.equal(h.requests.length, 4);
+  assert.equal(h.requests[3].options.method, "GET");
+  assert.match(h.requests[3].url, /job_id=17$/);
   assert.equal(h.statuses.at(-1).kind, "info");
 });
 
@@ -249,7 +275,10 @@ test("a terminal failure on the final bounded observation is still displayed", a
 
 test("recent independent outcome entries stay bounded", async () => {
   const h = harness(Array.from({ length: 12 }, (_, index) => ({ state: "SUCCESS", message: `Multipath result ${index}.` })));
-  for (let index = 0; index < 12; index += 1) await h.context.run("multipath", "system-a");
+  for (let index = 0; index < 12; index += 1) {
+    h.state.selectedSystemId = `system-${index}`;
+    await h.context.run("multipath", h.state.selectedSystemId);
+  }
   assert.equal(h.state.diskInventorySync.statuses.length, 8);
   assert.match(h.statuses.at(-1).text, /Multipath result 11/);
   assert.equal(h.state.diskInventorySync.observations.size, 0);

@@ -11807,6 +11807,15 @@
       statusOwner.result = result;
       const rows = state.diskInventorySync.statuses ||= [];
       if (!rows.includes(statusOwner)) rows.push(statusOwner);
+      if (["SUCCESS", "FAILED", "ABORTED"].includes(result?.state)) {
+        // A rerun replaces earlier finished results for this operation only.
+        const ownerIndex = rows.indexOf(statusOwner);
+        for (let index = ownerIndex - 1; index >= 0; index -= 1) {
+          const row = rows[index];
+          if (row.systemId === systemId && row.mode === mode
+              && ["SUCCESS", "FAILED", "ABORTED"].includes(row.result?.state)) rows.splice(index, 1);
+        }
+      }
       // Retain bounded recent outcomes, independently of active observer ownership.
       if (rows.length > 8) rows.splice(0, rows.length - 8);
       if (systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) renderDiskInventorySyncStatuses();

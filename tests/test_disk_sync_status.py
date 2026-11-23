@@ -281,6 +281,37 @@ class DiskSyncStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("77%", unknown.message)
         self.assertNotIn("Synthetic old progress", unknown.message)
 
+    async def test_final_status_read_timeout_keeps_the_observed_active_state(self):
+        self.service.settings.app.disk_inventory_sync_timeout_seconds = 30
+        self.service.settings.app.disk_inventory_sync_poll_interval_seconds = 5
+        for state in ("RUNNING", "WAITING"):
+            with self.subTest(state=state):
+                self.clock[0] = 0.0
+                self.service._disk_inventory_sync_active_job_id = None
+                timeouts = []
+
+                async def run(command, **kwargs):
+                    if command.endswith("call disk.sync_all"):
+                        return ok("17")
+                    timeout = kwargs["timeout_seconds"]
+                    timeouts.append(timeout)
+                    self.clock[0] += min(8, timeout)
+                    if timeout < 8:
+                        return failed("SSH command timed out.")
+                    return ok(job_payload(17, state))
+
+                self.service._run_ssh_command = run
+                result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+                self.assertEqual(result.state, state)
+                self.assertTrue(result.timed_out)
+                self.assertEqual(result.job_id, 17)
+                self.assertEqual(result.elapsed_seconds, 30.0)
+                self.assertIn("deadline reached while " + state.lower(), result.message.lower())
+                self.assertNotIn("state is unknown", result.message)
+                self.assertEqual(self.service._disk_inventory_sync_active_job_id, 17)
+                self.assertEqual(len(timeouts), 3)
+                self.assertEqual(timeouts[-1], 4)
+
     async def test_expired_poll_budget_keeps_last_active_state_without_another_read(self):
         self.service.settings.app.disk_inventory_sync_timeout_seconds = 2
         for state in ("RUNNING", "WAITING"):
