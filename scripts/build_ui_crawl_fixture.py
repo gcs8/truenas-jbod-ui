@@ -239,8 +239,32 @@ def topology_fabric(bundle) -> dict:
     return fabric
 
 
-def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY, fabric: dict | None = None) -> str:
-    snapshot = bundle.primary_snapshot
+# The cascade's own two four-bay boards as the inventory layout, one row each,
+# so Topology draws them as boards with one port mark per path (#1471).
+TOPOLOGY_LAYOUT = [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def topology_snapshot(bundle):
+    data = _dump(live_snapshot(bundle))
+    place = {slot: (row, column) for row, items in enumerate(TOPOLOGY_LAYOUT) for column, slot in enumerate(items)}
+    data["slots"] = [
+        {**slot, "row_index": place[slot["slot"]][0], "column_index": place[slot["slot"]][1]}
+        for slot in data["slots"]
+        if slot["slot"] in place
+    ]
+    count = len(place)
+    columns = max(len(row) for row in TOPOLOGY_LAYOUT)
+    data.update(layout_rows=TOPOLOGY_LAYOUT, layout_slot_count=count, layout_columns=columns)
+    shape = {"rows": len(TOPOLOGY_LAYOUT), "columns": columns, "slot_count": count, "slot_layout": TOPOLOGY_LAYOUT}
+    data["selected_profile"] = {**data["selected_profile"], **shape, "row_groups": []}
+    data["enclosures"][0].update(shape)
+    disks = sum(1 for slot in data["slots"] if slot["state"] != "empty")
+    data["summary"].update(disk_count=disks, mapped_slot_count=disks)
+    return InventorySnapshot.model_validate(data)
+
+
+def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY, fabric: dict | None = None, snapshot=None) -> str:
+    snapshot = snapshot or bundle.primary_snapshot
     fabric = fabric or fabric_with_diagnostics(bundle.sas_fabric)
     bootstrap = {
         "snapshot": _dump(snapshot),
@@ -427,6 +451,7 @@ async def build() -> dict:
         "ui-ssh:/api/inventory": _dump(live_snapshot(bundle, ssh=True)),
         "ui:/api/sas-fabric": fabric_with_diagnostics(bundle.sas_fabric),
         "ui-fabric-topology:/api/sas-fabric": topology_fabric(bundle),
+        "ui-fabric-topology:/api/inventory": _dump(topology_snapshot(bundle)),
         "ui:/api/history/status": await history.get_status(),
         "ui:/api/release-status": {"status": "disabled"},
         "ui:/api/system-locator": {"available": False, "supported": False},
@@ -492,7 +517,7 @@ async def build() -> dict:
             "ui-write-sign-in:/": render_main(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
             # Topology drawn from the real builder's synthetic cascade.
-            "ui-fabric-topology:/sas-fabric": render_fabric(bundle, fabric=topology_fabric(bundle)),
+            "ui-fabric-topology:/sas-fabric": render_fabric(bundle, fabric=topology_fabric(bundle), snapshot=topology_snapshot(bundle)),
             "ui-quantastor:/": render_main(bundle, platform="quantastor"),
             "ui-slow-prefetch:/": render_main(bundle, settings=slow_prefetch_settings()),
             "ui-dense-sleds:/": render_main(bundle, snapshot=dense_sled_snapshot(bundle)),
