@@ -1237,6 +1237,20 @@ class TrueNASWebsocketClient:
                 enclosure_query_failed=enclosure_query_failed,
             )
 
+    async def fetch_disk_sync_jobs(self) -> list[dict[str, Any]]:
+        """Read bounded queue context without broadening the SSH sudo grants."""
+        return await self._run_operation(self._fetch_disk_sync_jobs())
+
+    async def _fetch_disk_sync_jobs(self) -> list[dict[str, Any]]:
+        async with self._session() as ws:
+            result = await self._call(ws, "core.get_jobs", [
+                [["method", "=", "disk.sync_all"], ["state", "in", ["RUNNING", "WAITING"]]],
+                {"limit": 32, "order_by": ["id"]},
+            ])
+        if not isinstance(result, list):
+            raise TrueNASAPIError("TrueNAS returned unreadable disk sync queue context.")
+        return [row for row in result[:32] if isinstance(row, dict)]
+
     async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
         return await self._run_operation(self._fetch_disk_smartctl(disk_name, args))
 
