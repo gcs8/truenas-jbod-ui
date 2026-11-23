@@ -133,6 +133,128 @@ test("a multipath completion cannot release an outstanding full request", async 
   assert.equal(h.state.diskInventorySync.inFlight, false);
 });
 
+test("full failure remains visible after a newer multipath success", async () => {
+  let release;
+  const fullAnswer = new Promise(resolve => { release = resolve; });
+  const h = harness([fullAnswer, { state: "SUCCESS", message: "Multipath rebuilt." }]);
+  const full = h.context.run("full", "system-a");
+  await h.context.run("multipath", "system-a");
+  release({ state: "FAILED", job_id: 17, message: "Disk sync failed.", error: "Synthetic full-job error." });
+  await full;
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /Synthetic full-job error/);
+  assert.match(h.statuses.at(-1).text, /Multipath rebuilt/);
+  assert.equal(h.requests.filter(row => row.options.method === "POST").length, 2);
+});
+
+test("a full failure wins visually even when multipath finishes afterward", async () => {
+  let release;
+  const multipathAnswer = new Promise(resolve => { release = resolve; });
+  const h = harness([
+    multipathAnswer,
+    { state: "FAILED", job_id: 17, message: "Disk sync failed.", error: "Synthetic full-job error." },
+  ]);
+  const multipath = h.context.run("multipath", "system-a");
+  await h.context.run("full", "system-a");
+  release({ state: "SUCCESS", message: "Multipath rebuilt." });
+  await multipath;
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /Synthetic full-job error/);
+  assert.match(h.statuses.at(-1).text, /Multipath rebuilt/);
+});
+
+test("unknown job observation permits a separately requested full sync and keeps observing the old job", async () => {
+  const h = harness([
+    { state: "UNKNOWN", job_id: 17, message: "State is unknown. You can start a new sync." },
+    { state: "SUCCESS", job_id: 18, message: "New inventory re-read." },
+    { state: "FAILED", job_id: 17, message: "Earlier job failed.", error: "Synthetic earlier-job error." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const first = h.context.run("full", "system-a");
+  await observing;
+  assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
+  assert.equal(h.state.diskInventorySync.inFlight, false, "read-only observation never owns POST admission");
+  assert.equal(h.requests.length, 1, "observation must not automatically submit another sync");
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 2, "a separate explicit request reaches the backend");
+  assert.equal(h.requests[1].options.method, "POST");
+  resume();
+  await first;
+  assert.equal(h.requests.length, 3);
+  assert.equal(h.requests[2].options.method, "GET");
+  assert.match(h.requests[2].url, /job_id=17$/);
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /Synthetic earlier-job error/);
+  assert.match(h.statuses.at(-1).text, /New inventory re-read/);
+});
+
+test("known running observation defers admission decisions to the backend busy refusal", async () => {
+  const busy = new Error("busy");
+  busy.status = 409;
+  busy.detail = { state: "RUNNING", job_id: 17, message: "Job 17 is still running." };
+  const h = harness([
+    { state: "RUNNING", job_id: 17, message: "Job 17 is running." },
+    busy,
+    { state: "SUCCESS", job_id: 17, message: "Inventory re-read." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const first = h.context.run("full", "system-a");
+  await observing;
+  assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 2, "busy response must reuse the existing observer, not start another loop");
+  resume();
+  await first;
+  assert.equal(h.requests.length, 3);
+  assert.equal(h.requests[2].options.method, "GET");
+  assert.equal(h.statuses.at(-1).kind, "info");
+});
+
+test("an older observer completion does not release a newer POST request", async () => {
+  let releaseNew;
+  const newAnswer = new Promise(resolve => { releaseNew = resolve; });
+  const h = harness([
+    { state: "UNKNOWN", job_id: 17, message: "Job state is unknown." },
+    newAnswer,
+    { state: "SUCCESS", job_id: 17, message: "Earlier job finished." },
+  ]);
+  let reached, resume;
+  const observing = new Promise(resolve => { reached = resolve; });
+  h.context.window.setTimeout = fn => { resume = fn; reached(); };
+  const first = h.context.run("full", "system-a");
+  await observing;
+  assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
+  const second = h.context.run("full", "system-a");
+  resume();
+  await first;
+  assert.equal(h.context.diskInventorySyncModeAvailability("full").available, false);
+  releaseNew({ state: "SUCCESS", job_id: 18, message: "New job finished." });
+  await second;
+  assert.equal(h.context.diskInventorySyncModeAvailability("full").available, true);
+});
+
+test("a terminal failure on the final bounded observation is still displayed", async () => {
+  const answers = Array.from({ length: 720 }, () => ({ state: "RUNNING", job_id: 17, message: "Job running." }));
+  answers.push({ state: "FAILED", job_id: 17, message: "Job failed.", error: "Final observation error." });
+  const h = harness(answers);
+  await h.context.run("full", "system-a");
+  assert.equal(h.requests.length, 721);
+  assert.equal(h.statuses.at(-1).kind, "error");
+  assert.match(h.statuses.at(-1).text, /Final observation error/);
+});
+
+test("recent independent outcome entries stay bounded", async () => {
+  const h = harness(Array.from({ length: 12 }, (_, index) => ({ state: "SUCCESS", message: `Multipath result ${index}.` })));
+  for (let index = 0; index < 12; index += 1) await h.context.run("multipath", "system-a");
+  assert.equal(h.state.diskInventorySync.statuses.length, 8);
+  assert.match(h.statuses.at(-1).text, /Multipath result 11/);
+  assert.equal(h.state.diskInventorySync.observations.size, 0);
+});
+
 test("completion on another selected system does not replace its inventory", async () => {
   const h = harness([{ state: "SUCCESS", message: "Inventory re-read." }]);
   h.state.selectedSystemId = "system-b";

@@ -11778,6 +11778,16 @@
     return `${result?.message || "Disk re-scan finished."}${summary}${error}`;
   }
 
+  function renderDiskInventorySyncStatuses() {
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id;
+    const rows = (state.diskInventorySync.statuses || []).filter((row) => row.systemId === systemId && row.result);
+    if (!rows.length) return;
+    const failed = (row) => ["FAILED", "ABORTED"].includes(row.result.state);
+    rows.sort((a, b) => Number(failed(b)) - Number(failed(a)));
+    setStatus(rows.map((row) => `${diskInventorySyncModeSpec(row.mode).label}: ${formatDiskInventorySyncResult(row.result)}`).join(" | "),
+      rows.some(failed) ? "error" : "info");
+  }
+
   async function runDiskInventorySync(
     mode,
     systemId = state.selectedSystemId || state.snapshot?.selected_system_id,
@@ -11788,18 +11798,31 @@
       return;
     }
     if (state.diskInventorySync[mode]) return;
-    const owner = {};
+    const owner = { mode, systemId, result: null };
+    let statusOwner = owner;
+    let observationKey = null;
+    const observations = state.diskInventorySync.observations ||= new Map();
+    const publish = (result) => {
+      statusOwner.result = result;
+      const rows = state.diskInventorySync.statuses ||= [];
+      if (!rows.includes(statusOwner)) rows.push(statusOwner);
+      // Retain bounded recent outcomes, independently of active observer ownership.
+      if (rows.length > 8) rows.splice(0, rows.length - 8);
+      if (systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) renderDiskInventorySyncStatuses();
+    };
+    const releaseAdmission = () => {
+      if (state.diskInventorySync[mode] === owner) delete state.diskInventorySync[mode];
+      state.diskInventorySync.inFlight = Boolean(state.diskInventorySync.full || state.diskInventorySync.multipath);
+      renderDiskInventorySyncControls();
+    };
     state.diskInventorySync[mode] = owner;
-    state.diskInventorySync.displayOwner = owner;
     state.diskInventorySync.inFlight = true;
     state.diskInventorySync.mode = mode;
     renderDiskInventorySyncControls();
     const startedAt = Date.now();
     const showProgress = () => {
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
-      if (state.diskInventorySync.displayOwner === owner && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
-        setStatus(`Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s`);
-      }
+      publish({ message: `Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s` });
     };
     showProgress();
     const progressTimerId = window.setInterval(showProgress, 1000);
@@ -11815,15 +11838,26 @@
         if (error.status !== 409) throw error;
         result = typeof error.detail === "object" && error.detail !== null
           ? error.detail : { state: "UNKNOWN", message: error.detail || error.message };
+      } finally {
+        // Only POST owns admission. Observing an earlier job never fences a new
+        // confirmed request; the backend decides whether that request is busy.
+        releaseAdmission();
       }
       window.clearInterval(progressTimerId);
+      if (mode === "full" && Number.isInteger(result?.job_id)) {
+        observationKey = `${systemId}/${result.job_id}`;
+        if (observations.has(observationKey)) {
+          state.diskInventorySync.statuses = state.diskInventorySync.statuses.filter((row) => row !== owner);
+          statusOwner = observations.get(observationKey);
+          publish(result);
+          return;
+        }
+        observations.set(observationKey, owner);
+      }
       // Observe only. Never replay the POST when a job is queued or running.
       for (let attempt = 0; attempt < 720; attempt += 1) {
         if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
-        const failed = result?.state === "FAILED" || result?.state === "ABORTED";
-        if (state.diskInventorySync.displayOwner === owner) {
-          setStatus(formatDiskInventorySyncResult(result), failed ? "error" : "info");
-        }
+        publish(result);
         if (!["WAITING", "RUNNING", "UNKNOWN"].includes(result?.state) || !Number.isInteger(result?.job_id)) break;
         await new Promise((resolve) => window.setTimeout(resolve, 5000));
         if (systemId !== (state.selectedSystemId || state.snapshot?.selected_system_id)) break;
@@ -11836,25 +11870,22 @@
             message: "The disk sync job's state is unknown. Checking again; TrueNAS will queue a new sync if requested." };
         }
       }
+      if (statusOwner.result !== result) publish(result);
       if (result?.state === "SUCCESS" && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
         try {
           await refreshSnapshot(true, "manual-refresh");
-          if (state.diskInventorySync.displayOwner === owner) setStatus(formatDiskInventorySyncResult(result), "info");
+          publish(result);
         } catch (_error) {
-          if (state.diskInventorySync.displayOwner === owner) {
-            setStatus(`${formatDiskInventorySyncResult(result)} The inventory refresh is unavailable; refresh again.`, "info");
-          }
+          publish({ ...result, message: `${result.message} The inventory refresh is unavailable; refresh again.` });
         }
       }
     } catch (error) {
       window.clearInterval(progressTimerId);
-      if (state.diskInventorySync.displayOwner === owner && systemId === (state.selectedSystemId || state.snapshot?.selected_system_id)) {
-        setStatus(`TrueNAS disk inventory sync failed: ${error.message || error}`, "error");
-      }
+      publish({ state: "FAILED", message: `TrueNAS disk inventory sync failed: ${error.message || error}` });
     } finally {
-      delete state.diskInventorySync[mode];
-      state.diskInventorySync.inFlight = Boolean(state.diskInventorySync.full || state.diskInventorySync.multipath);
-      renderDiskInventorySyncControls();
+      window.clearInterval(progressTimerId);
+      releaseAdmission();
+      if (observations.get(observationKey) === owner) observations.delete(observationKey);
     }
   }
 
