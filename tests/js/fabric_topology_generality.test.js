@@ -61,6 +61,59 @@ function known(fixture) {
   return { all, phys, addresses };
 }
 
+// Each PHY owner's own PHY numbers: its PHY rows and its census ports. A
+// chip seen via several HBAs owns its members' PHYs.
+function ownerPhys(fixture, model) {
+  const byOwner = new Map();
+  const add = (id, phy) => {
+    if (!Number.isInteger(phy)) return;
+    if (!byOwner.has(id)) byOwner.set(id, new Set());
+    byOwner.get(id).add(phy);
+  };
+  for (const node of fixture.fabric.nodes) for (const row of [...(node.raw?.phys || []), ...(node.raw?.phy_rows || [])]) add(node.id, row.phy);
+  for (const port of fixture.fabric.raw?.sas_transport_ports || []) for (const phy of port.phys || []) add(port.owner_id, phy);
+  return (id) => new Set([id, ...model.nodes.filter((entry) => entry.mergedInto === id).map((entry) => entry.id)].flatMap((owner) => [...(byOwner.get(owner) || [])]));
+}
+
+const numbers = (text) => (String(text).match(/[0-9]+/g) || []).map(Number);
+
+// The PHY numbers a cable's card or inspector row gives, each held against
+// the PHYs of the end it names: unlabeled numerals, both ends of a range and
+// the far side included. Returns what is not that end's.
+function cableRowFaults(row, link, phys) {
+  const faults = [];
+  const check = (values, owner, where) => {
+    const own = phys(owner);
+    for (const value of values) if (!own.has(value)) faults.push(`${where}: PHY ${value} is not a PHY of ${owner}`);
+  };
+  const ends = /^(.*?) at (.+?)(?: ↔ (.*?) at (.+))?$/.exec(row.value || "");
+  if (row.label === "PHYs") {
+    if (!ends) faults.push(`PHYs row not in "near at end ↔ far at end" form: ${row.value}`);
+    else {
+      check(numbers(ends[1]), link.source, "near end");
+      if (ends[3] !== undefined) check(numbers(ends[3]), link.target, "far end");
+    }
+  } else if (row.label === "Per lane") {
+    for (const part of String(row.value).split("; ")) check(numbers(part.split(":")[0]), link.source, "per lane");
+  } else if (row.label === "Below both ends' max") {
+    for (const part of String(row.value).split(", ")) {
+      const lane = /PHY ([0-9]+) ↔ ([0-9]+)/.exec(part);
+      if (!lane) faults.push(`lane row not read as PHY pairs: ${part}`);
+      else { check([Number(lane[1])], link.source, "lane near"); check([Number(lane[2])], link.target, "lane far"); }
+    }
+  } else if (/^Errors at /.test(row.label)) {
+    const far = row.label.includes("(far end");
+    for (const part of String(row.value).split(/; |, (?=PHY)/)) {
+      const named = /^PHYs? ([0-9–, ]+):/.exec(part);
+      if (named) check(numbers(named[1]), far ? link.target : link.source, row.label);
+    }
+  }
+  return faults;
+}
+
+const kvRows = (html) => [...String(html).matchAll(/<span class="kv-label">([^<]*)<\/span><span class="kv-value">([^<]*)<\/span>/g)]
+  .map(([, label, value]) => ({ label: decode(label), value: decode(value) }));
+
 // Hardware strings outside these invented fabrics: none may reach a synthetic fabric's page.
 const OURS = /\bLSI\b|SAS3x|SMCDRS|Supermicro|QuantaStor|\bmpr[0-9]/;
 
@@ -102,6 +155,25 @@ for (const fixture of fixtures) {
     }
   });
 
+  test(`${fixture.id}: each card and inspector names only its own owner's PHYs`, () => {
+    const model = build(fixture);
+    const phys = ownerPhys(fixture, model);
+    const faults = [];
+    for (const link of model.links.filter((entry) => entry.lanes)) {
+      const rows = [...T.cardFor(model, { kind: "link", id: link.id }).rows, ...kvRows(T.detailFor(model, { kind: "link", id: link.id })?.html || "")];
+      assert.ok(rows.some((row) => row.label === "PHYs"), `${link.id}: a PHYs row`);
+      for (const row of rows) faults.push(...cableRowFaults(row, link, phys).map((fault) => `${link.id}: ${fault}`));
+    }
+    for (const port of model.portByKey.values()) {
+      const path = T.cardFor(model, { kind: "port", id: port.key }).rows.find((row) => row.label === "Path");
+      const named = path ? /PHY ([0-9]+)/.exec(path.value) : null;
+      if (!named) continue;
+      assert.ok(port.expanderId, `${port.key}: a PHY is named only on a read expander`);
+      if (!phys(port.expanderId).has(Number(named[1]))) faults.push(`${port.key}: PHY ${named[1]} is not a PHY of ${port.expanderId}`);
+    }
+    same(faults, [], faults.join("\n"));
+  });
+
   test(`${fixture.id}: findings only where the fixture has a fault`, () => {
     const model = build(fixture);
     const found = model.checks.filter((check) => check.status === "critical" || check.status === "warning").map((check) => `${check.status}: ${check.title}: ${check.lines.join(" | ")}`);
@@ -111,6 +183,27 @@ for (const fixture of fixtures) {
     assert.ok(![...model.flags.values()].flat().some((flag) => flag.tier === "critical"), "nothing critical");
   });
 }
+
+test("the per-owner PHY oracle catches an invented or misplaced PHY on a cable card (negative control)", () => {
+  const fixture = byId["cascade3-top"];
+  const model = build(fixture);
+  const phys = ownerPhys(fixture, model);
+  const link = model.links.find((entry) => entry.lanes && entry.lanes.targetPhys.length);
+  const row = T.cardFor(model, { kind: "link", id: link.id }).rows.find((entry) => entry.label === "PHYs");
+  same(cableRowFaults(row, link, phys), [], "control: the card as drawn");
+  const [near, far] = row.value.split(" ↔ ");
+  const nearName = near.replace(/^.*? at /, "");
+  // An unlabeled numeral no PHY of either end has.
+  assert.ok(cableRowFaults({ ...row, value: `250 at ${nearName} ↔ ${far}` }, link, phys).length);
+  // A real PHY of the far end, shown at the near end.
+  const farPhy = [...phys(link.target)].find((phy) => !phys(link.source).has(phy));
+  assert.ok(Number.isInteger(farPhy));
+  assert.ok(cableRowFaults({ ...row, value: `${farPhy} at ${nearName} ↔ ${far}` }, link, phys).length);
+  // The far side is held against the far end's own PHYs.
+  assert.ok(cableRowFaults({ ...row, value: `${near} ↔ 250 at ${far.replace(/^.*? at /, "")}` }, link, phys).length);
+  // Both ends of a range are held: the upper end alone is wrong.
+  assert.ok(cableRowFaults({ ...row, value: `0–250 at ${nearName} ↔ ${far}` }, link, phys).length);
+});
 
 const stubsOf = (model) => model.nodes.filter((entry) => entry.neighbour || entry.stubGroup).map((entry) => entry.label);
 
@@ -176,7 +269,11 @@ test("two HBAs to one expander on Linux: one chip, both HBAs, and the unjoined s
 test("an x4 port beside an x8 port to another backplane is not a finding; SATA disks are one port each and not judged for rate", () => {
   const model = build(byId["wide-x4-sata"]);
   same(model.links.filter((link) => link.lanes).map((link) => link.lanes.count).sort(), [4, 8]);
-  assert.equal(model.checks.find((check) => check.id === "lanes").status, "pass");
+  // Not a finding: no warning or critical. sysfs does not pair the PHYs
+  // across a cable, so whether each lane runs at both ends' maximum is not read.
+  const lanes = model.checks.filter((check) => check.id === "lanes" || check.id.startsWith("lanes:"));
+  same(lanes.map((check) => check.status), ["not_read"]);
+  assert.ok(lanes[0].lines.every((line) => /which PHY pairs with which is not read/.test(line)), lanes[0].lines.join(" | "));
   const sata = model.bays.filter((bay) => bay.protocol === "SATA");
   assert.equal(sata.length, 2);
   for (const bay of sata) {

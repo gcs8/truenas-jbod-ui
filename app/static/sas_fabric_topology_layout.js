@@ -767,7 +767,8 @@ function routeRails(model, rails, byId) {
   }
 
 function placeCells(model) {
-    const hbas = model.nodes.filter((entry) => entry.kind === "controller").map((entry) => entry.label);
+    // By the payload's controller id: two HBAs may share a Friendly Label.
+    const hbas = model.nodes.filter((entry) => entry.kind === "controller").map((entry) => entry.id);
     for (const group of model.groups) {
       if (!group.rows) {
         group.cells.forEach((bay, index) => {
@@ -808,7 +809,7 @@ function placeCells(model) {
       // One mark per path, grouped by HBA: each HBA has as many places in a
       // cell as the most paths it has to one bay of the block, so the marks
       // of one HBA line up down the block.
-      const perHba = Math.max(1, ...group.bays.flatMap((bay) => hbas.map((name) => bay.ports.filter((port) => port.controller === name).length)));
+      const perHba = Math.max(1, ...group.bays.flatMap((bay) => hbas.map((name) => bay.ports.filter((port) => port.controllerId === name).length)));
       const slots = Math.max(1, hbas.length * perHba, ...group.bays.map((bay) => bay.ports.length));
       group.rows.forEach((row, r) => row.forEach(({ bay, column }) => {
         bay.x = cellsLeft + column * group.pitch + group.breaks.filter((at) => at <= column).length * context.GROUP_GAP;
@@ -824,8 +825,8 @@ function placeCells(model) {
         bay.tag = group.cellH === context.PHYS_CELL_TALL ? bay.protocol : "";
         const used = new Set();
         bay.ports.forEach((port, index) => {
-          const owner = hbas.indexOf(port.controller);
-          let slot = owner < 0 ? -1 : owner * perHba + bay.ports.slice(0, index).filter((other) => other.controller === port.controller).length;
+          const owner = port.controllerId ? hbas.indexOf(port.controllerId) : -1;
+          let slot = owner < 0 ? -1 : owner * perHba + bay.ports.slice(0, index).filter((other) => other.controllerId === port.controllerId).length;
           if (slot < 0 || slot >= slots || used.has(slot)) slot = [...Array(slots).keys()].find((at) => !used.has(at)) ?? index;
           used.add(slot);
           const chip = chips[chipAt(port)];
@@ -1326,7 +1327,7 @@ function addBayVia(group, bay, link, path) {
     path.bays.add(bay.bayId);
     const via = context.list(group.paths).find((item) => item.id === link.via);
     for (const port of bay.ports) {
-      if (link.reported ? port.expanderId === link.source : via?.controllerId ? port.controller === via.label : true) path.ports.add(port.key);
+      if (link.reported ? port.expanderId === link.source : via?.controllerId ? port.controllerId === via.controllerId : true) path.ports.add(port.key);
     }
   }
 
@@ -1360,7 +1361,7 @@ function portPath(model, key, path) {
     path.groups.add(group.id);
     if (!group.enclosure) return bayPath(model, port.bayId, path);
     reportedChips(model, [port], path);
-    const mine = group.paths.filter((item) => !item.controllerId || item.label === port.controller);
+    const mine = group.paths.filter((item) => !item.controllerId || item.controllerId === port.controllerId);
     const own = mine.filter((item) => (item.rowId ? item.rowId === port.expanderId || !port.expanderId : true));
     enclosurePaths(model, group, own.length ? own : mine, path);
     return path;
@@ -1650,7 +1651,7 @@ const link = entry.neighbour?.href || "";
 
 function portTone(model, port) {
     const tone = pathTone(port.state, port.basis);
-    const role = model.roleOf?.get(port.controller)?.role;
+    const role = (model.roleOf?.get(port.controllerId) || model.roleOf?.get(port.controller))?.role;
     if (!role || tone !== "member" || !/^(online|ok|healthy|optimal)$/i.test(port.state)) return tone;
     return role === "active" ? "active" : "standby";
   }
@@ -1660,7 +1661,7 @@ function renderPort(model, bay, port, path, used) {
     used.add(`path-${tone}`);
     const flagged = context.flagTier(model, "port", port.key);
     const highlight = onPathClass(path, "ports", port.key) + (pinnedRef(path, "port", port.key) ? " is-pinned" : "");
-    const controller = model.nodes.find((entry) => entry.kind === "controller" && entry.label === port.controller);
+    const controller = model.nodes.find((entry) => entry.kind === "controller" && entry.id === port.controllerId);
     const chain = chainClass(controller ? model.chains.indexOf(controller.id) : -1);
     const name = context.cardText(context.cardFor(model, { kind: "port", id: port.key }));
     // The port's target is its mark's band only: never over its bay's box,

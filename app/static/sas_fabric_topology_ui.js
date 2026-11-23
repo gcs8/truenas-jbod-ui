@@ -60,6 +60,7 @@ function transportNote(model) {
     const cables = model.links.filter((link) => context.LANE_LINKS.has(link.kind) && link.lanes);
     const phys = [...hbas.map((entry) => model.sas.controllers.get(entry.id).phys), ...chips.map((entry) => model.sas.expanders.get(entry.id).phys)].flat();
     const counted = phys.filter((row) => row.measured).length;
+    const rated = phys.filter((row) => row.rate !== null && row.max !== null).length;
     const disks = model.bays.filter((bay) => bay.occupancy === "yes");
     const paths = disks.flatMap((bay) => bay.ports);
     const joined = paths.filter((port) => port.phy).length;
@@ -68,7 +69,7 @@ function transportNote(model) {
     const before = model.shared ? "each head end as a storage system and its disks" : "its bays and what reports them";
     const measured = [
       `${context.plural(hbas.length, "HBA")} (${hbas.map((entry) => [entry.label, entry.facts[0]].filter(Boolean).join(": ")).join("; ")}) and ${context.plural(chips.length, "expander")} (${chips.map((entry) => context.tail(entry.address || entry.rawId)).join(", ")}): before, this view had ${before} and no hardware above them.`,
-      `${context.plural(phys.length, "PHY")} with link rate and maximum rate; the four error counters are read on ${counted} of them${counted < phys.length ? ` (${phys.length - counted} return none)` : ""}.`,
+      `${rated === phys.length ? context.plural(phys.length, "PHY") : `${rated} of ${context.plural(phys.length, "PHY")}`} with link rate and maximum rate; the four error counters are read on ${counted} of ${phys.length}${counted < phys.length ? ` (${phys.length - counted} return none)` : ""}.`,
       cables.length ? `${context.plural(cables.length, "cable")} as its parent sees it: ${cables.map((link) => `${context.nodeName(model, link.source)} → ${context.nodeName(model, link.target)} x${link.lanes.count} on PHY ${context.phyRanges(link.lanes.sourcePhys)}`).join("; ")}.` : "",
       paths.length ? `${joined} of ${context.plural(paths.length, "disk path")} on its expander PHY, joined by the disk's block device name${model.shared ? " on each head" : ""}, not by bay number.` : "",
     ].filter(Boolean);
@@ -146,7 +147,7 @@ function wiringChecks(model, fabric) {
       const lines = [];
       let known = false;
       for (const entry of controllers) {
-        const states = model.bays.flatMap((bay) => bay.pathStates.filter((state) => state.controller === entry.label || `controller:${state.controller}` === entry.id));
+        const states = model.bays.flatMap((bay) => bay.pathStates.filter((state) => state.controllerId === entry.id));
         if (!states.length) continue;
         const blank = states.every((state) => state.state === context.STATE_UNREAD);
         if (!blank) known = true;
@@ -354,9 +355,7 @@ function wiringChecks(model, fabric) {
       severity = "warning";
       const flags = [];
       const unread = [];
-      let paired = true;
       let farInferred = 0;
-      const farUnread = [];
       // Cables are compared with the other cables into the same backplane
       // (the two sides of a dual-path chain), never with every cable of the
       // fabric: an x8 uplink beside x4 cascades is not a finding.
@@ -376,26 +375,23 @@ function wiringChecks(model, fabric) {
         if (link.lanes.count < widest) found.push(`x${link.lanes.count} where another cable into the same backplane is x${widest}`);
         const slow = slowLanes(model, link);
         if (slow.length) found.push(`${context.plural(slow.length, "lane")} below the maximum of both ends: ${slow.map((lane) => `PHY ${lane.source} ↔ ${lane.target} at ${lane.rate} Gb/s (both ends ${lane.cap})`).join(", ")}`);
+        // A lane is judged against both of its ends only where the payload
+        // pairs its PHYs; one end's maximum alone says nothing about the lane.
         const ends = unpairedPhys(model, link);
-        const slowEnds = ends.filter((item) => item.row && item.row.rate !== null && item.row.max !== null && item.row.rate < item.row.max);
-        if (slowEnds.length) found.push(`below its maximum: ${slowEnds.map((item) => `${item.end} PHY ${item.row.phy} at ${item.row.rate} Gb/s (max ${item.row.max})`).join(", ")}`);
-        const blind = ends.length ? ends.filter((item) => !item.row || item.row.rate === null || item.row.max === null).length
-          : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null).length;
-        if (blind > 0) unread.push(`${name}: rate or an end's maximum not read for ${context.plural(blind, ends.length ? "PHY" : "lane")}`);
-        if (ends.length) paired = false;
+        if (!link.lanes.targetPhys.length && link.lanes.targetBasis !== "inferred") unread.push(`${name}: far end not read, so no lane is judged against both of its ends`);
+        else if (ends.length) unread.push(`${name}: which PHY pairs with which is not read, so no lane is judged against the maximum of both of its ends`);
+        const blind = ends.length ? 0 : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null).length;
+        if (blind > 0) unread.push(`${name}: rate or an end's maximum not read for ${context.plural(blind, "lane")}`);
         if (link.lanes.targetBasis === "inferred") farInferred += 1;
-        else if (!link.lanes.targetPhys.length) farUnread.push(name);
         if (!found.length) continue;
-        const text = tiered(`${name}: ${found.join("; ")}`, slow.length || slowEnds.length ? "critical" : "warning");
+        const text = tiered(`${name}: ${found.join("; ")}`, slow.length ? "critical" : "warning");
         flags.push(text);
         flag("link", link.id, text);
       }
       if (!cables.length) unread.push("no HBA or cascade cable is in the payload");
       check("lanes", "Every cable has the same lane count and every lane runs at the maximum of both its ends", flags, unread, `${context.plural(cables.length, "cable")}${widths.length === 1 ? `, each x${widths[0]}` : ` (${widths.map((width) => `x${width}`).join(", ")})`}, every lane at the maximum of both its ends`,
         ["A lane is judged only where both of its ends report their maximum: below it is critical; a cable narrower than another into the same backplane is a warning. Disk ports are not judged for rate: the drive's maximum is not in the payload.",
-          ...(paired ? [] : ["Which PHY at one end is cabled to which at the other is not read: each end's PHYs are judged on their own."]),
-          ...(farInferred ? [`The far end of ${context.plural(farInferred, "cable")} is inferred (the child expander's only linked PHYs in no port): sysfs has a port on the parent only.`] : []),
-          ...(farUnread.length ? [`Far end not read, so only the parent's PHYs are judged: ${farUnread.join("; ")}.`] : [])]);
+          ...(farInferred ? [`The far end of ${context.plural(farInferred, "cable")} is inferred (the child expander's only linked PHYs in no port): sysfs has a port on the parent only.`] : [])]);
     }
 
     // (d) Bay ports: a path via each HBA, on the bay's own board. A SATA
@@ -411,7 +407,8 @@ function wiringChecks(model, fabric) {
       let sas2 = 0;
       let sata = 0;
       for (const board of boards) {
-        const hbas = [...new Set(board.chips.flatMap((chip) => chip.rows.map((row) => labelOf(row.controllerId))))];
+        // By id; each is named by its label where the check says so.
+        const hbas = [...new Set(board.chips.flatMap((chip) => chip.rows.map((row) => row.controllerId)))];
         const unmapped = [];
         const single = new Map();
         const unsure = new Map();
@@ -446,21 +443,22 @@ function wiringChecks(model, fabric) {
             // No path at all via an HBA is evidence. Which expander a path
             // uses is evidence only where the payload has the path's port
             // row: without it nothing is said about expanders.
-            const missing = hbas.filter((name) => !bay.ports.some((port) => port.controller === name));
+            const missing = hbas.filter((id) => !bay.ports.some((port) => port.controllerId === id)).map(labelOf);
             // The transport collector joins one block device per slot, so a
             // second path through another HBA is not read, not missing. A
             // head end's own survey does read that head's path.
             if (missing.length && model.transport && !model.shared) unjoined.push(`${bay.label}: via ${missing.join(", ")}`);
             else if (missing.length) found.push(`no path via ${missing.join(", ")}`);
             if (unknown.length) {
-              const shape = `${context.plural(bay.ports.length, "path")}: ${hbas.map((name) => `${bay.ports.filter((port) => port.controller === name).length} via ${name}`).join(", ")}`;
+              const shape = `${context.plural(bay.ports.length, "path")}: ${hbas.map((id) => `${bay.ports.filter((port) => port.controllerId === id).length} via ${labelOf(id)}`).join(", ")}`;
               if (!unsure.has(shape)) unsure.set(shape, []);
               unsure.get(shape).push(bay.label);
             } else {
-              const pairs = bay.ports.map((port) => `${port.controller}|${chipOf(port.expanderId).id}`);
-              for (const pair of new Set(pairs.filter((pair, index) => pairs.indexOf(pair) !== index))) found.push(`two paths via ${pair.split("|")[0]} through ${chipOf(pair.split("|")[1]).label}`);
+              const pairs = bay.ports.map((port) => `${port.controllerId || port.controller}|${chipOf(port.expanderId).id}`);
+              for (const pair of new Set(pairs.filter((pair, index) => pairs.indexOf(pair) !== index))) found.push(`two paths via ${model.nodeById.get(pair.split("|")[0])?.label || pair.split("|")[0]} through ${chipOf(pair.split("|")[1]).label}`);
               if (board.chips.length > 1 && used.length === 1 && bay.ports.length > 1) found.push(`every path runs through ${used[0].label}: one of its two ports is in use`);
-              if (!found.length) sas2 += 1;
+              // Counted only where a path via every HBA was read.
+              if (!found.length && !missing.length) sas2 += 1;
             }
           }
           if (!found.length) continue;
@@ -504,9 +502,15 @@ function wiringChecks(model, fabric) {
       const unread = [];
       let counted = 0;
       let hbaRead = false;
+      let farRead = true;
       for (const link of cables) {
         if (!link.lanes) continue;
         const name = cableName(model, link);
+        // A far end whose PHYs are not read is not checked: never "both ends".
+        if (!link.lanes.targetPhys.length) {
+          farRead = false;
+          unread.push(`${name}: counters not read at its far end (which of its PHYs the cable uses is not read)`);
+        }
         for (const end of cableEnds(model, link)) {
           if (end.hba && !end.rows.length) continue;
           if (end.hba) hbaRead = true;
@@ -534,7 +538,7 @@ function wiringChecks(model, fabric) {
       }
       if (!counted && !unread.length && !flags.length) unread.push("no expander PHY counters for a cable are in the payload");
       check("cable-errors", "No PHY errors on the cables' lanes", flags, unread, `no errors on the ${context.plural(counted, "PHY")} the cables use`,
-        [hbaRead ? "Each cable is checked at both of its ends." : "Error counters for the HBA's own PHYs are not in the payload: each cable is checked at its expander ends.",
+        [hbaRead && farRead ? "Each cable is checked at both of its ends." : hbaRead ? "Each cable is checked at each end whose PHYs are read." : "Error counters for the HBA's own PHYs are not in the payload: each cable is checked at its expander ends.",
           "The counters are cumulative since the expander last reset; this view cannot tell when that was.", context.THRESHOLD_NOTE, context.TREND_NOTE]);
     }
 
@@ -666,7 +670,7 @@ function hbaRows(model, entry) {
           + `${others.length ? `; this system's other ${others.length === 1 ? "enclosure is" : "enclosures are"} ${others.join(", ")}` : ""}`,
       });
     }
-    const paths = model.bays.flatMap((bay) => bay.ports.filter((port) => port.controller === entry.label));
+    const paths = model.bays.flatMap((bay) => bay.ports.filter((port) => port.controllerId === entry.id));
     rows.push({ label: "Disk paths", value: record.pathCounts.length ? record.pathCounts.map(([state, count]) => `${count} ${state}`).join(", ") : paths.length ? stateCounts(paths.map((port) => `${port.basis === context.MEMBER_HEALTH ? "member health " : ""}${port.state}`)) : context.NOT_READ, warn: bad });
     return rows;
   }
@@ -817,7 +821,7 @@ function portRows(model, port) {
     const chip = context.chipOfNode(model, port.expanderId);
     const phy = port.phy;
     const tone = context.pathTone(port.state, port.basis);
-    const role = model.roleOf?.get(port.controller);
+    const role = model.roleOf?.get(port.controllerId) || model.roleOf?.get(port.controller);
     const rows = [
       ...(role ? [{ label: "Head end", value: `${role.head}: ${role.role === "active" ? "active (pool owner)" : role.role || `role ${context.NOT_READ}`}` }] : []),
       { label: "State", value: `${port.basis === context.MEMBER_HEALTH ? "member health " : ""}${port.state}`, warn: tone === "fault" || tone === "missing" },
@@ -867,8 +871,8 @@ function cardFor(model, ref) {
       if (!bay) return null;
       const rows = bay.ports.map((port) => ({
         // The device is named where it tells two paths of one source apart, or is short.
-        label: `via ${port.controller || "?"}${port.device && (context.deviceShort(port.device).length <= 12 || bay.ports.filter((other) => other.controller === port.controller).length > 1) ? ` (${context.deviceShort(port.device)})` : ""}`,
-        value: `${{ active: "active head · ", standby: "standby head · " }[model.roleOf?.get(port.controller)?.role] || ""}${portBrief(port)}`,
+        label: `via ${port.controller || "?"}${port.device && (context.deviceShort(port.device).length <= 12 || bay.ports.filter((other) => other.controllerId === port.controllerId && other.controller === port.controller).length > 1) ? ` (${context.deviceShort(port.device)})` : ""}`,
+        value: `${{ active: "active head · ", standby: "standby head · " }[(model.roleOf?.get(port.controllerId) || model.roleOf?.get(port.controller))?.role] || ""}${portBrief(port)}`,
         warn: ["fault", "missing"].includes(context.pathTone(port.state, port.basis)) ? "critical" : context.phyTier(port.phy),
       }));
       if (!rows.length) rows.push({ label: "Paths", value: bay.occupancy === "yes" ? "none reported for this disk" : bay.occupancy === "no" ? "none: no disk" : context.NOT_READ });
@@ -1127,6 +1131,23 @@ function boxRect(box) {
     return rect && Number.isFinite(rect.left) && Number.isFinite(rect.top) ? { left: rect.left, top: rect.top } : { left: 0, top: 0 };
   }
 
+// A port's key is its place in its bay; the path is its controller and its
+// member device. A pinned port follows that path when rows move, and is
+// cleared when no single port of the new drawing is provably it.
+function portIdentity(port, ports) {
+    const same = (other) => other.bayId === port.bayId && (other.controllerId || other.controller) === (port.controllerId || port.controller) && other.device === port.device;
+    return `${port.bayId}|${port.controllerId || port.controller}|${port.device}#${ports.filter(same).indexOf(port)}`;
+  }
+
+function followPort(previous, model, pin) {
+    const before = previous.portByKey.get(pin.id);
+    if (!before) return pin;
+    const identity = portIdentity(before, [...previous.portByKey.values()]);
+    const ports = [...model.portByKey.values()];
+    const found = ports.filter((port) => portIdentity(port, ports) === identity);
+    return found.length === 1 ? { ...pin, id: found[0].key } : null;
+  }
+
 function render(fabric, options = {}) {
     listen();
     const previous = live.model;
@@ -1180,11 +1201,13 @@ function render(fabric, options = {}) {
     live.expandedKeys = keys;
     live.scope = model.scope;
     live.model = model;
+    const carried = live.pin;
     if (options.selection !== undefined) {
       const selected = refFromSelection(model, options.selection);
       if (selected) live.pin = selected;
       else if (!ownPin(model, live.pin)) live.pin = null;
     }
+    if (previous && live.pin === carried && live.pin?.kind === "port") live.pin = followPort(previous, model, live.pin);
     if (!refExists(model, live.pin)) live.pin = null;
     live.hover = null;
     // The sentences this drawing's band can show, for its one measure.
@@ -1504,7 +1527,17 @@ function inspectorDetail() {
           objectKind: entry.kind || "bay" }));
       return { ...detail, aliases };
     }
-    if (live.pin.kind === "link") return context.linkDetail(live.model, live.pin.id);
+    if (live.pin.kind === "link") {
+      // A bundle's or a link's own details: its two ends are its label
+      // targets, and an enclosure it leads into is one by its own target.
+      const found = context.linkDetail(live.model, live.pin.id);
+      const link = live.model.linkById.get(live.pin.id);
+      if (!found || !link) return found;
+      const ends = [link.source, link.target].map((id) => live.model.nodeById.get(id)).filter(Boolean)
+        .map((entry) => ({ label: entry.label, objectId: entry.id, objectKind: entry.kind }));
+      const enclosure = live.model.groupById.get(link.target)?.enclosure?.aliasTarget;
+      return { ...found, aliases: [...ends, ...(enclosure ? [{ label: "Enclosure", ...enclosure }] : [])] };
+    }
     if (!ownPin(live.model, live.pin)) return null;
     const enclosure = live.model.nodeById.get(live.pin.id)?.physical;
     const found = enclosureDetail(live.model, live.pin.id);

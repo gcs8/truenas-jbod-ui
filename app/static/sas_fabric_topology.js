@@ -922,7 +922,8 @@ function planNeighbours(context) {
     const selected = new Set(String(fabric?.selected_enclosure_id || "").toLowerCase().split("+"));
     for (const entry of off) {
       const address = sasAddressOf(entry.rawId);
-      const ports = census.filter((port) => port.owner_id === entry.id && port.remote_kind === "end_device");
+      const owned = census.filter((port) => port.owner_id === entry.id);
+      const ports = owned.filter((port) => port.remote_kind === "end_device");
       const identities = [...new Set(ports.map((port) => text(port.enclosure_identifier).toLowerCase()).filter(Boolean))];
       const found = identities.length === 1 ? byIdentity.get(identities[0]) : !identities.length && address ? byIdentity.get(address) : null;
       const relation = entry.below === 1 ? "Next in chain" : entry.below ? "Further down the chain" : above.get(entry.id) === 1 ? "Reached through" : above.has(entry.id) ? "Further up the chain" : "Elsewhere in the fabric";
@@ -934,8 +935,10 @@ function planNeighbours(context) {
         basis: !found ? "" : identities.length === 1 ? "the enclosure id its disks report" : "an enclosure id equal to its SAS address",
         enclosureId: found ? found.id : "",
         bays: found && Number.isInteger(found.slot_count) ? found.slot_count : null,
-        // The disks on it: its end devices with a block device, where the payload lists its ports.
-        disks: census.length ? ports.filter((port) => port.has_block).length : null,
+        // The disks on it: its end devices with a block device, where the
+        // payload lists its ports; and its ports whose attachment is not read.
+        disks: census.length ? ports.filter((port) => port.has_block === true).length : null,
+        unreadAttachments: owned.filter((port) => port.remote_kind !== "expander" && (port.remote_kind !== "end_device" || typeof port.has_block !== "boolean")).length,
         product: text(sas.expanders.get(entry.id)?.product),
         href: found && hrefFor && !found.id.toLowerCase().split("+").some((part) => selected.has(part)) ? String(hrefFor(found.id) || "") : "",
       };
@@ -948,7 +951,11 @@ function planNeighbours(context) {
 
 function stubFacts(entry, health) {
     const { neighbour } = entry;
-    const disks = neighbour.disks === null ? "disks not read" : neighbour.bays === null ? `${plural(neighbour.disks, "disk")}, bays not read` : `${neighbour.disks}/${neighbour.bays} disks`;
+    // A count is exact only where every port's attachment was read.
+    const partial = neighbour.unreadAttachments ? `, ${plural(neighbour.unreadAttachments, "attachment")} not read` : "";
+    const disks = neighbour.disks === null ? "disks not read"
+      : partial ? `${plural(neighbour.disks, "disk")} seen${neighbour.bays === null ? ", bays not read" : ` of ${neighbour.bays} bays`}${partial}`
+      : neighbour.bays === null ? `${plural(neighbour.disks, "disk")}, bays not read` : `${neighbour.disks}/${neighbour.bays} disks`;
     return [
       [neighbour.product, entry.address ? tail(entry.address) : ""].filter(Boolean).join(" · "),
       [entry.level === null ? "level not reported" : `level ${entry.level}`, disks].join(" · "),
@@ -971,7 +978,7 @@ function neighbourRows(model, entry) {
     if (entry.neighbour) {
       const { neighbour } = entry;
       rows.push({ label: "Enclosure", value: neighbour.known ? `${neighbour.name}: another enclosure of this system, by ${neighbour.basis}. Its bays are on its own page` : `${NOT_READ}: the payload does not say which enclosure this expander is the backplane of` });
-      rows.push({ label: "Disks on it", value: neighbour.disks === null ? `${NOT_READ}: the payload lists no ports for it` : `${neighbour.disks}${neighbour.bays === null ? "; its bay count is not read" : ` of ${plural(neighbour.bays, "bay")}`}` });
+      rows.push({ label: "Disks on it", value: neighbour.disks === null ? `${NOT_READ}: the payload lists no ports for it` : `${neighbour.disks}${neighbour.unreadAttachments ? ` seen; what ${plural(neighbour.unreadAttachments, "other port")} ${neighbour.unreadAttachments === 1 ? "is" : "are"} attached to is ${NOT_READ}` : ""}${neighbour.bays === null ? "; its bay count is not read" : ` of ${plural(neighbour.bays, "bay")}`}`, warn: neighbour.unreadAttachments > 0 });
       if (neighbour.health) rows.push({ label: "State", value: neighbour.health, warn: neighbour.tier || false });
     }
     const from = [...new Set(cables.filter((link) => ids.has(link.target)).map((link) => neighbourText(model, link.source)))];
@@ -996,9 +1003,15 @@ function finishNeighbours(model) {
       const flags = [...context.flagsOf(model, "node", entry.id), ...cables.flatMap((link) => context.flagsOf(model, "link", link.id))];
       const tier = worse(...flags.map((item) => item.tier));
       const record = model.sas.expanders.get(entry.id);
-      const measured = list(record?.phys).filter((row) => row.measured).length;
+      const all = list(record?.phys);
+      const measured = all.filter((row) => row.measured).length;
+      // Clean only where every linked PHY's counters were read.
+      const linked = all.filter((row) => row.rate !== null);
+      const rows = linked.length ? linked : all;
+      const read = rows.filter((row) => row.measured).length;
+      const clean = read === rows.length ? "no PHY errors" : `no PHY errors on ${read} of ${plural(rows.length, linked.length ? "linked PHY" : "PHY")}; counters not read on ${rows.length - read}`;
       entry.neighbour.tier = tier;
-      entry.neighbour.health = tier ? `${tier}: ${[...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))].join("; ")}` : measured ? "no PHY errors" : "PHY counters not read";
+      entry.neighbour.health = tier ? `${tier}: ${[...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))].join("; ")}` : measured ? clean : "PHY counters not read";
       entry.facts = stubFacts(entry, entry.neighbour.health);
     }
     // More than three under one parent: one stub that lists them.
@@ -1093,7 +1106,9 @@ function adoptLinuxTransport(payload, options = {}) {
       const mapped = rows.map((row) => {
         const found = resolve ? resolve(payload, row) : { state: "not_read", phys: [] };
         const entry = own(index, row.sas_transport_port_id);
-        const ownerId = isRecord(entry) && typeof entry.owner_id === "string" ? entry.owner_id : "";
+        // The owner of an entry the shared resolver rejected is not read:
+        // its PHY names did not resolve on it (#1494).
+        const ownerId = found.state === "read" && isRecord(entry) && typeof entry.owner_id === "string" ? entry.owner_id : "";
         const protocol = protocolOf(row.target_port_protocol, row.transport_protocol);
         const device = protocol ? `${protocol} Target` : "End device (disk)";
         const phys = found.state === "read" ? list(found.phys) : [];
@@ -1503,15 +1518,23 @@ function buildTopologyModel(given, options = {}) {
     const groupByBay = new Map();
     const bays = [];
     const controllerNodes = nodes.filter((entry) => entry.kind === "controller");
+    const controllerOf = (named) => {
+      const byLabel = controllerNodes.filter((entry) => entry.label === named);
+      const owner = controllerNodes.find((entry) => entry.id === `controller:${named}` || entry.id === named) || (byLabel.length === 1 ? byLabel[0] : null);
+      return { controller: owner ? owner.label : named, controllerId: owner ? owner.id : "" };
+    };
+    // Two paths name one controller when they name the same id, or, without
+    // an id, the same text.
+    const sameController = (left, right) => (left.controllerId || right.controllerId ? left.controllerId === right.controllerId : left.controller === right.controller);
     for (const item of bayRows) {
       if (payloadNodeIds.get(item.id) !== item) continue;
       const found = traces.get(item.id);
       const trace = found?.kind === "bay" ? found : null;
       const metrics = isRecord(item.metrics) ? item.metrics : {};
-      // A path names its controller by label or by the tail of its id.
-      const ownerOf = (named) => controllerNodes.find((entry) => entry.label === named || entry.id === `controller:${named}`)?.label || named;
+      // A path names its controller by the tail of its id, or by a label
+      // only one controller has. Joins use the id; the label is display.
       const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
-        controller: ownerOf(String(state.controller_label || state.controller || "")),
+        ...controllerOf(String(state.controller_label || state.controller || "")),
         state: String(state.state ?? "unknown"),
         basis: String(state.state_basis ?? ""),
         device: text(state.device_name),
@@ -1520,7 +1543,7 @@ function buildTopologyModel(given, options = {}) {
         transportPhyCount: window.SasFabricTransport?.pathState?.(fabric, state)?.transportPhyCount,
         raw: state,
       }));
-      const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id));
+      const pathStates = traced.length ? traced : list(pathStatesByBay.get(item.id)).map((state) => ({ ...state, ...controllerOf(state.controller) }));
       const slot = Number.isInteger(item.slot) ? item.slot : null;
       const inventorySlot = slot === null ? null : inventory.get(slot);
       const located = locationKnown(metrics, item.raw, trace?.metrics, inventorySlot, inventorySlot?.raw_status);
@@ -1553,15 +1576,14 @@ function buildTopologyModel(given, options = {}) {
       const port = (state, device) => {
         const joined = device ? joinPort(sas, device)
           : { expanderId: "", phy: null, why: core ? "the payload has no port row for this path, so its expander and PHY are not matched" : "the payload has no expander PHY table for this path" };
-        const named = state ? state.controller : String(device.controller || "");
-        const owner = controllerNodes.find((entry) => entry.label === named || entry.id === `controller:${named}`);
+        const owner = state || controllerOf(String(device.controller || ""));
         const raw = state?.raw || {};
         const spelled = shared ? expanderInPath(raw.device_name) : null;
         return {
           key: `${item.id}#${bay.ports.length}`,
           bayId: item.id,
-          controller: owner ? owner.label : named,
-          controllerId: owner ? owner.id : "",
+          controller: owner.controller,
+          controllerId: owner.controllerId,
           state: state ? state.state : String(device.state ?? "unknown"),
           basis: state ? state.basis : "",
           device: text(device?.member_device_name) || state?.device || "",
@@ -1586,13 +1608,12 @@ function buildTopologyModel(given, options = {}) {
       // has one path and neither names a member. Otherwise not read: never a
       // sibling path's row (#1504).
       const memberOf = (state) => text(state.raw?.member_device_name) || state.device;
-      const statesOn = (name) => pathStates.filter((state) => state.controller === name);
       for (const state of pathStates) {
-        const open = devices.map((device, at) => ({ device, at })).filter(({ device, at }) => !taken.has(at) && ownerOf(String(device.controller || "")) === state.controller);
+        const open = devices.map((device, at) => ({ device, at })).filter(({ device, at }) => !taken.has(at) && sameController(controllerOf(String(device.controller || "")), state));
         const member = memberOf(state);
         const named = open.filter(({ device }) => text(device.member_device_name));
         const own = member ? named.filter(({ device }) => text(device.member_device_name) === member) : [];
-        const sole = open.length === 1 && statesOn(state.controller).length === 1 && (!member || !named.length) ? open : [];
+        const sole = open.length === 1 && pathStates.filter((other) => sameController(other, state)).length === 1 && (!member || !named.length) ? open : [];
         const found = own.length === 1 ? own[0] : sole[0] || null;
         if (found) taken.add(found.at);
         bay.ports.push(port(state, found ? found.device : null));
@@ -1614,9 +1635,10 @@ function buildTopologyModel(given, options = {}) {
       groupsByKey.get(key).bays.push(bay);
     }
     const groups = [];
-    const controllerLabels = nodes.filter((entry) => entry.kind === "controller").map((entry) => entry.label);
+    const controllerIds = nodes.filter((entry) => entry.kind === "controller").map((entry) => entry.id);
     const viewLayout = inventoryLayout(fabric, options.inventory);
     const viewSlots = new Set(viewLayout ? viewLayout.rows.flat() : []);
+    const unplaced = [];
     for (const raw of groupsByKey.values()) {
       raw.bays.sort((left, right) => (left.slot ?? Infinity) - (right.slot ?? Infinity) || naturalCompare(left.label, right.label));
       const expandKey = `topology:${raw.id}`;
@@ -1627,8 +1649,8 @@ function buildTopologyModel(given, options = {}) {
         // In an enclosure block the marks are in HBA order in every cell.
         if (raw.enclosure) {
           const rank = (state) => {
-            const index = controllerLabels.indexOf(state.controller);
-            return index < 0 ? controllerLabels.length : index;
+            const index = controllerIds.indexOf(state.controllerId);
+            return index < 0 ? controllerIds.length : index;
           };
           bay.pathStates = bay.pathStates.map((state, index) => ({ state, index })).sort((left, right) => rank(left.state) - rank(right.state) || left.index - right.index).map((item) => item.state);
           bay.ports = bay.ports.map((state, index) => ({ state, index })).sort((left, right) => rank(left.state) - rank(right.state) || left.index - right.index).map((item) => item.state);
@@ -1653,7 +1675,13 @@ function buildTopologyModel(given, options = {}) {
       // bays of every platform follow the enclosure view's grid.
       let rows = null;
       const bySlot = new Map(raw.bays.map((bay) => [bay.slot, bay]));
-      const gridRows = raw.enclosure ? raw.enclosure.layoutRows : raw.locationKnown && raw.bays.every((bay) => viewSlots.has(bay.slot)) ? viewLayout.rows : null;
+      // An enclosure the view's rows cross keeps its cells' rows and columns
+      // in the view, in order, beside the other enclosure's gaps.
+      const inView = raw.locationKnown && raw.bays.every((bay) => viewSlots.has(bay.slot));
+      const gridRows = raw.enclosure?.layoutRows || (inView ? viewLayout.rows : null);
+      if (raw.enclosure && !gridRows && viewLayout) {
+        unplaced.push(enclosureName(raw.enclosure) || raw.enclosure.id);
+      }
       if (gridRows) {
         rows = gridRows.map((row) => row.map((slot, column) => ({ bay: bySlot.get(slot), column })).filter((cell) => cell.bay)).filter((row) => row.length);
       }
@@ -1983,7 +2011,9 @@ function buildTopologyModel(given, options = {}) {
       // label without transport, its HBA's label with it.
       roleOf: new Map(shared ? nodes.filter((entry) => entry.head).flatMap((entry) => {
         const info = shared.heads.find((head) => head.controller_id === entry.id);
-        return [[info?.hba_label || entry.label, { role: entry.head.role, head: entry.label }]];
+        const role = { role: entry.head.role, head: entry.label };
+        // By the payload's id first; by its label where a path names no id.
+        return [[entry.id, role], [info?.hba_label || entry.label, role]];
       }) : []),
       warnings: list(fabric?.warnings).filter((item) => typeof item === "string"),
       // What a path's upper end is called here.
@@ -2006,6 +2036,9 @@ function buildTopologyModel(given, options = {}) {
     // because the order drawn is then the bay numbers', not the chassis's.
     if (inventory.size && !viewLayout && bays.some((bay) => bay.locationKnown)) {
       model.notices.push("The inventory gives no layout rows for this enclosure: its bays are drawn in bay-number order, not as they sit in the chassis.");
+    }
+    if (unplaced.length) {
+      model.notices.push(`The inventory's layout rows do not place every bay of ${unplaced.join(", ")}: ${unplaced.length === 1 ? "its" : "their"} bays are drawn in bay-number order, not as they sit in the chassis.`);
     }
 
     if (transport && !transport.resolved) model.notices.push("The transport port helper (sas_fabric_transport.js) is not loaded: each disk's expander PHY is not read.");
@@ -2126,7 +2159,7 @@ function planBoards(physical, context) {
         }
         if (!counts.size) return false;
         // In the order of the heads that name them, then by address.
-        const first = (ports) => Math.min(...ports.map((port) => controllerNodes.findIndex((entry) => entry.label === port.controller)).map((index) => (index < 0 ? controllerNodes.length : index)));
+        const first = (ports) => Math.min(...ports.map((port) => controllerNodes.findIndex((entry) => entry.id === port.controllerId)).map((index) => (index < 0 ? controllerNodes.length : index)));
         for (const [address, ports] of [...counts].sort((left, right) => first(left[1]) - first(right[1]) || naturalCompare(left[0], right[0]))) {
           chips.push({ address, rows: [], reportedBy: ports.length, fromPath: ports.every((port) => port.pathPhy !== null), namedBy: [...new Set(ports.map((port) => port.controller).filter(Boolean))] });
         }
