@@ -263,7 +263,7 @@ test("a bay's PHY the census also lists as an expander link has its owner not re
   census.push({ ...disk, id: `${disk.id}-uplink`, remote_kind: "expander", remote_id: null, has_block: null, bay_identifier: null });
   const built = model(item);
   const portErrors = cardRow(built, { kind: "port", id: built.bays[0].ports[0].key }, /^PHY errors$/);
-  assert.match(portErrors.value, /owner not read: the transport census also lists it as a link/);
+  assert.match(portErrors.value, /owner not read: Bay 00 claims it, but its row or the transport census calls it a link/);
   assert.ok(!statuses(built, "ports").includes("pass"), textOf(checksOf(built, "ports")));
 });
 

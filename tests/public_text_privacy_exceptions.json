@@ -410,10 +410,18 @@
   "tests/js/fabric_topology_coverage.test.js": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:bd96b60870f0942ef717d75787eccb236001a61197a02f25327aa73e8851915e": 5
+        "sha256:c09424c7174f925ab9b40cbddda0a4c49c07f9554683b20630f1583d27e5bcda": 9
       }
     },
-    "reason": "One invented decoy-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
+    "reason": "One invented decoy-expander address in the synthetic prefix of the CORE direct-path fixture, and the generality fixture's patterned HBA and disk-port addresses for a direct-attached disk; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_surfaces.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:c234a6634c4a9b36b3ba8bcb11022d0cf910451013e40a78191c3320284ea5b6": 6
+      }
+    },
+    "reason": "Patterned synthetic HBA and disk-port addresses from the Topology generality fixture seeds; exact detector count is pinned."
   },
   "tests/js/fabric_topology_generality.test.js": {
     "findings": {

@@ -562,6 +562,29 @@ function namesItsMeasurement(built, why) {
 }
 const namesPhy = (line, phy) => [...line.matchAll(/PHY (\d+)(?:–(\d+))?/g)].some((match) => phy >= Number(match[1]) && phy <= Number(match[2] || match[1]));
 
+// Every pinned cable, bus and bay agrees with the check on who owns an
+// injected fault: only the owner the check names shows it as critical, and
+// no surface does where the check says the owner is not read. A chip's own
+// inspector is the chip's, and always may.
+const unescapeHtml = (value) => value.replaceAll("&#39;", "'").replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"");
+const warnRows = (built, ref) => [...(T.detailFor(built, ref)?.html || "").matchAll(/<div class="kv-row topo-warn"><span[^>]*>([^<]*)<\/span><span[^>]*>([^<]*)<\/span>/g)]
+  .map((match) => unescapeHtml(match[2])).filter((value) => /10 loss of dword sync/.test(value));
+function surfacesAgree(built, line, why) {
+  const disputed = /owner not read/.test(line);
+  for (const link of built.links.filter((entry) => entry.bus || (entry.lanes && entry.kind !== "expander-group"))) {
+    const shown = warnRows(built, { kind: "link", id: link.id });
+    if (!shown.length) continue;
+    const title = T.cardFor(built, { kind: "link", id: link.id })?.title || "";
+    const allowed = !disputed && (link.bus ? /^Bay \d+/.test(line) : line.startsWith(`${title}: at `));
+    assert.ok(allowed, `${why}: the pinned ${link.bus ? "bus" : "cable"} ${title} shows the fault the check says is ${disputed ? "owned by no one read" : "another's"}: ${line} | ${shown}`);
+  }
+  for (const bay of built.bays) {
+    const shown = warnRows(built, { kind: "bay", id: bay.bayId });
+    if (!shown.length) continue;
+    assert.ok(!disputed && line.startsWith(bay.label), `${why}: the pinned ${bay.label} shows a fault the check does not give it: ${line} | ${shown}`);
+  }
+}
+
 function runProperty(name, base, build) {
   const before = build(structuredClone(base));
   namesItsMeasurement(before, `${name}: baseline`);
@@ -595,6 +618,7 @@ function runProperty(name, base, build) {
       const lines = after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0]) && entry.status === "critical").flatMap((entry) => entry.lines)
         .filter((line) => /10 loss of dword sync/.test(line) && namesPhy(line, deletion.injected.phy));
       assert.ok(lines.length >= 1, `${why}: the injected critical is not said with PHY ${deletion.injected.phy}: ${textOf(after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0])))}`);
+      surfacesAgree(after, lines[0], why);
       continue;
     }
     for (const id of ids) {
@@ -622,10 +646,27 @@ function runProperty(name, base, build) {
   return { proposed: deletions.length, applied, absent };
 }
 
+function directDisk() {
+  const item = fixture("wide-x4-sata");
+  const host = item.fabric.nodes.find((entry) => entry.id === "controller:host1");
+  host.raw.phy_rows.push({ ...host.raw.phy_rows[0], name: "phy-1:12", phy: 12, not_read: [], counter_state: "measured", invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 });
+  const id = "sas-port:port-1:12";
+  item.fabric.raw.sas_transport_ports.push({ id, owner_id: host.id, state: "read", phy_names: ["phy-1:12"], phys: [12], remote_kind: "end_device", remote_id: null,
+    remote_sas_address: "5eee001e00000123", has_block: true, bay_identifier: 7, enclosure_identifier: null, target_basis: "reported" });
+  item.fabric.raw.sas_transport_port_index[id] = { id, owner_id: host.id, phy_names: ["phy-1:12"], state: "read" };
+  Object.assign(item.fabric.nodes.find((entry) => entry.id === "bay:7").metrics, { present: true, device_name: "wdfresh", sas_address: "5eee001e00000123", transport_protocol: "SAS", target_port_protocol: "SSP" });
+  const row = { controller: "host1", state: "unknown", device_name: "wdfresh", transport_protocol: "SAS", attached_sas_address: "5aaa000000000101", phy_identifier: 12, target_port_protocol: "SSP",
+    sas_address: "5eee001e00000123", member_device_name: "wdfresh", bay_identifier: 7, port: "port-1:12", expander_ids: [], sas_transport_port_id: id, source: "linux_sas_transport" };
+  Object.assign(item.fabric.traces.find((entry) => entry.id === "bay:7").metrics, { sas_transport_ports: [row], path_states: [row] });
+  return item;
+}
+
 test("property: on every synthetic fabric and the CORE fabric, every deleted subject is not read, named or counted, and nothing vanishes", (t) => {
   const report = {};
   for (const base of FIXTURES) report[base.id] = runProperty(base.id, base, (item) => model(item));
   report.core_cascade = runProperty("core_cascade", core(), (data) => coreModel(data));
+  // A disk attached directly to an HBA PHY, mapped to a bay.
+  report["wide-x4-sata+direct"] = runProperty("wide-x4-sata+direct", directDisk(), (item) => model(item));
   t.diagnostic(`applied/proposed per fabric (already absent): ${Object.entries(report).map(([id, { applied, proposed, absent }]) => `${id} ${applied}/${proposed}${absent ? ` (${absent})` : ""}`).join(", ")}`);
   // Every subject proposed was deleted, or its evidence was already absent.
   for (const [id, { applied, proposed, absent }] of Object.entries(report)) {

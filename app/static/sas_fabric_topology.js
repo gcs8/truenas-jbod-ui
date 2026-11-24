@@ -555,19 +555,27 @@ function sasIndex(fabric) {
         })).filter((row) => row.phy !== null),
       });
     }
+    // An HBA's PHY table is looked up as an expander's is: a disk attached
+    // directly to an HBA is joined on that HBA's own PHY.
+    for (const record of controllers.values()) {
+      record.rowsByPhy = record.phys.reduce((map, row) => map.set(row.phy, [...(map.get(row.phy) || []), row]), new Map());
+      record.byPhy = new Map([...record.rowsByPhy].filter(([, rows]) => rows.length === 1).map(([phy, rows]) => [phy, rows[0]]));
+      record.handle = "";
+    }
     return { expanders, controllers };
   }
 
 function joinPort(sas, device) {
     const ids = list(device.expander_ids).filter((id) => typeof id === "string");
-    const found = ids.map((id) => sas.expanders.get(id)).filter(Boolean);
+    const found = ids.map((id) => sas.expanders.get(id) || sas.controllers.get(id)).filter(Boolean);
     const parent = text(device.parent);
     const expander = found.find((item) => parent && item.handle === parent) || (found.length === 1 && !parent ? found[0] : null);
     // A source without handles names the expander PHY itself.
     if (expander && Number.isInteger(device.expander_phy)) {
       const row = expander.byPhy.get(device.expander_phy);
-      if (list(expander.rowsByPhy.get(device.expander_phy)).length > 1) return { expanderId: expander.id, phy: null, why: "more than one row of the expander's PHY table has the PHY number this port names" };
-      return row ? { expanderId: expander.id, phy: row, why: "", basis: text(device.phy_basis) } : { expanderId: expander.id, phy: null, why: "the expander's PHY table has no row for the PHY this port names" };
+      if (list(expander.rowsByPhy.get(device.expander_phy)).length > 1) return { expanderId: expander.id, phy: null, why: `more than one row of ${sas.controllers.has(expander.id) ? "the HBA's" : "the expander's"} PHY table has the PHY number this port names` };
+      const table = sas.controllers.has(expander.id) ? "the HBA's PHY table" : "the expander's PHY table";
+      return row ? { expanderId: expander.id, phy: row, why: "", basis: text(device.phy_basis) } : { expanderId: expander.id, phy: null, why: `${table} has no row for the PHY this port names` };
     }
     if (expander && device.expander_phy === null && !text(device.handle)) return { expanderId: expander.id, phy: null, why: "the source does not say which expander PHY this port is on" };
     if (!expander) return { expanderId: ids.length === 1 ? ids[0] : "", phy: null, why: "the payload has no PHY table for the port's expander" };
@@ -652,7 +660,7 @@ function chipPhyNumbers(model, id) {
     const owners = chip ? [...new Set([chip.id, ...list(chip.rows).map((row) => row.id), id])] : [id];
     const key = owners[0];
     if (model.chipPhyCache.has(key)) return model.chipPhyCache.get(key);
-    const numbers = new Set(owners.flatMap((owner) => list(model.sas.expanders.get(owner)?.phys).map((row) => row.phy)));
+    const numbers = new Set(owners.flatMap((owner) => list((model.sas.expanders.get(owner) || model.sas.controllers.get(owner))?.phys).map((row) => row.phy)));
     for (const port of list(model.censusRows)) {
       if (owners.includes(port.owner_id)) for (const phy of list(port.phys)) if (Number.isInteger(phy)) numbers.add(phy);
     }
@@ -674,8 +682,11 @@ const disagreement = (reading) => (reading?.disagree ? `; the ${plural(reading.o
 function faultDigest(bad) {
     const ordered = [...bad].sort((left, right) => left.phy - right.phy);
     const groups = ["critical", "warning"].map((tier) => ordered.filter((reading) => reading.tier === tier)).filter((group) => group.length);
-    const text = groups.map((group) => errorDigest(group.map((reading) => reading.worst))).join("; ");
-    return text ? `${text}${ordered.map(disagreement).find(Boolean) || ""}` : "";
+    // A disagreement is said of the PHY whose observations disagree.
+    const text = groups.map((group) => (group.length <= 3
+      ? group.map((reading) => `PHY ${reading.phy}: ${counterText(reading.worst)}${disagreement(reading)}`).join("; ")
+      : `${errorDigest(group.map((reading) => reading.worst))}${group.some((reading) => reading.disagree) ? `; the observations of PHY ${phyRanges(group.filter((reading) => reading.disagree).map((reading) => reading.phy))} disagree, the worst is shown` : ""}`)).join("; ");
+    return text;
   }
 
 // What a set of PHY readings says: the faults, and what was not read, both.

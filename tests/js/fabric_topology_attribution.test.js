@@ -101,9 +101,11 @@ test("an HBA fault on a number two rows share is said, never lost", () => {
   const note = built.transportNote.measured.join(" ");
   assert.doesNotMatch(note, /in part on 2/, note);
   assert.match(note, /1 number on more than one row/, note);
-  // The disputed number is not also counted as read: read + disputed = all.
+  // The disputed number is not also counted as read, and the census's PHY 1
+  // (its row renumbered to 0) is missing: read + disputed + missing = all.
   const [, readCount, total] = /read on (\d+) of (\d+)/.exec(note).map(Number);
-  assert.equal(readCount + 1, total, note);
+  assert.match(note, /\(1 return none\)/, note);
+  assert.equal(readCount + 2, total, note);
 });
 
 // --- 2: a verdict names the measurement that set it ----------------------------
@@ -202,9 +204,9 @@ test("the transport note's denominator is the expected PHYs, so a missing row is
 
 // --- an unmarked subject is not read, never a pass ---------------------------
 
-test("a disk port on a PHY its own expander row calls an expander link is not judged, and said", () => {
+test("a disk port on a PHY its own expander row calls an expander link has its owner not read, and said", () => {
   // CORE: a bay port joined by handle to a PHY whose row says SMP Target.
-  // No check may judge it as a disk port or as a cable; it is said unjudged.
+  // A bay claims it and its row calls it a link: the owner is not read.
   const data = structuredClone(require("../fixtures/sas_fabric/core_direct_paths.json"));
   const expander = data.fabric.expanders[0];
   const device = data.fabric.traces.find((entry) => entry.id === "bay:0").metrics.mpr_devices.find((entry) => (entry.expander_ids || []).includes(expander.id));
@@ -214,5 +216,23 @@ test("a disk port on a PHY its own expander row calls an expander link is not ju
   assert.equal(built.bays[0].ports.find((port) => port.expanderId === expander.id).phy.phy, 4);
   const found = checksOf(built, "port-errors");
   assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(found));
-  assert.match(textOf(found), /1 disk port PHY not judged from read evidence: Bay 00: PHY 4/);
+  assert.match(textOf(found), /PHY 4 \(owner not read: Bay 00 claims it, but its row or the transport census calls it a link/);
+});
+
+test("a CORE disk attached directly to an HBA whose counters are not collected is not judged, and said", () => {
+  // The port names a PHY of its HBA's own table; this platform does not read
+  // HBA counters, so no check judges it, and the disk-port check says so.
+  const data = structuredClone(require("../fixtures/sas_fabric/core_direct_paths.json"));
+  const controller = data.fabric.controllers.find((entry) => entry.id === "controller:mpr0");
+  controller.phy_rows = [{ phy: "2", device_handle: "0030", device: "SAS Target", speed: "12.0", min: "1.5", max: "12.0" }];
+  const device = data.fabric.traces.find((entry) => entry.id === "bay:0").metrics.mpr_devices[0];
+  Object.assign(device, { expander_ids: ["controller:mpr0"], expander_phy: 2, handle: null, parent: null });
+  const built = T.buildTopologyModel(data.fabric, { inventory: data.snapshot });
+  const port = built.bays[0].ports.find((item) => item.expanderId === "controller:mpr0");
+  assert.equal(port.phy?.phy, 2);
+  const found = checksOf(built, "port-errors");
+  assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(found));
+  assert.match(textOf(found), /1 disk port PHY not judged from read evidence: Bay 00: PHY 2 of mpr0/);
+  // Its other path, through an expander, is not said to carry every path.
+  assert.doesNotMatch(textOf(checksOf(built, "ports")), /every path runs through/);
 });
