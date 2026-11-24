@@ -309,7 +309,8 @@ test("PHYs a census lists without rows are said in one order, whatever the censu
     const data = JSON.parse(text);
     const census = data.fabric.raw.sas_transport_ports;
     const proto = census.find((port) => port.remote_kind === "end_device");
-    const owners = ["expander:chip1", "expander:chip01", "expander:chip1"];
+    // Two keys a numeric collation calls equal, listed in either order.
+    const owners = ["expander:chip1", "expander:chip01"];
     (reverse ? [...owners].reverse() : owners).forEach((owner_id, index) => census.push({ ...proto, id: `sas-port:extra${index}`, owner_id, phys: [91], phy_names: ["phy-unread-91"] }));
     return checksOf(model(data), "port-errors").flatMap((entry) => entry.lines).filter((line) => /PHY 91/.test(line));
   });

@@ -87,6 +87,8 @@ test("a repeated lane member never stands in for a missing one; lane count and m
   hba.raw.phy_rows.find((entry) => entry.phy === 7).invalid_dword_count = 101;
   let built = model(repeated);
   assert.ok(!statuses(built, "cable-errors").includes("pass"), textOf(checksOf(built, "cable-errors")));
+  // Its distinct members, and the repeat, are said.
+  assert.match(textOf(checksOf(built, "cable-errors")), /8 lanes reported, 7 distinct PHYs listed at host2 \(1 repeated\)/);
   let end = cardRow(built, { kind: "link", id: uplink.id }, /^Errors at host/);
   assert.doesNotMatch(end.value, /none on 8 PHYs/);
   const wide = fixture("fanout-2");

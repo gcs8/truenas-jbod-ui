@@ -721,7 +721,8 @@ function wiringChecks(model, fabric) {
         }
         const widest = Math.max(...cables.filter((other) => other.lanes && into(other) === into(link)).map((other) => other.lanes.count));
         if (link.lanes.count < widest) found.push(`x${link.lanes.count} where another cable into the same backplane is x${widest}`);
-        const slow = membership.read ? slowLanes(model, link) : [];
+        // slowLanes judges nothing past unread membership.
+        const slow = slowLanes(model, link);
         if (slow.length) found.push(`${context.plural(slow.length, "lane")} below the maximum of both ends: ${slow.map((lane) => `PHY ${lane.source} ↔ ${lane.target} at ${lane.rate} Gb/s (both ends ${lane.cap})`).join(", ")}`);
         // A lane is judged against both of its ends only where the payload
         // pairs its PHYs; one end's maximum alone says nothing about the lane.
