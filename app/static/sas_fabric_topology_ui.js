@@ -20,8 +20,11 @@ function cableEnds(model, link) {
     // Each end's PHYs as one reading each, across every observation of its
     // chip. The width expected is the cable's lane count; a far end whose
     // PHYs are not read expects none.
-    return [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]].map(([side, id, phys]) => {
+    return [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]].map(([side, id, listed]) => {
       const hba = model.nodeById.get(id)?.kind === "controller";
+      // The members are the distinct PHYs listed: a repeated entry never
+      // stands in for a member that is not listed.
+      const phys = [...new Set(listed)];
       const readings = phys.map((phy) => context.phyReading(model, id, phy));
       return {
         side,
@@ -30,6 +33,7 @@ function cableEnds(model, link) {
         label: `${context.nodeName(model, id)}${side === "far" && link.lanes.targetBasis === "inferred" ? " (far end, inferred)" : ""}`,
         hba,
         phys,
+        listed: listed.length,
         readings,
         rows: readings.map((reading) => reading.worst).filter((row) => row && (!hba || row.counters)),
         wanted: side === "near" || phys.length ? link.lanes.count : 0,
@@ -75,9 +79,13 @@ function transportNote(model) {
     const hbas = model.nodes.filter((entry) => entry.kind === "controller" && model.sas.controllers.has(entry.id));
     const chips = model.nodes.filter((entry) => entry.kind === "expander" && !entry.mergedInto && model.sas.expanders.has(entry.id));
     const cables = model.links.filter((link) => context.LANE_LINKS.has(link.kind) && link.lanes);
-    const phys = [...hbas.map((entry) => model.sas.controllers.get(entry.id).phys), ...chips.map((entry) => model.sas.expanders.get(entry.id).phys)].flat();
-    const counted = phys.filter((row) => row.measured).length;
-    const rated = phys.filter((row) => row.rate !== null && row.max !== null).length;
+    // The same readings as every card and check: each physical PHY once,
+    // over every observation of its chip.
+    const phys = [...hbas.map((entry) => model.sas.controllers.get(entry.id).phys.map((row) => context.phyReading(model, entry.id, row.phy))),
+      ...chips.map((entry) => context.chipPhyNumbers(model, entry.id).map((phy) => context.phyReading(model, entry.id, phy)))].flat();
+    const counted = phys.filter((reading) => reading.read).length;
+    const inPart = phys.filter((reading) => !reading.read && reading.partial).length;
+    const rated = phys.filter((reading) => reading.observations.some((item) => item.row.rate !== null && item.row.max !== null)).length;
     const disks = model.bays.filter((bay) => bay.occupancy === "yes");
     const paths = disks.flatMap((bay) => bay.ports);
     const joined = paths.filter((port) => port.phy).length;
@@ -86,7 +94,7 @@ function transportNote(model) {
     const before = model.shared ? "each head end as a storage system and its disks" : "its bays and what reports them";
     const measured = [
       `${context.plural(hbas.length, "HBA")} (${hbas.map((entry) => [entry.label, entry.facts[0]].filter(Boolean).join(": ")).join("; ")}) and ${context.plural(chips.length, "expander")} (${chips.map((entry) => context.tail(entry.address || entry.rawId)).join(", ")}): before, this view had ${before} and no hardware above them.`,
-      `${rated === phys.length ? context.plural(phys.length, "PHY") : `${rated} of ${context.plural(phys.length, "PHY")}`} with link rate and maximum rate; the four error counters are read on ${counted} of ${phys.length}${counted < phys.length ? ` (${phys.length - counted} return none)` : ""}.`,
+      `${rated === phys.length ? context.plural(phys.length, "PHY") : `${rated} of ${context.plural(phys.length, "PHY")}`} with link rate and maximum rate; the four error counters are read on ${counted} of ${phys.length}${inPart ? `, in part on ${inPart}` : ""}${counted + inPart < phys.length ? ` (${phys.length - counted - inPart} return none)` : ""}.`,
       cables.length ? `${context.plural(cables.length, "cable")} as its parent sees it: ${cables.map((link) => `${context.nodeName(model, link.source)} → ${context.nodeName(model, link.target)} x${link.lanes.count} on PHY ${context.phyRanges(link.lanes.sourcePhys)}`).join("; ")}.` : "",
       paths.length ? `${joined} of ${context.plural(paths.length, "disk path")} on its expander PHY, joined by the disk's block device name${model.shared ? " on each head" : ""}, not by bay number.` : "",
     ].filter(Boolean);
@@ -116,6 +124,29 @@ function unmatchedTargets(model) {
 function targetCount(rows) {
     const kinds = [...new Set(rows.map((row) => row.device.replace(/ Target$/, "")))];
     return context.plural(rows.length, `${kinds.length === 1 ? kinds[0] : "disk"} target`);
+  }
+
+// Which bay a physical PHY belongs to, for every surface: the bays whose
+// ports are placed on it. Known only where exactly one bay claims it and
+// the PHY's number names one row of its expander; otherwise the owner is
+// not read, and every surface says so.
+function phyOwner(model, id, phy) {
+    if (!model.phyOwners) {
+      model.phyOwners = new Map();
+      for (const bay of model.bays) {
+        for (const port of bay.ports) {
+          if (!port.phy || !port.expanderId) continue;
+          const key = `${context.chipOfNode(model, port.expanderId)?.id || port.expanderId}|${port.phy.phy}`;
+          if (!model.phyOwners.has(key)) model.phyOwners.set(key, new Set());
+          model.phyOwners.get(key).add(bay);
+        }
+      }
+    }
+    const reading = context.phyReading(model, id, phy);
+    const bays = [...(model.phyOwners.get(`${context.chipOfNode(model, id)?.id || id}|${phy}`) || [])];
+    const known = bays.length === 1 && !reading.conflict;
+    const why = reading.conflict ? "its number is on more than one row of its expander" : bays.length > 1 ? `${bays.map((bay) => bay.label).join(" and ")} all claim it` : "";
+    return { bays, known, reading, text: known ? bays[0].label : bays.length || reading.conflict ? `owner ${context.NOT_READ}: ${why}` : "" };
   }
 
 function wiringChecks(model, fabric) {
@@ -199,7 +230,7 @@ function wiringChecks(model, fabric) {
           else entry.size += gap.size;
         }
         for (const { nouns, labels, size, unknown } of byNoun.values()) {
-          lines.push(`${unknown ? `${nouns[1]}, how many is not read,` : counted(nouns, size)} not read: ${labels.slice(0, 6).join("; ")}${labels.length > 6 ? `; and ${labels.length - 6} more` : ""}`);
+          lines.push(`${unknown ? `${size ? `at least ${counted(nouns, size)}` : `${nouns[1][0].toUpperCase()}${nouns[1].slice(1)} (how many is unknown)`}` : counted(nouns, size)} not read: ${labels.slice(0, 6).join("; ")}${labels.length > 6 ? `; and ${labels.length - 6} more` : ""}`);
         }
         const fine = cover.count("ok");
         const total = cover.total();
@@ -262,11 +293,17 @@ function wiringChecks(model, fabric) {
       const mapped = new Map();
       for (const bay of model.bays) {
         const states = bay.pathStates.filter((state) => {
-          if (!["mapped", "unmapped"].includes(context.pathTone(state.state, state.basis))) return true;
-          if (bay.occupancy !== "no") {
-            const name = state.controller || "a source not read";
-            mapped.set(name, (mapped.get(name) || 0) + 1);
-          }
+          const tone = context.pathTone(state.state, state.basis);
+          if (!["mapped", "unmapped"].includes(tone)) return true;
+          // Each slot counted as what it is: mapped with a disk, mapped and
+          // empty, mapped with occupancy not read, or unmapped.
+          const name = state.controller || "a source not read";
+          if (!mapped.has(name)) mapped.set(name, { disk: 0, empty: 0, unknown: 0, unmapped: 0 });
+          const counts = mapped.get(name);
+          if (tone === "unmapped") counts.unmapped += 1;
+          else if (bay.occupancy === "yes") counts.disk += 1;
+          else if (bay.occupancy === "no") counts.empty += 1;
+          else counts.unknown += 1;
           return false;
         });
         states.forEach((state, index) => {
@@ -283,7 +320,15 @@ function wiringChecks(model, fabric) {
           cover.gap(["path", "paths"], bay.occupancy === "yes" ? `${bay.label} (holds a disk; no path state is read for it)` : `${bay.label} (whether it holds a disk is not read)`, null);
         }
       }
-      for (const [name, count] of mapped) unread.push(`${name}: ${context.plural(count, "slot")} mapped; a slot mapping says where a disk is, not the state of its path, so the path state is not read`);
+      for (const [name, counts] of mapped) {
+        const parts = [
+          counts.disk ? `${context.plural(counts.disk, "slot")} mapped (holding a disk)` : "",
+          counts.unknown ? `${context.plural(counts.unknown, "slot")} mapped (occupancy ${context.NOT_READ})` : "",
+          counts.empty ? `${context.plural(counts.empty, "empty slot")} mapped` : "",
+          counts.unmapped ? `${context.plural(counts.unmapped, "slot")} unmapped` : "",
+        ].filter(Boolean);
+        unread.push(`${name}: ${parts.join(", ")}; a slot mapping says where a disk is, not the state of its path, so the path state is not read`);
+      }
       if (context.readState(fabric, "paths") === "partial") unread.push("The path read was not reported complete, so a path may be unread rather than absent.");
       let read = 0;
       for (const [owner, items] of byOwner) {
@@ -581,6 +626,12 @@ function wiringChecks(model, fabric) {
         }
         const found = [];
         let blind = false;
+        // Its width is its lane count only where its distinct members agree.
+        const members = new Set(link.lanes.sourcePhys);
+        if (members.size !== link.lanes.sourcePhys.length || members.size !== link.lanes.count) {
+          blind = true;
+          unread.push(`${name}: ${link.lanes.count} lanes reported, ${members.size} distinct PHYs listed at ${context.nodeName(model, link.source)}, so its membership is not read`);
+        }
         const widest = Math.max(...cables.filter((other) => other.lanes && into(other) === into(link)).map((other) => other.lanes.count));
         if (link.lanes.count < widest) found.push(`x${link.lanes.count} where another cable into the same backplane is x${widest}`);
         const slow = slowLanes(model, link);
@@ -640,12 +691,13 @@ function wiringChecks(model, fabric) {
       for (const board of boards) {
         for (const bay of board.enclosure.group.bays) {
           for (const port of bay.ports) {
-            if (!port.phy) continue;
+            if (!port.phy || !port.expanderId) continue;
             const key = phyKey(port.expanderId, port.phy.phy);
-            const held = portAt.get(key);
-            // Two bays on one PHY: which disk is on it is not read.
-            if (held && held.bay !== bay) conflicts.set(key, new Set([...(conflicts.get(key) || [held.bay]), bay]));
-            else portAt.set(key, { port, bay });
+            // One attribution for every surface: a PHY two bays claim, or
+            // whose number is on two rows, has its owner not read.
+            const owner = phyOwner(model, port.expanderId, port.phy.phy);
+            if (owner.known) portAt.set(key, { port, bay });
+            else conflicts.set(key, owner);
           }
         }
       }
@@ -690,7 +742,7 @@ function wiringChecks(model, fabric) {
           const disputed = bay.ports.filter((port) => port.phy && conflicts.has(phyKey(port.expanderId, port.phy.phy)));
           if (disputed.length) {
             open = true;
-            unread.push(`${bay.label}: ${disputed.map((port) => `PHY ${port.phy.phy} of ${chipOf(port.expanderId)?.label || port.expanderId}`).join(", ")} is also claimed by ${[...new Set(disputed.flatMap((port) => [...conflicts.get(phyKey(port.expanderId, port.phy.phy))]))].filter((other) => other !== bay).map((other) => other.label).join(", ")}, so which disk is on it is not read`);
+            unread.push(`${bay.label}: ${disputed.map((port) => `PHY ${port.phy.phy} of ${chipOf(port.expanderId)?.label || port.expanderId} (${conflicts.get(phyKey(port.expanderId, port.phy.phy)).text})`).join(", ")}, so which disk is on it is not read`);
           }
           if (bay.ports.every((port) => port.protocol === "SATA")) {
             // One port, behind one expander: every HBA that reaches that
@@ -727,7 +779,14 @@ function wiringChecks(model, fabric) {
             } else if (missing.length) found.push(`no path via ${missing.map(labelOf).join(", ")}`);
             if (unknown.length) {
               open = true;
-              const shape = `${context.plural(bay.ports.length, "path")}: ${hbas.map((id) => `${bay.ports.filter((port) => port.controllerId === id).length} via ${labelOf(id)}`).join(", ")}`;
+              // What was retained, of how many, and for each path what exactly
+              // is missing: never "no port row" for a path that has one.
+              const via = hbas.map((id) => `${bay.ports.filter((port) => port.controllerId === id).length} via ${labelOf(id)}`).join(", ");
+              const past = Number.isSafeInteger(bay.notReadCounts?.path_states) ? bay.notReadCounts.path_states : null;
+              const held = capped ? past !== null ? `${bay.ports.length} of ${context.plural(bay.ports.length + past, "path")} retained (${via}; ${past} past the producer's limit, not read)` : `${context.plural(bay.ports.length, "path")} retained (${via}; more past the producer's limit, not read)` : `${context.plural(bay.ports.length, "path")} (${via})`;
+              const reasons = [...unknown.reduce((map, port) => map.set(port.why, [...(map.get(port.why) || []), port]), new Map())]
+                .map(([why, ports]) => `for ${ports.length}${ports.some((port) => port.device) ? ` (${ports.map((port) => port.device || "?").slice(0, 4).join(", ")}${ports.length > 4 ? ", …" : ""})` : ""}: ${why}`);
+              const shape = `${held}. Which expander a path uses is not read ${reasons.join("; ")}`;
               if (!unsure.has(shape)) unsure.set(shape, []);
               unsure.get(shape).push(bay.label);
             } else if (!found.length) {
@@ -747,7 +806,7 @@ function wiringChecks(model, fabric) {
         }
         const spareText = board.chips.filter((chip) => context.list(chip.unmatched).length).map((chip) => `${chip.unmatchedText} of ${chip.label}`).join("; ");
         for (const [shape, labels] of unsure) {
-          unread.push(`${board.name}: ${labels.join(", ")}: ${shape.replace(/^(\d+ paths?): (.*)$/, labels.length > 1 ? "$1 each ($2)" : "$1 ($2)")}. Which expander each path uses is not read: the payload has no port rows for ${labels.length > 1 ? "these disks" : "this disk"}.${spareText ? ` Reported, but not matched to a bay: ${spareText}.` : ""}`);
+          unread.push(`${board.name}: ${labels.join(", ")}: ${shape}.${spareText ? ` Reported, but not matched to a bay: ${spareText}.` : ""}`);
         }
         if (unjoined.length) unread.push(`${board.name}: a path via another HBA is not read for ${context.plural(unjoined.length, "disk")} (${model.transport && !model.shared ? "the collector joins one block device per bay" : "a path's HBA is not read"}): ${unjoined.slice(0, 6).join("; ")}${unjoined.length > 6 ? `; and ${unjoined.length - 6} more` : ""}`);
         if (unknownBays.length) unread.push(`${board.name}: ${unknownBays.map((bay) => bay.label).join(", ")}: whether ${unknownBays.length === 1 ? "the bay holds" : "these bays hold"} a disk is not read`);
@@ -820,10 +879,12 @@ function wiringChecks(model, fabric) {
             unread.push(`${name}: which PHYs it uses at ${end.label} is not read`);
             continue;
           }
-          // The expected width is the cable's lane count, not its list.
-          if (end.phys.length < end.wanted) {
+          // The expected members are the cable's lanes, each a distinct PHY.
+          // A list longer, shorter or repeated is membership not read.
+          const repeated = end.listed - end.phys.length;
+          if (repeated > 0 || end.phys.length !== end.wanted) {
             cover.unread(key);
-            unread.push(`${name}: ${end.wanted - end.phys.length} of its ${end.wanted} lanes at ${end.label} are not in its PHY list, so their counters are not read`);
+            unread.push(`${name}: ${end.wanted} lanes reported, ${end.phys.length} distinct PHYs listed at ${end.label}${repeated ? ` (${repeated} repeated)` : ""}, so which PHYs the cable uses there, and their counters, are not read`);
           }
           const summary = context.readingSummary(end.readings, end.phys.length);
           if (summary.warn) {
@@ -891,7 +952,8 @@ function wiringChecks(model, fabric) {
           cover.gap(["disk path", "disk paths"], `${bay.label}: past the producer's path limit`, size);
         }
         if (!bay.ports.length) {
-          cover.gap(["disk", "disks"], bay.occupancy === "yes" ? `${bay.label}: no port is joined to its disk` : `${bay.label}: whether it holds a disk is not read`);
+          if (bay.occupancy === "yes") cover.gap(["disk", "disks"], `${bay.label}: no port is joined to its disk`);
+          else cover.gap(["bay with occupancy", "bays with occupancy"], `${bay.label}: whether it holds a disk is not read`);
           continue;
         }
         for (const port of bay.ports) {
@@ -902,6 +964,27 @@ function wiringChecks(model, fabric) {
           cover.expect(phyKey(port.expanderId, port.phy.phy), `${bay.label}: PHY ${port.phy.phy} of ${chipOf(port.expanderId).label}`, "phy");
         }
       }
+      // The disk ports the transport census lists are expected whether or
+      // not a row for their PHY arrived: a PHY with no row is not read.
+      const listed = new Map();
+      for (const port of context.list(fabric?.raw?.sas_transport_ports)) {
+        if (!context.isRecord(port) || port.remote_kind !== "end_device") continue;
+        const chip = chipOf(port.owner_id);
+        if (!chip || !views.some((view) => view.id === chip.id)) continue;
+        for (const phy of context.list(port.phys).filter((value) => Number.isInteger(value))) {
+          const key = `${chip.id}|${phy}`;
+          if (cablePhys.has(key)) continue;
+          listed.set(key, { chip, phy });
+          cover.expect(key, `${chip.label}: PHY ${phy}, a disk port the transport census lists`, "phy");
+        }
+      }
+      for (const [key, { chip, phy }] of listed) {
+        const reading = readingOf(chip.id, phy);
+        if (!reading.observations.length) {
+          cover.unread(key);
+          unread.push(`${chip.label}: PHY ${phy}, a disk port the transport census lists, has no row in the expander's PHY table, so its counters are not read`);
+        }
+      }
       for (const view of views) {
         const entry = model.nodeById.get(view.id);
         for (const phy of chipPhys(view)) {
@@ -909,15 +992,15 @@ function wiringChecks(model, fabric) {
           const reading = readingOf(view.id, phy);
           if (cablePhys.has(key) || reading.devices.some((device) => device === "SAS Initiator" || device === "SMP Target")) continue;
           const at = portAt.get(key);
-          if (!at && diskRole(reading)) cover.expect(key, `${entry.label}: PHY ${phy}, a disk port no bay is matched to`, "phy");
+          if (!at && (diskRole(reading) || conflicts.has(key))) cover.expect(key, `${entry.label}: PHY ${phy}, ${conflicts.has(key) ? "a disk port whose owner is not read" : "a disk port no bay is matched to"}`, "phy");
           // Anything else: a fault is still a fault; quiet is not judged.
           if (!cover.has(key) && !reading.tier) continue;
           if (reading.disagree) disagree = true;
           if (reading.tier) {
             if (cover.has(key)) cover.bad(key);
-            const claimants = conflicts.get(key);
-            if (claimants) {
-              const text = tiered(`${entry.label}: PHY ${phy}, which ${[...claimants].map((bay) => bay.label).join(" and ")} both claim, so which disk is on it is not read: ${context.counterText(reading.worst)}${context.disagreement(reading)}`, reading.tier);
+            const owner = phyOwner(model, view.id, phy);
+            if (!owner.known && (owner.bays.length || reading.conflict)) {
+              const text = tiered(`${entry.label}: PHY ${phy} (${owner.text}), so which disk is on it is not read: ${context.counterText(reading.worst)}${context.disagreement(reading)}`, reading.tier);
               flags.push(text);
               flag("node", entry.id, text);
             } else if (at) {
@@ -934,7 +1017,7 @@ function wiringChecks(model, fabric) {
             }
           }
           if (cover.has(key)) {
-            if (!reading.read) cover.unread(key);
+            if (!reading.read || conflicts.has(key) || reading.conflict) cover.unread(key);
             cover.ok(key);
           }
         }
@@ -1034,9 +1117,11 @@ function hbaLanes(model, entry) {
     const record = model.sas.controllers.get(entry.id);
     const drawn = new Map();
     for (const link of context.list(model.outgoing.get(entry.id))) {
-      for (const phy of context.list(link.lanes?.sourcePhys)) drawn.set(phy, link);
+      // A PHY two cables list belongs to neither: it is not drawn as one's.
+      for (const phy of context.list(link.lanes?.sourcePhys)) drawn.set(phy, drawn.has(phy) && drawn.get(phy) !== link ? null : link);
     }
     const linked = context.list(record?.phys).filter((row) => row.rate !== null);
+    for (const [phy, link] of [...drawn]) if (!link) drawn.delete(phy);
     return { linked, drawn, inside: linked.filter((row) => drawn.has(row.phy)), outside: linked.filter((row) => !drawn.has(row.phy)) };
   }
 
@@ -1048,9 +1133,8 @@ function phyPeer(model, expanderId, row) {
       if (ids.includes(link.target) && link.lanes.targetPhys.includes(row.phy)) return `cable from ${context.nodeName(model, link.source)}${link.lanes.targetBasis === "inferred" ? ", inferred" : ""}`;
       if (ids.includes(link.source) && link.lanes.sourcePhys.includes(row.phy)) return `cable to ${context.nodeName(model, link.target)}`;
     }
-    for (const port of model.portByKey.values()) {
-      if (ids.includes(port.expanderId) && port.phy?.phy === row.phy) return model.bayById.get(port.bayId)?.label || port.bayId;
-    }
+    const owner = phyOwner(model, expanderId, row.phy);
+    if (owner.text) return owner.text;
     if (!row.device && row.rate !== null) return "linked, device not identified";
     const role = { "SAS Initiator": "HBA uplink in no reported cable", "SMP Target": "another expander, in no reported cable", "SEP Target": "enclosure processor" }[row.device];
     return role ? `${role} (${row.device}${row.handle ? `, handle ${row.handle}` : ""})` : row.device ? `${row.device}${row.handle ? `, handle ${row.handle}` : ""}` : "nothing reported";
@@ -1086,8 +1170,10 @@ function expanderRows(model, entry) {
       const row = model.nodeById.get(id);
       const name = model.nodeById.get(row?.controllerId)?.label || id;
       if (!model.sas.expanders.get(id)) return `${name}: ${context.NOT_READ}`;
-      const differ = readings.filter((reading) => reading.disagree || observed.some((owner) => !reading.observations.some((item) => item.owner === owner)));
-      return `${name}: ${differ.length ? `counters differ or are missing on PHY ${context.phyRanges(differ.map((reading) => reading.phy))}` : "same counters"}`;
+      const differ = readings.filter((reading) => reading.disagree || reading.conflict || observed.some((owner) => !reading.observations.some((item) => item.owner === owner)));
+      const partial = readings.filter((reading) => !differ.includes(reading) && reading.observations.some((item) => item.owner === id && !item.row.measured));
+      return `${name}: ${[differ.length ? `counters differ or are missing on PHY ${context.phyRanges(differ.map((reading) => reading.phy))}` : "",
+        partial.length ? `counters not all read on PHY ${context.phyRanges(partial.map((reading) => reading.phy))}` : ""].filter(Boolean).join("; ") || "same counters"}`;
     });
     // What is attached, as the source counts it; else counted from its PHY
     // rows, a linked PHY with no device named being said as that.
@@ -1146,6 +1232,10 @@ function cableRows(model, link) {
     const slow = slowLanes(model, link);
     if (slow.length) rows.push({ label: "Below both ends' max", value: slow.map((lane) => `PHY ${lane.source} ↔ ${lane.target} at ${lane.rate} Gb/s (both ends ${lane.cap})`).join(", "), warn: true });
     for (const end of cableEnds(model, link)) {
+      const repeated = end.listed - end.phys.length;
+      if (end.wanted && (repeated > 0 || end.phys.length !== end.wanted)) rows.push({ label: "Membership", value: `${context.NOT_READ} at ${end.label}: ${end.wanted} lanes reported, ${end.phys.length} distinct PHYs listed${repeated ? ` (${repeated} repeated)` : ""}`, warn: false });
+    }
+    for (const end of cableEnds(model, link)) {
       const summary = end.hba && !end.rows.length ? { text: `${context.NOT_READ} (HBA PHY counters are not in the payload)`, warn: false } : context.readingSummary(end.readings, end.wanted);
       rows.push({ label: `Errors at ${end.label}`, value: summary.text, warn: summary.warn });
     }
@@ -1183,7 +1273,7 @@ function busRows(model, link) {
       { label: "Path states", value: ports.length ? stateCounts(ports.map((item) => `${item.port.controller} ${item.port.state}`)) : context.NOT_READ, warn: ports.some((item) => ["fault", "missing"].includes(context.pathTone(item.port.state, item.port.basis))) },
       {
         label: "PHY errors",
-        value: [bad.length ? [...new Set(bad.map((item) => `${item.bay.label} PHY ${item.reading.phy}: ${context.counterText(item.reading.worst)}${context.disagreement(item.reading)}`))].join("; ") : measured ? `none on ${context.plural(measured, "disk port PHY")}` : "",
+        value: [bad.length ? [...new Set(bad.map((item) => `${phyOwner(model, chip?.id || item.port?.expanderId, item.reading.phy).text || "no bay matched"} PHY ${item.reading.phy}: ${context.counterText(item.reading.worst)}${context.disagreement(item.reading)}`))].join("; ") : measured ? `none on ${context.plural(measured, "disk port PHY")}` : "",
           unread ? `${context.plural(unread, "disk port PHY")} ${context.NOT_READ}` : ""].filter(Boolean).join("; ") || context.NOT_READ,
         warn: context.worse(...bad.map((item) => item.reading.tier)),
       },
@@ -1196,6 +1286,8 @@ function phyErrorsRow(model, port) {
     const phy = port.phy;
     if (!phy || !port.expanderId) return { label: "PHY errors", value: `${context.NOT_READ}: ${port.why}`, warn: "" };
     const reading = context.phyReading(model, port.expanderId, phy.phy);
+    const owner = phyOwner(model, port.expanderId, phy.phy);
+    if (!owner.known) return { label: "PHY errors", value: `${owner.text}; PHY ${phy.phy}'s counters are said on its expander`, warn: "" };
     const worst = reading.worst || phy;
     const counts = context.PHY_COUNTERS.map(([key, label]) => `${worst.counters?.[key] ?? context.NOT_READ} ${label}`).join(" · ");
     const read = context.PHY_COUNTERS.some(([key]) => worst.counters?.[key] !== null && worst.counters?.[key] !== undefined);
@@ -1231,7 +1323,9 @@ function portRows(model, port) {
 function portBrief(port, model = null) {
     const phy = port.phy;
     const reading = phy && port.expanderId && model ? context.phyReading(model, port.expanderId, phy.phy) : null;
-    const seen = phy ? `PHY ${phy.phy} · ${context.rateText(phy.rate)} · ${reading?.tier ? context.counterText(reading.worst) : !(reading ? reading.read : phy.measured) ? `errors ${context.NOT_READ}` : "no PHY errors"}`
+    const owner = reading ? phyOwner(model, port.expanderId, phy.phy) : null;
+    const seen = phy && owner && !owner.known ? `PHY ${phy.phy} · ${owner.text}`
+      : phy ? `PHY ${phy.phy} · ${context.rateText(phy.rate)} · ${reading?.tier ? context.counterText(reading.worst) : !(reading ? reading.read : phy.measured) ? `errors ${context.NOT_READ}` : "no PHY errors"}`
       : port.fromPath ? `expander ${port.attached} PHY ${port.pathPhy} (from the device path)` : port.attached ? `expander PHY ${context.NOT_READ}` : `transport ${context.NOT_READ}`;
     return [`${port.basis === context.MEMBER_HEALTH ? "member health " : ""}${port.state}`, port.sasAddress && !phy ? `port ${port.sasAddress}` : "", port.attached && !port.fromPath && !phy ? `attached to ${port.attached}` : "", seen, port.hctl ? `SCSI ${port.hctl}` : ""].filter(Boolean).join(" · ");
   }
@@ -2317,6 +2411,7 @@ function attach(container, searchInput, searchStatus, hooks = {}) {
     laneCap: { configurable: true, get: () => laneCap },
     cableEnds: { configurable: true, get: () => cableEnds },
     unpairedPhys: { configurable: true, get: () => unpairedPhys },
+    phyOwner: { configurable: true, get: () => phyOwner },
     slowLanes: { configurable: true, get: () => slowLanes },
     stateCounts: { configurable: true, get: () => stateCounts },
     transportNote: { configurable: true, get: () => transportNote },

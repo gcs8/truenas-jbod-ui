@@ -512,7 +512,11 @@ function sasIndex(fabric) {
         reportedLevel: text(item.reported_level),
         enclosureAddress: text(item.enclosure_sas_address),
         phys,
-        byPhy: new Map(phys.map((row) => [row.phy, row])),
+        // Every row of each PHY number: two rows claiming one PHY are both
+        // kept, never one replaced by the other. Only a number with one row
+        // is a PHY that can be looked up by number.
+        rowsByPhy: phys.reduce((map, row) => map.set(row.phy, [...(map.get(row.phy) || []), row]), new Map()),
+        byPhy: new Map(phys.filter((row, index) => phys.findIndex((other) => other.phy === row.phy) === index && phys.filter((other) => other.phy === row.phy).length === 1).map((row) => [row.phy, row])),
         total: decimal(item.num_phys),
         linked: decimal(item.linked_phys),
         attached: isRecord(item.device_counts) ? Object.entries(item.device_counts).filter(([, count]) => Number.isSafeInteger(count) && count >= 0) : [],
@@ -577,16 +581,23 @@ function rateText(rate) {
   }
 
 function counterText(row) {
-    return PHY_COUNTERS.filter(([key]) => row.counters[key]).map(([key, label]) => `${row.counters[key]} ${label}`).join(", ");
+    const read = PHY_COUNTERS.filter(([key]) => row.counters?.[key]).map(([key, label]) => `${row.counters[key]} ${label}`);
+    // A counter not read is named, never shown as a value.
+    const unread = row.measured || !row.counters ? [] : PHY_COUNTERS.filter(([key]) => row.counters[key] === null).map(([, label]) => label);
+    return [...read, ...(unread.length ? [`${unread.join(", ")} ${NOT_READ}`] : [])].join(", ");
   }
 
 function errorDigest(rows) {
     const bad = rows.filter((row) => row.errors > 0);
     if (bad.length <= 3) return bad.map((row) => `PHY ${row.phy}: ${counterText(row)}`).join("; ");
+    // A range spans only the counts that were read; the PHYs that did not
+    // read a counter are counted and named, never taken as 0.
     const spans = PHY_COUNTERS.map(([key, label]) => {
-      const counts = bad.map((row) => row.counters[key] || 0);
+      const counts = bad.map((row) => row.counters[key]).filter((value) => value !== null && value !== undefined);
+      const lost = bad.length - counts.length;
+      if (!counts.length || !Math.max(...counts)) return "";
       const [low, high] = [Math.min(...counts), Math.max(...counts)];
-      return high ? `${low === high ? low : `${low}–${high}`} ${label}` : "";
+      return `${low === high ? low : `${low}–${high}`} ${label}${lost ? ` (${lost} ${NOT_READ})` : ""}`;
     }).filter(Boolean);
     return `PHY ${phyRanges(bad.map((row) => row.phy).sort((a, b) => a - b))} (${bad.length} PHYs), each: ${spans.join(", ")}`;
   }
@@ -605,17 +616,24 @@ function phyReading(model, id, phy) {
     const owners = chip ? [...new Set([chip.id, ...list(chip.rows).map((row) => row.id), id])] : [id];
     const key = `${owners[0]}|${phy}`;
     if (model.phyReadings.has(key)) return model.phyReadings.get(key);
-    const observations = owners.map((owner) => {
-      const row = model.sas.expanders.get(owner)?.byPhy.get(phy) || model.sas.controllers.get(owner)?.phys.find((item) => item.phy === phy);
-      return row ? { owner, row, tier: phyTier(row) } : null;
-    }).filter(Boolean);
+    // Every row any observation reports for this PHY: a duplicate number is
+    // two observations, never one. An observation of the chip that has no
+    // row for it is a missing observation: not read.
+    const tables = owners.map((owner) => [owner, model.sas.expanders.get(owner)?.rowsByPhy.get(phy) || model.sas.controllers.get(owner)?.phys.filter((item) => item.phy === phy) || null, Boolean(model.sas.expanders.get(owner) || model.sas.controllers.get(owner))]);
+    const observations = tables.flatMap(([owner, rows]) => list(rows).map((row) => ({ owner, row, tier: phyTier(row) })));
+    const missing = tables.filter(([, rows, known]) => known && !list(rows).length).map(([owner]) => owner);
+    const conflict = tables.some(([, rows]) => list(rows).length > 1);
     const worst = observations.reduce((best, item) => (!best || TIER_RANK[item.tier] > TIER_RANK[best.tier] || (TIER_RANK[item.tier] === TIER_RANK[best.tier] && item.row.errors > best.row.errors) ? item : best), null);
     const disagree = PHY_COUNTERS.some(([name]) => new Set(observations.map((item) => item.row.counters?.[name]).filter((value) => value !== null && value !== undefined)).size > 1);
     const devices = [...new Set(observations.map((item) => item.row.device).filter(Boolean))];
     const reading = {
       phy, chipId: owners[0], observations, worst: worst?.row || null, tier: worst?.tier || "",
-      read: observations.length > 0 && observations.every((item) => item.row.measured),
-      disagree, devices, device: worst?.row.device || devices[0] || "",
+      // Read only where every observation has its own one row, measured:
+      // a number on two rows of one expander is not this PHY's identity.
+      read: observations.length > 0 && !missing.length && !conflict && observations.every((item) => item.row.measured),
+      // Some counter was read somewhere, though not all.
+      partial: observations.some((item) => PHY_COUNTERS.some(([name]) => item.row.counters?.[name] !== null && item.row.counters?.[name] !== undefined)),
+      missing, conflict, disagree, devices, device: worst?.row.device || devices[0] || "",
       rate: observations.map((item) => item.row.rate).find((value) => value !== null && value !== undefined) ?? null,
     };
     model.phyReadings.set(key, reading);
@@ -1159,7 +1177,10 @@ function adoptLinuxTransport(payload, options = {}) {
     for (const port of census) {
       const device = port.remote_kind === "expander" ? "SMP Target" : port.remote_kind !== "end_device" ? "Attachment not read" : port.has_block ? "End device (disk outside this view)" : "End device, no block device";
       for (const name of list(port.phy_names)) {
-        role.set(`${port.owner_id}|${name}`, device);
+        // Two census ports naming one PHY: both roles are kept, never the
+        // later one alone.
+        const held = role.get(`${port.owner_id}|${name}`);
+        role.set(`${port.owner_id}|${name}`, held && held !== device ? `${held} / ${device}` : device);
         inPort.add(`${port.owner_id}|${name}`);
       }
     }

@@ -393,10 +393,21 @@ test("W11: a neighbour's attached PHY without a rate still counts for its health
 const CHECK_IDS = (built) => [...new Set(built.checks.map((entry) => entry.id.split(":")[0]))];
 const tierOfCheck = (built, id) => statuses(built, id).filter((status) => status !== "not_read" && status !== "pass");
 
-function subjectDeletions(fabric) {
+function subjectDeletions(fabric, built) {
   const out = [];
   const nodes = new Map(fabric.nodes.map((node) => [node.id, node]));
+  const COUNTERS = ["invalid_dword_count", "running_disparity_error_count", "loss_of_dword_synchronization_count", "phy_reset_problem_count"];
+  // Every table a PHY row of this owner can sit in: the node's own, and the
+  // payload's expander list (CORE projects that one; its numbers are text).
+  const tables = (copy, ownerId) => {
+    const owner = copy.fabric.nodes.find((entry) => entry.id === ownerId);
+    return [owner?.raw?.phys, owner?.raw?.phy_rows, ...(copy.fabric.expanders || []).filter((entry) => entry.id === ownerId).map((entry) => entry.phys)].filter(Array.isArray);
+  };
   const phyRows = (node) => node?.raw?.phys || node?.raw?.phy_rows || [];
+  const hasPhy = (ownerId, phy) => {
+    const lists = [phyRows(nodes.get(ownerId)), ...(fabric.expanders || []).filter((entry) => entry.id === ownerId).map((entry) => entry.phys || [])];
+    return lists.some((rows) => rows.some((entry) => Number(entry.phy) === phy));
+  };
   // Every observation of the chip a node belongs to: nodes with its SAS address.
   const observations = (id) => {
     const node = nodes.get(id);
@@ -404,36 +415,69 @@ function subjectDeletions(fabric) {
     return node?.kind === "expander" && address ? fabric.nodes.filter((entry) => entry.kind === "expander" && entry.raw?.sas_address === address) : node ? [node] : [];
   };
   const cut = (copy, ownerId, phy) => {
-    const row = phyRows(copy.fabric.nodes.find((entry) => entry.id === ownerId)).find((entry) => entry.phy === phy);
-    if (!row) return false;
-    cutCounters(row);
-    row.not_read = [...new Set([...(row.not_read || []), "invalid_dword_count", "running_disparity_error_count", "loss_of_dword_synchronization_count", "phy_reset_problem_count"])];
-    return true;
+    let done = false;
+    for (const rows of tables(copy, ownerId)) {
+      for (const row of rows.filter((entry) => Number(entry.phy) === phy)) {
+        cutCounters(row);
+        row.not_read = [...new Set([...(row.not_read || []), ...COUNTERS])];
+        done = true;
+      }
+    }
+    return done;
+  };
+  const drop = (copy, ownerId, phy) => {
+    let done = false;
+    for (const rows of tables(copy, ownerId)) {
+      for (let index = rows.length - 1; index >= 0; index -= 1) if (Number(rows[index].phy) === phy) { rows.splice(index, 1); done = true; }
+    }
+    return done;
+  };
+  // Another row of the same table is given this PHY's number.
+  const duplicate = (copy, ownerId, phy) => {
+    let done = false;
+    for (const rows of tables(copy, ownerId)) {
+      const other = rows.find((entry) => Number(entry.phy) !== phy);
+      if (!other) continue;
+      other.phy = typeof other.phy === "string" ? String(phy) : phy;
+      done = true;
+    }
+    return done;
+  };
+  // Each of a PHY's evidences, on each observation of its chip.
+  const phySubject = (label, checks, tokens, ownerId, phy) => {
+    for (const observed of observations(ownerId)) {
+      if (!hasPhy(observed.id, phy)) continue;
+      // An HBA's own counters are subjects only where the platform reads them.
+      if (observed.kind === "controller" && !phyRows(observed).some((entry) => entry.counter_state)) continue;
+      const faulty = { owner: observed.id, phy };
+      out.push({ name: `${label} on ${observed.id}`, checks, tokens, faulty, change: (copy) => cut(copy, observed.id, phy) });
+      out.push({ name: `${label} on ${observed.id}, row deleted`, checks, tokens, faulty, change: (copy) => drop(copy, observed.id, phy) });
+      // Only where the table has another row to give this PHY's number.
+      if (phyRows(observed).some((entry) => Number(entry.phy) !== phy)) out.push({ name: `${label} on ${observed.id}, number duplicated`, checks, tokens, faulty, change: (copy) => duplicate(copy, observed.id, phy) });
+    }
   };
   const cables = fabric.links.filter((link) => ["controller-expander", "expander-expander"].includes(link.kind));
   cables.forEach((link, index) => {
     const lanesOf = (copy) => copy.fabric.links.filter((entry) => ["controller-expander", "expander-expander"].includes(entry.kind))[index];
     out.push({ name: `cable ${index} lanes`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => { lanesOf(copy).reported_lanes = null; return true; } });
     out.push({ name: `cable ${index} parent`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => { unresolve(copy.fabric, lanesOf(copy)); return true; } });
-    for (const [end, phys] of [[link.source, link.reported_lanes?.source_phys || []], [link.target, link.reported_lanes?.target_phys || []]]) {
-      for (const phy of phys) {
-        for (const observed of observations(end)) {
-          if (!phyRows(observed).some((entry) => entry.phy === phy)) continue;
-          // An HBA's own counters are subjects only where the platform reads them.
-          if (observed.kind === "controller" && !phyRows(observed).some((entry) => entry.counter_state)) continue;
-          out.push({ name: `cable ${index} PHY ${phy} on ${observed.id}`, checks: ["cable-errors"], tokens: [end, `PHY ${phy}`], faulty: { owner: observed.id, phy }, change: (copy) => cut(copy, observed.id, phy) });
-        }
-      }
+    const near = link.reported_lanes?.source_phys || [];
+    if (near.length > 1) {
+      out.push({ name: `cable ${index} repeated member`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => {
+        const lanes = lanesOf(copy).reported_lanes;
+        lanes.source_phys[lanes.source_phys.length - 1] = lanes.source_phys[0];
+        return true;
+      } });
     }
+    for (const phy of near) phySubject(`cable ${index} near PHY ${phy}`, ["cable-errors"], [link.source, `PHY ${phy}`], link.source, phy);
+    // The far end's members as the renderer derives them (sysfs reports a
+    // port on the parent only), else as reported.
+    const drawn = built.links.find((entry) => entry.source === link.source && entry.target === link.target && entry.lanes);
+    for (const phy of drawn?.lanes.targetPhys || link.reported_lanes?.target_phys || []) phySubject(`cable ${index} far PHY ${phy}`, ["cable-errors"], [link.target, `PHY ${phy}`], link.target, phy);
   });
   for (const port of fabric.raw?.sas_transport_ports || []) {
     if (port.remote_kind !== "end_device" || !port.has_block) continue;
-    for (const phy of port.phys || []) {
-      for (const observed of observations(port.owner_id)) {
-        if (!phyRows(observed).some((entry) => entry.phy === phy)) continue;
-        out.push({ name: `disk PHY ${phy} on ${observed.id}`, checks: ["port-errors"], tokens: [port.owner_id, `PHY ${phy}`], faulty: { owner: observed.id, phy }, change: (copy) => cut(copy, observed.id, phy) });
-      }
-    }
+    for (const phy of port.phys || []) phySubject(`disk PHY ${phy}`, ["port-errors"], [port.owner_id, `PHY ${phy}`], port.owner_id, phy);
   }
   for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
     (trace.metrics?.path_states || []).forEach((state, index) => {
@@ -475,11 +519,17 @@ function runProperty(name, base, build) {
   const before = build(structuredClone(base));
   const ids = CHECK_IDS(before);
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
-  const deletions = subjectDeletions(base.fabric);
+  const deletions = subjectDeletions(base.fabric, before);
   let applied = 0;
+  let absent = 0;
   for (const deletion of deletions) {
     const copy = structuredClone(base);
-    if (deletion.change(copy) === false || JSON.stringify(copy) === JSON.stringify(base)) continue;
+    if (deletion.change(copy) === false) continue;
+    // The evidence was already absent (e.g. counters already not read).
+    if (JSON.stringify(copy) === JSON.stringify(base)) {
+      absent += 1;
+      continue;
+    }
     applied += 1;
     const after = build(copy);
     const why = `${name}: deleting ${deletion.name}`;
@@ -494,25 +544,28 @@ function runProperty(name, base, build) {
     }
     // A known critical fault stays unless the deleted evidence was the
     // fault, or removed the subject that carried it.
-    const removesSubject = /(ports|lanes|parent)$/.test(deletion.name);
+    // Only for the checks whose subjects it removes, never every check.
+    const removesSubject = /(ports|lanes|parent|member)$/.test(deletion.name);
     const owner = deletion.faulty && base.fabric.nodes.find((node) => node.id === deletion.faulty.owner);
     const faultRow = owner && (owner.raw.phys || owner.raw.phy_rows || []).find((entry) => entry.phy === deletion.faulty.phy);
     const wasFault = faultRow && ["invalid_dword_count", "running_disparity_error_count", "loss_of_dword_synchronization_count", "phy_reset_problem_count"].some((key) => faultRow[key] > 0);
     if (!removesSubject && !wasFault) {
       for (const id of critical) assert.ok(tierOfCheck(after, id).includes("critical"), `${why} hid the known critical fault of ${id}: ${textOf(checksOf(after, id))}`);
+    } else {
+      for (const id of [...critical].filter((check) => !deletion.checks.includes(check))) assert.ok(tierOfCheck(after, id).includes("critical"), `${why} hid the unrelated critical fault of ${id}: ${textOf(checksOf(after, id))}`);
     }
   }
-  return { proposed: deletions.length, applied };
+  return { proposed: deletions.length, applied, absent };
 }
 
 test("property: on every synthetic fabric and the CORE fabric, every deleted subject is not read, named or counted, and nothing vanishes", (t) => {
   const report = {};
   for (const base of FIXTURES) report[base.id] = runProperty(base.id, base, (item) => model(item));
   report.core_cascade = runProperty("core_cascade", core(), (data) => coreModel(data));
-  t.diagnostic(`applied/proposed per fabric: ${Object.entries(report).map(([id, { applied, proposed }]) => `${id} ${applied}/${proposed}`).join(", ")}`);
-  // Every fabric with wiring checks has subjects deleted, and every subject proposed was applied.
-  for (const [id, { applied, proposed }] of Object.entries(report)) {
-    assert.equal(applied, proposed, `${id}: ${applied} of ${proposed} deletions applied`);
+  t.diagnostic(`applied/proposed per fabric (already absent): ${Object.entries(report).map(([id, { applied, proposed, absent }]) => `${id} ${applied}/${proposed}${absent ? ` (${absent})` : ""}`).join(", ")}`);
+  // Every subject proposed was deleted, or its evidence was already absent.
+  for (const [id, { applied, proposed, absent }] of Object.entries(report)) {
+    assert.equal(applied + absent, proposed, `${id}: ${applied} applied and ${absent} already absent of ${proposed}`);
   }
   assert.ok(Object.values(report).reduce((sum, item) => sum + item.applied, 0) > 500);
 });
