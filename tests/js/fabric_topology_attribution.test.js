@@ -101,9 +101,24 @@ test("an HBA fault on a number two rows share is said, never lost", () => {
   const note = built.transportNote.measured.join(" ");
   assert.doesNotMatch(note, /in part on 2/, note);
   assert.match(note, /1 number on more than one row/, note);
+  // The disputed number is not also counted as read: read + disputed = all.
+  const [, readCount, total] = /read on (\d+) of (\d+)/.exec(note).map(Number);
+  assert.equal(readCount + 1, total, note);
 });
 
 // --- 2: a verdict names the measurement that set it ----------------------------
+
+test("CRITICAL names the critical PHY first, whatever its number", () => {
+  // The warning on a lower PHY number than the critical one.
+  const item = fixture("wide-x4-sata");
+  node(item.fabric, X4).raw.phys.find((entry) => entry.phy === 16).invalid_dword_count = 1;
+  const seventeen = node(item.fabric, X4).raw.phys.find((entry) => entry.phy === 17);
+  unread(seventeen, "invalid_dword_count");
+  seventeen.loss_of_dword_synchronization_count = 10;
+  const line = critical(model(item), "cable-errors").flatMap((entry) => entry.lines)[0];
+  assert.match(line, /PHY 17: 10 loss of dword sync/, line);
+  assert.ok(line.indexOf("PHY 17") < line.indexOf("PHY 16"), line);
+});
 
 test("CRITICAL names the critical PHY and its count first, beside a partial read", () => {
   for (const mode of ["one critical", "critical and warning"]) {
@@ -133,6 +148,12 @@ test("a repeated far-end member is membership not read for lanes and cables", ()
     const found = checksOf(built, "lanes");
     assert.ok(!statuses(built, "lanes").includes("pass"), `${mode}: ${textOf(found)}`);
     assert.match(textOf(found), /3 distinct PHYs listed at .*far|far.*3 distinct/, mode);
+    // A lane below both ends' maximum is not judged while its far member is not read.
+    const slow = structuredClone(data);
+    const lanesRow = slow.fabric.links.find((entry) => entry.reported_lanes).reported_lanes.lanes[0];
+    for (const key of Object.keys(lanesRow).filter((name) => /rate/.test(name) && typeof lanesRow[name] === "number")) lanesRow[key] = 3;
+    const slowBuilt = T.buildTopologyModel(slow.fabric, slow.options || { inventory: slow.snapshot });
+    assert.ok(!statuses(slowBuilt, "lanes").some((status) => ["critical", "warning"].includes(status) && checksOf(slowBuilt, "lanes").some((entry) => /below the maximum/.test(entry.lines.join(" ")))), textOf(checksOf(slowBuilt, "lanes")));
     // The unlisted uplink PHY is an uplink PHY, never a seventh cable end.
     assert.doesNotMatch(textOf(checksOf(built, "cable-errors")), /\b\d+ of 7 cable ends\b/);
   }
@@ -177,4 +198,21 @@ test("the transport note's denominator is the expected PHYs, so a missing row is
   assert.match(chip.value, /1 PHY not read/, chip.value);
   const bus = cardRows(built, { kind: "link", id: built.nodeById.get(X4).busId }).find((entry) => entry.label === "PHY errors");
   assert.match(bus.value, /1 disk port PHY not read/, bus.value);
+});
+
+// --- an unmarked subject is not read, never a pass ---------------------------
+
+test("a disk port on a PHY its own expander row calls an expander link is not judged, and said", () => {
+  // CORE: a bay port joined by handle to a PHY whose row says SMP Target.
+  // No check may judge it as a disk port or as a cable; it is said unjudged.
+  const data = structuredClone(require("../fixtures/sas_fabric/core_direct_paths.json"));
+  const expander = data.fabric.expanders[0];
+  const device = data.fabric.traces.find((entry) => entry.id === "bay:0").metrics.mpr_devices.find((entry) => (entry.expander_ids || []).includes(expander.id));
+  expander.phys.push({ ...expander.phys[0], phy: "4", device: "SMP Target", dev_handle: device.handle, counter_state: "measured",
+    invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 });
+  const built = T.buildTopologyModel(data.fabric, { inventory: data.snapshot });
+  assert.equal(built.bays[0].ports.find((port) => port.expanderId === expander.id).phy.phy, 4);
+  const found = checksOf(built, "port-errors");
+  assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(found));
+  assert.match(textOf(found), /1 disk port PHY not judged from read evidence: Bay 00: PHY 4/);
 });

@@ -1061,7 +1061,8 @@ function wiringChecks(model, fabric) {
           cover.expect(key, `${chip.label}: PHY ${phy}, a disk port the transport census lists`, "phy");
         }
       }
-      for (const [key, { chip, phy }] of listed) {
+      // In chip and PHY order, whatever order the census listed them in.
+      for (const [key, { chip, phy }] of [...listed].sort(([left], [right]) => context.naturalCompare(left, right))) {
         const reading = readingOf(chip.id, phy);
         if (!reading.observations.length) {
           cover.unread(key);

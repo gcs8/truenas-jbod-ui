@@ -672,7 +672,7 @@ const disagreement = (reading) => (reading?.disagree ? `; the ${plural(reading.o
 // first, then the warnings; a counter not read is named beside them, never
 // in their place.
 function faultDigest(bad) {
-    const ordered = [...bad].sort((left, right) => TIER_RANK[right.tier] - TIER_RANK[left.tier] || left.phy - right.phy);
+    const ordered = [...bad].sort((left, right) => left.phy - right.phy);
     const groups = ["critical", "warning"].map((tier) => ordered.filter((reading) => reading.tier === tier)).filter((group) => group.length);
     const text = groups.map((group) => errorDigest(group.map((reading) => reading.worst))).join("; ");
     return text ? `${text}${ordered.map(disagreement).find(Boolean) || ""}` : "";
