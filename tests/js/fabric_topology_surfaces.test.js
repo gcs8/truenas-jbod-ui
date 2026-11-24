@@ -370,5 +370,7 @@ test("an observation is compared with the chip's own only where that reads one r
   const built = model(item);
   const chip = built.nodes.find((entry) => entry.kind === "expander" && entry.rows?.length > 1);
   const via = cardRows(built, { kind: "node", id: chip.id }).find((entry) => /Also read via/.test(entry.label)).value;
-  assert.match(via, /host7: counters missing or on more than one row on PHY [^;]*28/, via);
+  // host6 is the chip's own observation: host7 is not compared there, never named missing.
+  assert.match(via, /host7: not compared on PHY [^;]*28[^;]* \(host6 did not read it as one full row\)/, via);
+  assert.doesNotMatch(via, /host7: counters missing/, via);
 });

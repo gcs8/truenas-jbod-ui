@@ -443,6 +443,18 @@ function subjectDeletions(fabric, built) {
     }
     return done;
   };
+  const copyRow = (copy, ownerId, phy, where) => {
+    let done = false;
+    for (const rows of tables(copy, ownerId)) {
+      const row = rows.find((entry) => Number(entry.phy) === phy);
+      if (!row) continue;
+      const twin = { ...row, name: `${row.name || "phy"}-copy`, counter_state: "measured", not_read: [], invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 };
+      if (where === "first") rows.unshift(twin);
+      else rows.push(twin);
+      done = true;
+    }
+    return done;
+  };
   // Another row of the same table is given this PHY's number.
   const duplicate = (copy, ownerId, phy) => {
     let done = false;
@@ -465,7 +477,11 @@ function subjectDeletions(fabric, built) {
       out.push({ name: `${label} on ${observed.id}, row deleted`, checks, tokens, faulty, change: (copy) => drop(copy, observed.id, phy) });
       // The opposite of a deletion: a critical count measured on this one
       // observation. Some check must say it, naming this PHY and the count.
-      out.push({ name: `${label} on ${observed.id}, critical injected`, checks, tokens, faulty, injected: { phy }, change: (copy) => inject(copy, observed.id, phy) });
+      out.push({ name: `${label} on ${observed.id}, critical injected`, checks, tokens, faulty, injected: { phy }, countersOnly: true, change: (copy) => inject(copy, observed.id, phy) });
+      // A second row for this PHY, a clean copy, put first or last: the
+      // two orders must say the same.
+      out.push({ name: `${label} on ${observed.id}, row duplicated`, checks, tokens, faulty, orders: true,
+        change: (copy) => copyRow(copy, observed.id, phy, "first"), twin: (copy) => copyRow(copy, observed.id, phy, "last") });
       // Only where the table has another row to give this PHY's number.
       if (phyRows(observed).some((entry) => Number(entry.phy) !== phy)) out.push({ name: `${label} on ${observed.id}, number duplicated`, checks, tokens, faulty, change: (copy) => duplicate(copy, observed.id, phy) });
     }
@@ -492,6 +508,22 @@ function subjectDeletions(fabric, built) {
         if (pairs.length) pairs[pairs.length - 1].target_phy = pairs[0].target_phy;
         return true;
       } });
+    }
+    // A PHY of that end not in the list, appended: a disk port's where the
+    // census names one there. The list is not read; the PHY keeps its role.
+    for (const [side, key, end] of [["near", "source_phys", link.source], ["far", "target_phys", link.target]]) {
+      const listed = link.reported_lanes?.[key] || [];
+      if (!listed.length) continue;
+      const rows = phyRows(nodes.get(end)).concat(...(fabric.expanders || []).filter((entry) => entry.id === end).map((entry) => entry.phys || []));
+      const census = (fabric.raw?.sas_transport_ports || []).filter((port) => port.owner_id === end && port.remote_kind === "end_device").flatMap((port) => port.phys || []);
+      const spare = [...census, ...rows.map((entry) => Number(entry.phy))].find((phy) => Number.isInteger(phy) && !listed.includes(phy));
+      if (spare === undefined) continue;
+      const append = (copy) => { lanesOf(copy).reported_lanes[key].push(spare); return true; };
+      out.push({ name: `cable ${index} ${side} list with PHY ${spare} appended`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: append });
+      // A counter is injected only where the platform reads that owner's counters.
+      const counted = nodes.get(end)?.kind !== "controller" || phyRows(nodes.get(end)).some((entry) => entry.counter_state);
+      if (counted) out.push({ name: `cable ${index} ${side} list with PHY ${spare} appended, critical on it`, checks: ["cable-errors"], tokens: [end, `PHY ${spare}`], faulty: { owner: end, phy: spare }, injected: { phy: spare },
+        change: (copy) => append(copy) && inject(copy, end, spare) });
     }
     for (const phy of near) phySubject(`cable ${index} near PHY ${phy}`, ["cable-errors"], [link.source, `PHY ${phy}`], link.source, phy);
     // The far end's members as the renderer derives them (sysfs reports a
@@ -586,12 +618,22 @@ function surfacesAgree(built, line, why) {
   }
 }
 
+// Every rate any card or inspector displays, by surface.
+function plainRates(built) {
+  const refs = [...built.links.filter((link) => link.bus || link.lanes).map((link) => ({ kind: "link", id: link.id })),
+    ...built.nodes.filter((entry) => ["expander", "controller"].includes(entry.kind)).map((entry) => ({ kind: "node", id: entry.id })),
+    ...built.bays.flatMap((bay) => bay.ports.map((port) => ({ kind: "port", id: port.key })))];
+  return Object.fromEntries(refs.map((ref) => [`${ref.kind}:${ref.id}`, [...(T.detailFor(built, ref)?.html || "").matchAll(/\b(\d+(?:\.\d+)?) Gb\/s/g)].map((match) => match[1])]));
+}
+
 function runProperty(name, base, build) {
   const before = build(structuredClone(base));
   namesItsMeasurement(before, `${name}: baseline`);
   const ids = CHECK_IDS(before);
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
   const deletions = subjectDeletions(base.fabric, before);
+  let rates = null;
+  const baselineRates = () => (rates ??= plainRates(before));
   let applied = 0;
   let absent = 0;
   for (const deletion of deletions) {
@@ -605,6 +647,11 @@ function runProperty(name, base, build) {
     applied += 1;
     const after = build(copy);
     const why = `${name}: deleting ${deletion.name}`;
+    if (deletion.orders) {
+      const other = structuredClone(base);
+      deletion.twin(other);
+      assert.equal(textOf(build(other).checks), textOf(after.checks), `${why}: the two orders of the rows say different things`);
+    }
     namesItsMeasurement(after, why);
     if (deletion.injected && !ids.length) {
       // A fabric that builds no check list: the PHY's own card still says it.
@@ -620,6 +667,8 @@ function runProperty(name, base, build) {
         .filter((line) => /10 loss of dword sync/.test(line) && namesPhy(line, deletion.injected.phy));
       assert.ok(lines.length >= 1, `${why}: the injected critical is not said with PHY ${deletion.injected.phy}: ${textOf(after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0])))}`);
       surfacesAgree(after, lines[0], why);
+      // Locality: a counter on one observation changes no displayed rate.
+      if (deletion.countersOnly) assert.deepEqual(plainRates(after), baselineRates(), `${why}: a counter change moved a displayed rate`);
       continue;
     }
     for (const id of ids) {

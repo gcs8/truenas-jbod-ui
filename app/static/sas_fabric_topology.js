@@ -1253,6 +1253,9 @@ function adoptLinuxTransport(payload, options = {}) {
           controller: options.label || text(row.controller), state: isUnreadState(row) ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),
           mpr_device: protocol ? device : "", sas_address: text(row.sas_address), expander_ids: ownerId ? [rename(ownerId)] : [],
           expander_phy: phys.length === 1 && Number.isInteger(phys[0].phy) ? phys[0].phy : null, phy_basis: "",
+          // Every PHY the port's own read census entry names: a wide port's
+          // PHYs are its bay's, though no single one is its path's.
+          expander_phys: phys.map((phy) => phy.phy).filter((phy) => Number.isInteger(phy)),
         };
       });
       if (mapped.length) ports.set(trace.id, mapped);
@@ -1742,6 +1745,8 @@ function buildTopologyModel(given, options = {}) {
           sg: sasAddressOf(raw.sas_address) ? text(raw.sg_device) : "",
           expanderId: joined.expanderId,
           phy: joined.phy,
+          // All PHYs of the port the payload names on that owner (a wide port).
+          phys: joined.phy ? [joined.phy.phy] : list(device?.expander_phys).filter((phy) => Number.isInteger(phy)),
           phyBasis: joined.basis || "",
           why: joined.why,
         };

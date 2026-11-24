@@ -212,7 +212,7 @@ test("placement past the cap says what was retained and what is missing, never n
   // Every path of a reason is counted under it: seven without a port row.
   assert.match(text, /not read for 7 \(da30/);
   // da3's own row names its expander: only its PHY is not read.
-  assert.match(text, /the expander PHY of 1 disk port is not read/);
+  assert.match(text, /the expander or HBA PHY of 1 disk port is not read/);
 });
 
 test("a bay whose occupancy is not read is said as a bay, never a disk", () => {
@@ -289,7 +289,7 @@ test("an HBA PHY two cables list is drawn as neither cable's", () => {
   item.fabric.links.push({ ...structuredClone(uplink), id: `controller-expander:${uplink.source}->${leaf.id}`, target: leaf.id });
   const built = model(item);
   const html = (T.detailFor(built, { kind: "node", id: uplink.source })?.html || "").replaceAll("&#39;", "'");
-  assert.match(html, /PHY 0<\/span><span class="kv-value">in more than one cable's PHY list/);
+  assert.match(html, /PHY 0<\/span><span class="kv-value">owner not read: the cable to [^<]* and the cable to [^<]* all claim it/);
   const lanes = T.cardFor(built, { kind: "node", id: uplink.source }).rows.find((entry) => entry.label === "In this view");
   assert.match(lanes.value, /in more than one cable's PHY list/);
 });

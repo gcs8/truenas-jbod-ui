@@ -407,6 +407,14 @@
     },
     "reason": "One invented second-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
   },
+  "tests/js/fabric_topology_classification.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:c234a6634c4a9b36b3ba8bcb11022d0cf910451013e40a78191c3320284ea5b6": 6
+      }
+    },
+    "reason": "Patterned synthetic HBA and disk-port addresses from the Topology generality fixture seeds; exact detector count is pinned."
+  },
   "tests/js/fabric_topology_coverage.test.js": {
     "findings": {
       "sas_wwn_identifier": {
