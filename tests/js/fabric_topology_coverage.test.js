@@ -618,12 +618,29 @@ function surfacesAgree(built, line, why) {
   }
 }
 
-// Every rate any card or inspector displays, by surface.
+// Every rate any surface displays, bound to its surface and row: the
+// cards and inspectors of every cable, bus, chip, HBA, disk port, bay and
+// enclosure, and the drawn link labels. A rate is a negotiated or maximum
+// rate in Gb/s, an end's maximum "(max N)", a lane's "(both ends N)" and a
+// PHY's range "(PHY a–b)". Counters are not rates: they may change.
+const RATE_TOKEN = /\b\d+(?:\.\d+)? Gb\/s|\(max \d+(?:\.\d+)?\)|\(both ends \d+(?:\.\d+)?\)|\(PHY \d+(?:\.\d+)?–\d+(?:\.\d+)?\)|PHY max \d+(?:\.\d+)?/g;
 function plainRates(built) {
-  const refs = [...built.links.filter((link) => link.bus || link.lanes).map((link) => ({ kind: "link", id: link.id })),
-    ...built.nodes.filter((entry) => ["expander", "controller"].includes(entry.kind)).map((entry) => ({ kind: "node", id: entry.id })),
+  const refs = [...built.links.map((link) => ({ kind: "link", id: link.id })),
+    ...built.nodes.map((entry) => ({ kind: "node", id: entry.id })),
+    ...built.bays.map((bay) => ({ kind: "bay", id: bay.bayId })),
     ...built.bays.flatMap((bay) => bay.ports.map((port) => ({ kind: "port", id: port.key })))];
-  return Object.fromEntries(refs.map((ref) => [`${ref.kind}:${ref.id}`, [...(T.detailFor(built, ref)?.html || "").matchAll(/\b(\d+(?:\.\d+)?) Gb\/s/g)].map((match) => match[1])]));
+  const out = {};
+  const add = (key, value) => {
+    const tokens = String(value ?? "").match(RATE_TOKEN);
+    if (tokens) out[key] = [...(out[key] || []), ...tokens];
+  };
+  for (const ref of refs) {
+    const html = T.detailFor(built, ref)?.html || "";
+    for (const match of html.matchAll(/<div class="kv-row[^"]*"[^>]*><span[^>]*>([^<]*)<\/span><span[^>]*>([^<]*)<\/span>/g)) add(`${ref.kind}:${ref.id} pin ${match[1]}`, match[2]);
+    for (const row of T.cardFor(built, ref)?.rows || []) add(`${ref.kind}:${ref.id} card ${row.label}`, row.value);
+  }
+  for (const link of built.links) add(`link:${link.id} drawn`, (link.labelLines || []).join(" | "));
+  return out;
 }
 
 function runProperty(name, base, build) {
@@ -633,6 +650,7 @@ function runProperty(name, base, build) {
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
   const deletions = subjectDeletions(base.fabric, before);
   let rates = null;
+  let compared = 0;
   const baselineRates = () => (rates ??= plainRates(before));
   let applied = 0;
   let absent = 0;
@@ -653,6 +671,12 @@ function runProperty(name, base, build) {
       assert.equal(textOf(build(other).checks), textOf(after.checks), `${why}: the two orders of the rows say different things`);
     }
     namesItsMeasurement(after, why);
+    // Locality, on every counters-only injection, whatever the fabric: a
+    // counter on one observation changes no rate on any surface.
+    if (deletion.countersOnly) {
+      assert.deepEqual(plainRates(after), baselineRates(), `${why}: a counter change moved a displayed rate`);
+      compared += 1;
+    }
     if (deletion.injected && !ids.length) {
       // A fabric that builds no check list: the PHY's own card still says it.
       const owner = deletion.faulty.owner;
@@ -668,7 +692,6 @@ function runProperty(name, base, build) {
       assert.ok(lines.length >= 1, `${why}: the injected critical is not said with PHY ${deletion.injected.phy}: ${textOf(after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0])))}`);
       surfacesAgree(after, lines[0], why);
       // Locality: a counter on one observation changes no displayed rate.
-      if (deletion.countersOnly) assert.deepEqual(plainRates(after), baselineRates(), `${why}: a counter change moved a displayed rate`);
       continue;
     }
     for (const id of ids) {
@@ -693,7 +716,7 @@ function runProperty(name, base, build) {
       for (const id of [...critical].filter((check) => !deletion.checks.includes(check))) assert.ok(tierOfCheck(after, id).includes("critical"), `${why} hid the unrelated critical fault of ${id}: ${textOf(checksOf(after, id))}`);
     }
   }
-  return { proposed: deletions.length, applied, absent };
+  return { proposed: deletions.length, applied, absent, compared, injected: deletions.filter((item) => item.countersOnly).length };
 }
 
 function directDisk() {
@@ -718,6 +741,10 @@ test("property: on every synthetic fabric and the CORE fabric, every deleted sub
   // A disk attached directly to an HBA PHY, mapped to a bay.
   report["wide-x4-sata+direct"] = runProperty("wide-x4-sata+direct", directDisk(), (item) => model(item));
   t.diagnostic(`applied/proposed per fabric (already absent): ${Object.entries(report).map(([id, { applied, proposed, absent }]) => `${id} ${applied}/${proposed}${absent ? ` (${absent})` : ""}`).join(", ")}`);
+  // Locality is compared on every counters-only injection, no-check-list fabrics included.
+  const sums = Object.values(report).reduce((total, entry) => [total[0] + entry.compared, total[1] + entry.injected], [0, 0]);
+  t.diagnostic(`locality compared on ${sums[0]} of ${sums[1]} counters-only injections`);
+  assert.equal(sums[0], sums[1]);
   // Every subject proposed was deleted, or its evidence was already absent.
   for (const [id, { applied, proposed, absent }] of Object.entries(report)) {
     assert.equal(applied + absent, proposed, `${id}: ${applied} applied and ${absent} already absent of ${proposed}`);

@@ -291,5 +291,6 @@ test("an HBA PHY two cables list is drawn as neither cable's", () => {
   const html = (T.detailFor(built, { kind: "node", id: uplink.source })?.html || "").replaceAll("&#39;", "'");
   assert.match(html, /PHY 0<\/span><span class="kv-value">owner not read: the cable to [^<]* and the cable to [^<]* all claim it/);
   const lanes = T.cardFor(built, { kind: "node", id: uplink.source }).rows.find((entry) => entry.label === "In this view");
-  assert.match(lanes.value, /in more than one cable's PHY list/);
+  // Each contested PHY with the attribution's own reason: both cables named.
+  assert.match(lanes.value, /PHY 0–7: owner not read: the cable to [^;]* and the cable to [^;]* all claim it/);
 });

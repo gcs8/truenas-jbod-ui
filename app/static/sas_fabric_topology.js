@@ -565,6 +565,46 @@ function sasIndex(fabric) {
     return { expanders, controllers };
   }
 
+// Every attached-device type a source prints, with what it says is on the
+// PHY: a disk (an end device), a link (an expander or an initiator), the
+// enclosure processor, nothing, or a type whose role the source did not
+// read. One table for the builder and the checks: every type mprutil prints
+// and every expander type the CORE builder reads is in it (a test holds the
+// Python sets to it). A type not in it has its role not read.
+const DEVICE_ROLES = new Map([
+  ["SAS Target", "disk"], ["SATA Target", "disk"], ["STP Target", "disk"], ["ATAPI Target", "disk"],
+  ["End device (disk)", "disk"], ["End device, no block device", "disk"],
+  ["SMP Target", "link"], ["Edge Expander", "link"], ["Fanout Expander", "link"], ["Expander", "link"],
+  ["SAS Initiator", "link"], ["SATA Initiator", "link"], ["Cable far end (inferred)", "link"],
+  ["SEP Target", "sep"],
+  ["No Device", "none"],
+  ["Unknown Device", "unread"], ["Attachment not read", "unread"],
+]);
+
+function deviceRole(device) {
+    const value = text(device);
+    return value ? DEVICE_ROLES.get(value) || "unknown" : "none";
+  }
+
+// The transport census as the checks read it: each record's PHYs are the
+// numbers it lists and the names it lists that resolve to exactly one row of
+// its owner's table, so a record naming its PHY only by name still names it.
+function censusOf(fabric) {
+    const byName = new Map();
+    for (const item of list(fabric?.nodes)) {
+      if (!isRecord(item) || typeof item.id !== "string" || !isRecord(item.raw)) continue;
+      for (const row of [...list(item.raw.phys), ...list(item.raw.phy_rows)].filter(isRecord)) {
+        if (typeof row.name !== "string") continue;
+        const key = `${item.id}|${row.name}`;
+        byName.set(key, [...(byName.get(key) || []), decimal(row.phy)]);
+      }
+    }
+    return list(fabric?.raw?.sas_transport_ports).filter(isRecord).map((port) => {
+      const named = list(port.phy_names).map((name) => byName.get(`${port.owner_id}|${name}`)).filter((found) => found?.length === 1 && Number.isInteger(found[0])).map((found) => found[0]);
+      return { ...port, phys: [...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy)), ...named])] };
+    });
+  }
+
 // Two roles for one PHY, said the same whichever record came first.
 function bothRoles(held, device) {
     return [...new Set([...held.split(" / "), device])].sort().join(" / ");
@@ -1223,7 +1263,7 @@ function adoptLinuxTransport(payload, options = {}) {
     for (const port of census) {
       // A record that was not read names no role, as it names no destination.
       if (port.state !== "read") continue;
-      const device = port.remote_kind === "expander" ? "SMP Target" : port.remote_kind !== "end_device" ? "Attachment not read" : port.has_block ? "End device (disk outside this view)" : "End device, no block device";
+      const device = port.remote_kind === "expander" ? "SMP Target" : port.remote_kind !== "end_device" ? "Attachment not read" : port.has_block ? "End device (disk)" : "End device, no block device";
       for (const name of list(port.phy_names)) {
         // Two census ports naming one PHY: both roles are kept, never the
         // later one alone.
@@ -2182,7 +2222,7 @@ function buildTopologyModel(given, options = {}) {
       otherEnclosures: inventory.size ? list(options.inventory?.enclosures).filter((item) => isRecord(item) && item.id !== fabric.selected_enclosure_id).map((item) => text(item.label) || text(item.id)).filter(Boolean) : [],
       portByKey: new Map(bays.flatMap((bay) => bay.ports.map((port) => [port.key, port]))),
       // The transport census as the payload lists it: which PHYs it expects.
-      censusRows: list(fabric?.raw?.sas_transport_ports).filter(isRecord),
+      censusRows: censusOf(fabric),
       checks: [],
       flags: new Map(),
       contract: mode,
@@ -2622,6 +2662,7 @@ function modelParts(fabric, core) {
     errorDigest: { configurable: true, get: () => errorDigest },
     errorSummary: { configurable: true, get: () => errorSummary },
     phyReading: { configurable: true, get: () => phyReading },
+    deviceRole: { configurable: true, get: () => deviceRole },
     chipPhyNumbers: { configurable: true, get: () => chipPhyNumbers },
     readingSummary: { configurable: true, get: () => readingSummary },
     faultDigest: { configurable: true, get: () => faultDigest },
@@ -2667,6 +2708,7 @@ function modelParts(fabric, core) {
     NOT_COLLECTED,
     BAY_DETAIL_LIMIT,
     buildTopologyModel,
+    deviceRole,
     tracePath: context.tracePath,
     searchTopology: context.searchTopology,
     renderTopology: context.renderTopology,
