@@ -566,7 +566,8 @@ const namesPhy = (line, phy) => [...line.matchAll(/PHY (\d+)(?:–(\d+))?/g)].so
 // injected fault: only the owner the check names shows it as critical, and
 // no surface does where the check says the owner is not read. A chip's own
 // inspector is the chip's, and always may.
-const unescapeHtml = (value) => value.replaceAll("&#39;", "'").replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"");
+// Entities are decoded with "&amp;" last, so no text is decoded twice.
+const unescapeHtml = (value) => value.replaceAll("&#39;", "'").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"").replaceAll("&amp;", "&");
 const warnRows = (built, ref) => [...(T.detailFor(built, ref)?.html || "").matchAll(/<div class="kv-row topo-warn"><span[^>]*>([^<]*)<\/span><span[^>]*>([^<]*)<\/span>/g)]
   .map((match) => unescapeHtml(match[2])).filter((value) => /10 loss of dword sync/.test(value));
 function surfacesAgree(built, line, why) {

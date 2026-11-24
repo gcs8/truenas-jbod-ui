@@ -26,7 +26,8 @@ const textOf = (value) => JSON.stringify(value);
 const node = (fabric, id) => fabric.nodes.find((entry) => entry.id === id);
 const phyRows = (fabric, id) => node(fabric, id).raw.phys || node(fabric, id).raw.phy_rows;
 const cardRows = (built, ref) => T.cardFor(built, ref)?.rows || [];
-const unescape = (value) => value.replaceAll("&#39;", "'").replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"");
+// Entities are decoded with "&amp;" last, so no text is decoded twice.
+const unescape = (value) => value.replaceAll("&#39;", "'").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"").replaceAll("&amp;", "&");
 // The rows of an inspector as rendered: [warn class, label, value].
 const kv = (built, ref) => [...(T.detailFor(built, ref)?.html || "").matchAll(/<div class="kv-row([^"]*)"[^>]*><span[^>]*>([^<]*)<\/span><span[^>]*>([^<]*)<\/span>/g)]
   .map((match) => [match[1].trim(), unescape(match[2]), unescape(match[3])]);
