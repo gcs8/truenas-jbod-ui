@@ -144,8 +144,11 @@ function phyOwner(model, id, phy) {
     }
     const reading = context.phyReading(model, id, phy);
     const bays = [...(model.phyOwners.get(`${context.chipOfNode(model, id)?.id || id}|${phy}`) || [])];
-    const known = bays.length === 1 && !reading.conflict;
-    const why = reading.conflict ? "its number is on more than one row of its expander" : bays.length > 1 ? `${bays.map((bay) => bay.label).join(" and ")} all claim it` : "";
+    // A PHY the census also lists as a link to an HBA or expander is not
+    // known to be a disk's.
+    const link = reading.devices.some((device) => / \/ /.test(device) && /SMP Target|SAS Initiator/.test(device));
+    const known = bays.length === 1 && !reading.conflict && !link;
+    const why = reading.conflict ? "its number is on more than one row of its expander" : bays.length > 1 ? `${bays.map((bay) => bay.label).join(" and ")} all claim it` : link ? "the transport census also lists it as a link to an HBA or expander" : "";
     return { bays, known, reading, text: known ? bays[0].label : bays.length || reading.conflict ? `owner ${context.NOT_READ}: ${why}` : "" };
   }
 
@@ -1072,7 +1075,7 @@ function headRows(model, entry) {
 function hbaRows(model, entry) {
     const record = model.sas.controllers.get(entry.id);
     if (!record) return [{ label: "HBA detail", value: context.NOT_READ }];
-    const { linked, drawn, inside, outside } = hbaLanes(model, entry);
+    const { linked, drawn, contested, inside, outside } = hbaLanes(model, entry);
     const rates = (rows) => [...new Set(rows.map((row) => row.rate))].sort((a, b) => b - a).map((rate) => `${rows.filter((row) => row.rate === rate).length} at ${rate} Gb/s`).join(", ");
     // A lane of a cable drawn here is judged against both of its ends.
     const slow = inside.filter((row) => slowLanes(model, drawn.get(row.phy)).some((lane) => lane.source === row.phy));
@@ -1091,7 +1094,8 @@ function hbaRows(model, entry) {
     if (linked.length) {
       rows.push({
         label: "In this view",
-        value: inside.length ? `${context.plural(inside.length, "lane")} on PHY ${context.phyRanges(inside.map((row) => row.phy))}: ${rates(inside)}${slow.length ? `; PHY ${context.phyRanges(slow.map((row) => row.phy))} below the maximum of both ends` : ""}` : "no lane of a cable drawn here",
+        value: [inside.length ? `${context.plural(inside.length, "lane")} on PHY ${context.phyRanges(inside.map((row) => row.phy))}: ${rates(inside)}${slow.length ? `; PHY ${context.phyRanges(slow.map((row) => row.phy))} below the maximum of both ends` : ""}` : contested.size ? "" : "no lane of a cable drawn here",
+          contested.size ? `PHY ${context.phyRanges([...contested])} in more than one cable's PHY list: which cable each is in is ${context.NOT_READ}` : ""].filter(Boolean).join("; "),
         warn: slow.length > 0,
       });
     }
@@ -1121,8 +1125,9 @@ function hbaLanes(model, entry) {
       for (const phy of context.list(link.lanes?.sourcePhys)) drawn.set(phy, drawn.has(phy) && drawn.get(phy) !== link ? null : link);
     }
     const linked = context.list(record?.phys).filter((row) => row.rate !== null);
-    for (const [phy, link] of [...drawn]) if (!link) drawn.delete(phy);
-    return { linked, drawn, inside: linked.filter((row) => drawn.has(row.phy)), outside: linked.filter((row) => !drawn.has(row.phy)) };
+    const contested = new Set([...drawn].filter(([, link]) => !link).map(([phy]) => phy));
+    for (const phy of contested) drawn.delete(phy);
+    return { linked, drawn, contested, inside: linked.filter((row) => drawn.has(row.phy)), outside: linked.filter((row) => !drawn.has(row.phy) && !contested.has(row.phy)) };
   }
 
 function phyPeer(model, expanderId, row) {
@@ -1490,9 +1495,9 @@ function detailFor(model, ref) {
         }
       } else if (entry.kind === "controller" && model.sas.controllers.has(entry.id)) {
         title = "HBA SAS detail";
-        const { drawn } = hbaLanes(model, entry);
+        const { drawn, contested } = hbaLanes(model, entry);
         for (const row of model.sas.controllers.get(entry.id).phys) {
-          const where = drawn.has(row.phy) ? `to ${context.nodeName(model, drawn.get(row.phy).target)}` : "outside this view";
+          const where = contested.has(row.phy) ? `in more than one cable's PHY list: which cable is ${context.NOT_READ}` : drawn.has(row.phy) ? `to ${context.nodeName(model, drawn.get(row.phy).target)}` : "outside this view";
           rows.push(kvRow(`PHY ${row.phy}`, row.rate === null ? `${row.device || "no device"}${row.disabled ? " · disabled" : ""}`
             : `${where}${row.handle ? ` · handle ${row.handle}` : ""} · ${row.rate} Gb/s${row.min !== null && row.max !== null ? ` (PHY ${row.min}–${row.max})` : ""}`,
           drawn.has(row.phy) && slowLanes(model, drawn.get(row.phy)).some((lane) => lane.source === row.phy)));

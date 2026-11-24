@@ -99,6 +99,16 @@ test("a repeated lane member never stands in for a missing one; lane count and m
   assert.ok(T.cardFor(built, { kind: "link", id: link.id }).rows.some((entry) => /not read/.test(entry.value) && /lane/i.test(entry.value)), textOf(T.cardFor(built, { kind: "link", id: link.id }).rows));
 });
 
+test("a disk target its expander reports, matched to no bay and in no census, is a disk port subject", () => {
+  // CORE has no transport census: the expander's own PHY table names the
+  // disk target. Its counters not read make the disk-port check not read.
+  const data = structuredClone(DIRECT);
+  const expander = data.fabric.expanders[0];
+  expander.phys.push({ ...expander.phys[0], phy: "4", device: "SAS Target", dev_handle: "0030", counter_state: "not_read" });
+  const found = checksOf(T.buildTopologyModel(data.fabric, { inventory: data.snapshot }), "port-errors");
+  assert.match(textOf(found), /\b1 of 1 disk port PHY not read\b/, textOf(found));
+});
+
 // --- 3: no synthesized value -------------------------------------------------
 
 test("a range uses only counters that were read, and names the ones that were not", () => {
@@ -126,6 +136,24 @@ test("the transport note counts every observation, as the chip does", () => {
   assert.doesNotMatch(line, /read on (\d+) of \1\b/, line);
 });
 
+test("a fault line names the counters its PHY did not read", () => {
+  const item = fixture("dual-domain-linux");
+  const seven = row(item.fabric, HOST7, "phy-7:0:0");
+  seven.loss_of_dword_synchronization_count = 10;
+  unread(seven, "invalid_dword_count");
+  const critical = checksOf(model(item), "port-errors").filter((entry) => entry.status === "critical");
+  assert.match(textOf(critical), /10 loss of dword sync, invalid dword not read/);
+});
+
+test("a disk port the census lists with no row in its expander's table is said so", () => {
+  const item = fixture("fanout-2");
+  const disk = item.fabric.raw.sas_transport_ports.find((port) => port.remote_kind === "end_device" && port.has_block && port.owner_id.endsWith("expander-2:1"));
+  const leaf = node(item.fabric, disk.owner_id);
+  leaf.raw.phys = leaf.raw.phys.filter((entry) => entry.phy !== disk.phys[0]);
+  const found = checksOf(model(item), "port-errors");
+  assert.match(textOf(found), new RegExp(`PHY ${disk.phys[0]}, a disk port the transport census lists, has no row`));
+});
+
 // --- 4: one attribution ------------------------------------------------------
 
 test("a PHY two bays claim has its owner not read on every surface", () => {
@@ -144,7 +172,11 @@ test("a PHY two bays claim has its owner not read on every surface", () => {
   const busErrors = cardRow(built, { kind: "link", id: chip.busId }, /^PHY errors$/).value;
   assert.doesNotMatch(busErrors, /^Bay 0[01] PHY/, busErrors);
   assert.match(busErrors, /owner not read/);
-  for (const bay of built.bays.slice(0, 2)) assert.doesNotMatch(bay.extra.join(" "), /101 invalid dword/, `${bay.label}: ${bay.extra.join(" | ")}`);
+  for (const bay of built.bays.slice(0, 2)) {
+    assert.doesNotMatch(bay.extra.join(" "), /101 invalid dword/, `${bay.label}: ${bay.extra.join(" | ")}`);
+    const portErrors = cardRow(built, { kind: "port", id: bay.ports[0].key }, /^PHY errors$/);
+    assert.match(portErrors.value, /owner not read/, `${bay.label}: ${portErrors.value}`);
+  }
 });
 
 // --- 5: counts match their labels --------------------------------------------
@@ -180,4 +212,74 @@ test("a bay whose occupancy is not read is said as a bay, never a disk", () => {
   const text = textOf(checksOf(model(item), "port-errors"));
   assert.match(text, /1 bay with occupancy not read/);
   assert.doesNotMatch(text, /1 disk not read/);
+});
+
+// --- 1: every keyed map keeps every claimant ---------------------------------
+
+test("a port naming a PHY number two rows share is matched to neither row", () => {
+  const data = structuredClone(DIRECT);
+  const expander = data.fabric.expanders[0];
+  const device = data.fabric.traces.find((entry) => entry.id === "bay:0").metrics.mpr_devices.find((entry) => (entry.expander_ids || []).includes(expander.id));
+  Object.assign(device, { expander_phy: 4, handle: null });
+  expander.phys.push({ ...expander.phys[0], phy: "4", device: "SAS Target", dev_handle: null, counter_state: "measured", invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 },
+    { ...expander.phys[0], phy: "4", device: "SAS Target", dev_handle: null, counter_state: "measured", invalid_dword_count: 101, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 });
+  const port = T.buildTopologyModel(data.fabric, { inventory: data.snapshot }).bays[0].ports.find((entry) => entry.expanderId === expander.id);
+  assert.equal(port.phy, null);
+  assert.match(port.why, /more than one row/);
+});
+
+test("a PHY two census ports claim keeps both roles, whatever their order", () => {
+  for (const order of ["disk first", "expander first"]) {
+    // A disk of Leaf 1, in no bay of this view, also listed as an expander link.
+    const item = fixture("fanout-2");
+    const census = item.fabric.raw.sas_transport_ports;
+    const disk = census.find((port) => port.remote_kind === "end_device" && port.has_block && port.owner_id.endsWith("expander-2:1"));
+    const uplink = { ...disk, id: `${disk.id}-uplink`, remote_kind: "expander", remote_id: null, has_block: null, bay_identifier: null };
+    if (order === "disk first") census.push(uplink);
+    else census.splice(census.indexOf(disk), 0, uplink);
+    node(item.fabric, disk.owner_id).raw.phys.find((entry) => entry.phy === disk.phys[0]).invalid_dword_count = 101;
+    const built = model(item);
+    const found = checksOf(built, "port-errors");
+    assert.ok(statuses(built, "port-errors").includes("critical"), `${order}: ${textOf(found)}`);
+    const critical = textOf(found.filter((entry) => entry.status === "critical"));
+    assert.match(critical, /End device/, order);
+    assert.match(critical, /SMP Target/, order);
+  }
+});
+
+test("a bay's PHY the census also lists as an expander link has its owner not read", () => {
+  const item = fixture("fanout-2");
+  const port = model(item).bays[0].ports[0];
+  const census = item.fabric.raw.sas_transport_ports;
+  const disk = census.find((entry) => entry.owner_id === port.expanderId && (entry.phys || []).includes(port.phy.phy));
+  census.push({ ...disk, id: `${disk.id}-uplink`, remote_kind: "expander", remote_id: null, has_block: null, bay_identifier: null });
+  const built = model(item);
+  const portErrors = cardRow(built, { kind: "port", id: built.bays[0].ports[0].key }, /^PHY errors$/);
+  assert.match(portErrors.value, /owner not read: the transport census also lists it as a link/);
+  assert.ok(!statuses(built, "ports").includes("pass"), textOf(checksOf(built, "ports")));
+});
+
+test("a cable PHY number two rows share gives its lane no maximum", () => {
+  const data = structuredClone(H.producerCases().core_cascade);
+  const options = data.options || { inventory: data.snapshot };
+  const link = T.buildTopologyModel(data.fabric, options).links.find((entry) => entry.lanes?.rows.length);
+  const lane = link.lanes.rows[0];
+  const expander = data.fabric.expanders.find((entry) => entry.id === link.target);
+  const original = expander.phys.find((entry) => Number(entry.phy) === lane.target);
+  expander.phys.push({ ...original, max: "6.0" });
+  const found = checksOf(T.buildTopologyModel(data.fabric, options), "lanes");
+  assert.ok(!found.some((entry) => entry.status === "pass"), textOf(found));
+  assert.match(textOf(found), /maximum not read for 1 lane/);
+});
+
+test("an HBA PHY two cables list is drawn as neither cable's", () => {
+  const item = fixture("fanout-2");
+  const uplink = item.fabric.links.find((link) => link.kind === "controller-expander");
+  const leaf = item.fabric.nodes.filter((entry) => entry.kind === "expander")[1];
+  item.fabric.links.push({ ...structuredClone(uplink), id: `controller-expander:${uplink.source}->${leaf.id}`, target: leaf.id });
+  const built = model(item);
+  const html = (T.detailFor(built, { kind: "node", id: uplink.source })?.html || "").replaceAll("&#39;", "'");
+  assert.match(html, /PHY 0<\/span><span class="kv-value">in more than one cable's PHY list/);
+  const lanes = T.cardFor(built, { kind: "node", id: uplink.source }).rows.find((entry) => entry.label === "In this view");
+  assert.match(lanes.value, /in more than one cable's PHY list/);
 });

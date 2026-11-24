@@ -566,6 +566,7 @@ function joinPort(sas, device) {
     // A source without handles names the expander PHY itself.
     if (expander && Number.isInteger(device.expander_phy)) {
       const row = expander.byPhy.get(device.expander_phy);
+      if (list(expander.rowsByPhy.get(device.expander_phy)).length > 1) return { expanderId: expander.id, phy: null, why: "more than one row of the expander's PHY table has the PHY number this port names" };
       return row ? { expanderId: expander.id, phy: row, why: "", basis: text(device.phy_basis) } : { expanderId: expander.id, phy: null, why: "the expander's PHY table has no row for the PHY this port names" };
     }
     if (expander && device.expander_phy === null && !text(device.handle)) return { expanderId: expander.id, phy: null, why: "the source does not say which expander PHY this port is on" };
@@ -1202,7 +1203,12 @@ function adoptLinuxTransport(payload, options = {}) {
         const device = protocol ? `${protocol} Target` : "End device (disk)";
         const phys = found.state === "read" ? list(found.phys) : [];
         if (ownerId) owners.add(rename(ownerId));
-        for (const phy of phys) role.set(`${ownerId}|${phy.name}`, device);
+        // A bay's own port names its disk more exactly than the census does;
+        // a census role that is not a disk's is kept beside it.
+        for (const phy of phys) {
+          const held = role.get(`${ownerId}|${phy.name}`);
+          role.set(`${ownerId}|${phy.name}`, held && held !== device && /SMP Target|SAS Initiator|Attachment not read| \/ /.test(held) ? `${held} / ${device}` : device);
+        }
         return {
           controller: options.label || text(row.controller), state: isUnreadState(row) ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),
           mpr_device: protocol ? device : "", sas_address: text(row.sas_address), expander_ids: ownerId ? [rename(ownerId)] : [],
