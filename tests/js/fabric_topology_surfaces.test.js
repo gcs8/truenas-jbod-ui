@@ -136,6 +136,7 @@ test("an HBA disk PHY the census lists without its row is not read and stays in 
   assert.equal(total(built.transportNote), total(before.transportNote));
   assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(checksOf(built, "port-errors")));
   assert.match(textOf(cardRows(built, { kind: "node", id: HOST1 })), /1 PHY not read/);
+  assert.match(textOf(checksOf(built, "port-errors")), /host1: PHY 12, a disk port the transport census lists, has no row in the HBA's PHY table/);
 });
 
 test("an HBA PHY the census lists as an expander link, in no cable, is an uplink subject", () => {

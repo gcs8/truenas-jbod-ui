@@ -1123,7 +1123,7 @@ function wiringChecks(model, fabric) {
         const reading = readingOf(chip.id, phy);
         if (!reading.observations.length) {
           cover.unread(key);
-          unread.push(`${chip.label}: PHY ${phy}, a disk port the transport census lists, has no row in the expander's PHY table, so its counters are not read`);
+          unread.push(`${chip.label}: PHY ${phy}, a disk port the transport census lists, has no row in ${chip.kind === "controller" ? "the HBA's" : "the expander's"} PHY table, so its counters are not read`);
         }
       }
       for (const view of [...views, ...hbaViews]) {
