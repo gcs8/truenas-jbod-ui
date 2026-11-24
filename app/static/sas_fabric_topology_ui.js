@@ -1340,21 +1340,18 @@ function hbaRows(model, entry) {
 function hbaLanes(model, entry) {
     const record = model.sas.controllers.get(entry.id);
     const drawn = new Map();
+    // A listed PHY is a lane of a cable only where the attribution gives it
+    // to that cable; one whose owner is not read (two cables, a disk and a
+    // cable, two rows) is contested; one no cable owns is in no lane.
+    const contested = new Set();
     for (const link of context.list(model.outgoing.get(entry.id))) {
-      // A PHY two cables list belongs to neither: it is not drawn as one's.
-      for (const phy of context.list(link.lanes?.sourcePhys)) drawn.set(phy, drawn.has(phy) && drawn.get(phy) !== link ? null : link);
-    }
-    const linked = context.list(record?.phys).filter((row) => row.rate !== null);
-    const contested = new Set([...drawn].filter(([, link]) => !link).map(([phy]) => phy));
-    for (const phy of contested) drawn.delete(phy);
-    // Listed is not owned: a PHY whose owner is not that cable is no lane of it.
-    for (const [phy, link] of [...drawn]) {
-      const owner = phyOwner(model, entry.id, phy);
-      if (!(owner.known && owner.link?.id === link.id)) {
-        drawn.delete(phy);
-        if (owner.disputed) contested.add(phy);
+      for (const phy of context.list(link.lanes?.sourcePhys)) {
+        const owner = phyOwner(model, entry.id, phy);
+        if (owner.known && owner.link?.id === link.id) drawn.set(phy, link);
+        else if (owner.disputed) contested.add(phy);
       }
     }
+    const linked = context.list(record?.phys).filter((row) => row.rate !== null);
     return { linked, drawn, contested, inside: linked.filter((row) => drawn.has(row.phy)), outside: linked.filter((row) => !drawn.has(row.phy) && !contested.has(row.phy)) };
   }
 

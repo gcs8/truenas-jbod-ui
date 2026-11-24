@@ -286,6 +286,23 @@ test("a cable's PHY a read census record names a disk on is owner not read, from
   const lines = said(built, /101 invalid dword/);
   assert.equal(lines.length, 1, textOf(lines));
   assert.match(lines[0], /owner not read: the cable to [^)]* claims it, but its row or the transport census names a disk on it/);
+  // The census names a disk: the disk-port check says it, and does not pass.
+  assert.equal(critical(built, "port-errors").filter((line) => /101 invalid dword/.test(line)).length, 1, textOf(checksOf(built, "port-errors")));
+});
+
+test("a bay's PHY a read census record names as an expander link by PHY name only is owner not read", () => {
+  const item = fixture("fanout-2");
+  const port = model(item).bays[0].ports[0];
+  const row = phyRows(item.fabric, port.expanderId).find((entry) => entry.phy === port.phy.phy);
+  item.fabric.raw.sas_transport_ports.push({ id: "sas-port:extra-named", owner_id: port.expanderId, state: "read", phy_names: [row.name], phys: [],
+    remote_kind: "expander", remote_id: null, remote_sas_address: null, has_block: null, bay_identifier: null, enclosure_identifier: null, target_basis: "reported" });
+  const built = model(item);
+  const errors = cardRows(built, { kind: "port", id: built.bays[0].ports[0].key }).find((entry) => entry.label === "PHY errors");
+  assert.match(errors.value, /owner not read: Bay 00 claims it, but its row or the transport census calls it a link/, errors.value);
+  // The same record not read names no role: Bay 00 keeps its PHY.
+  item.fabric.raw.sas_transport_ports.at(-1).state = "not_read";
+  const kept = model(item);
+  assert.doesNotMatch(cardRows(kept, { kind: "port", id: kept.bays[0].ports[0].key }).find((entry) => entry.label === "PHY errors").value, /owner not read/);
 });
 
 test("a pinned lane shows its far observation's counters, never another observation's", () => {

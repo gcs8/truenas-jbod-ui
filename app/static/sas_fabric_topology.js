@@ -1221,6 +1221,8 @@ function adoptLinuxTransport(payload, options = {}) {
     const role = new Map();
     const inPort = new Set();
     for (const port of census) {
+      // A record that was not read names no role, as it names no destination.
+      if (port.state !== "read") continue;
       const device = port.remote_kind === "expander" ? "SMP Target" : port.remote_kind !== "end_device" ? "Attachment not read" : port.has_block ? "End device (disk outside this view)" : "End device, no block device";
       for (const name of list(port.phy_names)) {
         // Two census ports naming one PHY: both roles are kept, never the

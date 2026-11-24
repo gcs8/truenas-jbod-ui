@@ -233,6 +233,6 @@ test("a CORE disk attached directly to an HBA whose counters are not collected i
   const found = checksOf(built, "port-errors");
   assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(found));
   assert.match(textOf(found), /1 disk port PHY not judged from read evidence: Bay 00: PHY 2 of mpr0/);
-  // Its other path, through an expander, is not said to carry every path.
-  assert.doesNotMatch(textOf(checksOf(built, "ports")), /every path runs through/);
+  // Its one other path, through an expander, is not said to carry every path.
+  assert.doesNotMatch(textOf(checksOf(built, "ports")), /runs through/);
 });
