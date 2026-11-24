@@ -174,6 +174,45 @@ for (const fixture of fixtures) {
     same(faults, [], faults.join("\n"));
   });
 
+  test(`${fixture.id}: each card and inspector names only its own owner's SAS addresses`, () => {
+    const model = build(fixture);
+    const faults = [];
+    const hex = (text) => (String(text).match(/[0-9a-f]{16}/g) || []);
+    // A port's own address: what its bay's own path rows give as the port's
+    // address; what it is attached to is the far side's, not its own.
+    const ownOf = (bayId, field) => {
+      const trace = fixture.fabric.traces.find((entry) => entry.id === bayId);
+      return new Set([...(trace?.metrics?.path_states || []), ...(trace?.metrics?.sas_transport_ports || []), ...(trace?.metrics?.mpr_devices || [])]
+        .map((row) => row[field]).filter((value) => typeof value === "string").map((value) => value.toLowerCase().replace(/^0x/, "")));
+    };
+    const nodeAddress = (id) => {
+      const node = fixture.fabric.nodes.find((entry) => entry.id === id);
+      return String(node?.raw?.sas_address || "").toLowerCase();
+    };
+    for (const port of model.portByKey.values()) {
+      const rows = [...T.cardFor(model, { kind: "port", id: port.key }).rows, ...kvRows(T.detailFor(model, { kind: "port", id: port.key })?.html || "")];
+      for (const row of rows.filter((entry) => /SAS address/i.test(entry.label))) {
+        const own = ownOf(port.bayId, /attached/i.test(row.label) ? "attached_sas_address" : "sas_address");
+        for (const value of hex(row.value)) if (!own.has(value)) faults.push(`${port.key}: ${row.label} ${value} is not this port's own address`);
+      }
+      const path = rows.find((entry) => entry.label === "Path");
+      const shown = path ? hex(path.value) : [];
+      if (shown.length) {
+        assert.ok(port.expanderId, `${port.key}: an expander address only on a read expander`);
+        const chip = model.nodeById.get(port.expanderId);
+        const allowed = new Set([port.expanderId, ...(chip?.mergedInto ? [chip.mergedInto] : []), ...((model.nodeById.get(chip?.mergedInto || port.expanderId)?.rows || []).map((row) => row.id))].map(nodeAddress).filter(Boolean));
+        for (const value of shown) if (!allowed.has(value)) faults.push(`${port.key}: Path names ${value}, not its own expander's address`);
+      }
+    }
+    for (const entry of model.nodes.filter((item) => item.kind === "expander" && !item.mergedInto && !item.stubGroup)) {
+      const row = T.cardFor(model, { kind: "node", id: entry.id })?.rows.find((item) => item.label === "SAS address");
+      if (!row) continue;
+      const allowed = new Set([entry.id, ...(entry.rows || []).map((item) => item.id)].map(nodeAddress).filter(Boolean));
+      for (const value of hex(row.value)) if (!allowed.has(value)) faults.push(`${entry.id}: SAS address ${value} is not its own`);
+    }
+    same(faults, [], faults.join("\n"));
+  });
+
   test(`${fixture.id}: findings only where the fixture has a fault`, () => {
     const model = build(fixture);
     const found = model.checks.filter((check) => check.status === "critical" || check.status === "warning").map((check) => `${check.status}: ${check.title}: ${check.lines.join(" | ")}`);
@@ -249,8 +288,13 @@ test("one expander with two children has two stubs; with five, one stub that lis
   // The grouped cables keep their lanes in the group cable's card.
   const cable = five.links.find((link) => link.stubCables);
   assert.equal(T.cardFor(five, { kind: "link", id: cable.id }).rows.length, 5);
-  // The checks ran on every cable before the grouping.
-  assert.match(five.checks.find((check) => check.id === "cascades").lines[0], /^5 cascades/);
+  // The checks ran on every cable before the grouping. The fifth leaf's
+  // enclosure is not read, so its cascade is not confirmed to join another
+  // backplane: four of five are read and as expected, the fifth not read.
+  const cascades = five.checks.find((check) => check.id === "cascades");
+  assert.equal(cascades.status, "not_read");
+  assert.match(cascades.lines[0], /^Partial: 4 of 5 cascades read and as expected/);
+  assert.match(cascades.lines.join(" "), /the backplane of an end is not read/);
 });
 
 test("two HBAs to one expander on Linux: one chip, both HBAs, and the unjoined second path is not read", () => {

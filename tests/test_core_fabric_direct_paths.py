@@ -572,6 +572,40 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         outputs["camcontrol devlist -v"] = ""
         self.assertEqual(set(self.mpr_rows(self.build(system, snapshot, outputs))), {"da3", "da11"})
 
+    async def test_member_with_an_unread_controller_keeps_its_row_from_any_sibling(self):
+        # da3's gmultipath controller is not read; CAM still names da3, not
+        # da4. da4 is then not provably the controller's only member.
+        system, snapshot, outputs = await self.fixture()
+        self.four_multipath_members(snapshot, outputs, cam_second=False, second_rows=False)
+        snapshot.slots[0].multipath.members[0].controller_label = None
+        rows = self.mpr_rows(self.build(system, snapshot, outputs))
+        self.assertNotIn("da4", rows)
+        self.assertNotIn("5000c50000000d00", [row[1] for row in rows.values()])
+        # The same with da3 failed: still never da4's row.
+        snapshot.slots[0].multipath.members[0].state = "FAIL"
+        bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertNotIn("da4", {row["member_device_name"] for row in bay.metrics["mpr_devices"]})
+        self.assertIn({"controller": None, "state": "fail", "device_name": "da3"},
+                      [{key: row[key] for key in ("controller", "state", "device_name")} for row in bay.metrics["path_states"]])
+
+    async def test_member_past_the_admission_limit_still_counts_against_position_joins(self):
+        system, snapshot, outputs = await self.fixture()
+        names = ["da4", "da11", "da12", "da13", "da14", "da15", "da16", "da17", "da3"]
+        self.assertGreater(len(names), sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY)
+        results = {}
+        for mode, order in (("inside", [names[-1], *names[:-1]]), ("past", names)):
+            snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                MultipathMember(device_name=name, controller_label="mpr0" if name in ("da4", "da3") else "mpr1",
+                                state="PASSIVE" if name in ("da3", "da4") else "ACTIVE")
+                for name in order])
+            results[mode] = self.mpr_rows(self.build(system, snapshot, outputs))
+        # Inside the limit: CAM ties da3 to its row; da4 shares mpr0 and has none.
+        self.assertEqual(results["inside"].get("da3", (None, None))[1], "5000c50000000d00")
+        self.assertNotIn("da4", results["inside"])
+        # Past it, da3 is dropped, and da4 still never takes its row.
+        self.assertNotIn("da4", results["past"])
+        self.assertNotIn("5000c50000000d00", [row[1] for row in results["past"].values()])
+
     async def test_multipath_member_expander_is_only_its_row_parent(self):
         system, snapshot, outputs = await self.fixture()
         snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[

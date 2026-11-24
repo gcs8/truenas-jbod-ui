@@ -1010,11 +1010,13 @@ function finishNeighbours(model) {
       const record = model.sas.expanders.get(entry.id);
       const all = list(record?.phys);
       const measured = all.filter((row) => row.measured).length;
-      // Clean only where every linked PHY's counters were read.
-      const linked = all.filter((row) => row.rate !== null);
+      // Clean only where every PHY in use was read: linked, or attached to
+      // something the payload names (a disk, an HBA, another expander),
+      // whether or not its rate was read.
+      const linked = all.filter((row) => row.rate !== null || text(row.device));
       const rows = linked.length ? linked : all;
       const read = rows.filter((row) => row.measured).length;
-      const clean = read === rows.length ? "no PHY errors" : `no PHY errors on ${read} of ${plural(rows.length, linked.length ? "linked PHY" : "PHY")}; counters not read on ${rows.length - read}`;
+      const clean = read === rows.length ? "no PHY errors" : `no PHY errors on ${read} of ${rows.length} ${linked.length ? (rows.length === 1 ? "PHY in use" : "PHYs in use") : rows.length === 1 ? "PHY" : "PHYs"}; counters not read on ${rows.length - read}`;
       entry.neighbour.tier = tier;
       entry.neighbour.health = tier ? `${tier}: ${[...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))].join("; ")}` : measured ? clean : "PHY counters not read";
       entry.facts = stubFacts(entry, entry.neighbour.health);
@@ -1523,10 +1525,11 @@ function buildTopologyModel(given, options = {}) {
     const groupByBay = new Map();
     const bays = [];
     const controllerNodes = nodes.filter((entry) => entry.kind === "controller");
-    const controllerOf = (named) => {
-      const byLabel = controllerNodes.filter((entry) => entry.label === named);
-      const owner = controllerNodes.find((entry) => entry.id === `controller:${named}` || entry.id === named) || (byLabel.length === 1 ? byLabel[0] : null);
-      return { controller: owner ? owner.label : named, controllerId: owner ? owner.id : "" };
+    // A controller by its payload id only; a label, the payload's or a
+    // Friendly Label, is what is shown, never what is joined.
+    const controllerOf = (named, display = "") => {
+      const owner = named ? controllerNodes.find((entry) => entry.id === `controller:${named}` || entry.id === named) : null;
+      return { controller: owner ? owner.label : display || named, controllerId: owner ? owner.id : "" };
     };
     // Two paths name one controller when they name the same id, or, without
     // an id, the same text.
@@ -1539,8 +1542,9 @@ function buildTopologyModel(given, options = {}) {
       // A path names its controller by the tail of its id, or by a label
       // only one controller has. Joins use the id; the label is display.
       const traced = list(trace?.metrics?.path_states).filter(isRecord).map((state) => ({
-        ...controllerOf(String(state.controller_label || state.controller || "")),
-        state: String(state.state ?? "unknown"),
+        ...controllerOf(text(state.controller), text(state.controller_label)),
+        // A state the payload did not read is shown as not read everywhere.
+        state: isUnreadState(state) ? STATE_UNREAD : String(state.state),
         basis: String(state.state_basis ?? ""),
         device: text(state.device_name),
         // Its port's reported PHY rows through the shared resolver: a count
@@ -1628,6 +1632,8 @@ function buildTopologyModel(given, options = {}) {
       });
       bay.protocol = [...new Set(bay.ports.map((item) => item.protocol).filter(Boolean))].join("/");
       bay.heads = list(metrics.heads).filter(isRecord);
+      // What the producer says it did not read for this bay (path states past a limit, ...).
+      bay.notRead = list(trace?.metrics?.not_read).filter((key) => typeof key === "string");
       bays.push(bay);
       // A bay of a physical enclosure is in that enclosure's block, with or
       // without a disk; any other bay is grouped by the nodes that link to it.

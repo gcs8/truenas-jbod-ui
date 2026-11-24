@@ -809,7 +809,7 @@
   "tests/test_core_fabric_direct_paths.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:ac5ba46418456cbc2c544a0256fd17b8e32f1bbcd089e800b4d330b9bb3f51a0": 14
+        "sha256:86619d1d21c7f8b67800ee36c7f01e009a69c3c4c900906aaede6c9fae3573cf": 17
       }
     },
     "reason": "Invented CORE enclosure-path and multipath regression identifiers, using the same synthetic prefix and numeric seeds as the fixture builder; no captured value is used."

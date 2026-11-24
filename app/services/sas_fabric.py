@@ -713,7 +713,16 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         port_detail_read = direct_members or path_evidence_read or ownership is None or ownership.path_evidence is None
         if not port_detail_read and any(member.controller_label for member in slot_members):
             multipath_detail_unread_bays.add(slot.slot)
-        paths_per_controller = Counter(normalize_text(member.controller_label) for member in slot_members)
+        # Bay position may pick a row only for a controller's one member in
+        # the whole snapshot: every member counts, including one past the
+        # admission limit, and a member whose controller is not read could
+        # be on any controller.
+        snapshot_members = list(slot.multipath.members) if slot.multipath and slot.multipath.members else []
+        snapshot_controllers = Counter(_core_controller_name(member.controller_label) for member in snapshot_members)
+        position_allowed = (
+            bool(snapshot_members) and None not in snapshot_controllers
+            and slot.slot not in members_by_slot.path_limited
+        )
         for member in slot_members:
             controller_name = normalize_text(member.controller_label)
             if not controller_name:
@@ -746,9 +755,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 slot_location_numbers=_slot_location_number_candidates(slot),
                 slot_ses_number=_parse_mpr_slot_number((slot.raw_status or {}).get("ses_slot_number")),
                 diagnostics=mpr_kernel_diagnostics,
-                # Bay position may pick a row only for the one path of this
-                # bay on its controller; otherwise it could be a sibling's.
-                own_evidence=direct_members or paths_per_controller[controller_name] > 1,
+                own_evidence=direct_members or not position_allowed or snapshot_controllers[controller_name] != 1,
             )
             if mpr_context:
                 bay_related_nodes.extend(mpr_context["node_ids"])

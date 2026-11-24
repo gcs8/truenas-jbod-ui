@@ -1361,9 +1361,26 @@ function portPath(model, key, path) {
     path.groups.add(group.id);
     if (!group.enclosure) return bayPath(model, port.bayId, path);
     reportedChips(model, [port], path);
-    const mine = group.paths.filter((item) => !item.controllerId || item.controllerId === port.controllerId);
-    const own = mine.filter((item) => (item.rowId ? item.rowId === port.expanderId || !port.expanderId : true));
-    enclosurePaths(model, group, own.length ? own : mine, path);
+    // Only the port's own route: the bundle from its own expander and that
+    // expander's cables up to its HBA. Never another expander of the
+    // enclosure; a port whose expander is not read reaches its HBA only.
+    path.nodes.add(group.enclosure.id);
+    if (!port.expanderId) {
+      if (port.controllerId && model.nodeById.has(port.controllerId)) {
+        path.nodes.add(port.controllerId);
+        walkUp(model, port.controllerId, path);
+      }
+      return path;
+    }
+    for (const item of group.paths) {
+      item.sourceIds.forEach((sourceId, index) => {
+        if (sourceId === port.expanderId) path.links.add(item.linkIds[index]);
+      });
+    }
+    if (model.nodeById.has(port.expanderId)) {
+      path.nodes.add(port.expanderId);
+      walkUp(model, port.expanderId, path);
+    }
     return path;
   }
 
