@@ -1193,7 +1193,10 @@ function wiringChecks(model, fabric) {
               for (const port of at.bay.ports) if (chipOf(port.expanderId) === entry && (port.phy ? port.phy.phy === phy : context.list(port.phys).includes(phy))) flag("port", port.key, `PHY ${phy} of ${entry.label}: ${context.counterText(reading.worst)}`, reading.tier);
             } else {
               const device = reading.device;
-              const what = diskRole(reading) ? `a disk port (${device}${reading.worst.handle ? `, handle ${reading.worst.handle}` : ""}) mapped to no bay`
+              // A disk role beside a link role is no disk port's: its role is not read.
+              const linkToo = reading.devices.some((item) => /SMP Target|SAS Initiator/.test(item)) || censusKinds(model, view.id, phy).kinds.has("expander");
+              const what = diskRole(reading) && linkToo ? `role ${context.NOT_READ} (${device}): the payload names a disk and a link on it`
+                : diskRole(reading) ? `a disk port (${device}${reading.worst.handle ? `, handle ${reading.worst.handle}` : ""}) mapped to no bay`
                 : /^SEP/.test(device) ? "the enclosure processor (SEP Target)" : `${device || "nothing reported"}`;
               const text = tiered(`${entry.label}: PHY ${phy}, ${what}: ${context.counterText(reading.worst)}${context.disagreement(reading)}`, reading.tier);
               flags.push(text);

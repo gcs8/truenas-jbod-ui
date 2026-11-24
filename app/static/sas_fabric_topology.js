@@ -565,6 +565,11 @@ function sasIndex(fabric) {
     return { expanders, controllers };
   }
 
+// Two roles for one PHY, said the same whichever record came first.
+function bothRoles(held, device) {
+    return [...new Set([...held.split(" / "), device])].sort().join(" / ");
+  }
+
 function joinPort(sas, device) {
     const ids = list(device.expander_ids).filter((id) => typeof id === "string");
     const found = ids.map((id) => sas.expanders.get(id) || sas.controllers.get(id)).filter(Boolean);
@@ -1221,7 +1226,7 @@ function adoptLinuxTransport(payload, options = {}) {
         // Two census ports naming one PHY: both roles are kept, never the
         // later one alone.
         const held = role.get(`${port.owner_id}|${name}`);
-        role.set(`${port.owner_id}|${name}`, held && held !== device ? `${held} / ${device}` : device);
+        role.set(`${port.owner_id}|${name}`, held && held !== device ? bothRoles(held, device) : device);
         inPort.add(`${port.owner_id}|${name}`);
       }
     }
@@ -1247,7 +1252,7 @@ function adoptLinuxTransport(payload, options = {}) {
         // a census role that is not a disk's is kept beside it.
         for (const phy of phys) {
           const held = role.get(`${ownerId}|${phy.name}`);
-          role.set(`${ownerId}|${phy.name}`, held && held !== device && /SMP Target|SAS Initiator|Attachment not read| \/ /.test(held) ? `${held} / ${device}` : device);
+          role.set(`${ownerId}|${phy.name}`, held && held !== device && /SMP Target|SAS Initiator|Attachment not read| \/ /.test(held) ? bothRoles(held, device) : device);
         }
         return {
           controller: options.label || text(row.controller), state: isUnreadState(row) ? STATE_UNREAD : row.state, member_device_name: text(row.member_device_name),

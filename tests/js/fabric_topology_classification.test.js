@@ -161,6 +161,17 @@ test("a PHY two census records name differently has its destination not read, in
   });
   assert.deepEqual(outputs[0], outputs[1]);
   assert.doesNotMatch(outputs[0][1], /to Expander|a disk attached directly/, outputs[0][1]);
+  // The check says the same in either order, and does not call it a disk port.
+  const lines = [false, true].map((first) => {
+    const item = direct();
+    const census = item.fabric.raw.sas_transport_ports;
+    const disk = census.find((entry) => entry.owner_id === HOST1 && entry.phys.includes(12));
+    census[first ? "unshift" : "push"]({ ...disk, id: "sas-port:relation2", remote_kind: "expander", remote_id: item.fabric.nodes.find((entry) => entry.kind === "expander").id, remote_sas_address: null, bay_identifier: null, has_block: null });
+    return said(model(item), /101 invalid dword/);
+  });
+  assert.deepEqual(lines[0], lines[1]);
+  assert.equal(lines[0].length, 1);
+  assert.match(lines[0][0], /role not read/, lines[0][0]);
 });
 
 test("a disk on a wide HBA port is its bay's on every PHY of the port", () => {
