@@ -1244,6 +1244,24 @@ function wiringChecks(model, fabric) {
           cover.expect(key, `${chip.label}: PHY ${phy}, a disk port the transport census lists`, "phy");
         }
       }
+      // Its fault, if any, is said once by the cable check.
+      const roleUnread = new Set();
+      // A PHY a census record not read lists, that nothing else classifies:
+      // whether it is a disk port is not read, so the check cannot pass on it.
+      for (const port of context.list(model.censusRows)) {
+        if (port.state === "read") continue;
+        const chip = chipOf(port.owner_id);
+        if (!chip || ![...views, ...hbaViews].some((view) => view.id === chip.id)) continue;
+        for (const phy of context.list(port.phys)) {
+          const key = `${chip.id}|${phy}`;
+          const owner = phyOwner(model, chip.id, phy);
+          if (owner.known || owner.disputed || owner.roles.size || cover.has(key)) continue;
+          cover.expect(key, `${chip.label}: PHY ${phy}`, "phy");
+          cover.unread(key);
+          roleUnread.add(key);
+          unread.push(`${chip.label}: PHY ${phy} (${owner.note}), so whether it is a disk port is not read`);
+        }
+      }
       // In chip and PHY order, whatever order the census listed them in.
       // A total order over the keys: whatever order the census listed them in.
       for (const [key, { chip, phy }] of [...listed].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
@@ -1257,6 +1275,7 @@ function wiringChecks(model, fabric) {
         const entry = model.nodeById.get(view.id);
         for (const phy of chipPhys(view)) {
           const key = `${view.id}|${phy}`;
+          if (roleUnread.has(key)) continue;
           const reading = readingOf(view.id, phy);
           const owner = phyOwner(model, view.id, phy);
           // A disputed PHY a bay claims, or that names a disk, is said here.

@@ -109,6 +109,9 @@ test("a census record not read is unread evidence: no role, no destination, its 
   assert.equal(critical(built, "port-errors").length, 0, textOf(critical(built, "port-errors")));
   assert.match(lines[0], /role not read: its transport census record was not read/, lines[0]);
   assert.match(pin(built, HOST1, 12), /destination not read/);
+  // Whether it is a disk port is not read: the disk-port check does not pass.
+  assert.ok(!statuses(built, "port-errors").includes("pass"), textOf(checksOf(built, "port-errors")));
+  assert.match(textOf(checksOf(built, "port-errors")), /host1: PHY 12 \(role not read: its transport census record was not read\), so whether it is a disk port is not read/);
 });
 
 // --- 2: one role ledger per physical PHY -------------------------------------------
