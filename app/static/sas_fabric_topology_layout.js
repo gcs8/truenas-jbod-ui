@@ -1359,8 +1359,17 @@ function portPath(model, key, path) {
     path.ports.add(key);
     path.bays.add(port.bayId);
     path.groups.add(group.id);
-    if (!group.enclosure) return bayPath(model, port.bayId, path);
     reportedChips(model, [port], path);
+    if (!group.enclosure) {
+      // Off a board: the port's own expander and its bundle, or only its
+      // HBA. Never the bay's other ports or sources.
+      const own = port.expanderId && model.nodeById.has(port.expanderId) ? port.expanderId : port.controllerId && model.nodeById.has(port.controllerId) ? port.controllerId : "";
+      if (!own) return path;
+      if (model.linkById.has(`bundle:${own}->${group.id}`)) path.links.add(`bundle:${own}->${group.id}`);
+      path.nodes.add(own);
+      walkUp(model, own, path);
+      return path;
+    }
     // Only the port's own route: the bundle from its own expander and that
     // expander's cables up to its HBA. Never another expander of the
     // enclosure; a port whose expander is not read reaches its HBA only.

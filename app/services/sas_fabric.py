@@ -2325,6 +2325,8 @@ class _CorePathMembers(dict[int, list[MultipathMember]]):
     def __init__(self) -> None:
         super().__init__()
         self.path_limited: set[int] = set()
+        # How many paths each limited bay did not keep: a count, never names.
+        self.path_dropped: dict[int, int] = {}
         self.not_read_reasons: dict[int, str] = {}
         self.refused: set[int] = set()
         self.ownership_limited: set[int] = set()
@@ -2356,7 +2358,10 @@ class _CorePathMembers(dict[int, list[MultipathMember]]):
             reasons["path_states"] = PATH_LIMIT_REASON
         if slot in self.ownership_limited:
             reasons["alternate_paths"] = OWNERSHIP_LIMIT_REASON
-        return {"not_read": list(reasons), "not_read_reasons": reasons} if reasons else {}
+        if not reasons:
+            return {}
+        counts = {"path_states": self.path_dropped[slot]} if self.path_dropped.get(slot) else {}
+        return {"not_read": list(reasons), "not_read_reasons": reasons, **({"not_read_counts": counts} if counts else {})}
 
 
 def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) -> None:
@@ -2394,6 +2399,8 @@ def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) ->
                         continue
                     path_nodes.add(node)
             kept.append(member)
+        if len(kept) < len(members):
+            result.path_dropped[slot] = len(members) - len(kept)
         result[slot] = kept
 
 

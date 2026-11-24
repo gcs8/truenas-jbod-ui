@@ -158,6 +158,8 @@ test("lane rates are judged per lane only where the pairing is read, and never p
   delete plain.fabric.raw.sas_transport_ports;
   const unread = model(plain);
   assert.match(textOf(checksOf(unread, "lanes")), /far end not read/);
+  // The far ends are not read: two of the four cable ends were.
+  assert.match(textOf(checksOf(unread, "cable-errors")), /Partial: 2 of 4 cable ends read and as expected/);
   for (const id of ["lanes", "cable-errors"]) {
     const found = checksOf(unread, id);
     assert.ok(!found.some((entry) => entry.status === "pass"), `${id}: ${textOf(found)}`);

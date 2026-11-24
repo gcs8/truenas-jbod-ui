@@ -609,6 +609,22 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         snapshot.slots[0].multipath.members[1].controller_label = None
         self.assertNotIn("da3", self.mpr_rows(self.build(system, snapshot, outputs)))
 
+    async def test_paths_past_the_bay_limit_are_counted_with_their_true_number(self):
+        # Eight mpr0 members, then four mpr1: the graph keeps eight, and the
+        # bay says four paths were not read, never a gap of unknown size.
+        system, snapshot, outputs = await self.fixture()
+        names = ["da3", *[f"da{index}" for index in range(30, 37)], "da11", "da12", "da13", "da14"]
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name=name, controller_label="mpr0" if index < 8 else "mpr1", state="ACTIVE")
+            for index, name in enumerate(names)])
+        bay = self.bay(self.build(system, snapshot, outputs))
+        self.assertEqual(len(bay.metrics["path_states"]), sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY)
+        self.assertIn("path_states", bay.metrics["not_read"])
+        self.assertEqual(bay.metrics["not_read_counts"], {"path_states": len(names) - sas_fabric.MAX_FABRIC_PATH_MEMBERS_PER_BAY})
+        # Control: inside the limit, no count.
+        snapshot.slots[0].multipath.members = snapshot.slots[0].multipath.members[:2]
+        self.assertNotIn("not_read_counts", self.bay(self.build(system, snapshot, outputs)).metrics)
+
     async def test_member_past_the_admission_limit_still_counts_against_position_joins(self):
         system, snapshot, outputs = await self.fixture()
         names = ["da4", "da11", "da12", "da13", "da14", "da15", "da16", "da17", "da3"]

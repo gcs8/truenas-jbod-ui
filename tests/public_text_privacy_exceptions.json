@@ -423,6 +423,14 @@
     },
     "reason": "Invented Topology generality test: one patterned synthetic expander address from the fixture generator's seeds; exact detector count is pinned."
   },
+  "tests/js/fabric_topology_health.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:ee5263bacff2d3e7f9bf4b507182926429ec336b2b89acc7dbbb0534e74aebe9": 2
+      }
+    },
+    "reason": "Two patterned synthetic identifiers from the Topology generality fixture seeds (a disk port address and its shelf id); exact detector count is pinned."
+  },
   "tests/js/fabric_topology_own_evidence.test.js": {
     "findings": {
       "sas_wwn_identifier": {

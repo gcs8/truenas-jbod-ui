@@ -381,79 +381,152 @@ test("W11: a neighbour's attached PHY without a rate still counts for its health
   assert.match(stub.neighbour.health, /not read/);
 });
 
-// --- Property: deleting one subject's evidence never keeps a PASS ----------
+// --- Property: deleting any one subject's evidence ------------------------
+//
+// Every subject, one at a time: each PHY at each end of each cable on each
+// observation of its chip, each disk port PHY on each observation, each
+// cable's lanes and its parent link, each path state, each bay's occupancy
+// and its ports. After the deletion no check may vanish, no check may become
+// PASS, the subject's own checks may not pass, and they must name the lost
+// subject or count what was read; a known fault elsewhere must stay.
 
-// Each deletion names the checks whose subject it removes.
-function deletions(item) {
+const CHECK_IDS = (built) => [...new Set(built.checks.map((entry) => entry.id.split(":")[0]))];
+const tierOfCheck = (built, id) => statuses(built, id).filter((status) => status !== "not_read" && status !== "pass");
+
+function subjectDeletions(fabric) {
   const out = [];
-  const fabric = item.fabric;
-  for (const [index, link] of lanes(item).entries()) {
-    out.push([`cable ${index} lanes`, ["lanes", "cable-errors"], (copy) => { lanes(copy)[index].reported_lanes = null; }]);
-    out.push([`cable ${index} unresolved`, ["lanes", "cable-errors"], (copy) => { unresolve(copy.fabric, lanes(copy)[index]); }]);
-    if (link.reported_lanes?.source_phys?.length) out.push([`cable ${index} near PHY`, ["cable-errors"], (copy) => {
-      const own = lanes(copy)[index];
-      const node = copy.fabric.nodes.find((entry) => entry.id === own.source);
-      const row = (node.raw.phys || node.raw.phy_rows).find((entry) => entry.phy === own.reported_lanes.source_phys[0]);
-      if (row) cutCounters(row);
-    }]);
+  const nodes = new Map(fabric.nodes.map((node) => [node.id, node]));
+  const phyRows = (node) => node?.raw?.phys || node?.raw?.phy_rows || [];
+  // Every observation of the chip a node belongs to: nodes with its SAS address.
+  const observations = (id) => {
+    const node = nodes.get(id);
+    const address = node?.raw?.sas_address;
+    return node?.kind === "expander" && address ? fabric.nodes.filter((entry) => entry.kind === "expander" && entry.raw?.sas_address === address) : node ? [node] : [];
+  };
+  const cut = (copy, ownerId, phy) => {
+    const row = phyRows(copy.fabric.nodes.find((entry) => entry.id === ownerId)).find((entry) => entry.phy === phy);
+    if (!row) return false;
+    cutCounters(row);
+    row.not_read = [...new Set([...(row.not_read || []), "invalid_dword_count", "running_disparity_error_count", "loss_of_dword_synchronization_count", "phy_reset_problem_count"])];
+    return true;
+  };
+  const cables = fabric.links.filter((link) => ["controller-expander", "expander-expander"].includes(link.kind));
+  cables.forEach((link, index) => {
+    const lanesOf = (copy) => copy.fabric.links.filter((entry) => ["controller-expander", "expander-expander"].includes(entry.kind))[index];
+    out.push({ name: `cable ${index} lanes`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => { lanesOf(copy).reported_lanes = null; return true; } });
+    out.push({ name: `cable ${index} parent`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => { unresolve(copy.fabric, lanesOf(copy)); return true; } });
+    for (const [end, phys] of [[link.source, link.reported_lanes?.source_phys || []], [link.target, link.reported_lanes?.target_phys || []]]) {
+      for (const phy of phys) {
+        for (const observed of observations(end)) {
+          if (!phyRows(observed).some((entry) => entry.phy === phy)) continue;
+          // An HBA's own counters are subjects only where the platform reads them.
+          if (observed.kind === "controller" && !phyRows(observed).some((entry) => entry.counter_state)) continue;
+          out.push({ name: `cable ${index} PHY ${phy} on ${observed.id}`, checks: ["cable-errors"], tokens: [end, `PHY ${phy}`], faulty: { owner: observed.id, phy }, change: (copy) => cut(copy, observed.id, phy) });
+        }
+      }
+    }
+  });
+  for (const port of fabric.raw?.sas_transport_ports || []) {
+    if (port.remote_kind !== "end_device" || !port.has_block) continue;
+    for (const phy of port.phys || []) {
+      for (const observed of observations(port.owner_id)) {
+        if (!phyRows(observed).some((entry) => entry.phy === phy)) continue;
+        out.push({ name: `disk PHY ${phy} on ${observed.id}`, checks: ["port-errors"], tokens: [port.owner_id, `PHY ${phy}`], faulty: { owner: observed.id, phy }, change: (copy) => cut(copy, observed.id, phy) });
+      }
+    }
   }
-  for (const [index, port] of (fabric.raw?.sas_transport_ports || []).entries()) {
-    if (port.remote_kind !== "end_device" || !port.phys?.length) continue;
-    out.push([`disk port ${index} counters`, ["port-errors"], (copy) => {
-      const census = copy.fabric.raw.sas_transport_ports[index];
-      const node = copy.fabric.nodes.find((entry) => entry.id === census.owner_id);
-      const row = node && (node.raw.phys || []).find((entry) => entry.phy === census.phys[0]);
-      if (row) cutCounters(row);
-    }]);
+  for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
+    (trace.metrics?.path_states || []).forEach((state, index) => {
+      out.push({ name: `${trace.id} path ${index}`, checks: ["path-states"], tokens: [trace.id], change: (copy) => {
+        Object.assign(copy.fabric.traces.find((entry) => entry.id === trace.id).metrics.path_states[index], { state: "unknown", not_read: ["state"] });
+        return true;
+      } });
+    });
   }
   for (const bay of fabric.nodes.filter((node) => node.kind === "bay" && node.metrics?.present === true)) {
-    out.push([`${bay.id} occupancy`, ["ports"], (copy) => { copy.fabric.nodes.find((entry) => entry.id === bay.id).metrics.present = null; }]);
-    out.push([`${bay.id} ports`, ["ports", "port-errors"], (copy) => {
+    out.push({ name: `${bay.id} occupancy`, checks: ["ports"], tokens: [bay.id], change: (copy) => { copy.fabric.nodes.find((entry) => entry.id === bay.id).metrics.present = null; return true; } });
+    out.push({ name: `${bay.id} ports`, checks: ["ports", "port-errors", "path-states"], tokens: [bay.id], change: (copy) => {
       const trace = copy.fabric.traces.find((entry) => entry.id === bay.id);
-      if (trace) Object.assign(trace.metrics, { path_states: [], sas_transport_ports: [] });
-    }]);
-    out.push([`${bay.id} path states`, ["path-states"], (copy) => {
-      const trace = copy.fabric.traces.find((entry) => entry.id === bay.id);
-      for (const row of trace?.metrics?.path_states || []) Object.assign(row, { state: "unknown", not_read: ["state"] });
-    }]);
+      if (!trace) return false;
+      Object.assign(trace.metrics, { path_states: [], sas_transport_ports: [] });
+      return true;
+    } });
   }
   return out;
 }
 
-test("property: on every synthetic fabric, deleting one subject's evidence never keeps its check at PASS", () => {
-  const seen = [];
-  for (const base of FIXTURES) {
-    const before = model(structuredClone(base));
-    const passing = new Set(before.checks.filter((entry) => entry.status === "pass").map((entry) => entry.id));
-    for (const [name, ids, change] of deletions(base)) {
-      const watched = ids.filter((id) => passing.has(id));
-      if (!watched.length) continue;
-      const copy = structuredClone(base);
-      change(copy);
-      const after = model(copy);
-      for (const id of watched) {
-        seen.push(`${base.id}:${id}`);
-        assert.ok(!statuses(after, id).includes("pass"), `${base.id}: deleting ${name} kept ${id} at PASS: ${textOf(checksOf(after, id))}`);
-      }
+// Whether a check's entries name the lost subject, or count what was read.
+function accounted(before, after, id, tokens) {
+  const lines = checksOf(after, id).filter((entry) => entry.status !== "pass").flatMap((entry) => entry.lines);
+  const text = textOf(lines);
+  if (lines.some((line) => /\b\d+\b/.test(line) && /\bnot read\b/.test(line))) return true;
+  // A node is named by its label or by the short form of its SAS address.
+  const tail = (token) => {
+    const address = before.nodeById.get(token)?.address || before.nodeById.get(context(token))?.address || "";
+    return address ? address.slice(-4) : "";
+  };
+  const context = (token) => before.nodeById.get(token)?.mergedInto || token;
+  const labels = tokens.flatMap((token) => [before.nodeById.get(token)?.label, before.bayById.get(token)?.label, tail(token), /^PHY \d+$/.test(token) ? token : ""]).filter(Boolean);
+  // Counted (a partial count, or a number of subjects not read) or named.
+  return /Partial: \d+/.test(text) || /\b\d+ [a-zA-Z ]+? not read\b/.test(text) || labels.some((label) => text.includes(label));
+}
+
+function runProperty(name, base, build) {
+  const before = build(structuredClone(base));
+  const ids = CHECK_IDS(before);
+  const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
+  const deletions = subjectDeletions(base.fabric);
+  let applied = 0;
+  for (const deletion of deletions) {
+    const copy = structuredClone(base);
+    if (deletion.change(copy) === false || JSON.stringify(copy) === JSON.stringify(base)) continue;
+    applied += 1;
+    const after = build(copy);
+    const why = `${name}: deleting ${deletion.name}`;
+    for (const id of ids) {
+      assert.ok(checksOf(after, id).length, `${why} made ${id} vanish`);
+      if (!statuses(before, id).includes("pass")) assert.ok(!statuses(after, id).includes("pass"), `${why} made ${id} pass: ${textOf(checksOf(after, id))}`);
+    }
+    for (const id of deletion.checks.filter((check) => ids.includes(check))) {
+      assert.ok(!statuses(after, id).includes("pass"), `${why} kept ${id} at PASS: ${textOf(checksOf(after, id))}`);
+      // Where the check judged its subjects, it names or counts the lost one.
+      if (statuses(before, id).includes("pass") && !tierOfCheck(after, id).length) assert.ok(accounted(before, after, id, deletion.tokens), `${why}: ${id} does not name or count the lost subject: ${textOf(checksOf(after, id))}`);
+    }
+    // A known critical fault stays unless the deleted evidence was the
+    // fault, or removed the subject that carried it.
+    const removesSubject = /(ports|lanes|parent)$/.test(deletion.name);
+    const owner = deletion.faulty && base.fabric.nodes.find((node) => node.id === deletion.faulty.owner);
+    const faultRow = owner && (owner.raw.phys || owner.raw.phy_rows || []).find((entry) => entry.phy === deletion.faulty.phy);
+    const wasFault = faultRow && ["invalid_dword_count", "running_disparity_error_count", "loss_of_dword_synchronization_count", "phy_reset_problem_count"].some((key) => faultRow[key] > 0);
+    if (!removesSubject && !wasFault) {
+      for (const id of critical) assert.ok(tierOfCheck(after, id).includes("critical"), `${why} hid the known critical fault of ${id}: ${textOf(checksOf(after, id))}`);
     }
   }
-  // The property was exercised on every kind of check that can pass.
-  for (const id of ["lanes", "cable-errors", "ports", "port-errors", "path-states"]) {
-    assert.ok(seen.some((entry) => entry.endsWith(`:${id}`)) || id === "lanes" || id === "path-states", `exercised ${id}`);
+  return { proposed: deletions.length, applied };
+}
+
+test("property: on every synthetic fabric and the CORE fabric, every deleted subject is not read, named or counted, and nothing vanishes", (t) => {
+  const report = {};
+  for (const base of FIXTURES) report[base.id] = runProperty(base.id, base, (item) => model(item));
+  report.core_cascade = runProperty("core_cascade", core(), (data) => coreModel(data));
+  t.diagnostic(`applied/proposed per fabric: ${Object.entries(report).map(([id, { applied, proposed }]) => `${id} ${applied}/${proposed}`).join(", ")}`);
+  // Every fabric with wiring checks has subjects deleted, and every subject proposed was applied.
+  for (const [id, { applied, proposed }] of Object.entries(report)) {
+    assert.equal(applied, proposed, `${id}: ${applied} of ${proposed} deletions applied`);
   }
+  assert.ok(Object.values(report).reduce((sum, item) => sum + item.applied, 0) > 500);
 });
 
-test("property: on the CORE fabric, deleting one subject's evidence never keeps its check at PASS", () => {
-  const base = core();
-  const before = coreModel(structuredClone(base));
-  const passing = new Set(before.checks.filter((entry) => entry.status === "pass").map((entry) => entry.id));
-  assert.ok(passing.has("lanes"));
-  for (const [name, ids, change] of deletions({ fabric: base.fabric })) {
-    const watched = ids.filter((id) => passing.has(id));
-    if (!watched.length) continue;
-    const copy = structuredClone(base);
-    change(copy);
-    const after = coreModel(copy);
-    for (const id of watched) assert.ok(!statuses(after, id).includes("pass"), `deleting ${name} kept ${id} at PASS: ${textOf(checksOf(after, id))}`);
+test("the disk-port PHY count is by subject type, whatever an expander id contains", () => {
+  const item = fixture("fanout-2");
+  const chip = item.fabric.nodes.find((node) => node.kind === "expander");
+  const phy = chip.raw.phys.find((entry) => entry.phy === 0);
+  phy.invalid_dword_count = null;
+  phy.counter_state = "not_read";
+  const strange = JSON.parse(JSON.stringify(item).replaceAll(chip.id, `${chip.id}#A`));
+  for (const data of [item, strange]) {
+    const found = checksOf(model(data), "port-errors");
+    assert.ok(!found.some((entry) => entry.status === "pass"), textOf(found));
+    assert.match(textOf(found), /counters not read for 1 disk port PHY/);
   }
 });

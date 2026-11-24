@@ -473,10 +473,13 @@ function protocolOf(...words) {
 
 function phyFacts(row) {
     const measured = row.counter_state === "measured";
+    // Each counter is read or not on its own: a row the source measured has
+    // all four; a row that names the counters it did not read has the rest.
+    const named = Array.isArray(row.not_read) ? row.not_read : null;
     const counters = {};
     for (const [key] of PHY_COUNTERS) {
       const value = row[key];
-      counters[key] = measured && Number.isSafeInteger(value) && value >= 0 ? value : null;
+      counters[key] = Number.isSafeInteger(value) && value >= 0 && (measured || (named !== null && !named.includes(key))) ? value : null;
     }
     return {
       phy: decimal(row.phy),
@@ -586,6 +589,58 @@ function errorDigest(rows) {
       return high ? `${low === high ? low : `${low}–${high}`} ${label}` : "";
     }).filter(Boolean);
     return `PHY ${phyRanges(bad.map((row) => row.phy).sort((a, b) => a - b))} (${bad.length} PHYs), each: ${spans.join(", ")}`;
+  }
+
+const TIER_RANK = { critical: 2, warning: 1, "": 0 };
+
+// One reading per physical PHY: every observation of it (one per HBA that
+// reaches its chip), each judged counter by counter. The worst observation
+// by evaluated severity stands, then by count; never by count alone. It is
+// read only where every observation read every counter; a counter that was
+// read is never dropped because another was not. Its role is what any
+// observation says is attached. Every surface and check reads this.
+function phyReading(model, id, phy) {
+    if (!model.phyReadings) model.phyReadings = new Map();
+    const chip = chipOfNode(model, id);
+    const owners = chip ? [...new Set([chip.id, ...list(chip.rows).map((row) => row.id), id])] : [id];
+    const key = `${owners[0]}|${phy}`;
+    if (model.phyReadings.has(key)) return model.phyReadings.get(key);
+    const observations = owners.map((owner) => {
+      const row = model.sas.expanders.get(owner)?.byPhy.get(phy) || model.sas.controllers.get(owner)?.phys.find((item) => item.phy === phy);
+      return row ? { owner, row, tier: phyTier(row) } : null;
+    }).filter(Boolean);
+    const worst = observations.reduce((best, item) => (!best || TIER_RANK[item.tier] > TIER_RANK[best.tier] || (TIER_RANK[item.tier] === TIER_RANK[best.tier] && item.row.errors > best.row.errors) ? item : best), null);
+    const disagree = PHY_COUNTERS.some(([name]) => new Set(observations.map((item) => item.row.counters?.[name]).filter((value) => value !== null && value !== undefined)).size > 1);
+    const devices = [...new Set(observations.map((item) => item.row.device).filter(Boolean))];
+    const reading = {
+      phy, chipId: owners[0], observations, worst: worst?.row || null, tier: worst?.tier || "",
+      read: observations.length > 0 && observations.every((item) => item.row.measured),
+      disagree, devices, device: worst?.row.device || devices[0] || "",
+      rate: observations.map((item) => item.row.rate).find((value) => value !== null && value !== undefined) ?? null,
+    };
+    model.phyReadings.set(key, reading);
+    return reading;
+  }
+
+// Every PHY number any observation of a chip reports.
+function chipPhyNumbers(model, id) {
+    const chip = chipOfNode(model, id);
+    const owners = chip ? [...new Set([chip.id, ...list(chip.rows).map((row) => row.id), id])] : [id];
+    return [...new Set(owners.flatMap((owner) => list(model.sas.expanders.get(owner)?.phys).map((row) => row.phy)))].sort((a, b) => a - b);
+  }
+
+const disagreement = (reading) => (reading?.disagree ? `; the ${plural(reading.observations.length, "observation")} of this PHY disagree, the worst is shown` : "");
+
+// What a set of PHY readings says: the faults, and what was not read, both.
+function readingSummary(readings, wanted) {
+    const found = readings.filter(Boolean);
+    const bad = found.filter((reading) => reading.tier);
+    const read = found.filter((reading) => reading.read).length;
+    const unread = Math.max(0, wanted - read);
+    const parts = bad.length ? [`${errorDigest(bad.map((reading) => reading.worst))}${bad.map(disagreement).find(Boolean) || ""}`] : [];
+    if (!bad.length && read) parts.push(`none on ${plural(read, "PHY")}`);
+    if (unread > 0) parts.push(`${plural(unread, "PHY")} ${NOT_READ}`);
+    return { text: parts.join("; ") || NOT_READ, warn: worse(...bad.map((reading) => reading.tier)), unread, bad: bad.length, read };
   }
 
 function errorSummary(rows, wanted) {
@@ -942,7 +997,9 @@ function planNeighbours(context) {
         bays: found && Number.isInteger(found.slot_count) ? found.slot_count : null,
         // The disks on it: its end devices with a block device, where the
         // payload lists its ports; and its ports whose attachment is not read.
-        disks: census.length ? ports.filter((port) => port.has_block === true).length : null,
+        // Only where the census lists this owner's own ports: another
+        // owner's rows say nothing of this one.
+        disks: owned.length ? ports.filter((port) => port.has_block === true).length : null,
         unreadAttachments: owned.filter((port) => port.remote_kind !== "expander" && (port.remote_kind !== "end_device" || typeof port.has_block !== "boolean")).length,
         product: text(sas.expanders.get(entry.id)?.product),
         href: found && hrefFor && !found.id.toLowerCase().split("+").some((part) => selected.has(part)) ? String(hrefFor(found.id) || "") : "",
@@ -1006,19 +1063,21 @@ function finishNeighbours(model) {
     for (const entry of stubs) {
       const cables = model.links.filter((link) => LANE_LINKS.has(link.kind) && (link.source === entry.id || link.target === entry.id));
       const flags = [...context.flagsOf(model, "node", entry.id), ...cables.flatMap((link) => context.flagsOf(model, "link", link.id))];
-      const tier = worse(...flags.map((item) => item.tier));
-      const record = model.sas.expanders.get(entry.id);
-      const all = list(record?.phys);
-      const measured = all.filter((row) => row.measured).length;
+      // The same readings the checks use: one per PHY, over every
+      // observation of the chip, the worst by severity.
+      const all = context.chipPhyNumbers(model, entry.id).map((phy) => context.phyReading(model, entry.id, phy));
+      const tier = worse(...flags.map((item) => item.tier), ...all.map((reading) => reading.tier));
+      const measured = all.filter((reading) => reading.read).length;
       // Clean only where every PHY in use was read: linked, or attached to
       // something the payload names (a disk, an HBA, another expander),
       // whether or not its rate was read.
-      const linked = all.filter((row) => row.rate !== null || text(row.device));
+      const linked = all.filter((reading) => reading.rate !== null || reading.devices.length);
       const rows = linked.length ? linked : all;
-      const read = rows.filter((row) => row.measured).length;
+      const read = rows.filter((reading) => reading.read).length;
       const clean = read === rows.length ? "no PHY errors" : `no PHY errors on ${read} of ${rows.length} ${linked.length ? (rows.length === 1 ? "PHY in use" : "PHYs in use") : rows.length === 1 ? "PHY" : "PHYs"}; counters not read on ${rows.length - read}`;
       entry.neighbour.tier = tier;
-      entry.neighbour.health = tier ? `${tier}: ${[...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))].join("; ")}` : measured ? clean : "PHY counters not read";
+      const said = [...new Set(flags.filter((item) => item.tier === tier).map((item) => item.short))];
+      entry.neighbour.health = tier ? `${tier}: ${said.length ? said.join("; ") : "PHY errors"}${read < rows.length ? `; counters not read on ${rows.length - read}` : ""}` : measured ? clean : "PHY counters not read";
       entry.facts = stubFacts(entry, entry.neighbour.health);
     }
     // More than three under one parent: one stub that lists them.
@@ -1043,7 +1102,9 @@ function finishNeighbours(model) {
         }
       }
       const beyond = gone.size - members.length;
-      const tier = worse(...members.map((entry) => entry.neighbour.tier));
+      // The group carries the worst of everything it hides, members and
+      // everything further down alike.
+      const tier = worse(...[...gone].map((id) => model.nodeById.get(id)?.neighbour?.tier || ""));
       const first = members[0];
       const group = {
         ...first, id: `stubs:${parentId}`, label: `Next in chain: ${members.length} enclosures`, alias: "", rawId: "", address: "", neighbour: null, stubGroup: members, stubCables: cables,
@@ -1151,6 +1212,8 @@ function adoptLinuxTransport(payload, options = {}) {
         phy: row.phy, name: text(row.name), dev_handle: "", device: role.get(`${ownerId}|${row.name}`) || "",
         speed: finite(row.negotiated_rate_gbps), min: finite(row.minimum_rate_gbps), max: finite(row.maximum_rate_gbps),
         ...Object.fromEntries(PHY_COUNTERS.map(([key]) => [key, row[key] ?? null])),
+        // Which counters sysfs did not return, by name: the others were read.
+        not_read: list(row.not_read).filter((key) => typeof key === "string"),
         counter_state: measured ? "measured" : "not_read", counter_reason: measured ? "" : "sysfs did not return this PHY's counters",
       };
     };
@@ -1529,11 +1592,14 @@ function buildTopologyModel(given, options = {}) {
     // Friendly Label, is what is shown, never what is joined.
     const controllerOf = (named, display = "") => {
       const owner = named ? controllerNodes.find((entry) => entry.id === `controller:${named}` || entry.id === named) : null;
-      return { controller: owner ? owner.label : display || named, controllerId: owner ? owner.id : "" };
+      // An id the graph does not have is kept as the payload's own text, for
+      // joins; the label is display only.
+      return { controller: owner ? owner.label : display || named, controllerId: owner ? owner.id : "", controllerRaw: owner ? owner.id : named ? `raw:${named}` : "" };
     };
-    // Two paths name one controller when they name the same id, or, without
-    // an id, the same text.
-    const sameController = (left, right) => (left.controllerId || right.controllerId ? left.controllerId === right.controllerId : left.controller === right.controller);
+    // Two paths name one controller only when they name the same id, the
+    // graph's or the payload's own; never by a label, and never when neither
+    // names one.
+    const sameController = (left, right) => Boolean(left.controllerRaw) && left.controllerRaw === right.controllerRaw;
     for (const item of bayRows) {
       if (payloadNodeIds.get(item.id) !== item) continue;
       const found = traces.get(item.id);
@@ -1593,6 +1659,7 @@ function buildTopologyModel(given, options = {}) {
           bayId: item.id,
           controller: owner.controller,
           controllerId: owner.controllerId,
+          controllerRaw: owner.controllerRaw || "",
           state: state ? state.state : String(device.state ?? "unknown"),
           basis: state ? state.basis : "",
           device: text(device?.member_device_name) || state?.device || "",
@@ -1634,6 +1701,8 @@ function buildTopologyModel(given, options = {}) {
       bay.heads = list(metrics.heads).filter(isRecord);
       // What the producer says it did not read for this bay (path states past a limit, ...).
       bay.notRead = list(trace?.metrics?.not_read).filter((key) => typeof key === "string");
+      // How many it did not read, where it says (paths past its limit).
+      bay.notReadCounts = isRecord(trace?.metrics?.not_read_counts) ? trace.metrics.not_read_counts : {};
       bays.push(bay);
       // A bay of a physical enclosure is in that enclosure's block, with or
       // without a disk; any other bay is grouped by the nodes that link to it.
@@ -2105,7 +2174,7 @@ function buildTopologyModel(given, options = {}) {
     }
     for (const bay of bays) {
       bay.extra = [
-        ...bay.ports.filter((port) => port.phy || port.sasAddress).map((port) => `via ${port.controller}: ${context.portBrief(port)}`).filter((line, index, all) => all.indexOf(line) === index),
+        ...bay.ports.filter((port) => port.phy || port.sasAddress).map((port) => `via ${port.controller}: ${context.portBrief(port, model)}`).filter((line, index, all) => all.indexOf(line) === index),
         ...context.flagRows(model, "bay", bay.bayId).map((row) => `${row.label}: ${row.value}`),
       ];
       bay.flagged = context.flagTier(model, "bay", bay.bayId);
@@ -2471,6 +2540,10 @@ function modelParts(fabric, core) {
     counterText: { configurable: true, get: () => counterText },
     errorDigest: { configurable: true, get: () => errorDigest },
     errorSummary: { configurable: true, get: () => errorSummary },
+    phyReading: { configurable: true, get: () => phyReading },
+    chipPhyNumbers: { configurable: true, get: () => chipPhyNumbers },
+    readingSummary: { configurable: true, get: () => readingSummary },
+    disagreement: { configurable: true, get: () => disagreement },
     tierForNode: { configurable: true, get: () => tierForNode },
     hiddenByDesign: { configurable: true, get: () => hiddenByDesign },
     expanderLevel: { configurable: true, get: () => expanderLevel },

@@ -178,11 +178,13 @@ for (const fixture of fixtures) {
     const model = build(fixture);
     const faults = [];
     const hex = (text) => (String(text).match(/[0-9a-f]{16}/g) || []);
-    // A port's own address: what its bay's own path rows give as the port's
-    // address; what it is attached to is the far side's, not its own.
-    const ownOf = (bayId, field) => {
-      const trace = fixture.fabric.traces.find((entry) => entry.id === bayId);
+    // A port's own address: what its own path rows give as the port's
+    // address, by the port's member device, never another path of the bay;
+    // what it is attached to is the far side's, not its own.
+    const ownOf = (port, field) => {
+      const trace = fixture.fabric.traces.find((entry) => entry.id === port.bayId);
       return new Set([...(trace?.metrics?.path_states || []), ...(trace?.metrics?.sas_transport_ports || []), ...(trace?.metrics?.mpr_devices || [])]
+        .filter((row) => (row.device_name || row.member_device_name || "") === port.device)
         .map((row) => row[field]).filter((value) => typeof value === "string").map((value) => value.toLowerCase().replace(/^0x/, "")));
     };
     const nodeAddress = (id) => {
@@ -192,7 +194,7 @@ for (const fixture of fixtures) {
     for (const port of model.portByKey.values()) {
       const rows = [...T.cardFor(model, { kind: "port", id: port.key }).rows, ...kvRows(T.detailFor(model, { kind: "port", id: port.key })?.html || "")];
       for (const row of rows.filter((entry) => /SAS address/i.test(entry.label))) {
-        const own = ownOf(port.bayId, /attached/i.test(row.label) ? "attached_sas_address" : "sas_address");
+        const own = ownOf(port, /attached/i.test(row.label) ? "attached_sas_address" : "sas_address");
         for (const value of hex(row.value)) if (!own.has(value)) faults.push(`${port.key}: ${row.label} ${value} is not this port's own address`);
       }
       const path = rows.find((entry) => entry.label === "Path");
