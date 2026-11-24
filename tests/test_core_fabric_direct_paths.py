@@ -588,6 +588,27 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"controller": None, "state": "fail", "device_name": "da3"},
                       [{key: row[key] for key in ("controller", "state", "device_name")} for row in bay.metrics["path_states"]])
 
+    async def test_member_named_past_the_controller_limit_is_not_an_unread_owner(self):
+        # Control for the missing-label replay: the other member's controller
+        # is named in the snapshot, only past the graph's controller limit,
+        # so it is not an unread owner. da3 is still mpr0's only member and
+        # keeps its single-row position join; never a sibling's.
+        system, snapshot, outputs = await self.fixture()
+        limit = sas_fabric.MAX_FABRIC_CONTROLLERS
+        outputs["mprutil show adapters"] = "\n".join(f"/dev/mpr{unit} SAS3008 Synthetic 16.00.12.00" for unit in range(limit))
+        outputs["camcontrol devlist -v"] = ""
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name="da3", controller_label="mpr0", state="ACTIVE"),
+            MultipathMember(device_name="da11", controller_label=f"mpr{limit + 5}", state="PASSIVE")])
+        bay = self.bay(self.build(system, snapshot, outputs))
+        states = {row["device_name"]: row for row in bay.metrics["path_states"]}
+        self.assertIsNone(states["da11"]["controller"])
+        self.assertIn("controller", states["da11"]["not_read"])
+        self.assertEqual(self.mpr_rows(self.build(system, snapshot, outputs)).get("da3", (None, None))[1], "5000c50000000d00")
+        # The replay itself: with that member's label missing, no position join.
+        snapshot.slots[0].multipath.members[1].controller_label = None
+        self.assertNotIn("da3", self.mpr_rows(self.build(system, snapshot, outputs)))
+
     async def test_member_past_the_admission_limit_still_counts_against_position_joins(self):
         system, snapshot, outputs = await self.fixture()
         names = ["da4", "da11", "da12", "da13", "da14", "da15", "da16", "da17", "da3"]
@@ -605,6 +626,16 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         # Past it, da3 is dropped, and da4 still never takes its row.
         self.assertNotIn("da4", results["past"])
         self.assertNotIn("5000c50000000d00", [row[1] for row in results["past"].values()])
+        # A capped bay never joins by position, even for a controller's only
+        # member: da4 is mpr0's only member, CAM does not name it, and the
+        # one mpr0 row is the row CAM ties to da3.
+        lone = ["da4", "da11", "da12", "da13", "da14", "da15", "da16", "da17", "da18"]
+        snapshot.slots[0].multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+            MultipathMember(device_name=name, controller_label="mpr0" if name == "da4" else "mpr1", state="ACTIVE")
+            for name in lone])
+        fabric = self.build(system, snapshot, outputs)
+        self.assertIn("path_states", self.bay(fabric).metrics.get("not_read", []))
+        self.assertNotIn("da4", self.mpr_rows(fabric))
 
     async def test_multipath_member_expander_is_only_its_row_parent(self):
         system, snapshot, outputs = await self.fixture()

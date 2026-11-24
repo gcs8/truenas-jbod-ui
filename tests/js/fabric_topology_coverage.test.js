@@ -348,6 +348,25 @@ test("W10: disk port counters cover every observation, port and expected path", 
   notPass(model(fixture("dual-domain-linux")), "port-errors", "unjoined second paths");
 });
 
+test("a subject no judgement reaches is not read, never a pass", () => {
+  // A disk port the payload places on a PHY a cable uses: contradictory, so
+  // the disk-port check does not judge it, and must not pass without it.
+  const item = fixture("wide-x4-sata");
+  const before = model(item);
+  assert.deepEqual(statuses(before, "port-errors"), ["pass"]);
+  const cable = before.links.find((link) => link.kind === "controller-expander" && link.lanes?.targetPhys.length);
+  const far = item.fabric.nodes.find((node) => node.id === cable.target);
+  const phy = far.raw.phys.find((row) => row.phy === cable.lanes.targetPhys[0]);
+  const bay = before.bays.find((entry) => entry.occupancy === "yes" && entry.ports.some((port) => port.expanderId === cable.target));
+  const trace = item.fabric.traces.find((entry) => entry.id === bay.bayId);
+  const id = trace.metrics.sas_transport_ports[0].sas_transport_port_id;
+  item.fabric.raw.sas_transport_port_index[id] = { id, owner_id: far.id, phy_names: [phy.name], state: "read" };
+  const built = model(item);
+  assert.equal(built.bayById.get(bay.bayId).ports[0].phy?.phy, phy.phy);
+  const found = notPass(built, "port-errors", "disk port on a cable PHY");
+  assert.match(textOf(found), /not judged from read evidence/);
+});
+
 // --- W11: neighbour health from the same coverage set -----------------------
 
 test("W11: a neighbour's attached PHY without a rate still counts for its health", () => {

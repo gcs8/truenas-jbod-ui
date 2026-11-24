@@ -407,6 +407,14 @@
     },
     "reason": "One invented second-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
   },
+  "tests/js/fabric_topology_coverage.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:bd96b60870f0942ef717d75787eccb236001a61197a02f25327aa73e8851915e": 5
+      }
+    },
+    "reason": "One invented decoy-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
+  },
   "tests/js/fabric_topology_generality.test.js": {
     "findings": {
       "sas_wwn_identifier": {
@@ -809,7 +817,7 @@
   "tests/test_core_fabric_direct_paths.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:86619d1d21c7f8b67800ee36c7f01e009a69c3c4c900906aaede6c9fae3573cf": 17
+        "sha256:409fd7895fb33a25a75410661938c90ca2949d08bcb5102df35efe35177aad22": 18
       }
     },
     "reason": "Invented CORE enclosure-path and multipath regression identifiers, using the same synthetic prefix and numeric seeds as the fixture builder; no captured value is used."
