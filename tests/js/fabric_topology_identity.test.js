@@ -172,6 +172,10 @@ test("a PHY two bays claim has its owner not read on every surface", () => {
   const busErrors = cardRow(built, { kind: "link", id: chip.busId }, /^PHY errors$/).value;
   assert.doesNotMatch(busErrors, /^Bay 0[01] PHY/, busErrors);
   assert.match(busErrors, /owner not read/);
+  // Placement names both claimants on each bay's line.
+  const placement = checksOf(built, "ports").flatMap((entry) => entry.lines).filter((line) => /^Bay 0[01]:/.test(line));
+  assert.equal(placement.length, 2, textOf(placement));
+  for (const line of placement) assert.match(line, /owner not read: Bay 00 and Bay 01 all claim it/, line);
   for (const bay of built.bays.slice(0, 2)) {
     assert.doesNotMatch(bay.extra.join(" "), /101 invalid dword/, `${bay.label}: ${bay.extra.join(" | ")}`);
     const portErrors = cardRow(built, { kind: "port", id: bay.ports[0].key }, /^PHY errors$/);
@@ -203,6 +207,10 @@ test("placement past the cap says what was retained and what is missing, never n
   const text = textOf(checksOf(built, "ports"));
   assert.match(text, /8 of 12 paths/);
   assert.doesNotMatch(text, /no port rows? for this disk/);
+  // Every path of a reason is counted under it: seven without a port row.
+  assert.match(text, /not read for 7 \(da30/);
+  // da3's own row names its expander: only its PHY is not read.
+  assert.match(text, /the expander PHY of 1 disk port is not read/);
 });
 
 test("a bay whose occupancy is not read is said as a bay, never a disk", () => {

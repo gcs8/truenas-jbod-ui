@@ -363,8 +363,9 @@ test("a subject no judgement reaches is not read, never a pass", () => {
   item.fabric.raw.sas_transport_port_index[id] = { id, owner_id: far.id, phy_names: [phy.name], state: "read" };
   const built = model(item);
   assert.equal(built.bayById.get(bay.bayId).ports[0].phy?.phy, phy.phy);
+  // A bay and a cable both claim the PHY: its owner is not read, and said.
   const found = notPass(built, "port-errors", "disk port on a cable PHY");
-  assert.match(textOf(found), /not judged from read evidence/);
+  assert.match(textOf(found), /owner not read: .* all claim it/);
 });
 
 // --- W11: neighbour health from the same coverage set -----------------------
@@ -432,6 +433,16 @@ function subjectDeletions(fabric, built) {
     }
     return done;
   };
+  const inject = (copy, ownerId, phy) => {
+    let done = false;
+    for (const rows of tables(copy, ownerId)) {
+      for (const row of rows.filter((entry) => Number(entry.phy) === phy)) {
+        Object.assign(row, { counter_state: "measured", counter_reason: null, not_read: [], invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 10, phy_reset_problem_count: 0 });
+        done = true;
+      }
+    }
+    return done;
+  };
   // Another row of the same table is given this PHY's number.
   const duplicate = (copy, ownerId, phy) => {
     let done = false;
@@ -452,6 +463,9 @@ function subjectDeletions(fabric, built) {
       const faulty = { owner: observed.id, phy };
       out.push({ name: `${label} on ${observed.id}`, checks, tokens, faulty, change: (copy) => cut(copy, observed.id, phy) });
       out.push({ name: `${label} on ${observed.id}, row deleted`, checks, tokens, faulty, change: (copy) => drop(copy, observed.id, phy) });
+      // The opposite of a deletion: a critical count measured on this one
+      // observation. Some check must say it, naming this PHY and the count.
+      out.push({ name: `${label} on ${observed.id}, critical injected`, checks, tokens, faulty, injected: { phy }, change: (copy) => inject(copy, observed.id, phy) });
       // Only where the table has another row to give this PHY's number.
       if (phyRows(observed).some((entry) => Number(entry.phy) !== phy)) out.push({ name: `${label} on ${observed.id}, number duplicated`, checks, tokens, faulty, change: (copy) => duplicate(copy, observed.id, phy) });
     }
@@ -469,10 +483,21 @@ function subjectDeletions(fabric, built) {
         return true;
       } });
     }
+    const far = link.reported_lanes?.target_phys || [];
+    if (far.length > 1) {
+      out.push({ name: `cable ${index} repeated far member`, checks: ["lanes", "cable-errors"], tokens: [link.source, link.target], change: (copy) => {
+        const lanes = lanesOf(copy).reported_lanes;
+        lanes.target_phys[lanes.target_phys.length - 1] = lanes.target_phys[0];
+        const pairs = lanes.lanes || [];
+        if (pairs.length) pairs[pairs.length - 1].target_phy = pairs[0].target_phy;
+        return true;
+      } });
+    }
     for (const phy of near) phySubject(`cable ${index} near PHY ${phy}`, ["cable-errors"], [link.source, `PHY ${phy}`], link.source, phy);
     // The far end's members as the renderer derives them (sysfs reports a
     // port on the parent only), else as reported.
-    const drawn = built.links.find((entry) => entry.source === link.source && entry.target === link.target && entry.lanes);
+    // The cables as the checks saw them, before neighbours were grouped.
+    const drawn = built.links.flatMap((entry) => entry.stubCables || [entry]).find((entry) => entry.source === link.source && entry.target === link.target && entry.lanes);
     for (const phy of drawn?.lanes.targetPhys || link.reported_lanes?.target_phys || []) phySubject(`cable ${index} far PHY ${phy}`, ["cable-errors"], [link.target, `PHY ${phy}`], link.target, phy);
   });
   for (const port of fabric.raw?.sas_transport_ports || []) {
@@ -515,8 +540,31 @@ function accounted(before, after, id, tokens) {
   return /Partial: \d+/.test(text) || /\b\d+ [a-zA-Z ]+? not read\b/.test(text) || labels.some((label) => text.includes(label));
 }
 
+// Every CRITICAL or WARNING line of a counter check names a measured count
+// that reaches its tier; every CRITICAL lane line names its rate.
+const LIMITS = { "invalid dword": [1, 100], "running disparity": [1, 100], "loss of dword sync": [1, 10], "PHY reset problem": [1, 10] };
+function namesItsMeasurement(built, why) {
+  for (const entry of built.checks) {
+    const id = entry.id.split(":")[0];
+    if (!["critical", "warning"].includes(entry.status)) continue;
+    for (const line of entry.lines) {
+      if (id === "lanes" && entry.status === "critical") {
+        assert.match(line, /at \d+(\.\d+)? Gb\/s \(both ends \d+(\.\d+)?\)/, `${why}: ${id} critical without its rate: ${line}`);
+        continue;
+      }
+      if (!["cable-errors", "port-errors"].includes(id)) continue;
+      const counts = [...line.matchAll(/(\d+)(?:–(\d+))? (invalid dword|running disparity|loss of dword sync|PHY reset problem)/g)]
+        .map((match) => [Number(match[2] || match[1]), LIMITS[match[3]]]);
+      const level = entry.status === "critical" ? 1 : 0;
+      assert.ok(counts.some(([count, limit]) => count >= limit[level]), `${why}: ${id} ${entry.status} line names no count of that tier: ${line}`);
+    }
+  }
+}
+const namesPhy = (line, phy) => [...line.matchAll(/PHY (\d+)(?:–(\d+))?/g)].some((match) => phy >= Number(match[1]) && phy <= Number(match[2] || match[1]));
+
 function runProperty(name, base, build) {
   const before = build(structuredClone(base));
+  namesItsMeasurement(before, `${name}: baseline`);
   const ids = CHECK_IDS(before);
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
   const deletions = subjectDeletions(base.fabric, before);
@@ -533,6 +581,22 @@ function runProperty(name, base, build) {
     applied += 1;
     const after = build(copy);
     const why = `${name}: deleting ${deletion.name}`;
+    namesItsMeasurement(after, why);
+    if (deletion.injected && !ids.length) {
+      // A fabric that builds no check list: the PHY's own card still says it.
+      const owner = deletion.faulty.owner;
+      const node = after.nodeById.get(owner) || after.nodes.find((entry) => entry.rows?.some((row) => row.id === owner) || entry.stubGroup?.some((member) => member.id === owner));
+      const rows = node ? T.cardFor(after, { kind: "node", id: node.id })?.rows || [] : [];
+      assert.ok(rows.some((row) => row.warn === "critical"), `${why}: no check list, and the card of ${owner} does not say the critical: ${textOf(rows)}`);
+      continue;
+    }
+    if (deletion.injected) {
+      // Said once as critical, with this PHY and its count, in a counter check.
+      const lines = after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0]) && entry.status === "critical").flatMap((entry) => entry.lines)
+        .filter((line) => /10 loss of dword sync/.test(line) && namesPhy(line, deletion.injected.phy));
+      assert.ok(lines.length >= 1, `${why}: the injected critical is not said with PHY ${deletion.injected.phy}: ${textOf(after.checks.filter((entry) => ["cable-errors", "port-errors"].includes(entry.id.split(":")[0])))}`);
+      continue;
+    }
     for (const id of ids) {
       assert.ok(checksOf(after, id).length, `${why} made ${id} vanish`);
       if (!statuses(before, id).includes("pass")) assert.ok(!statuses(after, id).includes("pass"), `${why} made ${id} pass: ${textOf(checksOf(after, id))}`);

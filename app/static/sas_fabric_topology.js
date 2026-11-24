@@ -642,13 +642,41 @@ function phyReading(model, id, phy) {
   }
 
 // Every PHY number any observation of a chip reports.
+// Every PHY number expected of a chip: any observation's rows, any the
+// transport census lists for it, and any a cable lists at it. A number
+// expected with no row is a PHY not read, never one that is not there.
+// Fixed on first use, before neighbours are grouped.
 function chipPhyNumbers(model, id) {
+    if (!model.chipPhyCache) model.chipPhyCache = new Map();
     const chip = chipOfNode(model, id);
     const owners = chip ? [...new Set([chip.id, ...list(chip.rows).map((row) => row.id), id])] : [id];
-    return [...new Set(owners.flatMap((owner) => list(model.sas.expanders.get(owner)?.phys).map((row) => row.phy)))].sort((a, b) => a - b);
+    const key = owners[0];
+    if (model.chipPhyCache.has(key)) return model.chipPhyCache.get(key);
+    const numbers = new Set(owners.flatMap((owner) => list(model.sas.expanders.get(owner)?.phys).map((row) => row.phy)));
+    for (const port of list(model.censusRows)) {
+      if (owners.includes(port.owner_id)) for (const phy of list(port.phys)) if (Number.isInteger(phy)) numbers.add(phy);
+    }
+    for (const link of list(model.links)) {
+      if (!link.lanes) continue;
+      if (owners.includes(link.source)) for (const phy of link.lanes.sourcePhys) numbers.add(phy);
+      if (owners.includes(link.target)) for (const phy of link.lanes.targetPhys) numbers.add(phy);
+    }
+    const sorted = [...numbers].sort((a, b) => a - b);
+    model.chipPhyCache.set(key, sorted);
+    return sorted;
   }
 
 const disagreement = (reading) => (reading?.disagree ? `; the ${plural(reading.observations.length, "observation")} of this PHY disagree, the worst is shown` : "");
+
+// The measurements that set a verdict: the critical PHYs and their counts
+// first, then the warnings; a counter not read is named beside them, never
+// in their place.
+function faultDigest(bad) {
+    const ordered = [...bad].sort((left, right) => TIER_RANK[right.tier] - TIER_RANK[left.tier] || left.phy - right.phy);
+    const groups = ["critical", "warning"].map((tier) => ordered.filter((reading) => reading.tier === tier)).filter((group) => group.length);
+    const text = groups.map((group) => errorDigest(group.map((reading) => reading.worst))).join("; ");
+    return text ? `${text}${ordered.map(disagreement).find(Boolean) || ""}` : "";
+  }
 
 // What a set of PHY readings says: the faults, and what was not read, both.
 function readingSummary(readings, wanted) {
@@ -656,10 +684,11 @@ function readingSummary(readings, wanted) {
     const bad = found.filter((reading) => reading.tier);
     const read = found.filter((reading) => reading.read).length;
     const unread = Math.max(0, wanted - read);
-    const parts = bad.length ? [`${errorDigest(bad.map((reading) => reading.worst))}${bad.map(disagreement).find(Boolean) || ""}`] : [];
+    const faultText = faultDigest(bad);
+    const parts = faultText ? [faultText] : [];
     if (!bad.length && read) parts.push(`none on ${plural(read, "PHY")}`);
     if (unread > 0) parts.push(`${plural(unread, "PHY")} ${NOT_READ}`);
-    return { text: parts.join("; ") || NOT_READ, warn: worse(...bad.map((reading) => reading.tier)), unread, bad: bad.length, read };
+    return { text: parts.join("; ") || NOT_READ, faultText, warn: worse(...bad.map((reading) => reading.tier)), unread, bad: bad.length, read };
   }
 
 function errorSummary(rows, wanted) {
@@ -2129,6 +2158,8 @@ function buildTopologyModel(given, options = {}) {
       // The system's other enclosures, as the inventory of this scope names them.
       otherEnclosures: inventory.size ? list(options.inventory?.enclosures).filter((item) => isRecord(item) && item.id !== fabric.selected_enclosure_id).map((item) => text(item.label) || text(item.id)).filter(Boolean) : [],
       portByKey: new Map(bays.flatMap((bay) => bay.ports.map((port) => [port.key, port]))),
+      // The transport census as the payload lists it: which PHYs it expects.
+      censusRows: list(fabric?.raw?.sas_transport_ports).filter(isRecord),
       checks: [],
       flags: new Map(),
       contract: mode,
@@ -2570,6 +2601,7 @@ function modelParts(fabric, core) {
     phyReading: { configurable: true, get: () => phyReading },
     chipPhyNumbers: { configurable: true, get: () => chipPhyNumbers },
     readingSummary: { configurable: true, get: () => readingSummary },
+    faultDigest: { configurable: true, get: () => faultDigest },
     disagreement: { configurable: true, get: () => disagreement },
     tierForNode: { configurable: true, get: () => tierForNode },
     hiddenByDesign: { configurable: true, get: () => hiddenByDesign },
