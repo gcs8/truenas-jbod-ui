@@ -319,7 +319,9 @@ test("an x4 port beside an x8 port to another backplane is not a finding; SATA d
   // across a cable, so whether each lane runs at both ends' maximum is not read.
   const lanes = model.checks.filter((check) => check.id === "lanes" || check.id.startsWith("lanes:"));
   same(lanes.map((check) => check.status), ["not_read"]);
-  assert.ok(lanes[0].lines.every((line) => /which PHY pairs with which is not read/.test(line)), lanes[0].lines.join(" | "));
+  // Each cable's reason, and the ledger's count of cables not read.
+  assert.ok(lanes[0].lines.every((line) => /which PHY pairs with which is not read|^2 of 2 cables not read$/.test(line)), lanes[0].lines.join(" | "));
+  assert.ok(lanes[0].lines.includes("2 of 2 cables not read"), lanes[0].lines.join(" | "));
   const sata = model.bays.filter((bay) => bay.protocol === "SATA");
   assert.equal(sata.length, 2);
   for (const bay of sata) {

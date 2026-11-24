@@ -67,7 +67,7 @@ test("B: a critical counter that was read stands beside a counter that was not",
     assert.ok(found.includes("not_read"), `${id}: the unread counter is still said: ${textOf(checksOf(built, id))}`);
   }
   // The faulty PHY is also counted as not read: a fault and a gap, both.
-  assert.match(textOf(checksOf(built, "port-errors")), /counters not read for 1 disk port PHY\b/);
+  assert.match(textOf(checksOf(built, "port-errors")), /\b1 of \d+ disk port PHYs not read\b/);
   assert.match(textOf(checksOf(built, "cable-errors")), /counters not read for 1 PHY at Expander/);
   // Control: the same unread counter beside a zero: not read only.
   const { built: zero } = dual((six, seven) => { unreadCounter(seven, "invalid_dword_count"); });
@@ -126,7 +126,7 @@ test("D: a PHY one HBA's census names as a disk is a disk port, whichever HBA is
     const found = checksOf(built, "port-errors");
     assert.ok(statuses(built, "port-errors").includes(expected), textOf(found));
     assert.doesNotMatch(textOf(found), /nothing reported/);
-    assert.match(textOf(found), count === null ? /counters not read for 1 disk port PHY\b/ : /PHY 18, a disk port .*mapped to no bay/);
+    assert.match(textOf(found), count === null ? /\b1 of \d+ disk port PHYs not read\b/ : /PHY 18, a disk port .*mapped to no bay/);
   }
 });
 
@@ -348,6 +348,23 @@ test("boundary: a neighbour with no census rows of its own has bays not read, ne
   assert.equal(stub.neighbour.disks, null);
   assert.doesNotMatch(stub.facts.join(" "), /\b0 disks\b/);
   assert.match(stub.facts.join(" "), /disks not read/);
+});
+
+test("a neighbour's health includes a fault on a PHY a bay of this view is placed on", () => {
+  // Bay 00's port placed on a disk PHY of Leaf 1 (a neighbour): placement
+  // flags the port, and the leaf's own stub must not stay clean.
+  const item = fixture("fanout-2");
+  const trace = item.fabric.traces.find((entry) => entry.id === "bay:0");
+  const dest = item.fabric.raw.sas_transport_ports.find((port) => port.owner_id?.endsWith("expander-2:1") && port.has_block);
+  const { id, owner_id, phy_names, state } = dest;
+  item.fabric.raw.sas_transport_port_index[id] = { id, owner_id, phy_names, state };
+  for (const entry of [...trace.metrics.path_states, ...trace.metrics.sas_transport_ports]) Object.assign(entry, { sas_transport_port_id: id, expander_ids: [owner_id], sas_address: dest.remote_sas_address });
+  row(item.fabric, owner_id, dest.phys[0]).invalid_dword_count = 101;
+  const built = model(item);
+  assert.equal(built.bayById.get("bay:0").ports[0].expanderId, owner_id);
+  const stub = built.nodeById.get(owner_id);
+  assert.equal(stub.neighbour.tier, "critical", textOf(stub.neighbour));
+  assert.match(stub.neighbour.health, /^critical/);
 });
 
 // --- F9: per-port address oracle ---------------------------------------------

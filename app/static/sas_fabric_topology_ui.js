@@ -185,8 +185,9 @@ function wiringChecks(model, fabric) {
         const short = cover.count("unread");
         const bad = cover.count("bad");
         if (bad && !found.length) found.push(tiered(`${context.plural(bad, cover.noun)} with a finding`));
-        // A subject not read is never a pass, said or not.
-        if (short && !lines.length) lines.push(`${context.plural(short, cover.noun)} not read`);
+        // A subject not read is never a pass: the ledger's own count of them
+        // is always said, beside each call site's reasons.
+        if (short) lines.push(`${short} of ${context.plural(cover.total(), cover.noun)} not read`);
         if (unmarked.length) lines.push(`${context.plural(unmarked.length, cover.noun)} not judged from read evidence: ${unmarked.slice(0, 6).join("; ")}${unmarked.length > 6 ? `; and ${unmarked.length - 6} more` : ""}`);
         const byNoun = new Map();
         for (const gap of cover.gaps()) {
@@ -944,8 +945,6 @@ function wiringChecks(model, fabric) {
         flag("bay", bay.bayId, text);
         if (found.length > 1) both = true;
       }
-      const unreadPhys = cover.count("unread", "phy");
-      if (unreadPhys) unread.push(`counters not read for ${context.plural(unreadPhys, "disk port PHY")}`);
       if (both) notes.push("Errors on both ports of one drive point at the drive or its bay, not at a cable.");
       if (disagree) notes.push("Where the observations of one PHY via different HBAs disagree, the worst reading by severity is shown, never a sum.");
       if (flags.length) notes.push("The counters are cumulative since the expander last reset; this view cannot tell when that was.", context.THRESHOLD_NOTE, context.TREND_NOTE);

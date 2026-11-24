@@ -527,6 +527,6 @@ test("the disk-port PHY count is by subject type, whatever an expander id contai
   for (const data of [item, strange]) {
     const found = checksOf(model(data), "port-errors");
     assert.ok(!found.some((entry) => entry.status === "pass"), textOf(found));
-    assert.match(textOf(found), /counters not read for 1 disk port PHY/);
+    assert.match(textOf(found), /\b1 of \d+ disk port PHYs not read\b/);
   }
 });
