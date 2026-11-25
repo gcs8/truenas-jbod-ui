@@ -174,6 +174,7 @@ class DevCheckPlanTests(unittest.TestCase):
                 ("node", "--check", "app/static/sas_fabric_view.js"),
                 ("node", "--check", "app/static/sas_fabric_topology_layout.js"),
                 ("node", "--check", "app/static/sas_fabric_topology_ui.js"),
+                ("node", "--check", "app/static/sas_fabric_topology_evidence.js"),
                 ("node", "--check", "app/static/sas_fabric_topology.js"),
                 ("node", "--check", "app/static/sas_fabric_transport.js"),
                 ("node", "--check", "admin_service/static/admin.js"),

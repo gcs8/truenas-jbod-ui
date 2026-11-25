@@ -41,7 +41,7 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
         return `window.SAS_FABRIC_BOOTSTRAP = ${JSON.stringify(bootstrap)};`;
       });
       const errors = await routeSynthetic(page, html, { fabric });
-      const assets = ["sas_fabric_topology_layout.js", "sas_fabric_topology_ui.js", "sas_fabric_topology.js", "sas_fabric_topology.css"].map((name) => ({
+      const assets = ["sas_fabric_topology_layout.js", "sas_fabric_topology_ui.js", "sas_fabric_topology_evidence.js", "sas_fabric_topology.js", "sas_fabric_topology.css"].map((name) => ({
         name, response: page.waitForResponse((response) => new URL(response.url()).pathname === `/static/${name}`),
       }));
       await page.goto(`${origin}/sas-fabric`);

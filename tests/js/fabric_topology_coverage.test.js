@@ -619,6 +619,77 @@ function subjectDeletions(fabric, built) {
       return true;
     } });
   });
+  // A field blanked on one of two records of one subject: a second census
+  // record of the same disk missing its slot, its enclosure or its address,
+  // or the bay's own record missing the address its trace still reports.
+  // What is missing is not read, never a second subject: the checks and
+  // flags say the same.
+  census.forEach((port, index) => {
+    if (port.remote_kind !== "end_device" || !port.has_block) return;
+    for (const field of ["bay_identifier", "enclosure_identifier", "remote_sas_address"]) {
+      if (port[field] === null || port[field] === undefined) continue;
+      if (field === "remote_sas_address" && (port.bay_identifier === null || port.bay_identifier === undefined)) continue;
+      out.push({ name: `census ${index} second record without its ${field}`, same: true, checks: [], tokens: [], change: (copy) => {
+        copy.fabric.raw.sas_transport_ports.push({ ...copy.fabric.raw.sas_transport_ports[index], id: `${port.id}-copy`, [field]: null });
+        return true;
+      } });
+    }
+  });
+  for (const bay of fabric.nodes.filter((entry) => entry.kind === "bay" && entry.metrics?.sas_address)) {
+    const trace = fabric.traces.find((entry) => entry.id === bay.id);
+    if (!(trace?.metrics?.path_states || []).some((row) => row?.sas_address === bay.metrics.sas_address)) continue;
+    out.push({ name: `${bay.id} node without the address its trace reports`, same: true, checks: [], tokens: [], change: (copy) => {
+      copy.fabric.nodes.find((entry) => entry.id === bay.id).metrics.sas_address = null;
+      return true;
+    } });
+  }
+  // Reciprocal endpoint fields changed on one side of a CORE cable: the far
+  // row's handle or remote PHY, the near HBA row's own handle, an expander
+  // near row's handle or remote PHY. The lanes check cannot pass on it.
+  for (const link of fabric.links.filter((entry) => entry.reported_lanes?.lanes?.length && (fabric.expanders || []).some((item) => item.id === entry.target))) {
+    const [lane] = link.reported_lanes.lanes;
+    const hba = (fabric.controllers || []).some((item) => item.id === link.source);
+    const rowOf = (copy, id, phy) => coreRows(copy, id).find((entry) => Number(entry.phy) === phy);
+    const sides = [["far", link.target, lane.target_phy, "dev_handle", "0ffe"], ["far", link.target, lane.target_phy, "remote_phy", String(lane.source_phy + 100)],
+      hba ? ["near", link.source, lane.source_phy, "controller_handle", "0ffe"] : ["near", link.source, lane.source_phy, "dev_handle", "0ffe"],
+      ...(hba ? [] : [["near", link.source, lane.source_phy, "remote_phy", String(lane.target_phy + 100)]])];
+    for (const [side, id, phy, field, value] of sides) {
+      if (!rowOf({ fabric }, id, phy)?.[field]) continue;
+      out.push({ name: `${link.id} ${side} PHY ${phy} ${field} changed`, checks: ["lanes"], tokens: [link.source, link.target, `PHY ${phy}`], change: (copy) => {
+        rowOf(copy, id, phy)[field] = value;
+        return true;
+      } });
+    }
+    // The near HBA row's handle found to name the enclosure processor, a
+    // disk, or more than one device of the unit.
+    if (hba) {
+      for (const state of ["sep", "end_device", "ambiguous", "mismatch"]) {
+        out.push({ name: `${link.id} near handle found ${state}`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
+          const controller = copy.fabric.controllers.find((entry) => entry.id === link.source);
+          controller.device_handle_states = { ...controller.device_handle_states, [String(lane.source_phy)]: state };
+          return true;
+        } });
+      }
+    }
+  }
+  // A CORE bay path's handle given to another device of its HBA: the
+  // enclosure processor, or an expander.
+  for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
+    (trace.metrics?.mpr_devices || []).forEach((device, index) => {
+      const controller = (fabric.controllers || []).find((entry) => entry.id === `controller:${device.controller}`);
+      if (!controller || !device.handle || !(device.expander_ids || []).length) return;
+      const enclosure = fabric.nodes.find((entry) => entry.kind === "mpr-enclosure" && entry.controller_id === controller.id);
+      if (enclosure) out.push({ name: `${trace.id} port ${index} handle also the enclosure processor's`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
+        copy.fabric.nodes.find((entry) => entry.id === enclosure.id).raw.sep_handle = device.handle;
+        return true;
+      } });
+      const expander = (fabric.expanders || []).find((entry) => !(device.expander_ids || []).includes(entry.id) && entry.id.startsWith(`expander:${controller.id}:`));
+      if (expander) out.push({ name: `${trace.id} port ${index} handle also an expander's`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
+        copy.fabric.expanders.find((entry) => entry.id === expander.id).dev_handle = device.handle;
+        return true;
+      } });
+    });
+  }
   // Every list of records, reversed: whatever is said over a set of records
   // is said the same in any order.
   const reverseAll = (lists) => {
@@ -720,10 +791,48 @@ function surfacesAgree(built, line, why) {
 // PHY's range "(PHY a–b)". Counters are not rates: they may change.
 const RATE_TOKEN = /\b\d+(?:\.\d+)? Gb\/s|\(max \d+(?:\.\d+)?\)|\(both ends \d+(?:\.\d+)?\)|\(PHY \d+(?:\.\d+)?–\d+(?:\.\d+)?\)|PHY max \d+(?:\.\d+)?/g;
 const COUNTER_TOKEN = /\b\d+(?:–\d+)? (?:invalid dword|running disparity|loss of dword sync|PHY reset problem)\b/g;
+// The chip a name in a line names: every node's label, SAS address and
+// address tail, by the chip it belongs to (its address, else its id). The
+// longest name ending nearest the PHY is the one said.
+// A name two chips share (a short address tail) names neither.
+// A chip's key: its drawn node's SAS address, else the payload's, else its id.
+function chipKey(built, fabric, id) {
+  const drawn = built.nodeById.get(id) || built.nodes.find((entry) => (entry.rows || []).some((row) => row.id === id));
+  return drawn?.address || built.nodeById.get(drawn?.mergedInto)?.address || (fabric?.nodes || []).find((entry) => entry.id === id)?.raw?.sas_address || drawn?.id || id;
+}
+function chipNames(built, fabric) {
+  const keys = new Map();
+  // Every chip of the payload, drawn or grouped into a stub, and every node drawn.
+  const chips = (fabric?.nodes || []).filter((entry) => ["expander", "controller"].includes(entry.kind)).map((entry) => ({ id: entry.id, label: built.nodeById.get(entry.id)?.label, address: built.nodeById.get(entry.id)?.address || entry.raw?.sas_address || "", rawId: entry.raw_id }));
+  for (const entry of [...built.nodes, ...chips]) {
+    const key = chipKey(built, fabric, entry.id);
+    const tails = entry.address ? [4, 5, 6, 7, 8].map((size) => `…${entry.address.slice(-size)}`) : [];
+    for (const name of new Set([entry.label, entry.address, entry.rawId, ...tails].filter((value) => typeof value === "string" && value.length > 2))) keys.set(name, new Set([...(keys.get(name) || []), key]));
+  }
+  return [...keys].filter(([, found]) => found.size === 1).map(([name, found]) => [name, [...found][0]]).sort((left, right) => right[0].length - left[0].length);
+}
+function ownerBefore(names, line, at, after) {
+  // The text a PHY is said of: back to the nearest list or clause break,
+  // past any closed parenthetical (about something else), and a following
+  // "at <name>".
+  let prefix = line.slice(0, at);
+  for (let previous = ""; previous !== prefix;) [previous, prefix] = [prefix, prefix.replace(/\([^()]*\)/g, "")];
+  const window = prefix.slice(Math.max(...[";", "|", "(", ",", "·"].map((mark) => prefix.lastIndexOf(mark))) + 1);
+  let best = null;
+  for (const [name, key] of names) {
+    const index = window.lastIndexOf(name);
+    if (index >= 0 && (!best || index + name.length > best.end)) best = { end: index + name.length, key };
+  }
+  if (best) return best.key;
+  const following = /^ at ([^:;,(|·]+)/.exec(after)?.[1]?.trim() || "";
+  return names.find(([name]) => following === name || following.endsWith(name))?.[1] || "";
+}
 // Every rate and every counter any surface displays, each bound to its
 // surface and row: cards and inspectors, drawn link labels, and every
-// wiring check's lines and notes.
-function surfaceTokens(built) {
+// wiring check's lines and notes. A counter is bound to the PHY and the
+// chip it is said of.
+function surfaceTokens(built, fabric) {
+  const names = chipNames(built, fabric);
   const refs = [...built.links.map((link) => ({ kind: "link", id: link.id })),
     ...built.nodes.map((entry) => ({ kind: "node", id: entry.id })),
     ...built.bays.map((bay) => ({ kind: "bay", id: bay.bayId })),
@@ -745,10 +854,14 @@ function surfaceTokens(built) {
     const label = key.match(/ (?:pin|card) (.*)$/)?.[1] || "";
     for (const line of `${label ? `${label}: ` : ""}${text}`.split(" | ")) {
       let ref = own.get(surface) || "";
+      let owner = "";
       // A lane's row names both of its ends ("PHY 0 ↔ 32").
       for (const match of line.matchAll(/(?<!\()PHY (\d+(?:–\d+)?(?:, \d+(?:–\d+)?)*)(?: ↔ (\d+(?:–\d+)?(?:, \d+(?:–\d+)?)*))?|(\b\d+(?:–\d+)? (?:invalid dword|running disparity|loss of dword sync|PHY reset problem)\b)/g)) {
-        if (match[1]) ref = [match[1], match[2]].filter(Boolean).join(", ");
-        else counters[surface] = [...(counters[surface] || []), `${ref}::${match[3]}`];
+        if (match[1]) {
+          ref = [match[1], match[2]].filter(Boolean).join(", ");
+          // A PHY with no chip of its own named continues the line's list.
+          owner = ownerBefore(names, line, match.index, line.slice(match.index + match[0].length)) || owner;
+        } else counters[surface] = [...(counters[surface] || []), `${ref}::${owner}::${match[3]}`];
       }
     }
   };
@@ -765,32 +878,61 @@ function surfaceTokens(built) {
     add(`check:${entry.id.split(":")[0]} notes`, (entry.notes || []).join(" | "));
   }
   for (const key of Object.keys(rates)) rates[key].sort();
-  return { rates, counters };
+  return { rates, counters, built };
 }
 
 // A counters-only injection on one PHY changes no rate anywhere, and no
 // counter value but that PHY's: every counter any surface says is bound to
-// the PHY it is said of, and only that PHY's may come or go; what comes is
-// the injected count. A count said of no PHY never changes.
+// the PHY and the chip it is said of, and only that PHY's may come or go.
+// What comes is the injected count, or a range whose both ends are counts
+// some row of the payload measured, spanning the injected one. On a check's
+// lines and notes the chip is named; on a card, pin or label with no chip
+// named, the surface is the injected chip's own (its node, a cable at it, a
+// bay or port on it). A count said of no PHY never changes.
 const covers = (ref, phy) => ref.split(", ").some((part) => {
   const [low, high = low] = part.split("–").map(Number);
   return phy >= low && phy <= high;
 });
-function assertLocal(before, after, base, deletion, why) {
+function measuredCounts(fabric, key) {
+  const rows = [...fabric.nodes.flatMap((entry) => [entry.raw?.phys, entry.raw?.phy_rows]), ...(fabric.expanders || []).map((entry) => entry.phys), ...(fabric.controllers || []).map((entry) => entry.phy_rows)]
+    .filter(Array.isArray).flat();
+  return new Set(rows.map((row) => row?.[key]).filter((value) => Number.isSafeInteger(value)));
+}
+function injectedChip(before, base, owner) {
+  return chipKey(before, base.fabric, owner);
+}
+function surfaceOfChip(built, fabric, surface, chip) {
+  const keyOf = (id) => chipKey(built, fabric, id);
+  const [kind, ...rest] = surface.split(":");
+  const id = rest.join(":");
+  if (kind === "node") return keyOf(id) === chip || (built.nodeById.get(id)?.rows || []).some((row) => keyOf(row.id) === chip || row.id === chip);
+  if (kind === "link") {
+    const link = built.links.flatMap((entry) => [entry, ...(entry.stubCables || [])]).find((entry) => entry.id === id);
+    return Boolean(link) && [link.source, link.target].some((end) => keyOf(end) === chip);
+  }
+  const ports = kind === "bay" ? built.bayById.get(id)?.ports || [] : kind === "port" ? [built.portByKey.get(id)].filter(Boolean) : [];
+  return ports.some((port) => keyOf(port.expanderId) === chip);
+}
+function assertLocal(before, after, base, copy, deletion, why) {
   assert.deepEqual(after.rates, before.rates, `${why}: a counter change moved a displayed rate`);
   const phy = deletion.faulty.phy;
+  const chip = injectedChip(before.built, base, deletion.faulty.owner);
+  const measured = measuredCounts(copy.fabric, "loss_of_dword_synchronization_count");
   const bag = (list) => list.reduce((map, token) => map.set(token, (map.get(token) || 0) + 1), new Map());
   for (const key of new Set([...Object.keys(before.counters), ...Object.keys(after.counters)])) {
     const was = bag(before.counters[key] || []);
     const now = bag(after.counters[key] || []);
     for (const [pair, count] of now) {
       if (count <= (was.get(pair) || 0)) continue;
-      const [ref, token] = pair.split("::");
-      assert.ok(ref && covers(ref, phy) && /^(10|\d+–\d+) loss of dword sync$/.test(token), `${why}: ${key} gained ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}`);
+      const [ref, owner, token] = pair.split("::");
+      const range = /^(\d+)–(\d+) loss of dword sync$/.exec(token);
+      const value = token === "10 loss of dword sync" || (range && measured.has(Number(range[1])) && measured.has(Number(range[2])) && Number(range[1]) <= 10 && Number(range[2]) >= 10);
+      const whose = owner ? owner === chip : !key.startsWith("check:") && surfaceOfChip(after.built, copy.fabric, key, chip);
+      assert.ok(ref && covers(ref, phy) && value && whose, `${why}: ${key} gained ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}${owner ? ` of ${owner}` : ""}, not ${chip}'s`);
     }
     for (const [pair, count] of was) {
       if (count <= (now.get(pair) || 0)) continue;
-      const [ref, token] = pair.split("::");
+      const [ref, , token] = pair.split("::");
       assert.ok(ref && covers(ref, phy), `${why}: ${key} lost ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}, not PHY ${phy}'s`);
     }
   }
@@ -812,7 +954,7 @@ function runProperty(name, base, build) {
   const deletions = subjectDeletions(base.fabric, before);
   let rates = null;
   let compared = 0;
-  const baselineRates = () => (rates ??= surfaceTokens(before));
+  const baselineRates = () => (rates ??= surfaceTokens(before, base.fabric));
   let applied = 0;
   let absent = 0;
   for (const deletion of deletions) {
@@ -830,6 +972,10 @@ function runProperty(name, base, build) {
       assert.deepEqual(canonicalChecks(after), canonicalChecks(before), `${why}: the same records in another order say something else`);
       continue;
     }
+    if (deletion.same) {
+      assert.deepEqual(canonicalChecks(after), canonicalChecks(before), `${why}: a field missing from one record of a subject made it say something else`);
+      continue;
+    }
     if (deletion.orders) {
       const other = structuredClone(base);
       deletion.twin(other);
@@ -839,7 +985,7 @@ function runProperty(name, base, build) {
     // Locality, on every counters-only injection, whatever the fabric: a
     // counter on one observation changes no rate on any surface.
     if (deletion.countersOnly) {
-      assertLocal(baselineRates(), surfaceTokens(after), base, deletion, why);
+      assertLocal(baselineRates(), surfaceTokens(after, copy.fabric), base, copy, deletion, why);
       compared += 1;
     }
     if (deletion.injected && !ids.length) {

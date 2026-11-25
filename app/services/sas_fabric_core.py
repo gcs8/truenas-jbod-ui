@@ -694,6 +694,10 @@ def _mpr_expander_parent_context(
 
 _MPR_EXPANDER_ATTACHED_DEVICES = frozenset({"SMP Target", "Edge Expander", "Fanout Expander", "Expander"})
 _MPR_INITIATOR_ATTACHED_DEVICES = frozenset({"SAS Initiator"})
+# A disk (an end device) and the enclosure processor, as the view's device
+# table reads them (a JS test holds the two to agreement).
+_MPR_DISK_ATTACHED_DEVICES = frozenset({"SAS Target", "SATA Target", "STP Target", "ATAPI Target"})
+_MPR_SEP_ATTACHED_DEVICES = frozenset({"SEP Target"})
 _MPR_REPORTED_LANE_BASIS = "reciprocal_reported_phy_rows"
 
 
@@ -765,8 +769,11 @@ class _MprReportedLaneContext:
     unequal row sets leave the whole link null. Nothing here admits a link.
     """
 
-    def __init__(self, expanders: list[dict[str, Any]], adapter_detail: Any, unit: int) -> None:
+    def __init__(self, expanders: list[dict[str, Any]], adapter_detail: Any, unit: int,
+                 ambiguous_handles: set[str] | None = None) -> None:
         self._unit = unit
+        # A handle naming more than one device of the unit names neither end.
+        self._ambiguous = ambiguous_handles or set()
         self._expanders = expanders
         # Index once so each link costs O(its lanes), not a rescan of the unit.
         self._rows = [
@@ -794,7 +801,8 @@ class _MprReportedLaneContext:
         child = self._expanders[index]
         child_handle, child_rows = self._handles[index], self._rows[index]
         parent_handle = _mpr_handle(child.get("parent"))
-        if child_handle is None or parent_handle is None or child_rows is None or child_handle == parent_handle:
+        if (child_handle is None or parent_handle is None or child_rows is None or child_handle == parent_handle
+                or {child_handle, parent_handle} & self._ambiguous):
             return None
         if to_controller:
             parent_rows, parent_address = self._adapter_rows, None
@@ -852,37 +860,112 @@ class _MprReportedLaneContext:
         )
 
 
+def _mpr_device_kind(device: Any) -> str:
+    """What a device type says is attached, by the same table the view reads."""
+    for kind, types in (("expander", _MPR_EXPANDER_ATTACHED_DEVICES), ("disk", _MPR_DISK_ATTACHED_DEVICES),
+                        ("sep", _MPR_SEP_ATTACHED_DEVICES), ("initiator", _MPR_INITIATOR_ATTACHED_DEVICES)):
+        if isinstance(device, str) and device.strip() in types:
+            return kind
+    return "other"
+
+
+def _mpr_handle_devices(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """The devices each handle of one MPR unit names, one entry per device.
+
+    Every read list is evidence: the expander list, the device list and the
+    enclosure list's enclosure processors. A device is its whole identity
+    (kind, SAS address, parent handle): two records are one device only
+    where the kinds agree and no field both read differs; a field one record
+    does not read is not read, never a second device. The result is the
+    same in any record order.
+    """
+    lists = payload.get("lists") or {}
+    read = {"read", "empty"}
+    records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def add(handle: Any, kind: str, address: Any, parent: Any) -> None:
+        key = _mpr_handle(handle)
+        if key is not None and key != "0000":
+            records[key].append({"kind": kind, "address": (_mpr_sas_address(address) or "").lower() or None,
+                                 "parent": _mpr_handle(parent), "conflict": False})
+
+    if lists.get("expanders") in read:
+        for row in payload.get("expanders") or []:
+            add(row.get("dev_handle"), "expander", row.get("sas_address"), row.get("parent"))
+    if lists.get("devices") in read:
+        for row in payload.get("devices") or []:
+            add(row.get("handle"), _mpr_device_kind(row.get("device")), row.get("sas_address"), row.get("parent"))
+    if lists.get("enclosures") in read:
+        for row in payload.get("enclosures") or []:
+            add(row.get("sep_handle"), "sep", None, None)
+    devices: dict[str, list[dict[str, Any]]] = {}
+    for handle, found in records.items():
+        # Records with an address are grouped by kind and address; one
+        # address with two parents is one device whose identity disagrees.
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for record in (item for item in found if item["address"]):
+            held = grouped.setdefault((record["kind"], record["address"]), dict(record))
+            if record["parent"] and held["parent"] and record["parent"] != held["parent"]:
+                held["conflict"] = True
+            held["parent"] = held["parent"] or record["parent"]
+        named = list(grouped.values())
+        # A record with no address is one of those devices where exactly its
+        # kind and read parent fit; otherwise a device of its own.
+        loose: list[dict[str, Any]] = []
+        for record in (item for item in found if not item["address"]):
+            fits = [item for item in named + loose if item["kind"] == record["kind"]
+                    and (not record["parent"] or not item["parent"] or item["parent"] == record["parent"])]
+            if not fits:
+                loose.append(dict(record))
+        devices[handle] = named + loose
+    return devices
+
+
 def _mpr_adapter_handle_states(rows: list[dict[str, Any]] | None, payload: dict[str, Any]) -> dict[str, str]:
-    """Each adapter PHY whose device handle does not name exactly one expander.
+    """Each adapter PHY whose device handle does not name exactly one expander of it.
 
     Handles are local to one MPR unit, so this is decided over the unit's
-    whole expander and device lists, before any enclosure selection: a
-    handle two records carry is ambiguous everywhere, and a handle only a
-    non-expander device carries names that device, not an absent one.
-    The adapter rows stay as reported; the states are kept beside them, by
-    PHY. A handle naming exactly one expander, or lists not read, has none.
+    whole expander, device and enclosure lists, before any enclosure
+    selection. A handle naming more than one device, or one whose own
+    records disagree, is ``ambiguous`` everywhere. A handle naming one
+    device whose parent is not this adapter, or whose kind is not the kind
+    the row reports, contradicts the row (``mismatch``). Otherwise the one
+    device's kind: a disk (``end_device``), the enclosure processor
+    (``sep``) or another device (``other_device``); an expander, or a handle
+    no list carries, has no state. The adapter rows stay as reported; the
+    states are kept beside them, by PHY.
     """
     lists = payload.get("lists") or {}
     states: dict[str, str] = {}
     if not rows or lists.get("expanders") not in {"read", "empty"}:
         return states
-    expander_handles = Counter(str(row.get("dev_handle") or "").lower() for row in payload.get("expanders") or [])
-    devices_read = lists.get("devices") in {"read", "empty"}
-    device_handles = Counter(
-        str(device.get("handle") or "").lower()
-        for device in payload.get("devices") or []
-        if device.get("device") not in _MPR_EXPANDER_ATTACHED_DEVICES
-    )
+    devices = _mpr_handle_devices(payload)
     for row in rows:
-        handle = str(row.get("device_handle") or "").lower()
-        if not handle or handle == "0000":
+        handle = _mpr_handle(row.get("device_handle"))
+        found = devices.get(handle or "", [])
+        if not found:
             continue
-        expanders, others = expander_handles[handle], device_handles[handle] if devices_read else 0
-        if expanders + others > 1:
-            states[str(row.get("phy"))] = "ambiguous"
-        elif not expanders and others == 1:
-            states[str(row.get("phy"))] = "end_device"
+        phy = str(row.get("phy"))
+        if len(found) > 1 or found[0]["conflict"]:
+            states[phy] = "ambiguous"
+            continue
+        # 0000 is the utility's "no handle": the row's own handle not read.
+        own = _mpr_handle(row.get("controller_handle"))
+        kind, parent, own = found[0]["kind"], found[0]["parent"], None if own == "0000" else own
+        # An HBA row reporting an expander names it by the initiator or an
+        # expander type; any other kind must be the row's own.
+        row_kind = _mpr_device_kind(row.get("device"))
+        agrees = row_kind in {"initiator", "expander"} if kind == "expander" else row_kind == kind
+        if (parent and own and parent != own) or not agrees:
+            states[phy] = "mismatch"
+        elif kind != "expander":
+            states[phy] = {"disk": "end_device", "sep": "sep"}.get(kind, "other_device")
     return states
+
+
+def _mpr_ambiguous_handles(payload: dict[str, Any]) -> set[str]:
+    """Handles of one unit that name more than one device, or a device whose records disagree."""
+    return {handle for handle, found in _mpr_handle_devices(payload).items() if len(found) > 1 or found[0]["conflict"]}
 
 
 def _add_mpr_infrastructure(
@@ -913,7 +996,7 @@ def _add_mpr_infrastructure(
                 controller["device_handle_states"] = states
         expanders = payload.get("expanders") or []
         parent_context = _mpr_expander_parent_context(expanders, controller_id)
-        lane_context = _MprReportedLaneContext(expanders, payload.get("adapter_detail"), unit)
+        lane_context = _MprReportedLaneContext(expanders, payload.get("adapter_detail"), unit, _mpr_ambiguous_handles(payload))
         for index, (expander, (parent_id, parent_reason)) in enumerate(zip(expanders, parent_context, strict=True)):
             expander_id = f"expander:{controller_id}:{expander.get('sas_address') or expander.get('dev_handle')}"
             expander_key = _identifier_lookup_key(expander.get("sas_address"))

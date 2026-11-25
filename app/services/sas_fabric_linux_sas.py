@@ -173,6 +173,7 @@ def enrich_linux_sas_fabric(
             node.controller_id = None
             node.raw["controller_ids"] = []
     projection.attach_bays(snapshot, traces, warnings)
+    projection.mark_inventory_identities(snapshot)
     transport_raw.update(sas_transport_port_index=projection.port_facts, sas_transport_projected_facts=facts,
                          sas_transport_ports=projection.port_census)
     for controller_id in sorted(projection.controller_ids):
@@ -397,6 +398,28 @@ class _Projection:
         for record in self.port_census:
             address = str(record["remote_sas_address"] or "").lower()
             if record["remote_kind"] == "end_device" and len(slots_by_address.get(address, ())) > 1:
+                record["remote_address_state"] = "ambiguous"
+
+    def mark_inventory_identities(self, snapshot: Any) -> None:
+        """A disk port address is one disk's identity across the transport and
+        the inventory too: an address the inventory reports for two bays, or
+        one the transport places in another enclosure than the bay the
+        inventory gives it, identifies neither, though one end is not read.
+        Bay numbers are not compared: sysfs numbering need not be the
+        inventory's.
+        """
+        def key(value: Any) -> str:
+            return str(value or "").strip().lower().removeprefix("0x")
+
+        bays: dict[str, set[tuple[str, Any]]] = defaultdict(set)
+        for slot in getattr(snapshot, "slots", None) or []:
+            if key(slot.sas_address):
+                bays[key(slot.sas_address)].add((key(slot.enclosure_id), slot.slot))
+        for record in self.port_census:
+            if record["remote_kind"] != "end_device" or not key(record["remote_sas_address"]):
+                continue
+            found, enclosure = bays.get(key(record["remote_sas_address"]), set()), key(record["enclosure_identifier"])
+            if len(found) > 1 or (enclosure and any(item[0] and item[0] != enclosure for item in found)):
                 record["remote_address_state"] = "ambiguous"
 
     def chain(self, owner_id: str) -> tuple[list[str], list[str]]:

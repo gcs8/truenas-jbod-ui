@@ -54,7 +54,7 @@
   "fabric": {
    "service": "ui",
    "template": "app/templates/sas_fabric.html",
-   "scripts": ["app/static/sas_fabric_transport.js","app/static/sas_fabric_topology_layout.js","app/static/sas_fabric_topology_ui.js","app/static/sas_fabric_topology.js","app/static/sas_fabric_view.js"],
+   "scripts": ["app/static/sas_fabric_transport.js","app/static/sas_fabric_topology_layout.js","app/static/sas_fabric_topology_ui.js","app/static/sas_fabric_topology_evidence.js","app/static/sas_fabric_topology.js","app/static/sas_fabric_view.js"],
    "scopes": {
     "enclosure": [
      {"method":"GET","path":"/api/inventory","class":"read","query":["enclosure_id","force","mode","system_id"],"bind":["system_id","enclosure_id"],"sites":["app/static/sas_fabric_view.js#refreshFabric"]},

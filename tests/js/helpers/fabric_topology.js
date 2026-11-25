@@ -12,7 +12,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../../..");
-const TOPOLOGY_PATHS = ["sas_fabric_topology_layout.js", "sas_fabric_topology_ui.js", "sas_fabric_topology.js"].map((name) => path.join(ROOT, "app/static", name));
+const TOPOLOGY_PATHS = ["sas_fabric_topology_layout.js", "sas_fabric_topology_ui.js", "sas_fabric_topology_evidence.js", "sas_fabric_topology.js"].map((name) => path.join(ROOT, "app/static", name));
 function topologySource() { return TOPOLOGY_PATHS.map((file) => fs.readFileSync(file, "utf8")).join("\n"); }
 const FIXTURE_PATH = path.join(ROOT, "tests/fixtures/sas_fabric/topology_fabric.json");
 

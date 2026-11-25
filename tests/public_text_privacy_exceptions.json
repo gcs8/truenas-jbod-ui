@@ -407,6 +407,14 @@
     },
     "reason": "One invented second-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
   },
+  "tests/js/fabric_topology_identity_tuple.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:99f23c41a1fa3357e2beab454a987774671f7e763bd7962a1084271b1a800742": 10
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
   "tests/js/fabric_topology_presence.test.js": {
     "findings": {
       "sas_wwn_identifier": {
@@ -415,10 +423,18 @@
     },
     "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
   },
+  "tests/mutation/topology_frontend_mutants.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:a94dd50d4aec570dacf6b7798ce5674657ff5b0278928b215145dbe800ac5681": 1
+      }
+    },
+    "reason": "A mutant plants one invented SAS address in the view to prove the tests reject an address the payload does not carry."
+  },
   "tests/test_fabric_topology_fixture.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:852f3a734948c36a762c88478c3bbaea84379532f4e1f336bd29797cad584e99": 10
+        "sha256:24c0caddd3e2c39d956647edecdd85b93dfa3a7fde47f41dfcf46812044f662f": 18
       }
     },
     "reason": "Patterned synthetic CORE expander, disk, HBA and enclosure addresses of the builder's synthetic survey lines; exact detector count is pinned."

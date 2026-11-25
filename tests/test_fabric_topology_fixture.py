@@ -346,12 +346,27 @@ def _core_variant(mode: str):
     def build():
         system, snapshot, outputs = _core_case()
         adapter, devices, expanders = "mprutil -u 0 show adapter", "mprutil -u 0 show devices", "mprutil -u 0 show expanders"
-        if mode in {"present", "absent"}:
-            handle = "0020" if mode == "present" else "009b"
-            outputs[adapter] = outputs[adapter].replace("4 0000 0000 N 0 3.0 12.0 No Device", f"4 0001 {handle} N 12.0 3.0 12.0 SAS Target")
+        enclosures = "mprutil -u 0 show enclosures"
+        # PHY 4 of mpr0 given a handle: a disk's, the enclosure processor's,
+        # or one nothing carries; and the row's own device type.
+        handle = {"present": "0020", "behind": "0020", "type-clash": "0020", "sep": "0008", "sep-unlisted": "0008"}.get(mode, "009b")
+        device = {"sep": "SEP Target", "sep-unlisted": "SEP Target", "type-clash": "Edge Expander"}.get(mode, "SAS Target")
+        if mode in {"present", "absent", "behind", "type-clash", "sep", "sep-unlisted"}:
+            outputs[adapter] = outputs[adapter].replace("4 0000 0000 N 0 3.0 12.0 No Device", f"4 0001 {handle} N 12.0 3.0 12.0 {device}")
+        if mode in {"present", "absent", "type-clash"}:
             outputs[devices] = outputs[devices].replace("5000c5000000d000 0020 0009 SAS Target", "5000c5000000d000 0020 0001 SAS Target")
+        if mode == "sep":
+            outputs[devices] += f"\n00 8 {FRONT} 0008 0001 SEP Target 12.0 0002 8"
         if mode == "duplicate":
             outputs[expanders] = outputs[expanders].replace("5000c50000000e02 000a 0009", "5000c50000000e02 0009 0009")
+        # The expander's handle on a second device: the same expander seen
+        # again, another SMP target, or the enclosure processor.
+        if mode in {"smp-same", "smp-other", "smp-other-parent"}:
+            address = _address(0xEEE) if mode == "smp-other" else _expander_address(0, 1)
+            parent = "0002" if mode == "smp-other-parent" else "0001"
+            outputs[devices] += f"\n00 8 {address} 0009 {parent} SMP Target 12.0 0002 8"
+        if mode == "sep-collision":
+            outputs[enclosures] = outputs[enclosures].replace("0008 0002 SES", "0009 0002 SES")
         return system, snapshot, outputs
 
     return _case_payload(build)["fabric"]
@@ -379,11 +394,44 @@ class AdapterHandleIdentityTests(unittest.TestCase):
         absent = next(item for item in _core_variant("absent")["controllers"] if item["id"] == "controller:mpr0")
         self.assertNotIn("device_handle_states", absent)
 
+    @staticmethod
+    def _mpr0(mode: str) -> dict:
+        return next(item for item in _core_variant(mode)["controllers"] if item["id"] == "controller:mpr0")
+
+    def test_the_enclosure_processor_a_handle_names_is_one_whichever_reply_names_it(self) -> None:
+        # Named by the device list and the enclosure list, or by the
+        # enclosure list alone: the enclosure processor, never a disk.
+        for mode in ("sep", "sep-unlisted"):
+            self.assertEqual(self._mpr0(mode).get("device_handle_states"), {"4": "sep"}, mode)
+
+    def test_a_disk_handle_whose_device_is_not_attached_to_this_hba_or_of_another_type_contradicts_the_row(self) -> None:
+        # The disk's own parent is the expander, or the row says an expander
+        # is attached: the row and the device list disagree.
+        for mode in ("behind", "type-clash"):
+            self.assertEqual(self._mpr0(mode).get("device_handle_states"), {"4": "mismatch"}, mode)
+
+    def test_an_expander_handle_a_second_device_carries_is_ambiguous_and_its_cable_lanes_are_not_reported(self) -> None:
+        # The same expander's address under another parent is one device
+        # whose records disagree: ambiguous too.
+        for mode in ("smp-other", "sep-collision", "smp-other-parent"):
+            fabric = _core_variant(mode)
+            mpr0 = next(item for item in fabric["controllers"] if item["id"] == "controller:mpr0")
+            self.assertEqual(mpr0.get("device_handle_states"), {str(phy): "ambiguous" for phy in range(4)}, mode)
+            cable = next(link for link in fabric["links"] if link["kind"] == "controller-expander" and link["source"] == "controller:mpr0")
+            self.assertIsNone(cable["reported_lanes"], mode)
+
+    def test_the_same_expander_seen_again_in_the_device_list_is_one_device(self) -> None:
+        fabric = _core_variant("smp-same")
+        mpr0 = next(item for item in fabric["controllers"] if item["id"] == "controller:mpr0")
+        self.assertNotIn("device_handle_states", mpr0)
+        cable = next(link for link in fabric["links"] if link["kind"] == "controller-expander" and link["source"] == "controller:mpr0")
+        self.assertEqual(cable["reported_lanes"]["lane_count"], 4)
+
 
 class TransportAddressIdentityTests(unittest.TestCase):
     """A disk port address at two slots identifies neither, host-wide (#1504)."""
 
-    def _records(self, duplicate: bool) -> list[dict]:
+    def _records(self, duplicate: bool, inventory_addresses: bool = True) -> list[dict]:
         from tests import topology_generality_fixtures as generality
 
         survey = generality.Survey()
@@ -393,10 +441,16 @@ class TransportAddressIdentityTests(unittest.TestCase):
         for bay in (0, 1):
             address = "5eee000000000010" if duplicate or bay == 0 else "5eee000000000011"
             survey.end(expander, [bay], bay=bay, enclosure=shelf["id"], address=address, block=f"wdcase{bay}")
-            shelf["slots"].append({"slot": bay, "address": address, "block": f"wdcase{bay}"})
+            shelf["slots"].append({"slot": bay, "address": address if inventory_addresses else None, "block": f"wdcase{bay}"})
         fabric, _inventory, ok = generality.enriched({"id": "example", "label": "Test box", "enclosures": [shelf]}, shelf, survey.text())
         self.assertTrue(ok)
         return [record for record in fabric["raw"]["sas_transport_ports"] if record["remote_kind"] == "end_device"]
+
+    def test_one_address_at_two_transport_slots_marks_both_records_whatever_the_inventory_reports(self) -> None:
+        # The transport alone places one address at two slots.
+        records = self._records(duplicate=True, inventory_addresses=False)
+        self.assertEqual(sorted(record["bay_identifier"] for record in records), [0, 1])
+        self.assertTrue(all(record.get("remote_address_state") == "ambiguous" for record in records))
 
     def test_one_address_at_two_slots_marks_both_records(self) -> None:
         records = self._records(duplicate=True)
@@ -405,6 +459,40 @@ class TransportAddressIdentityTests(unittest.TestCase):
 
     def test_distinct_addresses_are_not_marked(self) -> None:
         self.assertTrue(all("remote_address_state" not in record for record in self._records(duplicate=False)))
+
+    def _survey(self, mode: str) -> list[dict]:
+        """Two bays whose inventory reports one address (``partial``: only
+        Bay 01's transport end is read), or whose second disk the transport
+        places in another enclosure than its bay (``contradict``)."""
+        from tests import topology_generality_fixtures as generality
+
+        survey = generality.Survey()
+        host = survey.host(1, address="5aaa000000000101", phys=4)
+        expander = survey.expander(host, [0, 1], index=0, address="5bbb00000000a1b2", phys=4, uplink=[2, 3])
+        shelf = {"id": "5fff0000000000f0", "label": "Test shelf", "layout": [[0, 1]], "slots": []}
+        for bay in (0, 1):
+            address = "5eee000000000010" if mode == "partial" or bay == 0 else "5eee000000000011"
+            if mode != "partial" or bay == 1:
+                placed = mode == "contradict" and bay == 1
+                survey.end(expander, [bay], bay=0 if placed else bay, enclosure="5fff0000000000aa" if placed else shelf["id"], address=address, block=f"wdcase{bay}")
+            shelf["slots"].append({"slot": bay, "address": address, "block": f"wdcase{bay}"})
+        fabric, _inventory, ok = generality.enriched({"id": "example", "label": "Test box", "enclosures": [shelf]}, shelf, survey.text())
+        self.assertTrue(ok)
+        return [record for record in fabric["raw"]["sas_transport_ports"] if record["remote_kind"] == "end_device"]
+
+    def test_an_address_the_inventory_reports_for_two_bays_is_ambiguous_though_one_end_is_not_read(self) -> None:
+        records = self._survey("partial")
+        self.assertEqual([record["bay_identifier"] for record in records], [1])
+        self.assertEqual(records[0].get("remote_address_state"), "ambiguous")
+
+    def test_a_disk_the_transport_places_in_another_enclosure_than_its_bay_is_ambiguous(self) -> None:
+        records = {record["remote_sas_address"]: record for record in self._survey("contradict")}
+        self.assertEqual(records["5eee000000000011"].get("remote_address_state"), "ambiguous")
+        # The disk whose enclosure agrees is not marked.
+        self.assertNotIn("remote_address_state", records["5eee000000000010"])
+
+    def test_agreeing_inventory_and_transport_mark_nothing(self) -> None:
+        self.assertTrue(all("remote_address_state" not in record for record in self._survey("agreement")))
 
 
 if __name__ == "__main__":

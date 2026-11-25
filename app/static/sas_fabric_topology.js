@@ -422,6 +422,16 @@ function identityTerms(item, trace, slot) {
     return [...new Set(values.filter((value) => typeof value === "string" && value).map((value) => value.toLowerCase()))];
   }
 
+// The disk port addresses a bay's own records report, and the enclosures
+// they place it in: its node, its trace's records and its inventory slot.
+// A field a record does not read adds nothing.
+function reportedPlace(item, trace, slot) {
+    const records = [item.metrics, item.raw, trace?.metrics, slot, slot?.raw_status,
+      ...[trace?.metrics?.path_states, trace?.metrics?.sas_transport_ports, trace?.metrics?.mpr_devices].flatMap(list)].filter(isRecord);
+    const values = (key) => [...new Set(records.map((record) => sasAddressOf(record[key])).filter(Boolean))].sort();
+    return { addresses: values("sas_address"), enclosures: values("enclosure_id") };
+  }
+
 function bayNumberOf(label, inventoryLabel) {
     const labelled = /^Bay\s+([0-9]+)$/.exec(String(label || ""));
     if (labelled) return labelled[1];
@@ -508,6 +518,7 @@ function sasIndex(fabric) {
         id: item.id,
         address: text(item.sas_address),
         handle: text(item.dev_handle),
+        controllerId: text(item.controller_id),
         product: text(item.product),
         reportedLevel: text(item.reported_level),
         enclosureAddress: text(item.enclosure_sas_address),
@@ -547,8 +558,12 @@ function sasIndex(fabric) {
           ...(row.counter_state ? phyFacts(row) : { counters: null, measured: false, errors: 0 }),
           phy: decimal(row.phy),
           handle: text(row.device_handle),
+          // The HBA's own handle on this row, which the far end names back.
+          // (0000 is the utility's "no handle").
+          ownHandle: /^0+$/.test(text(row.controller_handle)) ? "" : text(row.controller_handle),
           // What the builder found the handle names across the whole unit,
-          // before selection: "ambiguous", "end_device", or nothing.
+          // before selection: "ambiguous", "mismatch", the one device's kind
+          // ("end_device", "sep", "other_device"), or nothing.
           handleState: isRecord(item.device_handle_states) ? text(item.device_handle_states[String(row.phy)]) : "",
           device: text(row.device),
           disabled: row.disabled === "Y",
@@ -565,7 +580,18 @@ function sasIndex(fabric) {
       record.byPhy = new Map([...record.rowsByPhy].filter(([, rows]) => rows.length === 1).map(([phy, rows]) => [phy, rows[0]]));
       record.handle = "";
     }
-    return { expanders, controllers };
+    // Each HBA's enclosure processors by handle, as its enclosure list
+    // reports them: a handle any record carries is a device of that HBA.
+    const seps = new Map();
+    for (const item of list(fabric?.nodes)) {
+      if (!isRecord(item) || item.kind !== "mpr-enclosure" || !isRecord(item.raw) || !text(item.raw.sep_handle) || typeof item.controller_id !== "string") continue;
+      if (!seps.has(item.controller_id)) seps.set(item.controller_id, new Map());
+      const held = seps.get(item.controller_id);
+      held.set(text(item.raw.sep_handle), [...(held.get(text(item.raw.sep_handle)) || []), item.id]);
+    }
+    // Which of each HBA's lists were read, by its name, where the payload says.
+    const lists = isRecord(fabric?.raw?.controller_read?.lists) ? fabric.raw.controller_read.lists : null;
+    return { expanders, controllers, seps, lists };
   }
 
 // The device type a row is given when its PHY name is on more than one row
@@ -699,157 +725,6 @@ const TIER_RANK = { critical: 2, warning: 1, "": 0 };
 // read only where every observation read every counter; a counter that was
 // read is never dropped because another was not. Its role is what any
 // observation says is attached. Every surface and check reads this.
-// One role ledger per physical PHY, across every observation of its chip:
-// each row's device type, by the shared vocabulary, and each transport
-// census record that lists it (by number, or by a name that resolves to its
-// row). A record not read is unread evidence, never a role. Fixed on first
-// use.
-function phyRoles(model, id, phy) {
-    const chip = chipOfNode(model, id)?.id || id;
-    if (!model.roleLedger) model.roleLedger = new Map();
-    const key = `${chip}|${phy}`;
-    if (model.roleLedger.has(key)) return model.roleLedger.get(key);
-    const reading = phyReading(model, id, phy);
-    const roles = new Set();
-    // The finer kind of each link: an initiator, an expander, an inferred
-    // cable end; which cable end it can be is the table's.
-    const attached = new Set();
-    const unknown = [];
-    const unread = [];
-    const add = (kind) => {
-      attached.add(kind);
-      roles.add(({ initiator: "link", "sata initiator": "link", expander: "link", cable: "link" })[kind] || kind);
-    };
-    for (const device of reading.devices) {
-      for (const part of device.split(" / ")) {
-        const kind = deviceKind(part);
-        if (!kind) continue;
-        if (kind === "unknown") unknown.push(part);
-        else if (kind === "unread") {
-          // A row whose own type is not read: what is attached is not read.
-          unread.push(part === NAME_NOT_UNIQUE ? "its PHY name is on more than one row of its table, so no census record identifies it" : `its row says ${part}`);
-          add("unread");
-        }
-        else add(kind);
-      }
-    }
-    // A CORE row names its attached device's type; a row that names none
-    // has it not read (on the transport platform types come from the census).
-    if (!model.transport && reading.observations.some((item) => !text(item.row.device))) {
-      unread.push("its row names no attached device type");
-      add("unread");
-    }
-    const listing = list(model.censusRows).filter((port) => (chipOfNode(model, port.owner_id)?.id || port.owner_id) === chip && list(port.phys).includes(phy));
-    const records = listing.filter((port) => port.state === "read");
-    if (listing.some((port) => port.state === "ambiguous")) unread.unshift(`the transport census names it by ${listing.find((port) => port.state === "ambiguous").ambiguous.join(", ")}, a PHY name on more than one row, so that record identifies no PHY`);
-    if (listing.some((port) => !["read", "ambiguous"].includes(port.state))) unread.unshift("its transport census record was not read");
-    const kinds = new Set(records.map((port) => port.remote_kind || ""));
-    for (const kind of kinds) {
-      if (kind === "end_device") add("disk");
-      else if (kind === "expander") add("expander");
-      else {
-        unread.push(`the transport census does not say what it is attached to`);
-        add("unread");
-      }
-    }
-    if (unknown.length) roles.add("unknown");
-    // The targets the read expander records name, each one device whatever
-    // order the records came in: a present chip, or by SAS address or id a
-    // device not in this payload. An address two chips carry names neither.
-    // A record's id and its SAS address each name a target: where they name
-    // two, both are kept, and an id naming something other than an expander
-    // is a target of its own.
-    const targets = new Map();
-    for (const port of records.filter((item) => item.remote_kind === "expander")) {
-      const address = sasAddressOf(port.remote_sas_address);
-      const remote = port.remote_id ? model.nodeById.get(port.remote_id) : null;
-      if (remote?.kind === "expander") targets.set(chipOfNode(model, port.remote_id)?.id || port.remote_id, nodeName(model, chipOfNode(model, port.remote_id)?.id || port.remote_id));
-      else if (remote) targets.set(`kind:${port.remote_id}`, `${nodeName(model, port.remote_id)}, which is not an expander`);
-      else if (port.remote_id && !address) targets.set(`id:${port.remote_id}`, `a device not in this payload (${port.remote_id})`);
-      if (address) {
-        const found = [...new Set(model.nodes.filter((entry) => entry.kind === "expander" && [entry.address, sasAddressOf(entry.rawId)].includes(address)).map((entry) => chipOfNode(model, entry.id)?.id || entry.id))];
-        const keyed = found.length === 1 ? found[0] : found.length > 1 ? `ambiguous:${address}` : `address:${address}`;
-        targets.set(keyed, found.length === 1 ? nodeName(model, found[0]) : found.length > 1 ? `SAS address ${address}, which more than one expander here carries` : `a device not in this payload (${address})`);
-      }
-    }
-    // The disks the read end-device records name: two disks on one PHY
-    // are no one disk's.
-    const disks = new Map();
-    for (const port of records.filter((item) => item.remote_kind === "end_device")) {
-      const address = sasAddressOf(port.remote_sas_address);
-      const slot = port.bay_identifier !== null && port.bay_identifier !== undefined ? `${text(port.enclosure_identifier)}|${port.bay_identifier}` : "";
-      // By slot where the record names one: a dual-ported disk's two port
-      // addresses are one disk in one bay.
-      if (address || slot) disks.set(slot ? `slot:${slot}` : address, slot ? `the disk at bay ${port.bay_identifier}${address ? ` (${address})` : ""}` : `disk ${address}`);
-    }
-    const entry = { roles, attached, unknown: [...new Set(unknown)], unread, records, kinds, targets, disks };
-    model.roleLedger.set(key, entry);
-    return entry;
-  }
-
-const ROLE_WORDS = { disk: "a disk", link: "a link to an HBA or expander", sep: "an enclosure processor", none: "nothing attached", unread: "an attachment not read" };
-const KIND_WORDS = { initiator: "an HBA (an initiator)", "sata initiator": "a SATA initiator", expander: "an expander", cable: "an inferred cable end" };
-
-// The targets a PHY's read census records name, as words, in one order.
-function targetWords(targets) {
-  return [...targets.values()].sort().join(" and ");
-}
-
-// What a CORE HBA row's device handle names, over every record of the
-// payload that carries a handle of that HBA (expanders, bays' disk paths)
-// and what the builder found across the whole unit before selection: one
-// expander, one disk, a device of the HBA's own list, more than one (not
-// read), none read, or nothing here.
-function handleTarget(model, id, phy) {
-    const rows = list(model.sas.controllers.get(id)?.phys).filter((item) => item.phy === phy);
-    if (rows.length !== 1) return { state: rows.length ? "rows" : "" };
-    const [row] = rows;
-    if (!row.handle) return { state: row.rate !== null ? "none" : "", row };
-    const expanders = model.nodes.filter((entry) => entry.kind === "expander" && entry.controllerId === id && model.sas.expanders.get(entry.id)?.handle === row.handle);
-    const bays = [...new Set(model.bays.filter((bay) => bay.ports.some((port) => port.controllerId === id && port.handle === row.handle)))];
-    if (expanders.length > 1) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one expander of ${nodeName(model, id)}` };
-    if (row.handleState === "ambiguous" || expanders.length + bays.length > 1) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${nodeName(model, id)}` };
-    if (expanders.length === 1) return { state: "expander", row, id: chipOfNode(model, expanders[0].id)?.id || expanders[0].id };
-    if (bays.length === 1) return { state: "disk", row, bay: bays[0] };
-    if (row.handleState === "end_device") return { state: "device", row };
-    return { state: "absent", row };
-  }
-
-// Where a CORE HBA's own row is read, a cable from it claims a PHY only
-// where that row's handle names the cable's far end.
-function handleClash(model, link, side, phy) {
-    if (side !== "near" || model.transport || model.nodeById.get(link.source)?.kind !== "controller" || !list(model.sas.controllers.get(link.source)?.phys).length) return "";
-    const target = handleTarget(model, link.source, phy);
-    const far = chipOfNode(model, link.target)?.id || link.target;
-    if (target.state === "expander" && target.id === far) return "";
-    return target.state === "ambiguous" ? target.why
-      : target.state === "rows" ? `its number is on more than one row of ${nodeName(model, link.source)}`
-      : target.state === "none" || !target.state ? `its row's device handle is ${NOT_READ}`
-      : target.state === "expander" ? `its row's device handle ${target.row.handle} names ${nodeName(model, target.id)}, not this cable's far end`
-      : `its row's device handle ${target.row.handle} names no expander of this cable`;
-  }
-
-// A cable's members as the ledger reads them: each listed PHY's evidence
-// must be a kind the table says can end this cable there, and every target
-// a read census record names must be its other end. Otherwise which PHYs
-// the cable uses is not read, for lanes, rates, counters and inspectors.
-function memberConflicts(model, link) {
-    if (!link.lanes) return [];
-    const found = [];
-    for (const [side, id, phys] of [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]]) {
-      const other = chipOfNode(model, side === "near" ? link.target : link.source)?.id || (side === "near" ? link.target : link.source);
-      for (const phy of new Set(phys)) {
-        const ledger = phyRoles(model, id, phy);
-        const kind = [...ledger.attached].find((item) => !cableEndAccepts(link.kind, side, item));
-        const stray = [...ledger.roles].find((role) => !["link"].includes(role));
-        if (kind || stray) found.push({ side, id, phy, why: `its row or the transport census names ${KIND_WORDS[kind] || ROLE_WORDS[stray] || "a device type whose role is not read"}, which cannot be this end of the cable` });
-        else if ([...ledger.targets.keys()].some((key) => key !== other)) found.push({ side, id, phy, why: `the transport census names ${targetWords(ledger.targets)}` });
-        else if (handleClash(model, link, side, phy)) found.push({ side, id, phy, why: handleClash(model, link, side, phy) });
-      }
-    }
-    return found;
-  }
-
 function phyReading(model, id, phy) {
     if (!model.phyReadings) model.phyReadings = new Map();
     const chip = chipOfNode(model, id);
@@ -1762,6 +1637,15 @@ function buildTopologyModel(given, options = {}) {
             .filter((lane) => Number.isInteger(lane.source_phy) && Number.isInteger(lane.target_phy))
             .map((lane) => ({ source: lane.source_phy, target: lane.target_phy, rate: sasRate(lane.negotiated_rate_gbps) })),
         };
+        // A lane's rate is read only where both ends' own rows, where they
+        // report one, agree with it: a retained list never outranks its ends.
+        const endRate = (id, phy) => (sas.controllers.get(id) || sas.expanders.get(id))?.byPhy.get(phy)?.rate ?? null;
+        for (const lane of lanes.rows) {
+          if ([endRate(item.source, lane.source), endRate(item.target, lane.target)].some((rate) => rate !== null && rate !== lane.rate)) {
+            lane.rate = null;
+            lanes.rate = null;
+          }
+        }
       }
       const laneLink = LANE_LINKS.has(item.kind);
       const entry = {
@@ -1946,6 +1830,7 @@ function buildTopologyModel(given, options = {}) {
         deviceName: metrics.device_name || trace?.metrics?.device_name || "",
         terms: searchTerms(item, trace, inventorySlot),
         identities: identityTerms(item, trace, inventorySlot),
+        reported: reportedPlace(item, trace, inventorySlot),
         pathStates,
         ports: [],
         sources: [...(baySources.get(item.id) || [])].sort(naturalCompare),
@@ -1977,6 +1862,8 @@ function buildTopologyModel(given, options = {}) {
           device: text(device?.member_device_name) || state?.device || "",
           sasAddress: sasAddressOf(device?.sas_address) || sasAddressOf(raw.sas_address),
           handle: text(device?.handle),
+          // The handle of what the disk's own path is attached to.
+          parent: text(device?.parent),
           rate: device ? sasRate(device.speed) : null,
           protocol: protocolOf(device?.mpr_device, raw.target_port_protocol, raw.sas_device_type === "end device" ? raw.transport_protocol : ""),
           attached: sasAddressOf(raw.attached_sas_address) || spelled?.address || "",
@@ -2862,13 +2749,6 @@ function modelParts(fabric, core) {
     errorDigest: { configurable: true, get: () => errorDigest },
     errorSummary: { configurable: true, get: () => errorSummary },
     phyReading: { configurable: true, get: () => phyReading },
-    phyRoles: { configurable: true, get: () => phyRoles },
-    ROLE_WORDS: { configurable: true, get: () => ROLE_WORDS },
-    KIND_WORDS: { configurable: true, get: () => KIND_WORDS },
-    targetWords: { configurable: true, get: () => targetWords },
-    handleTarget: { configurable: true, get: () => handleTarget },
-    handleClash: { configurable: true, get: () => handleClash },
-    memberConflicts: { configurable: true, get: () => memberConflicts },
     deviceRole: { configurable: true, get: () => deviceRole },
     deviceKind: { configurable: true, get: () => deviceKind },
     cableEndAccepts: { configurable: true, get: () => cableEndAccepts },
@@ -2912,6 +2792,7 @@ function modelParts(fabric, core) {
     scopeOf: { configurable: true, get: () => scopeOf },
     modelParts: { configurable: true, get: () => modelParts },
   });
+  window.SasFabricTopologyEvidence(context);
   window.SasFabricTopologyLayout(context);
   window.SasFabricTopologyUI(context);
   window.SasFabricTopology = {
