@@ -305,3 +305,23 @@ test("a disk record naming one unique and one shared PHY name gives neither PHY 
   const line = said1(model(item), /101 invalid dword/);
   assert.match(line, /host1: PHY 12/, line);
 });
+
+test("a near PHY is not styled below the maximum while the far list is not read", () => {
+  const item = fixture("wide-x4-sata");
+  const uplink = item.fabric.links.find((link) => link.kind === "controller-expander" && link.reported_lanes?.lane_count === 4);
+  // Its four inferred far members, and one more PHY no census record names.
+  const inferred = model(fixture("wide-x4-sata")).links.find((entry) => entry.source === uplink.source && entry.target === uplink.target).lanes.targetPhys;
+  const listed = new Set(item.fabric.raw.sas_transport_ports.filter((port) => port.owner_id === uplink.target).flatMap((port) => port.phys || []));
+  const spare = phyRows(item.fabric, uplink.target).map((entry) => entry.phy).find((phy) => !inferred.includes(phy) && !listed.has(phy));
+  const far = [...inferred, spare];
+  Object.assign(uplink.reported_lanes, { target_phys: far, target_basis: "reported" });
+  const slowPhy = uplink.reported_lanes.source_phys[1];
+  Object.assign(phyRows(item.fabric, uplink.source).find((entry) => entry.phy === slowPhy), { negotiated_rate_gbps: 3, negotiated_link_rate: "3.0 Gbit" });
+  const built = model(item);
+  const link = built.links.find((entry) => entry.source === uplink.source && entry.target === uplink.target);
+  assert.ok(link?.lanes?.targetPhys.length === 5, textOf(link?.lanes));
+  const rows = kv(built, { kind: "link", id: link.id }).filter(([, label]) => new RegExp(`PHY ${slowPhy}$`).test(label));
+  assert.ok(rows.length, textOf(kv(built, { kind: "link", id: link.id })));
+  assert.ok(!rows.some(([cls]) => cls === "topo-warn"), textOf(rows));
+  assert.ok(!cardRows(built, { kind: "link", id: link.id }).some((entry) => entry.label === "Per lane" && entry.warn), textOf(cardRows(built, { kind: "link", id: link.id })));
+});

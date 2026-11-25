@@ -202,6 +202,9 @@ test("an HBA PHY on two rows gives its lane no maximum, in either order", () => 
   });
   assert.deepEqual(outputs[0], outputs[1]);
   assert.ok(!outputs[0].lanes.some((entry) => ["pass", "critical"].includes(entry.status)), textOf(outputs[0].lanes));
+  // No maximum is taken from either row, and the reason is said of the row.
+  assert.match(textOf(outputs[0].lanes), /rate or an end's maximum not read for 1 lane/);
+  assert.match(textOf(outputs[0].lanes), /PHY 0 at mpr0: its number is on more than one row of mpr0/);
 });
 
 test("a pinned lane whose membership is not read states no maximum", () => {

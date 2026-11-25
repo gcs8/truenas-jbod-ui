@@ -823,7 +823,8 @@ function handleClash(model, link, side, phy) {
     const far = chipOfNode(model, link.target)?.id || link.target;
     if (target.state === "expander" && target.id === far) return "";
     return target.state === "ambiguous" ? target.why
-      : target.state === "none" || target.state === "rows" || !target.state ? `its row's device handle is ${NOT_READ}`
+      : target.state === "rows" ? `its number is on more than one row of ${nodeName(model, link.source)}`
+      : target.state === "none" || !target.state ? `its row's device handle is ${NOT_READ}`
       : target.state === "expander" ? `its row's device handle ${target.row.handle} names ${nodeName(model, target.id)}, not this cable's far end`
       : `its row's device handle ${target.row.handle} names no expander of this cable`;
   }

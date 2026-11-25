@@ -263,6 +263,8 @@ test("an HBA cable's far PHY that names no initiator is not the cable's, for eve
     const line = said1(built, /101 invalid dword/);
     assert.doesNotMatch(line, /→/, `${device}: ${line}`);
     assert.match(line, /(owner|role) not read/, `${device}: ${line}`);
+    // The PHY's own reason, not only that its cable's members are not read.
+    if (device === "Edge Expander") assert.match(line, /names an expander, which cannot be this end of that cable/, line);
     const lane = kv(built, { kind: "link", id: link.id }).find(([, label]) => label === "Lane PHY 0 ↔ 32");
     assert.doesNotMatch(lane[2], /target PHY: 101/, `${device}: ${lane[2]}`);
     assert.ok(!statuses(built, "lanes").includes("pass"), `${device}: ${textOf(checksOf(built, "lanes"))}`);

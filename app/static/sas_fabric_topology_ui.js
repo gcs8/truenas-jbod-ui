@@ -1286,7 +1286,6 @@ function wiringChecks(model, fabric) {
           for (const phy of phys) cover.expect(phyKey(port.expanderId, phy), `${bay.label}: PHY ${phy} of ${chipOf(port.expanderId).label}`, "phy");
           const others = [...(addressBays.get(port.sasAddress) || [])].filter((other) => other !== bay);
           if (others.length) {
-            for (const phy of phys) cover.unread(phyKey(port.expanderId, phy));
             unread.push(`${bay.label}: its disk port address ${port.sasAddress} is also reported for ${others.map((other) => other.label).join(", ")}, so which disk is on PHY ${context.phyRanges(phys)} of ${chipOf(port.expanderId).label} is not read`);
           }
         }
@@ -1306,8 +1305,7 @@ function wiringChecks(model, fabric) {
           cover.expect(key, `${chip.label}: PHY ${phy}, a disk port the transport census lists`, "phy");
         }
       }
-      // Its fault, if any, is said once by the cable check.
-      const roleUnread = new Set();
+      // Its fault, if any, is said once by the cable check (saidFaults).
       // A PHY a census record not read lists, that nothing else classifies:
       // whether it is a disk port is not read, so the check cannot pass on it.
       for (const port of context.list(model.censusRows)) {
@@ -1328,7 +1326,6 @@ function wiringChecks(model, fabric) {
           if (owner.known || owner.disputed || [...owner.roles].some((role) => role !== "unread") || cover.has(key)) continue;
           cover.expect(key, `${chip.label}: PHY ${phy}`, "phy");
           cover.unread(key);
-          roleUnread.add(key);
           unread.push(`${chip.label}: PHY ${phy} (${owner.note}), so whether it is a disk port is not read`);
         }
       }
@@ -1345,15 +1342,13 @@ function wiringChecks(model, fabric) {
         const entry = model.nodeById.get(view.id);
         for (const phy of chipPhys(view)) {
           const key = `${view.id}|${phy}`;
-          if (roleUnread.has(key)) continue;
           const reading = readingOf(view.id, phy);
           const owner = phyOwner(model, view.id, phy);
           // A disputed PHY a bay claims, or that names a disk, is said here.
           const here = owner.disputed && diskEvidence(owner);
           if (!here && saidFaults.has(key)) continue;
-          // An HBA PHY is judged here only as a disk port: its other faults
-          // are the cable check's.
-          if (view.hba && !here && !cover.has(key) && !portAt.has(key)) continue;
+          // An HBA PHY's other faults are the cable check's: said there
+          // (saidFaults), on its cable, or as an uplink, never here again.
           if (!here && (cablePhys.has(key) || (owner.roles.has("link") && !owner.roles.has("disk")))) continue;
           const at = portAt.get(key);
           if (!at && (owner.roles.has("disk") || conflicts.has(key) || here)) cover.expect(key, `${entry.label}: PHY ${phy}, ${conflicts.has(key) || here ? "a disk port whose owner or role is not read" : "a disk port no bay is matched to"}`, "phy");
