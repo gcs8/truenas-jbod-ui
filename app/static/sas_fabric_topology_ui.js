@@ -1047,7 +1047,6 @@ function wiringChecks(model, fabric) {
     const readingOf = (id, phy) => context.phyReading(model, id, phy);
     // PHY numbers of each drawn chip, the union over its observations.
     const chipPhys = (view) => context.chipPhyNumbers(model, view.id);
-    const diskRole = (reading) => reading.devices.some((device) => /(SAS|SATA) Target|End device/.test(device));
     // What read evidence names a disk on a PHY: a bay's port, a disk role on
     // a row, or the read transport census. One rule for both checks.
     const diskEvidence = (owner) => owner.bays.length > 0 || owner.roles.has("disk");

@@ -410,7 +410,7 @@
   "tests/js/fabric_topology_ledger.test.js": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:d75f6158d2fdb96a337471b3a53d9a61f6aee069ff2c53d47bfe47345a45b709": 7
+        "sha256:0252233fe4dbf31e0360735d1c89ddd43c476907898100d456c1e76ed3c9b896": 8
       }
     },
     "reason": "Patterned synthetic HBA, disk-port and CORE expander addresses from the Topology fixture seeds; exact detector count is pinned."

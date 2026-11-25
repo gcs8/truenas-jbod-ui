@@ -296,3 +296,55 @@ test("beside a direct path, which disk ports the paths use is not read where an 
   assert.ok(!statuses(built, "ports").includes("pass"), textOf(checksOf(built, "ports")));
   assert.match(textOf(checksOf(built, "ports")), /which of its disk ports its direct and expander paths use is not read/);
 });
+
+test("a role the second observation of a chip reads governs the PHY as much as the first's", () => {
+  // CORE, two boards: mpr1 also observes mpr0's expander …0e01. Only
+  // mpr1's row for Bay 00's PHY names an expander on it.
+  const data = core();
+  const fabric = data.fabric;
+  const options = { inventory: { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, layout_rows: [[0, 1, 2, 3], [4, 5, 6, 7]] } };
+  const first = fabric.expanders.find((entry) => entry.id.endsWith("mpr0:5000c50000000e01"));
+  const device = fabric.traces.find((entry) => entry.id === "bay:0").metrics.mpr_devices.find((entry) => entry.expander_ids.includes(first.id));
+  Object.assign(first.phys.find((entry) => Number(entry.phy) === 6), { device: "SAS Target", dev_handle: device.handle, speed: "12.0" });
+  const id = first.id.replace("mpr0", "mpr1");
+  const second = { ...structuredClone(first), id };
+  fabric.expanders.push(second);
+  const original = fabric.nodes.find((entry) => entry.id === first.id);
+  fabric.nodes.push({ ...structuredClone(original), id, controller_id: "controller:mpr1", raw: { ...structuredClone(original.raw), controller_id: "controller:mpr1" } });
+  const before = T.buildTopologyModel(structuredClone(fabric), options);
+  const port = before.bays[0].ports.find((entry) => entry.expanderId === first.id);
+  assert.ok(port?.phy, "Bay 00 has a joined port on …0e01");
+  assert.ok(before.nodes.some((entry) => entry.rows?.length === 2), "the two observations are one chip");
+  second.phys.find((entry) => Number(entry.phy) === port.phy.phy).device = "Edge Expander";
+  const built = T.buildTopologyModel(fabric, options);
+  const errors = cardRows(built, { kind: "port", id: built.bays[0].ports.find((entry) => entry.expanderId === first.id).key }).find((entry) => entry.label === "PHY errors");
+  assert.match(errors.value, /owner not read: Bay 00 claims it, but its row or the transport census calls it a link/, errors.value);
+});
+
+test("a pinned chip row names every role its observations read, a bay's and the census's", () => {
+  const item = fixture("fanout-2");
+  const port = model(item).bays[0].ports[0];
+  const row = phyRows(item.fabric, port.expanderId).find((entry) => entry.phy === port.phy.phy);
+  Object.assign(row, { negotiated_rate_gbps: null, negotiated_link_rate: null, speed: null });
+  item.fabric.raw.sas_transport_ports.unshift({ id: "sas-port:extra-named", owner_id: port.expanderId, state: "read", phy_names: [row.name], phys: [],
+    remote_kind: "expander", remote_id: null, remote_sas_address: null, has_block: null, bay_identifier: null, enclosure_identifier: null, target_basis: "reported" });
+  const built = model(item);
+  const chip = built.nodeById.get(port.expanderId)?.mergedInto || port.expanderId;
+  const pinned = kv(built, { kind: "node", id: chip }).find(([, label]) => label === `PHY ${port.phy.phy}`);
+  assert.ok(pinned, textOf(kv(built, { kind: "node", id: chip })));
+  assert.match(pinned[2], /SMP Target/, pinned[2]);
+  assert.match(pinned[2], /SAS Target|SATA Target/, pinned[2]);
+});
+
+test("a read expander record that names no present target gives destination not read", () => {
+  const built = model(direct({ kind: "expander", count: 0 }));
+  assert.match(pin(built, HOST1, 12), /^destination not read/, pin(built, HOST1, 12));
+});
+
+test("read records naming an expander and an attachment not read give destination not read", () => {
+  const item = direct({ kind: "expander", count: 0 });
+  Object.assign(record(item), { remote_id: item.fabric.nodes.find((entry) => entry.kind === "expander").id });
+  item.fabric.raw.sas_transport_ports.push({ ...record(item), id: "sas-port:relation-2", remote_kind: "unknown", remote_id: null });
+  const value = pin(model(item), HOST1, 12);
+  assert.match(value, /^destination not read: the transport census lists it as expander and as unknown/, value);
+});
