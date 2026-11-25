@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -7,7 +8,9 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -34,6 +37,87 @@ EXTERNAL_ACTION_RE = re.compile(
 
 
 class CIWorkflowContractTests(unittest.TestCase):
+    def test_published_scan_is_main_only_serial_and_least_privilege(self) -> None:
+        path = WORKFLOW_DIR / "published-image-scan.yml"
+        self.assertTrue(path.is_file(), "published image scan workflow is missing")
+        text = self.read(path)
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertEqual(triggers["schedule"], [{"cron": "41 5 * * *"}])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        jobs = workflow["jobs"]
+        self.assertEqual(set(jobs), {"test", "scan"})
+        self.assertNotIn("permissions", jobs["test"])
+        writer = jobs["scan"]
+        self.assertEqual(writer["permissions"], {"contents": "read", "packages": "read", "issues": "write"})
+        self.assertEqual(writer["if"], "github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')")
+        self.assertEqual(writer["needs"], ["test"])
+        self.assertEqual(writer["concurrency"], {"group": "published-image-scan-writer", "cancel-in-progress": False})
+        for job in jobs.values():
+            self.assertEqual(job["runs-on"], "ubuntu-latest")
+            self.assertNotIn("runner.", json.dumps(job.get("env", {})))
+            self.assertNotIn("services", job)
+            for step in job["steps"]:
+                self.assertNotIn("continue-on-error", step)
+        steps = writer["steps"]
+        token_steps = [step for step in steps if "github.token" in json.dumps(step.get("env", {}))]
+        self.assertEqual(token_steps, [steps[-1]])
+        self.assertEqual(steps[-1]["env"]["GITHUB_TOKEN"], "${{ github.token }}")
+        self.assertIn("sync", steps[-1]["run"])
+        self.assertIn("scan", steps[-2]["run"])
+        self.assertIn("test_published_image_scan.py", json.dumps(jobs["test"]))
+        for forbidden in ("secrets.", "packages: write", "pull_request_target", "upload-artifact", "docker build"):
+            self.assertNotIn(forbidden, text)
+        ci_actions = {step["uses"] for job in yaml.safe_load(self.read(CI_WORKFLOW))["jobs"].values()
+                      for step in job.get("steps", []) if "uses" in step}
+        for job in jobs.values():
+            for step in job["steps"]:
+                if "uses" in step:
+                    self.assertIn(step["uses"], ci_actions)
+
+    def test_published_scan_native_policy_and_verified_version_pin(self) -> None:
+        policy = ROOT / ".trivyignore.yaml"
+        self.assertTrue(policy.is_file(), "native ignore policy is missing")
+        script = ROOT / ".github/scripts/published_image_scan.py"
+        spec = importlib.util.spec_from_file_location("published_image_scan_policy", script)
+        assert spec is not None and spec.loader is not None
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        validated = scanner.validate_policy(self.read(policy))
+        self.assertEqual(validated["secrets"], [])
+        source = self.read(script)
+        self.assertIn('TRIVY_VERSION = "0.76.2"', source)
+        self.assertIn("bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf", source)
+        self.assertIn("802e4ac1418ed967cd3c4b901f4f71ca00b7363ede67778665a22d9f13f58c83", source)
+        self.assertTrue((ROOT / ".github/PUBLISHED_IMAGE_SCAN.md").is_file())
+
+    def test_published_scan_policy_contract_accepts_reviewed_exceptions_only(self) -> None:
+        policy = ROOT / ".trivyignore.yaml"
+        future = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat()
+        valid = (
+            "vulnerabilities:\n  - id: CVE-2000-0001\n"
+            f"    statement: Synthetic reviewed exception\n    expired_at: {future}\nsecrets: []\n"
+        )
+        original_read = self.read
+        for text in ("vulnerabilities: []\nsecrets: []\n", valid):
+            with self.subTest(valid=text), patch.object(
+                self, "read", side_effect=lambda path: text if path == policy else original_read(path)
+            ):
+                self.test_published_scan_native_policy_and_verified_version_pin()
+        invalid = (
+            valid.replace("Synthetic reviewed exception", "' '"),
+            valid.replace(future, "2000-01-01"),
+            valid.replace("secrets: []", "secrets: [{id: synthetic-secret}]"),
+            valid + "secrets: []\n",
+        )
+        for text in invalid:
+            with self.subTest(invalid=text), patch.object(
+                self, "read", side_effect=lambda path: text if path == policy else original_read(path)
+            ), self.assertRaises(ValueError):
+                self.test_published_scan_native_policy_and_verified_version_pin()
+
     def test_workflow_lint_covers_all_workflows_and_its_own_inputs(self) -> None:
         path = WORKFLOW_DIR / "workflow-lint.yml"
         self.assertTrue(path.is_file(), "the maintained workflow lint workflow is missing")
@@ -327,9 +411,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
         # browser legs' failure-only report upload (#1191), plus the dependency
-        # audit workflow's checkout, Python setup and Node setup, plus the
-        # workflow-lint workflow's checkout and Python setup.
-        self.assertEqual(action_count, 51)
+        # audit workflow's checkout, Python setup and Node setup, and the
+        # published-image scan's two checkout and two Python setup uses.
+        # Also count main's workflow-lint checkout and Python setup.
+        self.assertEqual(action_count, 55)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 

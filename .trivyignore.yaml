@@ -1,0 +1,3 @@
+# Native Trivy policy. Exceptions require review, a statement and future UTC expiry.
+vulnerabilities: []
+secrets: []
