@@ -213,6 +213,49 @@ class CIWorkflowContractTests(unittest.TestCase):
                      "requirements-dev.txt", "high", "critical", "npm:123", "GHSA-"):
             self.assertIn(text, doc)
 
+    def test_stable_rebuild_scan_has_readonly_pr_and_main_only_issue_writer(self) -> None:
+        text = self.read(WORKFLOW_DIR / "stable-rebuild-scan.yml")
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["schedule"], [{"cron": "41 7 * * 2"}])
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertIsNone(triggers["workflow_dispatch"])
+        self.assertEqual(workflow["permissions"], {"contents": "read", "packages": "read"})
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        self.assertIn("current-stable-writer", workflow["concurrency"]["group"])
+        self.assertEqual(set(workflow["jobs"]), {"qualify-pr", "weekly"})
+        for name, job in workflow["jobs"].items():
+            self.assertEqual(job["runs-on"], "ubuntu-latest")
+            self.assertNotIn("env", job)
+            self.assertNotIn("continue-on-error", job)
+            steps = job["steps"]
+            commands = [s["run"] for s in steps if "run" in s]
+            self.assertIn("python -m unittest discover -s .github/tests -p 'test_stable_rebuild_scan.py' -v", commands)
+            self.assertIn("python .github/scripts/stable_rebuild_scan.py qualify", commands)
+            for step in steps:
+                self.assertNotIn("continue-on-error", step)
+                self.assertNotIn("secrets.", str(step))
+                self.assertNotIn("upload-artifact", step.get("uses", ""))
+            if name == "qualify-pr":
+                self.assertEqual(job["if"], "github.event_name == 'pull_request'")
+                self.assertNotIn("permissions", job)
+                self.assertNotIn("python .github/scripts/stable_rebuild_scan.py sync", commands)
+                self.assertFalse(any("github.token" in str(step) for step in steps if "uses" not in step))
+            else:
+                for condition in ("github.repository == 'gcs8/truenas-jbod-ui'", "github.ref == 'refs/heads/main'",
+                                  "github.event_name == 'schedule'", "github.event_name == 'workflow_dispatch'"):
+                    self.assertIn(condition, job["if"])
+                self.assertEqual(job["permissions"], {"contents": "read", "packages": "read", "issues": "write"})
+                token_steps = [s for s in steps if "github.token" in str(s)]
+                self.assertEqual(len(token_steps), 1)
+                self.assertEqual(token_steps[0]["run"], "python .github/scripts/stable_rebuild_scan.py sync")
+                self.assertEqual(token_steps[0]["env"], {"GH_TOKEN": "${{ github.token }}"})
+                self.assertGreater(steps.index(token_steps[0]), next(i for i, s in enumerate(steps)
+                                   if s.get("run") == "python .github/scripts/stable_rebuild_scan.py qualify"))
+        for forbidden in ("packages: write", "pull_request_target", "docker/login"):
+            self.assertNotIn(forbidden, text)
+
     def read(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
@@ -413,8 +456,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # browser legs' failure-only report upload (#1191), plus the dependency
         # audit workflow's checkout, Python setup and Node setup, and the
         # published-image scan's two checkout and two Python setup uses.
-        # Also count main's workflow-lint checkout and Python setup.
-        self.assertEqual(action_count, 55)
+        # Also count main's workflow-lint checkout and Python setup, plus
+        # checkout and Python setup in each stable-rebuild scan job.
+        self.assertEqual(action_count, 59)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
