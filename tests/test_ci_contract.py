@@ -34,6 +34,45 @@ EXTERNAL_ACTION_RE = re.compile(
 
 
 class CIWorkflowContractTests(unittest.TestCase):
+    def test_workflow_lint_covers_all_workflows_and_its_own_inputs(self) -> None:
+        path = WORKFLOW_DIR / "workflow-lint.yml"
+        self.assertTrue(path.is_file(), "the maintained workflow lint workflow is missing")
+        text = self.read(path)
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "push", "workflow_dispatch"})
+        for event in ("pull_request", "push"):
+            self.assertEqual(triggers[event]["branches"], ["main"])
+            self.assertEqual(triggers[event]["paths"], [".github/**", "tests/test_ci_contract.py"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"lint"})
+        job = workflow["jobs"]["lint"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], 10)
+        for key in ("permissions", "container", "services", "continue-on-error", "if", "env"):
+            self.assertNotIn(key, job)
+        steps = job["steps"]
+        actions = [step["uses"] for step in steps if "uses" in step]
+        self.assertEqual(actions, [
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+        ])
+        self.assertFalse(steps[0]["with"]["persist-credentials"])
+        self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+        for step in steps:
+            for key in ("continue-on-error", "if", "env"):
+                self.assertNotIn(key, step)
+        self.assertEqual([step["run"] for step in steps if "run" in step], [
+            "python -m unittest discover -s .github/tests -p 'test_workflow_lint.py' -v",
+            'python .github/scripts/workflow_lint.py --install-tools "$RUNNER_TEMP/workflow-lint-tools"',
+            'python .github/scripts/workflow_lint.py --tools-dir "$RUNNER_TEMP/workflow-lint-tools" '
+            '--report-dir "$RUNNER_TEMP/workflow-lint-reports"',
+        ])
+        for forbidden in ("secrets.", "github.token", "pip install", "npx", "curl", "-shellcheck="):
+            self.assertNotIn(forbidden, text)
+        config = yaml.safe_load(self.read(ROOT / ".github/actionlint.yaml"))
+        self.assertEqual(config, {"self-hosted-runner": {"labels": ["jbod-native-trial"]}})
+
     def test_dependency_audits_cover_inputs_policy_and_weekly_schedule(self) -> None:
         workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
         triggers = workflow.get("on", workflow.get(True, {}))
@@ -288,8 +327,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
         # browser legs' failure-only report upload (#1191), plus the dependency
-        # audit workflow's checkout, Python setup and Node setup.
-        self.assertEqual(action_count, 49)
+        # audit workflow's checkout, Python setup and Node setup, plus the
+        # workflow-lint workflow's checkout and Python setup.
+        self.assertEqual(action_count, 51)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 

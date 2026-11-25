@@ -226,7 +226,11 @@ jobs:
           {
             echo "### Immutable manifest digest"
             echo
+            # Markdown backticks are literal printf formatting, not commands.
+            # shellcheck disable=SC2016
             printf -- '- Image: `%s@%s`\n' "$IMAGE_NAME" "$PUBLISHED_DIGEST"
+            # Markdown backticks are literal printf formatting, not commands.
+            # shellcheck disable=SC2016
             printf -- '- Source revision: `%s`\n' "$GITHUB_SHA"
             echo
             echo "Registry tags are mutable pointers. Deploy the image reference above for immutable activation and rollback evidence."
