@@ -346,5 +346,7 @@ test("read records naming an expander and an attachment not read give destinatio
   Object.assign(record(item), { remote_id: item.fabric.nodes.find((entry) => entry.kind === "expander").id });
   item.fabric.raw.sas_transport_ports.push({ ...record(item), id: "sas-port:relation-2", remote_kind: "unknown", remote_id: null });
   const value = pin(model(item), HOST1, 12);
-  assert.match(value, /^destination not read: the transport census lists it as expander and as unknown/, value);
+  // Two kinds for one PHY: its role, and so its destination, is not read.
+  assert.match(value, /^role not read: its rows or the transport census name a link to an HBA or expander and an attachment not read/, value);
+  assert.doesNotMatch(value, /^to /, value);
 });

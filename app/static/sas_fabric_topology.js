@@ -565,25 +565,53 @@ function sasIndex(fabric) {
     return { expanders, controllers };
   }
 
+// The device type a row is given when its PHY name is on more than one row
+// of its owner's table: a census record naming it identifies neither row.
+const NAME_NOT_UNIQUE = "PHY name on more than one row";
+
 // Every attached-device type a source prints, with what it says is on the
-// PHY: a disk (an end device), a link (an expander or an initiator), the
-// enclosure processor, nothing, or a type whose role the source did not
-// read. One table for the builder and the checks: every type mprutil prints
-// and every expander type the CORE builder reads is in it (a test holds the
-// Python sets to it). A type not in it has its role not read.
-const DEVICE_ROLES = new Map([
+// PHY: a disk (an end device), an initiator (an HBA), an expander, a cable
+// end the payload inferred, the enclosure processor, nothing, or a type
+// whose role the source did not read. One table for the builder and the
+// checks: every type mprutil prints and every expander and initiator type
+// the CORE builder reads is in it (a test holds the Python sets to it). A
+// type not in it has its role not read.
+const DEVICE_KINDS = new Map([
   ["SAS Target", "disk"], ["SATA Target", "disk"], ["STP Target", "disk"], ["ATAPI Target", "disk"],
   ["End device (disk)", "disk"], ["End device, no block device", "disk"],
-  ["SMP Target", "link"], ["Edge Expander", "link"], ["Fanout Expander", "link"], ["Expander", "link"],
-  ["SAS Initiator", "link"], ["SATA Initiator", "link"], ["Cable far end (inferred)", "link"],
+  ["SMP Target", "expander"], ["Edge Expander", "expander"], ["Fanout Expander", "expander"], ["Expander", "expander"],
+  ["SAS Initiator", "initiator"], ["SATA Initiator", "sata initiator"],
+  ["Cable far end (inferred)", "cable"],
   ["SEP Target", "sep"],
   ["No Device", "none"],
-  ["Unknown Device", "unread"], ["Attachment not read", "unread"],
+  ["Unknown Device", "unread"], ["Attachment not read", "unread"], [NAME_NOT_UNIQUE, "unread"],
 ]);
+// What each kind is, as a role: a disk, a link (an initiator, an expander or
+// an inferred cable end), the enclosure processor, nothing attached.
+const KIND_ROLES = { disk: "disk", initiator: "link", "sata initiator": "link", expander: "link", cable: "link", sep: "sep", none: "none", unread: "unread" };
+// Which kinds can be at each end of each cable, as the CORE builder reads
+// them: the child end of a cable from an HBA sees the HBA (an initiator), the
+// child end of a cable from an expander sees an expander; the parent end of
+// a cascade sees the child expander. An HBA's own row may name either. A
+// SATA initiator ends no SAS cable.
+const CABLE_ENDS = {
+  "controller-expander": { near: ["initiator", "expander", "cable"], far: ["initiator", "cable"] },
+  "expander-expander": { near: ["expander", "cable"], far: ["expander", "cable"] },
+};
+
+function deviceKind(device) {
+    const value = text(device);
+    return value ? DEVICE_KINDS.get(value) || "unknown" : "";
+  }
 
 function deviceRole(device) {
-    const value = text(device);
-    return value ? DEVICE_ROLES.get(value) || "unknown" : "none";
+    const kind = deviceKind(device);
+    return kind ? KIND_ROLES[kind] || "unknown" : "none";
+  }
+
+function cableEndAccepts(linkKind, side, device) {
+    const kind = DEVICE_KINDS.has(device) ? DEVICE_KINDS.get(device) : device;
+    return list(CABLE_ENDS[linkKind]?.[side]).includes(kind);
   }
 
 // The transport census as the checks read it: each record's PHYs are the
@@ -591,6 +619,8 @@ function deviceRole(device) {
 // its owner's table, so a record naming its PHY only by name still names it.
 function censusOf(fabric) {
     const byName = new Map();
+    // A record naming a PHY by a name on more than one row of its owner's
+    // table identifies nothing: it is unread evidence, never the first row.
     for (const item of list(fabric?.nodes)) {
       if (!isRecord(item) || typeof item.id !== "string" || !isRecord(item.raw)) continue;
       for (const row of [...list(item.raw.phys), ...list(item.raw.phy_rows)].filter(isRecord)) {
@@ -601,7 +631,9 @@ function censusOf(fabric) {
     }
     return list(fabric?.raw?.sas_transport_ports).filter(isRecord).map((port) => {
       const named = list(port.phy_names).map((name) => byName.get(`${port.owner_id}|${name}`)).filter((found) => found?.length === 1 && Number.isInteger(found[0])).map((found) => found[0]);
-      return { ...port, phys: [...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy)), ...named])] };
+      const ambiguous = list(port.phy_names).filter((name) => (byName.get(`${port.owner_id}|${name}`) || []).length > 1);
+      const phys = [...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy)), ...named])];
+      return ambiguous.length ? { ...port, phys, ambiguous, state: port.state === "read" ? "ambiguous" : port.state } : { ...port, phys };
     });
   }
 
@@ -664,6 +696,80 @@ const TIER_RANK = { critical: 2, warning: 1, "": 0 };
 // read only where every observation read every counter; a counter that was
 // read is never dropped because another was not. Its role is what any
 // observation says is attached. Every surface and check reads this.
+// One role ledger per physical PHY, across every observation of its chip:
+// each row's device type, by the shared vocabulary, and each transport
+// census record that lists it (by number, or by a name that resolves to its
+// row). A record not read is unread evidence, never a role. Fixed on first
+// use.
+function phyRoles(model, id, phy) {
+    const chip = chipOfNode(model, id)?.id || id;
+    if (!model.roleLedger) model.roleLedger = new Map();
+    const key = `${chip}|${phy}`;
+    if (model.roleLedger.has(key)) return model.roleLedger.get(key);
+    const reading = phyReading(model, id, phy);
+    const roles = new Set();
+    // The finer kind of each link: an initiator, an expander, an inferred
+    // cable end; which cable end it can be is the table's.
+    const attached = new Set();
+    const unknown = [];
+    const unread = [];
+    const add = (kind) => {
+      attached.add(kind);
+      roles.add(({ initiator: "link", "sata initiator": "link", expander: "link", cable: "link" })[kind] || kind);
+    };
+    for (const device of reading.devices) {
+      for (const part of device.split(" / ")) {
+        const kind = deviceKind(part);
+        if (!kind) continue;
+        if (kind === "unknown") unknown.push(part);
+        else if (kind === "unread") {
+          // A row whose own type is not read: what is attached is not read.
+          unread.push(part === NAME_NOT_UNIQUE ? "its PHY name is on more than one row of its table, so no census record identifies it" : `its row says ${part}`);
+          add("unread");
+        }
+        else add(kind);
+      }
+    }
+    const listing = list(model.censusRows).filter((port) => (chipOfNode(model, port.owner_id)?.id || port.owner_id) === chip && list(port.phys).includes(phy));
+    const records = listing.filter((port) => port.state === "read");
+    if (listing.some((port) => port.state === "ambiguous")) unread.unshift(`the transport census names it by ${listing.find((port) => port.state === "ambiguous").ambiguous.join(", ")}, a PHY name on more than one row, so that record identifies no PHY`);
+    if (listing.some((port) => !["read", "ambiguous"].includes(port.state))) unread.unshift("its transport census record was not read");
+    const kinds = new Set(records.map((port) => port.remote_kind || ""));
+    for (const kind of kinds) {
+      if (kind === "end_device") add("disk");
+      else if (kind === "expander") add("expander");
+      else {
+        unread.push(`the transport census does not say what it is attached to`);
+        add("unread");
+      }
+    }
+    if (unknown.length) roles.add("unknown");
+    // The targets the read expander records name, each one device whatever
+    // order the records came in: a present chip, or by SAS address or id a
+    // device not in this payload. An address two chips carry names neither.
+    const targets = new Map();
+    for (const port of records.filter((item) => item.remote_kind === "expander")) {
+      const address = sasAddressOf(port.remote_sas_address);
+      let key = "";
+      let label = "";
+      if (port.remote_id && model.nodeById.has(port.remote_id)) {
+        key = chipOfNode(model, port.remote_id)?.id || port.remote_id;
+        label = nodeName(model, key);
+      } else if (address) {
+        const found = [...new Set(model.nodes.filter((entry) => entry.kind === "expander" && [entry.address, sasAddressOf(entry.rawId)].includes(address)).map((entry) => chipOfNode(model, entry.id)?.id || entry.id))];
+        key = found.length === 1 ? found[0] : found.length > 1 ? `ambiguous:${address}` : `address:${address}`;
+        label = found.length === 1 ? nodeName(model, found[0]) : found.length > 1 ? `SAS address ${address}, which more than one expander here carries` : `a device not in this payload (${address})`;
+      } else if (port.remote_id) {
+        key = `id:${port.remote_id}`;
+        label = `a device not in this payload (${port.remote_id})`;
+      }
+      if (key) targets.set(key, label);
+    }
+    const entry = { roles, attached, unknown: [...new Set(unknown)], unread, records, kinds, targets };
+    model.roleLedger.set(key, entry);
+    return entry;
+  }
+
 function phyReading(model, id, phy) {
     if (!model.phyReadings) model.phyReadings = new Map();
     const chip = chipOfNode(model, id);
@@ -1323,10 +1429,16 @@ function adoptLinuxTransport(payload, options = {}) {
       }
       links.push({ ...item, id: `${item.kind}:${rename(item.source)}->${rename(item.target)}`, source: rename(item.source), target: rename(item.target), reported_lanes: lanes });
     }
+    // A name on more than one row of an owner's table names neither row.
+    const names = new Map();
+    for (const item of hardware) for (const row of list(item.raw.phys || item.raw.phy_rows).filter(isRecord)) {
+      const key = `${item.id}|${text(row.name)}`;
+      if (text(row.name)) names.set(key, (names.get(key) || 0) + 1);
+    }
     const phyRow = (ownerId, row) => {
       const measured = row.counter_state === "measured";
       return {
-        phy: row.phy, name: text(row.name), dev_handle: "", device: role.get(`${ownerId}|${row.name}`) || "",
+        phy: row.phy, name: text(row.name), dev_handle: "", device: (names.get(`${ownerId}|${text(row.name)}`) || 0) > 1 ? NAME_NOT_UNIQUE : role.get(`${ownerId}|${row.name}`) || "",
         speed: finite(row.negotiated_rate_gbps), min: finite(row.minimum_rate_gbps), max: finite(row.maximum_rate_gbps),
         ...Object.fromEntries(PHY_COUNTERS.map(([key]) => [key, row[key] ?? null])),
         // Which counters sysfs did not return, by name: the others were read.
@@ -2662,7 +2774,11 @@ function modelParts(fabric, core) {
     errorDigest: { configurable: true, get: () => errorDigest },
     errorSummary: { configurable: true, get: () => errorSummary },
     phyReading: { configurable: true, get: () => phyReading },
+    phyRoles: { configurable: true, get: () => phyRoles },
     deviceRole: { configurable: true, get: () => deviceRole },
+    deviceKind: { configurable: true, get: () => deviceKind },
+    cableEndAccepts: { configurable: true, get: () => cableEndAccepts },
+    NAME_NOT_UNIQUE: { configurable: true, get: () => NAME_NOT_UNIQUE },
     chipPhyNumbers: { configurable: true, get: () => chipPhyNumbers },
     readingSummary: { configurable: true, get: () => readingSummary },
     faultDigest: { configurable: true, get: () => faultDigest },
@@ -2709,6 +2825,7 @@ function modelParts(fabric, core) {
     BAY_DETAIL_LIMIT,
     buildTopologyModel,
     deviceRole,
+    cableEndAccepts,
     tracePath: context.tracePath,
     searchTopology: context.searchTopology,
     renderTopology: context.renderTopology,

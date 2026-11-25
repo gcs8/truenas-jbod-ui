@@ -536,6 +536,89 @@ function subjectDeletions(fabric, built) {
     if (port.remote_kind !== "end_device" || !port.has_block) continue;
     for (const phy of port.phys || []) phySubject(`disk PHY ${phy}`, ["port-errors"], [port.owner_id, `PHY ${phy}`], port.owner_id, phy);
   }
+  // An identifier on two rows identifies neither: a disk PHY's name given
+  // to another row of its table, a CORE disk's device handle given to
+  // another row of its expander, a disk port's SAS address reported for
+  // another bay. A device type flipped to another entry of the table that
+  // cannot be that subject: the subject's checks cannot pass on it.
+  const census = fabric.raw?.sas_transport_ports || [];
+  const ownerRows = (copy, ownerId) => tables(copy, ownerId)[0] || [];
+  census.forEach((port, index) => {
+    const disk = port.remote_kind === "end_device" && port.has_block;
+    const uplink = port.remote_kind === "expander" && nodes.get(port.owner_id)?.kind === "controller";
+    if (!disk && !uplink) return;
+    // Only where something claims the PHY does a flip contradict it: a bay
+    // joined to it, or a cable listing it. Unclaimed, the flip is new
+    // evidence of another role, and the PHY is that role's subject.
+    const claimed = (port.phys || []).some((phy) => (disk
+      ? built.bays.some((bay) => bay.ports.some((item) => item.expanderId === port.owner_id && (item.phy?.phy === phy)))
+      : built.links.some((link) => link.source === port.owner_id && link.lanes?.sourcePhys.includes(phy))));
+    const checks = !claimed ? [] : disk ? ["port-errors"] : ["lanes", "cable-errors"];
+    for (const phy of port.phys || []) {
+      const row = phyRows(nodes.get(port.owner_id)).find((entry) => Number(entry.phy) === phy);
+      if (row?.name && phyRows(nodes.get(port.owner_id)).some((entry) => Number(entry.phy) !== phy)) {
+        out.push({ name: `census ${index} PHY ${phy} name on two rows`, checks: disk ? checks : [], tokens: [port.owner_id, `PHY ${phy}`], change: (copy) => {
+          const other = ownerRows(copy, port.owner_id).find((entry) => Number(entry.phy) !== phy);
+          other.name = row.name;
+          return true;
+        } });
+      }
+    }
+    out.push({ name: `census ${index} kind flipped`, checks, tokens: [port.owner_id, ...(port.phys || []).map((phy) => `PHY ${phy}`)], change: (copy) => {
+      copy.fabric.raw.sas_transport_ports[index].remote_kind = disk ? "expander" : "end_device";
+      return true;
+    } });
+  });
+  // CORE rows: each claimed row's device type flipped to the table's other
+  // kinds it cannot be; each bay's handle given to another row.
+  const FLIPS = {
+    bay: ["SMP Target", "SAS Initiator", "SEP Target", "No Device", "Unknown Device"],
+    "controller-expander:near": ["SAS Target", "SEP Target", "No Device", "Unknown Device"],
+    "controller-expander:far": ["Edge Expander", "SAS Target", "SEP Target", "No Device", "Unknown Device"],
+    "expander-expander:near": ["SAS Initiator", "SAS Target", "SEP Target", "No Device", "Unknown Device"],
+    "expander-expander:far": ["SAS Initiator", "SAS Target", "SEP Target", "No Device", "Unknown Device"],
+  };
+  const coreRows = (copy, ownerId) => [...(copy.fabric.expanders || []).filter((entry) => entry.id === ownerId).map((entry) => entry.phys), ...(copy.fabric.controllers || []).filter((entry) => entry.id === ownerId).map((entry) => entry.phy_rows)].filter(Array.isArray).flat();
+  const flip = (label, checks, ownerId, phy, devices) => {
+    // Only a row that names its device type (CORE): Linux rows take theirs
+    // from the census, flipped above.
+    if (!coreRows({ fabric }, ownerId).some((entry) => Number(entry.phy) === phy && entry.device)) return;
+    for (const device of devices) {
+      out.push({ name: `${label} type flipped to ${device}`, checks, tokens: [ownerId, `PHY ${phy}`], change: (copy) => {
+        const rows = coreRows(copy, ownerId).filter((entry) => Number(entry.phy) === phy && entry.device);
+        for (const entry of rows) entry.device = device;
+        return rows.length > 0;
+      } });
+    }
+  };
+  for (const link of fabric.links.filter((entry) => entry.reported_lanes && FLIPS[`${entry.kind}:near`])) {
+    for (const phy of link.reported_lanes.source_phys || []) flip(`${link.id} near PHY ${phy}`, ["lanes", "cable-errors"], link.source, phy, FLIPS[`${link.kind}:near`]);
+    for (const phy of link.reported_lanes.target_phys || []) flip(`${link.id} far PHY ${phy}`, ["lanes", "cable-errors"], link.target, phy, FLIPS[`${link.kind}:far`]);
+  }
+  for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
+    (trace.metrics?.mpr_devices || []).forEach((device, index) => {
+      const expander = (fabric.expanders || []).find((entry) => (device.expander_ids || []).includes(entry.id));
+      const row = expander?.phys.find((entry) => device.handle && entry.dev_handle === device.handle);
+      if (!row) return;
+      flip(`${trace.id} port ${index} PHY ${row.phy}`, ["port-errors"], expander.id, Number(row.phy), FLIPS.bay);
+      out.push({ name: `${trace.id} port ${index} handle on two rows`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
+        const other = copy.fabric.expanders.find((entry) => entry.id === expander.id).phys.find((entry) => entry.dev_handle !== device.handle);
+        other.dev_handle = device.handle;
+        return true;
+      } });
+    });
+  }
+  const addressed = fabric.traces.filter((entry) => entry.kind === "bay" && Object.values(entry.metrics || {}).filter(Array.isArray).flat().some((row) => row?.sas_address));
+  addressed.forEach((trace, index) => {
+    const from = addressed[(index + 1) % addressed.length];
+    if (from === trace) return;
+    const address = Object.values(from.metrics).filter(Array.isArray).flat().find((row) => row?.sas_address).sas_address;
+    out.push({ name: `${trace.id} disk port address also ${from.id}'s`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
+      const metrics = copy.fabric.traces.find((entry) => entry.id === trace.id).metrics;
+      for (const row of Object.values(metrics).filter(Array.isArray).flat()) if (row && typeof row === "object" && row.sas_address) row.sas_address = address;
+      return true;
+    } });
+  });
   for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
     (trace.metrics?.path_states || []).forEach((state, index) => {
       out.push({ name: `${trace.id} path ${index}`, checks: ["path-states"], tokens: [trace.id], change: (copy) => {
@@ -624,15 +707,26 @@ function surfacesAgree(built, line, why) {
 // rate in Gb/s, an end's maximum "(max N)", a lane's "(both ends N)" and a
 // PHY's range "(PHY a–b)". Counters are not rates: they may change.
 const RATE_TOKEN = /\b\d+(?:\.\d+)? Gb\/s|\(max \d+(?:\.\d+)?\)|\(both ends \d+(?:\.\d+)?\)|\(PHY \d+(?:\.\d+)?–\d+(?:\.\d+)?\)|PHY max \d+(?:\.\d+)?/g;
-function plainRates(built) {
+const COUNTER_TOKEN = /\b\d+(?:–\d+)? (?:invalid dword|running disparity|loss of dword sync|PHY reset problem)\b/g;
+// Every rate and every counter any surface displays, each bound to its
+// surface and row: cards and inspectors, drawn link labels, and every
+// wiring check's lines and notes.
+function surfaceTokens(built) {
   const refs = [...built.links.map((link) => ({ kind: "link", id: link.id })),
     ...built.nodes.map((entry) => ({ kind: "node", id: entry.id })),
     ...built.bays.map((bay) => ({ kind: "bay", id: bay.bayId })),
     ...built.bays.flatMap((bay) => bay.ports.map((port) => ({ kind: "port", id: port.key })))];
-  const out = {};
+  const rates = {};
+  const counters = {};
   const add = (key, value) => {
-    const tokens = String(value ?? "").match(RATE_TOKEN);
-    if (tokens) out[key] = [...(out[key] || []), ...tokens];
+    const text = String(value ?? "");
+    const found = text.match(RATE_TOKEN);
+    if (found) rates[key] = [...(rates[key] || []), ...found];
+    // A counter is bound to its surface: a row's label can change with the
+    // tier it is in (Warning, Critical) as a fault joins it.
+    const counts = text.match(COUNTER_TOKEN);
+    const surface = key.replace(/ (pin|card|lines|notes|drawn)( .*)?$/, "");
+    if (counts) counters[surface] = [...(counters[surface] || []), ...counts];
   };
   for (const ref of refs) {
     const html = T.detailFor(built, ref)?.html || "";
@@ -640,7 +734,33 @@ function plainRates(built) {
     for (const row of T.cardFor(built, ref)?.rows || []) add(`${ref.kind}:${ref.id} card ${row.label}`, row.value);
   }
   for (const link of built.links) add(`link:${link.id} drawn`, (link.labelLines || []).join(" | "));
-  return out;
+  // A check splits by tier (cable-errors, cable-errors:warning): its lines
+  // and notes are one surface, whichever tier a line is in.
+  for (const entry of built.checks) {
+    add(`check:${entry.id.split(":")[0]} lines`, entry.lines.join(" | "));
+    add(`check:${entry.id.split(":")[0]} notes`, (entry.notes || []).join(" | "));
+  }
+  for (const key of Object.keys(rates)) rates[key].sort();
+  return { rates, counters };
+}
+
+// A counters-only injection on one PHY changes no rate anywhere; a counter
+// changes only where it is that PHY's: the injected count appears, and only
+// counts some row of that PHY number held before may go.
+function assertLocal(before, after, base, deletion, why) {
+  assert.deepEqual(after.rates, before.rates, `${why}: a counter change moved a displayed rate`);
+  const phy = deletion.faulty.phy;
+  const LABELS = [["invalid_dword_count", "invalid dword"], ["running_disparity_error_count", "running disparity"], ["loss_of_dword_synchronization_count", "loss of dword sync"], ["phy_reset_problem_count", "PHY reset problem"]];
+  const tables = [...base.fabric.nodes.flatMap((entry) => [entry.raw?.phys, entry.raw?.phy_rows]), ...(base.fabric.expanders || []).map((entry) => entry.phys)].filter(Array.isArray);
+  const values = new Set(tables.flat().filter((row) => Number(row?.phy) === phy).flatMap((row) => LABELS.filter(([key]) => Number.isFinite(Number(row[key])) && row[key] !== null).map(([key]) => Number(row[key]))));
+  const removable = (token) => token.match(/^(\d+)(?:–(\d+))?/).slice(1).filter(Boolean).every((value) => values.has(Number(value))) || /–/.test(token);
+  const bag = (list) => list.reduce((map, token) => map.set(token, (map.get(token) || 0) + 1), new Map());
+  for (const key of new Set([...Object.keys(before.counters), ...Object.keys(after.counters)])) {
+    const was = bag(before.counters[key] || []);
+    const now = bag(after.counters[key] || []);
+    for (const [token, count] of now) if (count > (was.get(token) || 0)) assert.ok(token === "10 loss of dword sync" || /–/.test(token), `${why}: ${key} gained ${token}`);
+    for (const [token, count] of was) if (count > (now.get(token) || 0)) assert.ok(removable(token), `${why}: ${key} lost ${token}, which is not PHY ${phy}'s`);
+  }
 }
 
 function runProperty(name, base, build) {
@@ -651,7 +771,7 @@ function runProperty(name, base, build) {
   const deletions = subjectDeletions(base.fabric, before);
   let rates = null;
   let compared = 0;
-  const baselineRates = () => (rates ??= plainRates(before));
+  const baselineRates = () => (rates ??= surfaceTokens(before));
   let applied = 0;
   let absent = 0;
   for (const deletion of deletions) {
@@ -674,7 +794,7 @@ function runProperty(name, base, build) {
     // Locality, on every counters-only injection, whatever the fabric: a
     // counter on one observation changes no rate on any surface.
     if (deletion.countersOnly) {
-      assert.deepEqual(plainRates(after), baselineRates(), `${why}: a counter change moved a displayed rate`);
+      assertLocal(baselineRates(), surfaceTokens(after), base, deletion, why);
       compared += 1;
     }
     if (deletion.injected && !ids.length) {
