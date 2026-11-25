@@ -1,0 +1,5 @@
+# The dispatch-only trial already uses this custom label. Register its spelling
+# without changing its runner admission or suppressing runner-label diagnostics.
+self-hosted-runner:
+  labels:
+    - jbod-native-trial

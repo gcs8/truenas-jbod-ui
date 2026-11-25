@@ -1,0 +1,38 @@
+name: Workflow lint
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [".github/**", "tests/test_ci_contract.py"]
+  push:
+    branches: [main]
+    paths: [".github/**", "tests/test_ci_contract.py"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Test selection and fail-closed report handling without network
+        run: python -m unittest discover -s .github/tests -p 'test_workflow_lint.py' -v
+      - name: Install checksum-verified workflow lint tools
+        run: python .github/scripts/workflow_lint.py --install-tools "$RUNNER_TEMP/workflow-lint-tools"
+      - name: Lint every workflow with actionlint, ShellCheck and zizmor
+        run: python .github/scripts/workflow_lint.py --tools-dir "$RUNNER_TEMP/workflow-lint-tools" --report-dir "$RUNNER_TEMP/workflow-lint-reports"
