@@ -34,6 +34,62 @@ EXTERNAL_ACTION_RE = re.compile(
 
 
 class CIWorkflowContractTests(unittest.TestCase):
+    def test_dependency_audits_cover_inputs_policy_and_weekly_schedule(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertEqual(set(triggers["pull_request"]["paths"]), {
+            "requirements.txt", "requirements.lock", "requirements-dev.txt",
+            "package.json", "package-lock.json", ".github/workflows/dependency-audit.yml",
+            ".github/scripts/dependency_audit.py", ".github/tests/test_dependency_audit.py",
+            ".github/dependency-audit-ignore.json", ".github/DEPENDENCY_AUDIT.md",
+            "tests/test_ci_contract.py",
+        })
+        self.assertEqual(triggers["schedule"], [{"cron": "23 6 * * 1"}])
+
+    def test_dependency_audits_are_hosted_read_only_and_reuse_verified_pins(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"audit"})
+        job = workflow["jobs"]["audit"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        for key in ("permissions", "container", "services", "continue-on-error", "if"):
+            self.assertNotIn(key, job)
+        self.assertLessEqual(job["timeout-minutes"], 20)
+        steps = job["steps"]
+        actions = [step["uses"] for step in steps if "uses" in step]
+        self.assertEqual(len(actions), 3)
+        ci_actions = {step["uses"] for ci_job in yaml.safe_load(self.read(CI_WORKFLOW))["jobs"].values()
+                      for step in ci_job.get("steps", []) if "uses" in step}
+        for action in actions:
+            self.assertIn(action, ci_actions)
+        for step in steps:
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotIn("if", step)
+        self.assertNotIn("secrets.", self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+
+    def test_dependency_audits_validate_policy_and_test_before_installing_scanners(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        commands = [step["run"] for step in workflow["jobs"]["audit"]["steps"] if "run" in step]
+        self.assertEqual(commands, [
+            "python -m unittest discover -s .github/tests -p 'test_dependency_audit.py' -v",
+            "python .github/scripts/dependency_audit.py --validate-only",
+            'python -m venv "$RUNNER_TEMP/audit-venv"\n'
+            '"$RUNNER_TEMP/audit-venv/bin/python" -m pip install --only-binary=:all: pip-audit==2.10.1\n'
+            'npm install --global --ignore-scripts npm@10.9.8\n',
+            '"$RUNNER_TEMP/audit-venv/bin/python" .github/scripts/dependency_audit.py',
+        ])
+        self.assertEqual(workflow["jobs"]["audit"]["env"]["PIP_ONLY_BINARY"], ":all:")
+        policy = json.loads(self.read(ROOT / ".github/dependency-audit-ignore.json"))
+        self.assertEqual(set(policy), {"version", "ignores"})
+        self.assertEqual(policy["version"], 1)
+        self.assertIsInstance(policy["ignores"], list)
+        doc = self.read(ROOT / ".github/DEPENDENCY_AUDIT.md")
+        for text in ("reason", "expires", "UTC", "--package-lock-only", "requirements.lock",
+                     "requirements-dev.txt", "high", "critical", "npm:123", "GHSA-"):
+            self.assertIn(text, doc)
+
     def read(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
@@ -231,8 +287,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
-        # browser legs' failure-only report upload (#1191).
-        self.assertEqual(action_count, 46)
+        # browser legs' failure-only report upload (#1191), plus the dependency
+        # audit workflow's checkout, Python setup and Node setup.
+        self.assertEqual(action_count, 49)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
