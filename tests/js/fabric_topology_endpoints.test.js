@@ -311,3 +311,21 @@ test("a fault on an expander PHY only a census record not read lists is said onc
   const line = said1(model(item), /101 invalid dword/);
   assert.match(line, /PHY 91 \(role not read: its transport census record was not read\)/, line);
 });
+
+test("an over-long far list claims none of its members, even one whose type can end the cable", () => {
+  const data = core();
+  const link = data.fabric.links.find((entry) => entry.reported_lanes);
+  const rows = data.fabric.expanders.find((entry) => entry.id === link.target).phys;
+  const extra = rows.find((entry) => !link.reported_lanes.target_phys.includes(Number(entry.phy)) && entry.device === "No Device");
+  link.reported_lanes.target_phys.push(Number(extra.phy));
+  Object.assign(extra, { device: "SAS Initiator", invalid_dword_count: 101, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0, counter_state: "measured" });
+  const line = said1(coreModel(data), /101 invalid dword/);
+  assert.doesNotMatch(line, /→/, line);
+});
+
+test("a read expander record that names no target at all gives destination not read", () => {
+  const item = direct({ kind: "expander", count: 0 });
+  Object.assign(record(item), { remote_id: null, remote_sas_address: null });
+  const value = pin(model(item), HOST1, 12);
+  assert.match(value, /^destination not read( ·|$)/, value);
+});
