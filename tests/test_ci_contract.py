@@ -252,6 +252,20 @@ class CIWorkflowContractTests(unittest.TestCase):
         for forbidden in ("secrets.", "upload-artifact", "GITLEAKS_LICENSE"):
             self.assertNotIn(forbidden, self.read(WORKFLOW_DIR / "secret-scan.yml"))
 
+    def test_secret_scan_runtime_paths_use_step_environment_context(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "secret-scan.yml"))
+        self.assertNotIn("runner.", json.dumps(workflow.get("env", {})))
+        job = workflow["jobs"]["secret-scan"]
+        self.assertNotIn("runner.", json.dumps(job.get("env", {})))
+        run_steps = [step for step in job["steps"] if "run" in step]
+        self.assertEqual(len(run_steps), 3)
+        for step in run_steps:
+            with self.subTest(step=step["name"]):
+                self.assertEqual(step.get("env"), {
+                    "TMPDIR": "${{ runner.temp }}",
+                    "GITLEAKS_BINARY": "${{ runner.temp }}/secret-scan-tools/gitleaks",
+                })
+
     def test_python_floor_and_ceiling_are_separate_matrix_entries(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
         job = workflow["jobs"]["python-source"]
