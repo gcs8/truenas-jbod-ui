@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 import hashlib
 import io
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 from urllib.parse import urljoin, urlsplit
 
@@ -35,6 +38,18 @@ BASE = r"python:3\.(?:0|[1-9]\d*)-slim(?:-(?:bullseye|bookworm|trixie))?"
 ADVISORY = r"(?:CVE-\d{4}-\d{4,}|GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4})"
 MARKER = "<!-- stable-rebuild-scan:v1:" + hashlib.sha256((REPOSITORY + ":current-stable").encode()).hexdigest() + " -->"
 TITLE = "Stable image rebuild comparison (scan-only)"
+# Diagnostic fields are static identifiers and numbers, never derived native text.
+PHASES = frozenset("""startup qualification private_context published_registry_auth published_tags
+published_manifest source_init source_fetch source_commit source_checkout base_target base_manifest
+base_refresh build rebuilt_identity published_pull published_identity production_smoke
+production_identity production_recipe production_restore upgrade_smoke registry_start registry_tag registry_push
+upgrade_recipe registry_cleanup scanner_acquire scanner_manifest scanner_archive scanner_version scanner_config
+database_download database_snapshot published_archive rebuilt_archive published_vuln published_secret
+rebuilt_vuln rebuilt_secret database_verify archive_cleanup pair_compare pair_sanitize receipt_write summary_write
+sync_admission issue_sync""".split())
+ARCHIVE_PHASES = {"published": "published_archive", "rebuilt": "rebuilt_archive"}
+SCAN_PHASES = {(side, kind): side + "_" + kind for side in ("published", "rebuilt") for kind in ("vuln", "secret")}
+CURRENT_PHASE = ContextVar("stable_rebuild_phase", default="qualification")
 
 
 class ScanError(ValueError):
@@ -44,6 +59,42 @@ class ScanError(ValueError):
 def require(condition):
     if not condition:
         raise ScanError("stable rebuild qualification incomplete")
+
+
+def diagnostic(name, event, kind, status):
+    require(name in PHASES and event in ("begin", "complete", "failure", "native", "http"))
+    require(kind in ("phase", "native", "http", "python", "timeout", "os", "transport"))
+    require(type(status) is int and -2147483648 <= status <= 2147483647)
+    print(f"stable_rebuild phase={name} event={event} kind={kind} status={status}", file=sys.stderr, flush=True)
+
+
+class OperationError(ScanError):
+    def __init__(self, kind, status):
+        super().__init__("native or HTTP operation incomplete")
+        self.kind, self.status = kind, status
+
+
+class PhaseError(ScanError):
+    """The failing phase has already emitted its fixed diagnostic."""
+
+
+@contextmanager
+def phase(name):
+    require(name in PHASES)
+    token = CURRENT_PHASE.set(name)
+    diagnostic(name, "begin", "phase", 0)
+    try:
+        yield
+    except PhaseError:
+        raise  # Keep the original phase, even through a successful cleanup.
+    except Exception as exc:
+        kind, status = (exc.kind, exc.status) if isinstance(exc, OperationError) else ("python", 1)
+        diagnostic(name, "failure", kind, status)
+        raise PhaseError("qualification phase incomplete") from None
+    else:
+        diagnostic(name, "complete", "phase", 0)
+    finally:
+        CURRENT_PHASE.reset(token)
 
 
 def matches(pattern, value):
@@ -78,11 +129,18 @@ def http(method, url, headers=None, payload=None, limit=32 * 1024 * 1024):
                                      data=None if payload is None else json.dumps(payload).encode())
     try:
         with urllib.request.build_opener(Redirect).open(request, timeout=120) as response:
+            diagnostic(CURRENT_PHASE.get(), "http", "http", response.status)
             raw = response.read(limit + 1)
             require(len(raw) <= limit)
             return raw, {k.lower(): v for k, v in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        raise OperationError("http", exc.code) from None
+    except ScanError:
+        raise
+    except TimeoutError:
+        raise OperationError("timeout", 1) from None
     except Exception:
-        raise ScanError("HTTP operation incomplete") from None
+        raise OperationError("transport", 1) from None
 
 
 def pages(url, headers):
@@ -188,9 +246,16 @@ def loopback_push_argv(image):
 
 def run(argv, *, cwd, env=None, timeout=1800):
     # Native build/smoke/scanner outputs may contain secrets. Never echo them.
-    result = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=timeout, check=False)
-    require(result.returncode == 0)
+    try:
+        result = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise OperationError("timeout", 1) from None
+    except OSError:
+        raise OperationError("os", 1) from None
+    diagnostic(CURRENT_PHASE.get(), "native", "native", result.returncode)
+    if result.returncode != 0:
+        raise OperationError("native", result.returncode)
     return result.stdout
 
 
@@ -362,11 +427,13 @@ def scanner_env(directory):
 
 def acquire(directory):
     name = f"trivy_{TRIVY_VERSION}_Linux-64bit.tar.gz"
-    manifest, _ = http("GET", RELEASE + f"trivy_{TRIVY_VERSION}_checksums.txt")
-    require(hashlib.sha256(manifest).hexdigest() == MANIFEST_SHA256)
-    require(f"{ARCHIVE_SHA256}  {name}" in manifest.decode().splitlines())
-    archive, _ = http("GET", RELEASE + name, limit=80 * 1024 * 1024)
-    require(hashlib.sha256(archive).hexdigest() == ARCHIVE_SHA256)
+    with phase("scanner_manifest"):
+        manifest, _ = http("GET", RELEASE + f"trivy_{TRIVY_VERSION}_checksums.txt")
+        require(hashlib.sha256(manifest).hexdigest() == MANIFEST_SHA256)
+        require(f"{ARCHIVE_SHA256}  {name}" in manifest.decode().splitlines())
+    with phase("scanner_archive"):
+        archive, _ = http("GET", RELEASE + name, limit=80 * 1024 * 1024)
+        require(hashlib.sha256(archive).hexdigest() == ARCHIVE_SHA256)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         members = [m for m in tar.getmembers() if m.name == "trivy"]
         require(len(members) == 1 and members[0].isfile() and members[0].size < 300 * 1024 * 1024)
@@ -375,8 +442,9 @@ def acquire(directory):
         tool = directory / "trivy"
         tool.write_bytes(stream.read())
         tool.chmod(0o700)
-    version = parse_json(run([str(tool), "--version", "--format", "json"], cwd=directory, env=scanner_env(directory)))
-    require(version.get("Version") == TRIVY_VERSION)
+    with phase("scanner_version"):
+        version = parse_json(run([str(tool), "--version", "--format", "json"], cwd=directory, env=scanner_env(directory)))
+        require(version.get("Version") == TRIVY_VERSION)
     return tool
 
 
@@ -438,129 +506,177 @@ def production_smoke(source, private):
         for recipe in recipes:
             require("up -d --build --wait" in recipe or "--build" not in recipe)
             recipe = recipe.replace("up -d --build --wait", "up -d --no-build --wait")
-            env = {**scanner_env(private), "RUNNER_TEMP": str(private), "GITHUB_ENV": str(private / "smoke.env"),
-                   "CI_SMOKE_IMAGE_ID": image_info(LOCAL_IMAGE, private), "JBOD_UI_IMAGE": LOCAL_IMAGE}
-            run(["bash", "-e", "-o", "pipefail", "-c", recipe], cwd=source, env=env, timeout=900)
+            with phase("production_identity"):
+                env = {**scanner_env(private), "RUNNER_TEMP": str(private), "GITHUB_ENV": str(private / "smoke.env"),
+                       "CI_SMOKE_IMAGE_ID": image_info(LOCAL_IMAGE, private), "JBOD_UI_IMAGE": LOCAL_IMAGE}
+            with phase("production_recipe"):
+                run(["bash", "-e", "-o", "pipefail", "-c", recipe], cwd=source, env=env, timeout=900)
     finally:
-        compose_path.write_bytes(original)
+        with phase("production_restore"):
+            compose_path.write_bytes(original)
 
 
 def upgrade_smoke(source, private, published, tag, commit):
     registry = "stable-rebuild-scan-registry"
     try:
-        run(["docker", "run", "-d", "--name", registry, "-p", "127.0.0.1:5000:5000", REGISTRY_IMAGE], cwd=private)
-        run(["docker", "tag", LOCAL_IMAGE, SMOKE_IMAGE], cwd=private)
-        run(loopback_push_argv(SMOKE_IMAGE), cwd=private)
-        run([sys.executable, str(ROOT / "scripts/run_image_upgrade_smoke.py"), "--scenario", "hardened",
-             "--root", str(private / "upgrade"), "--compose-fixture", str(source / "docker-compose.yml"),
-             "--nonroot-fixture", str(source / "docker-compose.nonroot.yml"),
-             "--config-fixture", str(source / "tests/fixtures/ci-smoke-config.yaml"),
-             "--previous-image", IMAGE + "@" + published, "--previous-version", tag[1:],
-             "--candidate-image", SMOKE_IMAGE, "--candidate-version", tag[1:], "--candidate-revision", commit],
-            cwd=private, env=scanner_env(private), timeout=1500)
+        with phase("registry_start"):
+            run(["docker", "run", "-d", "--name", registry, "-p", "127.0.0.1:5000:5000", REGISTRY_IMAGE], cwd=private)
+        with phase("registry_tag"):
+            run(["docker", "tag", LOCAL_IMAGE, SMOKE_IMAGE], cwd=private)
+        with phase("registry_push"):
+            run(loopback_push_argv(SMOKE_IMAGE), cwd=private)
+        with phase("upgrade_recipe"):
+            run([sys.executable, str(ROOT / "scripts/run_image_upgrade_smoke.py"), "--scenario", "hardened",
+                 "--root", str(private / "upgrade"), "--compose-fixture", str(source / "docker-compose.yml"),
+                 "--nonroot-fixture", str(source / "docker-compose.nonroot.yml"),
+                 "--config-fixture", str(source / "tests/fixtures/ci-smoke-config.yaml"),
+                 "--previous-image", IMAGE + "@" + published, "--previous-version", tag[1:],
+                 "--candidate-image", SMOKE_IMAGE, "--candidate-version", tag[1:], "--candidate-revision", commit],
+                cwd=private, env=scanner_env(private), timeout=1500)
     finally:
-        run(["docker", "rm", "-f", registry], cwd=private)
+        with phase("registry_cleanup"):
+            run(["docker", "rm", "-f", registry], cwd=private)
 
 
 def qualify():
     # Fresh context from a public Git tag, with no local files or useful HOME.
-    with tempfile.TemporaryDirectory(prefix="stable-rebuild-") as raw:
+    with phase("private_context"), tempfile.TemporaryDirectory(prefix="stable-rebuild-") as raw:
         private = Path(raw)
         private.chmod(0o700)
         source = private / "source"
         source.mkdir()
-        registry = Registry("ghcr.io", REPOSITORY)
-        tag = registry.stable()
-        published = registry.resolve(tag)
-        run(["git", "init", "--quiet", str(source)], cwd=private)
-        run(["git", "fetch", "--depth=1", "https://github.com/" + REPOSITORY + ".git", "refs/tags/" + tag], cwd=source,
-            env=scanner_env(private))
-        commit = run(["git", "rev-parse", "FETCH_HEAD^{commit}"], cwd=source).decode().strip()
-        require(matches(r"[0-9a-f]{40}", commit))
-        run(["git", "checkout", "--detach", commit], cwd=source)
-        dockerfile = source / "Dockerfile"
-        original = dockerfile.read_bytes()
-        base = base_target(original)
-        base_digest = Registry("registry-1.docker.io", "library/python").resolve(base.split(":", 1)[1])
-        dockerfile.write_bytes(refresh_from(original, base, base_digest))
-        run(build_argv(source, commit), cwd=private)
-        rebuilt_id = image_info(LOCAL_IMAGE, private, commit=commit)
-        run(["docker", "pull", "--platform", "linux/amd64", IMAGE + "@" + published], cwd=private)
-        published_id = image_info(IMAGE + "@" + published, private, digest=published, commit=commit)
-        production_smoke(source, private)
-        upgrade_smoke(source, private, published, tag, commit)
-        tool = acquire(private)
-        (private / "trivy.yaml").write_text("{}\n")
-        (private / "empty.ignore").write_text("")
-        (private / "secret.yaml").write_text("{}\n")
-        run([str(tool), "image", "--quiet", "--config", str(private / "trivy.yaml"), "--cache-dir", str(private / "cache"),
-             "--download-db-only"], cwd=private, env=scanner_env(private))
-        snapshot = database(private)
+        with phase("published_registry_auth"):
+            registry = Registry("ghcr.io", REPOSITORY)
+        with phase("published_tags"):
+            tag = registry.stable()
+        with phase("published_manifest"):
+            published = registry.resolve(tag)
+        with phase("source_init"):
+            run(["git", "init", "--quiet", str(source)], cwd=private)
+        with phase("source_fetch"):
+            run(["git", "fetch", "--depth=1", "https://github.com/" + REPOSITORY + ".git", "refs/tags/" + tag], cwd=source,
+                env=scanner_env(private))
+        with phase("source_commit"):
+            commit = run(["git", "rev-parse", "FETCH_HEAD^{commit}"], cwd=source).decode().strip()
+            require(matches(r"[0-9a-f]{40}", commit))
+        with phase("source_checkout"):
+            run(["git", "checkout", "--detach", commit], cwd=source)
+        with phase("base_target"):
+            dockerfile = source / "Dockerfile"
+            original = dockerfile.read_bytes()
+            base = base_target(original)
+        with phase("base_manifest"):
+            base_digest = Registry("registry-1.docker.io", "library/python").resolve(base.split(":", 1)[1])
+        with phase("base_refresh"):
+            dockerfile.write_bytes(refresh_from(original, base, base_digest))
+        with phase("build"):
+            run(build_argv(source, commit), cwd=private)
+        with phase("rebuilt_identity"):
+            rebuilt_id = image_info(LOCAL_IMAGE, private, commit=commit)
+        with phase("published_pull"):
+            run(["docker", "pull", "--platform", "linux/amd64", IMAGE + "@" + published], cwd=private)
+        with phase("published_identity"):
+            published_id = image_info(IMAGE + "@" + published, private, digest=published, commit=commit)
+        with phase("production_smoke"):
+            production_smoke(source, private)
+        with phase("upgrade_smoke"):
+            upgrade_smoke(source, private, published, tag, commit)
+        with phase("scanner_acquire"):
+            tool = acquire(private)
+        with phase("scanner_config"):
+            (private / "trivy.yaml").write_text("{}\n")
+            (private / "empty.ignore").write_text("")
+            (private / "secret.yaml").write_text("{}\n")
+        with phase("database_download"):
+            run([str(tool), "image", "--quiet", "--config", str(private / "trivy.yaml"), "--cache-dir", str(private / "cache"),
+                 "--download-db-only"], cwd=private, env=scanner_env(private))
+        with phase("database_snapshot"):
+            snapshot = database(private)
         pair = {"version": 1, "tag": tag, "commit": commit, "published_digest": published, "base_ref": base,
                 "base_digest": base_digest, "rebuilt_id": rebuilt_id, "production_smoke": True, "upgrade_smoke": True}
         for side, reference, image_id in (("published", IMAGE + "@" + published, published_id), ("rebuilt", LOCAL_IMAGE, rebuilt_id)):
-            archive = private / (side + ".tar")
-            run(["docker", "image", "save", "--output", str(archive), reference], cwd=private)
-            entry = {"image_id": image_id, "database": database(private)}
-            require(entry["database"] == snapshot)
+            with phase(ARCHIVE_PHASES[side]):
+                archive = private / (side + ".tar")
+                run(["docker", "image", "save", "--output", str(archive), reference], cwd=private)
+            with phase("database_verify"):
+                entry = {"image_id": image_id, "database": database(private)}
+                require(entry["database"] == snapshot)
             for kind in ("vuln", "secret"):
-                output = private / "report.json"
-                output.touch(mode=0o600, exist_ok=False)
-                try:
-                    run(scan_argv(tool, archive, output, private, kind), cwd=private, env=scanner_env(private), timeout=1000)
-                    require(0 < output.stat().st_size <= 64 * 1024 * 1024)
-                    entry[kind] = parse_json(output.read_bytes())
-                    native_rows(entry[kind], image_id, kind)
-                finally:
-                    output.unlink(missing_ok=True)
-                require(database(private) == snapshot)
-            archive.unlink()
+                with phase(SCAN_PHASES[(side, kind)]):
+                    output = private / "report.json"
+                    output.touch(mode=0o600, exist_ok=False)
+                    try:
+                        run(scan_argv(tool, archive, output, private, kind), cwd=private, env=scanner_env(private), timeout=1000)
+                        require(0 < output.stat().st_size <= 64 * 1024 * 1024)
+                        entry[kind] = parse_json(output.read_bytes())
+                        native_rows(entry[kind], image_id, kind)
+                    finally:
+                        output.unlink(missing_ok=True)
+                with phase("database_verify"):
+                    require(database(private) == snapshot)
+            with phase("archive_cleanup"):
+                archive.unlink()
             pair[side] = entry
-        issue_body(pair)
+        with phase("pair_compare"):
+            issue_body(pair)
         # Strip all native paths, package versions and other raw fields BEFORE
         # leaving the private context. Reconstitute only allowlisted evidence.
-        for side in ("published", "rebuilt"):
-            entry = pair[side]
-            for kind in ("vuln", "secret"):
-                rows = native_rows(entry[kind], entry["image_id"], kind)
-                results = [{"Class": "os-pkgs" if eco == "debian" else "lang-pkgs", "Type": eco,
-                            "Vulnerabilities": [{"VulnerabilityID": min(ids), "VendorIDs": sorted(ids), "PkgName": pkg,
-                                                 "InstalledVersion": "redacted", "FixedVersion": "redacted", "Severity": severity}]}
-                           for eco, pkg, ids, severity in rows]
-                entry[kind] = {"SchemaVersion": 2, "Trivy": {"Version": TRIVY_VERSION}, "ArtifactType": "container_image",
-                               "Metadata": {"ImageID": entry["image_id"]}, "Results": results or
-                               ([{"Class": "os-pkgs", "Type": "debian"}] if kind == "vuln" else [])}
-        issue_body(pair)
+        with phase("pair_sanitize"):
+            for side in ("published", "rebuilt"):
+                entry = pair[side]
+                for kind in ("vuln", "secret"):
+                    rows = native_rows(entry[kind], entry["image_id"], kind)
+                    results = [{"Class": "os-pkgs" if eco == "debian" else "lang-pkgs", "Type": eco,
+                                "Vulnerabilities": [{"VulnerabilityID": min(ids), "VendorIDs": sorted(ids), "PkgName": pkg,
+                                                     "InstalledVersion": "redacted", "FixedVersion": "redacted", "Severity": severity}]}
+                               for eco, pkg, ids, severity in rows]
+                    entry[kind] = {"SchemaVersion": 2, "Trivy": {"Version": TRIVY_VERSION}, "ArtifactType": "container_image",
+                                   "Metadata": {"ImageID": entry["image_id"]}, "Results": results or
+                                   ([{"Class": "os-pkgs", "Type": "debian"}] if kind == "vuln" else [])}
+            issue_body(pair)
     return pair  # All native outputs and the temporary source are gone.
 
 
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ScanError("invalid command")  # argparse's message can contain argv.
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("qualify", "sync"))
-    args = parser.parse_args(argv)
     try:
-        receipt = Path(os.environ["RUNNER_TEMP"]) / "stable-rebuild-pair.json"
-        if args.mode == "qualify":
-            require(not receipt.exists())
-            pair = qualify()
-            body = issue_body(pair)
-            with receipt.open("x") as stream:
-                receipt.chmod(0o600)
-                json.dump(pair, stream)
-            with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
-                summary.write(body + f"\nLocal rebuilt image ID (not a registry digest): `{pair['rebuilt_id']}`\n")
-                summary.write(f"Database metadata: `{json.dumps(pair['published']['database'], sort_keys=True)}`\n")
-                run_id = os.environ["GITHUB_RUN_ID"]
-                require(matches(r"[1-9]\d*", run_id))
-                summary.write(f"Run: https://github.com/{REPOSITORY}/actions/runs/{run_id}\n")
-        else:
-            require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY and os.environ.get("GITHUB_REF") == "refs/heads/main")
-            require(os.environ.get("GITHUB_EVENT_NAME") in ("schedule", "workflow_dispatch"))
-            pair = parse_json(receipt.read_bytes())
-            sync_issue(pair, token=os.environ["GH_TOKEN"])
+        with phase("startup"):
+            parser = SafeArgumentParser(description=__doc__)
+            parser.add_argument("mode", choices=("qualify", "sync"))
+            args = parser.parse_args(argv)
+        with phase("qualification" if args.mode == "qualify" else "issue_sync"):
+            receipt = Path(os.environ["RUNNER_TEMP"]) / "stable-rebuild-pair.json"
+            if args.mode == "qualify":
+                require(not receipt.exists())
+                pair = qualify()
+                with phase("pair_compare"):
+                    body = issue_body(pair)
+                with phase("receipt_write"):
+                    with receipt.open("x") as stream:
+                        receipt.chmod(0o600)
+                        json.dump(pair, stream)
+                with phase("summary_write"):
+                    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                        summary.write(body + f"\nLocal rebuilt image ID (not a registry digest): `{pair['rebuilt_id']}`\n")
+                        summary.write(f"Database metadata: `{json.dumps(pair['published']['database'], sort_keys=True)}`\n")
+                        run_id = os.environ["GITHUB_RUN_ID"]
+                        require(matches(r"[1-9]\d*", run_id))
+                        summary.write(f"Run: https://github.com/{REPOSITORY}/actions/runs/{run_id}\n")
+            else:
+                with phase("sync_admission"):
+                    require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY and os.environ.get("GITHUB_REF") == "refs/heads/main")
+                    require(os.environ.get("GITHUB_EVENT_NAME") in ("schedule", "workflow_dispatch"))
+                    pair = parse_json(receipt.read_bytes())
+                sync_issue(pair, token=os.environ["GH_TOKEN"])
         return 0
+    except PhaseError:
+        return 1
     except Exception:
-        print("Stable rebuild qualification or synchronization incomplete; no clean comparison claimed.", file=sys.stderr)
+        diagnostic("startup", "failure", "python", 1)
         return 1
 
 

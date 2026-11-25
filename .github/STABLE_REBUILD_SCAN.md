@@ -74,7 +74,17 @@ Native command output and reports are never printed or uploaded. Raw reports,
 image archives, scanner cache and disposable source live outside the checkout in
 a private ephemeral directory, removed before the final issue-sync step. The
 inter-step receipt contains only validated, allowlisted comparison evidence and
-is removed at job end. Errors are generic and contain no native traceback.
+is removed at job end. Errors contain no native traceback.
+
+Qualification diagnostics contain only fixed allowlisted phase/event/kind fields
+and numeric statuses. Phase begin/complete events use status 0. Native events
+preserve the actual subprocess exit, including negative signal statuses. HTTP
+failures preserve the numeric HTTP status; successful responses also record their
+status. `python`, `timeout`, `os` and `transport` failures use the generic status 1,
+not an invented native exit. Cleanup has its own phase, so its status does not
+hide an already-recorded smoke failure. Command arguments, URLs, headers, source
+snippets, native stdout/stderr, arbitrary exception text and secret reports never
+enter these diagnostics. A phase completion is not proof that later phases ran.
 
 Counts use advisory, ecosystem and package identity. Python package spelling is
 normalized, advisory aliases are merged within that package/ecosystem, and

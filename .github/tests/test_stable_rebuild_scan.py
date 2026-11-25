@@ -7,11 +7,13 @@ import hashlib
 import importlib.util
 import io
 import os
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import threading
 import unittest
 from unittest.mock import patch
@@ -250,6 +252,127 @@ class NativeRecipeTests(unittest.TestCase):
             self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
             self.assertFalse((Path(raw) / "stable-rebuild-pair.json").exists())
+
+
+class DiagnosticTests(unittest.TestCase):
+    PRIVATE = "SYNTHETIC_PRIVATE_DIAGNOSTIC_6b5e70c8"
+
+    def setUp(self):
+        self.m = load()
+
+    def invoke(self, operation):
+        with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {"RUNNER_TEMP": raw}), \
+                patch.object(self.m, "qualify", side_effect=operation), \
+                patch.object(self.m, "sync_issue") as sync, \
+                redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr:
+            result = self.m.main(["qualify"])
+            sync.assert_not_called()
+            self.assertFalse((Path(raw) / "stable-rebuild-pair.json").exists())
+        text = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(self.PRIVATE, text)
+        self.assertNotIn("http://", text)
+        self.assertNotIn("https://", text)
+        self.assertNotIn("Traceback", text)
+        for line in text.splitlines():
+            self.assertRegex(line, r"^stable_rebuild phase=[a-z_]+ event=(?:begin|complete|failure|native|http) "
+                                   r"kind=(?:phase|native|http|python|timeout|os|transport) status=-?[0-9]+$")
+            self.assertIn(line.split()[1].split("=", 1)[1], self.m.PHASES)
+        return result, text
+
+    def test_real_native_failure_preserves_exit_and_redacts_both_streams_and_argv(self):
+        def operation():
+            code = "import sys; print(sys.argv[1]); print(sys.argv[1], file=sys.stderr); sys.exit(37)"
+            return self.m.run([sys.executable, "-c", code, self.PRIVATE], cwd=Path.cwd())
+        result, text = self.invoke(operation)
+        self.assertEqual(result, 1)
+        self.assertIn("phase=qualification event=failure kind=native status=37", text)
+        self.assertNotIn("sys.exit", text)
+
+    def test_actual_http_failure_reports_only_numeric_status_without_headers_or_url(self):
+        with FakeAPI() as api:
+            api.deny = True
+            result, text = self.invoke(lambda: self.m.http("GET", api.url + "/" + self.PRIVATE,
+                                                        {"Authorization": "Bearer " + self.PRIVATE}))
+            self.assertEqual(api.calls, [("GET", "/" + self.PRIVATE)])
+        self.assertEqual(result, 1)
+        self.assertIn("phase=qualification event=failure kind=http status=401", text)
+        self.assertNotIn("Authorization", text)
+        self.assertNotIn("Bearer", text)
+
+    def test_python_and_schema_failure_use_fixed_generic_fallback(self):
+        for operation in (lambda: (_ for _ in ()).throw(RuntimeError(self.PRIVATE)),
+                          lambda: self.m.parse_json(self.PRIVATE)):
+            with self.subTest(operation=operation):
+                result, text = self.invoke(operation)
+                self.assertEqual(result, 1)
+                self.assertIn("phase=qualification event=failure kind=python status=1", text)
+
+    def test_timeout_launch_signal_and_transport_failures_are_value_safe(self):
+        def timeout():
+            return self.m.run([sys.executable, "-c", "import time; time.sleep(30)", self.PRIVATE], cwd=Path.cwd(), timeout=0.1)
+        def launch():
+            return self.m.run(["/missing/" + self.PRIVATE], cwd=Path.cwd())
+        def signal():
+            return self.m.run([sys.executable, "-c", "import os,signal; os.kill(os.getpid(),signal.SIGTERM)", self.PRIVATE], cwd=Path.cwd())
+        for operation, kind, status in ((timeout, "timeout", 1), (launch, "os", 1), (signal, "native", -15)):
+            with self.subTest(kind=kind):
+                result, text = self.invoke(operation)
+                self.assertEqual(result, 1)
+                self.assertIn(f"event=failure kind={kind} status={status}", text)
+        with patch.object(self.m.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = self.m.urllib.error.URLError(self.PRIVATE)
+            result, text = self.invoke(lambda: self.m.http("GET", "https://example.test/" + self.PRIVATE))
+        self.assertEqual(result, 1)
+        self.assertIn("event=failure kind=transport status=1", text)
+
+    def test_unknown_phases_numeric_fields_and_cli_argv_cannot_escape_allowlists(self):
+        for operation in (lambda: self.m.diagnostic(self.PRIVATE, "failure", "native", 7),
+                          lambda: self.m.diagnostic("build", "failure", "native", self.PRIVATE)):
+            result, text = self.invoke(operation)
+            self.assertEqual(result, 1)
+            self.assertIn("event=failure kind=python status=1", text)
+        for argv in ([self.PRIVATE], ["qualify", "--" + self.PRIVATE], []):
+            with self.subTest(argv=argv), redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(self.m.main(argv), 1)
+            self.assertNotIn(self.PRIVATE, stdout.getvalue() + stderr.getvalue())
+            self.assertIn("phase=startup event=failure kind=python status=1", stderr.getvalue())
+
+    def test_upgrade_failure_attribution_survives_successful_or_failed_cleanup(self):
+        native_run = subprocess.run
+        for cleanup_exit in (0, 13):
+            commands = []
+            def native(argv, **kwargs):
+                commands.append(argv[:2])
+                if "--candidate-image" in argv:
+                    return native_run([sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(29)", self.PRIVATE], **kwargs)
+                return subprocess.CompletedProcess(argv, cleanup_exit if argv[:2] == ["docker", "rm"] else 0,
+                                                   stdout=self.PRIVATE.encode(), stderr=self.PRIVATE.encode())
+            with self.subTest(cleanup_exit=cleanup_exit), patch.object(self.m.subprocess, "run", side_effect=native):
+                result, text = self.invoke(lambda: self.m.upgrade_smoke(Path("source"), Path.cwd(), D1, "v0.23.0", "e" * 40))
+            self.assertEqual(result, 1)
+            self.assertEqual(commands[-1], ["docker", "rm"])
+            self.assertIn("phase=upgrade_recipe event=failure kind=native status=29", text)
+            self.assertIn(f"phase=registry_cleanup event=native kind=native status={cleanup_exit}", text)
+            if cleanup_exit:
+                self.assertIn("phase=registry_cleanup event=failure kind=native status=13", text)
+
+    def test_actual_qualification_attributes_failure_before_any_docker_or_scanner(self):
+        native_run = subprocess.run
+        commands = []
+        def failed_init(argv, **kwargs):
+            commands.append(argv[:2])
+            return native_run([sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(19)", self.PRIVATE], **kwargs)
+        with patch.object(self.m, "Registry") as registry, \
+                patch.object(self.m.subprocess, "run", side_effect=failed_init), \
+                patch.object(self.m, "acquire") as acquire:
+            registry.return_value.stable.return_value = "v0.23.0"
+            registry.return_value.resolve.return_value = D1
+            operation = self.m.qualify
+            result, text = self.invoke(operation)
+            acquire.assert_not_called()
+        self.assertEqual(result, 1)
+        self.assertEqual(commands, [["git", "init"]])
+        self.assertIn("phase=source_init event=failure kind=native status=19", text)
 
 
 class FakeAPI:
