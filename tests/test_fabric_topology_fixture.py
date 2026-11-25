@@ -340,6 +340,73 @@ class FabricTopologyFixtureTests(unittest.TestCase):
         self.assertTrue(drawn <= {key for state in states for key in state["covers"]})
 
 
+def _core_variant(mode: str):
+    """The CORE case with one adapter or expander header line changed (#1504)."""
+
+    def build():
+        system, snapshot, outputs = _core_case()
+        adapter, devices, expanders = "mprutil -u 0 show adapter", "mprutil -u 0 show devices", "mprutil -u 0 show expanders"
+        if mode in {"present", "absent"}:
+            handle = "0020" if mode == "present" else "009b"
+            outputs[adapter] = outputs[adapter].replace("4 0000 0000 N 0 3.0 12.0 No Device", f"4 0001 {handle} N 12.0 3.0 12.0 SAS Target")
+            outputs[devices] = outputs[devices].replace("5000c5000000d000 0020 0009 SAS Target", "5000c5000000d000 0020 0001 SAS Target")
+        if mode == "duplicate":
+            outputs[expanders] = outputs[expanders].replace("5000c50000000e02 000a 0009", "5000c50000000e02 0009 0009")
+        return system, snapshot, outputs
+
+    return _case_payload(build)["fabric"]
+
+
+class AdapterHandleIdentityTests(unittest.TestCase):
+    """A CORE adapter row's handle is decided over the unit, before selection (#1504)."""
+
+    def test_a_handle_two_expanders_carry_is_ambiguous_though_one_is_outside_the_selection(self) -> None:
+        fabric = _core_variant("duplicate")
+        shown = {expander["id"] for expander in fabric["expanders"]}
+        self.assertNotIn("expander:controller:mpr0:5000c50000000e02", shown)
+        mpr0 = next(item for item in fabric["controllers"] if item["id"] == "controller:mpr0")
+        self.assertEqual(mpr0["device_handle_states"], {"0": "ambiguous", "1": "ambiguous", "2": "ambiguous", "3": "ambiguous"})
+        # The adapter rows stay as reported.
+        self.assertTrue(all("device_handle_state" not in row for row in mpr0["phy_rows"]))
+
+    def test_a_handle_one_expander_carries_has_no_state(self) -> None:
+        self.assertTrue(all("device_handle_states" not in item for item in _core_variant("base")["controllers"]))
+
+    def test_a_handle_only_a_disk_carries_names_that_disk(self) -> None:
+        mpr0 = next(item for item in _core_variant("present")["controllers"] if item["id"] == "controller:mpr0")
+        self.assertEqual(mpr0["device_handle_states"], {"4": "end_device"})
+        # A handle no list carries is not marked: it is outside the payload.
+        absent = next(item for item in _core_variant("absent")["controllers"] if item["id"] == "controller:mpr0")
+        self.assertNotIn("device_handle_states", absent)
+
+
+class TransportAddressIdentityTests(unittest.TestCase):
+    """A disk port address at two slots identifies neither, host-wide (#1504)."""
+
+    def _records(self, duplicate: bool) -> list[dict]:
+        from tests import topology_generality_fixtures as generality
+
+        survey = generality.Survey()
+        host = survey.host(1, address="5aaa000000000101", phys=4)
+        expander = survey.expander(host, [0, 1], index=0, address="5bbb00000000a1b2", phys=4, uplink=[2, 3])
+        shelf = {"id": "5fff0000000000f0", "label": "Test shelf", "layout": [[0, 1]], "slots": []}
+        for bay in (0, 1):
+            address = "5eee000000000010" if duplicate or bay == 0 else "5eee000000000011"
+            survey.end(expander, [bay], bay=bay, enclosure=shelf["id"], address=address, block=f"wdcase{bay}")
+            shelf["slots"].append({"slot": bay, "address": address, "block": f"wdcase{bay}"})
+        fabric, _inventory, ok = generality.enriched({"id": "example", "label": "Test box", "enclosures": [shelf]}, shelf, survey.text())
+        self.assertTrue(ok)
+        return [record for record in fabric["raw"]["sas_transport_ports"] if record["remote_kind"] == "end_device"]
+
+    def test_one_address_at_two_slots_marks_both_records(self) -> None:
+        records = self._records(duplicate=True)
+        self.assertEqual(sorted(record["bay_identifier"] for record in records), [0, 1])
+        self.assertTrue(all(record["remote_address_state"] == "ambiguous" for record in records))
+
+    def test_distinct_addresses_are_not_marked(self) -> None:
+        self.assertTrue(all("remote_address_state" not in record for record in self._records(duplicate=False)))
+
+
 if __name__ == "__main__":
     import sys
 

@@ -72,28 +72,8 @@ function membershipOf(link) {
     return { read: pairs && ends.every((end) => end.read), ends, pairs };
   }
 
-// A cable's members as the ledger reads them: each listed PHY's evidence
-// must be a kind the table says can end this cable there, and every target
-// a read census record names must be its other end. Otherwise which PHYs
-// the cable uses is not read, for lanes, rates, counters and inspectors.
-function memberConflicts(model, link) {
-    if (!link.lanes) return [];
-    const found = [];
-    for (const [side, id, phys] of [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]]) {
-      const other = context.chipOfNode(model, side === "near" ? link.target : link.source)?.id || (side === "near" ? link.target : link.source);
-      for (const phy of new Set(phys)) {
-        const ledger = context.phyRoles(model, id, phy);
-        const kind = [...ledger.attached].find((item) => !context.cableEndAccepts(link.kind, side, item));
-        const stray = [...ledger.roles].find((role) => !["link"].includes(role));
-        if (kind || stray) found.push({ side, id, phy, why: `its row or the transport census names ${KIND_WORDS[kind] || ROLE_WORDS[stray] || "a device type whose role is not read"}, which cannot be this end of the cable` });
-        else if ([...ledger.targets.keys()].some((key) => key !== other)) found.push({ side, id, phy, why: `the transport census names ${targetWords(ledger.targets)}` });
-      }
-    }
-    return found;
-  }
-
 function membershipRead(model, link) {
-    return membershipOf(link).read && !memberConflicts(model, link).length;
+    return membershipOf(link).read && !context.memberConflicts(model, link).length;
   }
 
 function unpairedPhys(model, link) {
@@ -203,30 +183,24 @@ function censusKinds(model, id, phy) {
     return { kinds: ledger.kinds, records: ledger.records };
   }
 
-const ROLE_WORDS = { disk: "a disk", link: "a link to an HBA or expander", sep: "an enclosure processor", none: "nothing attached", unread: "an attachment not read" };
-const KIND_WORDS = { initiator: "an HBA (an initiator)", "sata initiator": "a SATA initiator", expander: "an expander", cable: "an inferred cable end" };
-
-// The targets a PHY's read census records name, as words, in one order.
-function targetWords(targets) {
-  return [...targets.values()].sort().join(" and ");
-}
-
-// Where an HBA's own row names the device handle of an expander of the same
-// HBA (CORE): that expander, though which cable is not read.
-// A handle two expanders of the HBA carry names neither; a linked row with
-// no handle read names nothing. Only a read handle no expander here carries
-// goes outside this payload ("").
+// Where an HBA's own row names a handle (CORE): the device it names, said
+// only once every record is checked; only a read handle that nothing here
+// carries goes outside this payload ("").
 function handleDestination(model, id, phy) {
-    const rows = context.list(model.sas.controllers.get(id)?.phys).filter((item) => item.phy === phy);
-    const row = rows.length === 1 ? rows[0] : null;
-    if (!row) return "";
-    if (!row.handle) return row.rate !== null ? `destination ${context.NOT_READ}: its row names no device handle` : "";
-    const found = model.nodes.filter((entry) => entry.kind === "expander" && entry.controllerId === id && model.sas.expanders.get(entry.id)?.handle === row.handle);
-    if (found.length > 1) return `destination ${context.NOT_READ}: device handle ${row.handle} names more than one expander of ${context.nodeName(model, id)}`;
+    const target = context.handleTarget(model, id, phy);
+    const { row } = target;
+    if (target.state === "none") return `destination ${context.NOT_READ}: its row names no device handle`;
+    if (target.state === "ambiguous") return `destination ${context.NOT_READ}: ${target.why}`;
+    if (target.state === "disk") {
+      const port = target.bay.ports.find((item) => item.controllerId === id && item.handle === row.handle);
+      return `to the disk in ${target.bay.label}${port?.device ? ` (${port.device})` : ""}, attached directly; its path is not joined to this PHY`;
+    }
+    if (target.state === "device") return `a disk the HBA's device list names (handle ${row.handle}), in no bay of this view`;
+    if (target.state !== "expander") return "";
     // A row whose own type cannot be a cable from this HBA names no expander.
     const kind = context.deviceKind(row.device);
-    if (found.length === 1 && kind && !context.cableEndAccepts("controller-expander", "near", kind)) return `destination ${context.NOT_READ}: its row says ${row.device}, but its device handle names ${context.nodeName(model, found[0].id)}`;
-    return found.length === 1 ? `to ${context.nodeName(model, found[0].id)}; which cable it is in is ${context.NOT_READ}` : "";
+    if (kind && !context.cableEndAccepts("controller-expander", "near", kind)) return `destination ${context.NOT_READ}: its row says ${row.device}, but its device handle names ${context.nodeName(model, target.id)}`;
+    return `to ${context.nodeName(model, target.id)}; which cable it is in is ${context.NOT_READ}`;
   }
 
 // A PHY's destination, said only where it is read: its owner by the one
@@ -243,7 +217,7 @@ function destinationOf(model, id, phy) {
     // Every read record's target, whatever order they came in: two targets,
     // present or not, are a destination not read.
     const { targets } = context.phyRoles(model, id, phy);
-    if (targets.size > 1 || [...targets.keys()].some((key) => key.startsWith("ambiguous:"))) return `destination ${context.NOT_READ}: the transport census names ${targetWords(targets)}`;
+    if (targets.size > 1 || [...targets.keys()].some((key) => key.startsWith("ambiguous:"))) return `destination ${context.NOT_READ}: the transport census names ${context.targetWords(targets)}`;
     const [key] = [...targets.keys()];
     if (key && model.nodeById.has(key)) return `to ${context.nodeName(model, key)}; which cable it is in is ${context.NOT_READ}`;
     if (key) return `destination ${context.NOT_READ}: the transport census names ${targets.get(key)}`;
@@ -256,12 +230,39 @@ function ownerIndex(model) {
     const claim = (id, phy, claimant) => {
       const key = `${context.chipOfNode(model, id)?.id || id}|${phy}`;
       if (!owners.has(key)) owners.set(key, []);
-      if (!owners.get(key).some((other) => other.key === claimant.key)) owners.get(key).push(claimant);
+      const held = owners.get(key).find((other) => other.key === claimant.key);
+      if (!held) owners.get(key).push(claimant);
+      else if (claimant.address) held.address = held.address || claimant.address;
     };
+    // A disk port address is one disk's identity across the whole payload,
+    // before any scope: one address at two slots (two bays here, a census
+    // record of another slot, or as the builder found it) identifies neither.
+    const slots = new Map();
+    const note = (address, slot) => {
+      if (!address || !slot) return;
+      if (!slots.has(address)) slots.set(address, new Set());
+      slots.get(address).add(slot);
+    };
+    const ambiguous = new Set();
+    for (const port of context.list(model.censusRows).filter((item) => item.remote_kind === "end_device")) {
+      const address = context.sasAddressOf(port.remote_sas_address);
+      if (port.remote_address_state === "ambiguous" && address) ambiguous.add(address);
+      if (port.bay_identifier !== null && port.bay_identifier !== undefined) note(address, `census:${context.text(port.enclosure_identifier)}|${port.bay_identifier}`);
+    }
+    for (const bay of model.bays) for (const port of bay.ports) note(port.sasAddress, `bay:${bay.bayId}`);
+    // A bay of this view and its own census record are one slot.
+    const sameSlot = (marks) => {
+      const bays = [...marks].filter((mark) => mark.startsWith("bay:"));
+      const census = [...marks].filter((mark) => mark.startsWith("census:"));
+      return bays.length <= 1 && census.length <= 1;
+    };
+    for (const [address, marks] of slots) if (!sameSlot(marks)) ambiguous.add(address);
+    model.ambiguousAddresses = ambiguous;
     for (const bay of model.bays) {
       for (const port of bay.ports) {
         if (!port.expanderId) continue;
-        for (const phy of port.phy ? [port.phy.phy] : context.list(port.phys)) claim(port.expanderId, phy, { key: `bay:${bay.bayId}`, kind: "bay", bay, label: bay.label });
+        const address = ambiguous.has(port.sasAddress) ? port.sasAddress : "";
+        for (const phy of port.phy ? [port.phy.phy] : context.list(port.phys)) claim(port.expanderId, phy, { key: `bay:${bay.bayId}`, kind: "bay", bay, label: bay.label, address });
       }
     }
     // A cable claims the PHYs at an end only where its members there are
@@ -292,7 +293,10 @@ function phyOwner(model, id, phy) {
     const ledger = context.phyRoles(model, id, phy);
     const evidence = ledger.roles;
     const clash = (allowed) => [...evidence].find((role) => role !== allowed) || "";
-    const bayClash = bays.length > 0 ? clash("disk") : "";
+    // A bay claims a disk PHY only through a disk port address that
+    // identifies one slot, and only where one disk is named on the PHY.
+    const ambiguousBay = claimants.find((item) => item.kind === "bay" && item.address);
+    const bayClash = bays.length > 0 ? clash("disk") || (ambiguousBay ? "address" : ledger.disks.size > 1 ? "disks" : "") : "";
     // A cable's PHY must be a kind the table says can end that cable at that
     // end, and every target the census names must be the cable's other end.
     const cableClash = cables.length !== 1 ? (cables.length ? clash("link") : "") : (() => {
@@ -302,20 +306,32 @@ function phyOwner(model, id, phy) {
       const kind = [...ledger.attached].find((item) => !context.cableEndAccepts(cable.kind, side, item));
       if (kind) return `kind:${kind}`;
       const other = context.chipOfNode(model, side === "near" ? cable.target : cable.source)?.id || (side === "near" ? cable.target : cable.source);
-      return [...ledger.targets.keys()].some((key) => key !== other) ? "target" : "";
+      if ([...ledger.targets.keys()].some((key) => key !== other)) return "target";
+      if (context.handleClash(model, cable, side, phy)) return "handle";
+      // One conflict state for the whole cable: a retained list whose other
+      // member's evidence does not fit claims none of its members.
+      return context.memberConflicts(model, cable).length ? "members" : "";
     })();
-    const roleClash = !claimants.length && evidence.size > 1;
+    const roleClash = !claimants.length && (evidence.size > 1 || ledger.disks.size > 1);
     const known = claimants.length === 1 && !reading.conflict && !bayClash && !cableClash;
     const disputed = !known && (claimants.length > 1 || reading.conflict || Boolean(bayClash) || Boolean(cableClash) || roleClash);
     const hba = model.nodeById.get(id)?.kind === "controller";
     const says = (role) => (role === "unknown" ? `its row says ${ledger.unknown.join(" and ")}, a device type whose role is not read`
-      : role === "target" ? `the transport census names ${targetWords(ledger.targets)}: destination ${context.NOT_READ}`
-      : role.startsWith("kind:") ? `its row or the transport census names ${KIND_WORDS[role.slice(5)]}, which cannot be this end of that cable`
+      : role === "target" ? `the transport census names ${context.targetWords(ledger.targets)}: destination ${context.NOT_READ}`
+      : role === "handle" ? `${context.handleClash(model, cables[0].link, cables[0].side, phy)}: destination ${context.NOT_READ}`
+      : role === "members" ? (() => {
+        const [first] = context.memberConflicts(model, cables[0].link);
+        return `the cable's members are ${context.NOT_READ} (PHY ${first.phy} at ${context.nodeName(model, first.id)}: ${first.why})`;
+      })()
+      : role === "address" ? `its disk port address ${ambiguousBay.address} is reported for more than one slot, so which disk is on it is ${context.NOT_READ}`
+      : role === "disks" ? `the transport census names two disks on it (${[...ledger.disks.values()].sort().join(" and ")})`
+      : role.startsWith("kind:") ? `its row or the transport census names ${context.KIND_WORDS[role.slice(5)]}, which cannot be this end of that cable`
       : role === "unread" ? `${ledger.unread.find((item) => !/census record was not read/.test(item)) || ledger.unread[0]}, so what is attached is not read`
-      : role === "disk" ? "its row or the transport census names a disk on it" : role === "none" ? "its row or the transport census says nothing is attached" : `its row or the transport census calls it ${ROLE_WORDS[role]}`);
+      : role === "disk" ? "its row or the transport census names a disk on it" : role === "none" ? "its row or the transport census says nothing is attached" : `its row or the transport census calls it ${context.ROLE_WORDS[role]}`);
     const why = reading.conflict ? `its number is on more than one row of its ${hba ? "HBA" : "expander"}` : claimants.length > 1 ? `${claimants.map((item) => item.label).join(" and ")} all claim it`
       : bayClash || cableClash ? `${claimants[0].label} claims it, but ${says(bayClash || cableClash)}`
-      : roleClash ? `its rows or the transport census name ${[...evidence].sort().map((role) => (role === "unknown" ? `a device type whose role is not read (${ledger.unknown.join(" and ")})` : ROLE_WORDS[role])).join(" and ")}${reading.devices.length ? ` (${reading.devices.join(", ")})` : ""}` : "";
+      : roleClash && evidence.size <= 1 ? `the transport census names two disks on it (${[...ledger.disks.values()].sort().join(" and ")})`
+      : roleClash ? `its rows or the transport census name ${[...evidence].sort().map((role) => (role === "unknown" ? `a device type whose role is not read (${ledger.unknown.join(" and ")})` : context.ROLE_WORDS[role])).join(" and ")}${reading.devices.length ? ` (${reading.devices.join(", ")})` : ""}` : "";
     const sole = claimants[0];
     const text = known ? (sole.kind === "bay" ? sole.label : sole.side === "near" ? `cable to ${context.nodeName(model, sole.link.target)}` : `cable from ${context.nodeName(model, sole.link.source)}${sole.link.lanes.targetBasis === "inferred" ? ", inferred" : ""}`)
       : disputed ? `${roleClash ? "role" : "owner"} ${context.NOT_READ}: ${why}` : "";
@@ -824,7 +840,7 @@ function wiringChecks(model, fabric) {
           blind = true;
           unread.push(`${name}: its ${context.plural(link.lanes.rows.length, "measured pair")} do not pair the PHYs listed at its ends one to one, so its membership is not read`);
         }
-        for (const item of memberConflicts(model, link)) {
+        for (const item of context.memberConflicts(model, link)) {
           blind = true;
           unread.push(`${name}: PHY ${item.phy} at ${context.nodeName(model, item.id)}: ${item.why}, so which PHYs the cable uses is not read`);
         }
@@ -899,7 +915,9 @@ function wiringChecks(model, fabric) {
               // One attribution for every surface: a PHY two bays claim, or
               // whose number is on two rows, has its owner not read.
               const owner = phyOwner(model, port.expanderId, phy);
-              if (owner.known) portAt.set(key, { port, bay });
+              // Every path of the bay on this PHY, in any order: which disk
+              // port the PHY is on is decided from all of them.
+              if (owner.known) portAt.set(key, { port: portAt.get(key)?.port || port, bay, ports: [...(portAt.get(key)?.ports || []), port] });
               else conflicts.set(key, owner);
             }
           }
@@ -1078,6 +1096,9 @@ function wiringChecks(model, fabric) {
     // cable the payload could not resolve, and on any other PHY an HBA or an
     // expander is attached to.
     const cablePhys = new Set();
+    // One finding per measured observation: a fault the cable check says
+    // without an owner is not said again by the disk-port check.
+    const saidFaults = new Set();
     const views = [...sas.expanders.values()].filter((item) => model.nodeById.has(item.id) && !model.nodeById.get(item.id).mergedInto);
     // HBAs whose own PHY counters are read: their PHYs are subjects too
     // (a disk attached directly, an uplink in no cable).
@@ -1209,6 +1230,7 @@ function wiringChecks(model, fabric) {
         const reading = owner.reading;
         if (!reading.tier || diskEvidence(owner)) continue;
         const key = `fault:${id}|${phy}`;
+        saidFaults.add(`${id}|${phy}`);
         const where = `${context.nodeName(model, id)}: PHY ${phy} (${owner.text || owner.note || `owner ${context.NOT_READ}: in no cable the payload reports`})`;
         cover.expect(key, where, "fault");
         cover.bad(key);
@@ -1289,7 +1311,9 @@ function wiringChecks(model, fabric) {
       // A PHY a census record not read lists, that nothing else classifies:
       // whether it is a disk port is not read, so the check cannot pass on it.
       for (const port of context.list(model.censusRows)) {
-        if (port.state === "read") continue;
+        // A read record that does not say what is attached is unread
+        // evidence too.
+        if (port.state === "read" && ["end_device", "expander"].includes(port.remote_kind)) continue;
         // A disk port the census names by a PHY name on more than one row:
         // its PHY is not read, and the check cannot pass on it.
         if (port.state === "ambiguous" && port.remote_kind === "end_device") {
@@ -1326,6 +1350,7 @@ function wiringChecks(model, fabric) {
           const owner = phyOwner(model, view.id, phy);
           // A disputed PHY a bay claims, or that names a disk, is said here.
           const here = owner.disputed && diskEvidence(owner);
+          if (!here && saidFaults.has(key)) continue;
           // An HBA PHY is judged here only as a disk port: its other faults
           // are the cable check's.
           if (view.hba && !here && !cover.has(key) && !portAt.has(key)) continue;
@@ -1343,7 +1368,7 @@ function wiringChecks(model, fabric) {
               flag("node", entry.id, text);
             } else if (at) {
               if (!byBay.has(at.bay)) byBay.set(at.bay, []);
-              byBay.get(at.bay).push({ reading, chip: entry, port: at.port });
+              byBay.get(at.bay).push({ reading, chip: entry, port: at.port, ports: at.ports });
               for (const port of at.bay.ports) if (chipOf(port.expanderId) === entry && (port.phy ? port.phy.phy === phy : context.list(port.phys).includes(phy))) flag("port", port.key, `PHY ${phy} of ${entry.label}: ${context.counterText(reading.worst)}`, reading.tier);
             } else {
               const device = reading.device;
@@ -1367,8 +1392,14 @@ function wiringChecks(model, fabric) {
         // A disk port is its own SAS address: two paths that name one address
         // are one port seen twice. Where a path's address is not read, which
         // port it is is not read, so no count of ports is said.
-        const addresses = found.map((item) => item.port?.sasAddress || "");
-        const ports = addresses.every(Boolean) ? new Set(addresses).size : new Set(found.map((item) => item.port?.key)).size > 1 ? 0 : 1;
+        // Each faulty PHY's disk port from all of its paths: two addresses on
+        // one PHY, or one not read, leave its port not read.
+        const portOf = (item) => {
+          const named = new Set(context.list(item.ports).map((port) => port.sasAddress));
+          return named.size === 1 && !named.has("") ? [...named][0] : null;
+        };
+        const addresses = found.map(portOf);
+        const ports = addresses.every(Boolean) ? new Set(addresses).size : new Set(found.flatMap((item) => context.list(item.ports).map((port) => port.key))).size > 1 ? 0 : 1;
         const text = tiered(`${bay.label}${bay.deviceName ? ` (${bay.deviceName})` : ""}, ${ports > 1 ? "both ports" : ports === 1 ? "one port" : "its ports (which disk port each path uses is not read)"}: ${[...found].sort((left, right) => left.reading.phy - right.reading.phy).map((item) => `${item.chip.label} PHY ${item.reading.phy}: ${context.counterText(item.reading.worst)}${context.disagreement(item.reading)}`).join("; ")}`, context.worse(...found.map((item) => item.reading.tier)));
         flags.push(text);
         flag("bay", bay.bayId, text);
@@ -1615,7 +1646,11 @@ function cableRows(model, link) {
     if (link.lanes.targetBasis === "inferred") rows.push({ label: "Far end", value: `inferred: the only linked PHYs of ${context.nodeName(model, link.target)} that are in no port. sysfs has a port on the parent only` });
     else if (!link.lanes.targetPhys.length && parentOnly) rows.push({ label: "Far end", value: `${context.NOT_READ}: sysfs has a port on the parent only` });
     // Each lane's own rate, at the end that is read.
-    const near = unpairedPhys(model, link).filter((item) => item.side === "near" && item.row);
+    // Only the PHYs this cable owns give it a rate; a member whose owner is
+    // not read is said as that.
+    const listedNear = unpairedPhys(model, link).filter((item) => item.side === "near" && item.row);
+    const near = listedNear.filter((item) => { const owner = phyOwner(model, item.id, item.phy); return owner.known && owner.link?.id === link.id; });
+    const strayNear = listedNear.filter((item) => !near.includes(item));
     const below = unpairedBelow(model, link);
     if (near.length) {
       const groups = new Map();
@@ -1625,6 +1660,7 @@ function cableRows(model, link) {
       }
       rows.push({ label: "Per lane", value: [...groups].map(([key, phys]) => `PHY ${context.phyRanges(phys)}: ${phys.length > 1 ? "each " : ""}${key}`).join("; "), warn: near.some(below) });
     }
+    if (strayNear.length) rows.push({ label: "Per lane", value: `PHY ${context.phyRanges(strayNear.map((item) => item.phy))}: rate not this cable's (owner ${context.NOT_READ})` });
     if (!link.lanes.rows.length) rows.push({ label: "Pairing", value: `${context.NOT_READ}: which PHY at one end is cabled to which at the other` });
     const slow = slowLanes(model, link);
     if (slow.length) rows.push({ label: "Below both ends' max", value: slow.map((lane) => `PHY ${lane.source} ↔ ${lane.target} at ${lane.rate} Gb/s (both ends ${lane.cap})`).join(", "), warn: true });
@@ -2851,6 +2887,7 @@ function attach(container, searchInput, searchStatus, hooks = {}) {
     cableEnds: { configurable: true, get: () => cableEnds },
     unpairedPhys: { configurable: true, get: () => unpairedPhys },
     phyOwner: { configurable: true, get: () => phyOwner },
+    membershipRead: { configurable: true, get: () => membershipRead },
     censusKinds: { configurable: true, get: () => censusKinds },
     destinationOf: { configurable: true, get: () => destinationOf },
     slowLanes: { configurable: true, get: () => slowLanes },

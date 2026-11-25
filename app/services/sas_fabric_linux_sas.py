@@ -387,6 +387,17 @@ class _Projection:
                 "enclosure_identifier": device.enclosure_identifier if device else None,
                 "target_basis": "reported" if remote else "not_read",
             })
+        # A disk port address is one disk's identity across the whole host:
+        # one address at two slots identifies neither, wherever either slot is.
+        slots_by_address: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        for record in self.port_census:
+            if record["remote_kind"] == "end_device" and record["remote_sas_address"] and record["bay_identifier"] is not None:
+                slots_by_address[str(record["remote_sas_address"]).lower()].add(
+                    (str(record["enclosure_identifier"] or ""), str(record["bay_identifier"])))
+        for record in self.port_census:
+            address = str(record["remote_sas_address"] or "").lower()
+            if record["remote_kind"] == "end_device" and len(slots_by_address.get(address, ())) > 1:
+                record["remote_address_state"] = "ambiguous"
 
     def chain(self, owner_id: str) -> tuple[list[str], list[str]]:
         node_ids, link_ids = [owner_id], []

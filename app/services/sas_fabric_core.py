@@ -852,6 +852,39 @@ class _MprReportedLaneContext:
         )
 
 
+def _mpr_adapter_handle_states(rows: list[dict[str, Any]] | None, payload: dict[str, Any]) -> dict[str, str]:
+    """Each adapter PHY whose device handle does not name exactly one expander.
+
+    Handles are local to one MPR unit, so this is decided over the unit's
+    whole expander and device lists, before any enclosure selection: a
+    handle two records carry is ambiguous everywhere, and a handle only a
+    non-expander device carries names that device, not an absent one.
+    The adapter rows stay as reported; the states are kept beside them, by
+    PHY. A handle naming exactly one expander, or lists not read, has none.
+    """
+    lists = payload.get("lists") or {}
+    states: dict[str, str] = {}
+    if not rows or lists.get("expanders") not in {"read", "empty"}:
+        return states
+    expander_handles = Counter(str(row.get("dev_handle") or "").lower() for row in payload.get("expanders") or [])
+    devices_read = lists.get("devices") in {"read", "empty"}
+    device_handles = Counter(
+        str(device.get("handle") or "").lower()
+        for device in payload.get("devices") or []
+        if device.get("device") not in _MPR_EXPANDER_ATTACHED_DEVICES
+    )
+    for row in rows:
+        handle = str(row.get("device_handle") or "").lower()
+        if not handle or handle == "0000":
+            continue
+        expanders, others = expander_handles[handle], device_handles[handle] if devices_read else 0
+        if expanders + others > 1:
+            states[str(row.get("phy"))] = "ambiguous"
+        elif not expanders and others == 1:
+            states[str(row.get("phy"))] = "end_device"
+    return states
+
+
 def _add_mpr_infrastructure(
     *,
     nodes: dict[str, SasFabricNode],
@@ -874,6 +907,10 @@ def _add_mpr_infrastructure(
         }
         selected_enc_handles.discard("")
         expander_ids_by_enc_handle: dict[str, list[str]] = defaultdict(list)
+        for controller in controllers:
+            states = _mpr_adapter_handle_states(controller.get("phy_rows"), payload) if controller.get("id") == controller_id else {}
+            if states:
+                controller["device_handle_states"] = states
         expanders = payload.get("expanders") or []
         parent_context = _mpr_expander_parent_context(expanders, controller_id)
         lane_context = _MprReportedLaneContext(expanders, payload.get("adapter_detail"), unit)

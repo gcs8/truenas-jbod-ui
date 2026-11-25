@@ -619,6 +619,18 @@ function subjectDeletions(fabric, built) {
       return true;
     } });
   });
+  // Every list of records, reversed: whatever is said over a set of records
+  // is said the same in any order.
+  const reverseAll = (lists) => {
+    let done = false;
+    for (const items of lists) if (Array.isArray(items) && items.length > 1) { items.reverse(); done = true; }
+    // Nothing to reverse is evidence already absent, counted as such.
+    return done || true;
+  };
+  out.push({ name: "census records reversed", permuted: true, checks: [], tokens: [], change: (copy) => reverseAll([copy.fabric.raw?.sas_transport_ports]) });
+  out.push({ name: "trace record lists reversed", permuted: true, checks: [], tokens: [], change: (copy) => reverseAll(copy.fabric.traces.flatMap((entry) => Object.values(entry.metrics || {}).filter(Array.isArray))) });
+  out.push({ name: "PHY tables reversed", permuted: true, checks: [], tokens: [], change: (copy) => reverseAll([...copy.fabric.nodes.flatMap((entry) => [entry.raw?.phys, entry.raw?.phy_rows]), ...(copy.fabric.expanders || []).map((entry) => entry.phys), ...(copy.fabric.controllers || []).map((entry) => entry.phy_rows)]) });
+  out.push({ name: "links reversed", permuted: true, checks: [], tokens: [], change: (copy) => reverseAll([copy.fabric.links]) });
   for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
     (trace.metrics?.path_states || []).forEach((state, index) => {
       out.push({ name: `${trace.id} path ${index}`, checks: ["path-states"], tokens: [trace.id], change: (copy) => {
@@ -718,15 +730,27 @@ function surfaceTokens(built) {
     ...built.bays.flatMap((bay) => bay.ports.map((port) => ({ kind: "port", id: port.key })))];
   const rates = {};
   const counters = {};
+  // A disk port's surface (its card, its bay's rows) is about its own PHYs:
+  // a counter there with no PHY named is said of those.
+  const portPhys = (ports) => ports.flatMap((port) => (port.phy ? [port.phy.phy] : port.phys || [])).join(", ");
+  const own = new Map([...built.bays.map((bay) => [`bay:${bay.bayId}`, portPhys(bay.ports)]), ...built.bays.flatMap((bay) => bay.ports.map((port) => [`port:${port.key}`, portPhys([port])]))]);
   const add = (key, value) => {
     const text = String(value ?? "");
     const found = text.match(RATE_TOKEN);
     if (found) rates[key] = [...(rates[key] || []), ...found];
-    // A counter is bound to its surface: a row's label can change with the
-    // tier it is in (Warning, Critical) as a fault joins it.
-    const counts = text.match(COUNTER_TOKEN);
+    // A counter is bound to its surface and to the PHY it is said of (the
+    // nearest "PHY n" before it in its line): a row's label can change with
+    // the tier it is in (Warning, Critical) as a fault joins it.
     const surface = key.replace(/ (pin|card|lines|notes|drawn)( .*)?$/, "");
-    if (counts) counters[surface] = [...(counters[surface] || []), ...counts];
+    const label = key.match(/ (?:pin|card) (.*)$/)?.[1] || "";
+    for (const line of `${label ? `${label}: ` : ""}${text}`.split(" | ")) {
+      let ref = own.get(surface) || "";
+      // A lane's row names both of its ends ("PHY 0 ↔ 32").
+      for (const match of line.matchAll(/(?<!\()PHY (\d+(?:–\d+)?(?:, \d+(?:–\d+)?)*)(?: ↔ (\d+(?:–\d+)?(?:, \d+(?:–\d+)?)*))?|(\b\d+(?:–\d+)? (?:invalid dword|running disparity|loss of dword sync|PHY reset problem)\b)/g)) {
+        if (match[1]) ref = [match[1], match[2]].filter(Boolean).join(", ");
+        else counters[surface] = [...(counters[surface] || []), `${ref}::${match[3]}`];
+      }
+    }
   };
   for (const ref of refs) {
     const html = T.detailFor(built, ref)?.html || "";
@@ -744,23 +768,40 @@ function surfaceTokens(built) {
   return { rates, counters };
 }
 
-// A counters-only injection on one PHY changes no rate anywhere; a counter
-// changes only where it is that PHY's: the injected count appears, and only
-// counts some row of that PHY number held before may go.
+// A counters-only injection on one PHY changes no rate anywhere, and no
+// counter value but that PHY's: every counter any surface says is bound to
+// the PHY it is said of, and only that PHY's may come or go; what comes is
+// the injected count. A count said of no PHY never changes.
+const covers = (ref, phy) => ref.split(", ").some((part) => {
+  const [low, high = low] = part.split("–").map(Number);
+  return phy >= low && phy <= high;
+});
 function assertLocal(before, after, base, deletion, why) {
   assert.deepEqual(after.rates, before.rates, `${why}: a counter change moved a displayed rate`);
   const phy = deletion.faulty.phy;
-  const LABELS = [["invalid_dword_count", "invalid dword"], ["running_disparity_error_count", "running disparity"], ["loss_of_dword_synchronization_count", "loss of dword sync"], ["phy_reset_problem_count", "PHY reset problem"]];
-  const tables = [...base.fabric.nodes.flatMap((entry) => [entry.raw?.phys, entry.raw?.phy_rows]), ...(base.fabric.expanders || []).map((entry) => entry.phys)].filter(Array.isArray);
-  const values = new Set(tables.flat().filter((row) => Number(row?.phy) === phy).flatMap((row) => LABELS.filter(([key]) => Number.isFinite(Number(row[key])) && row[key] !== null).map(([key]) => Number(row[key]))));
-  const removable = (token) => token.match(/^(\d+)(?:–(\d+))?/).slice(1).filter(Boolean).every((value) => values.has(Number(value))) || /–/.test(token);
   const bag = (list) => list.reduce((map, token) => map.set(token, (map.get(token) || 0) + 1), new Map());
   for (const key of new Set([...Object.keys(before.counters), ...Object.keys(after.counters)])) {
     const was = bag(before.counters[key] || []);
     const now = bag(after.counters[key] || []);
-    for (const [token, count] of now) if (count > (was.get(token) || 0)) assert.ok(token === "10 loss of dword sync" || /–/.test(token), `${why}: ${key} gained ${token}`);
-    for (const [token, count] of was) if (count > (now.get(token) || 0)) assert.ok(removable(token), `${why}: ${key} lost ${token}, which is not PHY ${phy}'s`);
+    for (const [pair, count] of now) {
+      if (count <= (was.get(pair) || 0)) continue;
+      const [ref, token] = pair.split("::");
+      assert.ok(ref && covers(ref, phy) && /^(10|\d+–\d+) loss of dword sync$/.test(token), `${why}: ${key} gained ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}`);
+    }
+    for (const [pair, count] of was) {
+      if (count <= (now.get(pair) || 0)) continue;
+      const [ref, token] = pair.split("::");
+      assert.ok(ref && covers(ref, phy), `${why}: ${key} lost ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}, not PHY ${phy}'s`);
+    }
   }
+}
+
+// What the checks and flags say, as sets: line order is presentation.
+function canonicalChecks(built) {
+  const checks = {};
+  for (const entry of built.checks) checks[entry.id] = { status: entry.status, lines: [...entry.lines].sort(), notes: [...(entry.notes || [])].sort() };
+  const flags = [...built.flags].map(([key, items]) => [key, items.map((item) => `${item.tier}:${item.text}`).sort()]).sort();
+  return { checks, flags };
 }
 
 function runProperty(name, base, build) {
@@ -785,6 +826,10 @@ function runProperty(name, base, build) {
     applied += 1;
     const after = build(copy);
     const why = `${name}: deleting ${deletion.name}`;
+    if (deletion.permuted) {
+      assert.deepEqual(canonicalChecks(after), canonicalChecks(before), `${why}: the same records in another order say something else`);
+      continue;
+    }
     if (deletion.orders) {
       const other = structuredClone(base);
       deletion.twin(other);
