@@ -223,6 +223,13 @@ class CIWorkflowContractTests(unittest.TestCase):
                     unpinned.append(f"{workflow_path.name}: {action}@{match.group('ref')}")
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
+        # The topology mutation job's checkout, Node setup and Python setup
+        # (#1516) are pinned exactly here, so the total below stays the
+        # pinned set of every other job.
+        topology = yaml.safe_load(self.read(CI_WORKFLOW))["jobs"]["topology-mutants"]
+        self.assertEqual([step["uses"].split("@")[0] for step in topology["steps"] if "uses" in step],
+                         ["actions/checkout", "actions/setup-node", "actions/setup-python"])
+        action_count -= 3
 
         # Existing actions plus the trial's pinned checkout, the dispatch-only
         # screenshot capture workflow's checkout and upload, the unittest
@@ -231,9 +238,8 @@ class CIWorkflowContractTests(unittest.TestCase):
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
-        # browser legs' failure-only report upload (#1191), and the topology
-        # mutation job's checkout, Node setup and Python setup (#1516).
-        self.assertEqual(action_count, 49)
+        # browser legs' failure-only report upload (#1191).
+        self.assertEqual(action_count, 46)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
