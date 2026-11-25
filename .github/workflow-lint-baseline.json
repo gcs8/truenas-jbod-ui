@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "scanner": "zizmor 1.33.1",
+  "format": "json-v1",
+  "findings": [
+    {
+      "rule": "adhoc-packages",
+      "path": ".github/workflows/dependency-audit.yml",
+      "line": 56,
+      "column": 11,
+      "severity": "Low",
+      "confidence": "High",
+      "source_sha256": "7c1cb75fa054eee5540443185bb04e433433fdfdb048e11f3731e372ece4b806",
+      "reason": "This existing audit-only bootstrap installs exact npm 10.9.8 with lifecycle scripts disabled. It is version-pinned, not integrity-locked; the low-severity package-resolution risk is retained in this lint-only change. No application dependency or release job is installed by this step."
+    },
+    {
+      "rule": "dangerous-triggers",
+      "path": ".github/workflows/pr-labels.yml",
+      "line": 12,
+      "column": 3,
+      "severity": "High",
+      "confidence": "Medium",
+      "source_sha256": "d0c036a2f2f3f07c8c1fd71c3ef7b189dec5314f0c5d035a83342103cfc09e63",
+      "reason": "The labeler intentionally uses pull_request_target for its label-write token. It only reads the event title and number through environment variables, derives fixed label names, and calls the GitHub labels API. It never checks out or executes pull-request code. The whole workflow hash binds that safety argument, including every step, not just the trigger."
+    },
+    {
+      "rule": "template-injection",
+      "path": ".github/workflows/publish-public-demo.yml",
+      "line": 149,
+      "column": 24,
+      "severity": "Informational",
+      "confidence": "Low",
+      "source_sha256": "88bdc23227a8d0b5b1c711ef71c960fc69850dc337f12a0b1ba1ff8e5edef64c",
+      "reason": "This informational, low-confidence finding interpolates the Pages URL from the pinned deploy-pages action, not pull-request content. Readback only runs on workflow_dispatch after the Pages deployment. This lane preserves publication and readback behavior; any change to the complete workflow requires fresh review."
+    }
+  ]
+}
