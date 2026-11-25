@@ -192,6 +192,40 @@ def scanner_commands(tools_dir, paths):
     }
 
 
+def emit_safe_diagnostics(root, name, result, paths):
+    """Expose locations, never native messages, snippets, URLs or stderr."""
+    print(f"{name}: native exit {result.returncode}")
+    try:
+        findings = strict_json(result.stdout)
+        require(isinstance(findings, list), "diagnostic array missing")
+        records = []
+        for finding in findings:
+            if name == "actionlint":
+                require(isinstance(finding, dict), "invalid diagnostic")
+                rule = finding.get("kind")
+                file, line, column = (finding.get(key) for key in ("filepath", "line", "column"))
+                require(isinstance(rule, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", rule), "invalid rule")
+                message = finding.get("message", "")
+                code = re.search(r"\bSC\d{4}\b", message) if isinstance(message, str) else None
+                if code:
+                    rule += "/" + code.group()
+            else:
+                entry = zizmor_identity(root, finding, paths)
+                rule, file, line, column = (entry[key] for key in ("rule", "path", "line", "column"))
+                require(re.fullmatch(r"[a-z][a-z0-9-]{0,63}", rule), "invalid rule")
+            require(file in paths and all(type(value) is int and value > 0 for value in (line, column)),
+                    "invalid diagnostic location")
+            records.append({"scanner": name, "rule": rule, "file": file, "line": line, "column": column})
+    except (LintError, OSError, ValueError, KeyError, TypeError, RecursionError):
+        print(f"{name}: diagnostic metadata unavailable")
+        return
+    for record in records[:100]:
+        # JSON escaping prevents filenames from adding log lines or workflow commands.
+        print(json.dumps(record, sort_keys=True))
+    if len(records) > 100:
+        print(f"{name}: {len(records) - 100} additional diagnostic locations omitted")
+
+
 def check_versions(tools_dir):
     for name, tool in TOOLS.items():
         try:
@@ -241,6 +275,7 @@ def scan(root, tools_dir, report_dir):
             count = check_actionlint(result) if name == "actionlint" else check_zizmor(root, result, baseline, paths)
         except LintError as exc:
             failures.append(name + ": " + str(exc))
+            emit_safe_diagnostics(root, name, result, paths)
         else:
             status.update(gate="pass", findings=count)
             print(f"{name}: native exit {result.returncode}, {count} findings, gate pass")

@@ -94,6 +94,13 @@ python -m unittest tests.test_ci_contract -v
 Both output directories must be new for that invocation. The report directory
 keeps each native JSON report and stderr plus `receipt.json` with the full
 selected file list, native exit codes, accepted finding counts and gate result.
+On failure, CI prints the native exit status and JSON records containing only the
+scanner, rule, selected repository-relative file, line and column. ShellCheck
+records also name the SC code. At most 100 locations per scanner are printed,
+with an explicit omitted count. Malformed or foreign metadata is not echoed.
+Messages, descriptions, URLs, source snippets and native stderr remain private;
+raw reports are not uploaded. These locations remain available in the failed
+job log after the ephemeral runner is discarded.
 Missing or malformed JSON is never treated as an empty finding set. A clean
 current gate means actionlint has no findings and zizmor has exactly the three
 reviewed findings. It does not mean zizmor itself returned zero findings.

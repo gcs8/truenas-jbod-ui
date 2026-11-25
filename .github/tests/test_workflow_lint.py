@@ -4,10 +4,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -201,6 +203,52 @@ class WorkflowLintTests(unittest.TestCase):
             self.assertIn(flag, zizmor)
         self.assertNotIn("--no-exit-codes", zizmor)
         self.assertEqual(zizmor[-2:], actionlint[-2:])
+
+    def test_failed_actionlint_exposes_locations_but_not_native_content(self):
+        report = [{"kind": "shellcheck", "filepath": self.path, "line": 1, "column": 1,
+                   "message": "SC2086 SYNTHETIC_PRIVATE_MESSAGE", "snippet": "SYNTHETIC_PRIVATE_SOURCE"}]
+        result = subprocess.CompletedProcess([], 1, json.dumps(report), "SYNTHETIC_PRIVATE_STDERR")
+        self.baseline()
+        output = io.StringIO()
+        with patch.object(self.lint, "check_versions"), patch.object(
+            self.lint.subprocess, "run", side_effect=[result, self.result()]
+        ), redirect_stdout(output), self.assertRaises(self.lint.LintError):
+            self.lint.scan(self.root, self.root / "tools", self.root / "reports")
+        diagnostics = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(diagnostics, [{"scanner": "actionlint", "rule": "shellcheck/SC2086",
+                                       "file": self.path, "line": 1, "column": 1}])
+        self.assertIn("actionlint: native exit 1", output.getvalue())
+        self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+
+    def test_failed_zizmor_exposes_locations_but_not_native_content(self):
+        finding = copy.deepcopy(self.finding)
+        finding.update(ident="template-injection", desc="SYNTHETIC_PRIVATE_DESCRIPTION",
+                       url="SYNTHETIC_PRIVATE_URL")
+        finding["locations"][0]["concrete"]["feature"] = "SYNTHETIC_PRIVATE_SOURCE"
+        result = self.result([finding])
+        result.stderr = "SYNTHETIC_PRIVATE_STDERR"
+        self.baseline()
+        output = io.StringIO()
+        with patch.object(self.lint, "check_versions"), patch.object(
+            self.lint.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, "[]", ""), result]
+        ), redirect_stdout(output), self.assertRaises(self.lint.LintError):
+            self.lint.scan(self.root, self.root / "tools", self.root / "reports")
+        diagnostics = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(diagnostics, [{"scanner": "zizmor", "rule": "template-injection",
+                                       "file": self.path, "line": 1, "column": 1}])
+        self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+
+    def test_diagnostic_metadata_rejects_malformed_or_foreign_rows(self):
+        for report in ("not-json", "{}", "[{}]", json.dumps([{
+            "kind": "shellcheck", "filepath": "../SYNTHETIC_PRIVATE", "line": 1, "column": 1,
+            "message": "SC2086 SYNTHETIC_PRIVATE",
+        }])):
+            output = io.StringIO()
+            with self.subTest(report=report), redirect_stdout(output):
+                self.lint.emit_safe_diagnostics(self.root, "actionlint",
+                    subprocess.CompletedProcess([], 1, report, "SYNTHETIC_PRIVATE"), [self.path])
+            self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+            self.assertNotIn('{"', output.getvalue())
 
     def test_tool_version_mismatch_or_execution_error_fails(self):
         with patch.object(self.lint.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "wrong version", "")):
