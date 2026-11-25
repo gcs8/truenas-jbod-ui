@@ -231,8 +231,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
-        # browser legs' failure-only report upload (#1191).
-        self.assertEqual(action_count, 46)
+        # browser legs' failure-only report upload (#1191), and the topology
+        # mutation job's checkout, Node setup and Python setup (#1516).
+        self.assertEqual(action_count, 49)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -1001,6 +1002,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "public-demo-artifact",
             "image-upgrade-smoke",
             "image-upgrade-scenarios",
+            "topology-mutants",
         ):
             job = workflow["jobs"][name]
             needs = job["needs"]

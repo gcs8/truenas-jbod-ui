@@ -510,6 +510,7 @@ jobs:
           node --check app/static/sas_fabric_view.js
           node --check app/static/sas_fabric_topology_layout.js
           node --check app/static/sas_fabric_topology_ui.js
+          node --check app/static/sas_fabric_topology_evidence.js
           node --check app/static/sas_fabric_topology.js
           node --check admin_service/static/admin.js
           node --check admin_service/static/admin_profile_model.js
@@ -1276,3 +1277,100 @@ jobs:
             fi
           done
           exit "$status"
+
+  topology-mutants:
+    # #1516: the Storage Fabric Topology mutation tests. Each mutant is one
+    # deliberate bug planted in the topology code; some topology test must
+    # fail with it in place. Runs when the topology code, its producer or its
+    # tests change, and on manual dispatch. A surviving mutant fails the job
+    # unless tests/mutation/topology_equivalent_mutants.json lists it with a
+    # reason; a mutant that cannot be planted, a missing module and a run
+    # that reports no test count fail it too.
+    name: Topology mutation tests (${{ matrix.part }})
+    needs: route
+    if: needs.route.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ["frontend 1/4", "frontend 2/4", "frontend 3/4", "frontend 4/4", "backend"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether the topology changed
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch: running every topology mutant."
+            exit 0
+          fi
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+            range="${PR_BASE_SHA}...HEAD"
+          elif [ -n "${BEFORE_SHA:-}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            range="${BEFORE_SHA}..HEAD"
+          else
+            # No base to compare with: run rather than skip.
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "No comparable base: running every topology mutant."
+            exit 0
+          fi
+          pattern='^(app/static/sas_fabric_topology[^/]*\.js|app/services/sas_fabric[^/]*\.py|tests/js/fabric_topology[^/]*\.test\.js|tests/js/fabric_linux_sas_transport\.test\.js|tests/js/helpers/fabric_topology\.js|tests/fixtures/sas_fabric/[^/]*|tests/test_fabric_topology_fixture\.py|tests/test_core_fabric_direct_paths\.py|tests/test_sas_fabric\.py|tests/test_core_fabric_legacy_controller\.py|tests/test_linux_sas_transport\.py|tests/test_core_adapter_summary_admission\.py|tests/topology_generality_fixtures\.py|tests/mutation/[^/]*|\.github/workflows/ci\.yml)$'
+          if git diff --name-only "${range}" | grep -Eq "${pattern}"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Topology code or tests changed in ${range}: running the mutants."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No topology code or test changed in ${range}; the mutation tests do not apply."
+          fi
+
+      - name: Set up Node.js
+        if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install locked Node dependencies without lifecycle scripts
+        if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
+        run: npm ci --ignore-scripts
+
+      - name: Run the frontend mutants
+        if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
+        env:
+          PART: ${{ matrix.part }}
+        run: node tests/mutation/run_topology_frontend_mutants.cjs --shard "${PART#frontend }"
+
+      - name: Set up Python
+        if: steps.scope.outputs.run == 'true' && matrix.part == 'backend'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        if: steps.scope.outputs.run == 'true' && matrix.part == 'backend'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+
+      - name: Run the backend mutants
+        if: steps.scope.outputs.run == 'true' && matrix.part == 'backend'
+        run: python tests/mutation/run_topology_backend_mutants.py

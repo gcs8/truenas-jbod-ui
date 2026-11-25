@@ -1,0 +1,1012 @@
+{
+ "F1": {
+  "from": "const size = Number.isSafeInteger(bay.notReadCounts?.path_states) ? bay.notReadCounts.path_states : null;\n          cover.gap([\"path\", \"paths\"]",
+  "to": "const size = 1;\n          cover.gap([\"path\", \"paths\"]"
+ },
+ "F2": {
+  "from": "if (missing.length && capped) {",
+  "to": "if (false) {"
+ },
+ "F2b": {
+  "from": "via?.controllerId ? port.controllerId === via.controllerId : true",
+  "to": "via?.controllerId ? port.controller === via.label : true"
+ },
+ "F3": {
+  "from": "if (previous && live.pin === carried && live.pin?.kind === \"port\") live.pin = followPort(previous, model, live.pin);",
+  "to": ""
+ },
+ "F4": {
+  "from": "} else if (ends.length) {\n          blind = true;",
+  "to": "} else if (false) {\n          blind = true;"
+ },
+ "F4b": {
+  "from": "if (!link.lanes.targetPhys.length && link.lanes.targetBasis !== \"inferred\") {\n          blind = true;",
+  "to": "if (false) {\n          blind = true;"
+ },
+ "F4c": {
+  "from": "if (!end.wanted) {\n            cover.unread(key);",
+  "to": "if (!end.wanted) {\n            cover.ok(key);"
+ },
+ "F5": {
+  "from": "if (missing.length && ((model.transport && !model.shared) || ownerless)) {",
+  "to": "if (false) {"
+ },
+ "F5b": {
+  "from": "`${rated === phys.length ?",
+  "to": "`${true ?"
+ },
+ "F6": {
+  "from": "const clean = read === rows.length ?",
+  "to": "const clean = true ?"
+ },
+ "F6b": {
+  "from": "const partial = neighbour.unreadAttachments ?",
+  "to": "const partial = false ?"
+ },
+ "F7": {
+  "from": "const gridRows = raw.enclosure?.layoutRows || (inView ? viewLayout.rows : null);",
+  "to": "const gridRows = raw.enclosure ? raw.enclosure.layoutRows : (inView ? viewLayout.rows : null);"
+ },
+ "F8": {
+  "from": "return { ...found, aliases: [...ends, ...(enclosure ? [{ label: \"Enclosure\", ...enclosure }] : [])] };",
+  "to": "return found;"
+ },
+ "R2": {
+  "from": "const text = tiered(`${name}: at ${end.label} ${summary.faultText}`, summary.warn);",
+  "to": "const text = tiered(`${name}: at ${end.label} ${summary.text.split(\"; \").filter((part) => !/not read$/.test(part)).join(\"; \")}`, summary.warn);"
+ },
+ "R3": {
+  "from": "for (const end of membership.ends.filter((item) => !item.read)) {",
+  "to": "for (const end of membership.ends.filter((item) => !item.read && item.side === \"near\")) {"
+ },
+ "R3b": {
+  "from": "} else if (!singlePath && controllers.length > 1 && group.length < 2) {",
+  "to": "} else if (false) {"
+ },
+ "U1": {
+  "from": "value.toLowerCase() === \"unknown\" || ",
+  "to": ""
+ },
+ "U2": {
+  "from": " || notRead.includes(\"state\");",
+  "to": ";"
+ },
+ "U3": {
+  "from": "if (blind) unread.push(known.length ?",
+  "to": "if (false) unread.push(known.length ?"
+ },
+ "S1": {
+  "from": "if (unmarked.length) lines.push(",
+  "to": "if (false) lines.push("
+ },
+ "S1b": {
+  "from": "if (short) lines.push(",
+  "to": "if (false) lines.push("
+ },
+ "S2": {
+  "from": "const unparented = model.nodes.filter((entry) =>",
+  "to": "const unparented = [].filter((entry) =>"
+ },
+ "S3": {
+  "from": "const reach = board.chips.map((chip) => [...new Set(rowsOf(chip).map((row) => reachOf(row.id)))]);",
+  "to": "const reach = board.chips.map((chip) => [...new Set(rowsOf(chip).map((row) => row.controllerId))]);"
+ },
+ "S4": {
+  "from": "const observations = tables.flatMap(([owner, rows]) =>",
+  "to": "const observations = tables.slice(0, 1).flatMap(([owner, rows]) =>"
+ },
+ "S5": {
+  "from": "const subjects = model.bays.filter((bay) => bay.occupancy !== \"no\");",
+  "to": "const subjects = boards.flatMap((board) => board.enclosure.group.bays).filter((bay) => bay.occupancy === \"yes\");"
+ },
+ "S6": {
+  "from": "if (bay.occupancy !== \"yes\") {\n            unknownBays.push(bay);\n            cover.unread(bay.bayId);",
+  "to": "if (bay.occupancy !== \"yes\") {\n            cover.ok(bay.bayId);"
+ },
+ "S7": {
+  "from": "const owner = byOwner.has(state.controllerId) ? state.controllerId : \"\";",
+  "to": "if (!state.controllerId || !byOwner.has(state.controllerId)) { cover.ok(key); return; }\n          const owner = state.controllerId;"
+ },
+ "S8": {
+  "from": "cover.gap([\"path\", \"paths\"], `${bay.label} (past the producer's path limit)`, size);",
+  "to": "void size;"
+ },
+ "S9": {
+  "from": "const hbaCounters = Boolean(model.transport);",
+  "to": "const hbaCounters = false;"
+ },
+ "S10": {
+  "from": "return entry?.neighbour?.known ? { name:",
+  "to": "return entry?.neighbour ? { name:"
+ },
+ "S11": {
+  "from": "if (!source?.controllerId || !target?.controllerId) {",
+  "to": "if (false) {"
+ },
+ "S12": {
+  "from": "const disagreement = (reading) => (reading?.disagree ?",
+  "to": "const disagreement = (reading) => (false ?"
+ },
+ "S13": {
+  "from": "const linked = all.filter((reading) => reading.rate !== null || reading.devices.length);",
+  "to": "const linked = all.filter((reading) => reading.rate !== null);"
+ },
+ "S15": {
+  "from": "if (sourceId === port.expanderId) path.links.add(item.linkIds[index]);",
+  "to": "{ path.links.add(item.linkIds[index]); path.nodes.add(sourceId); walkUp(model, sourceId, path); }"
+ },
+ "S16": {
+  "from": "below(item) ? \"critical\" : owner.reading.tier",
+  "to": "row && row.rate !== null && row.max !== null && row.rate < row.max ? \"critical\" : owner.reading.tier"
+ },
+ "S17": {
+  "from": "const listedNear = unpairedPhys(model, link).filter((item) => item.side === \"near\" && item.row);",
+  "to": "const listedNear = unpairedPhys(model, link).filter((item) => item.end === context.nodeName(model, link.source) && item.row);"
+ },
+ "S18": {
+  "from": "if (chip && landed !== board) {",
+  "to": "if (landed && landed !== board) {"
+ },
+ "S19": {
+  "from": "if (model.transport) {\n          for (const bay of unmapped) cover.unread(bay.bayId);",
+  "to": "if (false) {\n          for (const bay of unmapped) cover.unread(bay.bayId);"
+ },
+ "S20": {
+  "from": "const unjoined = unjoinedPaths.get(bay.bayId) || 0;",
+  "to": "const unjoined = 0;"
+ },
+ "S21": {
+  "from": "if (bay.occupancy === \"yes\") cover.gap([\"disk\", \"disks\"], `${bay.label}: no port is joined to its disk`);",
+  "to": "if (bay.occupancy === \"yes\") void 0;"
+ },
+ "S22": {
+  "from": "if (!at && (owner.roles.has(\"disk\") || conflicts.has(key) || here)) cover.expect(key,",
+  "to": "if (false) cover.expect(key,"
+ },
+ "S23": {
+  "from": "const unread = [...incomplete];\n      const cover = coverage(\"cable\");",
+  "to": "const unread = [];\n      const cover = coverage(\"cable\");"
+ },
+ "S24": {
+  "from": "if (context.readState(fabric, \"paths\") === \"partial\") unread.push(",
+  "to": "if (false) unread.push("
+ },
+ "S25": {
+  "from": "state: isUnreadState(state) ? STATE_UNREAD : String(state.state),",
+  "to": "state: String(state.state ?? \"unknown\"),"
+ },
+ "S26": {
+  "from": "if (summary.unread > 0) {\n            cover.unread(key);",
+  "to": "if (false) {\n            cover.unread(key);"
+ },
+ "S27": {
+  "from": "const chipPhys = (view) => context.chipPhyNumbers(model, view.id);",
+  "to": "const chipPhys = (view) => view.phys.map((row) => row.phy);"
+ },
+ "A1": {
+  "from": "TIER_RANK[item.tier] > TIER_RANK[best.tier] || (TIER_RANK[item.tier] === TIER_RANK[best.tier] && item.row.errors > best.row.errors)",
+  "to": "item.row.errors > best.row.errors"
+ },
+ "B1": {
+  "from": "(measured || (named !== null && !named.includes(key)))",
+  "to": "measured"
+ },
+ "B2": {
+  "from": "        not_read: list(row.not_read).filter((key) => typeof key === \"string\"),\n",
+  "to": ""
+ },
+ "C1": {
+  "from": "const readings = context.chipPhyNumbers(model, entry.id).map((phy) => context.phyReading(model, entry.id, phy));\n    const bad",
+  "to": "const readings = record.phys.map((row) => ({ phy: row.phy, tier: context.phyTier(row), read: row.measured, worst: row, disagree: false, observations: [] }));\n    const bad"
+ },
+ "C2": {
+  "from": "    readings.push(...spare);\n",
+  "to": ""
+ },
+ "C3": {
+  "from": "context.readingSummary(end.owned, end.owned.length);\n      // Each disputed PHY",
+  "to": "context.errorSummary(end.rows, end.wanted);\n      // Each disputed PHY"
+ },
+ "C4": {
+  "from": "return { label: \"PHY errors\", value, warn: reading.tier };",
+  "to": "return { label: \"PHY errors\", value, warn: context.phyTier(phy) };"
+ },
+ "D1": {
+  "from": "    for (const device of reading.devices) {\n      for (const part of device.split(\" / \")) {",
+  "to": "    for (const device of [reading.observations[0]?.row.device || \"\"]) {\n      for (const part of device.split(\" / \")) {"
+ },
+ "E1": {
+  "from": "const tier = worse(...[...gone].map((id) => model.nodeById.get(id)?.neighbour?.tier || \"\"));",
+  "to": "const tier = worse(...members.map((entry) => entry.neighbour.tier));"
+ },
+ "G1": {
+  "from": "const extra = Math.max(0, missing.length - ownerless);",
+  "to": "const extra = missing.length;"
+ },
+ "H1": {
+  "from": "const orphans = unparented;",
+  "to": "const orphans = unparented.filter((entry) => entry.level !== 1);"
+ },
+ "H2": {
+  "from": "if (from && to && from.id === to.id)",
+  "to": "if (from && to && from === to)"
+ },
+ "I1": {
+  "from": "    if (!group.enclosure) {\n      // Off a board",
+  "to": "    if (!group.enclosure) return bayPath(model, port.bayId, path);\n    if (false) {\n      // Off a board"
+ },
+ "J1": {
+  "from": "const sameController = (left, right) => Boolean(left.controllerRaw) && left.controllerRaw === right.controllerRaw;",
+  "to": "const sameController = (left, right) => (left.controllerId || right.controllerId ? left.controllerId === right.controllerId : left.controller === right.controller);"
+ },
+ "J2": {
+  "from": "port.controllerRaw || port.controllerId || \"\", port.device,",
+  "to": "port.controllerId || port.controller, port.device,"
+ },
+ "K1": {
+  "from": "        if (field) subject[field] = true;",
+  "to": "        if (field === \"bad\") { subject.bad = true; subject.unread = false; } else if (field && !subject.bad) subject[field] = true;"
+ },
+ "K2": {
+  "from": ": cover.complete() && !unread.length ? \"Each cable is checked at both of its ends.\"",
+  "to": ": true ? \"Each cable is checked at both of its ends.\""
+ },
+ "L1": {
+  "from": "if (![\"mapped\", \"unmapped\"].includes(tone)) return true;",
+  "to": "return true;"
+ },
+ "X1": {
+  "from": "if (repeated > 0 || end.phys.length !== end.wanted) {\n            cover.unread(key);",
+  "to": "if (false) {\n            cover.unread(key);"
+ },
+ "X2": {
+  "from": "if (owner.known) portAt.set(key, { port: portAt.get(key)?.port || port, bay, ports: [...(portAt.get(key)?.ports || []), port] });\n              else conflicts.set(key, owner);",
+  "to": "portAt.set(key, { port: portAt.get(key)?.port || port, bay, ports: [...(portAt.get(key)?.ports || []), port] });"
+ },
+ "X3": {
+  "from": "for (const bay of model.bays.filter((item) => item.occupancy !== \"no\")) {\n        const unjoined",
+  "to": "for (const bay of model.bays.filter((item) => item.occupancy === \"yes\")) {\n        const unjoined"
+ },
+ "X4": {
+  "from": "disks: owned.length ?",
+  "to": "disks: census.length ?"
+ },
+ "X5": {
+  "from": "if (!states.length && bay.occupancy !== \"no\" && !bay.notRead.includes(\"path_states\")) {",
+  "to": "if (!states.length && bay.occupancy === \"yes\" && !bay.notRead.includes(\"path_states\")) {"
+ },
+ "N1": {
+  "from": "const tier = worse(...flags.map((item) => item.tier), ...all.map((reading) => reading.tier));",
+  "to": "const tier = worse(...flags.map((item) => item.tier));"
+ },
+ "V1": {
+  "from": "if (bad && !found.length) found.push(",
+  "to": "if (false) found.push("
+ },
+ "W1": {
+  "from": "byPhy: new Map(phys.filter((row, index) => phys.findIndex((other) => other.phy === row.phy) === index && phys.filter((other) => other.phy === row.phy).length === 1).map((row) => [row.phy, row])),",
+  "to": "byPhy: new Map(phys.map((row) => [row.phy, row])),"
+ },
+ "W2": {
+  "from": "rowsByPhy: phys.reduce((map, row) => map.set(row.phy, [...(map.get(row.phy) || []), row]), new Map()),",
+  "to": "rowsByPhy: new Map(phys.map((row) => [row.phy, [row]])),"
+ },
+ "W3": {
+  "from": "role.set(`${port.owner_id}|${name}`, held && held !== device ? bothRoles(held, device) : device);",
+  "to": "role.set(`${port.owner_id}|${name}`, device);"
+ },
+ "W4": {
+  "from": "        else if (owner.disputed) contested.add(phy);\n",
+  "to": ""
+ },
+ "W5": {
+  "from": "const known = claimants.length === 1 && !reading.conflict && !bayClash && !cableClash;",
+  "to": "const known = claimants.length === 1 && !bayClash && !cableClash;"
+ },
+ "W6": {
+  "from": "&& !missing.length && !conflict && observations.every(",
+  "to": "&& !missing.length && observations.every("
+ },
+ "Z1": {
+  "from": "const counts = bad.map((row) => row.counters[key]).filter((value) => value !== null && value !== undefined);",
+  "to": "const counts = bad.map((row) => row.counters[key] || 0);"
+ },
+ "Z2": {
+  "from": "const unread = row.measured || !row.counters ? [] : PHY_COUNTERS",
+  "to": "const unread = true ? [] : PHY_COUNTERS"
+ },
+ "M1": {
+  "from": "read: observations.length > 0 && !missing.length && !conflict",
+  "to": "read: observations.length > 0 && !conflict"
+ },
+ "M2": {
+  "from": "if (!reading.observations.length) {\n          cover.unread(key);",
+  "to": "if (false) {\n          cover.unread(key);"
+ },
+ "M3": {
+  "from": "partial.length ? `counters not all read on PHY",
+  "to": "false ? `counters not all read on PHY"
+ },
+ "L2": {
+  "from": "const phys = [...new Set(listed)];",
+  "to": "const phys = listed;"
+ },
+ "L3": {
+  "from": "if (repeated > 0 || end.phys.length !== end.wanted) {\n            cover.unread(key);",
+  "to": "if (end.phys.length < end.wanted) {\n            cover.unread(key);"
+ },
+ "T1": {
+  "from": "const counted = phys.filter((reading) => reading.read).length;\n    const conflicted",
+  "to": "const counted = phys.filter((reading) => reading.read || reading.partial).length;\n    const conflicted"
+ },
+ "T2": {
+  "from": "...chips.map((entry) => context.chipPhyNumbers(model, entry.id).map((phy) => context.phyReading(model, entry.id, phy)))].flat();",
+  "to": "...chips.map((entry) => model.sas.expanders.get(entry.id).phys.map((row) => ({ read: row.measured, partial: false, observations: [{ row }] })))].flat();"
+ },
+ "O1": {
+  "from": "    const owner = context.phyOwner(model, expanderId, row.phy);\n    if (owner.text) return owner.text;",
+  "to": "    for (const port of model.portByKey.values()) if (port.expanderId === expanderId && port.phy?.phy === row.phy) return model.bayById.get(port.bayId)?.label || port.bayId;"
+ },
+ "O2": {
+  "from": "${context.phyOwner(model, chip?.id || item.port?.expanderId, item.reading.phy).text || \"no bay matched\"} PHY",
+  "to": "${item.bay.label} PHY"
+ },
+ "O3": {
+  "from": "if (!own.ok) return { label: \"PHY errors\", value:",
+  "to": "if (false) return { label: \"PHY errors\", value:"
+ },
+ "O4": {
+  "from": "const seen = phy && owner && !owner.known ?",
+  "to": "const seen = false ?"
+ },
+ "P1": {
+  "from": "seen.has(\"unmapped\") ? \"unmapped\" :",
+  "to": "false ? \"unmapped\" :"
+ },
+ "P2": {
+  "from": "bay.occupancy === \"no\" ? \"empty\" :",
+  "to": "false ? \"empty\" :"
+ },
+ "P3": {
+  "from": "const held = capped ? past !== null ?",
+  "to": "const held = false ? past !== null ?"
+ },
+ "P4": {
+  "from": "else cover.gap([\"bay with occupancy\", \"bays with occupancy\"]",
+  "to": "else cover.gap([\"disk\", \"disks\"]"
+ },
+ "W7": {
+  "from": "role.set(`${ownerId}|${phy.name}`, held && held !== device && /SMP Target|SAS Initiator|Attachment not read| \\/ /.test(held) ? bothRoles(held, device) : device);",
+  "to": "role.set(`${ownerId}|${phy.name}`, device);"
+ },
+ "MAProws": {
+  "from": "rowsByPhy: phys.reduce((map, row) => map.set(row.phy, [...(map.get(row.phy) || []), row]), new Map()),",
+  "to": "rowsByPhy: phys.reduce((map, row) => map.set(row.phy, [row]), new Map()),"
+ },
+ "MAPowners": {
+  "from": "      if (!held) owners.get(key).push(claimant);",
+  "to": "      if (!held) owners.set(key, [claimant]);"
+ },
+ "MAPmapped": {
+  "from": "if (!mapped.has(name)) mapped.set(name,",
+  "to": "mapped.set(name,"
+ },
+ "MAPreasons": {
+  "from": "[...(map.get(port.why) || []), port]",
+  "to": "[port]"
+ },
+ "MAPlisted": {
+  "from": "listed.set(key, { chip, phy });",
+  "to": "listed.delete(key); listed.set(key, { chip, phy });"
+ },
+ "MAPconflicts": {
+  "from": "else conflicts.set(key, owner);",
+  "to": "else conflicts.set(key, { ...owner, bays: [bay], text: bay.label });"
+ },
+ "R1": {
+  "from": "const groups = [\"critical\", \"warning\"].map((tier) => ordered.filter((reading) => reading.tier === tier)).filter((group) => group.length);",
+  "to": "const groups = [ordered];"
+ },
+ "R4": {
+  "from": "    if (!context.membershipRead(model, link)) return [];\n",
+  "to": "\n"
+ },
+ "R5": {
+  "from": "const owned = owners.filter(({ owner }) => owner.known && owner.link?.id === link.id).map(({ owner }) => owner.reading);",
+  "to": "const owned = readings;"
+ },
+ "R6": {
+  "from": "if (!reading.tier || diskEvidence(owner)) continue;",
+  "to": "if (true) continue;"
+ },
+ "R7": {
+  "from": "const known = claimants.length === 1 && !reading.conflict && !bayClash && !cableClash;",
+  "to": "const known = claimants.length >= 1 && !reading.conflict && !bayClash && !cableClash;"
+ },
+ "R8": {
+  "from": "for (const phy of new Set(link.lanes.targetPhys)) claim(link.target,",
+  "to": "for (const phy of [].concat()) claim(link.target,"
+ },
+ "R9": {
+  "from": "        if (theirs.length !== 1) missing.push(reading.phy);",
+  "to": "        if (false) missing.push(reading.phy);"
+ },
+ "R10": {
+  "from": "if (!tones.has(bay)) tones.set(bay, new Set());\n          tones.get(bay).add(tone);",
+  "to": "tones.set({ ...bay, rowIndex: tones.size }, new Set([tone]));"
+ },
+ "R11": {
+  "from": "const phys = [...hbas.map((entry) => hbaNumbers(entry).map(",
+  "to": "const phys = [...hbas.map((entry) => model.sas.controllers.get(entry.id).phys.map((row) => row.phy).map("
+ },
+ "R12": {
+  "from": "if (owners.includes(port.owner_id)) for (const phy of list(port.phys))",
+  "to": "if (false) for (const phy of list(port.phys))"
+ },
+ "R13": {
+  "from": "[\"SMP Target\", \"expander\"],",
+  "to": "[\"SMP Target\", \"disk\"],"
+ },
+ "R14": {
+  "from": "if (model.transport && record.phys.some((row) => row.counterState !== context.NOT_READ)) {",
+  "to": "if (false) {"
+ },
+ "R15": {
+  "from": "const here = owner.disputed && diskEvidence(owner);",
+  "to": "const here = false;"
+ },
+ "R16": {
+  "from": "const conflicted = phys.filter((reading) => reading.conflict).length;",
+  "to": "const conflicted = 0;"
+ },
+ "RAW1": {
+  "from": "          if (!(owner.known && owner.link?.id === link.id)) {\n            rows.push(kvRow(`${end} PHY ${item.phy}`",
+  "to": "          if (false) {\n            rows.push(kvRow(`${end} PHY ${item.phy}`"
+ },
+ "RAW2": {
+  "from": "const far = owner.known && owner.link?.id === link.id ? ",
+  "to": "const far = true ? "
+ },
+ "RAW3": {
+  "from": "const own = owner?.known && owner.bays[0] === bay;",
+  "to": "const own = Boolean(port.phy);"
+ },
+ "RAW4": {
+  "from": "const disputed = readings.filter((item) => ownerOf(item).disputed);",
+  "to": "const disputed = [];"
+ },
+ "HBA1": {
+  "from": "const hbaViews = model.transport ? model.nodes.filter(",
+  "to": "const hbaViews = false ? model.nodes.filter("
+ },
+ "HBA2": {
+  "from": "sas.expanders.get(id) || sas.controllers.get(id)).filter(Boolean);",
+  "to": "sas.expanders.get(id)).filter(Boolean);"
+ },
+ "HBA3": {
+  "from": "const onHba = (port) => chipOf(port.expanderId)?.kind === \"controller\";",
+  "to": "const onHba = () => false;"
+ },
+ "HBA4": {
+  "from": "(model.sas.expanders.get(owner) || model.sas.controllers.get(owner))?.phys",
+  "to": "model.sas.expanders.get(owner)?.phys"
+ },
+ "HBA5": {
+  "from": "if (where) said.set(row.phy, where);",
+  "to": "if (false) said.set(row.phy, where);"
+ },
+ "PAIR1": {
+  "from": "const pairs = !rows.length || (",
+  "to": "const pairs = true || ("
+ },
+ "CLAIM1": {
+  "from": "if (readEnd(\"far\")) for (const phy of new Set(link.lanes.targetPhys)) claim(",
+  "to": "for (const phy of new Set(link.lanes.targetPhys)) claim("
+ },
+ "ROLE1": {
+  "from": "      const role = clash(\"link\");\n      if (role) return role;\n",
+  "to": ""
+ },
+ "ROLE2": {
+  "from": "const bayClash = bays.length > 0 ? clash(\"disk\") || (ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";",
+  "to": "const bayClash = bays.length > 0 ? (ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";"
+ },
+ "PROV1": {
+  "from": "map.set(item.text, [...(map.get(item.text) || []), item.phy])",
+  "to": "map.set(end.disputed[0].text, [...(map.get(end.disputed[0].text) || []), item.phy])"
+ },
+ "PROV2": {
+  "from": "else if (!theirs[0].measured) partial.push(reading.phy);",
+  "to": "else if (reading.observations.some((item) => !item.row.measured)) partial.push(reading.phy);"
+ },
+ "PROV3": {
+  "from": "`PHY ${reading.phy}: ${counterText(reading.worst)}${disagreement(reading)}`",
+  "to": "`PHY ${reading.phy}: ${counterText(reading.worst)}`"
+ },
+ "PROV4": {
+  "from": "disputedFaults.set(`${end.chipId}|${phy}`, { id: end.chipId, phy, owner });",
+  "to": "disputedFaults.set(`${end.id}|${phy}`, { id: end.id, phy, owner });"
+ },
+ "CNT1": {
+  "from": "`no errors at ${passText || \"the cables\"}`",
+  "to": "`no errors at the ${context.plural(cover.total(), \"cable end\")} the cables use`"
+ },
+ "CNT2": {
+  "from": "const category = seen.size > 1 ? \"disputed\" :",
+  "to": "const category = false ? \"disputed\" :"
+ },
+ "SLOW1": {
+  "from": "    if (!context.membershipRead(model, link)) return () => false;\n",
+  "to": "\n"
+ },
+ "DIR1": {
+  "from": "if (port.expanderId || (port.parent && row.ownHandle && port.parent !== row.ownHandle)) return { state: \"mismatch\"",
+  "to": "if (false) return { state: \"mismatch\""
+ },
+ "MAProws2": {
+  "from": "record.rowsByPhy = record.phys.reduce((map, row) => map.set(row.phy, [...(map.get(row.phy) || []), row]), new Map());",
+  "to": "record.rowsByPhy = record.phys.reduce((map, row) => map.set(row.phy, [row]), new Map());"
+ },
+ "MAPsort": {
+  "from": "of [...listed].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {",
+  "to": "of listed) {"
+ },
+ "MAPnatural": {
+  "from": "of [...listed].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {",
+  "to": "of [...listed].sort(([left], [right]) => context.naturalCompare(left, right))) {"
+ },
+ "CLS1": {
+  "from": "if (!diskEvidence(owner)) cablePhys.add(",
+  "to": "cablePhys.add("
+ },
+ "CLS3": {
+  "from": "      else if (kind === \"expander\") add(\"expander\");",
+  "to": "      else if (false) add(\"expander\");"
+ },
+ "CLS4": {
+  "from": "      if (kind === \"end_device\") add(\"disk\");",
+  "to": "      if (false) add(\"disk\");"
+ },
+ "CLS5": {
+  "from": "(chipOfNode(model, port.owner_id)?.id || port.owner_id) === chip && ",
+  "to": "port.owner_id === id && "
+ },
+ "SEP1": {
+  "from": "[\"SEP Target\", \"sep\"],",
+  "to": "[\"SEP Target\", \"none\"],"
+ },
+ "OWN1": {
+  "from": "const row = owner.reading.observations.find((item2) => item2.owner === item.id)?.row || item.row;",
+  "to": "const row = owner.reading.worst || item.row;"
+ },
+ "OWN2": {
+  "from": "owner.reading.observations.find((item) => item.owner === link.target)?.row || null",
+  "to": "owner.reading.worst"
+ },
+ "OWN3": {
+  "from": "${phyLine(port.phy)}${otherReading(",
+  "to": "${phyLine(owner.reading.worst || port.phy)}${otherReading("
+ },
+ "DST1": {
+  "from": "    return `destination ${context.NOT_READ}`;\n  }",
+  "to": "    return \"outside this view\";\n  }"
+ },
+ "DST2": {
+  "from": "const records = listing.filter((port) => port.state === \"read\");",
+  "to": "const records = listing;"
+ },
+ "DST3": {
+  "from": "  return [...targets.values()].sort().join(\" and \");",
+  "to": "  return [...targets.values()].join(\" and \");"
+ },
+ "DST4": {
+  "from": "        if (owner.known && owner.link?.id === link.id) drawn.set(phy, link);",
+  "to": "        if (true) drawn.set(phy, link);"
+ },
+ "DUP1": {
+  "from": "const source = sas.controllers.get(link.source)?.byPhy.get(lane.source) ||",
+  "to": "const source = sas.controllers.get(link.source)?.phys.find((row) => row.phy === lane.source) ||"
+ },
+ "DUP2": {
+  "from": "${!membership.read ? `; membership ${context.NOT_READ}` : cap !== null ?",
+  "to": "${cap !== null ?"
+ },
+ "PRV1": {
+  "from": "        if (theirs.length !== 1) missing.push(reading.phy);",
+  "to": "        if (theirs.length !== 1 || reading.conflict) missing.push(reading.phy);"
+ },
+ "WIDE1": {
+  "from": "for (const phy of port.phy ? [port.phy.phy] : context.list(port.phys)) claim(",
+  "to": "for (const phy of port.phy ? [port.phy.phy] : []) claim("
+ },
+ "WIDE2": {
+  "from": "phys: joined.phy ? [joined.phy.phy] : list(device?.expander_phys).filter((phy) => Number.isInteger(phy)),",
+  "to": "phys: joined.phy ? [joined.phy.phy] : [],"
+ },
+ "MIX1": {
+  "from": "else if (bay.ports.some((port) => !port.sasAddress)) {",
+  "to": "else if (false) {"
+ },
+ "CLS6": {
+  "from": "const diskEvidence = (owner) => owner.bays.length > 0 || owner.roles.has(\"disk\");",
+  "to": "const diskEvidence = (owner) => owner.bays.length > 0;"
+ },
+ "BOTH1": {
+  "from": "    return [...new Set([...held.split(\" / \"), device])].sort().join(\" / \");",
+  "to": "    return `${held} / ${device}`;"
+ },
+ "ROLE3": {
+  "from": "const roleClash = !claimants.length && (evidence.size > 1 || ledger.disks.length > 1);",
+  "to": "const roleClash = !claimants.length && ledger.disks.length > 1;"
+ },
+ "ROLE4": {
+  "from": "if (port.state !== \"read\" || list(port.phy_names).some(",
+  "to": "if (list(port.phy_names).some("
+ },
+ "LOC1": {
+  "from": "    return { title, html: `<div class=\"kv-grid\">${rows.join(\"\")}</div>` };\n  }\n\nfunction enclosureDetail",
+  "to": "    if (ref.kind === \"bay\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.counters?.loss_of_dword_synchronization_count === 10))) rows.push(kvRow(\"Probe negotiated rate\", \"999 Gb/s\"));\n    return { title, html: `<div class=\"kv-grid\">${rows.join(\"\")}</div>` };\n  }\n\nfunction enclosureDetail"
+ },
+ "LOC2": {
+  "from": "    return { title, html: `<div class=\"kv-grid\">${rows.join(\"\")}</div>` };\n  }\n\nfunction enclosureDetail",
+  "to": "    if (ref.kind === \"port\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.counters?.loss_of_dword_synchronization_count === 10))) rows.push(kvRow(\"Probe negotiated rate\", \"999 Gb/s\"));\n    return { title, html: `<div class=\"kv-grid\">${rows.join(\"\")}</div>` };\n  }\n\nfunction enclosureDetail"
+ },
+ "NAME1": {
+  "from": "[...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy)), ...named])]",
+  "to": "[...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy))])]"
+ },
+ "VOC1": {
+  "from": "[\"Edge Expander\", \"expander\"],",
+  "to": "[\"Edge Expander\", \"none\"],"
+ },
+ "UNK1": {
+  "from": "    if (unknown.length) roles.add(\"unknown\");\n",
+  "to": ""
+ },
+ "DEST1": {
+  "from": "if (key) return `destination ${context.NOT_READ}: the transport census names ${targets.get(key)}`;",
+  "to": "if (key) return `to ${targets.get(key)}; which cable it is in is ${context.NOT_READ}`;"
+ },
+ "DEST2": {
+  "from": "if (!model.transport) return handleDestination(model, id, phy);",
+  "to": "if (!model.transport) return \"\";"
+ },
+ "DEST3": {
+  "from": "return \"a disk attached directly; no bay's path is joined to it\";",
+  "to": "return \"a disk attached directly, in no bay of this view\";"
+ },
+ "CONT1": {
+  "from": "const reason = context.phyOwner(model, entry.id, phy).text || `in more",
+  "to": "const reason = \"\" || `in more"
+ },
+ "WIDE3": {
+  "from": "new Set(found.flatMap((item) => context.list(item.ports).map((port) => port.key))).size > 1 ? 0 : 1;",
+  "to": "found.length > 1 ? 0 : 1;"
+ },
+ "WIDE4": {
+  "from": "const disputed = bay.ports.flatMap((port) => physOf(port).filter(",
+  "to": "const disputed = bay.ports.flatMap((port) => (port.phy ? [port.phy.phy] : []).filter("
+ },
+ "RD1": {
+  "from": "    if (listing.some((port) => ![\"read\", \"ambiguous\"].includes(port.state))) unread.unshift(\"its transport census record was not read\");\n",
+  "to": ""
+ },
+ "UPL1": {
+  "from": "            if (!owner.claimants.length) {\n              cover.expect(key,",
+  "to": "            if (false) {\n              cover.expect(key,"
+ },
+ "DUP3": {
+  "from": " && !cablePhys.has(`${entry.id}|${phy}`)) disputedFaults.set(",
+  "to": ") disputedFaults.set("
+ },
+ "RD2": {
+  "from": "          if (owner.known || owner.disputed || [...owner.roles].some((role) => role !== \"unread\") || cover.has(key)) continue;\n          cover.expect(key, `${chip.label}: PHY ${phy}`, \"phy\");",
+  "to": "          if (true) continue;\n          cover.expect(key, `${chip.label}: PHY ${phy}`, \"phy\");"
+ },
+ "LOC3": {
+  "from": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {",
+  "to": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {\n if (id === \"lanes\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.counters?.loss_of_dword_synchronization_count === 10))) notes.push(\"Probe negotiated rate: 999 Gb/s\");"
+ },
+ "LOC4": {
+  "from": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {",
+  "to": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {\n if (id === \"ports\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.counters?.loss_of_dword_synchronization_count === 10))) notes.push(\"Probe: 7 invalid dword elsewhere\");"
+ },
+ "ID1": {
+  "from": "const ambiguous = list(port.phy_names).filter((name) => (byName.get(`${port.owner_id}|${name}`) || []).length > 1);",
+  "to": "const ambiguous = [];"
+ },
+ "ID2": {
+  "from": "device: (names.get(`${ownerId}|${text(row.name)}`) || 0) > 1 ? NAME_NOT_UNIQUE : role.get(",
+  "to": "device: false ? NAME_NOT_UNIQUE : role.get("
+ },
+ "ID3": {
+  "from": "if (port.state === \"ambiguous\" && port.remote_kind === \"end_device\") {",
+  "to": "if (false) {"
+ },
+ "ID4": {
+  "from": "if (expanders.length > 1) return { state: \"ambiguous\", row, why:",
+  "to": "if (false) return { state: \"ambiguous\", row, why:"
+ },
+ "ID5": {
+  "from": "if (!row.handle) return { state: row.rate !== null ? \"none\" : \"\", row };",
+  "to": "if (!row.handle) return { state: \"\", row };"
+ },
+ "TGT1": {
+  "from": "        targets.set(keyed, found.length === 1",
+  "to": "        if (found.length === 1) targets.set(keyed, found.length === 1"
+ },
+ "TGT2": {
+  "from": "if ([...ledger.targets.keys()].some((key) => key !== other)) return \"target\";",
+  "to": "if (false) return \"target\";"
+ },
+ "TGT3": {
+  "from": "else if ([...ledger.targets.keys()].some((key) => key !== other)) found.push(",
+  "to": "else if (false) found.push("
+ },
+ "TGT4": {
+  "from": "if (targets.size > 1 || [...targets.keys()].some((key) => key.startsWith(\"ambiguous:\"))) return",
+  "to": "if (false) return"
+ },
+ "KIND1": {
+  "from": "const kind = [...ledger.attached].find((item) => !context.cableEndAccepts(cable.kind, side, item));\n      if (kind) return `kind:${kind}`;",
+  "to": "const kind = \"\";"
+ },
+ "KIND2": {
+  "from": "\"controller-expander\": { near: [\"initiator\", \"expander\", \"cable\"], far: [\"initiator\", \"cable\"] },",
+  "to": "\"controller-expander\": { near: [\"initiator\", \"expander\", \"cable\"], far: [\"initiator\", \"expander\", \"cable\"] },"
+ },
+ "KIND3": {
+  "from": "[\"No Device\", \"none\"],",
+  "to": "[\"No Device\", \"\"],"
+ },
+ "KIND4": {
+  "from": "          unread.push(part === NAME_NOT_UNIQUE ? \"its PHY name is on more than one row of its table, so no census record identifies it\" : `its row says ${part}`);\n          add(\"unread\");",
+  "to": "          unread.push(part === NAME_NOT_UNIQUE ? \"its PHY name is on more than one row of its table, so no census record identifies it\" : `its row says ${part}`);"
+ },
+ "KIND5": {
+  "from": "        if (kind || stray) found.push(",
+  "to": "        if (stray) found.push("
+ },
+ "PORT1": {
+  "from": "if (addresses.size !== 1 || addresses.has(\"\")) return { ok: false",
+  "to": "if (false) return { ok: false"
+ },
+ "UNR1": {
+  "from": "if (unclassified && !disputedFaults.has(`${view.id}|${phy}`)",
+  "to": "if (false && !disputedFaults.has(`${view.id}|${phy}`)"
+ },
+ "MEM1": {
+  "from": "        for (const item of context.memberConflicts(model, link)) {\n          blind = true;",
+  "to": "        for (const item of []) {\n          blind = true;"
+ },
+ "MEM2": {
+  "from": "    if (!context.membershipRead(model, link)) return [];",
+  "to": "    if (!context.membershipOf(link).read) return [];"
+ },
+ "CEN1": {
+  "from": "        unread.push(`the transport census does not say what it is attached to`);\n        add(\"unread\");",
+  "to": "        unread.push(`the transport census does not say what it is attached to`);"
+ },
+ "ID7": {
+  "from": "if (kind && !context.cableEndAccepts(\"controller-expander\", \"near\", kind)) return `destination",
+  "to": "if (false) return `destination"
+ },
+ "HS1": {
+  "from": "if (row.handleState === \"ambiguous\" || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return",
+  "to": "if (kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return"
+ },
+ "HS2": {
+  "from": "bays: [...new Set(model.bays.filter((bay) => bay.ports.some((port) => port.controllerId === id && port.handle === handle)))],",
+  "to": "bays: [],"
+ },
+ "HS3": {
+  "from": "if (side !== \"near\" || model.transport ||",
+  "to": "if (true || model.transport ||"
+ },
+ "HS4": {
+  "from": "if (built === \"disk\") return kind === \"disk\" ? { state: \"device\", row } : says(\"a disk of the HBA's device list\");",
+  "to": ""
+ },
+ "AD1": {
+  "from": " || places.some((one, index) => places.slice(index + 1).some((two) => apart(one, two)))) ambiguous.add(address);",
+  "to": ") ambiguous.add(address);"
+ },
+ "AD2": {
+  "from": "      if (port.remote_address_state === \"ambiguous\") ambiguous.add(place.address);\n",
+  "to": ""
+ },
+ "AD3": {
+  "from": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
+  "to": "(handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")"
+ },
+ "AD4": {
+  "from": "if (bays.length > 1 || elsewhere ||",
+  "to": "if (elsewhere ||"
+ },
+ "DK1": {
+  "from": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
+  "to": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : \"\")"
+ },
+ "DK2": {
+  "from": "\n        || (place.bay !== null && place.bay !== undefined && group.places.some((other) => other.bay === place.bay && (!other.enclosure || !place.enclosure || other.enclosure === place.enclosure)))",
+  "to": ""
+ },
+ "TG1": {
+  "from": "      if (address) {\n        const found = [...new Set(",
+  "to": "      if (address && !remote) {\n        const found = [...new Set("
+ },
+ "TG2": {
+  "from": "      if (remote?.kind === \"expander\") targets.set(",
+  "to": "      if (remote) targets.set("
+ },
+ "MB1": {
+  "from": "      return context.memberConflicts(model, cable).length ? \"members\" : \"\";",
+  "to": "      return \"\";"
+ },
+ "PL1": {
+  "from": "const near = listedNear.filter((item) => { const owner = context.phyOwner(model, item.id, item.phy); return owner.known && owner.link?.id === link.id; });",
+  "to": "const near = listedNear;"
+ },
+ "LB1": {
+  "from": "link.labelLines = [...link.labelLines, \"membership not read\"];",
+  "to": "link.labelLines = [...link.labelLines];"
+ },
+ "PT1": {
+  "from": "bay, ports: [...(portAt.get(key)?.ports || []), port] });",
+  "to": "bay, ports: [port] });"
+ },
+ "PT2": {
+  "from": "return named.size === 1 && !named.has(\"\") ? [...named][0] : null;",
+  "to": "return [...named][0] || null;"
+ },
+ "SF1": {
+  "from": "          if (!here && saidFaults.has(key)) continue;\n",
+  "to": ""
+ },
+ "RU1": {
+  "from": "if (port.state === \"read\" && [\"end_device\", \"expander\"].includes(port.remote_kind)) continue;",
+  "to": "if (port.state === \"read\") continue;"
+ },
+ "BL1": {
+  "from": "if (!model.transport && reading.observations.some((item) => !text(item.row.device))) {",
+  "to": "if (false) {"
+ },
+ "NM2": {
+  "from": "for (const item of hardware) for (const row of list(item.kind === \"controller\" ? item.raw.phy_rows : item.raw.phys).filter(isRecord)) {",
+  "to": "for (const item of hardware) for (const row of list(item.raw.phys || item.raw.phy_rows).filter(isRecord)) {"
+ },
+ "reviewer-hba-phy": {
+  "from": "if (board) facts.push(board);",
+  "to": "facts.push(\"PHY 250\"); if (board) facts.push(board);",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-full-address": {
+  "from": "if (board) facts.push(board);",
+  "to": "facts.push(\"5fffdeadbeefcafe\"); if (board) facts.push(board);",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-stub": {
+  "from": "entry.below === 1 ? \"Next in chain\"",
+  "to": "entry.below === 1 ? \"Reached through\"",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-per-lane-phy": {
+  "from": "${context.phyRanges(link.lanes.sourcePhys) || \"?\"} at ${context.nodeName(model, link.source)}",
+  "to": "250 at ${context.nodeName(model, link.source)}",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-friendly": {
+  "from": "text(found.alias) || text(found.label)",
+  "to": "text(found.label) || text(found.alias)",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-address": {
+  "from": "value: port.sasAddress || context.NOT_READ",
+  "to": "value: chip?.address || port.sasAddress || context.NOT_READ",
+  "tests": [
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "reviewer-sibling": {
+  "from": "value: port.sasAddress || context.NOT_READ",
+  "to": "value: model.bayById.get(port.bayId).ports.find(p=>p.key!==port.key && p.sasAddress)?.sasAddress || port.sasAddress || context.NOT_READ",
+  "tests": [
+   "tests/js/fabric_topology_health.test.js",
+   "tests/js/fabric_topology_generality.test.js"
+  ]
+ },
+ "LOC5": {
+  "from": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {",
+  "to": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {\n if (id === \"lanes\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.phy === 32 && r.counters?.loss_of_dword_synchronization_count === 10))) notes.push(\"Unrelated HBA PHY 32: 10 loss of dword sync\");"
+ },
+ "LOC6": {
+  "from": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {",
+  "to": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {\n if (id === \"lanes\" && [...model.sas.expanders.values()].some((e) => e.phys.some((r) => r.phy === 32 && r.counters?.loss_of_dword_synchronization_count === 10))) notes.push(\"Expander PHY 32: 777–999 loss of dword sync\");"
+ },
+ "SEPH1": {
+  "from": "      seps: list(model.sas.seps?.get(id)?.get(handle)),",
+  "to": "      seps: [],"
+ },
+ "SEPH2": {
+  "from": "if (seps.length === 1 || built === \"sep\") return kind === \"sep\" ? { state: \"sep\", row } : says(\"the enclosure processor\");",
+  "to": ""
+ },
+ "DIR2": {
+  "from": "      if (kind !== \"disk\") return says(disk);\n",
+  "to": ""
+ },
+ "MIS1": {
+  "from": "if (row.handleState === \"mismatch\") return",
+  "to": "if (false) return"
+ },
+ "REC1": {
+  "from": "      if (why) found.push({ side: \"far\", id: link.target, phy: lane.target, why });",
+  "to": ""
+ },
+ "REC2": {
+  "from": "if (!far.handle || !nearOwn || far.handle !== nearOwn) return",
+  "to": "if (false) return"
+ },
+ "REC3": {
+  "from": "if (far.remote !== lane.source) return",
+  "to": "if (false) return"
+ },
+ "RATE1": {
+  "from": "if ([endRate(item.source, lane.source), endRate(item.target, lane.target)].some((rate) => rate !== null && rate !== lane.rate)) {",
+  "to": "if (false) {"
+ },
+ "HDR1": {
+  "from": "rows.push({ label: \"Lanes\", value: verified ?",
+  "to": "rows.push({ label: \"Lanes\", value: true ?"
+ },
+ "PORT2": {
+  "from": "{ label: \"Rate\", value: phy && port.expanderId && !context.portPhyOwner(model, port).ok ?",
+  "to": "{ label: \"Rate\", value: false ?"
+ },
+ "PORT3": {
+  "from": "port.phy.phy === phy && context.portPhyOwner(model, port).ok",
+  "to": "port.phy.phy === phy"
+ },
+ "PLACE1": {
+  "from": "...context.list(bay.reported?.addresses), ",
+  "to": ""
+ },
+ "PLACE2": {
+  "from": "const elsewhere = places.some(",
+  "to": "const elsewhere = false && places.some("
+ },
+ "BAYID1": {
+  "from": "const disks = bayPlaces.length ? context.diskGroups(",
+  "to": "const disks = false ? context.diskGroups("
+ },
+ "GRP1": {
+  "from": "(place.address && group.addresses.has(place.address))",
+  "to": "false"
+ },
+ "WORD1": {
+  "from": "groups.length === 2 ? \"two\" : groups.length",
+  "to": "\"two\""
+ },
+ "HBH1": {
+  "from": "const handle = found && found.expanders.length + found.bays.length + found.seps.length > 1 ? port.handle : \"\";",
+  "to": "const handle = \"\";"
+ },
+ "LIST1": {
+  "from": "    if (unread.length) return { state: \"mismatch\", row, why:",
+  "to": "    if (false) return { state: \"mismatch\", row, why:"
+ },
+ "GRP2": {
+  "from": "group.located = group.places.some((place) => place.bay !== null && place.bay !== undefined);",
+  "to": "group.located = bays.length > 0;"
+ }
+}
