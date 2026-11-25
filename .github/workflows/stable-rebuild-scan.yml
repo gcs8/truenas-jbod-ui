@@ -1,0 +1,88 @@
+name: Stable rebuild scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/stable-rebuild-scan.yml
+      - .github/scripts/stable_rebuild_scan.py
+      - .github/tests/test_stable_rebuild_scan.py
+      - .github/STABLE_REBUILD_SCAN.md
+      - tests/test_ci_contract.py
+      - scripts/run_image_upgrade_smoke.py
+  schedule:
+    - cron: "41 7 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: stable-rebuild-scan-${{ github.event_name == 'pull_request' && github.ref || 'current-stable-writer' }}
+  cancel-in-progress: false
+
+jobs:
+  qualify-pr:
+    name: Stable rebuild native qualification
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Install workflow parser
+        run: |
+          python -m pip install --only-binary=:all: PyYAML==6.0.3
+      - name: Test offline comparison and issue transport
+        run: python -m unittest discover -s .github/tests -p 'test_stable_rebuild_scan.py' -v
+      - name: Build stable source, run both smokes and compare scans
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python .github/scripts/stable_rebuild_scan.py qualify
+      - name: Remove safe comparison receipt
+        if: always()
+        run: rm -f "$RUNNER_TEMP/stable-rebuild-pair.json"
+
+  weekly:
+    name: Stable rebuild scan-only comparison
+    if: >-
+      github.repository == 'gcs8/truenas-jbod-ui' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      issues: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Install workflow parser
+        run: |
+          python -m pip install --only-binary=:all: PyYAML==6.0.3
+      - name: Test offline comparison and issue transport
+        run: python -m unittest discover -s .github/tests -p 'test_stable_rebuild_scan.py' -v
+      - name: Build stable source, run both smokes and compare scans
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python .github/scripts/stable_rebuild_scan.py qualify
+      - name: Synchronize the single scan-only comparison issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/stable_rebuild_scan.py sync
+      - name: Remove safe comparison receipt
+        if: always()
+        run: rm -f "$RUNNER_TEMP/stable-rebuild-pair.json"
