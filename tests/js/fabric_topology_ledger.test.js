@@ -98,6 +98,8 @@ test("a disk the census names by its PHY name alone keeps its fault in the disk-
   const lines = said(built, /101 invalid dword/);
   assert.equal(lines.length, 1, textOf(lines));
   assert.match(lines[0], /host1: PHY 12, a disk port/);
+  // The record names the PHY by name: its destination is that record's disk.
+  assert.match(pin(built, HOST1, 12), /^a disk attached directly; no bay's path is joined to it/);
 });
 
 test("a census record not read is unread evidence: no role, no destination, its fault said once", () => {
