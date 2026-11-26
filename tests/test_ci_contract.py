@@ -228,6 +228,44 @@ class CIWorkflowContractTests(unittest.TestCase):
             contributing,
         )
 
+    def test_secret_scan_covers_every_main_pull_request_and_weekly_dispatch(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "secret-scan.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"], {"branches": ["main"]})
+        self.assertEqual(triggers["schedule"], [{"cron": "23 7 * * 1"}])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"secret-scan"})
+        job = workflow["jobs"]["secret-scan"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        for forbidden in ("if", "permissions", "services", "container", "continue-on-error"):
+            self.assertNotIn(forbidden, job)
+        steps = job["steps"]
+        checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {"fetch-depth": 0, "persist-credentials": False})
+        commands = "\n".join(step.get("run", "") for step in steps)
+        self.assertIn("python -m unittest discover -s .github/tests -p 'test_secret_scan.py' -v", commands)
+        self.assertIn('python .github/scripts/secret_scan.py scan --binary "$GITLEAKS_BINARY"', commands)
+        for step in steps:
+            for forbidden in ("if", "continue-on-error"):
+                self.assertNotIn(forbidden, step)
+        for forbidden in ("secrets.", "upload-artifact", "GITLEAKS_LICENSE"):
+            self.assertNotIn(forbidden, self.read(WORKFLOW_DIR / "secret-scan.yml"))
+
+    def test_secret_scan_runtime_paths_use_step_environment_context(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "secret-scan.yml"))
+        self.assertNotIn("runner.", json.dumps(workflow.get("env", {})))
+        job = workflow["jobs"]["secret-scan"]
+        self.assertNotIn("runner.", json.dumps(job.get("env", {})))
+        run_steps = [step for step in job["steps"] if "run" in step]
+        self.assertEqual(len(run_steps), 3)
+        for step in run_steps:
+            with self.subTest(step=step["name"]):
+                self.assertEqual(step.get("env"), {
+                    "TMPDIR": "${{ runner.temp }}",
+                    "GITLEAKS_BINARY": "${{ runner.temp }}/secret-scan-tools/gitleaks",
+                })
+
     def test_python_floor_and_ceiling_are_separate_matrix_entries(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
         job = workflow["jobs"]["python-source"]
@@ -413,8 +451,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # browser legs' failure-only report upload (#1191), plus the dependency
         # audit workflow's checkout, Python setup and Node setup, and the
         # published-image scan's two checkout and two Python setup uses.
-        # Also count main's workflow-lint checkout and Python setup.
-        self.assertEqual(action_count, 55)
+        # Also count main's workflow-lint checkout and Python setup, plus the
+        # secret-scan checkout and Python setup (#1513).
+        self.assertEqual(action_count, 57)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
