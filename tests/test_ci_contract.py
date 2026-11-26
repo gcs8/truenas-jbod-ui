@@ -1398,8 +1398,15 @@ class TopologyMutationScopeTests(unittest.TestCase):
             " if getattr(m, '__file__', None) and m.__file__.startswith(root)})))\n"
         )
         env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, env=env, check=True)
-        files = set(filter(None, result.stdout.splitlines()))
+        files: set[str] = set()
+        # The import closure needs the application's dependencies; a job that
+        # installs only the workflow tooling still checks everything else.
+        import importlib.util
+
+        if importlib.util.find_spec("pydantic") is not None:
+            result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, env=env, check=True)
+            files = set(filter(None, result.stdout.splitlines()))
+            self.assertIn("app/services/sas_fabric_core.py", files)
         # Modules the tests import inside a test, which the import above misses.
         for module in modules:
             source = (ROOT / (module.replace(".", "/") + ".py")).read_text(encoding="utf-8")
