@@ -304,3 +304,19 @@ test("a cable-error PASS counts cable ends and an extra uplink PHY apart where t
   assert.ok(pass, textOf(found));
   assert.match(textOf(pass.lines), /cable ends? and 1 uplink PHY/, textOf(pass.lines));
 });
+
+test("a far row that names another device or PHY is no lane of the cable, though another expander's row names the near PHY", () => {
+  for (const mode of ["far handle", "far remote PHY"]) {
+    const { data, link } = laneCase("control");
+    const expander = data.fabric.expanders.find((entry) => entry.id === link.target);
+    const far = expander.phys.find((entry) => Number(entry.phy) === 32);
+    const other = data.fabric.expanders.find((entry) => entry.id !== expander.id && entry.controller_id === expander.controller_id);
+    other.phys.push({ ...far, phy: "50", invalid_dword_count: 0 });
+    if (mode === "far handle") far.dev_handle = "000a";
+    else far.remote_phy = "2";
+    const built = coreModel(data);
+    const lanes = checksOf(built, "lanes");
+    assert.ok(!statuses(built, "lanes").includes("pass"), `${mode}: ${textOf(lanes)}`);
+    assert.match(textOf(lanes), mode === "far handle" ? /device handle 000a is not mpr0's own/ : /names remote PHY 2, not PHY 0/, `${mode}: ${textOf(lanes)}`);
+  }
+});
