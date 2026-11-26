@@ -108,13 +108,15 @@ function targetWords(targets) {
 // enclosures' processors. Handles are the HBA's own, so each kind is one
 // device per record.
 function handleDevices(model, id, handle) {
-    if (!handle) return { expanders: [], bays: [], seps: [] };
+    if (!handle) return { expanders: [], bays: [], seps: [], hbas: [] };
     const expanders = new Set([...model.nodes.filter((entry) => entry.kind === "expander" && entry.controllerId === id && model.sas.expanders.get(entry.id)?.handle === handle).map((entry) => entry.id),
       ...[...model.sas.expanders.values()].filter((record) => record.units.has(id) && record.handles.has(handle)).map((record) => record.id)]);
     return {
       expanders: [...expanders].map((key) => model.nodeById.get(key) || { id: key }),
       bays: [...new Set(model.bays.filter((bay) => bay.ports.some((port) => port.controllerId === id && port.handle === handle)))],
       seps: list(model.sas.seps?.get(id)?.get(handle)),
+      // The HBA itself, where any of its rows gives the handle as its own.
+      hbas: list(model.sas.controllers.get(id)?.phys).some((row) => row.ownHandle === handle) ? [id] : [],
     };
   }
 
@@ -149,13 +151,14 @@ function handleTarget(model, id, phy) {
     const [row] = rows;
     if (!row.handle) return { state: row.rate !== null ? "none" : "", row };
     const name = nodeName(model, id);
-    const { expanders, bays, seps } = handleDevices(model, id, row.handle);
+    const { expanders, bays, seps, hbas } = handleDevices(model, id, row.handle);
     if (expanders.length > 1) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one expander of ${name}` };
-    const kinds = [...expanders.map(() => "expander"), ...bays.map(() => "disk"), ...seps.map(() => "sep")];
+    const kinds = [...expanders.map(() => "expander"), ...bays.map(() => "disk"), ...seps.map(() => "sep"), ...hbas.map(() => "hba")];
     const built = HANDLE_KINDS[row.handleState];
     const hba = model.sas.controllers.get(id);
     if (row.handleState === "ambiguous" || hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${name}` };
     if (row.handleState === "conflict") return { state: "mismatch", row, why: `the records of ${name} disagree about what device handle ${row.handle} names` };
+    if (hbas.length) return { state: "mismatch", row, why: `device handle ${row.handle} is one ${name} gives as its own` };
     const coverage = context.listCoverage(model, id, row.handle);
     if (coverage) return { state: "mismatch", row, why: coverage };
     if (row.handleState === "mismatch") return { state: "mismatch", row, why: `device handle ${row.handle} names a device of ${name}'s device list whose parent or type is not this row's` };
@@ -200,6 +203,73 @@ function handleClash(model, link, side, phy) {
       : `its row's device handle ${target.row.handle} names no expander of this cable`;
   }
 
+const chipId = (model, id) => chipOfNode(model, id)?.id || id;
+
+// A lane list as a record gives it, in the shape the model reads a list in.
+function parseLanes(raw) {
+    const whole = (values) => list(values).filter((value) => Number.isInteger(value));
+    const rows = list(raw.lanes).filter((lane) => context.isRecord(lane) && Number.isInteger(lane.source_phy) && Number.isInteger(lane.target_phy)).map((lane) => ({ source: lane.source_phy, target: lane.target_phy }));
+    return { count: raw.lane_count, sourcePhys: whole(raw.source_phys), targetPhys: whole(raw.target_phys), rows };
+  }
+
+// Every lane list a link's records give besides the one shown as reported.
+function laneListsOf(link) {
+    return list(link.listRecords).map(parseLanes);
+  }
+
+// Every claim the payload makes on a PHY as a cable's lane, whichever
+// record makes it, decided once for every consumer: each list of each
+// link record, drawn or not (at both ends and in its pairs, one PHY per
+// lane or not), the far end the view infers for a drawn cable, and on
+// Linux what each node record reports as its parent port's PHYs. By chip
+// and PHY, the records that claim it, each with the chips at its two ends
+// and the PHYs it lists at that end; and by parent port name, the devices
+// that report being on it.
+function laneClaims(model) {
+    if (model.laneClaimIndex) return model.laneClaimIndex;
+    const claims = new Map();
+    const ports = new Map();
+    const claim = (id, phys, source, target) => {
+      const listed = new Set(phys.filter((phy) => Number.isInteger(phy)));
+      const entry = { pair: `${chipId(model, source)}|${chipId(model, target)}`, source, target, listed };
+      for (const key of [...listed].map((phy) => `${chipId(model, id)}|${phy}`)) (claims.get(key) || claims.set(key, []).get(key)).push(entry);
+    };
+    const drawn = model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).filter((entry) => context.LANE_LINKS.has(entry.kind) && entry.lanes);
+    for (const { source, target, lanes } of [...drawn, ...list(model.laneRecords).map((record) => ({ ...record, lanes: parseLanes(record.lanes) }))]) {
+      claim(source, [...lanes.sourcePhys, ...lanes.rows.map((lane) => lane.source)], source, target);
+      claim(target, [...lanes.targetPhys, ...lanes.rows.map((lane) => lane.target)], source, target);
+    }
+    for (const item of list(model.parentClaims)) {
+      if (item.port) ports.set(item.port, (ports.get(item.port) || new Set()).add(chipId(model, item.child)));
+      if (typeof item.parent === "string") claim(item.parent, item.phys, item.parent, item.child);
+    }
+    model.laneClaimIndex = { claims, ports };
+    return model.laneClaimIndex;
+  }
+
+// Every SAS address the payload gives a controller or expander: each record
+// of it, and its own node. And, by address, the chips given it.
+function addressesOf(model, id) {
+    const node = model.nodeById.get(id);
+    return new Set([...((model.sas.expanders.get(id) || model.sas.controllers.get(id))?.addresses || []), sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));
+  }
+
+function addressHolders(model) {
+    if (model.addressHolderIndex) return model.addressHolderIndex;
+    const holders = new Map();
+    for (const id of new Set([...model.sas.expanders.keys(), ...model.sas.controllers.keys(), ...model.nodes.filter((entry) => ["controller", "expander"].includes(entry.kind)).map((entry) => entry.id)])) {
+      for (const address of addressesOf(model, id)) holders.set(address, (holders.get(address) || new Set()).add(chipId(model, id)));
+    }
+    model.addressHolderIndex = holders;
+    return holders;
+  }
+
+// How a cable is said where another cable's card names it.
+function cableWords(model, source, target) {
+    const name = (id) => (model.nodeById.has(chipId(model, id)) ? nodeName(model, id) : "a device this view does not draw");
+    return `the cable from ${name(source)} to ${name(target)}`;
+  }
+
 // A cable's members as the ledger reads them: each listed PHY's evidence
 // must be a kind the table says can end this cable there, and every target
 // a read census record names must be its other end. Otherwise which PHYs
@@ -220,11 +290,16 @@ function memberConflicts(model, link) {
     }
     // More than one record of the link, giving different lists: no one list.
     if (link.listsDisagree) found.push({ side: "near", id: link.source, phy: link.lanes.sourcePhys[0], why: "the payload has more than one record of this link, and their lane lists differ" });
-    // The SAS address the list gives for an end, where that end's own is
-    // read, is that end's: a list naming another device is not this cable's.
+    // The SAS address of an end is one address by every record of that end
+    // and by its own node, no other device's, and the address the list gives
+    // for that end where it gives one: otherwise the list is not this cable's.
     for (const [side, id, address, phys] of [["near", link.source, link.listEnds[0], link.lanes.sourcePhys], ["far", link.target, link.listEnds[1], link.lanes.targetPhys]]) {
-      const own = sasAddressOf(model.sas.expanders.get(id)?.address || model.sas.controllers.get(id)?.sasAddress);
-      if (address && own && address !== own) found.push({ side, id, phy: phys[0] ?? link.lanes.sourcePhys[0], why: `the lane list gives another SAS address than ${nodeName(model, id)}'s for this end` });
+      const own = addressesOf(model, id);
+      const elsewhere = (value) => [...(addressHolders(model).get(value) || [])].some((chip) => chip !== chipId(model, id));
+      const at = { side, id, phy: phys[0] ?? link.lanes.sourcePhys[0] };
+      if (own.size > 1) found.push({ ...at, why: `the records of ${nodeName(model, id)} give it more than one SAS address` });
+      else if ([...own].some(elsewhere)) found.push({ ...at, why: `the SAS address of ${nodeName(model, id)} is also given for another device` });
+      else if (address && ((own.size && !own.has(address)) || elsewhere(address))) found.push({ ...at, why: `the lane list gives another SAS address than ${nodeName(model, id)}'s for this end` });
     }
     // A Linux list is its parent port's, by every source that reads the port.
     if (model.transport) {
@@ -242,6 +317,24 @@ function memberConflicts(model, link) {
       for (const lane of link.lanes.rows) {
         const why = reciprocalClash(model, link, lane);
         if (why) found.push({ side: "far", id: link.target, phy: lane.target, why });
+      }
+    }
+    // A PHY anything else claims is no one cable's, and a cable that lists
+    // one has no membership read: another cable's record (any of its lists),
+    // another device's report of its parent port, a list of a link this view
+    // does not draw, or a bay's path. The first such PHY at each end is named.
+    const { claims } = laneClaims(model);
+    const mine = `${chipId(model, link.source)}|${chipId(model, link.target)}`;
+    for (const [side, id, phys] of [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]]) {
+      for (const phy of new Set(phys)) {
+        const key = `${chipId(model, id)}|${phy}`;
+        // Another cable's record, or a record between the same two chips
+        // that lists other PHYs at this end than this list does.
+        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));
+        const bay = list(ownerIndex(model).get(key)).find((item) => item.kind === "bay");
+        if (!rival && !bay) continue;
+        found.push({ side, id, phy, why: !rival ? `${bay.label} also claims it, as a disk port` : rival.pair !== mine ? `a record of ${cableWords(model, rival.source, rival.target)} also lists it` : "another record between these two ends lists it with other PHYs" });
+        break;
       }
     }
     return found;
@@ -263,6 +356,7 @@ function parentPortClash(model, link) {
     const child = link.ancestry;
     if (child?.torn) return `the records of ${far} disagree about the parent port it is on`;
     if (!child?.port) return `${far} does not name the parent port it is on, so no port's PHY list is shown to be this cable's`;
+    if ((laneClaims(model).ports.get(child.port)?.size || 0) > 1) return `more than one device reports parent port ${child.port} as the port it is on`;
     if (child.parent !== link.source) return `${far} does not report ${near} as its resolved parent`;
     if (!whole(child.members) || child.count !== listed.size) return `the PHYs ${far} reports for parent port ${child.port} are not this cable's whole PHY list`;
     if (!model.transport.reported) return "";
@@ -272,6 +366,9 @@ function parentPortClash(model, link) {
     if (ports.length > 1) return `more than one census record names parent port ${child.port} or its two ends`;
     const [port] = ports;
     if (port.id !== id || port.state !== "read" || port.owner_id !== link.source || port.remote_kind !== "expander" || port.remote_id !== link.target) return `the census has no read record of parent port ${child.port} from ${near} to ${far}`;
+    // Any other census record of the parent that lists one of the PHYs, by
+    // number or by name, read or not, is a second claim to it.
+    if (model.censusRows.some((entry) => entry !== port && chipId(model, entry.owner_id) === chipId(model, link.source) && list(entry.phys).some((phy) => listed.has(phy)))) return `another census record of ${near} also lists a PHY of parent port ${child.port}`;
     if (!whole(port.listed.numbers)) return `the PHY numbers of parent port ${child.port} are not this cable's whole PHY list`;
     if (!whole(port.listed.names)) return `the PHY names of parent port ${child.port} do not name the same PHYs of ${near} as its PHY numbers`;
     return "";
@@ -301,7 +398,7 @@ function laneSetClash(model, link) {
     const nearOwn = new Set((nearHba ? nearHba.phys.map((row) => row.ownHandle) : [nearChip.handle]).filter(Boolean));
     for (const handle of [...nearOwn, farChip.handle].filter(Boolean)) {
       const devices = handleDevices(model, unit, handle);
-      const holders = devices.expanders.length + devices.bays.length + devices.seps.length + Number(nearHba && nearOwn.has(handle) || false);
+      const holders = devices.expanders.length + devices.bays.length + devices.seps.length + devices.hbas.length;
       if (holders > 1 || ambiguous.has(handle)) return at("far", first, `device handle ${handle} names more than one device of ${nodeName(model, unit)}`);
     }
     if (!nearHba) {
@@ -518,24 +615,40 @@ function ownerIndex(model) {
         // (an expander, another bay's disk, an enclosure processor) does not
         // say which disk it is.
         const found = !model.transport && port.controllerId ? context.handleDevices(model, port.controllerId, port.handle) : null;
-        const handle = found && (found.expanders.length + found.bays.length + found.seps.length > 1 || model.sas.controllers.get(port.controllerId)?.ambiguousHandles?.has(port.handle)) ? port.handle : "";
+        const handle = found && (found.expanders.length + found.bays.length + found.seps.length + found.hbas.length > 1 || model.sas.controllers.get(port.controllerId)?.ambiguousHandles?.has(port.handle)) ? port.handle : "";
         for (const phy of port.phy ? [port.phy.phy] : context.list(port.phys)) claim(port.expanderId, phy, { key: `bay:${bay.bayId}`, kind: "bay", bay, label: bay.label, address, handle, controllerId: port.controllerId });
       }
     }
     // A cable claims the PHYs at an end only where its members there are
     // read: an invalid list claims none.
-    for (const link of model.links.filter((entry) => context.LANE_LINKS.has(entry.kind) && entry.lanes)) {
-      const membership = membershipOf(link);
+    // Every list any record of the link gives claims so, not only the one
+    // shown as reported.
+    for (const link of model.links.filter((entry) => context.LANE_LINKS.has(entry.kind) && entry.lanes)) for (const lanes of [link.lanes, ...laneListsOf(link)]) {
+      const membership = membershipOf({ lanes });
       const readEnd = (side) => membership.pairs && membership.ends.some((end) => end.side === side && end.read);
-      if (readEnd("near")) for (const phy of new Set(link.lanes.sourcePhys)) claim(link.source, phy, { key: `link:${link.id}`, kind: "cable", link, side: "near", label: `the cable to ${context.nodeName(model, link.target)}` });
-      if (readEnd("far")) for (const phy of new Set(link.lanes.targetPhys)) claim(link.target, phy, { key: `link:${link.id}`, kind: "cable", link, side: "far", label: `the cable from ${context.nodeName(model, link.source)}` });
+      if (readEnd("near")) for (const phy of new Set(lanes.sourcePhys)) claim(link.source, phy, { key: `link:${link.id}`, kind: "cable", link, side: "near", label: `the cable to ${context.nodeName(model, link.target)}` });
+      if (readEnd("far")) for (const phy of new Set(lanes.targetPhys)) claim(link.target, phy, { key: `link:${link.id}`, kind: "cable", link, side: "far", label: `the cable from ${context.nodeName(model, link.source)}` });
+    }
+    // A list of a link this view does not draw (an end that is not a drawn
+    // node) is a claim too, where it is one PHY per lane: no cable to name.
+    const drawn = new Set(model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).map((entry) => entry.id));
+    for (const record of list(model.laneRecords).filter((item) => !drawn.has(item.key))) {
+      const lanes = parseLanes(record.lanes);
+      const membership = membershipOf({ lanes });
+      const readEnd = (side) => membership.pairs && membership.ends.some((end) => end.side === side && end.read);
+      const claimant = { key: `list:${record.key}`, kind: "list", label: "a lane list of a link this view does not draw" };
+      if (readEnd("near")) for (const phy of new Set(lanes.sourcePhys)) claim(record.source, phy, claimant);
+      if (readEnd("far")) for (const phy of new Set(lanes.targetPhys)) claim(record.target, phy, claimant);
     }
     model.phyOwners = owners;
     return owners;
   }
 
 function phyOwner(model, id, phy) {
-    const claimants = ownerIndex(model).get(`${context.chipOfNode(model, id)?.id || id}|${phy}`) || [];
+    // A list of a link this view does not draw disputes a bay's or a
+    // cable's claim; with no other claimant it names no owner to show.
+    const held = ownerIndex(model).get(`${context.chipOfNode(model, id)?.id || id}|${phy}`) || [];
+    const claimants = held.some((item) => item.kind !== "list") ? held : [];
     const reading = context.phyReading(model, id, phy);
     const bays = claimants.filter((item) => item.kind === "bay").map((item) => item.bay);
     const cables = claimants.filter((item) => item.kind === "cable");

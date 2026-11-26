@@ -602,6 +602,7 @@ function sasIndex(fabric) {
       expanders.set(item.id, {
         id: item.id,
         address: text(item.sas_address),
+        addresses: new Set(group.map((record) => sasAddressOf(record.sas_address)).filter(Boolean)),
         handle: text(item.dev_handle),
         controllerId: text(item.controller_id),
         // Every handle and controller unit any of its records gives it: a
@@ -645,6 +646,7 @@ function sasIndex(fabric) {
         pci: text(item.pci_address),
         pathCounts: isRecord(item.path_counts) ? Object.entries(item.path_counts).filter(([, count]) => Number.isSafeInteger(count) && count >= 0) : [],
         sasAddress: text(item.sas_address),
+        addresses: new Set(group.map((record) => sasAddressOf(record.sas_address)).filter(Boolean)),
         // An HBA's PHY rows carry error counters only where the source reads them.
         phys: list(item.phy_rows).filter(isRecord).map((row) => ({
           ...(row.counter_state ? phyFacts(row) : { counters: null, measured: false, errors: 0 }),
@@ -1676,6 +1678,7 @@ function buildTopologyModel(given, options = {}) {
         alias: text(item.alias) || text(item.display_label),
         peer: false,
         rawId: item.raw_id || "",
+        rawAddress: text(item.raw?.sas_address),
         controllerId: typeof item.controller_id === "string" ? item.controller_id : "",
         status: item.status || "",
         level: item.kind === "expander" ? expanderLevel(item) : null,
@@ -1705,9 +1708,12 @@ function buildTopologyModel(given, options = {}) {
     // cable by its kind and two ends, as it is drawn): a cable whose records
     // give different lists has no one list, whichever record came first.
     const laneLists = new Map();
+    // And every such record with a list, drawn or not: each is a claim.
+    const laneRecords = [];
     for (const item of list(given?.links).filter((entry) => isRecord(entry) && LANE_LINKS.has(entry.kind))) {
       const key = transport ? `${item.kind}:${item.source}->${item.target}` : item.id;
       laneLists.set(key, (laneLists.get(key) || new Map()).set(stable(item.reported_lanes ?? null), item.reported_lanes));
+      if (isRecord(item.reported_lanes)) laneRecords.push({ key, source: item.source, target: item.target, lanes: item.reported_lanes });
     }
     // Every record the payload carries of each node id: a Linux cable's
     // child is what all of its records report.
@@ -1788,6 +1794,8 @@ function buildTopologyModel(given, options = {}) {
         // The SAS address the lane list itself gives for each end, where it does.
         listEnds: [sasAddressOf(lanesPayload?.source_sas_address), sasAddressOf(lanesPayload?.attached_sas_address)],
         listsDisagree,
+        // Every lane list any record of the link gives: each is a claim.
+        listRecords: laneLink ? [...(lists?.values() || [])].filter(isRecord) : [],
         ancestry: transport && laneLink ? ancestryOf(nodeRecords.get(item.target) || []) : null,
         kind: item.kind,
         source: item.source,
@@ -2444,6 +2452,11 @@ function buildTopologyModel(given, options = {}) {
       portByKey: new Map(bays.flatMap((bay) => bay.ports.map((port) => [port.key, port]))),
       // The transport census as the payload lists it: which PHYs it expects.
       censusRows: censusOf(fabric),
+      // What each Linux node record reports of a parent port it is on: a
+      // claim on that port, and on its PHYs, whichever cable it is of.
+      laneRecords,
+      parentClaims: [...nodeRecords.values()].flat().filter((node) => isRecord(node.raw) && (node.raw.parent_port !== undefined || node.raw.source_phys !== undefined))
+        .map((node) => ({ child: node.id, parent: node.raw.parent_id, port: text(node.raw.parent_port), phys: list(node.raw.source_phys) })),
       checks: [],
       flags: new Map(),
       contract: mode,
@@ -2504,9 +2517,10 @@ function buildTopologyModel(given, options = {}) {
     context.unmatchedTargets(model);
     context.wiringChecks(model, fabric);
     // A cable whose members are not read says so on its drawn label: its
-    // listed PHYs are what the payload lists, not established members.
+    // listed PHYs are what the payload lists, not established members, and
+    // a rate measured on them is not shown as the cable's.
     for (const link of model.links) {
-      if (link.lanes && list(link.labelLines).length && context.LANE_LINKS.has(link.kind) && !context.membershipRead(model, link)) link.labelLines = [...link.labelLines, "membership not read"];
+      if (link.lanes && list(link.labelLines).length && context.LANE_LINKS.has(link.kind) && !context.membershipRead(model, link)) link.labelLines = [link.labelLines[0].replace(/\S+ Gb\/s$/, `rate ${NOT_READ}`), ...link.labelLines.slice(1), "membership not read"];
     }
     model.transportNote = context.transportNote(model);
     finishNeighbours(model);

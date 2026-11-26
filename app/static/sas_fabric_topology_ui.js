@@ -1449,6 +1449,8 @@ function cableRows(model, link) {
     const verified = context.membershipRead(model, link);
     rows.push({ label: "Lanes", value: verified ? `${link.lanes.count}${perRate.length ? `: ${perRate.join(", ")}` : ` · ${context.formatRate(link.lanes.rate)}`}`
       : `${link.lanes.count} reported; which PHYs the cable uses is ${context.NOT_READ}${conflicts.length ? ` (PHY ${conflicts[0].phy} at ${context.nodeName(model, conflicts[0].id)}: ${conflicts[0].why})` : ""}`, warn: verified && rates.length > 1 });
+    // Read from the child's report alone, where the payload has no port census.
+    if (verified && model.transport && !model.transport.reported) rows.push({ label: "Basis", value: "the parent port as its child reports it; the payload has no port census" });
     const parentOnly = link.lanes.basis === "sysfs_parent_port_membership";
     rows.push({ label: "PHYs", value: `${verified ? "" : "reported: "}${context.phyRanges(link.lanes.sourcePhys) || "?"} at ${context.nodeName(model, link.source)}${link.lanes.targetPhys.length ? ` ↔ ${context.phyRanges(link.lanes.targetPhys)} at ${context.nodeName(model, link.target)}` : ""}${verified ? "" : `; membership ${context.NOT_READ}`}` });
     if (link.lanes.targetBasis === "inferred") rows.push({ label: "Far end", value: `inferred: the only linked PHYs of ${context.nodeName(model, link.target)} that are in no port. sysfs has a port on the parent only` });

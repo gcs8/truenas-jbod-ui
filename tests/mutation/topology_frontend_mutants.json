@@ -424,7 +424,7 @@
   "to": "const known = claimants.length >= 1 && !reading.conflict && !bayClash && !cableClash;"
  },
  "R8": {
-  "from": "for (const phy of new Set(link.lanes.targetPhys)) claim(link.target,",
+  "from": "for (const phy of new Set(lanes.targetPhys)) claim(link.target,",
   "to": "for (const phy of [].concat()) claim(link.target,"
  },
  "R9": {
@@ -500,8 +500,8 @@
   "to": "const pairs = true || ("
  },
  "CLAIM1": {
-  "from": "if (readEnd(\"far\")) for (const phy of new Set(link.lanes.targetPhys)) claim(",
-  "to": "for (const phy of new Set(link.lanes.targetPhys)) claim("
+  "from": "if (readEnd(\"far\")) for (const phy of new Set(lanes.targetPhys)) claim(link.target,",
+  "to": "for (const phy of new Set(lanes.targetPhys)) claim(link.target,"
  },
  "ROLE1": {
   "from": "      const role = clash(\"link\");\n      if (role) return role;\n",
@@ -848,7 +848,7 @@
   "to": "const near = listedNear;"
  },
  "LB1": {
-  "from": "link.labelLines = [...link.labelLines, \"membership not read\"];",
+  "from": "link.labelLines = [link.labelLines[0].replace(/\\S+ Gb\\/s$/, `rate ${NOT_READ}`), ...link.labelLines.slice(1), \"membership not read\"];",
   "to": "link.labelLines = [...link.labelLines];"
  },
  "PT1": {
@@ -998,7 +998,7 @@
   "to": "\"two\""
  },
  "HBH1": {
-  "from": "found && (found.expanders.length + found.bays.length + found.seps.length > 1 || ",
+  "from": "found && (found.expanders.length + found.bays.length + found.seps.length + found.hbas.length > 1 || ",
   "to": "found && (false || "
  },
  "LIST1": {
@@ -1230,8 +1230,8 @@
   "to": "      if (readings.every((group) => group.length === 1) && new Set(rows.map(identity)).size === 1) return { ...rows[0], phy };"
  },
  "PPORT14": {
-  "from": "      if (address && own && address !== own) found.push(",
-  "to": "      if (false) found.push("
+  "from": "      else if (address && ((own.size && !own.has(address)) || elsewhere(address))) found.push({ ...at,",
+  "to": "      else if (false) found.push({ ...at,"
  },
  "PPORT15": {
   "from": "    return said.length && said.every((item) => stable(item) === stable(said[0])) ? said[0] : { port: \"\", torn: said.length > 1 };",
@@ -1244,5 +1244,77 @@
  "PPORT17": {
   "from": "    if (child?.torn) return `",
   "to": "    if (false) return `"
+ },
+ "ALLREC1": {
+  "from": "        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));",
+  "to": "        const rival = null;"
+ },
+ "ALLREC2": {
+  "from": "        const bay = list(ownerIndex(model).get(key)).find((item) => item.kind === \"bay\");",
+  "to": "        const bay = null;"
+ },
+ "ALLREC3": {
+  "from": "[...drawn, ...list(model.laneRecords).map((record) => ({ ...record, lanes: parseLanes(record.lanes) }))]",
+  "to": "[...drawn]"
+ },
+ "ALLREC4": {
+  "from": "      if (typeof item.parent === \"string\") claim(item.parent, item.phys, item.parent, item.child);",
+  "to": ""
+ },
+ "ALLREC5": {
+  "from": "    if ((laneClaims(model).ports.get(child.port)?.size || 0) > 1) return `",
+  "to": "    if (false) return `"
+ },
+ "ALLREC6": {
+  "from": "for (const lanes of [link.lanes, ...laneListsOf(link)]) {",
+  "to": "for (const lanes of [link.lanes]) {"
+ },
+ "ALLREC7": {
+  "from": "    for (const record of list(model.laneRecords).filter((item) => !drawn.has(item.key))) {",
+  "to": "    for (const record of []) {"
+ },
+ "ALLREC8": {
+  "from": "    const claimants = held.some((item) => item.kind !== \"list\") ? held : [];",
+  "to": "    const claimants = held;"
+ },
+ "ENDADDR1": {
+  "from": "      if (own.size > 1) found.push({ ...at,",
+  "to": "      if (false) found.push({ ...at,"
+ },
+ "ENDADDR2": {
+  "from": "      else if ([...own].some(elsewhere)) found.push({ ...at,",
+  "to": "      else if (false) found.push({ ...at,"
+ },
+ "ENDADDR4": {
+  "from": "      else if (address && ((own.size && !own.has(address)) || elsewhere(address))) found.push({ ...at,",
+  "to": "      else if (address && (own.size && !own.has(address))) found.push({ ...at,"
+ },
+ "HBAOWN1": {
+  "from": "      hbas: list(model.sas.controllers.get(id)?.phys).some((row) => row.ownHandle === handle) ? [id] : [],",
+  "to": "      hbas: [],"
+ },
+ "HBAOWN2": {
+  "from": "    if (hbas.length) return { state: \"mismatch\", row,",
+  "to": "    if (false) return { state: \"mismatch\", row,"
+ },
+ "UNLABEL1": {
+  "from": "link.labelLines = [link.labelLines[0].replace(/\\S+ Gb\\/s$/, `rate ${NOT_READ}`), ...link.labelLines.slice(1), \"membership not read\"];",
+  "to": "link.labelLines = [...link.labelLines, \"membership not read\"];"
+ },
+ "BASISROW1": {
+  "from": "    if (verified && model.transport && !model.transport.reported) rows.push(",
+  "to": "    if (false) rows.push("
+ },
+ "ALLREC9": {
+  "from": "find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));",
+  "to": "find((entry) => entry.pair !== mine);"
+ },
+ "ALLREC10": {
+  "from": "    if (model.censusRows.some((entry) => entry !== port && chipId(model, entry.owner_id) === chipId(model, link.source) && list(entry.phys).some((phy) => listed.has(phy)))) return `",
+  "to": "    if (false) return `"
+ },
+ "ENDADDR5": {
+  "from": "sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));",
+  "to": "].filter(Boolean));"
  }
 }
