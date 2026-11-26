@@ -507,9 +507,10 @@ function phyFacts(row) {
     };
   }
 
-// Group repeated endpoint observations before indexing. A field is read only
-// when every observation agrees; a speed disagreement must not erase the
-// other PHYs, the matching handles, or a separately measured counter.
+// Group repeated endpoint observations before indexing. Records of one
+// endpoint are joined toward not read, in any order: a field is read only
+// where every record agrees, and nothing one record says is dropped because
+// another came first.
 function endpointGroups(items) {
     const byId = new Map();
     for (const item of list(items)) {
@@ -520,13 +521,21 @@ function endpointGroups(items) {
     return byId.values();
   }
 
+// One value in any key order, so two records are compared by what they say.
+function stable(value) {
+    return JSON.stringify(value, (key, item) => (isRecord(item) ? Object.fromEntries(Object.keys(item).sort().map((name) => [name, item[name]])) : item));
+  }
+
 function agreedFields(records) {
     const keys = [...new Set(records.flatMap(Object.keys))].sort();
     return Object.fromEntries(keys.map((key) => {
       const values = records.map((record) => record[key]);
-      return [key, values.every(isRecord) ? agreedFields(values) : values.every((value) => value === values[0]) ? values[0] : null];
+      return [key, values.every(isRecord) ? agreedFields(values) : values.every((value) => value === values[0] || (Array.isArray(value) && stable(value) === stable(values[0]))) ? values[0] : null];
     }));
   }
+
+// A PHY row's readings of its rate: the rest is what the PHY is and names.
+const RATE_FIELDS = new Set(["speed", "min", "max"]);
 
 function agreedEndpoint(records, field) {
     if (records.length === 1) return records[0];
@@ -541,17 +550,46 @@ function agreedEndpoint(records, field) {
       }
       return rows;
     });
+    const identity = (row) => stable(Object.fromEntries(Object.entries(row).filter(([key]) => !RATE_FIELDS.has(key))));
     merged[field] = [...new Set(tables.flatMap((rows) => [...rows.keys()]))].sort((a, b) => a - b).flatMap((phy) => {
       const readings = tables.map((rows) => rows.get(phy) || []);
       const rows = readings.flat();
-      // A duplicated or missing PHY, or conflicting counter readings: keep
-      // the observations for the counter ledger, but no unique row lookup.
-      if (readings.some((group) => group.length !== 1) || PHY_COUNTERS.some(([key]) => new Set(rows.map((row) => row[key])).size > 1)) {
-        return [...rows, ...(readings.some((group) => !group.length) ? [{ phy }] : [])].sort((a, b) => JSON.stringify(a, Object.keys(a).sort()).localeCompare(JSON.stringify(b, Object.keys(b).sort())));
-      }
-      return { ...agreedFields(rows), phy };
+      // One row in every record, differing in nothing but a rate reading: one
+      // row, with that rate not read.
+      if (readings.every((group) => group.length === 1) && new Set(rows.map(identity)).size === 1) return { ...agreedFields(rows), phy };
+      // Otherwise every row is kept (a record without the PHY as a row that
+      // reads nothing): a handle, a remote PHY, a device type or a counter
+      // only one record gives is still evidence, and the PHY has no one row.
+      return [...rows, ...(readings.some((group) => !group.length) ? [{ phy }] : [])].sort((a, b) => stable(a).localeCompare(stable(b)));
     });
     return merged;
+  }
+
+// What a Linux cable's child reports of the parent port it is on, over
+// every record of the child: its port's name, its resolved parent, the
+// port's PHYs and how many. Records that disagree report none of it.
+function ancestryOf(records) {
+    const said = records.map((node) => (isRecord(node.raw) ? { port: text(node.raw.parent_port), parent: node.raw.parent_link_state === "resolved" ? node.raw.parent_id : null, members: node.raw.source_phys, count: node.raw.reported_num_phys } : { port: "" }));
+    return said.length && said.every((item) => stable(item) === stable(said[0])) ? said[0] : { port: "", torn: said.length > 1 };
+  }
+
+// What an HBA's records say the builder found each PHY's handle names, by
+// the PHY's number however a record writes it. A marker any record carries
+// survives (the first that applies, in this order); records that otherwise
+// disagree are a conflict; else what they all say.
+const HANDLE_MARKERS = ["ambiguous", "mismatch", "not_read", "unlisted_expander"];
+function handleStates(records) {
+    const tables = records.map((item) => {
+      const table = new Map();
+      for (const [key, state] of Object.entries(isRecord(item.device_handle_states) ? item.device_handle_states : {})) {
+        if (decimal(key) !== null) table.set(decimal(key), [...(table.get(decimal(key)) || []), text(state)]);
+      }
+      return table;
+    });
+    return (phy) => {
+      const states = [...new Set(tables.flatMap((table) => table.get(decimal(phy)) || [""]))];
+      return HANDLE_MARKERS.find((marker) => states.includes(marker)) || (states.length > 1 ? "conflict" : states[0]);
+    };
   }
 
 function sasIndex(fabric) {
@@ -566,6 +604,10 @@ function sasIndex(fabric) {
         address: text(item.sas_address),
         handle: text(item.dev_handle),
         controllerId: text(item.controller_id),
+        // Every handle and controller unit any of its records gives it: a
+        // handle one record gives it is still a claim to that handle.
+        handles: new Set(group.map((record) => text(record.dev_handle)).filter(Boolean)),
+        units: new Set(group.map((record) => text(record.controller_id)).filter(Boolean)),
         // The handle of the device this expander reports as its parent.
         parent: text(item.parent),
         product: text(item.product),
@@ -592,6 +634,7 @@ function sasIndex(fabric) {
     }
     for (const group of endpointGroups(fabric?.controllers)) {
       const item = agreedEndpoint(group, "phy_rows");
+      const handleState = handleStates(group);
       controllers.set(item.id, {
         id: item.id,
         board: text(item.board),
@@ -613,7 +656,7 @@ function sasIndex(fabric) {
           // What the builder found the handle names across the whole unit,
           // before selection: "ambiguous", "mismatch", the one device's kind
           // ("end_device", "sep", "other_device"), or nothing.
-          handleState: isRecord(item.device_handle_states) ? text(item.device_handle_states[String(row.phy)]) : "",
+          handleState: handleState(row.phy),
           device: text(row.device),
           disabled: row.disabled === "Y",
           rate: sasRate(row.speed),
@@ -721,7 +764,14 @@ function censusOf(fabric) {
       const named = list(port.phy_names).map((name) => byName.get(`${port.owner_id}|${name}`)).filter((found) => found?.length === 1 && Number.isInteger(found[0])).map((found) => found[0]);
       const ambiguous = list(port.phy_names).filter((name) => (byName.get(`${port.owner_id}|${name}`) || []).length > 1);
       const phys = [...new Set([...list(port.phys).filter((phy) => Number.isInteger(phy)), ...named])];
-      return ambiguous.length ? { ...port, phys, ambiguous, state: port.state === "read" ? "ambiguous" : port.state } : { ...port, phys };
+      // The record's PHYs by each identifier on its own, as listed: its
+      // numbers, and what each name resolves to (nothing where it is no one
+      // row). A cable's membership needs both, naming the same PHYs.
+      const listed = {
+        numbers: Array.isArray(port.phys) ? port.phys : null,
+        names: Array.isArray(port.phy_names) ? port.phy_names.map((name) => { const found = byName.get(`${port.owner_id}|${name}`); return found?.length === 1 && Number.isInteger(found[0]) ? found[0] : null; }) : null,
+      };
+      return ambiguous.length ? { ...port, phys, listed, ambiguous, state: port.state === "read" ? "ambiguous" : port.state } : { ...port, phys, listed };
     });
   }
 
@@ -1495,7 +1545,7 @@ function adoptLinuxTransport(payload, options = {}) {
         metrics: { ...(isRecord(item.metrics) ? item.metrics : {}), num_phys: rows.length, linked_phys: live, not_read: list(item.metrics?.not_read).filter((key) => key !== "linked_phys") },
       });
     }
-    return { controllers, expanders, nodes, links, ports, owners, census: census.length > 0, resolved: Boolean(resolve) };
+    return { controllers, expanders, nodes, links, ports, owners, census: census.length > 0, reported: Array.isArray(payload.raw.sas_transport_ports), resolved: Boolean(resolve) };
   }
 
 function withLinuxTransport(fabric) {
@@ -1521,7 +1571,7 @@ function withLinuxTransport(fabric) {
         // The collector admits only a complete survey of the SAS classes. An
         // enclosure is another read (SES): complete where it gave rows.
         controller_read: { counts: { controllers: "complete", expanders: "complete", ...(list(fabric.nodes).some((item) => isRecord(item) && String(item.kind || "").endsWith("enclosure")) ? { enclosures: "complete" } : {}) } },
-        linux_transport: { census: adopted.census, resolved: adopted.resolved },
+        linux_transport: { census: adopted.census, reported: adopted.reported, resolved: adopted.resolved },
       },
     };
   }
@@ -1651,6 +1701,18 @@ function buildTopologyModel(given, options = {}) {
     const bayLinks = [];
     const pathBayLinks = [];
     const seenLinks = new Set();
+    // Every lane list the payload gives for one link (by its id; a Linux
+    // cable by its kind and two ends, as it is drawn): a cable whose records
+    // give different lists has no one list, whichever record came first.
+    const laneLists = new Map();
+    for (const item of list(given?.links).filter((entry) => isRecord(entry) && LANE_LINKS.has(entry.kind))) {
+      const key = transport ? `${item.kind}:${item.source}->${item.target}` : item.id;
+      laneLists.set(key, (laneLists.get(key) || new Map()).set(stable(item.reported_lanes ?? null), item.reported_lanes));
+    }
+    // Every record the payload carries of each node id: a Linux cable's
+    // child is what all of its records report.
+    const nodeRecords = new Map();
+    for (const node of transport ? list(given?.nodes).filter(isRecord) : []) (nodeRecords.get(node.id) || nodeRecords.set(node.id, []).get(node.id)).push(node);
     for (const item of payload.links) {
       if (["enclosure-observation", "enclosure-ses"].includes(item.kind)) continue;
       if (seenLinks.has(item.id)) {
@@ -1679,7 +1741,11 @@ function buildTopologyModel(given, options = {}) {
         if (!hiddenEnd && !unsupportedEnd) skipped.unjoined.push(item.id);
         continue;
       }
-      const lanesPayload = isRecord(item.reported_lanes) ? item.reported_lanes : null;
+      const lists = laneLists.get(item.id);
+      const listsDisagree = (lists?.size || 0) > 1;
+      // Where they differ, the one shown as reported is the same in any order.
+      const reported = listsDisagree ? lists.get([...lists.keys()].filter((key) => key !== "null").sort()[0]) : item.reported_lanes;
+      const lanesPayload = isRecord(reported) ? reported : null;
       let lanes = null;
       if (lanesPayload && Number.isInteger(lanesPayload.lane_count)) {
         lanes = {
@@ -1719,8 +1785,10 @@ function buildTopologyModel(given, options = {}) {
       const laneLink = LANE_LINKS.has(item.kind);
       const entry = {
         id: item.id,
-        parentPort: transport ? targetItem.raw?.parent_port : null,
-        parentMembers: transport && targetItem.raw?.parent_link_state === "resolved" && targetItem.raw.parent_id === item.source ? targetItem.raw.source_phys : null,
+        // The SAS address the lane list itself gives for each end, where it does.
+        listEnds: [sasAddressOf(lanesPayload?.source_sas_address), sasAddressOf(lanesPayload?.attached_sas_address)],
+        listsDisagree,
+        ancestry: transport && laneLink ? ancestryOf(nodeRecords.get(item.target) || []) : null,
         kind: item.kind,
         source: item.source,
         target: item.target,

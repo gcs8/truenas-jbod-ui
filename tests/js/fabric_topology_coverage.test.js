@@ -780,6 +780,14 @@ function subjectDeletions(fabric, built) {
       } });
     }
   }
+  // A lane list that gives another device's SAS address for its far end
+  // is not this cable's list, on either platform.
+  for (const link of fabric.links.filter((entry) => LANE_KINDS.has(entry.kind) && entry.reported_lanes?.attached_sas_address)) {
+    const other = fabric.links.find((entry) => LANE_KINDS.has(entry.kind) && entry.reported_lanes?.attached_sas_address && entry.reported_lanes.attached_sas_address !== link.reported_lanes.attached_sas_address);
+    if (other) out.push({ name: `${link.id} lane list gives another far-end SAS address`, checks: [], tokens: [], expect: (after, why) => cableUnread(after, link, why), change: (copy) => {
+      copy.fabric.links.find((entry) => entry.id === link.id).reported_lanes.attached_sas_address = other.reported_lanes.attached_sas_address;
+    } });
+  }
   // A list without pairs (sysfs reports a port on the parent only): a speed
   // blanked on one PHY it lists leaves the list's rate not read.
   for (const link of fabric.links.filter((entry) => LANE_KINDS.has(entry.kind) && entry.reported_lanes?.source_phys?.length && !entry.reported_lanes?.lanes?.length)) {
@@ -793,6 +801,36 @@ function subjectDeletions(fabric, built) {
       const card = T.cardFor(after, { kind: "link", id: link.id });
       if (card?.rows.some((entry) => entry.label === "Lanes")) assert.match(textOf(card.rows), /which PHYs the cable uses is not read/, why);
     } });
+    // Each source of the parent port's membership, short of an identifier or
+    // disagreeing with the rest: which PHYs the cable uses is not read.
+    if (nodes.get(link.target)?.raw?.parent_port) {
+      const childOf = (copy) => copy.fabric.nodes.find((entry) => entry.id === link.target).raw;
+      const portOf = (copy) => copy.fabric.raw.sas_transport_ports.find((entry) => entry.id === parent.id);
+      const unread = (after, why) => cableUnread(after, link, why);
+      out.push({ name: `${link.id} child's parent port name removed`, checks: [], tokens: [], expect: unread, change: (copy) => { delete childOf(copy).parent_port; } });
+      // A second record of the child, or of the link, saying otherwise,
+      // after the first or before it.
+      const second = (records, id, change) => (copy, first) => {
+        const held = copy.fabric[records];
+        const at = held.findIndex((entry) => entry.id === id);
+        const twin = structuredClone(held[at]);
+        change(twin);
+        held.splice(at + (first ? 0 : 1), 0, twin);
+      };
+      const orphan = second("nodes", link.target, (twin) => { delete twin.raw.parent_port; });
+      out.push({ name: `${link.id} second record of its child naming no parent port`, checks: [], tokens: [], orders: true, expect: unread, change: (copy) => orphan(copy, false), twin: (copy) => orphan(copy, true) });
+      const shorter = second("links", link.id, (twin) => { twin.reported_lanes.source_phys.pop(); twin.reported_lanes.lane_count -= 1; });
+      if (link.reported_lanes.source_phys.length > 1) out.push({ name: `${link.id} second record of the link listing fewer PHYs`, checks: [], tokens: [], orders: true, expect: unread, change: (copy) => shorter(copy, false), twin: (copy) => shorter(copy, true) });
+      if (parent && parent.phys.length > 1) {
+        out.push({ name: `${link.id} child's parent port name removed, parent port shorter`, checks: [], tokens: [], expect: unread, change: (copy) => {
+          delete childOf(copy).parent_port;
+          portOf(copy).phys.pop(); portOf(copy).phy_names.pop();
+        } });
+        out.push({ name: `${link.id} parent port's PHY numbers fewer than its PHY names`, checks: [], tokens: [], expect: unread, change: (copy) => { portOf(copy).phys.pop(); } });
+        out.push({ name: `${link.id} parent port's PHY names fewer than its PHY numbers`, checks: [], tokens: [], expect: unread, change: (copy) => { portOf(copy).phy_names.pop(); } });
+        out.push({ name: `${link.id} a PHY name of the parent port on no row`, checks: [], tokens: [], expect: unread, change: (copy) => { portOf(copy).phy_names[0] += "-none"; } });
+      }
+    }
     if (!rowsOf({ fabric }).length) continue;
     out.push({ name: `${link.id} near PHY ${phy} speed blanked`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
       for (const entry of rowsOf(copy)) Object.assign(entry, { negotiated_rate_gbps: null, negotiated_link_rate: null, speed: null });
@@ -849,6 +887,24 @@ function subjectDeletions(fabric, built) {
     };
     out.push({ name: `${controller.id} duplicate with an unread list`, checks: ["lanes"], tokens: [controller.id], orders: true,
       change: (copy) => duplicateCoverage(copy, false), twin: (copy) => duplicateCoverage(copy, true) });
+    // A second record of the HBA, before or after the first: a marker it
+    // alone carries survives, a row naming another handle is kept, and a
+    // record that differs in nothing changes nothing.
+    const handled = controller.phy_rows.find((row) => row.device_handle && row.device_handle !== "0000");
+    const twinOf = (change) => (copy, first) => {
+      const twin = structuredClone(copy.fabric.controllers.find((item) => item.id === controller.id));
+      change(twin);
+      copy.fabric.controllers[first ? "unshift" : "push"](twin);
+    };
+    for (const [label, change] of [
+      ["an ambiguous handle marker", (twin) => { twin.device_handle_states = { ...twin.device_handle_states, [String(handled.phy)]: "ambiguous" }; }],
+      ["a handle state the first does not give", (twin) => { twin.device_handle_states = { ...twin.device_handle_states, [String(handled.phy)]: "end_device" }; }],
+      ["a row naming another handle", (twin) => { const row = twin.phy_rows.find((entry) => entry.phy === handled.phy); row.device_handle = `${row.device_handle.slice(0, -1)}${row.device_handle.endsWith("f") ? "e" : "f"}`; }],
+    ]) {
+      out.push({ name: `${controller.id} duplicate record with ${label}`, checks: ["lanes"], tokens: [controller.id], orders: true,
+        change: (copy) => twinOf(change)(copy, false), twin: (copy) => twinOf(change)(copy, true) });
+    }
+    for (const first of [false, true]) out.push({ name: `${controller.id} duplicate record that differs in nothing, ${first ? "first" : "last"}`, same: true, checks: [], tokens: [], change: (copy) => twinOf(() => {})(copy, first) });
     out.push({ name: `${controller.id} no list states at all`, checks: ["lanes"], tokens: [controller.id], change: (copy) => {
       const entry = copy.fabric.controllers.find((item) => item.id === controller.id);
       delete entry.device_handle_states;
@@ -856,6 +912,20 @@ function subjectDeletions(fabric, built) {
       if (copy.fabric.raw?.controller_read?.lists) delete copy.fabric.raw.controller_read.lists[entry.name];
       return true;
     } });
+  }
+  // A second record of a CORE expander, before or after the first: one that
+  // gives it another expander's handle leaves that handle naming no one
+  // device, and one that differs in nothing changes nothing.
+  for (const expander of (fabric.expanders || []).filter((item) => item.dev_handle && item.controller_id)) {
+    const twinOf = (change) => (copy, first) => {
+      const twin = structuredClone(copy.fabric.expanders.find((item) => item.id === expander.id));
+      change(twin);
+      copy.fabric.expanders[first ? "unshift" : "push"](twin);
+    };
+    const other = fabric.expanders.find((item) => item.controller_id === expander.controller_id && item.dev_handle && item.dev_handle !== expander.dev_handle);
+    if (other) out.push({ name: `${expander.id} duplicate record with another expander's handle`, checks: ["lanes"], tokens: [expander.id, other.id], orders: true,
+      change: (copy) => twinOf((twin) => { twin.dev_handle = other.dev_handle; })(copy, false), twin: (copy) => twinOf((twin) => { twin.dev_handle = other.dev_handle; })(copy, true) });
+    for (const first of [false, true]) out.push({ name: `${expander.id} duplicate record that differs in nothing, ${first ? "first" : "last"}`, same: true, checks: [], tokens: [], change: (copy) => twinOf(() => {})(copy, first) });
   }
   // A CORE bay path's handle given to another device of its HBA: the
   // enclosure processor, or an expander.
@@ -1186,6 +1256,89 @@ function coverageFirst(built, why) {
   }
 }
 
+// A Linux cable shown with a width that is not "not read" is one whose every
+// read source names the same PHYs, recomputed here from the payload alone:
+// its list, what its child reports of the parent port, and (where the
+// payload has a port census) the one census record of that port, by its PHY
+// numbers and by its PHY names resolved through the parent's own table.
+const compared = { cables: 0, unread: 0, markers: 0 };
+const drawnCable = (built, link) => built.links.flatMap((entry) => [entry, ...(entry.stubCables || [])]).find((entry) => entry.source === link.source && entry.target === link.target && entry.lanes);
+const lanesRow = (built, id) => (T.cardFor(built, { kind: "link", id })?.rows || []).find((row) => row.label === "Lanes")?.value || "";
+function parentPortsBacked(built, fabric, why) {
+  if (!built.transport) return;
+  const census = fabric.raw?.sas_transport_ports;
+  const sorted = (values) => [...values].sort((a, b) => a - b);
+  for (const link of built.links.flatMap((entry) => [entry, ...(entry.stubCables || [])]).filter((entry) => entry.lanes && LANE_KINDS.has(entry.kind))) {
+    const card = lanesRow(built, link.id);
+    if (!card || /not read/.test(card)) continue;
+    const said = `${why}: ${link.id} is shown as ${card}, but`;
+    const raw = fabric.links.filter((entry) => entry.source === link.source && entry.target === link.target && entry.kind === link.kind);
+    assert.ok(raw.length >= 1 && raw.every((entry) => textOf(entry.reported_lanes) === textOf(raw[0].reported_lanes)), `${said} the payload's ${raw.length} records of the link give different lists`);
+    const listed = sorted(raw[0].reported_lanes.source_phys);
+    assert.equal(new Set(listed).size, raw[0].reported_lanes.lane_count, `${said} its list is not one PHY per lane`);
+    for (const [key, end] of [["source_sas_address", link.source], ["attached_sas_address", link.target]]) {
+      const own = fabric.nodes.find((entry) => entry.id === end).raw.sas_address;
+      if (raw[0].reported_lanes[key] && own) assert.equal(raw[0].reported_lanes[key], own, `${said} its list gives another ${key}`);
+    }
+    // Every record of the child reports the same parent port.
+    const children = fabric.nodes.filter((entry) => entry.id === link.target).map((entry) => entry.raw);
+    const [child] = children;
+    for (const record of children) {
+      assert.ok(typeof record.parent_port === "string" && record.parent_port === child.parent_port, `${said} a record of its child names no parent port, or another`);
+      assert.deepEqual([record.parent_link_state, record.parent_id, record.reported_num_phys], ["resolved", link.source, listed.length], `${said} a record of its child does not report this parent and PHY count`);
+      assert.deepEqual(sorted(record.source_phys || []), listed, `${said} a record of its child reports other PHYs for the parent port`);
+    }
+    if (Array.isArray(census)) {
+      const ports = census.filter((port) => port.id === `sas-port:${child.parent_port}` || (port.owner_id === link.source && port.remote_id === link.target));
+      assert.equal(ports.length, 1, `${said} ${ports.length} census records name its parent port or its two ends`);
+      const [port] = ports;
+      assert.deepEqual([port.id, port.state, port.owner_id, port.remote_kind, port.remote_id], [`sas-port:${child.parent_port}`, "read", link.source, "expander", link.target], `${said} the census record is not a read record of its parent port between its ends`);
+      assert.deepEqual(sorted(port.phys || []), listed, `${said} its parent port lists other PHY numbers`);
+      const parent = fabric.nodes.find((entry) => entry.id === link.source);
+      const table = parent.raw.phys || parent.raw.phy_rows || [];
+      const named = (port.phy_names || []).map((name) => table.filter((row) => row.name === name).map((row) => row.phy));
+      assert.ok(named.every((found) => found.length === 1), `${said} a PHY name of its parent port is not one row of its parent`);
+      assert.deepEqual(sorted(named.flat()), listed, `${said} its parent port's PHY names name other PHYs`);
+    }
+    compared.cables += 1;
+  }
+}
+// A perturbed cable, where this view draws it with a lanes row, says which
+// PHYs it uses is not read.
+function cableUnread(after, link, why) {
+  const drawn = drawnCable(after, link);
+  const card = drawn ? lanesRow(after, drawn.id) : "";
+  if (!card) return;
+  assert.match(card, /reported; which PHYs the cable uses is not read/, `${why}: ${card}`);
+  assert.doesNotMatch(card, /Gb\/s/, `${why}: ${card}`);
+  compared.unread += 1;
+}
+// What any record of a CORE HBA says of a PHY's handle is on every surface:
+// a marker one record carries (its per-PHY state, or its handle among the
+// unit's ambiguous handles), or two records giving the PHY different
+// states, and the PHY names no device.
+function markersSurvive(built, fabric, why) {
+  if (built.transport) return;
+  const MARKERS = new Set(["ambiguous", "mismatch", "not_read", "unlisted_expander"]);
+  const byId = new Map();
+  for (const record of fabric.controllers || []) byId.set(record.id, [...(byId.get(record.id) || []), record]);
+  for (const [id, records] of byId) {
+    if (!built.nodeById.has(id)) continue;
+    const marked = new Set();
+    const states = (phy) => new Set(records.map((record) => record.device_handle_states?.[phy] ?? ""));
+    for (const phy of new Set(records.flatMap((record) => Object.keys(record.device_handle_states || {})))) {
+      if (states(phy).size > 1 || [...states(phy)].some((state) => MARKERS.has(state))) marked.add(Number(phy));
+    }
+    const ambiguous = new Set(records.flatMap((record) => record.ambiguous_device_handles || []));
+    for (const row of records.flatMap((record) => record.phy_rows || [])) if (ambiguous.has(row.device_handle)) marked.add(Number(row.phy));
+    const pins = [...(T.detailFor(built, { kind: "node", id })?.html || "").matchAll(/<div class="kv-row[^"]*"[^>]*><span[^>]*>(PHY \d+)<\/span><span[^>]*>([^<]*)<\/span>/g)].map((match) => [Number(match[1].slice(4)), unescapeHtml(match[2])]);
+    for (const [phy, value] of pins.filter(([number]) => marked.has(number))) {
+      assert.doesNotMatch(value, /attached directly|outside this view|^to |^cable to |^a disk the HBA's device list names|^the enclosure processor|^a device the HBA's device list names/, `${why}: ${id} PHY ${phy} names a device though a record of the HBA marks its handle: ${value}`);
+      compared.markers += 1;
+    }
+  }
+}
+
 // What the checks and flags say, as sets: line order is presentation.
 function canonicalChecks(built) {
   const checks = {};
@@ -1199,6 +1352,8 @@ function runProperty(name, base, build) {
   namesItsMeasurement(before, `${name}: baseline`);
   laneRatesBacked(before, `${name}: baseline`);
   coverageFirst(before, `${name}: baseline`);
+  parentPortsBacked(before, base.fabric, `${name}: baseline`);
+  markersSurvive(before, base.fabric, `${name}: baseline`);
   const ids = CHECK_IDS(before);
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
   const deletions = subjectDeletions(base.fabric, before);
@@ -1220,6 +1375,8 @@ function runProperty(name, base, build) {
     const why = `${name}: deleting ${deletion.name}`;
     laneRatesBacked(after, why);
     coverageFirst(after, why);
+    parentPortsBacked(after, copy.fabric, why);
+    markersSurvive(after, copy.fabric, why);
     if (deletion.expect) deletion.expect(after, why);
     if (deletion.permuted) {
       assert.deepEqual(canonicalChecks(after), canonicalChecks(before), `${why}: the same records in another order say something else`);
@@ -1314,6 +1471,9 @@ test("property: on every synthetic fabric and the CORE fabric, every deleted sub
     assert.equal(applied + absent, proposed, `${id}: ${applied} applied and ${absent} already absent of ${proposed}`);
   }
   assert.ok(Object.values(report).reduce((sum, item) => sum + item.applied, 0) > 500);
+  // The parent-port and handle-marker invariants each judged real subjects.
+  t.diagnostic(`Linux cables shown with a width, each compared with every read source: ${compared.cables}; perturbed cables shown as not read: ${compared.unread}; marked HBA PHYs compared: ${compared.markers}`);
+  assert.ok(compared.cables > 500 && compared.unread > 20 && compared.markers > 5, textOf(compared));
 });
 
 test("the disk-port PHY count is by subject type, whatever an expander id contains", () => {

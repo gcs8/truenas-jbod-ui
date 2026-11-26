@@ -110,7 +110,7 @@ function targetWords(targets) {
 function handleDevices(model, id, handle) {
     if (!handle) return { expanders: [], bays: [], seps: [] };
     const expanders = new Set([...model.nodes.filter((entry) => entry.kind === "expander" && entry.controllerId === id && model.sas.expanders.get(entry.id)?.handle === handle).map((entry) => entry.id),
-      ...[...model.sas.expanders.values()].filter((record) => record.controllerId === id && record.handle === handle).map((record) => record.id)]);
+      ...[...model.sas.expanders.values()].filter((record) => record.units.has(id) && record.handles.has(handle)).map((record) => record.id)]);
     return {
       expanders: [...expanders].map((key) => model.nodeById.get(key) || { id: key }),
       bays: [...new Set(model.bays.filter((bay) => bay.ports.some((port) => port.controllerId === id && port.handle === handle)))],
@@ -155,6 +155,7 @@ function handleTarget(model, id, phy) {
     const built = HANDLE_KINDS[row.handleState];
     const hba = model.sas.controllers.get(id);
     if (row.handleState === "ambiguous" || hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${name}` };
+    if (row.handleState === "conflict") return { state: "mismatch", row, why: `the records of ${name} disagree about what device handle ${row.handle} names` };
     const coverage = context.listCoverage(model, id, row.handle);
     if (coverage) return { state: "mismatch", row, why: coverage };
     if (row.handleState === "mismatch") return { state: "mismatch", row, why: `device handle ${row.handle} names a device of ${name}'s device list whose parent or type is not this row's` };
@@ -163,6 +164,10 @@ function handleTarget(model, id, phy) {
     if (row.handleState === "unlisted_expander") return { state: "mismatch", row, why: `device handle ${row.handle} names an expander of ${name}'s device list that its expander list does not carry` };
     const kind = deviceKind(row.device);
     const says = (what) => ({ state: "mismatch", row, why: `its row says ${row.device || "no device type"}, but its device handle ${row.handle} names ${what}` });
+    // An expander only some of whose records give it this handle, or place
+    // it in this unit, is not named by it.
+    const torn = expanders.find((entry) => { const record = model.sas.expanders.get(entry.id); return record && (record.handles.size > 1 || record.units.size > 1); });
+    if (torn) return { state: "mismatch", row, why: `the records of ${nodeName(model, chipOfNode(model, torn.id)?.id || torn.id)} disagree about its device handle or its controller unit` };
     if (expanders.length === 1) return { state: "expander", row, id: chipOfNode(model, expanders[0].id)?.id || expanders[0].id };
     if (bays.length === 1) {
       const [bay] = bays;
@@ -213,19 +218,21 @@ function memberConflicts(model, link) {
         else if (handleClash(model, link, side, phy)) found.push({ side, id, phy, why: handleClash(model, link, side, phy) });
       }
     }
+    // More than one record of the link, giving different lists: no one list.
+    if (link.listsDisagree) found.push({ side: "near", id: link.source, phy: link.lanes.sourcePhys[0], why: "the payload has more than one record of this link, and their lane lists differ" });
+    // The SAS address the list gives for an end, where that end's own is
+    // read, is that end's: a list naming another device is not this cable's.
+    for (const [side, id, address, phys] of [["near", link.source, link.listEnds[0], link.lanes.sourcePhys], ["far", link.target, link.listEnds[1], link.lanes.targetPhys]]) {
+      const own = sasAddressOf(model.sas.expanders.get(id)?.address || model.sas.controllers.get(id)?.sasAddress);
+      if (address && own && address !== own) found.push({ side, id, phy: phys[0] ?? link.lanes.sourcePhys[0], why: `the lane list gives another SAS address than ${nodeName(model, id)}'s for this end` });
+    }
+    // A Linux list is its parent port's, by every source that reads the port.
+    if (model.transport) {
+      const why = context.parentPortClash(model, link);
+      if (why) found.push({ side: "near", id: link.source, phy: link.lanes.sourcePhys[0], why });
+    }
     // Both ends must name each other on every lane before it is drawn or
     // judged: a retained list never stands in for its ends' own rows.
-    if (model.transport && link.parentPort) {
-      const ports = model.censusRows.filter((port) => port.id === `sas-port:${link.parentPort}`);
-      const listed = new Set(link.lanes.sourcePhys);
-      const same = (phys) => Array.isArray(phys) && phys.length === listed.size && new Set(phys).size === listed.size && phys.every((phy) => listed.has(phy));
-      // Older snapshots have no separate port census. The child's resolved
-      // sysfs ancestry carries the parent port and its measured members too.
-      const ancestry = same(link.parentMembers);
-      if ((!ports.length && !ancestry) || (Array.isArray(link.parentMembers) && !ancestry) || ports.some((port) => port.state !== "read" || port.owner_id !== link.source || port.remote_kind !== "expander" || port.remote_id !== link.target || !same(port.phys))) {
-        found.push({ side: "near", id: link.source, phy: link.lanes.sourcePhys[0], why: "the parent port does not confirm this endpoint and its whole PHY list" });
-      }
-    }
     if (!model.transport) {
       // The list must be the whole link, decided over both ends' tables.
       const whole = context.laneSetClash(model, link);
@@ -238,6 +245,36 @@ function memberConflicts(model, link) {
       }
     }
     return found;
+  }
+
+// Whether a Linux cable's list is its parent port's whole membership,
+// decided once over every source that reads the port: the list, what the
+// cable's child reports of the parent port it is on (its name, its
+// resolved parent, its PHYs and how many), and the port's one census
+// record (its two ends, its PHY numbers, and its PHY names, each one row of
+// the parent's table). A source that lacks an identifier or disagrees with
+// the others leaves which PHYs the cable uses not read. A payload that
+// reports no port census at all is judged on what the child reports.
+function parentPortClash(model, link) {
+    const near = nodeName(model, link.source);
+    const far = nodeName(model, link.target);
+    const listed = new Set(link.lanes.sourcePhys);
+    const whole = (phys) => Array.isArray(phys) && phys.length === listed.size && new Set(phys).size === listed.size && phys.every((phy) => listed.has(phy));
+    const child = link.ancestry;
+    if (child?.torn) return `the records of ${far} disagree about the parent port it is on`;
+    if (!child?.port) return `${far} does not name the parent port it is on, so no port's PHY list is shown to be this cable's`;
+    if (child.parent !== link.source) return `${far} does not report ${near} as its resolved parent`;
+    if (!whole(child.members) || child.count !== listed.size) return `the PHYs ${far} reports for parent port ${child.port} are not this cable's whole PHY list`;
+    if (!model.transport.reported) return "";
+    const id = `sas-port:${child.port}`;
+    const ports = model.censusRows.filter((port) => port.id === id || (port.owner_id === link.source && port.remote_id === link.target));
+    if (!ports.length) return `the port census has no record of parent port ${child.port}`;
+    if (ports.length > 1) return `more than one census record names parent port ${child.port} or its two ends`;
+    const [port] = ports;
+    if (port.id !== id || port.state !== "read" || port.owner_id !== link.source || port.remote_kind !== "expander" || port.remote_id !== link.target) return `the census has no read record of parent port ${child.port} from ${near} to ${far}`;
+    if (!whole(port.listed.numbers)) return `the PHY numbers of parent port ${child.port} are not this cable's whole PHY list`;
+    if (!whole(port.listed.names)) return `the PHY names of parent port ${child.port} do not name the same PHYs of ${near} as its PHY numbers`;
+    return "";
   }
 
 // Whether a CORE lane list is the whole link, decided once over both ends'
@@ -310,7 +347,7 @@ function reciprocalClash(model, link, lane) {
     // The far chip must report the near end as its parent.
     if (farChip.parent !== nearOwn) return `${nodeName(model, link.target)} reports parent ${farChip.parent || NOT_READ}, not ${nearName}'s own handle ${nearOwn}`;
     // And these rows must be the only rows of the unit that name these ends.
-    const unit = [...model.sas.expanders.values()].filter((record) => record.controllerId && record.controllerId === farChip.controllerId);
+    const unit = [...model.sas.expanders.values()].filter((record) => record.units.has(farChip.controllerId));
     const claims = (handle, phy) => unit.flatMap((record) => record.phys).filter((row) => row.handle === handle && row.remote === phy).length;
     if (claims(nearOwn, lane.source) !== 1) return `${claims(nearOwn, lane.source)} rows of the unit name PHY ${lane.source} of ${nearName}, so this is not shown to be the one link`;
     if (claims(farChip.handle, lane.target) !== (nearHba ? 0 : 1)) return `another row of the unit names PHY ${lane.target} of ${nodeName(model, link.target)}, so this is not shown to be the one link`;
@@ -637,6 +674,7 @@ function portPhyOwner(model, port) {
     handleTarget: { configurable: true, get: () => handleTarget },
     handleClash: { configurable: true, get: () => handleClash },
     memberConflicts: { configurable: true, get: () => memberConflicts },
+    parentPortClash: { configurable: true, get: () => parentPortClash },
     reciprocalClash: { configurable: true, get: () => reciprocalClash },
     laneSetClash: { configurable: true, get: () => laneSetClash },
     censusPlace: { configurable: true, get: () => censusPlace },

@@ -343,3 +343,304 @@ test("a lane whose HBA PHY number is on two rows has no maximum, whichever row c
   const built = model(item);
   assert.match(lanePin(built, linkOf(built, link.source, link.target), "0 ↔ 16")[2], /^12 Gb\/s \(both ends 12\)/);
 });
+
+// --- A Linux cable's PHY list is its parent port's, by every source that reads it ---
+
+// The first HBA cable of the fabric, with a measured fault on its last PHY.
+function parentPort() {
+  const item = fixture("wide-x4-sata");
+  const link = item.fabric.links.find((entry) => entry.kind === "controller-expander");
+  const census = item.fabric.raw.sas_transport_ports;
+  const port = census.find((entry) => entry.remote_id === link.target && entry.owner_id === link.source);
+  const rows = phyRows(item.fabric, link.source);
+  Object.assign(rows.find((row) => row.phy === 3), { counter_state: "measured", invalid_dword_count: 103 });
+  return { item, link, census, port, rows, child: node(item.fabric, link.target) };
+}
+
+// One source of the port's membership missing an identifier, or disagreeing
+// with the others, each time with every other source untouched.
+const PARENT_PORT_SOURCES = {
+  "the child names no parent port": ({ child }) => { delete child.raw.parent_port; },
+  "the child names no parent port, and the census port is shorter": ({ child, port }) => { delete child.raw.parent_port; port.phys.pop(); port.phy_names.pop(); },
+  "the port's PHY numbers are fewer than its PHY names": ({ port }) => { port.phys.pop(); },
+  "the port's PHY names are fewer than its PHY numbers": ({ port }) => { port.phy_names.pop(); },
+  "the port lists no PHY names": ({ port }) => { delete port.phy_names; },
+  "the port lists no PHY numbers": ({ port }) => { delete port.phys; },
+  "a PHY name of the port is on no row of the parent": ({ port }) => { port.phy_names[3] += "9"; },
+  "a listed PHY's row carries another name": ({ rows }) => { rows.find((row) => row.phy === 3).name += "9"; },
+  "a listed PHY's row carries no name": ({ rows }) => { delete rows.find((row) => row.phy === 3).name; },
+  "the child reports no PHYs for its parent port": ({ child }) => { delete child.raw.source_phys; },
+  "the child reports another PHY count for its parent port": ({ child }) => { child.raw.reported_num_phys -= 1; },
+  "the child reports another parent": ({ child }) => { child.raw.parent_id += "-other"; },
+  "the child's parent is not resolved": ({ child }) => { child.raw.parent_link_state = "unknown"; },
+  "the census names the port of these two ends otherwise": ({ port }) => { port.id += "9"; },
+  "a second census record names these two ends": ({ census, port }) => { census.push({ ...port, id: `${port.id}9`, phys: port.phys.slice(0, -1), phy_names: port.phy_names.slice(0, -1) }); },
+  "the census has no record of the port": ({ census, port }) => { census.splice(census.indexOf(port), 1); },
+  "the port census is reported with no records": ({ item }) => { item.fabric.raw.sas_transport_ports = []; },
+  "the port's census record was not read": ({ port }) => { port.state = "not_read"; },
+  "the port's census record names another owner": ({ port }) => { port.owner_id += "-other"; },
+  "no port census, and the child names no parent port": ({ item, child }) => { delete item.fabric.raw.sas_transport_ports; delete child.raw.parent_port; },
+};
+
+for (const [mode, change] of Object.entries(PARENT_PORT_SOURCES)) {
+  test(`Linux parent port: ${mode}`, () => {
+    const found = parentPort();
+    change(found);
+    const built = model(found.item);
+    const drawn = linkOf(built, found.link.source, found.link.target);
+    const card = lanesCard(built, drawn);
+    // No verified width, and no rate beside it.
+    assert.match(card, /^4 reported; which PHYs the cable uses is not read \(/, `${mode}: ${card}`);
+    assert.doesNotMatch(card, /Gb\/s/, `${mode}: ${card}`);
+    assert.match(textOf(drawn.labelLines), /membership not read/, mode);
+    assert.ok(!statuses(built, "lanes").includes("pass"), `${mode}: ${textOf(checksOf(built, "lanes"))}`);
+    // The measured fault is said once, and is not this cable's.
+    assert.doesNotMatch(said1(built, /103 invalid dword/), /→/, mode);
+  });
+}
+
+// The list's own SAS address for an end is one more identifier of the cable.
+for (const end of ["source_sas_address", "attached_sas_address"]) {
+  test(`a Linux lane list that gives another device's SAS address as its ${end} is no cable's membership`, () => {
+    const found = parentPort();
+    const other = found.census.find((entry) => entry.remote_kind === "expander" && entry.remote_id !== found.link.target).remote_sas_address;
+    found.link.reported_lanes[end] = other;
+    const built = model(found.item);
+    const drawn = linkOf(built, found.link.source, found.link.target);
+    assert.match(lanesCard(built, drawn), /^4 reported; which PHYs the cable uses is not read \(.*the lane list gives another SAS address than /);
+    assert.match(textOf(drawn.labelLines), /membership not read/);
+    assert.doesNotMatch(said1(built, /103 invalid dword/), /→/);
+  });
+}
+
+test("a CORE lane list that gives another expander's SAS address for its far end is no cable's membership", () => {
+  const data = core();
+  const [link, other] = data.fabric.links.filter((entry) => entry.kind === "expander-expander");
+  link.reported_lanes.attached_sas_address = other.reported_lanes.attached_sas_address;
+  const built = coreModel(data);
+  assert.match(lanesCard(built, linkOf(built, link.source, link.target)), /^4 reported; which PHYs the cable uses is not read \(.*the lane list gives another SAS address than /);
+  assert.equal(lanesCard(built, linkOf(built, other.source, other.target)), "4: 4 at 12 Gb/s");
+  assert.ok(!statuses(built, "lanes").includes("pass"), textOf(checksOf(built, "lanes")));
+});
+
+test("a Linux cable every source agrees on is read; with no port census it is judged on what its child reports", () => {
+  const found = parentPort();
+  const built = model(found.item);
+  assert.equal(lanesCard(built, linkOf(built, found.link.source, found.link.target)), "4 · 12 Gb/s");
+  assert.match(said1(built, /103 invalid dword/), /→/);
+  // An older payload carries no port census: the child's own report of its
+  // parent port is the read source, and the far end stays not read.
+  const older = parentPort();
+  delete older.item.fabric.raw.sas_transport_ports;
+  const plain = model(older.item);
+  const drawn = linkOf(plain, older.link.source, older.link.target);
+  assert.equal(lanesCard(plain, drawn), "4 · 12 Gb/s");
+  assert.match(textOf(drawn.labelLines), /far end not read/);
+  assert.doesNotMatch(textOf(drawn.labelLines), /membership not read/);
+});
+
+// --- More than one record of a Linux cable's child, or of a link -----------------
+
+// A second record of the same id, changed, before and after the first: the
+// two orders say the same, and neither resolves the cable.
+function bothOrders(build, pattern) {
+  const cards = [false, true].map((first) => {
+    const { built, link } = build(first);
+    const card = lanesCard(built, linkOf(built, link.source, link.target));
+    assert.match(card, pattern, `${first ? "first" : "last"}: ${card}`);
+    assert.doesNotMatch(card, /Gb\/s/, card);
+    assert.ok(!statuses(built, "lanes").includes("pass"), textOf(checksOf(built, "lanes")));
+    return card;
+  });
+  assert.equal(cards[0], cards[1]);
+}
+const beside = (records, record, twin, first) => records.splice(records.indexOf(record) + (first ? 0 : 1), 0, twin);
+
+for (const [what, change] of Object.entries({
+  "names no parent port": (twin) => { delete twin.raw.parent_port; },
+  "reports fewer PHYs for its parent port": (twin) => { twin.raw.source_phys.pop(); },
+  "reports another parent": (twin) => { twin.raw.parent_id += "-other"; },
+})) {
+  test(`two records of a Linux cable's child, one of which ${what}, leave its PHYs not read in either order`, () => {
+    bothOrders((first) => {
+      const found = parentPort();
+      const twin = structuredClone(found.child);
+      change(twin);
+      beside(found.item.fabric.nodes, found.child, twin, first);
+      const built = model(found.item);
+      assert.doesNotMatch(said1(built, /103 invalid dword/), /→/);
+      return { built, link: found.link };
+    }, /^4 reported; which PHYs the cable uses is not read \(.*the records of .* disagree about the parent port it is on/);
+  });
+}
+
+test("two records of a link whose lane lists differ leave its PHYs not read in either order", () => {
+  // Linux: one record lists one PHY fewer.
+  bothOrders((first) => {
+    const found = parentPort();
+    const twin = structuredClone(found.link);
+    twin.reported_lanes.source_phys.pop();
+    twin.reported_lanes.lane_count -= 1;
+    beside(found.item.fabric.links, found.link, twin, first);
+    const built = model(found.item);
+    assert.doesNotMatch(said1(built, /103 invalid dword/), /→/);
+    return { built, link: found.link };
+  }, /^\d reported; which PHYs the cable uses is not read \(.*more than one record of this link, and their lane lists differ/);
+  // CORE: one record lists one pair fewer.
+  bothOrders((first) => {
+    const data = core();
+    const [link] = data.fabric.links;
+    const twin = structuredClone(link);
+    for (const key of ["lanes", "source_phys", "target_phys"]) twin.reported_lanes[key].pop();
+    twin.reported_lanes.lane_count -= 1;
+    beside(data.fabric.links, link, twin, first);
+    return { built: coreModel(data), link };
+  }, /^\d reported; which PHYs the cable uses is not read \(.*more than one record of this link, and their lane lists differ/);
+});
+
+test("a second record of a Linux cable's child, or of a link, that differs in nothing changes nothing", () => {
+  const single = parentPort();
+  const expected = model(single.item);
+  for (const pick of ["child", "link"]) for (const first of [false, true]) {
+    const found = parentPort();
+    beside(pick === "child" ? found.item.fabric.nodes : found.item.fabric.links, found[pick], structuredClone(found[pick]), first);
+    const built = model(found.item);
+    assert.equal(lanesCard(built, linkOf(built, found.link.source, found.link.target)), "4 · 12 Gb/s", `${pick} ${first}`);
+    assert.equal(said1(built, /103 invalid dword/), said1(expected, /103 invalid dword/));
+  }
+});
+
+// --- Records of one endpoint are joined toward not read, in either order -------
+
+// The CORE cascade with a second record of one endpoint, changed, before
+// or after the first.
+function twinned(first, list, pick, change) {
+  const data = core();
+  const twin = structuredClone(pick(data));
+  change(twin, data);
+  data.fabric[list][first ? "unshift" : "push"](twin);
+  return data;
+}
+const hbaCable = (data, built) => linkOf(built, data.fabric.links[0].source, data.fabric.links[0].target);
+const names = (value) => /^to |^cable to |attached directly|outside this view/.test(value);
+
+for (const first of [false, true]) {
+  const order = first ? "first" : "last";
+  // What the builder found a handle names, kept beside one record only: a
+  // marker (the first four) survives, and a kind the other record does not
+  // give is a disagreement.
+  for (const state of ["ambiguous", "mismatch", "not_read", "unlisted_expander", "end_device"]) {
+    test(`duplicate HBA records: the one that says ${state} of a handle ${order}`, () => {
+      const data = twinned(first, "controllers", controllerOf, (twin) => { twin.device_handle_states = { ...twin.device_handle_states, 0: state }; });
+      const built = coreModel(data);
+      const value = pin(built, MPR0, 0);
+      assert.match(value, /not read/, value);
+      assert.ok(!names(value), value);
+      assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+      assert.ok(!statuses(built, "lanes").includes("pass"), textOf(checksOf(built, "lanes")));
+    });
+  }
+  test(`duplicate expander records: one gives a second expander the far end's handle, ${order}`, () => {
+    const far = (data) => data.fabric.expanders.find((entry) => entry.id === data.fabric.links[0].target);
+    const child = (data) => data.fabric.expanders.find((entry) => entry.controller_id === MPR0 && entry.id !== data.fabric.links[0].target);
+    const data = twinned(first, "expanders", child, (twin, whole) => { twin.dev_handle = far(whole).dev_handle; });
+    const built = coreModel(data);
+    const value = pin(built, MPR0, 0);
+    assert.match(value, /not read/, value);
+    assert.ok(!names(value), value);
+    assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+  });
+  test(`duplicate expander records: a row only one of them reads names the HBA, ${order}`, () => {
+    const far = (data) => data.fabric.expanders.find((entry) => entry.id === data.fabric.links[0].target);
+    const data = twinned(first, "expanders", far, (twin) => {
+      const lane = twin.phys.find((row) => Number(row.phy) === 32);
+      Object.assign(twin.phys.find((row) => Number(row.phy) === 4), { dev_handle: lane.dev_handle, device: lane.device, speed: lane.speed, remote_phy: "4" });
+    });
+    const built = coreModel(data);
+    assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+    assert.ok(!statuses(built, "lanes").includes("pass"), textOf(checksOf(built, "lanes")));
+  });
+  test(`duplicate expander records: one places another unit's expander in this unit, ${order}`, () => {
+    // The other unit's first expander is given a handle this unit does not
+    // use, so no handle collides; its rows still name an HBA handle and PHYs
+    // as this unit's far end does (those repeat across units).
+    const rehandled = () => {
+      const data = core();
+      const other = data.fabric.expanders.find((entry) => entry.controller_id !== MPR0 && entry.parent === data.fabric.expanders[0].parent);
+      const [from, to] = [other.dev_handle, `${other.dev_handle.slice(0, -2)}f${other.dev_handle.slice(-1)}`];
+      for (const record of [...data.fabric.expanders, ...data.fabric.controllers].filter((entry) => (entry.controller_id || entry.id) === other.controller_id)) {
+        for (const key of ["dev_handle", "parent"]) if (record[key] === from) record[key] = to;
+        for (const row of record.phys || record.phy_rows) for (const key of ["dev_handle", "device_handle"]) if (row[key] === from) row[key] = to;
+      }
+      return { data, other };
+    };
+    const control = rehandled();
+    assert.equal(lanesCard(coreModel(control.data), hbaCable(control.data, coreModel(control.data))), "4: 4 at 12 Gb/s");
+    const { data, other } = rehandled();
+    const twin = { ...structuredClone(other), controller_id: MPR0 };
+    data.fabric.expanders[first ? "unshift" : "push"](twin);
+    const built = coreModel(data);
+    const card = lanesCard(built, hbaCable(data, built));
+    assert.match(card, /^4 reported; which PHYs the cable uses is not read .*rows of the unit name PHY \d+ of mpr0/, card);
+  });
+  // Already held before records were joined row by row; kept beside the
+  // cases above so each part of the join is held by an assertion.
+  test(`duplicate expander records: one gives the far end another handle, ${order}`, () => {
+    const data = twinned(first, "expanders", (whole) => whole.fabric.expanders.find((entry) => entry.id === whole.fabric.links[0].target), (twin) => { twin.dev_handle = `${twin.dev_handle.slice(0, -1)}f`; });
+    const built = coreModel(data);
+    assert.ok(!names(pin(built, MPR0, 0)), pin(built, MPR0, 0));
+    assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+  });
+  test(`duplicate expander records: one has no row for a lane's PHY, ${order}`, () => {
+    const data = twinned(first, "expanders", (whole) => whole.fabric.expanders.find((entry) => entry.id === whole.fabric.links[0].target), (twin) => { twin.phys = twin.phys.filter((row) => Number(row.phy) !== 32); });
+    const built = coreModel(data);
+    assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+  });
+  test(`duplicate HBA records: one lists a handle among the unit's ambiguous handles, ${order}`, () => {
+    const data = twinned(first, "controllers", controllerOf, (twin) => { twin.ambiguous_device_handles = [twin.phy_rows[0].device_handle]; });
+    const built = coreModel(data);
+    assert.ok(!names(pin(built, MPR0, 0)), pin(built, MPR0, 0));
+    assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+  });
+  test(`duplicate expander records that differ in nothing keep a counter one row reads, ${order}`, () => {
+    // A row that names the counters it did not read has the rest.
+    const far = (data) => data.fabric.expanders.find((entry) => entry.id === data.fabric.links[0].target);
+    const partial = (record) => Object.assign(record.phys.find((row) => Number(row.phy) === 32), { counter_state: "partial", not_read: ["phy_reset_problem_count"], invalid_dword_count: 104, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: null });
+    const single = core();
+    partial(far(single));
+    const data = core();
+    partial(far(data));
+    data.fabric.expanders[first ? "unshift" : "push"](structuredClone(far(data)));
+    assert.match(said1(coreModel(single), /104 invalid dword/), /→/);
+    assert.equal(said1(coreModel(data), /104 invalid dword/), said1(coreModel(single), /104 invalid dword/));
+  });
+}
+
+test("duplicate HBA records keep a handle marker both carry, however the PHY number is written", () => {
+  const padded = () => {
+    const data = core();
+    const hba = controllerOf(data);
+    for (const row of hba.phy_rows) row.phy = row.phy.padStart(2, "0");
+    hba.device_handle_states = { ...hba.device_handle_states, "00": "ambiguous" };
+    return data;
+  };
+  const single = coreModel(padded());
+  assert.match(pin(single, MPR0, 0), /not read/);
+  const data = padded();
+  data.fabric.controllers.push(structuredClone(controllerOf(data)));
+  const built = coreModel(data);
+  assert.equal(pin(built, MPR0, 0), pin(single, MPR0, 0));
+  assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
+});
+
+test("duplicate records that differ in nothing say what one record says", () => {
+  const single = coreModel(core());
+  for (const [list, pick] of [["controllers", controllerOf], ["expanders", (data) => data.fabric.expanders[0]]]) for (const first of [false, true]) {
+    const data = twinned(first, list, pick, () => {});
+    const built = coreModel(data);
+    assert.equal(pin(built, MPR0, 0), pin(single, MPR0, 0));
+    assert.match(pin(built, MPR0, 0), /^to /);
+    assert.equal(lanesCard(built, hbaCable(data, built)), "4: 4 at 12 Gb/s");
+    assert.equal(textOf(built.checks), textOf(single.checks));
+  }
+});

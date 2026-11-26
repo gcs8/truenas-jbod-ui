@@ -1030,8 +1030,8 @@
   "to": ") ? port.handle : \"\";"
  },
  "LS1": {
-  "from": "const sources = [item.mpr_lists, listed[text(item.name)]].filter(isRecord);",
-  "to": "const sources = [item.mpr_lists || listed[text(item.name)]].filter(isRecord);"
+  "from": "const sources = group.map((item) => [item.mpr_lists, listed[text(item.name)]].filter(isRecord));",
+  "to": "const sources = group.map((item) => [item.mpr_lists || listed[text(item.name)]].filter(isRecord));"
  },
  "HV2": {
   "from": "\"critical\" : port.phy && port.expanderId && !context.portPhyOwner(model, port).ok ? \"\" : context.phyTier(port.phy),",
@@ -1124,5 +1124,125 @@
  "RATE8": {
   "from": "          const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];",
   "to": "          const read = [rowRate(ends[1], lane.target)];"
+ },
+ "PPORT1": {
+  "from": "    if (!child?.port) return `",
+  "to": "    if (false) return `"
+ },
+ "PPORT2": {
+  "from": "    if (child.parent !== link.source) return `",
+  "to": "    if (false) return `"
+ },
+ "PPORT3": {
+  "from": "    if (!whole(child.members) || child.count !== listed.size) return `",
+  "to": "    if (!whole(child.members)) return `"
+ },
+ "PPORT4": {
+  "from": "    if (!whole(child.members) || child.count !== listed.size) return `",
+  "to": "    if (child.count !== listed.size) return `"
+ },
+ "PPORT5": {
+  "from": "    if (!model.transport.reported) return \"\";",
+  "to": "    if (true) return \"\";"
+ },
+ "PPORT6": {
+  "from": "const ports = model.censusRows.filter((port) => port.id === id || (port.owner_id === link.source && port.remote_id === link.target));",
+  "to": "const ports = model.censusRows.filter((port) => port.id === id);"
+ },
+ "PPORT7": {
+  "from": "    if (ports.length > 1) return `more than one census record",
+  "to": "    if (false) return `more than one census record"
+ },
+ "PPORT8": {
+  "from": "    if (port.id !== id || port.state !== \"read\" || port.owner_id !== link.source || port.remote_kind !== \"expander\" || port.remote_id !== link.target) return `",
+  "to": "    if (false) return `"
+ },
+ "PPORT9": {
+  "from": "    if (!whole(port.listed.numbers)) return `",
+  "to": "    if (false) return `"
+ },
+ "PPORT10": {
+  "from": "    if (!whole(port.listed.names)) return `",
+  "to": "    if (false) return `"
+ },
+ "PPORT11": {
+  "from": "      if (why) found.push({ side: \"near\", id: link.source, phy: link.lanes.sourcePhys[0], why });",
+  "to": ""
+ },
+ "PPORT12": {
+  "from": "        numbers: Array.isArray(port.phys) ? port.phys : null,",
+  "to": "        numbers: phys,"
+ },
+ "PPORT13": {
+  "from": "return found?.length === 1 && Number.isInteger(found[0]) ? found[0] : null; }) : null,",
+  "to": "return found?.length === 1 && Number.isInteger(found[0]) ? found[0] : null; }) : phys,"
+ },
+ "JOIN1": {
+  "from": "      return HANDLE_MARKERS.find((marker) => states.includes(marker)) || (states.length > 1 ? \"conflict\" : states[0]);",
+  "to": "      return states[0];"
+ },
+ "JOIN2": {
+  "from": "      return HANDLE_MARKERS.find((marker) => states.includes(marker)) || (states.length > 1 ? \"conflict\" : states[0]);",
+  "to": "      return HANDLE_MARKERS.find((marker) => states.includes(marker)) || states[0];"
+ },
+ "JOIN3": {
+  "from": "    if (row.handleState === \"conflict\") return",
+  "to": "    if (false) return"
+ },
+ "JOIN4": {
+  "from": "      if (readings.every((group) => group.length === 1) && new Set(rows.map(identity)).size === 1) return { ...agreedFields(rows), phy };",
+  "to": "      if (readings.every((group) => group.length === 1)) return { ...agreedFields(rows), phy };"
+ },
+ "JOIN5": {
+  "from": "values.every((value) => value === values[0] || (Array.isArray(value) && stable(value) === stable(values[0])))",
+  "to": "values.every((value) => value === values[0])"
+ },
+ "JOIN6": {
+  "from": "filter((record) => record.units.has(id) && record.handles.has(handle))",
+  "to": "filter((record) => record.controllerId === id && record.handle === handle)"
+ },
+ "JOIN7": {
+  "from": "filter((record) => record.units.has(farChip.controllerId));",
+  "to": "filter((record) => record.controllerId && record.controllerId === farChip.controllerId);"
+ },
+ "JOIN8": {
+  "from": "    if (torn) return { state: \"mismatch\", row,",
+  "to": "    if (false) return { state: \"mismatch\", row,"
+ },
+ "JOIN9": {
+  "from": "      byId.get(item.id).push(item);\n    }\n    return byId.values();",
+  "to": "      if (!byId.get(item.id).length) byId.get(item.id).push(item);\n    }\n    return byId.values();"
+ },
+ "JOIN10": {
+  "from": "sources.every((pair) => pair.some((source) => key in source) && pair.every(",
+  "to": "sources.some((pair) => pair.some((source) => key in source) && pair.every("
+ },
+ "JOIN11": {
+  "from": "record.ambiguousHandles = new Set(group.flatMap((item) => list(item.ambiguous_device_handles)).map(text).filter(Boolean));",
+  "to": "record.ambiguousHandles = new Set(list(group[0].ambiguous_device_handles).map(text).filter(Boolean));"
+ },
+ "JOIN12": {
+  "from": "      return [...rows, ...(readings.some((group) => !group.length) ? [{ phy }] : [])].sort(",
+  "to": "      return [...rows].sort("
+ },
+ "JOIN13": {
+  "from": "      if (readings.every((group) => group.length === 1) && new Set(rows.map(identity)).size === 1) return { ...agreedFields(rows), phy };",
+  "to": "      if (readings.every((group) => group.length === 1) && new Set(rows.map(identity)).size === 1) return { ...rows[0], phy };"
+ },
+ "PPORT14": {
+  "from": "      if (address && own && address !== own) found.push(",
+  "to": "      if (false) found.push("
+ },
+ "PPORT15": {
+  "from": "    return said.length && said.every((item) => stable(item) === stable(said[0])) ? said[0] : { port: \"\", torn: said.length > 1 };",
+  "to": "    return said.length ? said[0] : { port: \"\", torn: said.length > 1 };"
+ },
+ "PPORT16": {
+  "from": "    if (link.listsDisagree) found.push(",
+  "to": "    if (false) found.push("
+ },
+ "PPORT17": {
+  "from": "    if (child?.torn) return `",
+  "to": "    if (false) return `"
  }
 }
