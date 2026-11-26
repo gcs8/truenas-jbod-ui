@@ -628,13 +628,37 @@ function subjectDeletions(fabric, built) {
     if (port.remote_kind !== "end_device" || !port.has_block) return;
     for (const field of ["bay_identifier", "enclosure_identifier", "remote_sas_address"]) {
       if (port[field] === null || port[field] === undefined) continue;
-      if (field === "remote_sas_address" && (port.bay_identifier === null || port.bay_identifier === undefined)) continue;
+      // Without its address a record is the same disk only at a census slot
+      // read whole: its bay number and its enclosure.
+      if (field === "remote_sas_address" && (port.bay_identifier === null || port.bay_identifier === undefined || !port.enclosure_identifier)) continue;
       out.push({ name: `census ${index} second record without its ${field}`, same: true, checks: [], tokens: [], change: (copy) => {
         copy.fabric.raw.sas_transport_ports.push({ ...copy.fabric.raw.sas_transport_ports[index], id: `${port.id}-copy`, [field]: null });
         return true;
       } });
     }
   });
+  // A second record of a claimed disk PHY that reads neither address nor
+  // enclosure identifies no disk: the PHY's owner is not read, never the
+  // record's bay number.
+  census.forEach((port, index) => {
+    if (port.remote_kind !== "end_device" || !port.has_block || port.bay_identifier === null || port.bay_identifier === undefined) return;
+    if (!(port.phys || []).some((phy) => built.bays.some((bay) => bay.ports.some((item) => item.expanderId === port.owner_id && item.phy?.phy === phy)))) return;
+    out.push({ name: `census ${index} unlocated second record`, checks: ["port-errors"], tokens: [port.owner_id, ...(port.phys || []).map((phy) => `PHY ${phy}`)], change: (copy) => {
+      copy.fabric.raw.sas_transport_ports.push({ ...copy.fabric.raw.sas_transport_ports[index], id: `${port.id}-unlocated`, remote_sas_address: null, enclosure_identifier: null });
+      return true;
+    } });
+  });
+  // A bay whose own trace places it in another enclosure than its node:
+  // the bay is placed in neither, and its disk port is not judged.
+  for (const bay of fabric.nodes.filter((entry) => entry.kind === "bay" && /^[0-9a-f]{16}$/i.test(String(entry.metrics?.enclosure_id || "")))) {
+    if (!built.bayById.get(bay.id)?.ports.some((port) => port.phy)) continue;
+    out.push({ name: `${bay.id} trace in another enclosure`, checks: ["port-errors"], tokens: [bay.id], change: (copy) => {
+      const trace = copy.fabric.traces.find((entry) => entry.id === bay.id);
+      if (!trace) return false;
+      trace.metrics.enclosure_id = `${bay.metrics.enclosure_id.slice(0, -2)}${bay.metrics.enclosure_id.endsWith("aa") ? "bb" : "aa"}`;
+      return true;
+    } });
+  }
   for (const bay of fabric.nodes.filter((entry) => entry.kind === "bay" && entry.metrics?.sas_address)) {
     const trace = fabric.traces.find((entry) => entry.id === bay.id);
     if (!(trace?.metrics?.path_states || []).some((row) => row?.sas_address === bay.metrics.sas_address)) continue;
@@ -660,10 +684,34 @@ function subjectDeletions(fabric, built) {
         return true;
       } });
     }
+    // Evidence not read at one end never lets a retained list pass: the far
+    // row's rate or the near row's rate unread, the near table or the far
+    // row not read, the pairs not reported; nor do ends that name each other
+    // but not as the far chip's parent, or rows another expander of the unit
+    // shares.
+    const farRows = (copy) => copy.fabric.expanders.find((entry) => entry.id === link.target).phys;
+    const unread = [
+      ["far rate not read", (copy) => { const row = rowOf(copy, link.target, lane.target_phy); if (!row?.speed) return false; row.speed = null; return true; }],
+      ["near rate not read", (copy) => { const row = rowOf(copy, link.source, lane.source_phy); if (!row?.speed) return false; row.speed = null; return true; }],
+      ["far row not read", (copy) => { const rows = farRows(copy); const at = rows.findIndex((entry) => Number(entry.phy) === lane.target_phy); if (at < 0) return false; rows.splice(at, 1); return true; }],
+      ["pairs not reported", (copy) => { copy.fabric.links.find((entry) => entry.id === link.id).reported_lanes.lanes = []; return true; }],
+      ["far parent not the near end", (copy) => { const far = copy.fabric.expanders.find((entry) => entry.id === link.target); far.parent = "0ffe"; return true; }],
+      ["far row shared with another expander", (copy) => {
+        const far = copy.fabric.expanders.find((entry) => entry.id === link.target);
+        const other = copy.fabric.expanders.find((entry) => entry.id !== far.id && entry.controller_id === far.controller_id);
+        const row = rowOf(copy, link.target, lane.target_phy);
+        if (!other || !row) return false;
+        other.phys.push({ ...row, phy: "90", invalid_dword_count: 0, counter_state: "measured", not_read: [] });
+        return true;
+      }],
+    ];
+    if (hba) unread.push(["near table not read", (copy) => { copy.fabric.controllers.find((entry) => entry.id === link.source).phy_rows = []; return true; }]);
+    for (const [label, change] of unread) out.push({ name: `${link.id} ${label}`, checks: ["lanes"], tokens: [link.source, link.target], change });
     // The near HBA row's handle found to name the enclosure processor, a
-    // disk, or more than one device of the unit.
+    // disk, more than one device of the unit, or not read because a reply
+    // was not.
     if (hba) {
-      for (const state of ["sep", "end_device", "ambiguous", "mismatch"]) {
+      for (const state of ["sep", "end_device", "ambiguous", "mismatch", "not_read", "unlisted_expander"]) {
         out.push({ name: `${link.id} near handle found ${state}`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
           const controller = copy.fabric.controllers.find((entry) => entry.id === link.source);
           controller.device_handle_states = { ...controller.device_handle_states, [String(lane.source_phy)]: state };
@@ -681,6 +729,11 @@ function subjectDeletions(fabric, built) {
       const enclosure = fabric.nodes.find((entry) => entry.kind === "mpr-enclosure" && entry.controller_id === controller.id);
       if (enclosure) out.push({ name: `${trace.id} port ${index} handle also the enclosure processor's`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
         copy.fabric.nodes.find((entry) => entry.id === enclosure.id).raw.sep_handle = device.handle;
+        return true;
+      } });
+      out.push({ name: `${trace.id} port ${index} handle on two devices of the unit`, checks: ["port-errors"], tokens: [trace.id], change: (copy) => {
+        const entry = copy.fabric.controllers.find((item) => item.id === controller.id);
+        entry.ambiguous_device_handles = [...(entry.ambiguous_device_handles || []), device.handle];
         return true;
       } });
       const expander = (fabric.expanders || []).find((entry) => !(device.expander_ids || []).includes(entry.id) && entry.id.startsWith(`expander:${controller.id}:`));
@@ -778,6 +831,9 @@ function surfacesAgree(built, line, why) {
     assert.ok(allowed, `${why}: the pinned ${link.bus ? "bus" : "cable"} ${title} shows the fault the check says is ${disputed ? "owned by no one read" : "another's"}: ${line} | ${shown}`);
   }
   for (const bay of built.bays) {
+    // The bay's hover is a surface too: each path row is one observation.
+    const hover = (T.cardFor(built, { kind: "bay", id: bay.bayId })?.rows || []).filter((row) => row.warn === "critical" && /10 loss of dword sync/.test(row.value));
+    assert.ok(hover.length <= 1 && (!hover.length || (!disputed && line.startsWith(bay.label))), `${why}: the hover of ${bay.label} shows ${hover.length} paths with a fault the check gives ${disputed ? "no one" : "another"}: ${line} | ${JSON.stringify(hover)}`);
     const shown = warnRows(built, { kind: "bay", id: bay.bayId });
     if (!shown.length) continue;
     assert.ok(!disputed && line.startsWith(bay.label), `${why}: the pinned ${bay.label} shows a fault the check does not give it: ${line} | ${shown}`);
@@ -893,10 +949,25 @@ const covers = (ref, phy) => ref.split(", ").some((part) => {
   const [low, high = low] = part.split("–").map(Number);
   return phy >= low && phy <= high;
 });
-function measuredCounts(fabric, key) {
-  const rows = [...fabric.nodes.flatMap((entry) => [entry.raw?.phys, entry.raw?.phy_rows]), ...(fabric.expanders || []).map((entry) => entry.phys), ...(fabric.controllers || []).map((entry) => entry.phy_rows)]
-    .filter(Array.isArray).flat();
-  return new Set(rows.map((row) => row?.[key]).filter((value) => Number.isSafeInteger(value)));
+// The counts each chip measured, by PHY: every observation of the chip, by
+// the same key the names use. A range is bound to the chip and PHYs it is
+// said of, never to a count some other PHY read.
+function measuredCounts(built, fabric, key) {
+  const counts = new Map();
+  const add = (id, rows) => {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!Number.isSafeInteger(row?.[key])) continue;
+      const at = `${chipKey(built, fabric, id)}|${Number(row.phy)}`;
+      counts.set(at, new Set([...(counts.get(at) || []), row[key]]));
+    }
+  };
+  for (const entry of fabric.nodes) add(entry.id, entry.raw?.phys || entry.raw?.phy_rows);
+  for (const entry of fabric.expanders || []) add(entry.id, entry.phys);
+  for (const entry of fabric.controllers || []) add(entry.id, entry.phy_rows);
+  return (chip, ref) => new Set(ref.split(", ").flatMap((part) => {
+    const [low, high = low] = part.split("–").map(Number);
+    return [...counts].filter(([at]) => at.startsWith(`${chip}|`) && Number(at.split("|").pop()) >= low && Number(at.split("|").pop()) <= high).flatMap(([, values]) => [...values]);
+  }));
 }
 function injectedChip(before, base, owner) {
   return chipKey(before, base.fabric, owner);
@@ -917,7 +988,7 @@ function assertLocal(before, after, base, copy, deletion, why) {
   assert.deepEqual(after.rates, before.rates, `${why}: a counter change moved a displayed rate`);
   const phy = deletion.faulty.phy;
   const chip = injectedChip(before.built, base, deletion.faulty.owner);
-  const measured = measuredCounts(copy.fabric, "loss_of_dword_synchronization_count");
+  const measured = measuredCounts(after.built, copy.fabric, "loss_of_dword_synchronization_count");
   const bag = (list) => list.reduce((map, token) => map.set(token, (map.get(token) || 0) + 1), new Map());
   for (const key of new Set([...Object.keys(before.counters), ...Object.keys(after.counters)])) {
     const was = bag(before.counters[key] || []);
@@ -926,7 +997,8 @@ function assertLocal(before, after, base, copy, deletion, why) {
       if (count <= (was.get(pair) || 0)) continue;
       const [ref, owner, token] = pair.split("::");
       const range = /^(\d+)–(\d+) loss of dword sync$/.exec(token);
-      const value = token === "10 loss of dword sync" || (range && measured.has(Number(range[1])) && measured.has(Number(range[2])) && Number(range[1]) <= 10 && Number(range[2]) >= 10);
+      const read = range ? measured(owner || chip, ref) : new Set();
+      const value = token === "10 loss of dword sync" || (range && read.has(Number(range[1])) && read.has(Number(range[2])) && Number(range[1]) <= 10 && Number(range[2]) >= 10);
       const whose = owner ? owner === chip : !key.startsWith("check:") && surfaceOfChip(after.built, copy.fabric, key, chip);
       assert.ok(ref && covers(ref, phy) && value && whose, `${why}: ${key} gained ${token} said of ${ref ? `PHY ${ref}` : "no PHY"}${owner ? ` of ${owner}` : ""}, not ${chip}'s`);
     }

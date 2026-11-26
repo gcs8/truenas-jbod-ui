@@ -739,7 +739,7 @@ class CoreFabricDirectPathTests(unittest.IsolatedAsyncioTestCase):
         observed = sorted(row["metrics"]["device_count"] for row in board.raw["observations"])
         self.assertEqual(observed, [1, 2])
         self.assertIsNone(board.metrics["device_count"])
-        self.assertIn("device_count", board.metrics["not_read"])
+        self.assertIn("device_count", board.metrics.get("not_read", []))
         # Control: agreeing observations keep the value and are not listed.
         system, snapshot, outputs = await self.fixture()
         board = next(node for node in self.build(system, snapshot, outputs).nodes if node.kind == "enclosure")

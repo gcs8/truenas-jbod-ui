@@ -356,7 +356,7 @@
   "to": "if (false) return { label: \"PHY errors\", value:"
  },
  "O4": {
-  "from": "const seen = phy && owner && !owner.known ?",
+  "from": "const seen = phy && own && !own.ok ?",
   "to": "const seen = false ?"
  },
  "P1": {
@@ -792,8 +792,8 @@
   "to": "if (false) return `destination"
  },
  "HS1": {
-  "from": "if (row.handleState === \"ambiguous\" || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return",
-  "to": "if (kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return"
+  "from": "if (row.handleState === \"ambiguous\" || hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1",
+  "to": "if (hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1"
  },
  "HS2": {
   "from": "bays: [...new Set(model.bays.filter((bay) => bay.ports.some((port) => port.controllerId === id && port.handle === handle)))],",
@@ -828,7 +828,7 @@
   "to": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : \"\")"
  },
  "DK2": {
-  "from": "\n        || (place.bay !== null && place.bay !== undefined && group.places.some((other) => other.bay === place.bay && (!other.enclosure || !place.enclosure || other.enclosure === place.enclosure)))",
+  "from": "\n        || (place.bay !== null && place.bay !== undefined && place.enclosure && group.places.some((other) => other.bay === place.bay && other.enclosure === place.enclosure))",
   "to": ""
  },
  "TG1": {
@@ -998,15 +998,87 @@
   "to": "\"two\""
  },
  "HBH1": {
-  "from": "const handle = found && found.expanders.length + found.bays.length + found.seps.length > 1 ? port.handle : \"\";",
-  "to": "const handle = \"\";"
+  "from": "found && (found.expanders.length + found.bays.length + found.seps.length > 1 || ",
+  "to": "found && (false || "
  },
  "LIST1": {
   "from": "    if (unread.length) return { state: \"mismatch\", row, why:",
   "to": "    if (false) return { state: \"mismatch\", row, why:"
  },
  "GRP2": {
-  "from": "group.located = group.places.some((place) => place.bay !== null && place.bay !== undefined);",
-  "to": "group.located = bays.length > 0;"
+  "from": "group.slots = group.places.filter((place) => place.bay !== null && place.bay !== undefined);",
+  "to": "group.slots = group.places.filter((place) => (place.bay !== null && place.bay !== undefined) || place.bayLabel).map((place) => ({ ...place, bay: place.bay ?? place.bayLabel }));"
+ },
+ "LOC7": {
+  "from": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {",
+  "to": "const check = (id, title, flags, unread, pass, notes = [], cover = null, options = {}) => {\n if (id === \"lanes\" && [...model.sas.expanders.values()].some((e) => e.address === \"5bbb0000000a00ff\" && e.phys.some((r) => r.phy === 32 && r.counters?.loss_of_dword_synchronization_count === 10))) notes.push(\"5bbb0000000a00ff PHY 32: 0–10 loss of dword sync\");"
+ },
+ "NR1": {
+  "from": "    if (row.handleState === \"not_read\") return { state: \"mismatch\"",
+  "to": "    if (false) return { state: \"mismatch\""
+ },
+ "UE1": {
+  "from": "    if (row.handleState === \"unlisted_expander\") return { state: \"mismatch\"",
+  "to": "    if (false) return { state: \"mismatch\""
+ },
+ "AH1": {
+  "from": "if (row.handleState === \"ambiguous\" || hba?.ambiguousHandles?.has(row.handle) ||",
+  "to": "if (row.handleState === \"ambiguous\" ||"
+ },
+ "AH2": {
+  "from": " || model.sas.controllers.get(port.controllerId)?.ambiguousHandles?.has(port.handle)) ? port.handle : \"\";",
+  "to": ") ? port.handle : \"\";"
+ },
+ "LS1": {
+  "from": "const sources = [item.mpr_lists, listed[text(item.name)]].filter(isRecord);",
+  "to": "const sources = [item.mpr_lists || listed[text(item.name)]].filter(isRecord);"
+ },
+ "HV2": {
+  "from": "\"critical\" : port.phy && port.expanderId && !context.portPhyOwner(model, port).ok ? \"\" : context.phyTier(port.phy),",
+  "to": "\"critical\" : context.phyTier(port.phy),"
+ },
+ "PATH1": {
+  "from": "${port.expanderId && !context.portPhyOwner(model, port).ok ? ` (not read as this path's: ${context.portPhyOwner(model, port).why})` : \"\"}",
+  "to": ""
+ },
+ "SLOT1": {
+  "from": "|| (place.bay !== null && place.bay !== undefined && place.enclosure && group.places.some((other) => other.bay === place.bay && other.enclosure === place.enclosure))",
+  "to": "|| (place.bay !== null && place.bay !== undefined && group.places.some((other) => other.bay === place.bay && (!other.enclosure || !place.enclosure || other.enclosure === place.enclosure)))"
+ },
+ "APART1": {
+  "from": "const apart = (one, two) => one.slots.some((left) => two.slots.some((right) => left.bay !== right.bay || (left.enclosure && right.enclosure && left.enclosure !== right.enclosure)));",
+  "to": "const apart = (one, two) => one.slots.length > 0 && two.slots.length > 0;"
+ },
+ "TORN1": {
+  "from": "if (bays.length > 1 || elsewhere || torn ||",
+  "to": "if (bays.length > 1 || elsewhere ||"
+ },
+ "REC4": {
+  "from": "    if (!near) return `PHY ${lane.source} of ${nearName} has no one row read",
+  "to": "    if (!near) return \"\"; if (false) return `PHY ${lane.source} of ${nearName} has no one row read"
+ },
+ "REC5": {
+  "from": "if (!link.lanes.rows.length && link.lanes.count && (",
+  "to": "if (false && ("
+ },
+ "REC6": {
+  "from": "    if (farChip.parent !== nearOwn) return",
+  "to": "    if (false) return"
+ },
+ "REC7": {
+  "from": "    if (claims(nearOwn, lane.source) !== 1) return",
+  "to": "    if (false) return"
+ },
+ "REC8": {
+  "from": "    if (!nearChip && !farChip) return \"\";",
+  "to": "    if (!nearChip || !farChip) return \"\";"
+ },
+ "RATE2": {
+  "from": "lane.rate !== null && laneCap(model, link, lane) !== null && laneRated(model, link, lane)).length;",
+  "to": "lane.rate !== null && laneCap(model, link, lane) !== null).length;"
+ },
+ "RATE3": {
+  "from": "lane.cap !== null && laneRated(model, link, lane) && lane.rate < lane.cap);",
+  "to": "lane.cap !== null && lane.rate < lane.cap);"
  }
 }

@@ -519,6 +519,8 @@ function sasIndex(fabric) {
         address: text(item.sas_address),
         handle: text(item.dev_handle),
         controllerId: text(item.controller_id),
+        // The handle of the device this expander reports as its parent.
+        parent: text(item.parent),
         product: text(item.product),
         reportedLevel: text(item.reported_level),
         enclosureAddress: text(item.enclosure_sas_address),
@@ -589,9 +591,19 @@ function sasIndex(fabric) {
       const held = seps.get(item.controller_id);
       held.set(text(item.raw.sep_handle), [...(held.get(text(item.raw.sep_handle)) || []), item.id]);
     }
-    // Which of each HBA's lists were read, by its name, where the payload says.
-    const lists = isRecord(fabric?.raw?.controller_read?.lists) ? fabric.raw.controller_read.lists : null;
-    return { expanders, controllers, seps, lists };
+    // Which of each HBA's lists were read, and every handle its unit's read
+    // records show naming more than one device: as the HBA carries them and
+    // as the payload's list states give them by the HBA's own name (never its
+    // label). A list is read only where every source that reports it says so.
+    const listed = isRecord(fabric?.raw?.controller_read?.lists) ? fabric.raw.controller_read.lists : {};
+    for (const item of list(fabric?.controllers)) {
+      const record = isRecord(item) && controllers.get(item.id);
+      if (!record || record.lists !== undefined) continue;
+      const sources = [item.mpr_lists, listed[text(item.name)]].filter(isRecord);
+      record.lists = sources.length ? Object.fromEntries([...new Set(sources.flatMap(Object.keys))].map((key) => [key, sources.every((source) => !(key in source) || ["read", "empty"].includes(source[key])) ? "read" : "not_read"])) : null;
+      record.ambiguousHandles = new Set(list(item.ambiguous_device_handles).map(text).filter(Boolean));
+    }
+    return { expanders, controllers, seps };
   }
 
 // The device type a row is given when its PHY name is on more than one row
@@ -1639,6 +1651,7 @@ function buildTopologyModel(given, options = {}) {
         };
         // A lane's rate is read only where both ends' own rows, where they
         // report one, agree with it: a retained list never outranks its ends.
+        // (A lane is judged only where both ends' rates are read: laneRated.)
         const endRate = (id, phy) => (sas.controllers.get(id) || sas.expanders.get(id))?.byPhy.get(phy)?.rate ?? null;
         for (const lane of lanes.rows) {
           if ([endRate(item.source, lane.source), endRate(item.target, lane.target)].some((rate) => rate !== null && rate !== lane.rate)) {

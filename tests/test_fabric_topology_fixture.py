@@ -367,6 +367,26 @@ def _core_variant(mode: str):
             outputs[devices] += f"\n00 8 {address} 0009 {parent} SMP Target 12.0 0002 8"
         if mode == "sep-collision":
             outputs[enclosures] = outputs[enclosures].replace("0008 0002 SES", "0009 0002 SES")
+        # PHY 4 names disk handle 0020, which one disk (or two) of the
+        # device list carries, with or without the expander reply read.
+        if mode.startswith("partial"):
+            outputs[adapter] = outputs[adapter].replace("4 0000 0000 N 0 3.0 12.0 No Device", "4 0001 0020 N 12.0 3.0 12.0 SAS Target")
+            outputs[devices] = outputs[devices].replace("5000c5000000d000 0020 0009", "5000c5000000d000 0020 0001")
+            if not mode.endswith("-unique"):
+                outputs[devices] += f"\n00 8 {_address(0xEEE)} 0020 0001 SAS Target 12.0 0003 8"
+            if "-unread" in mode:
+                del outputs[expanders]
+        # A second disk of the unit with Bay 00's disk handle, behind an
+        # expander PHY that names that handle; no adapter row names it.
+        if mode in {"disk-clean", "disk-collision"}:
+            outputs[expanders] = outputs[expanders].replace("  5 1.5 12.0 No Device", "  5 0 0020 3.0 1.5 12.0 SAS Target", 1)
+            if mode == "disk-collision":
+                outputs[devices] += f"\n00 8 {_address(0xEEE)} 0020 0009 SAS Target 12.0 0003 8"
+        # PHY 4 names a handle only the device list carries, as an expander.
+        if mode in {"listed-smp", "unlisted-exp"}:
+            outputs[adapter] = outputs[adapter].replace("4 0000 0000 N 0 3.0 12.0 No Device", "4 0001 009b N 12.0 3.0 12.0 Edge Expander")
+            if mode == "listed-smp":
+                outputs[devices] += f"\n00 8 {_address(0xEEE)} 009b 0001 SMP Target 12.0 0002 8"
         return system, snapshot, outputs
 
     return _case_payload(build)["fabric"]
@@ -419,6 +439,28 @@ class AdapterHandleIdentityTests(unittest.TestCase):
             self.assertEqual(mpr0.get("device_handle_states"), {str(phy): "ambiguous" for phy in range(4)}, mode)
             cable = next(link for link in fabric["links"] if link["kind"] == "controller-expander" and link["source"] == "controller:mpr0")
             self.assertIsNone(cable["reported_lanes"], mode)
+
+    def test_an_unread_list_never_relaxes_ambiguity_and_leaves_a_single_device_not_read(self) -> None:
+        # Two disks with the handle, read: ambiguous whether or not the
+        # expander reply was read. One disk read with the expander reply not
+        # read: what the handle names is not read, never that disk.
+        self.assertEqual(self._mpr0("partial").get("device_handle_states"), {"4": "ambiguous"})
+        unread = self._mpr0("partial-unread")
+        self.assertEqual(unread.get("device_handle_states", {}).get("4"), "ambiguous")
+        self.assertEqual(unread["mpr_lists"]["expanders"], "not_read")
+        states = self._mpr0("partial-unread-unique").get("device_handle_states", {})
+        self.assertEqual({states.get(str(phy)) for phy in range(5)}, {"not_read"})
+        self.assertEqual(self._mpr0("partial-unique").get("device_handle_states"), {"4": "end_device"})
+
+    def test_every_handle_two_devices_of_the_unit_carry_is_delivered_with_its_hba(self) -> None:
+        self.assertIn("0020", self._mpr0("disk-collision").get("ambiguous_device_handles", []))
+        self.assertNotIn("ambiguous_device_handles", self._mpr0("disk-clean"))
+        # The lists each reply was read from travel with the HBA, by id.
+        self.assertEqual(self._mpr0("base")["mpr_lists"], {"devices": "read", "enclosures": "read", "expanders": "read"})
+
+    def test_an_expander_only_the_device_list_names_is_not_absent(self) -> None:
+        self.assertEqual(self._mpr0("listed-smp").get("device_handle_states"), {"4": "unlisted_expander"})
+        self.assertNotIn("device_handle_states", self._mpr0("unlisted-exp"))
 
     def test_the_same_expander_seen_again_in_the_device_list_is_one_device(self) -> None:
         fabric = _core_variant("smp-same")

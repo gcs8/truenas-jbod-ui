@@ -6,12 +6,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -565,12 +573,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -1124,12 +1140,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -1883,6 +1907,11 @@
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -2652,6 +2681,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -3004,12 +3038,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -3731,12 +3773,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -4500,12 +4550,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -5269,12 +5327,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -6038,12 +6104,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -7770,6 +7844,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -8134,6 +8213,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {
             "active": 1
@@ -8898,12 +8982,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -9664,12 +9756,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": "SAS3008",
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -9711,12 +9811,20 @@
         },
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": "SAS3008",
           "device": "/dev/mpr1",
           "firmware": "16.00.12.00",
           "id": "controller:mpr1",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr1",
           "path_counts": {},
           "pci": null,
@@ -11160,6 +11268,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "unreadable",
+            "expanders": "unreadable"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -11520,6 +11633,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,

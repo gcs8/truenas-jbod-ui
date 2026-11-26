@@ -7,11 +7,15 @@ mutant at a time there (never in the checkout), runs the producer test
 modules, and restores the file. A mutant is killed when a test assertion
 fails with it in place.
 
-The run fails when the unmutated modules fail or run no test, when a mutant's
-anchor is missing or not unique, when the mutated module does not compile,
-when a mutant only breaks test loading (an import error is not a kill), when
-a mutant survives that topology_equivalent_mutants.json does not list with a
-reason, and when a listed equivalent is killed or no longer exists.
+A mutant counts as killed only on an assertion failure (a FAIL) in a
+collected test. The run fails when the unmutated modules fail or run no
+test, when a mutant's anchor is missing or not unique, when the mutated
+module does not compile, when a test module does not load, when a missing
+module or an import error appears anywhere in the run (even inside a test
+that ran), when a mutant only makes tests error without any assertion
+failing, when a mutant survives that topology_equivalent_mutants.json does
+not list with a reason, and when a listed equivalent is killed or no longer
+exists.
 
 Usage: python tests/mutation/run_topology_backend_mutants.py [--jobs N] [NAME ...]
 """
@@ -70,7 +74,7 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
  "T5 ambiguous far end picks first": (L, "remote = remotes.get(attached[0][1]) if len(attached) == 1 else None", "remote = remotes.get(attached[0][1]) if attached else None"),
  "T6 lane basis dropped": (L, "        target_basis=\"not_read\",\n", ""),
  # identity before scope (#1504)
- "I1 adapter handle ambiguity unmarked": (C, "        if len(found) > 1 or found[0][\"conflict\"]:\n            states[phy] = \"ambiguous\"", "        if False:\n            states[phy] = \"ambiguous\""),
+ "I1 adapter handle ambiguity unmarked": (C, "        if found and (len(found) > 1 or found[0][\"conflict\"]):\n            states[phy] = \"ambiguous\"", "        if False:\n            states[phy] = \"ambiguous\""),
  "I2 adapter handle device kind unmarked": (C, "        elif kind != \"expander\":\n            states[phy] =", "        elif False:\n            states[phy] ="),
  "I3 adapter handle states dropped": (C, "            if states:\n                controller[\"device_handle_states\"] = states", "            if False:\n                controller[\"device_handle_states\"] = states"),
  "I4 transport address ambiguity unmarked": (L, "len(slots_by_address.get(address, ())) > 1:\n                record[\"remote_address_state\"] = \"ambiguous\"", "len(slots_by_address.get(address, ())) > 1:\n                pass"),
@@ -95,6 +99,11 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
  "I12 enclosure contradiction ignored": (L, "            if len(found) > 1 or (enclosure and any(item[0] and item[0] != enclosure for item in found)):", "            if len(found) > 1:"),
  "I13 one address with two parents is one device": (C, "                held[\"conflict\"] = True", "                pass"),
  "I14 an unaddressed record is always a device of its own": (C, "            if not fits:\n                loose.append(dict(record))", "            loose.append(dict(record))"),
+ # an unread reply never resolves a handle (#1504)
+ "I15 an unread list lets the rest name one device": (C, "        if unread and handle is not None and handle != \"0000\":", "        if False:"),
+ "I16 an expander only the device list names is absent": (C, "        elif kind == \"expander\" and not found[0][\"listed\"]:", "        elif False:"),
+ "I17 ambiguous unit handles not delivered": (C, "                    controller[\"ambiguous_device_handles\"] = ambiguous", "                    pass"),
+ "I18 list states not delivered with the HBA": (C, "                controller[\"mpr_lists\"] = dict(payload[\"lists\"])", "                pass"),
 }
 
 
@@ -114,10 +123,22 @@ def _copy_tree(into: Path) -> None:
             shutil.copy2(source, target)
 
 
-def _run_modules(tree: Path) -> tuple[int, str]:
-    result = subprocess.run([sys.executable, "-m", "unittest", *MODULES], cwd=tree, env=_environment(),
-                            capture_output=True, text=True, timeout=1800)
+def _run_modules(tree: Path, modules: list[str] | None = None, verbose: bool = False) -> tuple[int, str]:
+    result = subprocess.run([sys.executable, "-m", "unittest", *(["-v"] if verbose else []), *(modules or MODULES)],
+                            cwd=tree, env=_environment(), capture_output=True, text=True, timeout=1800)
     return result.returncode, result.stderr
+
+
+def stock_problems(code: int, stderr: str, modules: list[str]) -> list[str]:
+    """Why the unmutated run cannot stand as the baseline, if it cannot."""
+    problems = [] if code == 0 else [f"exit {code}"]
+    if not _ran(stderr):
+        problems.append("no test count")
+    if _IMPORT.search(stderr):
+        problems.append("a missing module or an import error")
+    # Every selected module ran at least one test of its own (-v names each).
+    problems += [f"{module} ran no test" for module in modules if not re.search(rf"\({re.escape(module)}\.", stderr)]
+    return problems
 
 
 def _ran(stderr: str) -> int:
@@ -125,9 +146,39 @@ def _ran(stderr: str) -> int:
     return int(found[1]) if found else 0
 
 
-def _judge(tree: Path, name: str) -> dict[str, object]:
-    path, old, new = MUTANTS[name]
+# One block per failed or errored test: its heading and its traceback.
+# A subtest's heading carries its parameters after the test's own name.
+_BLOCK = re.compile(r"^(FAIL|ERROR): (\S+) \(([^)]*)\)[^\n]*\n-+\n(.*?)(?=^=+$|^-+\nRan )", re.M | re.S)
+_IMPORT = re.compile(r"\b(ModuleNotFoundError|ImportError)\b")
+
+
+def classify(code: int, stderr: str) -> tuple[str, str]:
+    """The verdict on one mutated run: killed, survived, or error (never a kill)."""
+    ran = _ran(stderr)
+    blocks = _BLOCK.findall(stderr)
+    if not ran:
+        return "error", "no test count"
+    loading = [test for _kind, test, where, _trace in blocks if "_FailedTest" in where or "loader" in where]
+    if loading:
+        return "error", f"a test module did not load: {loading[0]}"
+    if _IMPORT.search(stderr):
+        return "error", "a missing module or an import error in the run is not a kill"
+    asserted = [test for kind, test, _where, trace in blocks if kind == "FAIL" and "AssertionError" in trace]
+    if code and asserted:
+        return "killed", f"{len(asserted)} assertion failures of {ran}: {asserted[0]}"
+    if code and blocks:
+        return "error", f"{len(blocks)} tests errored and no assertion failed: {blocks[0][1]}"
+    if code:
+        return "error", f"exit {code} with no failing test"
+    return "survived", f"{ran} tests passed"
+
+
+def _judge(tree: Path, name: str, mutants: dict[str, tuple[str, str, str]] | None = None,
+           modules: list[str] | None = None) -> dict[str, object]:
+    path, old, new = (mutants or MUTANTS)[name]
     file = tree / path
+    if not file.is_file():
+        return {"name": name, "verdict": "error", "detail": f"the mutated file {path} is missing"}
     source = file.read_text(encoding="utf-8")
     if source.count(old) != 1:
         return {"name": name, "verdict": "error", "detail": f"anchor found {source.count(old)} times in {path}"}
@@ -138,21 +189,11 @@ def _judge(tree: Path, name: str) -> dict[str, object]:
         return {"name": name, "verdict": "error", "detail": f"the mutated module does not compile: {error}"}
     file.write_text(mutated, encoding="utf-8")
     try:
-        code, stderr = _run_modules(tree)
+        code, stderr = _run_modules(tree, modules)
     finally:
         file.write_text(source, encoding="utf-8")
-    failed = re.findall(r"^(FAIL|ERROR): (\S+) \((\S+)\)", stderr, re.M)
-    loading = [item for item in failed if "_FailedTest" in item[2] or "loader" in item[2]]
-    if not _ran(stderr):
-        return {"name": name, "verdict": "error", "detail": "no test count"}
-    if loading:
-        return {"name": name, "verdict": "error", "detail": f"a test module did not load: {loading[0][1]}"}
-    if code and failed:
-        kinds = sorted({kind for kind, _test, _where in failed})
-        return {"name": name, "verdict": "killed", "detail": f"{len(failed)} {'/'.join(kinds)} of {_ran(stderr)}: {failed[0][1]}"}
-    if code:
-        return {"name": name, "verdict": "error", "detail": f"exit {code} with no failing test"}
-    return {"name": name, "verdict": "survived", "detail": f"{_ran(stderr)} tests passed"}
+    verdict, detail = classify(code, stderr)
+    return {"name": name, "verdict": verdict, "detail": detail}
 
 
 def main() -> int:
@@ -173,10 +214,11 @@ def main() -> int:
         trees = [Path(scratch) / f"tree-{index}" for index in range(min(options.jobs, len(names)))]
         for tree in trees:
             _copy_tree(tree)
-        code, stderr = _run_modules(trees[0])
+        code, stderr = _run_modules(trees[0], verbose=True)
         print(f"python {sys.version.split()[0]}; {len(names)} of {len(MUTANTS)} mutants; {len(trees)} at a time")
         print(f"stock: {_ran(stderr)} tests, exit {code}")
-        if code or not _ran(stderr):
+        if stock_problems(code, stderr, MODULES):
+            print("; ".join(stock_problems(code, stderr, MODULES)))
             print(stderr[-3000:])
             print("FAIL the unmutated modules do not pass")
             return 1

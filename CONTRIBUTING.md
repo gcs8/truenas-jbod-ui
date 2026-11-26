@@ -699,11 +699,14 @@ the same script's longer `hardened`, `interrupted-migration` and
 `segmented-catalog` scenarios on every pull request and is report-only until
 branch protection adds it.
 `Topology mutation tests (<part>)` runs the Storage Fabric Topology mutation
-harness under `tests/mutation/` (four frontend shards and the backend) when the
-topology scripts, their Python producer or their tests change, and on manual
-dispatch; otherwise it reports that it does not apply. A mutant that survives
-and is not listed with a reason in `tests/mutation/topology_equivalent_mutants.json`,
-a mutant that cannot be planted, and a run that reports no test count fail it.
+harness under `tests/mutation/` (four frontend shards and the backend) when any
+file the runners mutate, import or read changes (a contract test holds the
+scope to that set), and on manual dispatch; otherwise it reports that it does
+not apply. A mutant counts as killed only when an assertion fails in a test the
+run collected. A mutant that survives and is not listed with a reason in
+`tests/mutation/topology_equivalent_mutants.json`, a mutant that cannot be
+planted, a missing module or import error, a test file that does not load or
+runs no test, and a run that reports no test count fail it.
 Publish workflows are release gates,
 not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
 check. If a check name changes, update branch protection and this list together

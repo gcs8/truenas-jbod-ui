@@ -16,6 +16,14 @@ function laneCap(model, link, lane) {
     return caps.every((value) => value !== null && value !== undefined) ? Math.min(...caps) : null;
   }
 
+// A lane is judged only where both ends' own rows read its rate: a listed
+// rate alone is what was reported, never a measurement of the lane.
+function laneRated(model, link, lane) {
+    const { sas } = model;
+    const rate = (id, phy) => (sas.controllers.get(id) || sas.expanders.get(id))?.byPhy.get(phy)?.rate ?? null;
+    return rate(link.source, lane.source) !== null && rate(link.target, lane.target) !== null;
+  }
+
 function cableEnds(model, link) {
     if (!link.lanes) return [];
     // Each end's PHYs as one reading each, across every observation of its
@@ -79,7 +87,7 @@ function unpairedBelow(model, link) {
 function slowLanes(model, link) {
     if (!context.membershipRead(model, link)) return [];
     if (!link.lanes) return [];
-    return link.lanes.rows.map((lane) => ({ ...lane, cap: laneCap(model, link, lane) })).filter((lane) => lane.rate !== null && lane.cap !== null && lane.rate < lane.cap);
+    return link.lanes.rows.map((lane) => ({ ...lane, cap: laneCap(model, link, lane) })).filter((lane) => lane.rate !== null && lane.cap !== null && laneRated(model, link, lane) && lane.rate < lane.cap);
   }
 
 function stateCounts(states) {
@@ -667,7 +675,7 @@ function wiringChecks(model, fabric) {
           blind = true;
           unread.push(`${name}: which PHY pairs with which is not read, so no lane is judged against the maximum of both of its ends`);
         }
-        const lost = ends.length ? 0 : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null).length;
+        const lost = ends.length ? 0 : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null && laneRated(model, link, lane)).length;
         if (lost > 0) {
           blind = true;
           unread.push(`${name}: rate or an end's maximum not read for ${context.plural(lost, "lane")}`);
@@ -1553,7 +1561,7 @@ function portRows(model, port) {
     const rows = [
       ...(role ? [{ label: "Head end", value: `${role.head}: ${role.role === "active" ? "active (pool owner)" : role.role || `role ${context.NOT_READ}`}` }] : []),
       { label: "State", value: `${port.basis === context.MEMBER_HEALTH ? "member health " : ""}${port.state}`, warn: tone === "fault" || tone === "missing" },
-      { label: "Path", value: `${port.controller || `${model.sideWord} not reported`} → ${chip ? `${chip.label}${chip.address ? ` (${chip.address})` : ""}` : `expander ${context.NOT_READ}`}${phy ? ` PHY ${phy.phy}${port.phyBasis ? ` (${port.phyBasis})` : ""}` : port.pathPhy !== null && port.pathPhy !== undefined ? ` PHY ${port.pathPhy} (from the device path)` : ""}` },
+      { label: "Path", value: `${port.controller || `${model.sideWord} not reported`} → ${chip ? `${chip.label}${chip.address ? ` (${chip.address})` : ""}` : `expander ${context.NOT_READ}`}${phy ? ` PHY ${phy.phy}${port.phyBasis ? ` (${port.phyBasis})` : ""}${port.expanderId && !context.portPhyOwner(model, port).ok ? ` (not read as this path's: ${context.portPhyOwner(model, port).why})` : ""}` : port.pathPhy !== null && port.pathPhy !== undefined ? ` PHY ${port.pathPhy} (from the device path)` : ""}` },
     ];
     if (port.protocol) rows.push({ label: "Disk", value: port.protocol === "SATA" ? "SATA: one port" : "SAS" });
     rows.push(
@@ -1576,8 +1584,9 @@ function portRows(model, port) {
 function portBrief(port, model = null) {
     const phy = port.phy;
     const reading = phy && port.expanderId && model ? context.phyReading(model, port.expanderId, phy.phy) : null;
-    const owner = reading ? context.phyOwner(model, port.expanderId, phy.phy) : null;
-    const seen = phy && owner && !owner.known ? `PHY ${phy.phy} · ${owner.text}`
+    // A PHY that is not this path's own is named with why, never measured.
+    const own = reading ? context.portPhyOwner(model, port) : null;
+    const seen = phy && own && !own.ok ? `PHY ${phy.phy} · ${own.why || `owner ${context.NOT_READ}`}`
       : phy ? `PHY ${phy.phy} · ${context.rateText(phy.rate)} · ${reading?.tier ? context.counterText(reading.worst) : !(reading ? reading.read : phy.measured) ? `errors ${context.NOT_READ}` : "no PHY errors"}`
       : port.fromPath ? `expander ${port.attached} PHY ${port.pathPhy} (from the device path)` : port.attached ? `expander PHY ${context.NOT_READ}` : `transport ${context.NOT_READ}`;
     return [`${port.basis === context.MEMBER_HEALTH ? "member health " : ""}${port.state}`, port.sasAddress && !phy ? `port ${port.sasAddress}` : "", port.attached && !port.fromPath && !phy ? `attached to ${port.attached}` : "", seen, port.hctl ? `SCSI ${port.hctl}` : ""].filter(Boolean).join(" · ");
@@ -1603,7 +1612,7 @@ function cardFor(model, ref) {
         // The device is named where it tells two paths of one source apart, or is short.
         label: `via ${port.controller || "?"}${port.device && (context.deviceShort(port.device).length <= 12 || bay.ports.filter((other) => other.controllerId === port.controllerId && other.controller === port.controller).length > 1) ? ` (${context.deviceShort(port.device)})` : ""}`,
         value: `${{ active: "active head · ", standby: "standby head · " }[(model.roleOf?.get(port.controllerId) || model.roleOf?.get(port.controller))?.role] || ""}${portBrief(port, model)}`,
-        warn: ["fault", "missing"].includes(context.pathTone(port.state, port.basis)) ? "critical" : context.phyTier(port.phy),
+        warn: ["fault", "missing"].includes(context.pathTone(port.state, port.basis)) ? "critical" : port.phy && port.expanderId && !context.portPhyOwner(model, port).ok ? "" : context.phyTier(port.phy),
       }));
       if (!rows.length) rows.push({ label: "Paths", value: bay.occupancy === "yes" ? "none reported for this disk" : bay.occupancy === "no" ? "none: no disk" : context.NOT_READ });
       card = { title: `${bay.label}${bay.deviceName ? ` · ${model.shared ? context.deviceShort(bay.deviceName) : bay.deviceName}` : ` · ${{ yes: "disk present", no: "empty", unknown: "occupancy not read" }[bay.occupancy]}`}${bay.protocol === "SATA" ? " · SATA: one port" : bay.protocol ? ` · ${bay.protocol}` : ""}`, rows };

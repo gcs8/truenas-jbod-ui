@@ -268,6 +268,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_startup_migration_recovery",
         "test_startup_writability",
         "test_tls_trust",
+        "test_topology_mutation_runners",
         "test_unknown_speed_columns",
         "test_wiki_drift_verifier",
     ),

@@ -12,6 +12,11 @@
      "firmware": "16.00.12.00",
      "id": "controller:mpr0",
      "iocfacts": {},
+     "mpr_lists": {
+      "devices": "read",
+      "enclosures": "read",
+      "expanders": "read"
+     },
      "name": "mpr0",
      "path_counts": {
       "active": 8
@@ -128,6 +133,11 @@
      "firmware": "16.00.12.00",
      "id": "controller:mpr1",
      "iocfacts": {},
+     "mpr_lists": {
+      "devices": "read",
+      "enclosures": "read",
+      "expanders": "read"
+     },
      "name": "mpr1",
      "path_counts": {
       "fail": 1,

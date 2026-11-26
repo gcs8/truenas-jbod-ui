@@ -1327,8 +1327,15 @@ jobs:
             echo "No comparable base: running every topology mutant."
             exit 0
           fi
-          pattern='^(app/static/sas_fabric_topology[^/]*\.js|app/services/sas_fabric[^/]*\.py|tests/js/fabric_topology[^/]*\.test\.js|tests/js/fabric_linux_sas_transport\.test\.js|tests/js/helpers/fabric_topology\.js|tests/fixtures/sas_fabric/[^/]*|tests/test_fabric_topology_fixture\.py|tests/test_core_fabric_direct_paths\.py|tests/test_sas_fabric\.py|tests/test_core_fabric_legacy_controller\.py|tests/test_linux_sas_transport\.py|tests/test_core_adapter_summary_admission\.py|tests/topology_generality_fixtures\.py|tests/mutation/[^/]*|\.github/workflows/ci\.yml)$'
-          if git diff --name-only "${range}" | grep -Eq "${pattern}"; then
+          # Every file the mutation runners mutate, import or read, their
+          # mutant and test lists, and the workflow itself; a contract test
+          # (tests/test_ci_contract.py) holds this pattern to that set.
+          pattern='^(app/.*|history_service/.*|qa/ui-crawl/.*|tests/js/helpers/.*|tests/js/fabric_topology[^/]*\.test\.js|tests/js/fabric_linux_sas_transport\.test\.js|tests/fixtures/.*|tests/mutation/.*|tests/(__init__|inventory_fixtures|topology_generality_fixtures|test_inventory|test_core_fabric_direct_paths|test_sas_fabric|test_core_fabric_legacy_controller|test_linux_sas_transport|test_fabric_topology_fixture|test_core_adapter_summary_admission|test_topology_mutation_runners)\.py|package(-lock)?\.json|requirements[^/]*\.txt|\.github/workflows/ci\.yml)$'
+          # The changed names go to a file first: a pipe into an early-exiting
+          # grep can kill git with SIGPIPE and, under pipefail, skip the run.
+          changed="${RUNNER_TEMP:-/tmp}/topology-changed-files.txt"
+          git diff --name-only "${range}" > "${changed}"
+          if grep -Eq "${pattern}" "${changed}"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Topology code or tests changed in ${range}: running the mutants."
           else

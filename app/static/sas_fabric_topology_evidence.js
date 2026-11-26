@@ -139,8 +139,12 @@ function handleTarget(model, id, phy) {
     if (expanders.length > 1) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one expander of ${name}` };
     const kinds = [...expanders.map(() => "expander"), ...bays.map(() => "disk"), ...seps.map(() => "sep")];
     const built = HANDLE_KINDS[row.handleState];
-    if (row.handleState === "ambiguous" || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${name}` };
+    const hba = model.sas.controllers.get(id);
+    if (row.handleState === "ambiguous" || hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${name}` };
     if (row.handleState === "mismatch") return { state: "mismatch", row, why: `device handle ${row.handle} names a device of ${name}'s device list whose parent or type is not this row's` };
+    // A reply the builder could not read never lets the rest name one device.
+    if (row.handleState === "not_read") return { state: "mismatch", row, why: `a list of ${name} that could carry device handle ${row.handle} was not read, so what it names is ${NOT_READ}` };
+    if (row.handleState === "unlisted_expander") return { state: "mismatch", row, why: `device handle ${row.handle} names an expander of ${name}'s device list that its expander list does not carry` };
     const kind = deviceKind(row.device);
     const says = (what) => ({ state: "mismatch", row, why: `its row says ${row.device || "no device type"}, but its device handle ${row.handle} names ${what}` });
     if (expanders.length === 1) return { state: "expander", row, id: chipOfNode(model, expanders[0].id)?.id || expanders[0].id };
@@ -159,7 +163,7 @@ function handleTarget(model, id, phy) {
     if (built === "other") return { state: "other", row };
     // Absence is said only where every list that could carry the handle was
     // read: an HBA list not read leaves the destination not read.
-    const lists = model.sas.lists?.[name];
+    const lists = hba?.lists;
     const unread = lists ? ["expanders", "devices", "enclosures"].filter((key) => !["read", "empty"].includes(lists[key])) : [];
     if (unread.length) return { state: "mismatch", row, why: `${name}'s ${unread.join(" and ")} ${unread.length === 1 ? "list was" : "lists were"} not read, so what device handle ${row.handle} names is ${NOT_READ}` };
     return { state: "absent", row };
@@ -199,9 +203,13 @@ function memberConflicts(model, link) {
     }
     // Both ends must name each other on every lane before it is drawn or
     // judged: a retained list never stands in for its ends' own rows.
-    if (!model.transport) for (const lane of link.lanes.rows) {
-      const why = reciprocalClash(model, link, lane);
-      if (why) found.push({ side: "far", id: link.target, phy: lane.target, why });
+    if (!model.transport) {
+      // A CORE list without its pairs cannot show which ends name each other.
+      if (!link.lanes.rows.length && link.lanes.count && (model.sas.controllers.has(link.source) || model.sas.expanders.has(link.source) || model.sas.expanders.has(link.target))) found.push({ side: "far", id: link.target, phy: link.lanes.targetPhys[0] ?? link.lanes.sourcePhys[0], why: "its lane pairs are not reported, so the two ends are not shown to name each other" });
+      for (const lane of link.lanes.rows) {
+        const why = reciprocalClash(model, link, lane);
+        if (why) found.push({ side: "far", id: link.target, phy: lane.target, why });
+      }
     }
     return found;
   }
@@ -217,13 +225,25 @@ function reciprocalClash(model, link, lane) {
     const farChip = model.sas.expanders.get(link.target);
     const near = nearChip?.byPhy.get(lane.source);
     const far = farChip?.byPhy.get(lane.target);
-    if (!near || !far) return "";
-    const nearOwn = nearHba ? near.ownHandle : nearChip.handle;
     const nearName = nodeName(model, link.source);
+    // A payload with no PHY table at either end measures nothing of this
+    // cable to attribute: its list is only what was reported.
+    if (!nearChip && !farChip) return "";
+    // A row not read cannot show the two ends name each other.
+    if (!near) return `PHY ${lane.source} of ${nearName} has no one row read, so the two ends are not shown to name each other`;
+    if (!far) return `its row is not read, so the two ends are not shown to name each other`;
+    const nearOwn = nearHba ? near.ownHandle : nearChip.handle;
     if (!far.handle || !nearOwn || far.handle !== nearOwn) return `its row's device handle ${far.handle || NOT_READ} is not ${nearName}'s own (${nearOwn || NOT_READ}), so the two ends do not name each other`;
     if (far.remote !== lane.source) return `its row names remote PHY ${far.remote ?? NOT_READ}, not PHY ${lane.source} of ${nearName}`;
     if (!nearHba && (near.handle !== farChip.handle || !near.handle)) return `PHY ${lane.source} of ${nearName} names device handle ${near.handle || NOT_READ}, not this cable's far end`;
     if (!nearHba && near.remote !== lane.target) return `PHY ${lane.source} of ${nearName} names remote PHY ${near.remote ?? NOT_READ}, not PHY ${lane.target}`;
+    // The far chip must report the near end as its parent.
+    if (farChip.parent !== nearOwn) return `${nodeName(model, link.target)} reports parent ${farChip.parent || NOT_READ}, not ${nearName}'s own handle ${nearOwn}`;
+    // And these rows must be the only rows of the unit that name these ends.
+    const unit = [...model.sas.expanders.values()].filter((record) => record.controllerId && record.controllerId === farChip.controllerId);
+    const claims = (handle, phy) => unit.flatMap((record) => record.phys).filter((row) => row.handle === handle && row.remote === phy).length;
+    if (claims(nearOwn, lane.source) !== 1) return `${claims(nearOwn, lane.source)} rows of the unit name PHY ${lane.source} of ${nearName}, so this is not shown to be the one link`;
+    if (claims(farChip.handle, lane.target) !== (nearHba ? 0 : 1)) return `another row of the unit names PHY ${lane.target} of ${nodeName(model, link.target)}, so this is not shown to be the one link`;
     return "";
   }
 
@@ -242,8 +262,10 @@ function censusPlace(port) {
 function diskGroups(places) {
     const groups = [];
     for (const place of places.filter((item) => item.address || item.bay !== null || item.bayId)) {
+      // A census slot is one place only where its bay number and its
+      // enclosure are both read: a missing enclosure joins nothing.
       const joins = groups.filter((group) => (place.address && group.addresses.has(place.address))
-        || (place.bay !== null && place.bay !== undefined && group.places.some((other) => other.bay === place.bay && (!other.enclosure || !place.enclosure || other.enclosure === place.enclosure)))
+        || (place.bay !== null && place.bay !== undefined && place.enclosure && group.places.some((other) => other.bay === place.bay && other.enclosure === place.enclosure))
         || (place.bayId && group.places.some((other) => other.bayId === place.bayId)));
       const into = joins[0] || { addresses: new Set(), places: [] };
       for (const other of joins.slice(1)) {
@@ -257,9 +279,7 @@ function diskGroups(places) {
     }
     for (const group of groups) {
       const bays = [...new Set(group.places.map((place) => (place.bayLabel ? place.bayLabel : place.bay !== null && place.bay !== undefined ? `transport bay ${place.bay}` : "")).filter(Boolean))].sort();
-      // At a census slot: groups are split by census slot, so two such
-      // groups are two slots. A bay of this view is not comparable with one.
-      group.located = group.places.some((place) => place.bay !== null && place.bay !== undefined);
+      group.slots = group.places.filter((place) => place.bay !== null && place.bay !== undefined);
       group.label = `${[...group.addresses].sort().join(", ") || "a disk"}${bays.length ? ` at ${bays.join(" and ")}` : ""}`;
     }
     return groups.sort((left, right) => left.label.localeCompare(right.label));
@@ -269,7 +289,11 @@ function diskGroups(places) {
 // are that many disks; otherwise the records do not name one disk.
 function diskWords(groups) {
     const labels = groups.map((group) => group.label).join("; ");
-    return groups.every((group) => group.located) ? `the transport census names ${groups.length === 2 ? "two" : groups.length} disks on it (${labels})`
+    // Two groups are two disks only where some read place of each is
+    // provably another slot: another bay number, or the same number in
+    // another read enclosure. A bay of this view is not comparable with one.
+    const apart = (one, two) => one.slots.some((left) => two.slots.some((right) => left.bay !== right.bay || (left.enclosure && right.enclosure && left.enclosure !== right.enclosure)));
+    return groups.every((one, index) => groups.slice(index + 1).every((two) => apart(one, two))) ? `the transport census names ${groups.length === 2 ? "two" : groups.length} disks on it (${labels})`
       : `its records do not name one disk on it (${labels})`;
   }
 
@@ -375,7 +399,7 @@ function ownerIndex(model) {
         // (an expander, another bay's disk, an enclosure processor) does not
         // say which disk it is.
         const found = !model.transport && port.controllerId ? context.handleDevices(model, port.controllerId, port.handle) : null;
-        const handle = found && found.expanders.length + found.bays.length + found.seps.length > 1 ? port.handle : "";
+        const handle = found && (found.expanders.length + found.bays.length + found.seps.length > 1 || model.sas.controllers.get(port.controllerId)?.ambiguousHandles?.has(port.handle)) ? port.handle : "";
         for (const phy of port.phy ? [port.phy.phy] : context.list(port.phys)) claim(port.expanderId, phy, { key: `bay:${bay.bayId}`, kind: "bay", bay, label: bay.label, address, handle, controllerId: port.controllerId });
       }
     }
@@ -492,7 +516,9 @@ function ambiguousAddresses(model) {
       const bays = views.get(address) || [];
       const apart = (one, two) => one.bay !== null && two.bay !== null && (one.bay !== two.bay || (one.enclosure && two.enclosure && one.enclosure !== two.enclosure));
       const elsewhere = places.some((place) => place.enclosure && bays.some((bay) => context.list(bay.reported?.enclosures).length && !bay.reported.enclosures.includes(place.enclosure)));
-      if (bays.length > 1 || elsewhere || places.some((one, index) => places.slice(index + 1).some((two) => apart(one, two)))) ambiguous.add(address);
+      // A bay whose own records report two enclosures is placed in neither.
+      const torn = bays.some((bay) => context.list(bay.reported?.enclosures).length > 1);
+      if (bays.length > 1 || elsewhere || torn || places.some((one, index) => places.slice(index + 1).some((two) => apart(one, two)))) ambiguous.add(address);
     }
     return ambiguous;
   }

@@ -1,0 +1,34 @@
+{
+ "pattern": "^tests/js/fabric_topology[^/]*\\.test\\.js$",
+ "stages": [
+  [
+   "tests/js/fabric_topology_accessible_names.test.js",
+   "tests/js/fabric_topology_attribution.test.js",
+   "tests/js/fabric_topology_band_clear_of_controls.test.js",
+   "tests/js/fabric_topology_classification.test.js",
+   "tests/js/fabric_topology_endpoints.test.js",
+   "tests/js/fabric_topology_generality.test.js",
+   "tests/js/fabric_topology_health.test.js",
+   "tests/js/fabric_topology_identity.test.js",
+   "tests/js/fabric_topology_identity_tuple.test.js",
+   "tests/js/fabric_topology_ledger.test.js",
+   "tests/js/fabric_topology_model.test.js",
+   "tests/js/fabric_topology_node_names.test.js",
+   "tests/js/fabric_topology_own_evidence.test.js",
+   "tests/js/fabric_topology_presence.test.js",
+   "tests/js/fabric_topology_surfaces.test.js",
+   "tests/js/fabric_topology_unread_evidence.test.js",
+   "tests/js/fabric_linux_sas_transport.test.js"
+  ],
+  [
+   "tests/js/fabric_topology_layout.test.js",
+   "tests/js/fabric_topology_trace_band.test.js"
+  ],
+  [
+   "tests/js/fabric_topology_truth.test.js"
+  ],
+  [
+   "tests/js/fabric_topology_coverage.test.js"
+  ]
+ ]
+}

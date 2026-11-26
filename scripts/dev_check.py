@@ -381,6 +381,14 @@ WINDOWS_EXCLUSIONS = (
         modules=("tests.test_bash_ci_contract",),
     ),
     WindowsExclusion(
+        category="Topology mutation runner self-tests",
+        reason=(
+            "the self-tests run the Node and Python mutation runners on disposable "
+            "trees as Linux CI runs them"
+        ),
+        modules=("tests.test_topology_mutation_runners",),
+    ),
+    WindowsExclusion(
         category="Linux singleton runner trial",
         reason="the trial contract invokes Bash and targets hardened Linux runner pods",
         modules=("tests.test_jbod_runner_trial",),
