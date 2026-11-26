@@ -508,8 +508,8 @@
   "to": ""
  },
  "ROLE2": {
-  "from": "const bayClash = bays.length > 0 ? clash(\"disk\") || (ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";",
-  "to": "const bayClash = bays.length > 0 ? (ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";"
+  "from": "const bayClash = bays.length > 0 ? clash(\"disk\") || (sharedAddress ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";",
+  "to": "const bayClash = bays.length > 0 ? (sharedAddress ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\") : \"\";"
  },
  "PROV1": {
   "from": "map.set(item.text, [...(map.get(item.text) || []), item.phy])",
@@ -816,7 +816,7 @@
   "to": ""
  },
  "AD3": {
-  "from": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
+  "from": "(sharedAddress ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
   "to": "(handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")"
  },
  "AD4": {
@@ -824,8 +824,8 @@
   "to": "if (elsewhere ||"
  },
  "DK1": {
-  "from": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
-  "to": "(ambiguousBay ? \"address\" : handleBay ? \"bay-handle\" : \"\")"
+  "from": "(sharedAddress ? \"address\" : handleBay ? \"bay-handle\" : disks.length > 1 ? \"disks\" : \"\")",
+  "to": "(sharedAddress ? \"address\" : handleBay ? \"bay-handle\" : \"\")"
  },
  "DK2": {
   "from": "\n        || (place.bay !== null && place.bay !== undefined && place.enclosure && group.places.some((other) => other.bay === place.bay && other.enclosure === place.enclosure))",
@@ -962,8 +962,8 @@
   "to": "if (false) return"
  },
  "RATE1": {
-  "from": "if ([endRate(item.source, lane.source), endRate(item.target, lane.target)].some((rate) => rate !== null && rate !== lane.rate)) {",
-  "to": "if (false) {"
+  "from": "          if (read.some((rate) => rate === null || rate !== lane.rate)) {",
+  "to": "          if (false) {"
  },
  "HDR1": {
   "from": "rows.push({ label: \"Lanes\", value: verified ?",
@@ -990,7 +990,7 @@
   "to": "const disks = false ? context.diskGroups("
  },
  "GRP1": {
-  "from": "(place.address && group.addresses.has(place.address))",
+  "from": "(key(place.address) && group.keys.has(place.address))",
   "to": "false"
  },
  "WORD1": {
@@ -1002,8 +1002,8 @@
   "to": "found && (false || "
  },
  "LIST1": {
-  "from": "    if (unread.length) return { state: \"mismatch\", row, why:",
-  "to": "    if (false) return { state: \"mismatch\", row, why:"
+  "from": "    const unread = [\"expanders\", \"devices\", \"enclosures\"].filter((key) => lists[key] !== \"read\");",
+  "to": "    const unread = [];"
  },
  "GRP2": {
   "from": "group.slots = group.places.filter((place) => place.bay !== null && place.bay !== undefined);",
@@ -1073,14 +1073,6 @@
   "from": "    if (!nearChip && !farChip) return \"\";",
   "to": "    if (!nearChip || !farChip) return \"\";"
  },
- "RATE2": {
-  "from": "lane.rate !== null && laneCap(model, link, lane) !== null && laneRated(model, link, lane)).length;",
-  "to": "lane.rate !== null && laneCap(model, link, lane) !== null).length;"
- },
- "RATE3": {
-  "from": "lane.cap !== null && laneRated(model, link, lane) && lane.rate < lane.cap);",
-  "to": "lane.cap !== null && lane.rate < lane.cap);"
- },
  "UL1": {
   "from": "    const coverage = context.listCoverage(model, id, row.handle);",
   "to": "    const coverage = \"\";"
@@ -1124,5 +1116,13 @@
  "RATE6": {
   "from": "          if (listed.some(([table, phys]) => phys.some((phy) => rowRate(table, phy) !== lanes.rate))) lanes.rate = null;",
   "to": ""
+ },
+ "RATE7": {
+  "from": "          const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];",
+  "to": "          const read = [rowRate(ends[0], lane.source)];"
+ },
+ "RATE8": {
+  "from": "          const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];",
+  "to": "          const read = [rowRate(ends[1], lane.target)];"
  }
 }

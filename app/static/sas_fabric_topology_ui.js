@@ -16,14 +16,6 @@ function laneCap(model, link, lane) {
     return caps.every((value) => value !== null && value !== undefined) ? Math.min(...caps) : null;
   }
 
-// A lane is judged only where both ends' own rows read its rate: a listed
-// rate alone is what was reported, never a measurement of the lane.
-function laneRated(model, link, lane) {
-    const { sas } = model;
-    const rate = (id, phy) => (sas.controllers.get(id) || sas.expanders.get(id))?.byPhy.get(phy)?.rate ?? null;
-    return rate(link.source, lane.source) !== null && rate(link.target, lane.target) !== null;
-  }
-
 function cableEnds(model, link) {
     if (!link.lanes) return [];
     // Each end's PHYs as one reading each, across every observation of its
@@ -87,7 +79,9 @@ function unpairedBelow(model, link) {
 function slowLanes(model, link) {
     if (!context.membershipRead(model, link)) return [];
     if (!link.lanes) return [];
-    return link.lanes.rows.map((lane) => ({ ...lane, cap: laneCap(model, link, lane) })).filter((lane) => lane.rate !== null && lane.cap !== null && laneRated(model, link, lane) && lane.rate < lane.cap);
+    // A lane's rate is not null only where both ends' own rows read it (the
+    // model keeps no other): a listed rate alone is never judged.
+    return link.lanes.rows.map((lane) => ({ ...lane, cap: laneCap(model, link, lane) })).filter((lane) => lane.rate !== null && lane.cap !== null && lane.rate < lane.cap);
   }
 
 function stateCounts(states) {
@@ -675,7 +669,7 @@ function wiringChecks(model, fabric) {
           blind = true;
           unread.push(`${name}: which PHY pairs with which is not read, so no lane is judged against the maximum of both of its ends`);
         }
-        const lost = ends.length ? 0 : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null && laneRated(model, link, lane)).length;
+        const lost = ends.length ? 0 : link.lanes.count - link.lanes.rows.filter((lane) => lane.rate !== null && laneCap(model, link, lane) !== null).length;
         if (lost > 0) {
           blind = true;
           unread.push(`${name}: rate or an end's maximum not read for ${context.plural(lost, "lane")}`);

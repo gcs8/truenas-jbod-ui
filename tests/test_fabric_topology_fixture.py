@@ -400,7 +400,7 @@ class AdapterHandleIdentityTests(unittest.TestCase):
         shown = {expander["id"] for expander in fabric["expanders"]}
         self.assertNotIn("expander:controller:mpr0:5000c50000000e02", shown)
         mpr0 = next(item for item in fabric["controllers"] if item["id"] == "controller:mpr0")
-        self.assertEqual(mpr0["device_handle_states"], {"0": "ambiguous", "1": "ambiguous", "2": "ambiguous", "3": "ambiguous"})
+        self.assertEqual(mpr0.get("device_handle_states"), {"0": "ambiguous", "1": "ambiguous", "2": "ambiguous", "3": "ambiguous"})
         # The adapter rows stay as reported.
         self.assertTrue(all("device_handle_state" not in row for row in mpr0["phy_rows"]))
 
@@ -409,7 +409,7 @@ class AdapterHandleIdentityTests(unittest.TestCase):
 
     def test_a_handle_only_a_disk_carries_names_that_disk(self) -> None:
         mpr0 = next(item for item in _core_variant("present")["controllers"] if item["id"] == "controller:mpr0")
-        self.assertEqual(mpr0["device_handle_states"], {"4": "end_device"})
+        self.assertEqual(mpr0.get("device_handle_states"), {"4": "end_device"})
         # A handle no list carries is not marked: it is outside the payload.
         absent = next(item for item in _core_variant("absent")["controllers"] if item["id"] == "controller:mpr0")
         self.assertNotIn("device_handle_states", absent)
@@ -447,7 +447,7 @@ class AdapterHandleIdentityTests(unittest.TestCase):
         self.assertEqual(self._mpr0("partial").get("device_handle_states"), {"4": "ambiguous"})
         unread = self._mpr0("partial-unread")
         self.assertEqual(unread.get("device_handle_states", {}).get("4"), "ambiguous")
-        self.assertEqual(unread["mpr_lists"]["expanders"], "not_read")
+        self.assertEqual(unread.get("mpr_lists", {}).get("expanders"), "not_read")
         states = self._mpr0("partial-unread-unique").get("device_handle_states", {})
         self.assertEqual({states.get(str(phy)) for phy in range(5)}, {"not_read"})
         self.assertEqual(self._mpr0("partial-unique").get("device_handle_states"), {"4": "end_device"})
@@ -456,7 +456,7 @@ class AdapterHandleIdentityTests(unittest.TestCase):
         self.assertIn("0020", self._mpr0("disk-collision").get("ambiguous_device_handles", []))
         self.assertNotIn("ambiguous_device_handles", self._mpr0("disk-clean"))
         # The lists each reply was read from travel with the HBA, by id.
-        self.assertEqual(self._mpr0("base")["mpr_lists"], {"devices": "read", "enclosures": "read", "expanders": "read"})
+        self.assertEqual(self._mpr0("base").get("mpr_lists"), {"devices": "read", "enclosures": "read", "expanders": "read"})
 
     def test_an_expander_only_the_device_list_names_is_not_absent(self) -> None:
         self.assertEqual(self._mpr0("listed-smp").get("device_handle_states"), {"4": "unlisted_expander"})

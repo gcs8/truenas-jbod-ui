@@ -338,9 +338,16 @@ test("an HBA PHY in no cable and no census still counts in the note and on the c
   const rows = phyRows(item.fabric, HOST1);
   rows.push({ ...rows[0], name: "phy-1:15", phy: 15 });
   const built = model(item);
-  const total = (one) => Number(/read on \d+ of (\d+)/.exec(one.transportNote.measured.join(" "))[1]);
+  // Asserted, never thrown: a missing count is a failed expectation.
+  const total = (one) => {
+    const found = /read on \d+ of (\d+)/.exec((one.transportNote?.measured || []).join(" "));
+    assert.ok(found, `the transport note counts the HBA's PHYs: ${textOf(one.transportNote)}`);
+    return Number(found[1]);
+  };
   assert.equal(total(built), total(before) + 1);
-  assert.match(cardRows(built, { kind: "node", id: HOST1 }).find((entry) => entry.label === "PHY errors").value, /none on 13 PHYs/);
+  const errors = cardRows(built, { kind: "node", id: HOST1 }).find((entry) => entry.label === "PHY errors");
+  assert.ok(errors, textOf(cardRows(built, { kind: "node", id: HOST1 })));
+  assert.match(errors.value, /none on 13 PHYs/);
 });
 
 test("a number two rows share, one claimed by a bay, has its owner not read", () => {
