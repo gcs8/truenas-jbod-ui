@@ -1494,6 +1494,47 @@ class TopologyMutationScopeTests(unittest.TestCase):
         self.assertEqual(self._run_scope(many), "run=true")
         self.assertNotIn("| grep", self._step())
 
+    def test_the_scope_covers_the_files_the_tests_read_at_run_time(self) -> None:
+        # Read only while the tests run (an import inside a test, a script a
+        # test runs as a child process, a JSON file a helper opens), so no
+        # import-time closure sees them; the runners' traced unmutated run
+        # (tests/mutation/read_trace/) found each, and fails on any new one.
+        pattern = self._pattern()
+        for path in ("qa/ui-states.json", "scripts/build_current_source_browser_fixture.py", "scripts/build_ui_crawl_fixture.py",
+                     "scripts/preview_system_sas_fabric.py", "tests/js/fabric_aggregate_provenance.test.js",
+                     "tests/test_history_bulk_bounds.py", "tests/test_snapshot_export.py", "tests/wait_bounds.py",
+                     "tests/mutation/read_trace/sitecustomize.py", "tests/mutation/read_trace/trace.cjs"):
+            self.assertIsNotNone(pattern.match(path), path)
+        # Both runners hold their traced reads to this same pattern line of
+        # this workflow.
+        for runner in ("run_topology_backend_mutants.py", "run_topology_frontend_mutants.cjs"):
+            source = (ROOT / "tests" / "mutation" / runner).read_text(encoding="utf-8")
+            for needle in ("pattern='([^']+)'$", "ci.yml", "read_trace", "the CI path filter of this job does not cover"):
+                self.assertIn(needle, source, f"{runner}: {needle}")
+
+    @unittest.skipIf(os.name == "nt", "the CI step is Bash on Linux")
+    def test_the_scope_step_runs_when_a_covered_file_is_renamed_away(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            repo = Path(scratch)
+            git = ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.invalid", "-c", "commit.gpgsign=false"]
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            covered = repo / "tests" / "js" / "helpers" / "fabric_topology_geometry.js"
+            covered.parent.mkdir(parents=True)
+            covered.write_text("const geometry = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+            # An exact rename (R100): only the destination is outside the filter.
+            (repo / "docs").mkdir()
+            subprocess.run(["git", "mv", str(covered), str(repo / "docs" / "retired.js")], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "move"], cwd=repo, check=True)
+            status = subprocess.run(["git", "diff", "--name-status", "-M", f"{base}..HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout
+            self.assertTrue(status.startswith("R100"), status)
+            output = repo / "output"
+            env = {**os.environ, "EVENT_NAME": "push", "BEFORE_SHA": base, "PR_BASE_SHA": "", "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": scratch}
+            subprocess.run(["bash", "-c", self._step()], cwd=repo, env=env, check=True, capture_output=True, text=True)
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "run=true")
+
 
 if __name__ == "__main__":
     unittest.main()

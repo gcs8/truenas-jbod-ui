@@ -1,8 +1,7 @@
 {
  "frontend": {
   "V1": "Removes the fallback line '<n> <subjects> with a finding' for a check that marked a subject bad but pushed no flag. Every place that marks a coverage subject bad pushes that subject's own flag in the same branch, so the fallback cannot run: the checks and flags are identical on every input.",
-  "MAPlisted": "Deletes a key of the listed disk-port map before setting it again, which only moves the key to the end of the map's insertion order. The map's one consumer sorts its keys by a strict total order before use, so the order cannot reach any output.",
-  "DUP1": "Takes a lane's maximum from the first of two HBA rows of one PHY number instead of none. A lane is judged, and its maximum shown, only where both ends' rows are read as the one row of their number (laneRated, and a cable whose HBA row number is on two rows has its members not read), so no lane that reaches the maximum has two rows: the first row is the only row, and the output is the same."
+  "MAPlisted": "Deletes a key of the listed disk-port map before setting it again, which only moves the key to the end of the map's insertion order. The map's one consumer sorts its keys by a strict total order before use, so the order cannot reach any output."
  },
  "backend": {}
 }

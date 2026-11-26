@@ -89,7 +89,7 @@ function phyRoles(model, id, phy) {
     // The disks the read end-device records name, one per identity: two
     // disks on one PHY are no one disk's. A record missing a field is not
     // read for it, never a second disk.
-    const disks = diskGroups(records.filter((item) => item.remote_kind === "end_device").map(censusPlace));
+    const disks = diskGroups(records.filter((item) => item.remote_kind === "end_device").map(censusPlace), context.addressAmbiguity(model));
     const entry = { roles, attached, unknown: [...new Set(unknown)], unread, records, kinds, targets, disks };
     model.roleLedger.set(key, entry);
     return entry;
@@ -121,12 +121,26 @@ function handleDevices(model, id, handle) {
 // What the builder's state for a handle says the one device is.
 const HANDLE_KINDS = { end_device: "disk", sep: "sep", other_device: "other" };
 
+// Which of a CORE HBA's lists were read, decided before any of its handles
+// names anything: a list the payload does not say was read could carry a
+// second device with any handle, so with one unread, or with no list states
+// reported at all, no handle of that HBA names one device or none.
+function listCoverage(model, id, handle) {
+    const lists = model.sas.controllers.get(id)?.lists;
+    const name = nodeName(model, id);
+    if (!lists) return `the payload does not say which lists of ${name} were read, so what device handle ${handle} names is ${NOT_READ}`;
+    const unread = ["expanders", "devices", "enclosures"].filter((key) => lists[key] !== "read");
+    return unread.length ? `${name}'s ${unread.join(" and ")} ${unread.length === 1 ? "list was" : "lists were"} not read, so what device handle ${handle} names is ${NOT_READ}` : "";
+  }
+
 // What a CORE HBA row's device handle names, over every record of the
 // payload that carries a handle of that HBA and what the builder found
 // across the whole unit before selection: one expander, one disk attached
 // directly, the enclosure processor, a device of the HBA's own list, more
 // than one device or records that disagree with the row (not read), none
-// read, or nothing here. A device is named only where every record of it
+// read, or nothing here. Two devices read are ambiguous whatever else was
+// read; otherwise every list must have been read before any device is
+// named or called absent. A device is named only where every record of it
 // agrees with the row: its kind is the row's, and a disk's own path has no
 // expander and names this HBA as its parent.
 function handleTarget(model, id, phy) {
@@ -141,6 +155,8 @@ function handleTarget(model, id, phy) {
     const built = HANDLE_KINDS[row.handleState];
     const hba = model.sas.controllers.get(id);
     if (row.handleState === "ambiguous" || hba?.ambiguousHandles?.has(row.handle) || kinds.length > 1 || (built && kinds.length && kinds[0] !== built)) return { state: "ambiguous", row, why: `device handle ${row.handle} names more than one device of ${name}` };
+    const coverage = context.listCoverage(model, id, row.handle);
+    if (coverage) return { state: "mismatch", row, why: coverage };
     if (row.handleState === "mismatch") return { state: "mismatch", row, why: `device handle ${row.handle} names a device of ${name}'s device list whose parent or type is not this row's` };
     // A reply the builder could not read never lets the rest name one device.
     if (row.handleState === "not_read") return { state: "mismatch", row, why: `a list of ${name} that could carry device handle ${row.handle} was not read, so what it names is ${NOT_READ}` };
@@ -161,11 +177,7 @@ function handleTarget(model, id, phy) {
     if (seps.length === 1 || built === "sep") return kind === "sep" ? { state: "sep", row } : says("the enclosure processor");
     if (built === "disk") return kind === "disk" ? { state: "device", row } : says("a disk of the HBA's device list");
     if (built === "other") return { state: "other", row };
-    // Absence is said only where every list that could carry the handle was
-    // read: an HBA list not read leaves the destination not read.
-    const lists = hba?.lists;
-    const unread = lists ? ["expanders", "devices", "enclosures"].filter((key) => !["read", "empty"].includes(lists[key])) : [];
-    if (unread.length) return { state: "mismatch", row, why: `${name}'s ${unread.join(" and ")} ${unread.length === 1 ? "list was" : "lists were"} not read, so what device handle ${row.handle} names is ${NOT_READ}` };
+    // Every list was read (above): nothing here carries the handle.
     return { state: "absent", row };
   }
 
@@ -204,6 +216,9 @@ function memberConflicts(model, link) {
     // Both ends must name each other on every lane before it is drawn or
     // judged: a retained list never stands in for its ends' own rows.
     if (!model.transport) {
+      // The list must be the whole link, decided over both ends' tables.
+      const whole = context.laneSetClash(model, link);
+      if (whole) found.push(whole);
       // A CORE list without its pairs cannot show which ends name each other.
       if (!link.lanes.rows.length && link.lanes.count && (model.sas.controllers.has(link.source) || model.sas.expanders.has(link.source) || model.sas.expanders.has(link.target))) found.push({ side: "far", id: link.target, phy: link.lanes.targetPhys[0] ?? link.lanes.sourcePhys[0], why: "its lane pairs are not reported, so the two ends are not shown to name each other" });
       for (const lane of link.lanes.rows) {
@@ -212,6 +227,44 @@ function memberConflicts(model, link) {
       }
     }
     return found;
+  }
+
+// Whether a CORE lane list is the whole link, decided once over both ends'
+// complete PHY tables rather than over the PHYs it lists: both ends are rows
+// of one controller unit (handles are that unit's own), neither end's handle
+// is one the unit carries on more than one device, and every row by which
+// the near end names the far chip, and the far chip names the near end, is
+// a PHY the list gives at that end. With no table at either end nothing
+// shows the two ends name each other: the list is only reported.
+function laneSetClash(model, link) {
+    const nearHba = model.sas.controllers.get(link.source);
+    const nearChip = nearHba || model.sas.expanders.get(link.source);
+    const farChip = model.sas.expanders.get(link.target);
+    const nearName = nodeName(model, link.source);
+    const farName = nodeName(model, link.target);
+    const first = link.lanes.targetPhys[0] ?? link.lanes.sourcePhys[0];
+    const at = (side, phy, why) => ({ side, id: side === "near" ? link.source : link.target, phy, why });
+    if (!nearChip && !farChip) return at("far", first, "neither end's PHY table is in the payload, so the two ends are not shown to name each other");
+    // One end without a table is said per lane (its row is not read).
+    if (!nearChip || !farChip) return null;
+    const unit = nearHba ? link.source : nearChip.controllerId;
+    if (!unit || farChip.controllerId !== unit) return at("far", first, `${farName} is a device of ${farChip.controllerId ? nodeName(model, farChip.controllerId) : `a controller unit ${NOT_READ}`}, another controller unit than ${nearName}'s, so its handles do not name ${nearName}`);
+    const ambiguous = model.sas.controllers.get(unit)?.ambiguousHandles || new Set();
+    const nearOwn = new Set((nearHba ? nearHba.phys.map((row) => row.ownHandle) : [nearChip.handle]).filter(Boolean));
+    for (const handle of [...nearOwn, farChip.handle].filter(Boolean)) {
+      if (ambiguous.has(handle)) return at("far", first, `device handle ${handle} names more than one device of ${nodeName(model, unit)}`);
+    }
+    if (!farChip.handle || !nearOwn.size) return null;
+    // Every row naming the other end, at each end, must be in the list there.
+    // (A listed PHY whose own row does not name the other end, or whose
+    // number is on two rows, is said per lane by reciprocalClash.)
+    const towardFar = nearChip.phys.filter((row) => row.handle === farChip.handle).map((row) => row.phy);
+    const towardNear = farChip.phys.filter((row) => row.handle && nearOwn.has(row.handle)).map((row) => row.phy);
+    for (const [side, rows, listed, name, other] of [["near", towardFar, link.lanes.sourcePhys, nearName, farName], ["far", towardNear, link.lanes.targetPhys, farName, nearName]]) {
+      const left = rows.find((phy) => !listed.includes(phy));
+      if (left !== undefined) return at(side, left, `PHY ${left} of ${name} also names ${other}, which the lane list leaves out`);
+    }
+    return null;
   }
 
 // Where a CORE cable's two ends do not name each other on one lane: the far
@@ -254,26 +307,39 @@ function censusPlace(port) {
     return { address: sasAddressOf(port.remote_sas_address), enclosure: sasAddressOf(port.enclosure_identifier), bay };
   }
 
+// Every disk port address no one place identifies, decided once over the
+// whole payload and read by every consumer: the ledger, the claims and the
+// disk groups below.
+function addressAmbiguity(model) {
+    if (!model.ambiguousAddresses) model.ambiguousAddresses = context.ambiguousAddresses(model);
+    return model.ambiguousAddresses;
+  }
+
 // Records grouped into disks, in any order: one port address is one disk,
 // and two records at one census slot (both bay numbers read, no enclosure
 // read in both that differs) are one disk, a dual-ported disk's two port
 // addresses included. A field one record does not read joins nothing and
-// splits nothing. Each group: its addresses, its slots, a label.
-function diskGroups(places) {
+// splits nothing; nor does an address the payload places at more than one
+// slot (`ambiguous`): it identifies no disk, so it joins no records. Each
+// group: its addresses, its slots, a label.
+function diskGroups(places, ambiguous = new Set()) {
     const groups = [];
+    const key = (address) => (address && !ambiguous.has(address) ? address : "");
     for (const place of places.filter((item) => item.address || item.bay !== null || item.bayId)) {
       // A census slot is one place only where its bay number and its
       // enclosure are both read: a missing enclosure joins nothing.
-      const joins = groups.filter((group) => (place.address && group.addresses.has(place.address))
+      const joins = groups.filter((group) => (key(place.address) && group.keys.has(place.address))
         || (place.bay !== null && place.bay !== undefined && place.enclosure && group.places.some((other) => other.bay === place.bay && other.enclosure === place.enclosure))
         || (place.bayId && group.places.some((other) => other.bayId === place.bayId)));
-      const into = joins[0] || { addresses: new Set(), places: [] };
+      const into = joins[0] || { addresses: new Set(), keys: new Set(), places: [] };
       for (const other of joins.slice(1)) {
         other.addresses.forEach((address) => into.addresses.add(address));
+        other.keys.forEach((address) => into.keys.add(address));
         into.places.push(...other.places);
         groups.splice(groups.indexOf(other), 1);
       }
       if (place.address) into.addresses.add(place.address);
+      if (key(place.address)) into.keys.add(place.address);
       into.places.push(place);
       if (!joins.length) groups.push(into);
     }
@@ -389,8 +455,7 @@ function ownerIndex(model) {
         held.handle = held.handle || claimant.handle;
       }
     };
-    const ambiguous = ambiguousAddresses(model);
-    model.ambiguousAddresses = ambiguous;
+    const ambiguous = context.addressAmbiguity(model);
     for (const bay of model.bays) {
       for (const port of bay.ports) {
         if (!port.expanderId) continue;
@@ -441,8 +506,13 @@ function phyOwner(model, id, phy) {
     const bayPlaces = claimants.filter((item) => item.kind === "bay").flatMap((item) => item.bay.ports
       .filter((port) => port.sasAddress && (context.chipOfNode(model, port.expanderId)?.id || port.expanderId) === chip && (port.phy ? port.phy.phy === phy : context.list(port.phys).includes(phy)))
       .map((port) => ({ address: port.sasAddress, bayId: item.bay.bayId, bayLabel: item.bay.label })));
-    const disks = bayPlaces.length ? context.diskGroups([...ledger.records.filter((port) => port.remote_kind === "end_device").map(context.censusPlace), ...bayPlaces]) : ledger.disks;
-    const bayClash = bays.length > 0 ? clash("disk") || (ambiguousBay ? "address" : handleBay ? "bay-handle" : disks.length > 1 ? "disks" : "") : "";
+    const ambiguousIds = context.addressAmbiguity(model);
+    const places = [...ledger.records.filter((port) => port.remote_kind === "end_device").map(context.censusPlace), ...bayPlaces];
+    const disks = bayPlaces.length ? context.diskGroups(places, ambiguousIds) : ledger.disks;
+    // Any record on the PHY whose address names no one place leaves which
+    // disk is on it not read, not only the claiming path's own address.
+    const sharedAddress = ambiguousBay?.address || places.map((place) => place.address).find((address) => address && ambiguousIds.has(address)) || "";
+    const bayClash = bays.length > 0 ? clash("disk") || (sharedAddress ? "address" : handleBay ? "bay-handle" : disks.length > 1 ? "disks" : "") : "";
     // A cable's PHY must be a kind the table says can end that cable at that
     // end, and every target the census names must be the cable's other end.
     const cableClash = cables.length !== 1 ? (cables.length ? clash("link") : "") : (() => {
@@ -469,7 +539,7 @@ function phyOwner(model, id, phy) {
         const [first] = context.memberConflicts(model, cables[0].link);
         return `the cable's members are ${context.NOT_READ} (PHY ${first.phy} at ${context.nodeName(model, first.id)}: ${first.why})`;
       })()
-      : role === "address" ? `its disk port address ${ambiguousBay.address} is reported for more than one slot, so which disk is on it is ${context.NOT_READ}`
+      : role === "address" ? `${ambiguousBay ? "its disk port address" : "a record on it names disk port address"} ${sharedAddress}, which is reported for more than one slot, so which disk is on it is ${context.NOT_READ}`
       : role === "bay-handle" ? `its device handle ${handleBay.handle} names more than one device of ${context.nodeName(model, handleBay.controllerId)}, so which disk is on it is ${context.NOT_READ}`
       : role === "disks" ? context.diskWords(disks)
       : role.startsWith("kind:") ? `its row or the transport census names ${context.KIND_WORDS[role.slice(5)]}, which cannot be this end of that cable`
@@ -546,11 +616,14 @@ function portPhyOwner(model, port) {
     targetWords: { configurable: true, get: () => targetWords },
     handleDevices: { configurable: true, get: () => handleDevices },
     HANDLE_KINDS: { configurable: true, get: () => HANDLE_KINDS },
+    listCoverage: { configurable: true, get: () => listCoverage },
     handleTarget: { configurable: true, get: () => handleTarget },
     handleClash: { configurable: true, get: () => handleClash },
     memberConflicts: { configurable: true, get: () => memberConflicts },
     reciprocalClash: { configurable: true, get: () => reciprocalClash },
+    laneSetClash: { configurable: true, get: () => laneSetClash },
     censusPlace: { configurable: true, get: () => censusPlace },
+    addressAmbiguity: { configurable: true, get: () => addressAmbiguity },
     diskGroups: { configurable: true, get: () => diskGroups },
     diskWords: { configurable: true, get: () => diskWords },
     membershipOf: { configurable: true, get: () => membershipOf },

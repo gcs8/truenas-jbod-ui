@@ -1080,5 +1080,49 @@
  "RATE3": {
   "from": "lane.cap !== null && laneRated(model, link, lane) && lane.rate < lane.cap);",
   "to": "lane.cap !== null && lane.rate < lane.cap);"
+ },
+ "UL1": {
+  "from": "    const coverage = context.listCoverage(model, id, row.handle);",
+  "to": "    const coverage = \"\";"
+ },
+ "UL2": {
+  "from": "    if (!lists) return `the payload does not say which lists of ${name} were read, so what device handle ${handle} names is ${NOT_READ}`;",
+  "to": "    if (!lists) return \"\";"
+ },
+ "AMB3": {
+  "from": "    const key = (address) => (address && !ambiguous.has(address) ? address : \"\");",
+  "to": "    const key = (address) => address || \"\";"
+ },
+ "AMB4": {
+  "from": "    const sharedAddress = ambiguousBay?.address || places.map((place) => place.address).find((address) => address && ambiguousIds.has(address)) || \"\";",
+  "to": "    const sharedAddress = ambiguousBay?.address || \"\";"
+ },
+ "SET1": {
+  "from": "    if (!nearChip && !farChip) return at(\"far\", first,",
+  "to": "    if (!nearChip && !farChip) return null && at(\"far\", first,"
+ },
+ "SET2": {
+  "from": "    if (!unit || farChip.controllerId !== unit) return at(",
+  "to": "    if (false) return at("
+ },
+ "SET3": {
+  "from": "      if (ambiguous.has(handle)) return at(",
+  "to": "      if (false) return at("
+ },
+ "SET4": {
+  "from": "      if (left !== undefined) return at(side, left,",
+  "to": "      if (false) return at(side, left,"
+ },
+ "SET5": {
+  "from": "      const whole = context.laneSetClash(model, link);\n      if (whole) found.push(whole);",
+  "to": "      const whole = context.laneSetClash(model, link);"
+ },
+ "RATE5": {
+  "from": "          if (read.some((rate) => rate === null || rate !== lane.rate)) {",
+  "to": "          if (read.some((rate) => rate !== null && rate !== lane.rate)) {"
+ },
+ "RATE6": {
+  "from": "          if (listed.some(([table, phys]) => phys.some((phy) => rowRate(table, phy) !== lanes.rate))) lanes.rate = null;",
+  "to": ""
  }
 }

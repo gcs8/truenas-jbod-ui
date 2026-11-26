@@ -296,13 +296,21 @@ test("a cable-error PASS counts cable ends and an extra uplink PHY apart where t
   for (const expander of data.fabric.expanders) for (const row of expander.phys) Object.assign(row, { counter_state: "measured", invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 });
   const link = data.fabric.links.find((entry) => entry.reported_lanes);
   const rows = data.fabric.expanders.find((entry) => entry.id === link.target).phys;
-  // An uplink row of its own: it names an HBA PHY no cable uses, so the
-  // cable's own rows stay the only ones naming its ends.
-  rows.push({ ...rows.find((entry) => Number(entry.phy) === 32), phy: "91", remote_phy: "7" });
+  // An uplink row of its own: it names another initiator of the unit, not
+  // this cable's HBA, so the cable's own rows stay the only ones naming its
+  // ends.
+  const uplink = { ...rows.find((entry) => Number(entry.phy) === 32), phy: "91", remote_phy: "7", dev_handle: "0002" };
+  rows.push(uplink);
   const found = checksOf(coreModel(data), "cable-errors");
   const pass = found.find((entry) => entry.status === "pass");
   assert.ok(pass, textOf(found));
   assert.match(textOf(pass.lines), /cable ends? and 1 uplink PHY/, textOf(pass.lines));
+  // Where that row names this cable's HBA, the lane list leaves out a row by
+  // which the two ends name each other: the cable's members are not read.
+  uplink.dev_handle = "0001";
+  const named = checksOf(coreModel(data), "cable-errors");
+  assert.ok(!named.some((entry) => entry.status === "pass"), textOf(named));
+  assert.match(textOf(named), /PHY 91 of 5000c50000000e01 also names mpr0, which the lane list leaves out/);
 });
 
 test("a far row that names another device or PHY is no lane of the cable, though another expander's row names the near PHY", () => {

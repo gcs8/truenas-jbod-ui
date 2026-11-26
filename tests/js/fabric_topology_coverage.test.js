@@ -720,6 +720,117 @@ function subjectDeletions(fabric, built) {
       }
     }
   }
+  // The whole evidence of each subject, not part of it (#1504): a lane
+  // list shorter than the rows by which its two ends name each other, or
+  // whose ends are rows of two controller units, is no cable's membership;
+  // a speed blanked on either end leaves that lane's rate not read on every
+  // surface.
+  const unusedPhy = (rows) => {
+    const used = new Set(rows.map((entry) => Number(entry.phy)));
+    let phy = 80;
+    while (used.has(phy)) phy += 1;
+    return phy;
+  };
+  for (const link of fabric.links.filter((entry) => entry.reported_lanes?.lanes?.length && (fabric.expanders || []).some((item) => item.id === entry.target))) {
+    const [lane] = link.reported_lanes.lanes;
+    const rowOf = (copy, id, phy) => coreRows(copy, id).find((entry) => Number(entry.phy) === phy);
+    const tableOf = (copy, id) => (copy.fabric.controllers || []).find((entry) => entry.id === id)?.phy_rows || (copy.fabric.expanders || []).find((entry) => entry.id === id)?.phys;
+    const lengthen = (copy, id, phy, extra = {}) => {
+      const rows = tableOf(copy, id);
+      const row = rowOf(copy, id, phy);
+      if (!rows || !row) return false;
+      rows.push({ ...row, phy: String(unusedPhy(rows)), ...extra, ...(row.counter_state ? { counter_state: "measured", not_read: [], invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 } : {}) });
+      return true;
+    };
+    const longer = {
+      "near table longer than the list": (copy) => lengthen(copy, link.source, lane.source_phy),
+      "far table longer than the list": (copy) => lengthen(copy, link.target, lane.target_phy, { remote_phy: String(unusedPhy(tableOf(copy, link.source) || [])) }),
+    };
+    for (const [label, change] of Object.entries(longer)) {
+      out.push({ name: `${link.id} ${label}`, checks: ["lanes"], tokens: [link.source, link.target], change,
+        expect: (after, why) => assert.match(textOf(checksOf(after, "lanes")), /which the lane list leaves out/, `${why}: the longer table is not said`) });
+    }
+    // The far chip a row of another controller unit: the same handles there
+    // name another device.
+    const far = (fabric.expanders || []).find((item) => item.id === link.target);
+    const other = (fabric.controllers || []).find((item) => item.id !== far.controller_id);
+    if (other) {
+      out.push({ name: `${link.id} far end of another controller unit`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
+        copy.fabric.expanders.find((item) => item.id === link.target).controller_id = other.id;
+        return true;
+      }, expect: (after, why) => assert.match(textOf(checksOf(after, "lanes")), /another controller unit/, `${why}: the other unit is not said`) });
+    }
+    for (const [side, id, phy] of [["near", link.source, lane.source_phy], ["far", link.target, lane.target_phy]]) {
+      out.push({ name: `${link.id} ${side} speed blanked`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
+        const row = rowOf(copy, id, phy);
+        if (!row?.speed) return false;
+        row.speed = null;
+        return true;
+      }, expect: (after, why) => {
+        const drawn = after.links.flatMap((entry) => [entry, ...(entry.stubCables || [])]).find((entry) => entry.source === link.source && entry.target === link.target && entry.lanes);
+        const value = (T.detailFor(after, { kind: "link", id: drawn.id })?.html || "").match(new RegExp(`Lane PHY ${lane.source_phy} ↔ ${lane.target_phy}</span><span[^>]*>([^<]*)`))?.[1] || "";
+        assert.match(value, /^rate not read/, `${why}: the lane's rate is shown though one end's row reads none: ${value}`);
+      } });
+    }
+  }
+  // A list without pairs (sysfs reports a port on the parent only): a speed
+  // blanked on one PHY it lists leaves the list's rate not read.
+  for (const link of fabric.links.filter((entry) => LANE_KINDS.has(entry.kind) && entry.reported_lanes?.source_phys?.length && !entry.reported_lanes?.lanes?.length)) {
+    const phy = link.reported_lanes.source_phys[0];
+    const rowsOf = (copy) => phyRows(copy.fabric.nodes.find((entry) => entry.id === link.source)).filter((entry) => Number(entry.phy) === phy && entry.negotiated_rate_gbps !== null && entry.negotiated_rate_gbps !== undefined);
+    if (!rowsOf({ fabric }).length) continue;
+    out.push({ name: `${link.id} near PHY ${phy} speed blanked`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
+      for (const entry of rowsOf(copy)) Object.assign(entry, { negotiated_rate_gbps: null, negotiated_link_rate: null, speed: null });
+      return true;
+    } });
+  }
+  // One disk port address in two enclosures, joined to a claimed disk PHY's
+  // own record through its slot: the address identifies no disk, so it
+  // bridges nothing, and the PHY's fault is no bay's.
+  census.forEach((port, index) => {
+    if (port.remote_kind !== "end_device" || !port.has_block || !port.remote_sas_address || port.bay_identifier === null || port.bay_identifier === undefined || !port.enclosure_identifier) return;
+    const claimed = (port.phys || []).filter((phy) => built.bays.some((bay) => bay.ports.some((item) => item.expanderId === port.owner_id && item.phy?.phy === phy)));
+    if (!claimed.length) return;
+    const counted = nodes.get(port.owner_id)?.kind !== "controller" || phyRows(nodes.get(port.owner_id)).some((entry) => entry.counter_state);
+    const bridged = `${port.remote_sas_address.slice(0, -4)}f00d`;
+    const elsewhere = `${port.enclosure_identifier.slice(0, -2)}${port.enclosure_identifier.endsWith("aa") ? "bb" : "aa"}`;
+    const bridge = (copy) => {
+      copy.fabric.raw.sas_transport_ports.push({ ...port, id: `${port.id}-foreign`, remote_sas_address: bridged, enclosure_identifier: elsewhere },
+        { ...port, id: `${port.id}-bridge`, remote_sas_address: bridged });
+      return true;
+    };
+    out.push({ name: `census ${index} address in two enclosures bridging its slot`, checks: ["port-errors"], tokens: [port.owner_id, ...claimed.map((phy) => `PHY ${phy}`)], change: bridge });
+    if (counted) {
+      out.push({ name: `census ${index} address in two enclosures bridging its slot, critical on it`, checks: ["port-errors"], tokens: [port.owner_id, `PHY ${claimed[0]}`],
+        faulty: { owner: port.owner_id, phy: claimed[0] }, injected: { phy: claimed[0] }, change: (copy) => bridge(copy) && inject(copy, port.owner_id, claimed[0]),
+        expect: (after, why) => {
+          // A fabric that builds no check list says the fault on the PHY's own card (below).
+          if (!CHECK_IDS(after).length) return;
+          const lines = after.checks.filter((entry) => entry.status === "critical").flatMap((entry) => entry.lines).filter((line) => /10 loss of dword sync/.test(line) && namesPhy(line, claimed[0]));
+          assert.ok(lines.length && lines.every((line) => !/^Bay \d+/.test(line) && /owner not read/.test(line)), `${why}: the fault is charged to a bay through an address that names no one place: ${textOf(lines)}`);
+        } });
+    }
+  });
+  // An HBA list not read beside the records that would name its handles
+  // (the builder that saved the payload kept no per-PHY state): no handle of
+  // that HBA names anything (coverageFirst, below, holds every surface).
+  for (const controller of (fabric.controllers || []).filter((item) => (item.phy_rows || []).some((row) => row.device_handle && row.device_handle !== "0000"))) {
+    for (const list of ["expanders", "devices", "enclosures"]) {
+      out.push({ name: `${controller.id} ${list} list not read, no handle states`, checks: ["lanes"], tokens: [controller.id], change: (copy) => {
+        const entry = copy.fabric.controllers.find((item) => item.id === controller.id);
+        delete entry.device_handle_states;
+        entry.mpr_lists = { expanders: "read", devices: "read", enclosures: "read", [list]: "not_read" };
+        return true;
+      } });
+    }
+    out.push({ name: `${controller.id} no list states at all`, checks: ["lanes"], tokens: [controller.id], change: (copy) => {
+      const entry = copy.fabric.controllers.find((item) => item.id === controller.id);
+      delete entry.device_handle_states;
+      delete entry.mpr_lists;
+      if (copy.fabric.raw?.controller_read?.lists) delete copy.fabric.raw.controller_read.lists[entry.name];
+      return true;
+    } });
+  }
   // A CORE bay path's handle given to another device of its HBA: the
   // enclosure processor, or an expander.
   for (const trace of fabric.traces.filter((entry) => entry.kind === "bay")) {
@@ -1010,6 +1121,45 @@ function assertLocal(before, after, base, copy, deletion, why) {
   }
 }
 
+// Two invariants of the whole-evidence rule, held on every built model.
+// A lane's rate is shown (pin, the cable's per-rate count, the drawn label)
+// only where both ends' own one rows read that rate; a list without pairs
+// only where every PHY it lists reads it.
+const LANE_KINDS = new Set(["controller-expander", "expander-expander"]);
+function laneRatesBacked(built, why) {
+  const table = (id) => built.sas.controllers.get(id) || built.sas.expanders.get(id);
+  const reads = (id, phy, rate) => table(id)?.byPhy.get(phy)?.rate === rate;
+  for (const link of built.links.flatMap((entry) => [entry, ...(entry.stubCables || [])]).filter((entry) => entry.lanes && LANE_KINDS.has(entry.kind))) {
+    const lanes = link.lanes.rows;
+    const backed = (rate) => (lanes.length ? lanes.filter((lane) => reads(link.source, lane.source, rate) && reads(link.target, lane.target, rate)).length
+      : [[link.source, link.lanes.sourcePhys], [link.target, link.lanes.targetPhys]].filter(([, phys]) => phys.length).every(([id, phys]) => phys.every((phy) => reads(id, phy, rate))) ? link.lanes.count : 0);
+    const html = unescapeHtml(T.detailFor(built, { kind: "link", id: link.id })?.html || "");
+    for (const match of html.matchAll(/Lane PHY (\d+) ↔ (\d+)<\/span><span[^>]*>(\d+(?:\.\d+)?) Gb\/s/g)) {
+      assert.ok(reads(link.source, Number(match[1]), Number(match[3])) && reads(link.target, Number(match[2]), Number(match[3])), `${why}: ${link.id} lane ${match[1]} ↔ ${match[2]} shows ${match[3]} Gb/s, which its ends' rows do not both read`);
+    }
+    const card = (T.cardFor(built, { kind: "link", id: link.id })?.rows || []).find((row) => row.label === "Lanes")?.value || "";
+    for (const match of card.matchAll(/(\d+) at (\d+(?:\.\d+)?) Gb\/s/g)) assert.ok(backed(Number(match[2])) >= Number(match[1]), `${why}: ${link.id} card says ${match[0]}, ${backed(Number(match[2]))} lanes read it at both ends`);
+    const label = /(\d+(?:\.\d+)?)(?:–(\d+(?:\.\d+)?))? Gb\/s$/.exec(link.labelLines?.[0] || "");
+    if (label && !label[2]) assert.equal(backed(Number(label[1])), link.lanes.count, `${why}: ${link.id} is drawn at ${label[0]}, which not every lane's ends read`);
+  }
+}
+// An HBA whose lists are not all read, or that reports no list states,
+// names no device by any handle and calls none absent, on any surface.
+function coverageFirst(built, why) {
+  if (built.transport) return;
+  for (const [id, record] of built.sas.controllers) {
+    if (record.lists && ["expanders", "devices", "enclosures"].every((key) => record.lists[key] === "read")) continue;
+    if (!built.nodeById.has(id)) continue;
+    const pins = [...(T.detailFor(built, { kind: "node", id })?.html || "").matchAll(/<div class="kv-row[^"]*"[^>]*><span[^>]*>(PHY \d+)<\/span><span[^>]*>([^<]*)<\/span>/g)].map((match) => [match[1], unescapeHtml(match[2])]);
+    for (const [label, value] of pins) {
+      const row = record.byPhy.get(Number(label.slice(4)));
+      if (!row?.handle) continue;
+      assert.doesNotMatch(value, /attached directly|outside this view|^to |^cable to |^a disk the HBA's device list names|^the enclosure processor|^a device the HBA's device list names/, `${why}: ${id} ${label} names what its handle carries though its lists are not all read: ${value}`);
+    }
+    assert.doesNotMatch(textOf(T.cardFor(built, { kind: "node", id })?.rows || []), /attached directly|outside this view/, `${why}: ${id}'s card names a handle's device though its lists are not all read`);
+  }
+}
+
 // What the checks and flags say, as sets: line order is presentation.
 function canonicalChecks(built) {
   const checks = {};
@@ -1021,6 +1171,8 @@ function canonicalChecks(built) {
 function runProperty(name, base, build) {
   const before = build(structuredClone(base));
   namesItsMeasurement(before, `${name}: baseline`);
+  laneRatesBacked(before, `${name}: baseline`);
+  coverageFirst(before, `${name}: baseline`);
   const ids = CHECK_IDS(before);
   const critical = new Set(ids.filter((id) => tierOfCheck(before, id).includes("critical")));
   const deletions = subjectDeletions(base.fabric, before);
@@ -1040,6 +1192,9 @@ function runProperty(name, base, build) {
     applied += 1;
     const after = build(copy);
     const why = `${name}: deleting ${deletion.name}`;
+    laneRatesBacked(after, why);
+    coverageFirst(after, why);
+    if (deletion.expect) deletion.expect(after, why);
     if (deletion.permuted) {
       assert.deepEqual(canonicalChecks(after), canonicalChecks(before), `${why}: the same records in another order say something else`);
       continue;

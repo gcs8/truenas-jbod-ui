@@ -1,10 +1,15 @@
 """The Storage Fabric Topology mutation runners judge only what they ran (#1516).
 
-A mutant counts as killed only when an assertion fails in a collected test.
-A missing module or import error (even inside a test that ran), a run whose
-tests only error, no test count, a missing anchor or a missing target file is
-an error that fails the run, never a kill. Each case runs the real runner on
-a disposable tree with its own tiny module and tests.
+A mutant counts as killed only when a collected test fails on the mutated
+behaviour: an assertion, or an exception thrown from the product. A missing
+module or import error (even inside a test that ran), a class or module
+fixture error, an exception from test or harness code (even beside a test
+that a kill would count), a hook failure, no test count, a missing anchor
+or a missing target file is an error that fails the run, never a kill; so
+is an unmutated run that reads a file outside the CI job's path filter.
+Each case runs the real runner on a disposable tree with its own tiny
+module and tests: a deliberately broken harness, and a deliberately broken
+target, in each direction.
 """
 
 from __future__ import annotations
@@ -47,6 +52,8 @@ class BackendRunnerTests(unittest.TestCase):
         (self.tree / "selftests").mkdir()
         (self.tree / "selftests" / "__init__.py").write_text("", encoding="utf-8")
         (self.tree / "selftests" / "test_value.py").write_text(TESTS, encoding="utf-8")
+        (self.tree / ".github" / "workflows").mkdir(parents=True)
+        (self.tree / ".github" / "workflows" / "ci.yml").write_text("          pattern='^(selftarget\\.py|selftests/.*|\\.github/.*)$'\n", encoding="utf-8")
         self.modules = ["selftests.test_value"]
 
     def judge(self, old: str, new: str, path: str = "selftarget.py") -> dict:
@@ -91,6 +98,61 @@ class BackendRunnerTests(unittest.TestCase):
         self.assertEqual(self.runner.stock_problems(code, stderr, ["selftests.test_value"]), [])
 
 
+    def test_an_exception_the_product_raises_through_the_standard_library_is_a_kill(self) -> None:
+        # The innermost frame is the json module; the innermost one inside
+        # the tree is the mutated product.
+        self.assertEqual(self.judge("    return 1\n", "    import json\n    return json.loads('not json')\n")["verdict"], "killed")
+
+    def test_a_class_fixture_that_calls_the_broken_target_is_an_error_not_a_kill(self) -> None:
+        # The target raises inside setUpClass: its class's test never runs,
+        # and no collected test fails, though other tests pass.
+        (self.tree / "selftests" / "test_value.py").write_text(
+            "import unittest\n\nfrom selftarget import untested, value\n\n\n"
+            "class Setup(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        cls.value = value()\n\n"
+            "    def test_value(self):\n        self.assertEqual(self.value, 1)\n\n\n"
+            "class Other(unittest.TestCase):\n    def test_other(self):\n        self.assertEqual(untested(), 3)\n", encoding="utf-8")
+        result = self.judge("    return 1\n", "    raise ValueError(\"broken target\")\n")
+        self.assertEqual(result["verdict"], "error", result)
+        self.assertIn("fixture", result["detail"])
+
+    def test_a_test_code_exception_beside_an_assertion_failure_is_an_error(self) -> None:
+        # The broken target fails one test's assertion; the harness of
+        # another test raises on its own. The run must not pass as a kill.
+        (self.tree / "selftests" / "test_value.py").write_text(TESTS + (
+            "\n    def test_fixture(self):\n        fixture = type('Fixture', (), {'value': 1}) if value() == 1 else None\n        self.assertEqual(fixture.value, 1)\n"), encoding="utf-8")
+        result = self.judge("    return 1\n", "    return 2\n")
+        self.assertEqual(result["verdict"], "error", result)
+        self.assertIn("beside 1", result["detail"])
+
+    def test_the_unmutated_run_fails_on_a_read_outside_the_ci_path_filter(self) -> None:
+        trace = self.tree / "reads.log"
+        code, stderr = self.runner._run_modules(self.tree, self.modules, verbose=True, trace=trace)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.runner.scope_problems(self.tree, trace), [])
+        # A test that reads a file the filter misses, opened and given to a
+        # child process stripped of the tracer's path.
+        (self.tree / "docs").mkdir()
+        (self.tree / "docs" / "outside.txt").write_text("x\n", encoding="utf-8")
+        (self.tree / "docs" / "child.py").write_text("print(1)\n", encoding="utf-8")
+        (self.tree / "selftests" / "test_reads.py").write_text(
+            "import os\nimport subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n\n"
+            "class Reads(unittest.TestCase):\n    def test_reads(self):\n"
+            "        self.assertEqual(Path('docs/outside.txt').read_text(), 'x\\n')\n"
+            "        env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}\n"
+            "        subprocess.run([sys.executable, 'docs/child.py'], env=env, check=True, capture_output=True)\n", encoding="utf-8")
+        trace.unlink()
+        code, stderr = self.runner._run_modules(self.tree, [*self.modules, "selftests.test_reads"], verbose=True, trace=trace)
+        self.assertEqual(code, 0, stderr)
+        problems = self.runner.scope_problems(self.tree, trace)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("docs/child.py", problems[0])
+        self.assertIn("docs/outside.txt", problems[1])
+        # The filter itself missing is no pass.
+        (self.tree / ".github" / "workflows" / "ci.yml").write_text("on: push\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.runner.scope_problems(self.tree, trace)
+
+
 class FrontendRunnerTests(unittest.TestCase):
     """The frontend runner on a disposable tree: one topology script, a
     required test list, one hook. A kill needs a failing assertion in a real
@@ -105,6 +167,7 @@ class FrontendRunnerTests(unittest.TestCase):
         (self.tree / "tests" / "mutation").mkdir(parents=True)
         for name in ("run_topology_frontend_mutants.cjs", "topology_frontend_hook.cjs"):
             shutil.copy2(MUTATION / name, self.tree / "tests" / "mutation" / name)
+        shutil.copytree(MUTATION / "read_trace", self.tree / "tests" / "mutation" / "read_trace")
         (self.tree / "app" / "static").mkdir(parents=True)
         (self.tree / "app" / "static" / "sas_fabric_topology_selftest.js").write_text(
             "module.exports = { value: () => 1, other: () => 3 };\n", encoding="utf-8")
@@ -112,6 +175,8 @@ class FrontendRunnerTests(unittest.TestCase):
         self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().value(), 1);")
         self.write_test("fabric_linux_sas_transport.test.js", "assert.equal(1, 1);")
         self.lists({"stages": [["tests/js/fabric_topology_selftest.test.js", "tests/js/fabric_linux_sas_transport.test.js"]]}, {})
+        (self.tree / ".github" / "workflows").mkdir(parents=True)
+        (self.tree / ".github" / "workflows" / "ci.yml").write_text("          pattern='^(app/.*|tests/.*|\\.github/.*)$'\n", encoding="utf-8")
 
     def write_test(self, name: str, body: str, top: str = "") -> None:
         # The product is run by path, as the topology helper runs scripts.
@@ -171,6 +236,65 @@ class FrontendRunnerTests(unittest.TestCase):
         code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
         self.assertEqual(code, 1, out)
         self.assertIn("missing", out)
+
+    def test_an_exception_from_an_unnamed_script_a_test_evaluates_is_an_error_not_a_kill(self) -> None:
+        # The broken target returns null; the test's own helper evaluates
+        # an unnamed script with it, which throws. No product frame threw.
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(fixtureOf(load().value()), undefined);",
+                        top="const fixtureOf = (value) => vm.runInNewContext(`(${JSON.stringify(value)}).fixture`);")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => null"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"m\s+error")
+        self.assertIn("neither an assertion nor a product exception", out)
+
+    def test_a_harness_exception_beside_an_assertion_failure_is_an_error(self) -> None:
+        # One test fails its assertion on the broken target; another test's
+        # own fixture raises. The run must not pass as a kill.
+        (self.tree / "tests" / "js" / "fabric_topology_selftest.test.js").write_text(
+            "\"use strict\";\nconst assert = require(\"node:assert/strict\");\nconst test = require(\"node:test\");\n"
+            "const fs = require(\"node:fs\");\nconst path = require(\"node:path\");\nconst vm = require(\"node:vm\");\n"
+            "const load = () => { const file = path.join(__dirname, \"..\", \"..\", \"app\", \"static\", \"sas_fabric_topology_selftest.js\");"
+            " const module = { exports: {} }; vm.runInNewContext(fs.readFileSync(file, \"utf8\"), { module, require }, { filename: file }); return module.exports; };\n"
+            "test(\"selftest\", () => { assert.equal(load().value(), 1); });\n"
+            "test(\"fixture\", () => { const fixture = load().value() === 1 ? {} : null; assert.equal(fixture.missing, undefined); });\n", encoding="utf-8")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"m\s+error")
+        self.assertIn("beside 1 that did", out)
+
+    def test_a_hook_that_fails_is_an_error_not_a_kill(self) -> None:
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().other(), 3);",
+                        top="test.before(() => { if (load().value() !== 1) throw new Error(\"hook\"); });")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"m\s+error")
+
+    def test_an_exception_the_product_throws_through_a_native_frame_is_a_kill(self) -> None:
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => JSON.parse(\"not json\")"}}, "m")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"m\s+killed")
+
+    def test_the_unmutated_run_fails_on_a_read_outside_the_ci_path_filter(self) -> None:
+        (self.tree / "docs").mkdir()
+        (self.tree / "docs" / "outside.json").write_text("{}\n", encoding="utf-8")
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().value(), 1); assert.deepEqual(JSON.parse(fs.readFileSync(path.join(__dirname, \"..\", \"..\", \"docs\", \"outside.json\"), \"utf8\")), {});")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the tests read docs/outside.json, which the CI path filter of this job does not cover", out)
+        # Read by a child process the test starts, without the tracer.
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().value(), 1); require(\"node:child_process\").execFileSync(process.execPath, [path.join(__dirname, \"..\", \"..\", \"docs\", \"child.js\")], { env: {} });")
+        (self.tree / "docs" / "outside.json").unlink()
+        (self.tree / "docs" / "child.js").write_text("process.exit(0);\n", encoding="utf-8")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the tests read docs/child.js", out)
+        # The filter itself missing is no pass.
+        (self.tree / "docs" / "child.js").unlink()
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().value(), 1);")
+        (self.tree / ".github" / "workflows" / "ci.yml").write_text("on: push\n", encoding="utf-8")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertIn("CI path filter of the topology mutation job is not found", out)
 
     def test_a_topology_test_file_the_list_does_not_name_fails_the_run(self) -> None:
         self.write_test("fabric_topology_unlisted.test.js", "assert.equal(1, 1);")

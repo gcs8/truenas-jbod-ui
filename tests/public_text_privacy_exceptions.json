@@ -426,7 +426,15 @@
   "tests/js/fabric_topology_unread_evidence.test.js": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:b894972671e18774812ec4dffcf58b47022aed4a55c07ef70cb0105c29cdd003": 11
+        "sha256:a0ed08dfbd4a4204a1127efe56bbde7526da3acc8eaf6fb3f29f545bc6a0d6ec": 12
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_whole_evidence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:5368930778f647e6737117cc12e5345c46a21fcd03b90075add8c47280584362": 13
       }
     },
     "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."

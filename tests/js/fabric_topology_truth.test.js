@@ -9,6 +9,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const H = require("./helpers/fabric_topology");
+const path = require("node:path");
 
 const cases = H.producerCases();
 
@@ -416,7 +417,7 @@ function loadPage(T, fabric, snapshot) {
   assert.ok(end > 0);
   vm.runInContext(`${source.slice(0, end)}
     window.renderTest = { renderMap, renderInspector, ensureSelectionForMode, setSelectionRef, state };
-  })();`, sandbox);
+  })();`, sandbox, { filename: path.join(H.ROOT, "app/static/sas_fabric_view.js") });
   return { api: sandbox.window.renderTest, elements };
 }
 
@@ -779,7 +780,7 @@ function loadFullPage(T, sharedDocument, fabric, snapshot, customize = () => {},
     document: sharedDocument,
   });
   page?.bind(sandbox.window);
-  vm.runInContext(source.replace(/\}\)\(\);\s*$/, "  window.__page = { state, render };\n})();"), sandbox);
+  vm.runInContext(source.replace(/\}\)\(\);\s*$/, "  window.__page = { state, render };\n})();"), sandbox, { filename: path.join(H.ROOT, "app/static/sas_fabric_view.js") });
   const click = (mode) => buttons.find((button) => button.dataset.fabricMode === mode).handlers.get("click")();
   return { page: sandbox.window.__page, elements, click, sandbox };
 }
@@ -1485,7 +1486,8 @@ function bigShelf() {
     enclosures.push(H.addEnclosure(fabric, name, "0x0001", `SYNTH-JBOD-${side ? "B" : "A"}`, exp.id).id);
   }
   H.addBays(fabric, H.range(0, 1024), enclosures, [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }]);
-  return fabric;
+  // Both ends' rows, as the builder reports them: the cables' lanes are read.
+  return H.reciprocalTables(fabric);
 }
 
 test("a visible expand control stays at its place on the screen also next to the drawing's left or top edge", () => {

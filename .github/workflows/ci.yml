@@ -1329,12 +1329,16 @@ jobs:
           fi
           # Every file the mutation runners mutate, import or read, their
           # mutant and test lists, and the workflow itself; a contract test
-          # (tests/test_ci_contract.py) holds this pattern to that set.
-          pattern='^(app/.*|history_service/.*|qa/ui-crawl/.*|tests/js/helpers/.*|tests/js/fabric_topology[^/]*\.test\.js|tests/js/fabric_linux_sas_transport\.test\.js|tests/fixtures/.*|tests/mutation/.*|tests/(__init__|inventory_fixtures|topology_generality_fixtures|test_inventory|test_core_fabric_direct_paths|test_sas_fabric|test_core_fabric_legacy_controller|test_linux_sas_transport|test_fabric_topology_fixture|test_core_adapter_summary_admission|test_topology_mutation_runners)\.py|package(-lock)?\.json|requirements[^/]*\.txt|\.github/workflows/ci\.yml)$'
+          # (tests/test_ci_contract.py) holds this pattern to that set, and
+          # each runner's unmutated run fails when its tests read a tracked
+          # file this pattern misses (tests/mutation/read_trace/).
+          pattern='^(app/.*|history_service/.*|qa/ui-crawl/.*|qa/ui-states\.json|scripts/(build_current_source_browser_fixture|build_ui_crawl_fixture|preview_system_sas_fabric)\.py|tests/js/helpers/.*|tests/js/fabric_topology[^/]*\.test\.js|tests/js/fabric_linux_sas_transport\.test\.js|tests/js/fabric_aggregate_provenance\.test\.js|tests/fixtures/.*|tests/mutation/.*|tests/(__init__|inventory_fixtures|topology_generality_fixtures|test_inventory|test_core_fabric_direct_paths|test_sas_fabric|test_core_fabric_legacy_controller|test_linux_sas_transport|test_fabric_topology_fixture|test_core_adapter_summary_admission|test_topology_mutation_runners|test_history_bulk_bounds|test_snapshot_export|wait_bounds)\.py|package(-lock)?\.json|requirements[^/]*\.txt|\.github/workflows/ci\.yml)$'
           # The changed names go to a file first: a pipe into an early-exiting
           # grep can kill git with SIGPIPE and, under pipefail, skip the run.
           changed="${RUNNER_TEMP:-/tmp}/topology-changed-files.txt"
-          git diff --name-only "${range}" > "${changed}"
+          # --no-renames: a renamed file is its old path and its new one, so
+          # moving a covered file away still runs the job.
+          git diff --name-only --no-renames "${range}" > "${changed}"
           if grep -Eq "${pattern}" "${changed}"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Topology code or tests changed in ${range}: running the mutants."

@@ -14,6 +14,10 @@ const vm = require("node:vm");
 const ROOT = path.resolve(__dirname, "../../..");
 const TOPOLOGY_PATHS = ["sas_fabric_topology_layout.js", "sas_fabric_topology_ui.js", "sas_fabric_topology_evidence.js", "sas_fabric_topology.js"].map((name) => path.join(ROOT, "app/static", name));
 function topologySource() { return TOPOLOGY_PATHS.map((file) => fs.readFileSync(file, "utf8")).join("\n"); }
+// The name a test gives the joined topology scripts when it runs them as
+// one script, so an exception thrown from them names the product (the
+// mutation runner counts only those, and assertion failures, as kills).
+const TOPOLOGY_JOINED = path.join(ROOT, "app/static/sas_fabric_topology.joined.js");
 const FIXTURE_PATH = path.join(ROOT, "tests/fixtures/sas_fabric/topology_fabric.json");
 
 function loadTopology(context = {}) {
@@ -133,6 +137,51 @@ function addBays(fabric, slots, enclosureIds, paths = []) {
 }
 
 
+// The PHY tables the CORE builder reports beside a lane list, for a drawing
+// built from the helpers above: each listed lane as a row at both ends
+// naming the other (the HBA's own handle 0001, each expander its own handle
+// in its controller unit), every list read. The view shows a lane list as
+// read only where both ends' rows name each other and read its rate; a
+// drawing without them shows its lists as reported. No maximum is given, so
+// no lane is judged against one.
+function reciprocalTables(fabric) {
+  const controllers = new Map();
+  const expanders = new Map();
+  const next = new Map();
+  const handleIn = (unit) => {
+    const value = (next.get(unit) || 8) + 1;
+    next.set(unit, value);
+    return value.toString(16).padStart(4, "0");
+  };
+  const hba = (id) => {
+    if (!controllers.has(id)) controllers.set(id, { id, name: id.replace(/^controller:/, ""), phy_rows: [], mpr_lists: { expanders: "read", devices: "read", enclosures: "read" } });
+    return controllers.get(id);
+  };
+  const chip = (id) => {
+    if (!expanders.has(id)) {
+      const item = fabric.nodes.find((entry) => entry.id === id);
+      expanders.set(id, { id, controller_id: item.controller_id, sas_address: item.raw_id, dev_handle: handleIn(item.controller_id), parent: null, phys: [] });
+    }
+    return expanders.get(id);
+  };
+  const rate = (value) => (value === null || value === undefined ? null : Number(value).toFixed(1));
+  for (const item of fabric.links.filter((entry) => ["controller-expander", "expander-expander"].includes(entry.kind) && entry.reported_lanes?.lanes?.length)) {
+    const fromHba = item.kind === "controller-expander";
+    const child = chip(item.target);
+    child.parent = fromHba ? "0001" : chip(item.source).dev_handle;
+    for (const lane of item.reported_lanes.lanes) {
+      const speed = rate(lane.negotiated_rate_gbps);
+      if (fromHba) hba(item.source).phy_rows.push({ phy: String(lane.source_phy), device: "SAS Initiator", device_handle: child.dev_handle, controller_handle: "0001", speed });
+      else chip(item.source).phys.push({ phy: String(lane.source_phy), device: "Edge Expander", dev_handle: child.dev_handle, remote_phy: String(lane.target_phy), speed, counter_state: "no_route" });
+      child.phys.push({ phy: String(lane.target_phy), device: fromHba ? "SAS Initiator" : "Edge Expander", dev_handle: child.parent, remote_phy: String(lane.source_phy), speed, counter_state: "no_route" });
+    }
+  }
+  fabric.controllers = [...controllers.values()];
+  fabric.expanders = [...expanders.values()];
+  fabric.raw.controller_read.lists = Object.fromEntries([...controllers.values()].map((entry) => [entry.name, entry.mpr_lists]));
+  return fabric;
+}
+
 const range = (start, end) => Array.from({ length: end - start }, (_, index) => start + index);
 const DUAL = [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }];
 
@@ -231,6 +280,7 @@ module.exports = {
   ROOT,
   loadTopology,
   topologySource,
+  TOPOLOGY_JOINED,
   producerCases,
   sasAddress,
   node,
@@ -241,4 +291,5 @@ module.exports = {
   addExpander,
   addEnclosure,
   addBays,
+  reciprocalTables,
 };

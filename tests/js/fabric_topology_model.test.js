@@ -18,10 +18,12 @@ const TOPOLOGY_PATH = path.join(ROOT, "app/static/sas_fabric_topology.js");
 const FABRIC_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
 const NOT_COLLECTED = "HBA and expander hops are not collected on this platform.";
 
+const H = require("./helpers/fabric_topology");
+
 function loadTopology() {
   assert.ok(fs.existsSync(TOPOLOGY_PATH), "app/static/sas_fabric_topology.js must exist");
   const sandbox = vm.createContext({ window: {} });
-  vm.runInContext(require("./helpers/fabric_topology").topologySource(), sandbox);
+  vm.runInContext(H.topologySource(), sandbox, { filename: H.TOPOLOGY_JOINED });
   const api = sandbox.window.SasFabricTopology;
   assert.ok(api, "the file must publish window.SasFabricTopology");
   return api;
@@ -264,6 +266,13 @@ test("two HBAs, dual path, level-2 cascade: the level-2 expander hangs off its l
 test("a link with reported lanes is labelled with lane count, PHYs at both ends and rate; a null one is drawn as not reported", () => {
   const T = loadTopology();
   const reported = oneHbaOneExpander({ reported: lanes([0, 1, 2, 3], [32, 33, 34, 35]) });
+  // A list with no PHY table at either end is only what was reported: its
+  // rate and membership are not read on the drawn label.
+  const tableless = T.buildTopologyModel(structuredClone(reported.fabric)).linkById.get(`controller-expander:${reported.hba.id}->${reported.exp.id}`);
+  assert.deepEqual([...tableless.labelLines], ["x4 · rate not reported", "PHY 0–3 ↔ 32–35", "membership not read"]);
+  assert.equal(tableless.lanes.rate, null);
+  // Both ends' rows, as the builder reports them beside the list.
+  H.reciprocalTables(reported.fabric);
   const model = T.buildTopologyModel(reported.fabric);
   const item = model.linkById.get(`controller-expander:${reported.hba.id}->${reported.exp.id}`);
   assert.equal(item.lanesState, "reported");
@@ -280,7 +289,7 @@ test("a link with reported lanes is labelled with lane count, PHYs at both ends 
   // A reported link without a common rate never gets one invented.
   const noRate = lanes([4, 5], [8, 9], null);
   const rateless = oneHbaOneExpander({ reported: noRate });
-  const rateModel = T.buildTopologyModel(rateless.fabric);
+  const rateModel = T.buildTopologyModel(H.reciprocalTables(rateless.fabric));
   const rateLink = rateModel.linkById.get(`controller-expander:${rateless.hba.id}->${rateless.exp.id}`);
   assert.deepEqual([...rateLink.labelLines], ["x2 · rate not reported", "PHY 4–5 ↔ 8–9"]);
   assert.equal(rateLink.lanes.rate, null);
@@ -517,7 +526,7 @@ test("the Storage Fabric page registers Topology as a fifth mode and hands it th
   assert.ok(end > 0);
   vm.runInContext(`${FABRIC_SOURCE.slice(0, end)}
     window.renderTest = { renderMap, renderModeChrome, state };
-  })();`, sandbox);
+  })();`, sandbox, { filename: path.join(ROOT, "app/static/sas_fabric_view.js") });
   const api = sandbox.window.renderTest;
   assert.equal(api.state.mode, "topology");
   api.state.fabric = fabric;

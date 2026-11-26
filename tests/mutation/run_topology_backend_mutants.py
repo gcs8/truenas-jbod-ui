@@ -4,18 +4,22 @@
 Each mutant is one textual change to a topology producer module. The run
 copies the tracked tree to a temporary directory once per worker, plants one
 mutant at a time there (never in the checkout), runs the producer test
-modules, and restores the file. A mutant is killed when a test assertion
-fails with it in place.
+modules, and restores the file.
 
 A mutant counts as killed only when a collected test fails on the mutated
 behaviour: an assertion failure (a FAIL), or an error whose exception was
-thrown from product code (app/, or the mutated file). The run fails when the unmutated modules fail or run no
-test, when a mutant's anchor is missing or not unique, when the mutated
+thrown from product code (the innermost frame inside the tree is under app/,
+or is the mutated file). The run fails when the unmutated modules fail or
+run no test, when the unmutated run reads a tracked file the CI job's path
+filter does not cover (read_trace/ records every file it and its children
+open), when a mutant's anchor is missing or not unique, when the mutated
 module does not compile, when a test module does not load, when a missing
 module or an import error appears anywhere in the run (even inside a test
-that ran), when a mutant only makes tests error from test code or a product exception, when a mutant survives that topology_equivalent_mutants.json does
-not list with a reason, and when a listed equivalent is killed or no longer
-exists.
+that ran), when a class or module fixture (setUpClass, setUpModule and their
+teardowns) errors, when any test errors from test code, even beside a test
+that a kill would count, when a mutant survives that
+topology_equivalent_mutants.json does not list with a reason, and when a
+listed equivalent is killed or no longer exists.
 
 Usage: python tests/mutation/run_topology_backend_mutants.py [--jobs N] [NAME ...]
 """
@@ -107,26 +111,62 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _environment() -> dict[str, str]:
+TRACE = Path(__file__).resolve().with_name("read_trace")
+
+
+def _environment(trace: Path | None = None) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if trace is not None:
+        # The unmutated run records every file it and its children read.
+        env["PYTHONPATH"] = str(TRACE)
+        env["NODE_OPTIONS"] = f"{env.get('NODE_OPTIONS', '')} --require={TRACE / 'trace.cjs'}".strip()
+        env["TOPOLOGY_READ_TRACE"] = str(trace)
     return env
 
 
-def _copy_tree(into: Path) -> None:
+def _tracked() -> list[str]:
     files = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=ROOT, capture_output=True, check=True).stdout.split(b"\0")
-    for name in filter(None, files):
-        source = ROOT / os.fsdecode(name)
+    return [os.fsdecode(name) for name in files if name]
+
+
+def _copy_tree(into: Path) -> None:
+    for name in _tracked():
+        source = ROOT / name
         if source.is_file():
-            target = into / os.fsdecode(name)
+            target = into / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
 
-def _run_modules(tree: Path, modules: list[str] | None = None, verbose: bool = False) -> tuple[int, str]:
+def _run_modules(tree: Path, modules: list[str] | None = None, verbose: bool = False,
+                 trace: Path | None = None) -> tuple[int, str]:
     result = subprocess.run([sys.executable, "-m", "unittest", *(["-v"] if verbose else []), *(modules or MODULES)],
-                            cwd=tree, env=_environment(), capture_output=True, text=True, timeout=1800)
+                            cwd=tree, env=_environment(trace), capture_output=True, text=True, timeout=1800)
     return result.returncode, result.stderr
+
+
+def scope_pattern(tree: Path) -> re.Pattern[str]:
+    """The CI job's path filter, as its workflow gives it."""
+    workflow = tree / ".github" / "workflows" / "ci.yml"
+    found = re.search(r"^\s*pattern='([^']+)'$", workflow.read_text(encoding="utf-8"), re.M) if workflow.is_file() else None
+    if found is None:
+        raise ValueError("the CI path filter of the topology mutation job is not found in .github/workflows/ci.yml")
+    return re.compile(found.group(1))
+
+
+def scope_problems(tree: Path, trace: Path, files: list[str] | None = None) -> list[str]:
+    """Every file of the tree a traced run read that the CI path filter misses."""
+    pattern = scope_pattern(tree)
+    known = set(files) if files is not None else {path.relative_to(tree).as_posix() for path in tree.rglob("*") if path.is_file()}
+    read: set[str] = set()
+    for line in trace.read_text(encoding="utf-8").splitlines() if trace.is_file() else []:
+        try:
+            read.add(Path(line).resolve().relative_to(tree.resolve()).as_posix())
+        except ValueError:
+            continue
+    return [f"the tests read {name}, which the CI path filter of this job does not cover (.github/workflows/ci.yml)"
+            for name in sorted(read & known) if not pattern.match(name)]
 
 
 def stock_problems(code: int, stderr: str, modules: list[str]) -> list[str]:
@@ -156,16 +196,23 @@ _FRAME = re.compile(r'^\s*File "([^"]+)", line \d+', re.M)
 
 
 def _thrown_from_product(trace: str, tree: Path | None, product: set[str]) -> bool:
-    """Whether the innermost frame of a traceback is product code."""
-    frames = _FRAME.findall(trace)
-    if not frames:
-        return False
-    innermost = Path(frames[-1])
-    try:
-        relative = innermost.resolve().relative_to(tree.resolve()).as_posix() if tree else innermost.as_posix()
-    except ValueError:
-        return False
-    return relative.startswith("app/") or relative in product
+    """Whether the innermost frame of a traceback inside the tree is product code.
+
+    Frames outside the tree (the standard library a product function called)
+    are passed over; the innermost one inside it decides.
+    """
+    for frame in reversed(_FRAME.findall(trace)):
+        try:
+            relative = Path(frame).resolve().relative_to(tree.resolve()).as_posix() if tree else Path(frame).as_posix()
+        except ValueError:
+            continue
+        return relative.startswith("app/") or relative in product
+    return False
+
+
+# A class or module fixture's error is reported under the fixture's name:
+# no collected test ran and failed.
+_FIXTURES = {"setUpClass", "tearDownClass", "setUpModule", "tearDownModule"}
 
 
 def classify(code: int, stderr: str, tree: Path | None = None, product: set[str] | None = None) -> tuple[str, str]:
@@ -179,12 +226,22 @@ def classify(code: int, stderr: str, tree: Path | None = None, product: set[str]
         return "error", f"a test module did not load: {loading[0]}"
     if _IMPORT.search(stderr):
         return "error", "a missing module or an import error in the run is not a kill"
-    asserted = [test for kind, test, _where, trace in blocks if kind == "FAIL" and "AssertionError" in trace]
-    thrown = [test for kind, test, _where, trace in blocks if kind == "ERROR" and _thrown_from_product(trace, tree, product or set())]
+    fixtures = [f"{test} ({where})" for _kind, test, where, _trace in blocks if test in _FIXTURES]
+    if fixtures:
+        return "error", f"a class or module fixture failed, so no collected test is shown to fail: {fixtures[0]}"
+    # Each failed or errored block on its own: a subtest's error beside a
+    # failed assertion of the same test is still an error.
+    verdicts = ["assertion" if kind == "FAIL" and "AssertionError" in trace
+                else "product" if kind == "ERROR" and _thrown_from_product(trace, tree, product or set()) else "harness"
+                for kind, _test, _where, trace in blocks]
+    asserted = [block[1] for block, verdict in zip(blocks, verdicts) if verdict == "assertion"]
+    thrown = [block[1] for block, verdict in zip(blocks, verdicts) if verdict == "product"]
+    harness = [block[1] for block, verdict in zip(blocks, verdicts) if verdict == "harness"]
+    if code and harness:
+        beside = f" (beside {len(asserted) + len(thrown)} that a kill would count)" if asserted or thrown else ""
+        return "error", f"{len(harness)} tests errored from test code, with no assertion failed and no product exception{beside}: {harness[0]}"
     if code and (asserted or thrown):
         return "killed", f"{len(asserted)} assertion failures and {len(thrown)} product exceptions of {ran}: {(asserted or thrown)[0]}"
-    if code and blocks:
-        return "error", f"{len(blocks)} tests errored from test code, with no assertion failed and no product exception: {blocks[0][1]}"
     if code:
         return "error", f"exit {code} with no failing test"
     return "survived", f"{ran} tests passed"
@@ -231,7 +288,8 @@ def main() -> int:
         trees = [Path(scratch) / f"tree-{index}" for index in range(min(options.jobs, len(names)))]
         for tree in trees:
             _copy_tree(tree)
-        code, stderr = _run_modules(trees[0], verbose=True)
+        reads = Path(scratch) / "reads.log"
+        code, stderr = _run_modules(trees[0], verbose=True, trace=reads)
         print(f"python {sys.version.split()[0]}; {len(names)} of {len(MUTANTS)} mutants; {len(trees)} at a time")
         print(f"stock: {_ran(stderr)} tests, exit {code}")
         if stock_problems(code, stderr, MODULES):
@@ -239,6 +297,13 @@ def main() -> int:
             print(stderr[-3000:])
             print("FAIL the unmutated modules do not pass")
             return 1
+        # Every tracked file the tests read must be one whose change runs this job.
+        uncovered = scope_problems(trees[0], reads, _tracked())
+        for problem in uncovered:
+            print(f"FAIL {problem}")
+        if uncovered:
+            return 1
+        print("stock: every file the tests read is in the CI path filter")
         queue = list(names)
         results: list[dict[str, object]] = []
 

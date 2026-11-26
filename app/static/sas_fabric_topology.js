@@ -1649,15 +1649,26 @@ function buildTopologyModel(given, options = {}) {
             .filter((lane) => Number.isInteger(lane.source_phy) && Number.isInteger(lane.target_phy))
             .map((lane) => ({ source: lane.source_phy, target: lane.target_phy, rate: sasRate(lane.negotiated_rate_gbps) })),
         };
-        // A lane's rate is read only where both ends' own rows, where they
-        // report one, agree with it: a retained list never outranks its ends.
-        // (A lane is judged only where both ends' rates are read: laneRated.)
-        const endRate = (id, phy) => (sas.controllers.get(id) || sas.expanders.get(id))?.byPhy.get(phy)?.rate ?? null;
+        // A lane's rate is read only where each end's own one row reads it
+        // and agrees with the list: a retained list never outranks its ends,
+        // and a row that reads no speed, a PHY number on two rows, or an end
+        // with no PHY table in the payload leaves the lane's rate not read on
+        // every surface (label, card, pin, slow lanes, the lanes check).
+        const tables = (id) => sas.controllers.get(id) || sas.expanders.get(id) || null;
+        const ends = [tables(item.source), tables(item.target)];
+        const rowRate = (table, phy) => table?.byPhy.get(phy)?.rate ?? null;
         for (const lane of lanes.rows) {
-          if ([endRate(item.source, lane.source), endRate(item.target, lane.target)].some((rate) => rate !== null && rate !== lane.rate)) {
+          const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];
+          if (read.some((rate) => rate === null || rate !== lane.rate)) {
             lane.rate = null;
             lanes.rate = null;
           }
+        }
+        // A list without pairs: every PHY each end lists must read the list's
+        // rate (an end that lists none, such as a far end not read, adds none).
+        if (!lanes.rows.length && lanes.rate !== null) {
+          const listed = [[ends[0], lanes.sourcePhys], [ends[1], lanes.targetPhys]].filter(([, phys]) => phys.length);
+          if (listed.some(([table, phys]) => phys.some((phy) => rowRate(table, phy) !== lanes.rate))) lanes.rate = null;
         }
       }
       const laneLink = LANE_LINKS.has(item.kind);

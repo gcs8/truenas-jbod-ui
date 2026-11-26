@@ -23,7 +23,9 @@ const BUILDER = "function traceSentences(model, view = {}) {";
 
 function loadSource(source, context = {}) {
   const sandbox = vm.createContext({ window: {}, document: { addEventListener() {} }, ...context });
-  vm.runInContext(source, sandbox);
+  // Named as the product it is (the joined topology scripts, perhaps
+  // reworded by the test), so its exceptions are the product's.
+  vm.runInContext(source, sandbox, { filename: H.TOPOLOGY_JOINED });
   return sandbox.window.SasFabricTopology;
 }
 
@@ -362,7 +364,8 @@ function widePort() {
   const dual = [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }];
   H.addBays(fabric, H.range(0, 24), fronts, dual);
   H.addBays(fabric, H.range(24, 48), rears, dual);
-  return fabric;
+  // Both ends' rows, as the builder reports them: the wide ports are read.
+  return H.reciprocalTables(fabric);
 }
 
 // One dual-pathed shelf of 1,024 bays behind two HBAs.

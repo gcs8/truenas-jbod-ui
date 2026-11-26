@@ -18,6 +18,7 @@
    "tests/js/fabric_topology_presence.test.js",
    "tests/js/fabric_topology_surfaces.test.js",
    "tests/js/fabric_topology_unread_evidence.test.js",
+   "tests/js/fabric_topology_whole_evidence.test.js",
    "tests/js/fabric_linux_sas_transport.test.js"
   ],
   [
