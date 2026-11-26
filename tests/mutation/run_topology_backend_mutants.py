@@ -7,13 +7,13 @@ mutant at a time there (never in the checkout), runs the producer test
 modules, and restores the file. A mutant is killed when a test assertion
 fails with it in place.
 
-A mutant counts as killed only on an assertion failure (a FAIL) in a
-collected test. The run fails when the unmutated modules fail or run no
+A mutant counts as killed only when a collected test fails on the mutated
+behaviour: an assertion failure (a FAIL), or an error whose exception was
+thrown from product code (app/, or the mutated file). The run fails when the unmutated modules fail or run no
 test, when a mutant's anchor is missing or not unique, when the mutated
 module does not compile, when a test module does not load, when a missing
 module or an import error appears anywhere in the run (even inside a test
-that ran), when a mutant only makes tests error without any assertion
-failing, when a mutant survives that topology_equivalent_mutants.json does
+that ran), when a mutant only makes tests error from test code or a product exception, when a mutant survives that topology_equivalent_mutants.json does
 not list with a reason, and when a listed equivalent is killed or no longer
 exists.
 
@@ -152,7 +152,23 @@ _BLOCK = re.compile(r"^(FAIL|ERROR): (\S+) \(([^)]*)\)[^\n]*\n-+\n(.*?)(?=^=+$|^
 _IMPORT = re.compile(r"\b(ModuleNotFoundError|ImportError)\b")
 
 
-def classify(code: int, stderr: str) -> tuple[str, str]:
+_FRAME = re.compile(r'^\s*File "([^"]+)", line \d+', re.M)
+
+
+def _thrown_from_product(trace: str, tree: Path | None, product: set[str]) -> bool:
+    """Whether the innermost frame of a traceback is product code."""
+    frames = _FRAME.findall(trace)
+    if not frames:
+        return False
+    innermost = Path(frames[-1])
+    try:
+        relative = innermost.resolve().relative_to(tree.resolve()).as_posix() if tree else innermost.as_posix()
+    except ValueError:
+        return False
+    return relative.startswith("app/") or relative in product
+
+
+def classify(code: int, stderr: str, tree: Path | None = None, product: set[str] | None = None) -> tuple[str, str]:
     """The verdict on one mutated run: killed, survived, or error (never a kill)."""
     ran = _ran(stderr)
     blocks = _BLOCK.findall(stderr)
@@ -164,10 +180,11 @@ def classify(code: int, stderr: str) -> tuple[str, str]:
     if _IMPORT.search(stderr):
         return "error", "a missing module or an import error in the run is not a kill"
     asserted = [test for kind, test, _where, trace in blocks if kind == "FAIL" and "AssertionError" in trace]
-    if code and asserted:
-        return "killed", f"{len(asserted)} assertion failures of {ran}: {asserted[0]}"
+    thrown = [test for kind, test, _where, trace in blocks if kind == "ERROR" and _thrown_from_product(trace, tree, product or set())]
+    if code and (asserted or thrown):
+        return "killed", f"{len(asserted)} assertion failures and {len(thrown)} product exceptions of {ran}: {(asserted or thrown)[0]}"
     if code and blocks:
-        return "error", f"{len(blocks)} tests errored and no assertion failed: {blocks[0][1]}"
+        return "error", f"{len(blocks)} tests errored from test code, with no assertion failed and no product exception: {blocks[0][1]}"
     if code:
         return "error", f"exit {code} with no failing test"
     return "survived", f"{ran} tests passed"
@@ -192,7 +209,7 @@ def _judge(tree: Path, name: str, mutants: dict[str, tuple[str, str, str]] | Non
         code, stderr = _run_modules(tree, modules)
     finally:
         file.write_text(source, encoding="utf-8")
-    verdict, detail = classify(code, stderr)
+    verdict, detail = classify(code, stderr, tree, {path})
     return {"name": name, "verdict": verdict, "detail": detail}
 
 

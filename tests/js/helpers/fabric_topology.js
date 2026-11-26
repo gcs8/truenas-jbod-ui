@@ -18,8 +18,9 @@ const FIXTURE_PATH = path.join(ROOT, "tests/fixtures/sas_fabric/topology_fabric.
 
 function loadTopology(context = {}) {
   const sandbox = vm.createContext({ window: {}, ...context });
-  vm.runInContext(fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_transport.js"), "utf8"), sandbox);
-  vm.runInContext(topologySource(), sandbox);
+  // Each script by its own path, as the page loads them, so an exception
+  // names the script it came from.
+  for (const file of [path.join(ROOT, "app/static/sas_fabric_transport.js"), ...TOPOLOGY_PATHS]) vm.runInContext(fs.readFileSync(file, "utf8"), sandbox, { filename: file });
   return sandbox.window.SasFabricTopology;
 }
 

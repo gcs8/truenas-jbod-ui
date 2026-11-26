@@ -5,7 +5,8 @@
 //
 // Each mutant in topology_frontend_mutants.json is one textual change to a
 // topology script, planted in memory by topology_frontend_hook.cjs. A mutant
-// is killed only when an assertion fails in a test the run collected. The
+// is killed only when a test the run collected fails on the mutated
+// behaviour: an assertion, or an exception thrown from the product code. The
 // tests run in the stages topology_frontend_tests.json lists, fastest first,
 // and a mutant stops at the first stage that kills it; a mutant that
 // survives every stage has run every listed test.
@@ -16,7 +17,7 @@
 // planted or loaded (an anchor that is missing or not unique, a mutant that
 // does not parse, tests that never read the mutated script), whose run
 // reports no test count, fails to load a test file, reaches a missing
-// module, or fails tests without any assertion failing. It also fails when
+// module, or fails tests only by exceptions from test or harness code. It also fails when
 // a mutant survives that topology_equivalent_mutants.json does not list
 // with a reason, and when a listed equivalent is killed or no longer exists.
 //
@@ -63,14 +64,24 @@ function results(output, files) {
   lines.forEach((line, index) => {
     const match = /^(\s*)(not ok|ok) \d+ - (.*)$/.exec(line);
     if (!match) return;
+    // Its YAML block is indented two past the result and closes with "..."
+    // at exactly that indent: an error text can contain either line.
+    const indent = `${match[1]}  `;
     let code = "";
-    for (let next = index + 1; next < lines.length && !/^\s*(not ok|ok) \d+ - /.test(lines[next]); next += 1) {
-      const field = /^\s*code: '([^']*)'/.exec(lines[next]);
-      if (field && !code) code = field[1];
-      if (/^\s*\.\.\.$/.test(lines[next])) break;
+    let top = "";
+    if (lines[index + 1] === `${indent}---`) {
+      for (let next = index + 2; next < lines.length && lines[next] !== `${indent}...`; next += 1) {
+        const field = lines[next].startsWith(`${indent}code: '`) ? /^\s*code: '([^']*)'/.exec(lines[next]) : null;
+        if (field && !code) code = field[1];
+        // The frame the error was thrown from: the first line of its stack.
+        if (lines[next] === `${indent}stack: |-` && !top) top = (lines[next + 1] || "").trim();
+      }
     }
     const name = match[3].trim();
-    found.push({ depth: match[1].length, ok: match[2] === "ok", name, code, file: names.has(name) || names.has(path.basename(name)) });
+    // Thrown by the product: a topology script, as a test loads it by path
+    // or as an unnamed script in a VM context (the only scripts tests run so).
+    const product = /[\\/]app[\\/]static[\\/]|evalmachine\.<anonymous>/.test(top);
+    found.push({ depth: match[1].length, ok: match[2] === "ok", name, code, top, product, file: names.has(name) || names.has(path.basename(name)) });
   });
   return found;
 }
@@ -93,7 +104,11 @@ function run(files, mutant) {
       if (log) fs.rmSync(path.dirname(log), { recursive: true, force: true });
       const entries = results(output, files);
       const failed = entries.filter((entry) => !entry.ok);
-      const asserted = failed.filter((entry) => entry.code === "ERR_ASSERTION" && !entry.file);
+      // A kill is a collected test failing on the mutated behaviour: an
+      // assertion, or an exception thrown from the product code itself.
+      // Anything else (a test file not loading, an exception from test or
+      // harness code) is not shown to be the mutant's doing.
+      const asserted = failed.filter((entry) => !entry.file && (entry.code === "ERR_ASSERTION" || entry.product));
       const result = { code, signal, tests: count("tests"), pass: count("pass"), fail: count("fail"), applied, entries, asserted };
       // Any sign the mutant was not run as planted, or that no assertion
       // caught it, is an error, never a kill.
@@ -104,7 +119,7 @@ function run(files, mutant) {
         : !Number.isInteger(result.tests) || result.tests === 0 ? "no test count"
         : !applied ? "the tests never loaded the mutated script"
         : loadFailure ? `a test file did not load: ${loadFailure.name}`
-        : failed.length && !asserted.length ? `${failed.length} tests failed and no assertion failed: ${failed[0].name}`
+        : failed.length && !asserted.length ? `${failed.length} tests failed with neither an assertion nor a product exception: ${failed[0].name}${failed[0].top ? ` (thrown at ${failed[0].top})` : ""}`
         : result.fail === 0 && code !== 0 ? `exit ${code} with no failing test`
         : "";
       resolve({ ...result, problem, tail: problem ? output.slice(-1500) : "" });
@@ -120,7 +135,10 @@ async function judge(name, plan) {
     const result = await run(files, name);
     counts.push(`${result.pass}/${result.tests}`);
     if (result.problem) return { name, verdict: "error", detail: result.problem, tail: result.tail };
-    if (result.asserted.length) return { name, verdict: "killed", detail: `${result.asserted.length} assertion failures in stage ${counts.length} (${counts.join(", ")} passed)` };
+    if (result.asserted.length) {
+      const thrown = result.asserted.filter((entry) => entry.code !== "ERR_ASSERTION").length;
+      return { name, verdict: "killed", detail: `${result.asserted.length - thrown} assertion failures and ${thrown} product exceptions in stage ${counts.length} (${counts.join(", ")} passed)` };
+    }
   }
   return { name, verdict: "survived", detail: `${counts.join(", ")} passed` };
 }

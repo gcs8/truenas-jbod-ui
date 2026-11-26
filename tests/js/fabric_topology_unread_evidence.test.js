@@ -290,3 +290,17 @@ test("a cable whose near end has no PHY table at all claims none of its far end'
   assert.ok(!statuses(built, "lanes").includes("pass"), textOf(checksOf(built, "lanes")));
   assert.doesNotMatch(said1(built, /101 invalid dword/), /→/);
 });
+
+test("a cable-error PASS counts cable ends and an extra uplink PHY apart where the extra row names another HBA PHY", () => {
+  const data = core();
+  for (const expander of data.fabric.expanders) for (const row of expander.phys) Object.assign(row, { counter_state: "measured", invalid_dword_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0, phy_reset_problem_count: 0 });
+  const link = data.fabric.links.find((entry) => entry.reported_lanes);
+  const rows = data.fabric.expanders.find((entry) => entry.id === link.target).phys;
+  // An uplink row of its own: it names an HBA PHY no cable uses, so the
+  // cable's own rows stay the only ones naming its ends.
+  rows.push({ ...rows.find((entry) => Number(entry.phy) === 32), phy: "91", remote_phy: "7" });
+  const found = checksOf(coreModel(data), "cable-errors");
+  const pass = found.find((entry) => entry.status === "pass");
+  assert.ok(pass, textOf(found));
+  assert.match(textOf(pass.lines), /cable ends? and 1 uplink PHY/, textOf(pass.lines));
+});

@@ -66,10 +66,14 @@ class BackendRunnerTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "error", result)
         self.assertIn("import", result["detail"])
 
-    def test_tests_that_only_error_are_an_error_not_a_kill(self) -> None:
-        result = self.judge("    return 1\n", "    return None + 1\n")
+    def test_an_exception_thrown_from_the_mutated_product_is_a_kill(self) -> None:
+        self.assertEqual(self.judge("    return 1\n", "    return None + 1\n")["verdict"], "killed")
+
+    def test_tests_that_only_error_in_test_code_are_an_error_not_a_kill(self) -> None:
+        (self.tree / "selftests" / "test_value.py").write_text(TESTS.replace("self.assertEqual(value(), 1)", "self.assertEqual(value() + 0, 1)"), encoding="utf-8")
+        result = self.judge("    return 1\n", "    return \"x\"\n")
         self.assertEqual(result["verdict"], "error", result)
-        self.assertIn("no assertion failed", result["detail"])
+        self.assertIn("from test code", result["detail"])
 
     def test_a_change_no_test_observes_survives(self) -> None:
         self.assertEqual(self.judge("    return 3\n", "    return 4\n")["verdict"], "survived")
@@ -109,13 +113,14 @@ class FrontendRunnerTests(unittest.TestCase):
         self.write_test("fabric_linux_sas_transport.test.js", "assert.equal(1, 1);")
         self.lists({"stages": [["tests/js/fabric_topology_selftest.test.js", "tests/js/fabric_linux_sas_transport.test.js"]]}, {})
 
-    def write_test(self, name: str, body: str) -> None:
+    def write_test(self, name: str, body: str, top: str = "") -> None:
+        # The product is run by path, as the topology helper runs scripts.
         (self.tree / "tests" / "js" / name).write_text(
             "\"use strict\";\nconst assert = require(\"node:assert/strict\");\nconst test = require(\"node:test\");\n"
-            "const fs = require(\"node:fs\");\nconst path = require(\"node:path\");\n"
+            "const fs = require(\"node:fs\");\nconst path = require(\"node:path\");\nconst vm = require(\"node:vm\");\n"
             "const load = () => { const file = path.join(__dirname, \"..\", \"..\", \"app\", \"static\", \"sas_fabric_topology_selftest.js\");"
-            " const module = { exports: {} }; new Function(\"module\", fs.readFileSync(file, \"utf8\"))(module); return module.exports; };\n"
-            f"test(\"selftest\", () => {{ {body} }});\n", encoding="utf-8")
+            " const module = { exports: {} }; vm.runInNewContext(fs.readFileSync(file, \"utf8\"), { module, require }, { filename: file }); return module.exports; };\n"
+            f"{top}\ntest(\"selftest\", () => {{ {body} }});\n", encoding="utf-8")
 
     def lists(self, tests: dict, mutants: dict) -> None:
         (self.tree / "tests" / "mutation" / "topology_frontend_tests.json").write_text(json.dumps(tests), encoding="utf-8")
@@ -134,12 +139,23 @@ class FrontendRunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertRegex(out, r"m\s+killed")
 
-    def test_a_load_failure_or_a_crash_without_an_assertion_is_an_error(self) -> None:
-        for label, to in (("load", "value: (() => { throw new Error(\"boom\"); })()"), ("crash", "value: () => null.x")):
-            with self.subTest(label):
-                code, out = self.run_runner({"m": {"from": "value: () => 1", "to": to}}, "m")
-                self.assertEqual(code, 1, out)
-                self.assertRegex(out, r"m\s+error")
+    def test_an_exception_thrown_from_the_mutated_product_is_a_kill(self) -> None:
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => null.x"}}, "m")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"m\s+killed")
+
+    def test_a_test_file_that_does_not_load_or_a_test_code_exception_is_an_error(self) -> None:
+        # The product loaded at the test file's top level, failing: the
+        # file is not collected.
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(lib.value(), 1);", top="const lib = load();")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: (() => { throw new Error(\"boom\"); })()"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"m\s+error")
+        # An exception thrown by the test's own code is not the mutant's doing.
+        self.write_test("fabric_topology_selftest.test.js", "assert.equal(load().value().toFixed(0), \"1\");")
+        code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => null"}}, "m")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"m\s+error")
 
     def test_a_missing_module_inside_a_test_is_an_error(self) -> None:
         code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => require(\"absent-selftest-module\")"}}, "m")
