@@ -801,7 +801,8 @@ class _MprReportedLaneContext:
         child = self._expanders[index]
         child_handle, child_rows = self._handles[index], self._rows[index]
         parent_handle = _mpr_handle(child.get("parent"))
-        if (child_handle is None or parent_handle is None or child_rows is None or child_handle == parent_handle
+        if (child_handle is None or len(self._positions_by_handle[child_handle]) != 1
+                or parent_handle is None or child_rows is None or child_handle == parent_handle
                 or {child_handle, parent_handle} & self._ambiguous):
             return None
         if to_controller:

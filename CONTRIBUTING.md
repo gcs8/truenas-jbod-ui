@@ -704,6 +704,9 @@ file the runners mutate, import or read changes (a contract test holds the
 scope to that set, a rename counts as both of its paths, and each runner's
 unmutated run fails when its tests read a tracked file the job's path filter
 misses), and on manual dispatch; otherwise it reports that it does not apply.
+On Linux, pass `--trace-opens` to the frontend runner to use the same `strace`
+child-process coverage as CI, including children that clear their environment.
+A selected backend module with only skipped tests is not an exercised baseline.
 A mutant counts as killed only when a test the run collected fails on an
 assertion or on an exception thrown from the product code. A mutant that
 survives and is not listed with a reason in

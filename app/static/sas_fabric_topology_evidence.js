@@ -215,6 +215,17 @@ function memberConflicts(model, link) {
     }
     // Both ends must name each other on every lane before it is drawn or
     // judged: a retained list never stands in for its ends' own rows.
+    if (model.transport && link.parentPort) {
+      const ports = model.censusRows.filter((port) => port.id === `sas-port:${link.parentPort}`);
+      const listed = new Set(link.lanes.sourcePhys);
+      const same = (phys) => Array.isArray(phys) && phys.length === listed.size && new Set(phys).size === listed.size && phys.every((phy) => listed.has(phy));
+      // Older snapshots have no separate port census. The child's resolved
+      // sysfs ancestry carries the parent port and its measured members too.
+      const ancestry = same(link.parentMembers);
+      if ((!ports.length && !ancestry) || (Array.isArray(link.parentMembers) && !ancestry) || ports.some((port) => port.state !== "read" || port.owner_id !== link.source || port.remote_kind !== "expander" || port.remote_id !== link.target || !same(port.phys))) {
+        found.push({ side: "near", id: link.source, phy: link.lanes.sourcePhys[0], why: "the parent port does not confirm this endpoint and its whole PHY list" });
+      }
+    }
     if (!model.transport) {
       // The list must be the whole link, decided over both ends' tables.
       const whole = context.laneSetClash(model, link);
@@ -252,7 +263,13 @@ function laneSetClash(model, link) {
     const ambiguous = model.sas.controllers.get(unit)?.ambiguousHandles || new Set();
     const nearOwn = new Set((nearHba ? nearHba.phys.map((row) => row.ownHandle) : [nearChip.handle]).filter(Boolean));
     for (const handle of [...nearOwn, farChip.handle].filter(Boolean)) {
-      if (ambiguous.has(handle)) return at("far", first, `device handle ${handle} names more than one device of ${nodeName(model, unit)}`);
+      const devices = handleDevices(model, unit, handle);
+      const holders = devices.expanders.length + devices.bays.length + devices.seps.length + Number(nearHba && nearOwn.has(handle) || false);
+      if (holders > 1 || ambiguous.has(handle)) return at("far", first, `device handle ${handle} names more than one device of ${nodeName(model, unit)}`);
+    }
+    if (!nearHba) {
+      const coverage = context.listCoverage(model, unit, farChip.handle);
+      if (coverage) return at("far", first, coverage);
     }
     if (!farChip.handle || !nearOwn.size) return null;
     // Every row naming the other end, at each end, must be in the list there.
@@ -584,7 +601,7 @@ function ambiguousAddresses(model) {
     for (const address of new Set([...census.keys(), ...views.keys()])) {
       const places = census.get(address) || [];
       const bays = views.get(address) || [];
-      const apart = (one, two) => one.bay !== null && two.bay !== null && (one.bay !== two.bay || (one.enclosure && two.enclosure && one.enclosure !== two.enclosure));
+      const apart = (one, two) => (one.bay !== null && two.bay !== null && one.bay !== two.bay) || (one.enclosure && two.enclosure && one.enclosure !== two.enclosure);
       const elsewhere = places.some((place) => place.enclosure && bays.some((bay) => context.list(bay.reported?.enclosures).length && !bay.reported.enclosures.includes(place.enclosure)));
       // A bay whose own records report two enclosures is placed in neither.
       const torn = bays.some((bay) => context.list(bay.reported?.enclosures).length > 1);

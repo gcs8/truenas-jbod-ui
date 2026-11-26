@@ -103,6 +103,22 @@ class BackendRunnerTests(unittest.TestCase):
         # the tree is the mutated product.
         self.assertEqual(self.judge("    return 1\n", "    import json\n    return json.loads('not json')\n")["verdict"], "killed")
 
+    def test_per_test_fixtures_do_not_kill(self) -> None:
+        for phase in ("setUp", "tearDown", "cleanup"):
+            for mutation in ("return 2", "raise ValueError('broken')"):
+                with self.subTest(phase=phase, mutation=mutation):
+                    setup = "    def setUp(self):\n        self.addCleanup(self.cleanup)\n" if phase == "cleanup" else ""
+                    source = TESTS.replace("    def test_value(self):", setup + f"    def {phase}(self):\n        self.assertEqual(value(), 1)\n    def test_value(self):").replace("def test_value(self):\n        self.assertEqual(value(), 1)", "def test_value(self):\n        self.assertTrue(True)")
+                    (self.tree / "selftests" / "test_value.py").write_text(source, encoding="utf-8")
+                    result = self.judge("    return 1\n", f"    {mutation}\n")
+                    self.assertEqual(result["verdict"], "error", result)
+
+    def test_a_skipped_only_module_is_not_an_exercised_baseline(self) -> None:
+        modules = [*self.modules, "selftests.test_skipped"]
+        (self.tree / "selftests" / "test_skipped.py").write_text(TESTS.replace("    def test_value", "    @unittest.skip('not exercised')\n    def test_value"), encoding="utf-8")
+        code, stderr = self.runner._run_modules(self.tree, modules, verbose=True)
+        self.assertIn("selftests.test_skipped ran no test", self.runner.stock_problems(code, stderr, modules))
+
     def test_a_class_fixture_that_calls_the_broken_target_is_an_error_not_a_kill(self) -> None:
         # The target raises inside setUpClass: its class's test never runs,
         # and no collected test fails, though other tests pass.
@@ -192,10 +208,10 @@ class FrontendRunnerTests(unittest.TestCase):
         (self.tree / "tests" / "mutation" / "topology_frontend_mutants.json").write_text(json.dumps(mutants), encoding="utf-8")
         (self.tree / "tests" / "mutation" / "topology_equivalent_mutants.json").write_text(json.dumps({"frontend": {}, "backend": {}}), encoding="utf-8")
 
-    def run_runner(self, mutants: dict, only: str) -> tuple[int, str]:
+    def run_runner(self, mutants: dict, only: str, *flags: str) -> tuple[int, str]:
         tests = json.loads((self.tree / "tests" / "mutation" / "topology_frontend_tests.json").read_text(encoding="utf-8"))
         self.lists(tests, mutants)
-        result = subprocess.run([shutil.which("node") or "node", "tests/mutation/run_topology_frontend_mutants.cjs", "--only", only, "--jobs", "1"],
+        result = subprocess.run([shutil.which("node") or "node", "tests/mutation/run_topology_frontend_mutants.cjs", "--only", only, "--jobs", "1", *flags],
                                 cwd=self.tree, capture_output=True, text=True, timeout=300, env={**os.environ, "NODE_OPTIONS": ""})
         return result.returncode, result.stdout + result.stderr
 
@@ -295,6 +311,30 @@ class FrontendRunnerTests(unittest.TestCase):
         code, out = self.run_runner({"m": {"from": "value: () => 1", "to": "value: () => 2"}}, "m")
         self.assertEqual(code, 1, out)
         self.assertIn("CI path filter of the topology mutation job is not found", out)
+
+    def test_python_child_data_must_be_covered_by_the_ci_filter(self) -> None:
+        import sys
+
+        (self.tree / "docs").mkdir()
+        (self.tree / "tests" / "reader.py").write_text("from pathlib import Path\nprint(Path('docs/count.txt').read_text())\n", encoding="utf-8")
+        (self.tree / "docs" / "count.txt").write_text("7", encoding="utf-8")
+        self.write_test("fabric_topology_selftest.test.js", f"assert.equal(require('node:child_process').execFileSync({json.dumps(sys.executable)}, ['tests/reader.py']).toString().trim(), '7'); assert.equal(load().value(), 1);")
+        mutant = {"m": {"from": "value: () => 1", "to": "value: () => 2"}}
+        code, out = self.run_runner(mutant, "m")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the tests read docs/count.txt", out)
+        if shutil.which("strace"):
+            # The kernel sees the data file even in an isolated Python
+            # interpreter which ignores sitecustomize and its parent env.
+            self.write_test("fabric_topology_selftest.test.js", f"assert.equal(require('node:child_process').execFileSync({json.dumps(sys.executable)}, ['-I', 'tests/reader.py'], {{env: {{}}}}).toString().trim(), '7'); assert.equal(load().value(), 1);")
+            code, out = self.run_runner(mutant, "m", "--trace-opens")
+            self.assertEqual(code, 1, out)
+            self.assertIn("the tests read docs/count.txt", out)
+        workflow = self.tree / ".github" / "workflows" / "ci.yml"
+        workflow.write_text(workflow.read_text().replace("app/.*|", "docs/count[.]txt|app/.*|"), encoding="utf-8")
+        code, out = self.run_runner(mutant, "m", *(["--trace-opens"] if shutil.which("strace") else []))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"m\s+killed")
 
     def test_a_topology_test_file_the_list_does_not_name_fails_the_run(self) -> None:
         self.write_test("fabric_topology_unlisted.test.js", "assert.equal(1, 1);")

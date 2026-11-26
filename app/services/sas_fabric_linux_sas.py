@@ -390,14 +390,19 @@ class _Projection:
             })
         # A disk port address is one disk's identity across the whole host:
         # one address at two slots identifies neither, wherever either slot is.
-        slots_by_address: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        slots_by_address: dict[str, set[int]] = defaultdict(set)
+        enclosures_by_address: dict[str, set[str]] = defaultdict(set)
         for record in self.port_census:
-            if record["remote_kind"] == "end_device" and record["remote_sas_address"] and record["bay_identifier"] is not None:
-                slots_by_address[str(record["remote_sas_address"]).lower()].add(
-                    (str(record["enclosure_identifier"] or ""), str(record["bay_identifier"])))
+            if record["remote_kind"] != "end_device" or not record["remote_sas_address"]:
+                continue
+            address = str(record["remote_sas_address"]).lower()
+            if record["bay_identifier"] is not None:
+                slots_by_address[address].add(record["bay_identifier"])
+            if record["enclosure_identifier"]:
+                enclosures_by_address[address].add(str(record["enclosure_identifier"]).lower())
         for record in self.port_census:
             address = str(record["remote_sas_address"] or "").lower()
-            if record["remote_kind"] == "end_device" and len(slots_by_address.get(address, ())) > 1:
+            if record["remote_kind"] == "end_device" and max(len(slots_by_address[address]), len(enclosures_by_address[address])) > 1:
                 record["remote_address_state"] = "ambiguous"
 
     def mark_inventory_identities(self, snapshot: Any) -> None:

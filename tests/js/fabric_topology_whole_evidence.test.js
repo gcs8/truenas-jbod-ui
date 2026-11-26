@@ -108,13 +108,14 @@ function directMapped() {
 }
 
 test("a disk port address the payload places in two enclosures bridges no records into one disk", () => {
-  for (const order of ["as read", "reversed"]) {
+  for (const partial of [false, true]) for (const order of ["as read", "reversed"]) {
     const { item, record } = directMapped();
     const census = item.fabric.raw.sas_transport_ports;
     // A second address on the PHY, at slot 7 of another enclosure, and the
     // same address at slot 7 of this one: it names no one place.
     census.push({ ...record, id: "sas-port:foreign", remote_sas_address: "5eee001e00000456", enclosure_identifier: "5fff0000000000aa" },
       { ...record, id: "sas-port:bridge", remote_sas_address: "5eee001e00000456" });
+    if (partial) census.find((row) => row.id === "sas-port:foreign").bay_identifier = null;
     if (order === "reversed") census.reverse();
     const built = model(item);
     assert.ok(built.ambiguousAddresses.has("5eee001e00000456"), order);
@@ -240,6 +241,79 @@ test("a lane whose end rows do not read its speed shows no measured rate on any 
     assert.doesNotMatch(textOf(cardRows(built, { kind: "link", id: drawn.id })), /below both ends/i, mode);
   }
 });
+
+for (const mode of ["parent handle on another expander", "child handle on a processor", "devices unread"]) {
+  test(`cascade membership: ${mode}`, () => {
+    const data = core();
+    const link = data.fabric.links.find((entry) => entry.kind === "expander-expander");
+    const [parent, child] = [link.source, link.target].map((id) => data.fabric.expanders.find((entry) => entry.id === id));
+    const other = data.fabric.links.find((entry) => entry.kind === link.kind && entry.id !== link.id);
+    const control = coreModel(data);
+    const otherCard = lanesCard(control, linkOf(control, other.source, other.target));
+    if (mode.startsWith("parent")) data.fabric.expanders.push({ ...parent, id: `${parent.id}-other`, sas_address: parent.sas_address.replace(/.$/, "b"), phys: [] });
+    if (mode.startsWith("child")) data.fabric.nodes.find((entry) => entry.kind === "mpr-enclosure" && entry.controller_id === child.controller_id).raw.sep_handle = child.dev_handle;
+    if (mode.endsWith("unread")) data.fabric.raw.controller_read.lists.mpr0.devices = "not_read";
+    Object.assign(child.phys[0], { counter_state: "measured", invalid_dword_count: 102, phy_reset_problem_count: 0, running_disparity_error_count: 0, loss_of_dword_synchronization_count: 0 });
+    const built = coreModel(data);
+    assert.match(lanesCard(built, linkOf(built, link.source, link.target)), /which PHYs the cable uses is not read/);
+    assert.doesNotMatch(said1(built, /102 invalid dword/), /→/);
+    assert.equal(lanesCard(built, linkOf(built, other.source, other.target)), otherCard);
+  });
+}
+
+for (const mode of ["shorter list", "shorter port", "longer port"]) {
+  test(`Linux cable membership: ${mode}`, () => {
+    const item = fixture("wide-x4-sata");
+    const link = item.fabric.links.find((entry) => entry.kind === "controller-expander");
+    const port = item.fabric.raw.sas_transport_ports.find((entry) => entry.remote_id === link.target && entry.owner_id === link.source);
+    if (mode === "shorter list") { link.reported_lanes.source_phys.pop(); link.reported_lanes.lane_count--; }
+    if (mode === "shorter port") { port.phys.pop(); port.phy_names.pop(); }
+    if (mode === "longer port") { port.phys.push(13); port.phy_names.push("phy-1:13"); phyRows(item.fabric, link.source).push({ ...phyRows(item.fabric, link.source)[0], phy: 13, name: "phy-1:13" }); }
+    Object.assign(phyRows(item.fabric, link.source).find((row) => row.phy === 3), { counter_state: "measured", invalid_dword_count: 103 });
+    const built = model(item);
+    const drawn = linkOf(built, link.source, link.target);
+    assert.match(lanesCard(built, drawn), /which PHYs the cable uses is not read/);
+    assert.match(textOf(drawn.labelLines), /membership not read/);
+    assert.doesNotMatch(said1(built, /103 invalid dword/), /→/);
+  });
+}
+
+for (const mixed of [false, true]) {
+  test(`the drawn rate is the rate of its lanes: ${mixed ? "mixed" : "uniform"}`, () => {
+    const data = core();
+    const link = data.fabric.links[0];
+    if (mixed) {
+      link.reported_lanes.lanes[0].negotiated_rate_gbps = 3;
+      hbaRow(data, 0).speed = "3.0";
+      data.fabric.expanders.find((row) => row.id === link.target).phys.find((row) => Number(row.phy) === 32).speed = "3.0";
+    } else link.reported_lanes.negotiated_rate_gbps = 3;
+    const built = coreModel(data);
+    assert.equal(linkOf(built, link.source, link.target).labelLines[0], mixed ? "x4 · 3–12 Gb/s" : "x4 · 12 Gb/s");
+  });
+}
+
+for (const first of [false, true]) {
+  test(`duplicate HBA coverage: unread ${first ? "first" : "last"}`, () => {
+    const data = directHandle();
+    delete data.fabric.raw.controller_read.lists;
+    const hba = controllerOf(data);
+    const twin = structuredClone(hba);
+    twin.mpr_lists = { ...hba.mpr_lists, expanders: "not_read" };
+    data.fabric.controllers[first ? "unshift" : "push"](twin);
+    assert.match(pin(coreModel(data), MPR0, 4), /^destination not read/);
+  });
+  test(`duplicate expander observations: slow ${first ? "first" : "last"}`, () => {
+    const data = core();
+    const link = data.fabric.links[0];
+    const twin = structuredClone(data.fabric.expanders.find((row) => row.id === link.target));
+    twin.phys.find((row) => Number(row.phy) === 32).speed = "3.0";
+    data.fabric.expanders[first ? "unshift" : "push"](twin);
+    const built = coreModel(data);
+    const drawn = linkOf(built, link.source, link.target);
+    assert.match(lanesCard(built, drawn), /3 at 12 Gb\/s, 1 at a rate not read/);
+    assert.doesNotMatch(drawn.labelLines[0], /12 Gb\/s$/);
+  });
+}
 
 // --- DUP1: a lane's maximum is no row's where its PHY number is on two rows ----
 

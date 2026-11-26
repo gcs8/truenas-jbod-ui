@@ -734,6 +734,13 @@ function subjectDeletions(fabric, built) {
   for (const link of fabric.links.filter((entry) => entry.reported_lanes?.lanes?.length && (fabric.expanders || []).some((item) => item.id === entry.target))) {
     const [lane] = link.reported_lanes.lanes;
     const rowOf = (copy, id, phy) => coreRows(copy, id).find((entry) => Number(entry.phy) === phy);
+    out.push({ name: `${link.id} independent summary rate changed`, same: true, checks: [], tokens: [], change: (copy) => {
+      copy.fabric.links.find((entry) => entry.id === link.id).reported_lanes.negotiated_rate_gbps = lane.negotiated_rate_gbps === 3 ? 12 : 3;
+    } });
+    const sep = fabric.nodes.find((entry) => entry.kind === "mpr-enclosure" && entry.controller_id === fabric.expanders.find((row) => row.id === link.target)?.controller_id);
+    if (link.kind === "expander-expander" && sep) out.push({ name: `${link.id} processor also carries the child's handle`, checks: ["lanes"], tokens: [link.target], change: (copy) => {
+      copy.fabric.nodes.find((entry) => entry.id === sep.id).raw.sep_handle = copy.fabric.expanders.find((entry) => entry.id === link.target).dev_handle;
+    } });
     const tableOf = (copy, id) => (copy.fabric.controllers || []).find((entry) => entry.id === id)?.phy_rows || (copy.fabric.expanders || []).find((entry) => entry.id === id)?.phys;
     const lengthen = (copy, id, phy, extra = {}) => {
       const rows = tableOf(copy, id);
@@ -778,6 +785,14 @@ function subjectDeletions(fabric, built) {
   for (const link of fabric.links.filter((entry) => LANE_KINDS.has(entry.kind) && entry.reported_lanes?.source_phys?.length && !entry.reported_lanes?.lanes?.length)) {
     const phy = link.reported_lanes.source_phys[0];
     const rowsOf = (copy) => phyRows(copy.fabric.nodes.find((entry) => entry.id === link.source)).filter((entry) => Number(entry.phy) === phy && entry.negotiated_rate_gbps !== null && entry.negotiated_rate_gbps !== undefined);
+    const parent = census.find((port) => port.state === "read" && port.remote_id === link.target && port.owner_id === link.source);
+    if (parent && parent.phys.length > 1) out.push({ name: `${link.id} parent port shorter than the lane list`, checks: [], tokens: [], change: (copy) => {
+      const port = copy.fabric.raw.sas_transport_ports.find((entry) => entry.id === parent.id);
+      port.phys.pop(); port.phy_names.pop();
+    }, expect: (after, why) => {
+      const card = T.cardFor(after, { kind: "link", id: link.id });
+      if (card?.rows.some((entry) => entry.label === "Lanes")) assert.match(textOf(card.rows), /which PHYs the cable uses is not read/, why);
+    } });
     if (!rowsOf({ fabric }).length) continue;
     out.push({ name: `${link.id} near PHY ${phy} speed blanked`, checks: ["lanes"], tokens: [link.source, link.target], change: (copy) => {
       for (const entry of rowsOf(copy)) Object.assign(entry, { negotiated_rate_gbps: null, negotiated_link_rate: null, speed: null });
@@ -800,6 +815,10 @@ function subjectDeletions(fabric, built) {
       return true;
     };
     out.push({ name: `census ${index} address in two enclosures bridging its slot`, checks: ["port-errors"], tokens: [port.owner_id, ...claimed.map((phy) => `PHY ${phy}`)], change: bridge });
+    out.push({ name: `census ${index} conflicting enclosure with no ordinal`, checks: [], tokens: [], change: (copy) => {
+      bridge(copy);
+      copy.fabric.raw.sas_transport_ports.at(-2).bay_identifier = null;
+    }, expect: (after, why) => assert.ok(after.ambiguousAddresses.has(bridged), why) });
     if (counted) {
       out.push({ name: `census ${index} address in two enclosures bridging its slot, critical on it`, checks: ["port-errors"], tokens: [port.owner_id, `PHY ${claimed[0]}`],
         faulty: { owner: port.owner_id, phy: claimed[0] }, injected: { phy: claimed[0] }, change: (copy) => bridge(copy) && inject(copy, port.owner_id, claimed[0]),
@@ -823,6 +842,13 @@ function subjectDeletions(fabric, built) {
         return true;
       } });
     }
+    const duplicateCoverage = (copy, first) => {
+      const twin = structuredClone(copy.fabric.controllers.find((item) => item.id === controller.id));
+      twin.mpr_lists = { ...twin.mpr_lists, expanders: "not_read" };
+      copy.fabric.controllers[first ? "unshift" : "push"](twin);
+    };
+    out.push({ name: `${controller.id} duplicate with an unread list`, checks: ["lanes"], tokens: [controller.id], orders: true,
+      change: (copy) => duplicateCoverage(copy, false), twin: (copy) => duplicateCoverage(copy, true) });
     out.push({ name: `${controller.id} no list states at all`, checks: ["lanes"], tokens: [controller.id], change: (copy) => {
       const entry = copy.fabric.controllers.find((item) => item.id === controller.id);
       delete entry.device_handle_states;

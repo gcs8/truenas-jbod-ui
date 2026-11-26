@@ -59,6 +59,7 @@ def project_enclosures(
         links[link_id] = SasFabricLink(id=link_id, source=physical.id, target=node.id,
                                       kind="enclosure-observation", evidence=["SES enclosure logical id"])
 
+    slots_by_board: dict[str, set[int]] = defaultdict(set)
     for slot in snapshot.slots:
         if not slot.physical_location_known:
             continue
@@ -70,7 +71,7 @@ def project_enclosures(
             continue
         identity = next(iter(identities))
         physical = board(identity)
-        physical.related_slots = sorted(set(physical.related_slots) | {slot.slot})
+        slots_by_board[physical.id].add(slot.slot)
         for target in slot.ssh_ses_targets:
             if logical_id(target.get("enclosure_id") or identity) == identity and target.get("ses_device"):
                 ses_ids[f"ses:{target['ses_device']}"].add(physical.id)
@@ -101,6 +102,7 @@ def project_enclosures(
     # Retain only agreement across observations; never sum the same disks
     # once per HBA. Individual route measurements remain in observations.
     for physical in by_id.values():
+        physical.related_slots = sorted(slots_by_board[physical.id])
         observed = physical.raw["observations"]
         unread = {key for row in observed for key in row["metrics"].get("not_read", [])}
         for key in {key for row in observed for key in row["metrics"]} - {"not_read"}:

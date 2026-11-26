@@ -1098,7 +1098,7 @@
   "to": "    if (false) return at("
  },
  "SET3": {
-  "from": "      if (ambiguous.has(handle)) return at(",
+  "from": "      if (holders > 1 || ambiguous.has(handle)) return at(",
   "to": "      if (false) return at("
  },
  "SET4": {
@@ -1114,8 +1114,8 @@
   "to": "          if (read.some((rate) => rate !== null && rate !== lane.rate)) {"
  },
  "RATE6": {
-  "from": "          if (listed.some(([table, phys]) => phys.some((phy) => rowRate(table, phy) !== lanes.rate))) lanes.rate = null;",
-  "to": ""
+  "from": "rates.every((rate) => rate === rates[0])) lanes.rate = rates[0];",
+  "to": "true) lanes.rate = rates.find((rate) => rate !== null) ?? null;"
  },
  "RATE7": {
   "from": "          const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];",

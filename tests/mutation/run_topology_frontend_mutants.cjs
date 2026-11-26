@@ -139,6 +139,16 @@ function outsideScope(log) {
   const pattern = scopePattern();
   const tracked = trackedFiles();
   const read = new Set(fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  // -yy gives the resolved path of the returned descriptor, even when a
+  // grandchild changed cwd, cleared its environment or used openat(dirfd).
+  // Keep the language hooks too: cached modules and path-existence checks
+  // can be dependencies without opening the source file.
+  if (process.argv.includes("--trace-opens")) {
+    for (const line of fs.readFileSync(`${log}.opens`, "utf8").split("\n")) {
+      const opened = / = \d+<([^<>]+)>$/.exec(line);
+      if (opened) read.add(opened[1]);
+    }
+  }
   return [...read].map((file) => path.relative(ROOT, file).split(path.sep).join("/")).filter((file) => tracked.has(file) && !pattern.test(file)).sort();
 }
 
@@ -149,8 +159,9 @@ function run(files, mutant, trace = "") {
     const env = { ...process.env, TOPOLOGY_MUTANT: mutant || "", TOPOLOGY_MUTANT_LOG: log };
     if (!mutant) delete env.TOPOLOGY_MUTANT;
     // The unmutated run records every file its processes read.
-    if (trace) Object.assign(env, { TOPOLOGY_READ_TRACE: trace, NODE_OPTIONS: `${env.NODE_OPTIONS || ""} --require=${TRACE}`.trim() });
-    const child = spawn(process.execPath, args, { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
+    if (trace) Object.assign(env, { TOPOLOGY_READ_TRACE: trace, PYTHONPATH: path.dirname(TRACE), NODE_OPTIONS: `${env.NODE_OPTIONS || ""} --require=${TRACE}`.trim() });
+    const native = trace && process.argv.includes("--trace-opens");
+    const child = spawn(native ? "strace" : process.execPath, native ? ["-f", "-qq", "-yy", "-A", "-o", `${trace}.opens`, "-e", "trace=open,openat,openat2", "--", process.execPath, ...args] : args, { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.stderr.on("data", (chunk) => { output += chunk; });

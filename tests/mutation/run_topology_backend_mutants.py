@@ -81,8 +81,8 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
  "I1 adapter handle ambiguity unmarked": (C, "        if found and (len(found) > 1 or found[0][\"conflict\"]):\n            states[phy] = \"ambiguous\"", "        if False:\n            states[phy] = \"ambiguous\""),
  "I2 adapter handle device kind unmarked": (C, "        elif kind != \"expander\":\n            states[phy] =", "        elif False:\n            states[phy] ="),
  "I3 adapter handle states dropped": (C, "            if states:\n                controller[\"device_handle_states\"] = states", "            if False:\n                controller[\"device_handle_states\"] = states"),
- "I4 transport address ambiguity unmarked": (L, "len(slots_by_address.get(address, ())) > 1:\n                record[\"remote_address_state\"] = \"ambiguous\"", "len(slots_by_address.get(address, ())) > 1:\n                pass"),
- "I5 transport address per slot ignored": (L, "            if record[\"remote_kind\"] == \"end_device\" and len(slots_by_address.get(address, ())) > 1:", "            if record[\"remote_kind\"] == \"end_device\" and len(slots_by_address.get(address, ())) > 2:"),
+ "I4 transport address ambiguity unmarked": (L, "max(len(slots_by_address[address]), len(enclosures_by_address[address])) > 1:\n                record[\"remote_address_state\"] = \"ambiguous\"", "max(len(slots_by_address[address]), len(enclosures_by_address[address])) > 1:\n                pass"),
+ "I5 transport address per slot ignored": (L, "            if record[\"remote_kind\"] == \"end_device\" and max(len(slots_by_address[address]), len(enclosures_by_address[address])) > 1:", "            if record[\"remote_kind\"] == \"end_device\" and max(len(slots_by_address[address]), len(enclosures_by_address[address])) > 2:"),
 
  "O3 expander parent filter off": (C, "    parent = _mpr_handle(device_context.get(\"parent\"))\n    expander_ids = [node_id for node_id in expander_ids\n                    if node_id in nodes and parent is not None\n                    and _mpr_handle(nodes[node_id].raw.get(\"dev_handle\")) == parent]\n    if len(expander_ids) != 1:\n        expander_ids = []\n", ""),
  "O5 position join for every member": (F, "own_evidence=direct_members or not position_allowed or snapshot_controllers[controller_name] != 1,", "own_evidence=False,"),
@@ -141,7 +141,8 @@ def _copy_tree(into: Path) -> None:
 
 def _run_modules(tree: Path, modules: list[str] | None = None, verbose: bool = False,
                  trace: Path | None = None) -> tuple[int, str]:
-    result = subprocess.run([sys.executable, "-m", "unittest", *(["-v"] if verbose else []), *(modules or MODULES)],
+    driver = Path(__file__).with_name("topology_unittest.py")
+    result = subprocess.run([sys.executable, "-c", "import runpy,sys; runpy.run_path(sys.argv.pop(1), run_name='__main__')", str(driver), *(["-v"] if verbose else []), *(modules or MODULES)],
                             cwd=tree, env=_environment(trace), capture_output=True, text=True, timeout=1800)
     return result.returncode, result.stderr
 
@@ -177,7 +178,7 @@ def stock_problems(code: int, stderr: str, modules: list[str]) -> list[str]:
     if _IMPORT.search(stderr):
         problems.append("a missing module or an import error")
     # Every selected module ran at least one test of its own (-v names each).
-    problems += [f"{module} ran no test" for module in modules if not re.search(rf"\({re.escape(module)}\.", stderr)]
+    problems += [f"{module} ran no test" for module in modules if not re.search(rf"^\S+ \({re.escape(module)}\.[^\n]*?\)(?:[^\n]*|\n[^\n]*) \.\.\. ok$", stderr, re.M)]
     return problems
 
 
@@ -222,6 +223,8 @@ def classify(code: int, stderr: str, tree: Path | None = None, product: set[str]
     if not ran:
         return "error", "no test count"
     loading = [test for _kind, test, where, _trace in blocks if "_FailedTest" in where or "loader" in where]
+    if "TOPOLOGY-FIXTURE-ERROR:" in stderr:
+        return "error", "a fixture failed outside the collected test body"
     if loading:
         return "error", f"a test module did not load: {loading[0]}"
     if _IMPORT.search(stderr):

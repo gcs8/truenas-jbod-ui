@@ -507,11 +507,58 @@ function phyFacts(row) {
     };
   }
 
+// Group repeated endpoint observations before indexing. A field is read only
+// when every observation agrees; a speed disagreement must not erase the
+// other PHYs, the matching handles, or a separately measured counter.
+function endpointGroups(items) {
+    const byId = new Map();
+    for (const item of list(items)) {
+      if (!isRecord(item) || typeof item.id !== "string") continue;
+      if (!byId.has(item.id)) byId.set(item.id, []);
+      byId.get(item.id).push(item);
+    }
+    return byId.values();
+  }
+
+function agreedFields(records) {
+    const keys = [...new Set(records.flatMap(Object.keys))].sort();
+    return Object.fromEntries(keys.map((key) => {
+      const values = records.map((record) => record[key]);
+      return [key, values.every(isRecord) ? agreedFields(values) : values.every((value) => value === values[0]) ? values[0] : null];
+    }));
+  }
+
+function agreedEndpoint(records, field) {
+    if (records.length === 1) return records[0];
+    const merged = agreedFields(records);
+    const tables = records.map((record) => {
+      const rows = new Map();
+      for (const row of list(record[field]).filter(isRecord)) {
+        const phy = decimal(row.phy);
+        if (phy === null) continue;
+        if (!rows.has(phy)) rows.set(phy, []);
+        rows.get(phy).push(row);
+      }
+      return rows;
+    });
+    merged[field] = [...new Set(tables.flatMap((rows) => [...rows.keys()]))].sort((a, b) => a - b).flatMap((phy) => {
+      const readings = tables.map((rows) => rows.get(phy) || []);
+      const rows = readings.flat();
+      // A duplicated or missing PHY, or conflicting counter readings: keep
+      // the observations for the counter ledger, but no unique row lookup.
+      if (readings.some((group) => group.length !== 1) || PHY_COUNTERS.some(([key]) => new Set(rows.map((row) => row[key])).size > 1)) {
+        return [...rows, ...(readings.some((group) => !group.length) ? [{ phy }] : [])].sort((a, b) => JSON.stringify(a, Object.keys(a).sort()).localeCompare(JSON.stringify(b, Object.keys(b).sort())));
+      }
+      return { ...agreedFields(rows), phy };
+    });
+    return merged;
+  }
+
 function sasIndex(fabric) {
     const expanders = new Map();
     const controllers = new Map();
-    for (const item of list(fabric?.expanders)) {
-      if (!isRecord(item) || typeof item.id !== "string" || expanders.has(item.id)) continue;
+    for (const group of endpointGroups(fabric?.expanders)) {
+      const item = agreedEndpoint(group, "phys");
       const phys = list(item.phys).filter(isRecord).map(phyFacts).filter((row) => row.phy !== null);
       const log = isRecord(item.phy_error_counters) ? item.phy_error_counters : null;
       expanders.set(item.id, {
@@ -543,8 +590,8 @@ function sasIndex(fabric) {
         } : null,
       });
     }
-    for (const item of list(fabric?.controllers)) {
-      if (!isRecord(item) || typeof item.id !== "string" || controllers.has(item.id)) continue;
+    for (const group of endpointGroups(fabric?.controllers)) {
+      const item = agreedEndpoint(group, "phy_rows");
       controllers.set(item.id, {
         id: item.id,
         board: text(item.board),
@@ -596,12 +643,12 @@ function sasIndex(fabric) {
     // as the payload's list states give them by the HBA's own name (never its
     // label). A list is read only where every source that reports it says so.
     const listed = isRecord(fabric?.raw?.controller_read?.lists) ? fabric.raw.controller_read.lists : {};
-    for (const item of list(fabric?.controllers)) {
-      const record = isRecord(item) && controllers.get(item.id);
-      if (!record || record.lists !== undefined) continue;
-      const sources = [item.mpr_lists, listed[text(item.name)]].filter(isRecord);
-      record.lists = sources.length ? Object.fromEntries([...new Set(sources.flatMap(Object.keys))].map((key) => [key, sources.every((source) => !(key in source) || ["read", "empty"].includes(source[key])) ? "read" : "not_read"])) : null;
-      record.ambiguousHandles = new Set(list(item.ambiguous_device_handles).map(text).filter(Boolean));
+    for (const group of endpointGroups(fabric?.controllers)) {
+      const record = controllers.get(group[0].id);
+      const sources = group.map((item) => [item.mpr_lists, listed[text(item.name)]].filter(isRecord));
+      const keys = [...new Set(sources.flat().flatMap(Object.keys))].sort();
+      record.lists = keys.length ? Object.fromEntries(keys.map((key) => [key, sources.every((pair) => pair.some((source) => key in source) && pair.every((source) => !(key in source) || ["read", "empty"].includes(source[key]))) ? "read" : "not_read"])) : null;
+      record.ambiguousHandles = new Set(group.flatMap((item) => list(item.ambiguous_device_handles)).map(text).filter(Boolean));
     }
     return { expanders, controllers, seps };
   }
@@ -1639,7 +1686,7 @@ function buildTopologyModel(given, options = {}) {
           count: lanesPayload.lane_count,
           sourcePhys: list(lanesPayload.source_phys).filter((value) => Number.isInteger(value)),
           targetPhys: list(lanesPayload.target_phys).filter((value) => Number.isInteger(value)),
-          rate: finite(lanesPayload.negotiated_rate_gbps),
+          rate: null,
           // "inferred" where the far end's PHYs are worked out, not read; and
           // the basis the source gives for what it did read.
           targetBasis: text(lanesPayload.target_basis),
@@ -1661,19 +1708,19 @@ function buildTopologyModel(given, options = {}) {
           const read = [rowRate(ends[0], lane.source), rowRate(ends[1], lane.target)];
           if (read.some((rate) => rate === null || rate !== lane.rate)) {
             lane.rate = null;
-            lanes.rate = null;
           }
         }
         // A list without pairs: every PHY each end lists must read the list's
         // rate (an end that lists none, such as a far end not read, adds none).
-        if (!lanes.rows.length && lanes.rate !== null) {
-          const listed = [[ends[0], lanes.sourcePhys], [ends[1], lanes.targetPhys]].filter(([, phys]) => phys.length);
-          if (listed.some(([table, phys]) => phys.some((phy) => rowRate(table, phy) !== lanes.rate))) lanes.rate = null;
-        }
+        const rates = lanes.rows.length ? lanes.rows.map((lane) => lane.rate)
+          : [...lanes.sourcePhys.map((phy) => rowRate(ends[0], phy)), ...lanes.targetPhys.map((phy) => rowRate(ends[1], phy))];
+        if (lanes.sourcePhys.length === lanes.count && rates.length && rates.every((rate) => rate === rates[0])) lanes.rate = rates[0];
       }
       const laneLink = LANE_LINKS.has(item.kind);
       const entry = {
         id: item.id,
+        parentPort: transport ? targetItem.raw?.parent_port : null,
+        parentMembers: transport && targetItem.raw?.parent_link_state === "resolved" && targetItem.raw.parent_id === item.source ? targetItem.raw.source_phys : null,
         kind: item.kind,
         source: item.source,
         target: item.target,

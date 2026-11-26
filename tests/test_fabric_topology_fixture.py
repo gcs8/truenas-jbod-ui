@@ -262,6 +262,20 @@ def build_fixture() -> dict:
 
 
 class FabricTopologyFixtureTests(unittest.TestCase):
+    def test_projection_sorts_one_boards_members_only_once(self) -> None:
+        from unittest.mock import patch
+
+        from app.services.sas_fabric_enclosures import project_enclosures
+
+        _, snapshot, _ = _core_case()
+        slot = snapshot.slots[0]
+        snapshot.slots = [slot.model_copy(update={"slot": index}) for index in reversed(range(4096))]
+        nodes = {}
+        with patch("app.services.sas_fabric_enclosures.sorted", wraps=sorted, create=True) as order:
+            project_enclosures(nodes, {}, {}, snapshot)
+        self.assertEqual(nodes[f"enclosure:{FRONT}"].related_slots, list(range(4096)))
+        self.assertLessEqual(order.call_count, 2)
+
     def test_thirteen_generality_fabrics_are_current_real_builder_output(self) -> None:
         from tests.topology_generality_fixtures import fixtures
 
@@ -376,6 +390,8 @@ def _core_variant(mode: str):
                 outputs[devices] += f"\n00 8 {_address(0xEEE)} 0020 0001 SAS Target 12.0 0003 8"
             if "-unread" in mode:
                 del outputs[expanders]
+        if mode.startswith("cascade-without-"):
+            del outputs[f"mprutil -u 0 show {mode.removeprefix('cascade-without-')}"]
         # A second disk of the unit with Bay 00's disk handle, behind an
         # expander PHY that names that handle; no adapter row names it.
         if mode in {"disk-clean", "disk-collision"}:
@@ -417,6 +433,23 @@ class AdapterHandleIdentityTests(unittest.TestCase):
     @staticmethod
     def _mpr0(mode: str) -> dict:
         return next(item for item in _core_variant(mode)["controllers"] if item["id"] == "controller:mpr0")
+
+    def test_cascade_child_handle_must_be_unique_even_if_the_second_table_is_empty(self) -> None:
+        from app.services.sas_fabric_core import _MprReportedLaneContext
+
+        expanders = [row for row in _core_variant("base")["expanders"] if row["controller_id"] == "controller:mpr0"]
+        child = next(index for index, row in enumerate(expanders) if row["parent"] == expanders[0]["dev_handle"])
+        self.assertIsNotNone(_MprReportedLaneContext(expanders, None, 0).parent_link_lanes(child, to_controller=False))
+        other = {**expanders[child], "sas_address": _address(0xEEE), "phys": []}
+        for records, index in (([*expanders, other], child), ([other, *expanders], child + 1)):
+            self.assertIsNone(_MprReportedLaneContext(records, None, 0).parent_link_lanes(index, to_controller=False))
+
+    def test_cascade_lanes_need_every_unit_list(self) -> None:
+        for missing in ("devices", "enclosures"):
+            fabric = _core_variant(f"cascade-without-{missing}")
+            cascades = [link for link in fabric["links"] if link["kind"] == "expander-expander"]
+            self.assertFalse(any(link["reported_lanes"] for link in cascades if "controller:mpr0:" in link["source"]))
+            self.assertTrue(any(link["reported_lanes"] for link in cascades if "controller:mpr1:" in link["source"]))
 
     def test_the_enclosure_processor_a_handle_names_is_one_whichever_reply_names_it(self) -> None:
         # Named by the device list and the enclosure list, or by the
@@ -473,7 +506,7 @@ class AdapterHandleIdentityTests(unittest.TestCase):
 class TransportAddressIdentityTests(unittest.TestCase):
     """A disk port address at two slots identifies neither, host-wide (#1504)."""
 
-    def _records(self, duplicate: bool, inventory_addresses: bool = True) -> list[dict]:
+    def _records(self, duplicate: bool, inventory_addresses: bool = True, missing_ordinal: bool = False) -> list[dict]:
         from tests import topology_generality_fixtures as generality
 
         survey = generality.Survey()
@@ -483,10 +516,19 @@ class TransportAddressIdentityTests(unittest.TestCase):
         for bay in (0, 1):
             address = "5eee000000000010" if duplicate or bay == 0 else "5eee000000000011"
             survey.end(expander, [bay], bay=bay, enclosure=shelf["id"], address=address, block=f"wdcase{bay}")
+            if missing_ordinal and bay == 1:
+                attrs = survey.rows[-2]["attrs"]
+                del attrs["bay_identifier"]
+                attrs["enclosure_identifier"] = "0x" + REAR
             shelf["slots"].append({"slot": bay, "address": address if inventory_addresses else None, "block": f"wdcase{bay}"})
         fabric, _inventory, ok = generality.enriched({"id": "example", "label": "Test box", "enclosures": [shelf]}, shelf, survey.text())
         self.assertTrue(ok)
         return [record for record in fabric["raw"]["sas_transport_ports"] if record["remote_kind"] == "end_device"]
+
+    def test_different_read_enclosures_conflict_even_without_a_bay_number(self) -> None:
+        records = self._records(duplicate=True, inventory_addresses=False, missing_ordinal=True)
+        self.assertCountEqual([row["bay_identifier"] for row in records], [0, None])
+        self.assertTrue(all(row.get("remote_address_state") == "ambiguous" for row in records))
 
     def test_one_address_at_two_transport_slots_marks_both_records_whatever_the_inventory_reports(self) -> None:
         # The transport alone places one address at two slots.

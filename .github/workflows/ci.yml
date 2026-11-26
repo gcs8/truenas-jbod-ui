@@ -1358,11 +1358,15 @@ jobs:
         if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
         run: npm ci --ignore-scripts
 
+      - name: Ensure the child-process file tracer is installed
+        if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
+        run: command -v strace || (sudo apt-get update && sudo apt-get install -y strace)
+
       - name: Run the frontend mutants
         if: steps.scope.outputs.run == 'true' && startsWith(matrix.part, 'frontend')
         env:
           PART: ${{ matrix.part }}
-        run: node tests/mutation/run_topology_frontend_mutants.cjs --shard "${PART#frontend }"
+        run: node tests/mutation/run_topology_frontend_mutants.cjs --trace-opens --shard "${PART#frontend }"
 
       - name: Set up Python
         if: steps.scope.outputs.run == 'true' && matrix.part == 'backend'
