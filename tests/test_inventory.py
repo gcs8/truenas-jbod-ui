@@ -9496,7 +9496,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 range(0, 6),
             ),
             make_enclosure(
-                "50030480090c4f7f",
+                "5000c500ee000001",
                 "LSI SAS3x40 0601",
                 "/dev/ses2",
                 range(0, 24),
@@ -9513,13 +9513,13 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 ],
             ),
             make_enclosure(
-                "500304801f715f3f",
+                "5000c500ee000003",
                 "LSI-F SAS3x48Front 0c04",
                 "/dev/ses4",
                 range(1, 31),
             ),
             make_enclosure(
-                "500304801f5a003f",
+                "5000c500ee000002",
                 "LSI-R SAS3x48Rear 0c04",
                 "/dev/ses5",
                 range(1, 31),
@@ -9581,7 +9581,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             with patch("app.services.inventory.parse_ssh_outputs", side_effect=fake_parse_ssh_outputs):
                 snapshot = await service.get_snapshot(force_refresh=True)
 
-        self.assertEqual(snapshot.selected_enclosure_id, "500304801f715f3f+500304801f5a003f")
+        self.assertEqual(snapshot.selected_enclosure_id, "5000c500ee000003+5000c500ee000002")
         self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
         self.assertEqual(snapshot.summary.enclosure_count, 2)
         self.assertTrue(snapshot.slots)
@@ -9596,8 +9596,8 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [option.id for option in snapshot.enclosures],
             [
-                "500304801f715f3f+500304801f5a003f",
-                "50030480090c4f7f",
+                "5000c500ee000003+5000c500ee000002",
+                "5000c500ee000001",
             ],
         )
         self.assertFalse(any(option.id == "3061686369656d30" for option in snapshot.enclosures))
@@ -9656,19 +9656,19 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             with patch("app.services.inventory.parse_ssh_outputs", side_effect=fake_parse_ssh_outputs):
                 snapshot = await service.get_snapshot(
-                    selected_enclosure_id="50030480090c4f7f",
+                    selected_enclosure_id="5000c500ee000001",
                     force_refresh=True,
                 )
 
-        self.assertEqual(snapshot.selected_enclosure_id, "50030480090c4f7f")
+        self.assertEqual(snapshot.selected_enclosure_id, "5000c500ee000001")
         self.assertEqual(snapshot.selected_enclosure_label, "LSI SAS3x40 0601")
         self.assertEqual(snapshot.selected_profile.id, SCALE_SSG_FRONT_24_PROFILE_ID)
         self.assertEqual(snapshot.layout_slot_count, 24)
         self.assertEqual(
             [option.id for option in snapshot.enclosures],
             [
-                "50030480090c4f7f",
-                "500304801f715f3f+500304801f5a003f",
+                "5000c500ee000001",
+                "5000c500ee000003+5000c500ee000002",
             ],
         )
 
@@ -11806,7 +11806,7 @@ Enclosure Status diagnostic page:
                         "Writeback Cache is:   Disabled\n"
                         "    negotiated logical link rate: phy enabled; 12 Gbps\n"
                         "    SAS address = 0x5000cca23b713c81\n"
-                        "    attached SAS address = 0x500304801f715f3f\n"
+                        "    attached SAS address = 0x5000c500ee000003\n"
                     )
                 return (
                     '{'
@@ -11898,7 +11898,7 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
             self.assertEqual(summary.logical_unit_id, "5000cca23b713c80")
             self.assertEqual(summary.sas_address, "0x5000cca23b713c81")
-            self.assertEqual(summary.attached_sas_address, "0x500304801f715f3f")
+            self.assertEqual(summary.attached_sas_address, "0x5000c500ee000003")
             self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
             self.assertEqual(service.ssh_probe.commands, [])
             self.assertEqual(
@@ -12189,7 +12189,7 @@ Enclosure Status diagnostic page:
                         '"attached_device_type":"expander device",'
                         '"negotiated_logical_link_rate":"phy enabled; 12 Gbps",'
                         '"sas_address":"0x5000cca2c272c1b9",'
-                        '"attached_sas_address":"0x500304801f715f3f"'
+                        '"attached_sas_address":"0x5000c500ee000003"'
                         '}'
                         '}'
                         "}"
@@ -12235,7 +12235,7 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.writeback_cache_enabled, False)
             self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
             self.assertEqual(summary.sas_address, "0x5000cca2c272c1b9")
-            self.assertEqual(summary.attached_sas_address, "0x500304801f715f3f")
+            self.assertEqual(summary.attached_sas_address, "0x5000c500ee000003")
             self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
 
     async def test_core_smart_summary_reports_missing_smartctl_sudo_permission_cleanly(self) -> None:

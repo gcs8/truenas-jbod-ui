@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -8,7 +9,9 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -35,6 +38,182 @@ EXTERNAL_ACTION_RE = re.compile(
 
 
 class CIWorkflowContractTests(unittest.TestCase):
+    def test_published_scan_is_main_only_serial_and_least_privilege(self) -> None:
+        path = WORKFLOW_DIR / "published-image-scan.yml"
+        self.assertTrue(path.is_file(), "published image scan workflow is missing")
+        text = self.read(path)
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertEqual(triggers["schedule"], [{"cron": "41 5 * * *"}])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        jobs = workflow["jobs"]
+        self.assertEqual(set(jobs), {"test", "scan"})
+        self.assertNotIn("permissions", jobs["test"])
+        writer = jobs["scan"]
+        self.assertEqual(writer["permissions"], {"contents": "read", "packages": "read", "issues": "write"})
+        self.assertEqual(writer["if"], "github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')")
+        self.assertEqual(writer["needs"], ["test"])
+        self.assertEqual(writer["concurrency"], {"group": "published-image-scan-writer", "cancel-in-progress": False})
+        for job in jobs.values():
+            self.assertEqual(job["runs-on"], "ubuntu-latest")
+            self.assertNotIn("runner.", json.dumps(job.get("env", {})))
+            self.assertNotIn("services", job)
+            for step in job["steps"]:
+                self.assertNotIn("continue-on-error", step)
+        steps = writer["steps"]
+        token_steps = [step for step in steps if "github.token" in json.dumps(step.get("env", {}))]
+        self.assertEqual(token_steps, [steps[-1]])
+        self.assertEqual(steps[-1]["env"]["GITHUB_TOKEN"], "${{ github.token }}")
+        self.assertIn("sync", steps[-1]["run"])
+        self.assertIn("scan", steps[-2]["run"])
+        self.assertIn("test_published_image_scan.py", json.dumps(jobs["test"]))
+        for forbidden in ("secrets.", "packages: write", "pull_request_target", "upload-artifact", "docker build"):
+            self.assertNotIn(forbidden, text)
+        ci_actions = {step["uses"] for job in yaml.safe_load(self.read(CI_WORKFLOW))["jobs"].values()
+                      for step in job.get("steps", []) if "uses" in step}
+        for job in jobs.values():
+            for step in job["steps"]:
+                if "uses" in step:
+                    self.assertIn(step["uses"], ci_actions)
+
+    def test_published_scan_native_policy_and_verified_version_pin(self) -> None:
+        policy = ROOT / ".trivyignore.yaml"
+        self.assertTrue(policy.is_file(), "native ignore policy is missing")
+        script = ROOT / ".github/scripts/published_image_scan.py"
+        spec = importlib.util.spec_from_file_location("published_image_scan_policy", script)
+        assert spec is not None and spec.loader is not None
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        validated = scanner.validate_policy(self.read(policy))
+        self.assertEqual(validated["secrets"], [])
+        source = self.read(script)
+        self.assertIn('TRIVY_VERSION = "0.76.2"', source)
+        self.assertIn("bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf", source)
+        self.assertIn("802e4ac1418ed967cd3c4b901f4f71ca00b7363ede67778665a22d9f13f58c83", source)
+        self.assertTrue((ROOT / ".github/PUBLISHED_IMAGE_SCAN.md").is_file())
+
+    def test_published_scan_policy_contract_accepts_reviewed_exceptions_only(self) -> None:
+        policy = ROOT / ".trivyignore.yaml"
+        future = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat()
+        valid = (
+            "vulnerabilities:\n  - id: CVE-2000-0001\n"
+            f"    statement: Synthetic reviewed exception\n    expired_at: {future}\nsecrets: []\n"
+        )
+        original_read = self.read
+        for text in ("vulnerabilities: []\nsecrets: []\n", valid):
+            with self.subTest(valid=text), patch.object(
+                self, "read", side_effect=lambda path: text if path == policy else original_read(path)
+            ):
+                self.test_published_scan_native_policy_and_verified_version_pin()
+        invalid = (
+            valid.replace("Synthetic reviewed exception", "' '"),
+            valid.replace(future, "2000-01-01"),
+            valid.replace("secrets: []", "secrets: [{id: synthetic-secret}]"),
+            valid + "secrets: []\n",
+        )
+        for text in invalid:
+            with self.subTest(invalid=text), patch.object(
+                self, "read", side_effect=lambda path: text if path == policy else original_read(path)
+            ), self.assertRaises(ValueError):
+                self.test_published_scan_native_policy_and_verified_version_pin()
+
+    def test_workflow_lint_covers_all_workflows_and_its_own_inputs(self) -> None:
+        path = WORKFLOW_DIR / "workflow-lint.yml"
+        self.assertTrue(path.is_file(), "the maintained workflow lint workflow is missing")
+        text = self.read(path)
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "push", "workflow_dispatch"})
+        for event in ("pull_request", "push"):
+            self.assertEqual(triggers[event]["branches"], ["main"])
+            self.assertEqual(triggers[event]["paths"], [".github/**", "tests/test_ci_contract.py"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"lint"})
+        job = workflow["jobs"]["lint"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], 10)
+        for key in ("permissions", "container", "services", "continue-on-error", "if", "env"):
+            self.assertNotIn(key, job)
+        steps = job["steps"]
+        actions = [step["uses"] for step in steps if "uses" in step]
+        self.assertEqual(actions, [
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+        ])
+        self.assertFalse(steps[0]["with"]["persist-credentials"])
+        self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+        for step in steps:
+            for key in ("continue-on-error", "if", "env"):
+                self.assertNotIn(key, step)
+        self.assertEqual([step["run"] for step in steps if "run" in step], [
+            "python -m unittest discover -s .github/tests -p 'test_workflow_lint.py' -v",
+            'python .github/scripts/workflow_lint.py --install-tools "$RUNNER_TEMP/workflow-lint-tools"',
+            'python .github/scripts/workflow_lint.py --tools-dir "$RUNNER_TEMP/workflow-lint-tools" '
+            '--report-dir "$RUNNER_TEMP/workflow-lint-reports"',
+        ])
+        for forbidden in ("secrets.", "github.token", "pip install", "npx", "curl", "-shellcheck="):
+            self.assertNotIn(forbidden, text)
+        config = yaml.safe_load(self.read(ROOT / ".github/actionlint.yaml"))
+        self.assertEqual(config, {"self-hosted-runner": {"labels": ["jbod-native-trial"]}})
+
+    def test_dependency_audits_cover_inputs_policy_and_weekly_schedule(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertEqual(set(triggers["pull_request"]["paths"]), {
+            "requirements.txt", "requirements.lock", "requirements-dev.txt",
+            "package.json", "package-lock.json", ".github/workflows/dependency-audit.yml",
+            ".github/scripts/dependency_audit.py", ".github/tests/test_dependency_audit.py",
+            ".github/dependency-audit-ignore.json", ".github/DEPENDENCY_AUDIT.md",
+            "tests/test_ci_contract.py",
+        })
+        self.assertEqual(triggers["schedule"], [{"cron": "23 6 * * 1"}])
+
+    def test_dependency_audits_are_hosted_read_only_and_reuse_verified_pins(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"audit"})
+        job = workflow["jobs"]["audit"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        for key in ("permissions", "container", "services", "continue-on-error", "if"):
+            self.assertNotIn(key, job)
+        self.assertLessEqual(job["timeout-minutes"], 20)
+        steps = job["steps"]
+        actions = [step["uses"] for step in steps if "uses" in step]
+        self.assertEqual(len(actions), 3)
+        ci_actions = {step["uses"] for ci_job in yaml.safe_load(self.read(CI_WORKFLOW))["jobs"].values()
+                      for step in ci_job.get("steps", []) if "uses" in step}
+        for action in actions:
+            self.assertIn(action, ci_actions)
+        for step in steps:
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotIn("if", step)
+        self.assertNotIn("secrets.", self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+
+    def test_dependency_audits_validate_policy_and_test_before_installing_scanners(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "dependency-audit.yml"))
+        commands = [step["run"] for step in workflow["jobs"]["audit"]["steps"] if "run" in step]
+        self.assertEqual(commands, [
+            "python -m unittest discover -s .github/tests -p 'test_dependency_audit.py' -v",
+            "python .github/scripts/dependency_audit.py --validate-only",
+            'python -m venv "$RUNNER_TEMP/audit-venv"\n'
+            '"$RUNNER_TEMP/audit-venv/bin/python" -m pip install --only-binary=:all: pip-audit==2.10.1\n'
+            'npm install --global --ignore-scripts npm@10.9.8\n',
+            '"$RUNNER_TEMP/audit-venv/bin/python" .github/scripts/dependency_audit.py',
+        ])
+        self.assertEqual(workflow["jobs"]["audit"]["env"]["PIP_ONLY_BINARY"], ":all:")
+        policy = json.loads(self.read(ROOT / ".github/dependency-audit-ignore.json"))
+        self.assertEqual(set(policy), {"version", "ignores"})
+        self.assertEqual(policy["version"], 1)
+        self.assertIsInstance(policy["ignores"], list)
+        doc = self.read(ROOT / ".github/DEPENDENCY_AUDIT.md")
+        for text in ("reason", "expires", "UTC", "--package-lock-only", "requirements.lock",
+                     "requirements-dev.txt", "high", "critical", "npm:123", "GHSA-"):
+            self.assertIn(text, doc)
+
     def read(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
@@ -49,6 +228,44 @@ class CIWorkflowContractTests(unittest.TestCase):
             "CI runs on every branch push and on pull requests targeting `main`.",
             contributing,
         )
+
+    def test_secret_scan_covers_every_main_pull_request_and_weekly_dispatch(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "secret-scan.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(triggers["pull_request"], {"branches": ["main"]})
+        self.assertEqual(triggers["schedule"], [{"cron": "23 7 * * 1"}])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"secret-scan"})
+        job = workflow["jobs"]["secret-scan"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        for forbidden in ("if", "permissions", "services", "container", "continue-on-error"):
+            self.assertNotIn(forbidden, job)
+        steps = job["steps"]
+        checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {"fetch-depth": 0, "persist-credentials": False})
+        commands = "\n".join(step.get("run", "") for step in steps)
+        self.assertIn("python -m unittest discover -s .github/tests -p 'test_secret_scan.py' -v", commands)
+        self.assertIn('python .github/scripts/secret_scan.py scan --binary "$GITLEAKS_BINARY"', commands)
+        for step in steps:
+            for forbidden in ("if", "continue-on-error"):
+                self.assertNotIn(forbidden, step)
+        for forbidden in ("secrets.", "upload-artifact", "GITLEAKS_LICENSE"):
+            self.assertNotIn(forbidden, self.read(WORKFLOW_DIR / "secret-scan.yml"))
+
+    def test_secret_scan_runtime_paths_use_step_environment_context(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "secret-scan.yml"))
+        self.assertNotIn("runner.", json.dumps(workflow.get("env", {})))
+        job = workflow["jobs"]["secret-scan"]
+        self.assertNotIn("runner.", json.dumps(job.get("env", {})))
+        run_steps = [step for step in job["steps"] if "run" in step]
+        self.assertEqual(len(run_steps), 3)
+        for step in run_steps:
+            with self.subTest(step=step["name"]):
+                self.assertEqual(step.get("env"), {
+                    "TMPDIR": "${{ runner.temp }}",
+                    "GITLEAKS_BINARY": "${{ runner.temp }}/secret-scan-tools/gitleaks",
+                })
 
     def test_python_floor_and_ceiling_are_separate_matrix_entries(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
@@ -239,8 +456,12 @@ class CIWorkflowContractTests(unittest.TestCase):
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup, and the fixture
-        # browser legs' failure-only report upload (#1191).
-        self.assertEqual(action_count, 46)
+        # browser legs' failure-only report upload (#1191), plus the dependency
+        # audit workflow's checkout, Python setup and Node setup, and the
+        # published-image scan's two checkout and two Python setup uses.
+        # Also count main's workflow-lint checkout and Python setup, plus the
+        # secret-scan checkout and Python setup (#1513).
+        self.assertEqual(action_count, 57)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 

@@ -1,0 +1,479 @@
+# Exact historical findings only. Review each new finding before adding an entry.
+# Native gitleaks accepts whole-line comments, not inline fingerprint comments.
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+00d7f42b90e6ff3144756fec3c3e56d980e548a8:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+0298323f78d0d80167e814f6d7815f0788215696:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+02a9caa9d907e028996f89280ac54e84e23c96fd:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+055d51e8a95818e20e474f944d9ad92dc04956d4:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+055d51e8a95818e20e474f944d9ad92dc04956d4:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+061d9129e7584a15f82e0baa19450cf74279c9da:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+061d9129e7584a15f82e0baa19450cf74279c9da:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+06fa1148fae194156c13c60edb82e762a1012788:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+08fa3570e1feb42df6512e5b96d96554c8c4840f:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+0bb2867997d9f04d5e7de9317152b4cd5be150be:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+0d3aa2f16c10626d3003e9285fff60ba79743a45:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+0d3aa2f16c10626d3003e9285fff60ba79743a45:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+0d44bdebfbac6f06d61e2b66da2237d71627aefa:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+1067b3589d317c8af98811c1327e5adaf8ccb74e:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+1067b3589d317c8af98811c1327e5adaf8ccb74e:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+120ccf6967c46b62360f294a58286392130f0633:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+120ccf6967c46b62360f294a58286392130f0633:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+133bb9195bdc11410aaf2ac742346c47bb66361f:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+15e888dc59cb69cfd34b6f472a63f933a830f19e:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+19fcb5fca8cfc37cce53cde536804d3d885df64a:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+1cfbec5afe282862b0c74d892bf44a06efeffdee:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+1d09186e380d71b06fe2f5a1eb6a00ef99966286:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+1d09186e380d71b06fe2f5a1eb6a00ef99966286:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+1dadf7da4b03a7c3cc76066ea7c2f92902380b28:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed tests/test_system_backup.py: explicit synthetic test literal in test_save_system_rejects_preserved_api_secrets_when_authority_changes, not a credential.
+1f9222e2a8bdf38dbaa5737bf8cb02f4fd2efbf1:tests/test_system_backup.py:generic-api-key:4937
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+209b181954961b386b14458c26a5d2c64fb4c073:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+25d6d21c2279f7b1307a9f126ec31f862e458169:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+25d6d21c2279f7b1307a9f126ec31f862e458169:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+2947d3eb0d2e6e6fbe2ec2f0a7bd4b66cf2c0cf0:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+2a7f11258083a4cd27b156fe4a073f83db2842a5:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+2acf609f67d79598234f0fde83ce9b34b57db331:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+2ae414345f5da1da6380247ab2805a4ea35f95b7:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+2db6f82a80a0415a37a35dbf3505a6834a65b843:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+2fbb96b0aa3f9e25fd80363a9208ccddcc810b50:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+321a3fb0e8e35e960913b36aabc1971a8d231ba4:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+321a3fb0e8e35e960913b36aabc1971a8d231ba4:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+33d4f552e2bcc66a0feb1c21a6e4b5a53e092581:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+346c8a23b0793168a6ac2ed536682d6c7659abe3:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+3685491d48f8f79e4031bb9ed0ba281fc76049a1:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+369fd22347c3bacf27eacf4e8367b4b2c9503b14:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+3e4b6c72aa4dba195b5fefe496bdf82d26476e17:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+40eb58a0d2c6f6fc57dd56f5de3a8eebea0255d6:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+413712f51949c5971f2533a46b6963bae5f95ad4:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_system_backup.py: explicit synthetic test literal in test_save_system_rejects_preserved_api_secrets_when_authority_changes, not a credential.
+418769356a7c1bc1789ce26e1e0962b9b53b067c:tests/test_system_backup.py:generic-api-key:4937
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+4408ec2f3b5714cd16b9a5bee3b4b24a8efa60d3:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+466eb1865d8b6ba85a8a4b266d9a92e8147ac346:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+4a27771d080cf74ab537be58eb8093507d9f1417:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+53c674699c8e8173cf29ec6e6d9c48cf80fdce5d:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+546837d9deda1f6de24dfe35243161b0b45b8e18:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+595bff6737069718997ab0abb38e83625c04e221:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+597852f73ac7d7a4f0aa5cd2ccad25fae0fb8b03:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+5bc1c090d65a4cf3dd9b0614b9538849a70a885d:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+5ef2c3122963664bc3fbe1c74a17d1388c34bea6:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+663e11b6003d2a10593ad7588cfe5a4a6c95507d:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+671295624406600b6c0dfc2d5ea5796631e36e6e:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+6a648a0112ed77a7549b42aae7e7435e89a7ff66:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+6bba03ae1ea6fcb551cccabb56b4303325a57a8e:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+6e3cce58f7b3c928c7bf70aa98b074f4fd176f58:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+6f1c443fa12475599b4f0d7f42de14bee4c7b11c:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+70e146963cd2dd4ca06325a4fed2652872ef3792:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+70e146963cd2dd4ca06325a4fed2652872ef3792:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+71f1b11f3204ccf510e4550b266453b25c58b706:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+7323e22a58e81ac163bb9014f1636e5ec6cd0c4b:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+7323e22a58e81ac163bb9014f1636e5ec6cd0c4b:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+74a29703e8dfbf01f160a6d699e40963c31c9d2b:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+77062115aedc8b388625608615873a04b42bdd93:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+78e118f4606d320feecef848ad891a67cefadb5f:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+7ccfd12f0daf458b92ba9f6e5a8612e8c9430ecf:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+7ccfd12f0daf458b92ba9f6e5a8612e8c9430ecf:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+7f15afae3b8a84ca7acedd8b06f3eead34bd7953:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+7f15afae3b8a84ca7acedd8b06f3eead34bd7953:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+7f470c4307a706190871bbf2c1a9fbfb302280b2:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8584fd15fdd7b60658c56c47307990065db3d7c4:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+875b86d41247571ab8e386d56aa330e7ff648c1e:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+87bd88b348c7269e0ae0e5076f2ebdf5f9697126:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+87f015b4bbccfcba21a64d13e64e14431758c1a8:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+88f95644a6306612f684f6bfc7155cd5525ad0d8:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+88fee5d62e252c8742ebf22a928905d70333b2f4:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8927182dddde16e9b73c9d7d44d15c84b9e5c3e2:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+893812623a28c7c379173025cc8087b920f9fff4:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+893812623a28c7c379173025cc8087b920f9fff4:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+89ccc8336b4f7c6f77ac0aecf2ebc90accd52d7d:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+89ccc8336b4f7c6f77ac0aecf2ebc90accd52d7d:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8a58702c91c999d43e450d13724181572250ec45:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8a9b4ede8622fc95122215cc7d99fa6d4794736e:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8b1a751a1a72d96cf01857b27debad05dc777b1a:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+8f52e540e3656cd55a9a44d83a1286949c77f689:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+914ac2852322dbabd365a407946fd19a0651b9ed:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+9378094906f4d3c5eddefe13d893ea761b4b2970:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+96aa20d4e4ce6fcd85a4741c6a248e6367e64531:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+96aa20d4e4ce6fcd85a4741c6a248e6367e64531:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+9722c882eb2c646d29863d19b956ced2b74bbff1:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+986c1efdb4a31d1bb6715f6ec49f319a0b060b77:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+9aa2b8c4beb3a1a54d7cef6d4475860a692b798c:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+9b0e0f5c79436c9205b77f3295496ac5c3309dbc:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+9c0ad2ff30aaa84ccb3c66297e0722619f424114:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+9f1a0f333e08a6a49ef9c55bb33c3fe1063c5960:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+a14e98a760f8be33c4ee2af3201e8c2010934885:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+a1db8d6504c1f9884180b98f881fc2a483d5aaf4:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_admin_service.py: reserved .invalid test URL in test_snapshot_export_download_reuses_estimate_source_inputs_when_packaging_changes, not a live endpoint credential.
+a5b5d5c181aa6d639c50377cc525dc4450d70f61:tests/test_admin_service.py:generic-api-key:1003
+
+# Reviewed tests/test_admin_service.py: reserved .invalid test URL in test_snapshot_export_download_reuses_estimate_source_inputs_when_packaging_changes, not a live endpoint credential.
+a5b5d5c181aa6d639c50377cc525dc4450d70f61:tests/test_admin_service.py:generic-api-key:999
+
+# Reviewed tests/test_snapshot_export.py: reserved .invalid test URL in test_none_export_preserves_configured_hostname_fidelity, not a live endpoint credential.
+a5b5d5c181aa6d639c50377cc525dc4450d70f61:tests/test_snapshot_export.py:generic-api-key:873
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+a736f39531dedf5ffca02f3c63e70bf8fe2fc4a6:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+a98917a4ba21aef06adab7bf7adc2c4bf0663f05:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+ac018a2edb6df9f0f8decfec55788ce7d41749fe:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_ssh_diagnostic_safety.py: curl-auth redaction fixture interpolates an explicit SYNTHETIC marker at example.test in test_ambiguous_options_are_redacted_only_when_credential_bearing, not a credential.
+b0a760ed151e8603bfe8602e6863e611f92c5ab0:tests/test_ssh_diagnostic_safety.py:curl-auth-user:362
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b11763e1936a2a3e15078ed6bfdb9f712bd6d51a:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+b11763e1936a2a3e15078ed6bfdb9f712bd6d51a:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b2b714d84d2a044551d6e4906a0015b597862abe:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b37aa0f5ffe16793db09b81a07d3e3fa51eeb1d7:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b47d4d064bf0a182490ea2b2bca1db6c8f8bc28f:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b4da251e1c13ae6bdf61bf29953df247ae8b420c:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b53b64dfbc01998d94d558f38cc31bb5ee688b2a:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+b53b64dfbc01998d94d558f38cc31bb5ee688b2a:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+b8757555a1dfbb748a6b37feed9e48fa1fd2265f:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+b8757555a1dfbb748a6b37feed9e48fa1fd2265f:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+bbfdee10c57ad6acf2430f32afc8cf2419ac809b:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+bd0f8bce2ebf7ef32240d882233be3e5984b2023:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+be71a49aee28fdc363f2a1cbf71b6707771a6825:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+bf4fc5fdf60878db3ac69536561a6d651e44e825:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+bf87016239ee91874f7e53f077a8dfd78933b21f:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+c0563b3ce799aee3481b838776d5298f1ff04c43:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: legacy source-hash manifest has no source revision; app/secret_files.py SHA-256 matches the file at this fingerprint commit, not a credential.
+c40b66054a27c25021600cabdda8dcc712ee4e26:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+c4f3eb00177c1591cf2c6749b72b4f8809fd3765:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+c63f4a20c320e259eec8a30e5fe2c5fe63e87385:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+c63f4a20c320e259eec8a30e5fe2c5fe63e87385:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+c699df203f22b4ed8649e59846a297ae2dc07946:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+c86d65f2fdf9600dc64e883e40faafd24cb7006c:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+ca8873d489602d0cf5f88846a367d2e53dfd4277:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+cdf1343f9ea439329ed7d5ff5ef45ec8d772b927:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+cdf1343f9ea439329ed7d5ff5ef45ec8d772b927:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+ce8c2fc5d593c01ff017c9f998a6584978809fe1:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+cee2843efbc77b997509689e47a945fc6aeb4422:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d1089637a25c851b6d2f34ca2b0a02ed4c2e84ee:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+d1e085faa00d69ed1f498a648ee630be9287ab9e:tests/test_full_backup_benchmark.py:generic-api-key:242
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d1e11ec8d07227c43f2276d6b1ebb42e2822e85d:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+d1e11ec8d07227c43f2276d6b1ebb42e2822e85d:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d2e740fa8b9337aed6b68b6769b77665ec8e0e2b:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d382aa35b39332f5c5b2df2413a0783774c85a81:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d43bfbf5cd6e6025c8e296d08eb30e96ada67bc3:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+d593e33081134c23cbc6c5b2977c577e8c8af6ca:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+dae7040facb167351c3d53564b272dc843ad77ff:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+dbcd2ab31e9a46083693cf08802434ac8cfc1e43:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+dc0d87cf6924263e406579b0a3231343ec5cc4db:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+dd7c17cb5d9f18a47e5465bdb03a7184c72e661e:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+dea8386bad00003bbb5289a20f42f1cdcf1b8e77:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+e567a65ffd5483a6574b664815ce5d0fae462317:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+ed5f12addee6e10fbeb7609247448ed8e5e8f69c:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+ef14683a095a69ac95b5bb0fcacce68225155e82:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+f12c9f28d433753e3c723da16477938dbeb990e9:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+f8d7f8ffecec295146cd847e45097204c84f4b48:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+f8d98b40eed3301eef7b82ab520c0d71bed8cb94:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+f97ae29839e16a1ecf6c893a21136ef32736e934:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+fb592734bb224d2967fafef51bd1b4790448a757:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+fb592734bb224d2967fafef51bd1b4790448a757:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+fc56cbd49bf8c71e8afb9b2c9a6c8786d6eb9d26:public-demo/index.html:generic-api-key:1
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+fe298a0f8ba331ad68a0285047607f2899b59a7c:public-demo/index.html:generic-api-key:1
+
+# Reviewed tests/test_full_backup_benchmark.py: explicit synthetic test literal in test_passphrase_only_in_stdin_and_errors_redacted, not a credential.
+fe298a0f8ba331ad68a0285047607f2899b59a7c:tests/test_full_backup_benchmark.py:generic-api-key:370
+
+# Reviewed public-demo/index.html: app/secret_files.py source SHA-256 equals that file at the manifest-recorded revision, not a credential.
+ff049c77671ec9d280c2209dc90924ebe2bde8e3:public-demo/index.html:generic-api-key:1

@@ -6225,9 +6225,15 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             remaining = timeout_seconds - (self._disk_inventory_sync_clock() - started)
             # A deadline is not a failed observation. Retain the last known
             # active state instead of attempting a doomed near-zero-budget read.
+            previous_state = state
             if remaining > 0:
                 state, error = await self._read_disk_sync_job(midclt, job_id, budget=min(50.0, remaining))
             elapsed = self._disk_inventory_sync_elapsed(started)
+            read_deadline_reached = (
+                elapsed >= timeout_seconds and state == "UNKNOWN" and previous_state in {"WAITING", "RUNNING"}
+            )
+            if read_deadline_reached:
+                state, error = previous_state, None
             if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
                 self._disk_inventory_sync_active_job_id = None
                 break
@@ -6245,6 +6251,7 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                          f"TrueNAS disk sync job {job_id} is waiting in the disk.sync_all queue. "
                          if state == "WAITING" else
                          f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. ") +
+                        (f"Status read deadline reached while {state.lower()}. " if read_deadline_reached else "") +
                         "Check the job in the TrueNAS UI, then refresh here when it finishes."
                     ),
                 )
