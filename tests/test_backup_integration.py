@@ -2090,24 +2090,30 @@ class ProductionPathCaptureTests(unittest.TestCase):
             self.assertEqual(dict(scheduler.backup_service._captured_config_files), {})
 
     def test_budget_reader_refusal_preserves_the_pending_config_change(self):
-        from app.services.json_state_budget import JsonStateFileTooLarge
+        from app.services import json_state_budget
 
-        refused = JsonStateFileTooLarge("slot_mappings.json", 8, "keys and values")
-        with patch(
-            "app.services.json_state_budget.read_json_state",
-            side_effect=refused,
-        ) as budget_reader:
-            with self.built() as (scheduler, _state, _layout, _raw, clock):
+        for key in ("mapping_file", "sas_fabric_alias_file"):
+            with self.subTest(key=key), self.built() as (scheduler, state, layout, raw, clock):
                 change = scheduler.journal.append("mapping.save", "synthetic-over-budget")
-                self.due(scheduler, clock)
-                self.assertEqual(scheduler.catalog.list(), [])
-                self.assertEqual(scheduler.journal.last_backup(), (None, None))
-                self.assertEqual(
-                    [entry.change_id for entry in scheduler.journal.pending()],
-                    [change.change_id],
-                )
-        self.assertEqual(budget_reader.call_count, 1)
-        self.assertEqual(budget_reader.call_args.args[1], "slot_mappings.json")
+                path = layout[key]
+                path.write_bytes(raw[key].ljust(65))
+                with patch.object(json_state_budget, "MAX_JSON_STATE_FILE_BYTES", 64):
+                    self.due(scheduler, clock)
+                    self.assertNotIn("capture", state, "Over-budget input reached the hash and export path")
+                    self.assertEqual(scheduler.catalog.list(), [])
+                    self.assertEqual(scheduler.journal.last_backup(), (None, None))
+                    self.assertEqual([entry.change_id for entry in scheduler.journal.pending()], [change.change_id])
+                    last_run = scheduler.library()["classes"]["config"]["last_run"]
+                    self.assertIsNotNone(last_run, "Snapshot refusal missing from backup status")
+                    self.assertIs(last_run["ok"], False)
+                    self.assertIn(path.name, last_run["detail"])
+                    self.assertIn("64 bytes", last_run["detail"])
+                    self.assertEqual(json.loads(scheduler.paths.status_file.read_text())["classes"]["config"], last_run)
+                    scheduler.tick()  # waiting for retry is not a successful read
+                    self.assertEqual(scheduler.library()["classes"]["config"]["last_run"], last_run)
+                    path.write_bytes(raw[key])
+                    self.due(scheduler, clock)
+                    self.assertTrue(scheduler.library()["classes"]["config"]["last_run"]["ok"])
 
     def test_invalid_captured_settings_preserve_journal_and_retry_live_generation(self):
         def initial(layout, raw):

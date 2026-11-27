@@ -139,7 +139,7 @@ def _row(value: Any) -> SasTransportRow:
     # A bad firmware string is one unread field, not a failed topology census.
     # Preserve structural/type refusal above and do not mutate the source row.
     attrs = {
-        key: None if isinstance(item, str) and any(unicodedata.category(c) in {"Cc", "Cf"} for c in item) else item
+        key: None if isinstance(item, str) and any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in item) else item
         for key, item in attrs.items()
     }
     if any(
