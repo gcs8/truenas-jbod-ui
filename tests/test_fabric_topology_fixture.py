@@ -502,6 +502,95 @@ class AdapterHandleIdentityTests(unittest.TestCase):
         cable = next(link for link in fabric["links"] if link["kind"] == "controller-expander" and link["source"] == "controller:mpr0")
         self.assertEqual(cable["reported_lanes"]["lane_count"], 4)
 
+    def test_handle_identity_reconciliation_is_once_per_unit(self) -> None:
+        from unittest.mock import patch
+
+        from app.services import sas_fabric_core
+
+        with patch.object(
+            sas_fabric_core,
+            "_mpr_handle_devices",
+            wraps=sas_fabric_core._mpr_handle_devices,
+        ) as reconcile:
+            _core_variant("base")
+
+        self.assertEqual(reconcile.call_count, len(UNITS))
+
+    def test_named_disk_destination_depends_on_exact_adapter_type(self) -> None:
+        from app.services.sas_fabric_core import _mpr_adapter_handle_states
+        from app.services.sas_fabric_parsers import parse_mpr_device_list
+
+        devices, rejected = parse_mpr_device_list(f"00 3 {_address(0xD01)} 0020 0001 SAS Target da3 12.0 0002 3 1")
+        self.assertEqual(rejected, 0)
+        adapter = {"phy": "4", "controller_handle": "0001", "device_handle": "0020", "device": "SAS Target"}
+        payload = {"devices": devices, "lists": {"devices": "read", "expanders": "empty", "enclosures": "empty"}}
+        self.assertEqual(_mpr_adapter_handle_states([adapter], payload), {"4": "end_device"})
+        unknown = {**adapter, "device": "SAS Target unrecognized-description"}
+        self.assertEqual(_mpr_adapter_handle_states([unknown], payload), {"4": "mismatch"})
+        # Older device-list rows had no separate type; discrepant evidence must not grant a disk destination.
+        legacy = {k: v for k, v in devices[0].items() if k != "device_type"}
+        self.assertEqual(_mpr_adapter_handle_states([adapter], {**payload, "devices": [legacy]}), {"4": "end_device"})
+        disputed = {**devices[0], "device_type": "SEP Target"}
+        self.assertEqual(_mpr_adapter_handle_states([adapter], {**payload, "devices": [disputed]}), {"4": "mismatch"})
+
+    def test_missing_identity_fields_do_not_bridge_parent_disagreements_in_any_order(self) -> None:
+        from app.services.sas_fabric_core import _mpr_adapter_handle_states
+
+        adapter_rows = [{
+            "phy": "4",
+            "controller_handle": "0001",
+            "device_handle": "0020",
+            "device": "SAS Target",
+        }]
+        observations = [
+            {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target", "parent": None},
+            {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target", "parent": "0001"},
+            {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target", "parent": "0002"},
+        ]
+        for rows in (observations, observations[::-1]):
+            with self.subTest(parents=[row["parent"] for row in rows]):
+                payload = {
+                    "lists": {"devices": "read", "enclosures": "empty", "expanders": "empty"},
+                    "devices": rows,
+                    "enclosures": [],
+                    "expanders": [],
+                }
+                self.assertEqual(_mpr_adapter_handle_states(adapter_rows, payload), {"4": "ambiguous"})
+
+    def test_addressed_identity_disagreements_are_ambiguous_in_any_order(self) -> None:
+        from app.services.sas_fabric_core import _mpr_adapter_handle_states
+
+        adapter_rows = [{
+            "phy": "4",
+            "controller_handle": "0001",
+            "device_handle": "0020",
+            "device": "SAS Target",
+        }]
+        cases = {
+            "parent": [
+                {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target",
+                 "sas_address": _address(0xD01), "parent": "0001"},
+                {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target",
+                 "sas_address": _address(0xD01), "parent": "0002"},
+            ],
+            "address": [
+                {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target",
+                 "sas_address": _address(0xD01), "parent": "0001"},
+                {"handle": "0020", "device": "SAS Target", "device_type": "SAS Target",
+                 "sas_address": _address(0xD02), "parent": "0001"},
+            ],
+        }
+        for disagreement, observations in cases.items():
+            for rows in (observations, observations[::-1]):
+                with self.subTest(disagreement=disagreement, order=[row["sas_address"] for row in rows]):
+                    payload = {
+                        "lists": {"devices": "read", "enclosures": "empty", "expanders": "empty"},
+                        "devices": rows,
+                        "enclosures": [],
+                        "expanders": [],
+                    }
+                    self.assertEqual(_mpr_adapter_handle_states(adapter_rows, payload), {"4": "ambiguous"})
+
 
 class TransportAddressIdentityTests(unittest.TestCase):
     """A disk port address at two slots identifies neither, host-wide (#1504)."""

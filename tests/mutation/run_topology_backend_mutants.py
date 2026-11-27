@@ -50,6 +50,7 @@ F = "app/services/sas_fabric.py"
 C = "app/services/sas_fabric_core.py"
 E = "app/services/sas_fabric_enclosures.py"
 L = "app/services/sas_fabric_linux_sas.py"
+P = "app/services/sas_fabric_parsers.py"
 
 # name -> (file, text replaced, replacement)
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -95,19 +96,23 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
  "M4 enclosure disagreement not listed": (E, "                unread.add(key)\n", ""),
  # one device per identity, whichever reply names it (#1504)
  "I6 enclosure processors not read": (C, "            add(row.get(\"sep_handle\"), \"sep\", None, None)", "            pass"),
- "I7 expander-typed device rows dropped": (C, "        for row in payload.get(\"devices\") or []:\n            add(", "        for row in [item for item in payload.get(\"devices\") or [] if _mpr_device_kind(item.get(\"device\")) != \"expander\"]:\n            add("),
+ "I7 expander-typed device rows dropped": (C, "        for row in payload.get(\"devices\") or []:\n            add(", "        for row in [item for item in payload.get(\"devices\") or [] if _mpr_device_kind(item) != \"expander\"]:\n            add("),
  "I8 parent or type contradiction unmarked": (C, "        if (parent and own and parent != own) or not agrees:", "        if False:"),
  "I9 enclosure processor said a disk": (C, "{\"disk\": \"end_device\", \"sep\": \"sep\"}", "{\"disk\": \"end_device\", \"sep\": \"end_device\"}"),
  "I10 lanes kept for an ambiguous handle": (C, "                or {child_handle, parent_handle} & self._ambiguous):", "                or False):"),
  "I11 inventory identities not marked": (L, "    projection.mark_inventory_identities(snapshot)\n", ""),
  "I12 enclosure contradiction ignored": (L, "            if len(found) > 1 or (enclosure and any(item[0] and item[0] != enclosure for item in found)):", "            if len(found) > 1:"),
- "I13 one address with two parents is one device": (C, "                held[\"conflict\"] = True", "                pass"),
- "I14 an unaddressed record is always a device of its own": (C, "            if not fits:\n                loose.append(dict(record))", "            loose.append(dict(record))"),
+ "I13 one address with two parents is one device": (C, "                    \"conflict\": len(parents) > 1,", "                    \"conflict\": False,"),
+ "I14 an unaddressed record is always a device of its own": (C, "                if len(kind_identities) == 1:\n                    kind_identities[0][\"listed\"] |= any(record[\"listed\"] for record in incomplete)\n                elif not kind_identities:", "                if False:\n                    kind_identities[0][\"listed\"] |= any(record[\"listed\"] for record in incomplete)\n                elif True:"),
  # an unread reply never resolves a handle (#1504)
  "I15 an unread list lets the rest name one device": (C, "        if unread and handle is not None and handle != \"0000\":", "        if False:"),
  "I16 an expander only the device list names is absent": (C, "        elif kind == \"expander\" and not found[0][\"listed\"]:", "        elif False:"),
  "I17 ambiguous unit handles not delivered": (C, "                    controller[\"ambiguous_device_handles\"] = ambiguous", "                    pass"),
  "I18 list states not delivered with the HBA": (C, "                controller[\"mpr_lists\"] = dict(payload[\"lists\"])", "                pass"),
+ # exact named types and one indexed reconciliation per unit (#1504)
+ "I19 named device type evidence widened to the destination": (P, "                \"device_type\": \" \".join(device_words[:2]),", "                \"device_type\": \" \".join(device_words),"),
+ "I20 handle identities rebuilt for adapter state": (C, "                controller.get(\"phy_rows\"), payload, handle_devices,", "                controller.get(\"phy_rows\"), payload, _mpr_handle_devices(payload),"),
+ "I21 missing identity field bridges disagreeing parents": (C, "                if len(kind_identities) == 1:", "                if kind_identities:\n                    kind_identities[:] = kind_identities[:1]"),
 }
 
 

@@ -1353,6 +1353,36 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(devices[0]["target"], "180")
         self.assertEqual(devices[0]["slot"], "0")
 
+    def test_parse_mpr_devices_keeps_exact_type_evidence_for_named_destinations(self) -> None:
+        from app.services.sas_fabric_core import _mpr_device_kind
+        from app.services.sas_fabric_parsers import parse_mpr_device_list
+
+        cases = (
+            ("SAS Target da5", "SAS Target", "disk"),
+            ("SMP Target expander0", "SMP Target", "expander"),
+            ("SEP Target ses0", "SEP Target", "sep"),
+            ("SAS Initiator mpr0", "SAS Initiator", "initiator"),
+            ("Unknown Device da9", "Unknown Device", "other"),
+        )
+        lines = [
+            f"00 {index} {index + 1:016x} {index + 1:04x} 0001 {device} 12.0 0002 {index} 1"
+            for index, (device, _device_type, _kind) in enumerate(cases)
+        ]
+        # The first two words are the complete type grammar. Similar prefixes
+        # are device rows but not supported types, so they are rejected.
+        lines.extend((
+            f"00 8 {8:016x} 0008 0001 SAS Targeted da8 12.0 0002 8 1",
+            f"00 9 {9:016x} 0009 0001 XSAS Target da9 12.0 0002 9 1",
+        ))
+
+        devices, rejected = parse_mpr_device_list("\n".join(lines))
+
+        self.assertEqual(rejected, 2)
+        self.assertEqual(
+            [(row["device"], row["device_type"], _mpr_device_kind(row)) for row in devices],
+            [(device, device_type, kind) for device, device_type, kind in cases],
+        )
+
     def test_parse_mpr_dmesg_events_summarizes_controller_and_disk_faults(self) -> None:
         events = parse_mpr_dmesg_events(MPR_DMESG_EVENTS)
 
@@ -4531,6 +4561,7 @@ class FabricPathRegressionTests(unittest.TestCase):
         fabric = self.core_build(5, 5, self.mpr_row(4, "SAS Target da5"))
         bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
         self.assertEqual([item["mpr_slot"] for item in bay.metrics["mpr_devices"]], ["4"])
+        self.assertEqual([item["mpr_device"] for item in bay.metrics["mpr_devices"]], ["SAS Target da5"])
 
     def test_mpr_rejects_named_member_at_contradictory_location_or_enclosure(self):
         for row in (self.mpr_row(2, "SAS Target da5"), self.mpr_row(5, "SAS Target da5", enclosure="0012")):
