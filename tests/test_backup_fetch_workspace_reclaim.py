@@ -97,8 +97,8 @@ class _FetchWorkspaceBase(SchedulerTestBase):
             log.removeHandler(handler)
 
     def fetch(self) -> bytes:
-        with self.scheduler.materialize(self.remote.artifact_id) as (_record, path):
-            return path.read_bytes()
+        with self.scheduler.materialize(self.remote.artifact_id) as (_record, handle):
+            return handle.read()
 
     def abandoned_workspace(self, name: str = "backup-fetch-abandoned", *, content: bytes = b"full copy") -> Path:
         workspace = self.state_dir / name
@@ -157,11 +157,11 @@ class FetchWorkspaceReclaimTests(_FetchWorkspaceBase):
 
     def test_a_workspace_held_by_a_live_fetch_is_not_reclaimed(self) -> None:
         with self.scheduler.materialize(self.remote.artifact_id) as (_record, held):
-            held_workspace = held.parent.name
+            (held_workspace,) = self.workspaces()
             result = self.verify()  # its own fetch scans the folder while this one is open
             self.assertEqual((result["ok"], result["outcome"]), (True, "matched"))
             self.assertEqual(self.workspaces(), [held_workspace])
-            self.assertEqual(hashlib.sha256(held.read_bytes()).hexdigest(), self.remote.sha256)
+            self.assertEqual(hashlib.sha256(held.read()).hexdigest(), self.remote.sha256)
             # A third fetch, entered while the first is still open, also leaves it.
             self.fetch()
             self.assertEqual(self.workspaces(), [held_workspace])
@@ -554,6 +554,33 @@ class PinnedStateFolderTests(_FetchWorkspaceBase):
         if data is None:
             self.fail("the pinned workspace did not receive the fetched bytes")
         self.assertEqual(hashlib.sha256(data).hexdigest(), self.remote.sha256)
+
+    def test_download_streams_the_file_that_passed_verification(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def replace_name_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                workspace = next(
+                    entry
+                    for entry in self.state_dir.iterdir()
+                    if entry.name.startswith(service.FETCH_WORKSPACE_PREFIX)
+                )
+                replacement = workspace / "replacement"
+                replacement.write_bytes(b"x" * self.remote.size)
+                os.replace(replacement, workspace / "archive")
+                yield opened
+
+        with mock.patch.object(self.scheduler, "materialize", replace_name_after_materialize):
+            status, body = asgi_call(
+                build_app(self.scheduler),
+                "GET",
+                f"/internal/backups/{self.remote.artifact_id}/download",
+            )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), self.remote.sha256)
 
     def test_an_empty_workspace_without_its_fetch_marker_is_left_in_place(self) -> None:
         empty = self.state_dir / "backup-fetch-empty"

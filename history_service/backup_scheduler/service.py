@@ -1672,16 +1672,16 @@ class BackupScheduler:
         return self.serialize(record)
 
     @contextlib.contextmanager
-    def materialize(self, artifact_id: str) -> Iterator[tuple[ArtifactRecord, Path]]:
-        """Yield a readable local file with the artifact's bytes (remote copies are fetched)."""
+    def materialize(self, artifact_id: str) -> Iterator[tuple[ArtifactRecord, BinaryIO]]:
+        """Yield the artifact through the same descriptor that passed verification."""
 
         record = self.get(artifact_id)
         if record.location == LOCAL_LOCATION:
             path = self._local_path(record)
             if not path.is_file() or path.is_symlink():
                 raise ArtifactNotFoundError("The local copy is missing.")
-            _require_match(record, *_hash_file(path))
-            yield record, path
+            with _verified_file(record, path) as handle:
+                yield record, handle
             return
         target = self.policy.target(record.location)
         if target is None:
@@ -1692,13 +1692,17 @@ class BackupScheduler:
                 workspace.descriptor,
                 _FETCH_WORKSPACE_FILE,
             )
-            local = workspace.path / _FETCH_WORKSPACE_FILE
             with self._open_configured_target(target) as remote:
                 size, digest = remote.get(record.name, destination, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
-            yield record, local
+            with _verified_file(
+                record,
+                _FETCH_WORKSPACE_FILE,
+                directory=workspace.descriptor,
+            ) as handle:
+                yield record, handle
         finally:
             try:
                 with _state_folder_lock(workspace.root):
@@ -1749,7 +1753,6 @@ class BackupScheduler:
             root=root,
             name=name,
             descriptor=held,
-            path=self.paths.state_dir / name,
         )
 
     def verify(self, artifact_id: str) -> dict[str, Any]:
@@ -1958,7 +1961,6 @@ class _FetchWorkspace:
     root: int  # the state folder, opened once
     name: str
     descriptor: int  # the workspace directory; holds its ``flock`` while the fetch runs
-    path: Path  # for callers after descriptor-relative destination creation
 
 
 @dataclass
@@ -2226,6 +2228,35 @@ def _hash_file(path: Path) -> tuple[int, str]:
             digest.update(chunk)
             size += len(chunk)
     return size, digest.hexdigest()
+
+
+@contextlib.contextmanager
+def _verified_file(
+    record: ArtifactRecord,
+    path: str | Path,
+    *,
+    directory: int | None = None,
+) -> Iterator[BinaryIO]:
+    """Verify and yield one regular file without reopening its name."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(path, flags, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := handle.read(_COPY_CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+        _require_match(record, size, digest.hexdigest())
+        handle.seek(0)
+        yield handle
 
 
 # -- config snapshot for the coalescer's content hash -------------------------------------

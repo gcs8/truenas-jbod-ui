@@ -14,9 +14,10 @@ import contextlib
 import logging
 import sys
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from history_service.backup_archive.catalog import CatalogError
@@ -31,7 +32,15 @@ from history_service.backup_scheduler.service import (
 
 logger = logging.getLogger(__name__)
 MAX_REASON_CHARS = 200
+_STREAM_CHUNK_BYTES = 1024 * 1024
 _ACTOR_HEADER = "X-Backup-Actor"
+
+
+def _attachment(filename: str) -> str:
+    encoded = quote(filename)
+    if encoded != filename:
+        return f"attachment; filename*=utf-8''{encoded}"
+    return f'attachment; filename="{filename}"'
 
 
 def _actor(request: Request) -> str:
@@ -158,11 +167,11 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
         return {"ok": True, "artifact": artifact}
 
     @app.get("/internal/backups/{artifact_id}/download")
-    async def download(artifact_id: str) -> FileResponse:
+    async def download(artifact_id: str) -> StreamingResponse:
         stack = contextlib.ExitStack()
         ambient = sys.exc_info()[1]  # as in Verify: not about this copy
         try:
-            record, path = await asyncio.to_thread(stack.enter_context, scheduler.materialize(artifact_id))
+            record, handle = await asyncio.to_thread(stack.enter_context, scheduler.materialize(artifact_id))
         except ArtifactNotFoundError:
             stack.close()
             raise
@@ -175,11 +184,16 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
                 raise HTTPException(status_code=409, detail=f"{rejection} Verify it, or use another copy.") from exc
             raise HTTPException(status_code=502, detail=f"Could not read the backup: {describe_error(exc)}") from exc
         filename = record.name.rsplit("/", 1)[-1]
-        return FileResponse(
-            path,
+        chunks = iter(lambda: handle.read(_STREAM_CHUNK_BYTES), b"")
+        return StreamingResponse(
+            chunks,
             media_type="application/octet-stream",
-            filename=filename,
-            headers={"X-Backup-Sha256": record.sha256, "X-Backup-Class": record.backup_class},
+            headers={
+                "Content-Disposition": _attachment(filename),
+                "Content-Length": str(record.size),
+                "X-Backup-Sha256": record.sha256,
+                "X-Backup-Class": record.backup_class,
+            },
             background=BackgroundTask(stack.close),
         )
 

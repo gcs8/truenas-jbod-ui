@@ -2864,8 +2864,8 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(remote), 1)
         verified = scheduler.verify(remote[0].artifact_id)
         self.assertTrue(verified["ok"], verified)
-        with scheduler.materialize(remote[0].artifact_id) as (_record, path):
-            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), remote[0].sha256)
+        with scheduler.materialize(remote[0].artifact_id) as (_record, handle):
+            self.assertEqual(hashlib.sha256(handle.read()).hexdigest(), remote[0].sha256)
         self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
         # Tamper with the remote copy: verify reports, never raises, and the copy
         # stops counting as verified (not restorable, not the protected newest).
