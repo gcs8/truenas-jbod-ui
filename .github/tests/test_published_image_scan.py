@@ -18,6 +18,7 @@ SCRIPT = ROOT / ".github/scripts/published_image_scan.py"
 DIGEST = "sha256:" + "a" * 64
 OTHER = "sha256:" + "b" * 64
 IMAGE = "ghcr.io/gcs8/truenas-jbod-ui"
+ISSUE_COLLECTION = "/repositories/1208650488/issues"
 STABLE = "v1.10.0"
 TARGETS = {"latest": DIGEST, "dev": OTHER, STABLE: DIGEST}
 
@@ -47,6 +48,8 @@ class Server:
         self.ambiguous = False
         self.bad_readback = False
         self.redirect = False
+        self.issue_next_path = ISSUE_COLLECTION
+        self.issue_next_query = "state=all&per_page=100&after=synthetic-cursor&page=2"
         self.tags = ["latest", "dev", "v1.9.9", "v9.0.0-rc.1", STABLE, "v01.99.0"]
         outer = self
 
@@ -82,7 +85,9 @@ class Server:
                     second = "page=2" in self.path
                     data = outer.issues[1:] if second else outer.issues[:1]
                     if not second:
-                        headers["link"] = '</repos/gcs8/truenas-jbod-ui/issues?state=all&per_page=100&page=2>; rel="next"'
+                        headers["link"] = (
+                            f'<{outer.issue_next_path}?{outer.issue_next_query}>; rel="next"'
+                        )
                 elif method == "POST":
                     data = {"number": len(outer.issues) + 1, "state": "open", "user": {"login": "github-actions[bot]"}, **payload}
                     outer.issues.append(data)
@@ -290,6 +295,62 @@ class PublishedImageScanTests(unittest.TestCase):
         server.calls.clear()
         self.mod.reconcile(self.api(server), self.bundle())
         self.assertEqual([call[1] for call in server.writes()], ["/repos/gcs8/truenas-jbod-ui/issues/4"])
+
+    def test_issue_census_uses_the_writers_named_collection_for_both_page_link_forms(self):
+        server = Server()
+        self.addCleanup(server.close)
+        server.issues = [
+            {"number": 1, "state": "open", "title": "synthetic one", "body": "", "user": {"login": "human"}},
+            {"number": 2, "state": "closed", "title": "synthetic two", "body": "", "user": {"login": "human"}},
+        ]
+
+        named = "/repos/gcs8/truenas-jbod-ui/issues"
+        for link_path in (ISSUE_COLLECTION, named):
+            with self.subTest(link_path=link_path):
+                server.issue_next_path = link_path
+                server.calls.clear()
+                self.assertEqual(self.api(server).issues(), server.issues)
+                self.assertEqual([call[1] for call in server.calls], [
+                    named + "?state=all&per_page=100",
+                    named + "?state=all&per_page=100&after=synthetic-cursor&page=2",
+                ])
+
+    def test_issue_census_rejects_incomplete_ambiguous_or_narrowed_page_queries(self):
+        invalid_queries = (
+            "per_page=100&page=2",
+            "state=open&per_page=100&page=2",
+            "state=all&state=open&per_page=100&page=2",
+            "state=all&per_page=50&page=2",
+            "state=all&per_page=100&labels=synthetic&page=2",
+            "state=all&per_page=100",
+            "state=all&per_page=100&page=3",
+        )
+        for query in invalid_queries:
+            server = Server()
+            try:
+                server.issues = [
+                    {"number": 1, "state": "open", "title": "synthetic one", "body": "", "user": {"login": "human"}},
+                    {"number": 2, "state": "open", "title": "synthetic two", "body": "", "user": {"login": "human"}},
+                ]
+                server.issue_next_query = query
+                with self.subTest(query=query), self.assertRaises(self.mod.ScanError):
+                    self.mod.reconcile(self.api(server), self.bundle([vulnerability()]))
+                self.assertEqual(server.writes(), [])
+            finally:
+                server.close()
+
+    def test_issue_census_rejects_a_different_repository_collection(self):
+        server = Server()
+        self.addCleanup(server.close)
+        server.issues = [
+            {"number": 1, "state": "open", "title": "synthetic one", "body": "", "user": {"login": "human"}},
+            {"number": 2, "state": "open", "title": "synthetic two", "body": "", "user": {"login": "human"}},
+        ]
+        server.issue_next_path = "/repositories/1208650489/issues"
+
+        with self.assertRaises(self.mod.ScanError):
+            self.mod.reconcile(self.api(server), self.bundle([vulnerability()]))
+        self.assertEqual(server.writes(), [])
 
     def test_auth_and_later_page_errors_fail_before_writes(self):
         for failure in (("/issues?", 401), ("page=2", 503)):
