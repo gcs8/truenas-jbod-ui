@@ -15,12 +15,14 @@ import tempfile
 import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "gcs8/truenas-jbod-ui"
+REPOSITORY_ID = 1208650488
+ISSUE_COLLECTION = f"/repositories/{REPOSITORY_ID}/issues"
 IMAGE = "ghcr.io/" + REPOSITORY
 TRIVY_VERSION = "0.76.2"
 ARCHIVE_SHA256 = "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"
@@ -124,12 +126,18 @@ def http(method, url, headers=None, payload=None, limit=32 * 1024 * 1024):
         raise ScanError("HTTP operation incomplete") from None
 
 
-def pages(url, headers, prefix):
+def pages(url, headers, prefix, *, link_alias=None, query_validator=None):
     seen = set()
     origin = urlsplit(url)[:2]
     while url:
+        parsed = urlsplit(url)
+        require(parsed[:2] == origin and parsed.path in (prefix, link_alias) and not parsed.fragment,
+                "unsafe pagination")
+        if query_validator is not None:
+            query_validator(parsed, len(seen) + 1)
+        # A numeric Link identifies this collection; it never supplies the request destination.
+        url = parsed._replace(path=prefix).geturl()
         require(url not in seen and len(seen) < 10000, "invalid pagination")
-        require(urlsplit(url)[:2] == origin and urlsplit(url).path == prefix, "unsafe pagination")
         seen.add(url)
         raw, response_headers = http("GET", url, headers)
         yield parse_json(raw)
@@ -137,6 +145,31 @@ def pages(url, headers, prefix):
         next_links = re.findall(r'<([^>]+)>;\s*rel="next"', link)
         require(len(next_links) <= 1 and (not link or next_links or 'rel="last"' in link or 'rel="prev"' in link or 'rel="first"' in link), "malformed pagination")
         url = urljoin(url, next_links[0]) if next_links else None
+
+
+def validate_issue_page(parsed, page_number):
+    require(len(parsed.query) <= 4096, "unsafe issue pagination")
+    try:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=4)
+    except ValueError:
+        raise ScanError("unsafe issue pagination") from None
+    query = {}
+    for key, value in pairs:
+        require(key not in query, "unsafe issue pagination")
+        query[key] = value
+    require(set(query) <= {"state", "per_page", "after", "page"} and
+            query.get("state") == "all" and query.get("per_page") == "100", "unsafe issue pagination")
+    if page_number == 1:
+        require(set(query) == {"state", "per_page"}, "unsafe issue pagination")
+        return
+    require("after" in query or "page" in query, "unsafe issue pagination")
+    if "after" in query:
+        cursor = query["after"]
+        require(0 < len(cursor) <= 2048 and all(0x21 <= ord(char) <= 0x7e for char in cursor),
+                "unsafe issue pagination")
+    if "page" in query:
+        require(matches(r"[1-9]\d{0,4}", query["page"]) and int(query["page"]) == page_number,
+                "unsafe issue pagination")
 
 
 class Registry:
@@ -351,7 +384,8 @@ class GitHub:
 
     def issues(self):
         issues = []
-        for page in pages(self.base + self.path + "?state=all&per_page=100", self.headers, self.path):
+        for page in pages(self.base + self.path + "?state=all&per_page=100", self.headers, self.path,
+                          link_alias=ISSUE_COLLECTION, query_validator=validate_issue_page):
             require(isinstance(page, list), "invalid issue page")
             issues.extend(page)
         return issues

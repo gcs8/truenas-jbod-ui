@@ -81,7 +81,12 @@ Bodies are deterministic and contain only public allowlisted package/advisory
 fields and tag aliases. They contain no volatile run metadata or image digest.
 
 The writer lists authoritative GitHub issue pages in `state=all`, not search.
-It manages only non-PR issues authored by `github-actions[bot]` with its exact
+GitHub can return the repository's numeric URL in a next-page link. The writer
+checks the origin, collection and query, then requests the next page on the same
+named repository path used for writes and readbacks. Every page must retain
+`state=all&per_page=100`. A different repository, ambiguous query or narrowing
+filter stops reconciliation before writes. The writer manages only non-PR
+issues authored by `github-actions[bot]` with its exact
 `published-image-scan:v1` marker at the beginning of the body. Human copies,
 other workflow markers and other marker versions are ignored. Conflicting
 managed identities fail before writes. It constructs the complete change plan
