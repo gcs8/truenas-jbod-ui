@@ -961,6 +961,11 @@ function subjectDeletions(fabric, built) {
     if (other && cables.length) {
       out.push({ name: `${expander.id} duplicate record with another expander's SAS address`, checks: ["lanes"], tokens: [expander.id], orders: true, expect: refused,
         change: (copy) => twinOf((twin) => { twin.sas_address = other.sas_address; })(copy, false), twin: (copy) => twinOf((twin) => { twin.sas_address = other.sas_address; })(copy, true) });
+      out.push({ name: `${expander.id} duplicate graph node with another chip's address`, checks: ["lanes"], tokens: [expander.id], expect: refused, change: (copy) => {
+        const twin = structuredClone(copy.fabric.nodes.find((entry) => entry.id === expander.id));
+        twin.raw.sas_address = other.sas_address;
+        copy.fabric.nodes.push(twin);
+      } });
     }
     const hba = (fabric.controllers || []).find((item) => item.id === expander.controller_id);
     const ownRow = hba?.phy_rows.findLast((row) => row.controller_handle && row.controller_handle !== "0000" && row.controller_handle !== expander.dev_handle);
@@ -1360,7 +1365,7 @@ function cablesUncontested(built, fabric, why) {
     const card = lanesRow(built, link.id);
     if (!card || /reported; which PHYs the cable uses is not read/.test(card)) continue;
     const said = `${why}: ${link.id} is shown as ${card}, but`;
-    const own = fabric.links.filter((entry) => entry.source === link.source && entry.target === link.target && entry.kind === link.kind && entry.reported_lanes);
+    const own = fabric.links.filter((entry) => (built.transport || entry.id === link.id) && entry.source === link.source && entry.target === link.target && entry.kind === link.kind && entry.reported_lanes);
     const lists = (entries, end, side) => entries.filter((entry) => entry[end] === link[end] && LANE_KINDS.has(entry.kind) && entry.reported_lanes)
       .flatMap((entry) => [...(entry.reported_lanes[`${side}_phys`] || []), ...(entry.reported_lanes.lanes || []).map((lane) => lane[`${side}_phy`])]);
     const rest = fabric.links.filter((entry) => !own.includes(entry));
@@ -1369,9 +1374,9 @@ function cablesUncontested(built, fabric, why) {
       const taken = lists(rest, end, side).filter((phy) => mine.has(phy));
       assert.deepEqual(taken, [], `${said} a record of another link lists PHY ${taken[0]} at its ${end}`);
     }
-    const records = (id) => [...(fabric.expanders || []), ...(fabric.controllers || []), ...(built.transport ? fabric.nodes : [])].filter((entry) => entry.id === id);
+    const records = (id) => [...(fabric.expanders || []), ...(fabric.controllers || []), ...fabric.nodes].filter((entry) => entry.id === id);
     for (const [id, key] of [[link.source, "source_sas_address"], [link.target, "attached_sas_address"]]) {
-      const given = new Set([...records(id).map((entry) => hex(entry.sas_address ?? entry.raw?.sas_address)), hex(fabric.nodes.find((entry) => entry.id === id)?.raw_id)].filter(Boolean));
+      const given = new Set(records(id).flatMap((entry) => [hex(entry.sas_address), hex(entry.raw?.sas_address), hex(entry.raw_id)]).filter(Boolean));
       assert.ok(given.size <= 1, `${said} the records of ${id} give it ${given.size} SAS addresses`);
       for (const list of own.map((entry) => hex(entry.reported_lanes[key])).filter(Boolean)) assert.ok(!given.size || given.has(list), `${said} its list gives another address for ${id}`);
     }

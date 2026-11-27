@@ -229,15 +229,15 @@ function laneClaims(model) {
     if (model.laneClaimIndex) return model.laneClaimIndex;
     const claims = new Map();
     const ports = new Map();
-    const claim = (id, phys, source, target) => {
+    const claim = (id, phys, source, target, linkId = null) => {
       const listed = new Set(phys.filter((phy) => Number.isInteger(phy)));
-      const entry = { pair: `${chipId(model, source)}|${chipId(model, target)}`, source, target, listed };
+      const entry = { pair: `${chipId(model, source)}|${chipId(model, target)}`, source, target, listed, linkId };
       for (const key of [...listed].map((phy) => `${chipId(model, id)}|${phy}`)) (claims.get(key) || claims.set(key, []).get(key)).push(entry);
     };
     const drawn = model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).filter((entry) => context.LANE_LINKS.has(entry.kind) && entry.lanes);
-    for (const { source, target, lanes } of [...drawn, ...list(model.laneRecords).map((record) => ({ ...record, lanes: parseLanes(record.lanes) }))]) {
-      claim(source, [...lanes.sourcePhys, ...lanes.rows.map((lane) => lane.source)], source, target);
-      claim(target, [...lanes.targetPhys, ...lanes.rows.map((lane) => lane.target)], source, target);
+    for (const { id, key, source, target, lanes } of [...drawn, ...list(model.laneRecords).map((record) => ({ ...record, lanes: parseLanes(record.lanes) }))]) {
+      claim(source, [...lanes.sourcePhys, ...lanes.rows.map((lane) => lane.source)], source, target, key ?? id);
+      claim(target, [...lanes.targetPhys, ...lanes.rows.map((lane) => lane.target)], source, target, key ?? id);
     }
     for (const item of list(model.parentClaims)) {
       if (item.port) ports.set(item.port, (ports.get(item.port) || new Set()).add(chipId(model, item.child)));
@@ -251,13 +251,14 @@ function laneClaims(model) {
 // of it, and its own node. And, by address, the chips given it.
 function addressesOf(model, id) {
     const node = model.nodeById.get(id);
-    return new Set([...((model.sas.expanders.get(id) || model.sas.controllers.get(id))?.addresses || []), sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));
+    return new Set([...((model.sas.expanders.get(id) || model.sas.controllers.get(id))?.addresses || []),
+      ...(model.nodeAddresses.get(id) || []), sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));
   }
 
 function addressHolders(model) {
     if (model.addressHolderIndex) return model.addressHolderIndex;
     const holders = new Map();
-    for (const id of new Set([...model.sas.expanders.keys(), ...model.sas.controllers.keys(), ...model.nodes.filter((entry) => ["controller", "expander"].includes(entry.kind)).map((entry) => entry.id)])) {
+    for (const id of new Set([...model.sas.expanders.keys(), ...model.sas.controllers.keys(), ...model.nodeAddresses.keys(), ...model.nodes.filter((entry) => ["controller", "expander"].includes(entry.kind)).map((entry) => entry.id)])) {
       for (const address of addressesOf(model, id)) holders.set(address, (holders.get(address) || new Set()).add(chipId(model, id)));
     }
     model.addressHolderIndex = holders;
@@ -276,6 +277,9 @@ function cableWords(model, source, target) {
 // the cable uses is not read, for lanes, rates, counters and inspectors.
 function memberConflicts(model, link) {
     if (!link.lanes) return [];
+    // The evidence belongs to this snapshot, not to the node/link subset left after grouping for display.
+    if (!model.cableConflicts) model.cableConflicts = new WeakMap();
+    if (model.cableConflicts.has(link)) return model.cableConflicts.get(link);
     const found = [];
     for (const [side, id, phys] of [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]]) {
       const other = chipOfNode(model, side === "near" ? link.target : link.source)?.id || (side === "near" ? link.target : link.source);
@@ -325,18 +329,26 @@ function memberConflicts(model, link) {
     // does not draw, or a bay's path. The first such PHY at each end is named.
     const { claims } = laneClaims(model);
     const mine = `${chipId(model, link.source)}|${chipId(model, link.target)}`;
+    const otherLink = (entry) => entry.linkId !== null && entry.linkId !== link.id;
     for (const [side, id, phys] of [["near", link.source, link.lanes.sourcePhys], ["far", link.target, link.lanes.targetPhys]]) {
-      for (const phy of new Set(phys)) {
+      const members = new Set(phys);
+      for (const phy of members) {
         const key = `${chipId(model, id)}|${phy}`;
         // Another cable's record, or a record between the same two chips
         // that lists other PHYs at this end than this list does.
-        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));
+        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || otherLink(entry)
+          || entry.listed.size !== members.size || phys.some((member) => !entry.listed.has(member)));
         const bay = list(ownerIndex(model).get(key)).find((item) => item.kind === "bay");
         if (!rival && !bay) continue;
-        found.push({ side, id, phy, why: !rival ? `${bay.label} also claims it, as a disk port` : rival.pair !== mine ? `a record of ${cableWords(model, rival.source, rival.target)} also lists it` : "another record between these two ends lists it with other PHYs" });
+        const why = !rival ? `${bay.label} also claims it, as a disk port`
+          : rival.pair !== mine ? `a record of ${cableWords(model, rival.source, rival.target)} also lists it`
+          : otherLink(rival) ? "a second link ID between these ends also claims it"
+          : "another record between these two ends lists it with other PHYs";
+        found.push({ side, id, phy, why });
         break;
       }
     }
+    model.cableConflicts.set(link, found);
     return found;
   }
 

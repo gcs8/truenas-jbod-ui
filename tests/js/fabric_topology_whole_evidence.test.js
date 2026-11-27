@@ -920,6 +920,90 @@ test("duplicate HBA records keep a handle marker both carry, however the PHY num
   assert.match(lanesCard(built, hbaCable(data, built)), /^4 reported; which PHYs the cable uses is not read/);
 });
 
+test("a CORE node's conflicting address disowns the cascade in either record order", () => {
+  for (const first of [true, false]) {
+    const { data, link, child } = cascade102();
+    const parent = node(data.fabric, link.source);
+    const other = structuredClone(parent);
+    other.raw.sas_address = child.sas_address;
+    beside(data.fabric.nodes, parent, other, first);
+    const built = coreModel(data);
+    unowned(built, /102 invalid dword/);
+    assert.match(lanesCard(built, linkOf(built, link.source, link.target)), /not read/);
+    assert.ok(!statuses(built, "lanes").includes("pass"));
+  }
+});
+
+test("two link IDs cannot verify two cables on the same four PHY pairs", () => {
+  for (const sameId of [true, false]) for (const first of [true, false]) {
+    const data = core();
+    const link = data.fabric.links.find((row) => row.kind === "controller-expander");
+    const other = structuredClone(link);
+    if (!sameId) other.id += "-another";
+    beside(data.fabric.links, link, other, first);
+    const built = coreModel(data);
+    if (sameId) assert.match(textOf(checksOf(built, "lanes")), /4 cables, each x4/);
+    else {
+      const svg = T.renderTopology(built, {});
+      for (const cable of [link, other]) {
+        assert.match(lanesCard(built, cable), /not read/);
+        const description = [...svg.matchAll(/<g class="topo-link-label[^>]*data-topo-link="([^"]*)" aria-label="([^"]*)"/g)].find((match) => unescape(match[1]) === cable.id)?.[2];
+        assert.match(description, /membership and rate not read/);
+        assert.doesNotMatch(description, /4 lanes, 12 Gb\/s/);
+      }
+      assert.ok(!statuses(built, "lanes").includes("pass"));
+    }
+  }
+});
+
+test("the grouped fan-out card claims only its members' verified rates", () => {
+  for (const order of ["control", "first", "last"]) {
+    const data = fixture("fanout-5");
+    const [a, b] = data.fabric.links.filter((row) => row.kind === "expander-expander" && row.reported_lanes);
+    if (order !== "control") {
+      const other = structuredClone(b);
+      other.reported_lanes.source_phys = [...a.reported_lanes.source_phys];
+      beside(data.fabric.links, b, other, order === "first");
+    }
+    const built = model(data);
+    const group = built.links.find((row) => row.stubCables);
+    assert.equal(group.labelLines.some((line) => line.includes("width not read")), order !== "control");
+    const rows = cardRows(built, { kind: "link", id: group.id });
+    for (const cable of group.stubCables.slice(0, 2)) {
+      const row = rows.find((entry) => entry.label === `to ${cable.targetName}`);
+      if (order === "control") assert.match(row.value, /x4 · 12 Gb\/s/);
+      else {
+        assert.match(lanesCard(built, cable), /not read/);
+        assert.match(row.value, /not read/);
+        assert.doesNotMatch(row.value, /Gb\/s/);
+      }
+    }
+  }
+});
+
+test("only established widths can warn about a narrower cable on the same backplane", () => {
+  for (const verified of [true, false]) {
+    const data = fixture("dual-domain-linux");
+    const [link] = data.fabric.links.filter((entry) => entry.reported_lanes);
+    link.reported_lanes.source_phys.pop();
+    link.reported_lanes.lane_count--;
+    if (verified) {
+      const child = node(data.fabric, link.target).raw;
+      child.source_phys.pop();
+      child.reported_num_phys--;
+      const port = data.fabric.raw.sas_transport_ports.find((entry) => entry.remote_id === link.target && entry.owner_id === link.source);
+      port.phys.pop();
+      port.phy_names.pop();
+    }
+    const compare = (built) => checksOf(built, "lanes").flatMap((check) => check.lines).some((line) => line.includes("another cable into the same backplane"));
+    assert.equal(compare(model(data)), verified, "disputed narrower member");
+    const [other] = data.fabric.links.filter((entry) => entry.reported_lanes && entry !== link);
+    other.reported_lanes.source_phys.push(40);
+    other.reported_lanes.lane_count++;
+    assert.equal(compare(model(data)), false, "disputed wider reference");
+  }
+});
+
 test("duplicate records that differ in nothing say what one record says", () => {
   const single = coreModel(core());
   for (const [list, pick] of [["controllers", controllerOf], ["expanders", (data) => data.fabric.expanders[0]]]) for (const first of [false, true]) {

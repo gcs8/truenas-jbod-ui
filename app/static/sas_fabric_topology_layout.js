@@ -1582,7 +1582,8 @@ function linkName(model, link) {
 function linkDescription(model, link) {
     const parts = [linkName(model, link)];
     if (link.lanesState === "reported") {
-      parts.push(context.plural(link.lanes.count, "lane"), context.laneRate(link.lanes));
+      if (context.membershipRead(model, link)) parts.push(context.plural(link.lanes.count, "lane"), context.laneRate(link.lanes));
+      else parts.push(`${context.plural(link.lanes.count, "lane")} reported; membership and rate not read`);
       parts.push(`PHYs ${link.lanes.sourcePhys.join(", ") || "not listed"} to PHYs ${link.lanes.targetPhys.join(", ") || "not listed"}${link.lanes.targetBasis === "inferred" ? " (far end inferred)" : ""}`);
     } else if (link.lanesState === "not_reported") {
       parts.push("lanes not reported");

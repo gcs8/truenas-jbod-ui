@@ -1394,7 +1394,7 @@ function finishNeighbours(model) {
       group.groupTier = tier;
       const cable = {
         id: `cables:${parentId}`, kind: "expander-group", source: parentId, target: group.id, status: "", bundle: false, lanes: null, lanesState: "n/a",
-        labelLines: [plural(cables.length, "cable"), [...new Set(cables.map((link) => (link.lanes ? `x${link.lanes.count}` : "lanes not reported")))].join(", ")],
+        labelLines: [plural(cables.length, "cable"), [...new Set(cables.map((link) => !link.lanes ? "lanes not reported" : context.membershipRead(model, link) ? `x${link.lanes.count}` : "width not read"))].join(", ")],
         memberLinkIds: cables.map((link) => link.id), count: cables.length, cable: cables.some((link) => link.cable), stubCables: cables,
       };
       for (const link of cables) link.targetName = model.nodeById.get(link.target).neighbour.name;
@@ -1652,6 +1652,15 @@ function buildTopologyModel(given, options = {}) {
     const nodes = [];
     const nodeById = new Map();
     const payloadNodeIds = new Map();
+    // Rendering keeps the first record of an ID. Identity checks need the addresses from every observation, even a record the transport view folded away.
+    const nodeAddresses = new Map();
+    for (const item of list(given?.nodes).filter(isRecord)) {
+      if (item.kind !== "controller" && item.kind !== "expander") continue;
+      for (const address of [sasAddressOf(item.raw_id), sasAddressOf(item.raw?.sas_address)].filter(Boolean)) {
+        if (!nodeAddresses.has(item.id)) nodeAddresses.set(item.id, new Set());
+        nodeAddresses.get(item.id).add(address);
+      }
+    }
     const bayRows = [];
     for (const item of payload.nodes) {
       if (payloadNodeIds.has(item.id)) {
@@ -2447,6 +2456,7 @@ function buildTopologyModel(given, options = {}) {
       // What a path's upper end is called here.
       sideWord: core ? "HBA" : shared ? "head" : "source",
       sas,
+      nodeAddresses,
       // The system's other enclosures, as the inventory of this scope names them.
       otherEnclosures: inventory.size ? list(options.inventory?.enclosures).filter((item) => isRecord(item) && item.id !== fabric.selected_enclosure_id).map((item) => text(item.label) || text(item.id)).filter(Boolean) : [],
       portByKey: new Map(bays.flatMap((bay) => bay.ports.map((port) => [port.key, port]))),

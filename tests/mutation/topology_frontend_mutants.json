@@ -1246,7 +1246,7 @@
   "to": "    if (false) return `"
  },
  "ALLREC1": {
-  "from": "        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));",
+  "from": "        const rival = list(claims.get(key)).find((entry) => entry.pair !== mine || otherLink(entry)\n          || entry.listed.size !== members.size || phys.some((member) => !entry.listed.has(member)));",
   "to": "        const rival = null;"
  },
  "ALLREC2": {
@@ -1306,7 +1306,7 @@
   "to": "    if (false) rows.push("
  },
  "ALLREC9": {
-  "from": "find((entry) => entry.pair !== mine || entry.listed.size !== new Set(phys).size || phys.some((member) => !entry.listed.has(member)));",
+  "from": "find((entry) => entry.pair !== mine || otherLink(entry)\n          || entry.listed.size !== members.size || phys.some((member) => !entry.listed.has(member)));",
   "to": "find((entry) => entry.pair !== mine);"
  },
  "ALLREC10": {
@@ -1314,7 +1314,23 @@
   "to": "    if (false) return `"
  },
  "ENDADDR5": {
-  "from": "sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));",
+  "from": "...(model.nodeAddresses.get(id) || []), sasAddressOf(node?.rawId), sasAddressOf(node?.rawAddress), sasAddressOf(node?.address)].filter(Boolean));",
   "to": "].filter(Boolean));"
+ },
+ "NODEADDR": {
+  "from": "...(model.nodeAddresses.get(id) || []), sasAddressOf(node?.rawId)",
+  "to": "sasAddressOf(node?.rawId)"
+ },
+ "LINKID": {
+  "from": "const otherLink = (entry) => entry.linkId !== null && entry.linkId !== link.id;",
+  "to": "const otherLink = () => false;"
+ },
+ "GROUPRATE": {
+  "from": ": context.membershipRead(model, cable) ? `x${cable.lanes.count}",
+  "to": ": true ? `x${cable.lanes.count}"
+ },
+ "SIBLINGWIDTH": {
+  "from": "for (const link of verified) {\n        const board = into(link);",
+  "to": "for (const link of cables.filter((entry) => entry.lanes)) {\n        const board = into(link);"
  }
 }

@@ -629,7 +629,13 @@ function wiringChecks(model, fabric) {
         const target = chipOf(link.target);
         return boardOf.get(link.target)?.enclosure.id || (target?.neighbour?.enclosureId ? `enclosure:${target.neighbour.enclosureId}` : target?.id) || link.target;
       };
-      const widths = [...new Set(cables.filter((link) => link.lanes).map((link) => link.lanes.count))].sort((left, right) => right - left);
+      const verified = new Set(cables.filter((link) => context.membershipRead(model, link)));
+      const widths = [...new Set([...verified].map((link) => link.lanes.count))].sort((left, right) => right - left);
+      const widestByBackplane = new Map();
+      for (const link of verified) {
+        const board = into(link);
+        widestByBackplane.set(board, Math.max(widestByBackplane.get(board) || 0, link.lanes.count));
+      }
       for (const link of cables) {
         const name = cableName(model, link);
         if (!link.lanes) {
@@ -654,8 +660,8 @@ function wiringChecks(model, fabric) {
           blind = true;
           unread.push(`${name}: ${link.lanes.count} lanes reported, ${end.distinct} distinct PHYs listed at ${context.nodeName(model, end.id)}${end.side === "far" ? " (far end)" : ""}${end.repeated ? ` (${end.repeated} repeated)` : ""}, so its membership is not read`);
         }
-        const widest = Math.max(...cables.filter((other) => other.lanes && into(other) === into(link)).map((other) => other.lanes.count));
-        if (link.lanes.count < widest) found.push(`x${link.lanes.count} where another cable into the same backplane is x${widest}`);
+        const widest = widestByBackplane.get(into(link));
+        if (verified.has(link) && link.lanes.count < widest) found.push(`x${link.lanes.count} where another cable into the same backplane is x${widest}`);
         // slowLanes judges nothing past unread membership.
         const slow = slowLanes(model, link);
         if (slow.length) found.push(`${context.plural(slow.length, "lane")} below the maximum of both ends: ${slow.map((lane) => `PHY ${lane.source} ↔ ${lane.target} at ${lane.rate} Gb/s (both ends ${lane.cap})`).join(", ")}`);
@@ -1620,7 +1626,8 @@ function cardFor(model, ref) {
       else if (link.stubCables) {
         card = {
           title: `${context.nodeName(model, link.source)} → ${context.plural(link.stubCables.length, "enclosure")}`,
-          rows: link.stubCables.map((cable) => ({ label: `to ${cable.targetName}`, value: cable.lanes ? `x${cable.lanes.count} · ${context.laneRate(cable.lanes)} on PHY ${context.phyRanges(cable.lanes.sourcePhys) || "?"}` : "lanes not reported" })),
+          rows: link.stubCables.map((cable) => ({ label: `to ${cable.targetName}`, value: !cable.lanes ? "lanes not reported"
+            : context.membershipRead(model, cable) ? `x${cable.lanes.count} · ${context.laneRate(cable.lanes)} on PHY ${context.phyRanges(cable.lanes.sourcePhys) || "?"}` : "membership and rate not read" })),
         };
       } else card = { title: context.linkName(model, link), rows: link.bundle ? [{ label: "Bays", value: link.labelLines.join(" · ") || String(link.count) }] : [] };
     } else if (ref.kind === "node") {
