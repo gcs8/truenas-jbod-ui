@@ -31,6 +31,163 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## v0.24.0-rc.3 - 2026-11-27
+
+### Highlights
+
+- Storage Fabric draws physical enclosures, shared expanders and path-owned wiring evidence.
+- SCALE and Linux can report read-only SAS paths and PHY counters where sysfs exposes them.
+- Disk synchronization and snapshot export explain busy or unread status and how to retry.
+- Backup, restore and history import apply stricter workspace and publication checks.
+
+### Added
+
+- Added read-only SCALE/Linux SAS transport sysfs collection for HBA and expander
+  PHY rates and error counters, reported cascade lanes, and block-identified bay
+  ports, with bounded reads and aggregate projection, shared PHY references, and
+  honest SES-only fallback when detail is not read (#1480).
+
+### Fixed
+
+- Stopped SES descriptor text from appearing as disk capacity before the disk
+  inventory has a size reading. Unread capacities now say "not read yet", and
+  unparsed enclosure text is shown separately as an enclosure descriptor (#1478).
+- Distinguished queued and running TrueNAS disk syncs from failures, retried
+  unreadable remembered-job status without blocking a new full sync, and observed
+  job completion without resubmitting a sync, including slow or temporarily unreadable
+  status responses. Kept independent full-sync and multipath outcomes visible,
+  prioritized failures, and allowed confirmed full-sync requests during background
+  job observation. Kept multipath table sync independent
+  of full-sync jobs, displayed bounded job errors, and advised CORE operators to
+  sync the multipath table first when collected disk identities show duplicate
+  paths without a provider (#1479).
+- Kept disk sync outcomes in the order they were requested, so a late observation
+  or inventory refresh cannot replace a newer result for the same operation, and
+  kept the last active job state when its final status read reached the deadline (#1487).
+- Added explicit estimate and download retries when snapshot export is waiting
+  for an inventory refresh, keeping the dialog settings and respecting the
+  server's retry delay without reporting a busy response as a failed export (#1488).
+- Kept validated history imports bound to the checked bytes through publication
+  and restored the previous history when the published file changed (#1493).
+- Admitted larger SCALE/Linux SAS cascades by charging resolved expander ancestry
+  instead of sysfs path separators, while retaining projection bounds. Kept unread
+  or contradictory transport PHY references visibly not read in Topology, Disk
+  Path and Storage Lanes, and rejected control and format characters per field (#1494).
+- Kept remote backup fetch writes and workspace cleanup bound to the private state
+  folder when names changed during the operation (#1495).
+- Applied the JSON state-file read budget to scheduled backup snapshots of
+  mapping and SAS Fabric alias files (#1496).
+- Drew Storage Fabric Topology from physical enclosures keyed by SES logical id,
+  with inventory-ordered bays, shared expander chips, cascade neighbours and
+  source-labelled wiring checks. Kept direct and multipath port detail bound to
+  each member's own controller and target evidence, including four-path disks;
+  unread detail stays not read and withheld totals remain partial. Wiring checks
+  now name every cable, expander PHY, bay and path they cover first and pass
+  only when each was read and found as expected; anything not read makes the
+  check not read or partial. Each PHY is judged once, counter by counter
+  across every HBA's observation, the worst by severity, and every card, bus,
+  stub and check shows that one reading. Two rows claiming one PHY, a
+  missing observation row and a repeated lane member are not read, never
+  a pass, and a counter not read is never shown as zero. A PHY a bay and a
+  cable, or two cables, claim has its owner not read on every surface, and
+  its fault is said once; a verdict names the critical measurement first.
+  Pinned cables, buses and HBAs show only their own readings; a disk attached
+  directly to an HBA is a disk-port subject on its HBA; a cable's members are
+  checked against its measured pairs at both ends. Each PHY is classified
+  once, from read evidence, as a disk port, a cable member or neither; an
+  invalid list never moves a disk port out of its check, and a lane shows its
+  own observation's rate. A destination is said only where it was read.
+  One role ledger per physical PHY merges every observation's rows, read
+  census records (by PHY number or name) and claims; device types come from
+  one table, and evidence of two roles is "role not read" in both checks. A
+  wide port is one disk port.
+  A PHY name, device handle or disk SAS address on more than one row or bay
+  identifies nothing and is not read. Two read records naming different
+  targets leave a PHY's destination, and its cable's members, not read. Two
+  paths naming one disk port address are one port. A cable end must be a
+  device type the shared table says can end that cable.
+  Identity is decided over the whole payload before scope: the CORE builder
+  marks an adapter handle two devices of the unit carry, the transport builder
+  marks a disk address at two slots, and the view reads both. A handle a bay's
+  disk carries is that disk, never outside the payload. A destination or role
+  conflict is read by every consumer, a retained CORE lane list included; port
+  counts and findings do not depend on record order, and one measurement is one
+  finding.
+  A device is its whole identity across the payload: an enclosure processor is
+  one device whichever reply names it, a second device on a handle makes it
+  ambiguous, and a disk is "attached directly" only where its own path says so.
+  A disk's place comes from every record that reports it; a record missing a
+  field, or a reply that was not read, is not read, never a second subject or a
+  resolved one. A bay's hover charges a PHY's counters only to the path that owns
+  it. A retained lane list counts only where both ends' own rows are read, name
+  each other as the only ends of the link and read the lane's rate; otherwise it
+  is shown as reported.
+  Nothing is resolved from part of its evidence: an HBA list not read, or no
+  list states at all, leaves every handle of that HBA naming nothing; an address
+  placed at more than one slot joins no records into one disk; a lane list is a
+  cable's only where it is every row by which its two ends, rows of one
+  controller unit, name each other; and a lane's rate is shown on any surface
+  only where both ends' own rows read it.
+  Joins, traces and pins use payload ids rather than
+  Friendly Labels, lane rates are judged only where the pairing and both ends'
+  maxima were read, and HBA disagreements are marked not read. Removed invented
+  backplane zones, added a bounded transport-port census and explicit far-end
+  provenance, and kept keyboard, hover and Friendly Label details aligned (#1504).
+- Storage Fabric Topology stopped resolving an owner, a cable width or a drawn
+  rate from part of a retained snapshot's evidence. A disk port address placed
+  in two enclosures joined no records, whether or not a bay number was read. A
+  cascade was read only where each of its two handles named one device of its
+  controller unit and that unit's lists were read. A Linux cable's width was
+  read only where its lane list, what its child reported of the parent port and
+  that port's one census record (by PHY number and by PHY name) all named the
+  same PHYs; a missing or disagreeing identifier left which PHYs the cable uses
+  not read. Cable labels used the measured lane rates, not a separate summary.
+  Repeated records of one HBA or expander were joined toward not read in either
+  order: a handle marker any record carried survived, and a row, handle or
+  controller unit only one record gave still counted against a unique reading.
+  Enclosure membership was sorted once per board rather than once per bay.
+  A claim on a PHY, a parent port, a handle or an end's SAS address was decided
+  over every record that could make it: any list of any record of another link
+  (drawn or not), another device reporting the same parent port or one of its
+  PHYs, another census record, a bay's path, a handle the HBA gives as its own,
+  or a second address for an end left the cable's PHYs not read, and a cable
+  whose PHYs were not read showed no width or rate as its own on its card or its
+  drawn label. A Linux cable read from its child's report alone said so.
+  Conflicting CORE node addresses no longer assign errors according to record
+  order, and two link IDs claiming the same PHY pairs no longer count as two
+  verified cables. Grouped cable cards and diagram descriptions withhold a
+  disputed rate. Width warnings compare only cables with verified membership.
+  On CORE, a provider name after a disk type no longer hides its direct adapter
+  connection. Adapter states and cable checks share one indexed handle lookup
+  per controller unit; conflicting observations still leave ownership unread.
+  The Linux disk-port error check reports known ports whose PHY membership is
+  unread instead of passing on the remaining ports alone (#1504).
+
+### Internal
+
+- Accepted either an orderly socket close or a connection reset in the
+  performance client's trickle-deadline test while retaining its deadline and
+  pre-cleanup closure checks (#1469).
+- Replaced hardware-derived SAS addresses in documentation examples and test
+  fixtures with consistent synthetic values while preserving address relationships
+  and exact public-text privacy checks (#1485).
+- Isolated crash-recovery test workspaces so terminated imports cannot leave temporary bundles visible to later tests (#1489).
+- Required an authenticated synthetic enclosure reply before Compose matrix readiness and persistence readback, and pinned the paired unread-source refusal when the default selection changes (#1490).
+- Bound Compose matrix commands and retained safe HTTP context on inventory readiness timeouts, with diagnostic category consistency checks (#1491).
+- Raised the performance harness readiness default above the background-refresh limit, documented comparable estimate timings, and independently tested retry caps and failure-record publication (#1492).
+- Added weekly and pull-request dependency audits for production and development
+  Python requirements and the npm lockfile, with fail-closed report handling and
+  package-specific accepted findings that require a reason and expiry date (#1517).
+- Added full-history secret scanning on pull requests and a weekly schedule with
+  fully redacted output, pinned scanner integrity checks, and reviewed exact
+  fingerprints for historical source hashes and synthetic fixtures (#1518).
+- Added nightly published-image vulnerability and secret scans, expiring reviewed
+  exceptions, and idempotent issue tracking for package-advisory findings across
+  stable, development and latest tags without building or publishing images (#1519).
+- Added pinned actionlint, ShellCheck and zizmor checks across all workflows, with
+  exact-source reviewed findings and fail-closed handling for new findings,
+  changed baselines and incomplete scanner output (#1521).
+
 ## v0.24.0-rc.2 - 2026-11-21
 
 ### Highlights
