@@ -123,7 +123,7 @@ _MPR_PHY_SPEED = r"(?:[\d.]+|\?\?\?|Unk)"
 _MPR_UNATTACHED_ADAPTER_PHY = re.compile(rf"^\d+\s+[YN]\s+{_MPR_PHY_SPEED}\s+{_MPR_PHY_SPEED}\s+\S.*$")
 
 
-def parse_mpr_devices(text: str) -> list[dict[str, str]]:
+def parse_mpr_devices(text: str) -> list[dict[str, str | None]]:
     return parse_mpr_device_list(text)[0]
 
 
@@ -154,7 +154,7 @@ _MPR_DEVICE_RATE = re.compile(r"\d+(?:\.\d+)?")
 _MPR_DEVICE_SPEED = re.compile(r"\d+(?:\.\d+)?|Unk|\?\?\?")
 
 
-def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
+def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str | None]], int]:
     """The device rows of a `show devices` reply and how many rows were not understood.
 
     A line carrying a SAS address is a device row. One whose device type is
@@ -162,7 +162,7 @@ def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
     not understood, so the list is not read whole. Other text (a notice, the
     heading) is not a device row.
     """
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, str | None]] = []
     rejected = 0
     printed_heading = any(_MPR_DEVICES_HEADING.match(line) for line in text.splitlines())
     for line in text.splitlines():
@@ -211,6 +211,10 @@ def parse_mpr_device_list(text: str) -> tuple[list[dict[str, str]], int]:
                 "handle": parts[sas_index + 1],
                 "parent": parts[sas_index + 2],
                 "device": " ".join(device_words),
+                # The first two words are mprutil's closed device-type
+                # grammar. Keep them separately without changing the reported
+                # device text, including an optional destination name.
+                "device_type": " ".join(device_words[:2]),
                 "speed": parts[index],
                 "enclosure_handle": parts[index + 1],
                 "slot": parts[index + 2],

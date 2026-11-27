@@ -698,6 +698,23 @@ is required on `main`. `Hardened, interrupted and segmented upgrade smoke` runs
 the same script's longer `hardened`, `interrupted-migration` and
 `segmented-catalog` scenarios on every pull request and is report-only until
 branch protection adds it.
+`Topology mutation tests (<part>)` runs the Storage Fabric Topology mutation
+harness under `tests/mutation/` (four frontend shards and the backend) when any
+file the runners mutate, import or read changes (a contract test holds the
+scope to that set, a rename counts as both of its paths, and each runner's
+unmutated run fails when its tests read a tracked file the job's path filter
+misses), and on manual dispatch; otherwise it reports that it does not apply.
+On Linux, pass `--trace-opens` to the frontend runner to use the same `strace`
+child-process coverage as CI, including children that clear their environment.
+A selected backend module with only skipped tests is not an exercised baseline.
+A mutant counts as killed only when a test the run collected fails on an
+assertion or on an exception thrown from the product code. A mutant that
+survives and is not listed with a reason in
+`tests/mutation/topology_equivalent_mutants.json`, a mutant that cannot be
+planted, a missing module or import error, a test file that does not load or
+runs no test, a run that reports no test count, and any failure from test or
+harness code (a fixture, a hook, an exception a test's own code throws), even
+beside an assertion that failed, fail it.
 Publish workflows are release gates,
 not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
 check. If a check name changes, update branch protection and this list together

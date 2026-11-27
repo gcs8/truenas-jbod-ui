@@ -575,6 +575,29 @@ def _match_camcontrol_device_line(line: str) -> re.Match[str] | None:
     return None
 
 
+def bay_peer_devices(
+    raw_slot_status: dict[str, Any],
+    own_lookup_keys: set[str],
+    devices_by_key: dict[str, Any],
+    owner: Any,
+) -> list[str]:
+    """Other unclaimed paths SES lists beside this disk's own path (#902).
+
+    CAM model/target/LUN similarity across controllers is not bay evidence.
+    Callers supply their current disk owners so another disk cannot lend a path.
+    """
+    names = raw_slot_status.get("device_names")
+    if not own_lookup_keys or not isinstance(names, list):
+        return []
+    listed = list(dict.fromkeys(filter(None, (normalize_device_name(name) for name in names if isinstance(name, str)))))
+    if not any(name.lower() in own_lookup_keys for name in listed):
+        return []
+    return [
+        peer for peer in listed
+        if peer.lower() not in own_lookup_keys and devices_by_key.get(peer.lower(), owner) is owner
+    ]
+
+
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     info = CamcontrolInfo()
     current_controller: str | None = None

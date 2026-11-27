@@ -642,7 +642,9 @@ class CoreFabricReplyReadStateTests(unittest.TestCase):
                 if devices is not None:
                     outputs["mprutil show devices"] = devices
                 fabric = _core_fabric(outputs, selected=SELECTED_ENCLOSURE)
-                [enclosure] = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
+                found = [node for node in fabric.nodes if node.kind == "mpr-enclosure"]
+                self.assertEqual(len(found), 1, [node.id for node in found])
+                [enclosure] = found
                 self.assertEqual(enclosure.metrics["device_count"], expected)
                 self.assertEqual(enclosure.raw["device_count"], expected)
                 self.assertEqual(enclosure.metrics.get("not_read", []), ["device_count"] if expected is None else [])
@@ -908,7 +910,9 @@ class CoreFabricHealthyReplyShapeTests(unittest.TestCase):
         outputs = {"mprutil -u 0 show all": _show_all().replace("Devices:\n" + devices, "Devices:\n\n")}
         fabric = _core_fabric(outputs, slots=[_inventory_slot()], selected=SELECTED_ENCLOSURE)
         self.assertEqual(fabric.raw["controller_read"]["lists"].get("mpr0", {}).get("devices"), "not_read")
-        [enclosure] = self.kind_metrics(fabric, "mpr-enclosure")
+        found = self.kind_metrics(fabric, "mpr-enclosure")
+        self.assertEqual(len(found), 1, found)
+        [enclosure] = found
         self.assertEqual((enclosure["device_count"], enclosure["not_read"]), (None, ["device_count"]))
 
     def test_discovery_line_in_place_of_a_phy_row_is_recognised(self) -> None:

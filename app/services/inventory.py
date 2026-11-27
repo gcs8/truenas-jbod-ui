@@ -147,7 +147,10 @@ from app.services.sas_fabric import (
     CORE_PCICONF_LV_OPTIONAL_COMMAND,  # noqa: F401
     SAS_FABRIC_CANONICAL_ALIAS_SOURCE,
     build_core_mprutil_unit_commands,  # noqa: F401
+    attach_fabric_disk_ownership,
     build_sas_fabric_snapshot,
+    fabric_disk_ownership,
+    fabric_path_evidence,
     storage_node_legacy_alias_ids,
 )
 from app.services.core_expander_counters import (
@@ -194,6 +197,7 @@ from app.services.parsers import (
     format_bytes,
     merge_enclosure_meta,
     merge_slot_candidate_maps,
+    bay_peer_devices,
     normalize_device_name,
     normalize_gptid,
     normalize_hex_identifier,
@@ -1213,16 +1217,7 @@ def _bay_peer_devices(
     name beside it that no other API disk owns is another path to it. CAM
     model/target/LUN matches across HBAs are not such evidence (#695).
     """
-    names = raw_slot_status.get("device_names")
-    if disk is None or not isinstance(names, list):
-        return []
-    listed = list(dict.fromkeys(filter(None, (normalize_device_name(name) for name in names if isinstance(name, str)))))
-    if not any(name.lower() in disk.lookup_keys for name in listed):
-        return []
-    return [
-        peer for peer in listed
-        if peer.lower() not in disk.lookup_keys and disks_by_key.get(peer.lower(), disk) is disk
-    ]
+    return bay_peer_devices(raw_slot_status, disk.lookup_keys if disk else set(), disks_by_key, disk)
 
 
 @dataclass(frozen=True, slots=True)
@@ -8266,15 +8261,13 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             asyncio.get_running_loop().run_in_executor(None, copy_context().run, mapping_metadata)
         )
         with perf_stage("inventory.disk_retention_accounting"):
-            retention = build_disk_retention_accounting(
-                source_disks=self._build_storage_view_candidate_records(
-                    raw_data,
-                    ssh_data,
-                    resolved_enclosure_id,
-                    bmc_inventory,
-                ),
-                slots=slots,
+            source_disks = self._build_storage_view_candidate_records(
+                raw_data,
+                ssh_data,
+                resolved_enclosure_id,
+                bmc_inventory,
             )
+            retention = build_disk_retention_accounting(source_disks=source_disks, slots=slots)
         if retention.bare_device_mapper_unplaced_count:
             count = retention.bare_device_mapper_unplaced_count
             warnings.append(
@@ -8337,6 +8330,14 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             capabilities=capabilities,
             summary=summary,
         )
+        if self.system.truenas.platform == "core":
+            # This build's own API disk ownership, and a digest of the CAM and
+            # mprutil replies it read, ride on its snapshot object and are freed
+            # with it; never serialized, never a later bundle's (#1471).
+            attach_fabric_disk_ownership(snapshot, fabric_disk_ownership(
+                (disk.lookup_keys for disk in source_disks),
+                path_evidence=fabric_path_evidence(source_bundle.ssh_outputs),
+            ))
         # Do not admit a read that crossed invalidation, even when the ordinary
         # producer later rejects its candidate before publication.
         if (read_generation == self._snapshot_topology_generation
@@ -15756,6 +15757,10 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             resolution_source = "enclosure-sysfs" if ses_device_names_source == "enclosure_sysfs" else "device-name"
         gptid = self._select_gpt_label(device_name, ssh_data, api_topology_members) if device_name else None
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
+        pool_path_device = None
+        if zpool:
+            pool_label = normalize_gptid(zpool.raw_path or zpool.raw_name)
+            pool_path_device = normalize_device_name(ssh_data.glabel.gptid_to_device.get((pool_label or "").lower(), pool_label))
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
             # A bay peer may supply direct membership, not SSH-only geom inference.
@@ -15763,6 +15768,7 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
                 None, peer, peer_gptid, ssh_data, api_topology_members, allow_geom_inference=False,
             ):
                 gptid = gptid or peer_gptid
+                pool_path_device = peer
                 break
         membership_conflict = (
             self.system.truenas.platform == "core"
@@ -16065,6 +16071,9 @@ class InventoryService(InventorySourceCollectionMixin, DiskSyncStatusMixin):
             else None
         )
         enriched_raw_status = dict(raw_slot_status)
+        if self.system.truenas.platform == "core" and not multipath and zpool and not membership_conflict:
+            if pool_path_device and re.fullmatch(r"da[0-9]+", pool_path_device):
+                enriched_raw_status["pool_device_name"] = pool_path_device
         if membership_conflict:
             enriched_raw_status["pool_membership_conflict"] = True
         if stale_manual_mapping:

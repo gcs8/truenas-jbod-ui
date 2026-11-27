@@ -42,7 +42,7 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, backplane zone and disk.",
+      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, enclosure and disk.",
     },
   };
 
@@ -500,11 +500,11 @@
           },
           trace: {
             title: "Physical Trace",
-            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
+            subtitle: linuxSas ? "Follow observed SAS transport hops and SES enclosure membership for the selected bay." : "Follow the selected SG device or bay through host, Linux SES source, enclosure and disk layers.",
           },
           disk: {
             title: "Disk Path",
-            subtitle: "Pick a bay and render the read-only Linux SES path from host to SG enclosure, backplane zone, and disk.",
+            subtitle: "Pick a bay and render the read-only Linux SES path from host to SG enclosure and disk.",
           },
         },
         summary: {
@@ -2163,7 +2163,7 @@
 
   function backplaneZoneForSlot(slotNumber, fabric) {
     const zoneNode = Array.from(nodeMap(fabric).values()).find((node) => (
-      node.kind === "backplane" && sortedSlots(node.related_slots).includes(Number(slotNumber))
+      node.kind === "enclosure" && sortedSlots(node.related_slots).includes(Number(slotNumber))
     ));
     if (zoneNode) {
       const slots = sortedSlots(zoneNode.related_slots);
@@ -2178,20 +2178,7 @@
         range: zoneNode.raw?.range || (slots.length ? `Bays ${formatSlotLabel(start)}-${formatSlotLabel(end)}` : "Bays n/a"),
       };
     }
-    const slotCount = Math.max(layoutSlotCount(fabric), Number(slotNumber) + 1, 1);
-    const zoneCount = slotCount >= 4 ? 4 : 1;
-    const zoneSize = Math.max(1, Math.ceil(slotCount / zoneCount));
-    const zoneIndex = Math.min(zoneCount - 1, Math.floor(Number(slotNumber) / zoneSize));
-    const start = zoneIndex * zoneSize;
-    const end = Math.min(slotCount - 1, start + zoneSize - 1);
-    return {
-      id: `backplane:${zoneIndex}`,
-      index: zoneIndex,
-      label: `Backplane Zone ${zoneIndex + 1}`,
-      rawLabel: `Backplane Zone ${zoneIndex + 1}`,
-      slots: Array.from({ length: end - start + 1 }, (_, index) => start + index),
-      range: `Bays ${formatSlotLabel(start)}-${formatSlotLabel(end)}`,
-    };
+    return { id: "", index: null, label: "Enclosure not read", rawLabel: "Enclosure not read", slots: [], range: "Membership not read" };
   }
 
   function formatLinkSpeed(value) {
@@ -2974,14 +2961,40 @@
     const mprDevices = list(trace.metrics?.mpr_devices);
     const controller = seed.controller || controllerNameFromId(seed.controller_id);
     const stateName = classToken(seed.state || seed.pathState?.state || seed.pathNode?.status || seed.mprDevice?.state);
-    return seed.mprDevice
-      || mprDevices.find((device) => (
-        device.controller === controller
-        && classToken(device.state) === stateName
-        && (!seed.device_name || device.member_device_name === seed.device_name)
-      ))
-      || mprDevices.find((device) => device.controller === controller)
+    if (list(seed.pathState?.not_read).includes("controller")) return null;
+    if (seed.mprDevice) {
+      return seed.mprDevice;
+    }
+    // A seed that names its device takes only that member's own row: another
+    // port on the same controller is a different path (#1471).
+    const ownRow = (device) => device.controller === controller
+      && (!seed.device_name || device.member_device_name === seed.device_name);
+    return mprDevices.find((device) => ownRow(device) && classToken(device.state) === stateName)
+      || (seed.device_name ? mprDevices.find(ownRow) : mprDevices.find((device) => device.controller === controller))
       || null;
+  }
+
+  function ownDirectPath(seed, trace) {
+    return Boolean(seed.device_name) && list(trace.evidence).includes("sesutil map shared bay");
+  }
+
+  // A named member's port detail is its own MPR row or not read, whether or
+  // not another path of the bay has a row (the producer's own-evidence rule).
+  function branchPortNotRead(seed, mprDevice, trace) {
+    return Boolean(seed.device_name) && !mprDevice;
+  }
+
+  // Bay-level reachability is not a path identity, for cards or faults.
+  function branchControllerContext(seed, mprDevice, trace, fabric) {
+    const unread = list(seed.pathState?.not_read).includes("controller");
+    const name = unread ? null : seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id);
+    const id = name ? `controller:${name}` : "";
+    const direct = ownDirectPath(seed, trace);
+    const ownState = seed.pathState?.state;
+    const ownPath = nodeMap(fabric).get(seed.pathState?.path_id || (name && ownState ? `path:${name}:${classToken(ownState)}` : ""));
+    const node = unread || (direct && !ownPath) ? null : nodeMap(fabric).get(id) || seed.controllerNode
+      || (direct ? null : firstTraceNode(trace, fabric, (item) => item?.kind === "controller"));
+    return { unread, name, id, node };
   }
 
   function firstTraceNode(trace, fabric, predicate) {
@@ -3105,17 +3118,17 @@
   }
 
   function diskPathBranchEvidence(seed, trace, fabric) {
-    const nodes = nodeMap(fabric);
     const mprDevice = branchMprDevice(seed, trace);
-    const controllerName = seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id) || "controller";
+    const controller = branchControllerContext(seed, mprDevice, trace, fabric);
+    const controllerName = controller.name;
     const stateName = seed.state || seed.pathState?.state || seed.pathNode?.status || mprDevice?.state || "unknown";
-    const controllerId = controllerName ? `controller:${controllerName}` : seed.controller_id;
-    const controllerNode = nodes.get(controllerId) || seed.controllerNode || firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
+    const controllerId = controller.id;
+    const controllerNode = controller.node;
     const controllerDiagnostics = controllerNode?.metrics?.kernel_diagnostics || controllerNode?.raw?.kernel_diagnostics;
     const linkDiagnostics = mprDevice?.diagnostics;
     const diagnostics = Number(linkDiagnostics?.event_count || 0) ? linkDiagnostics : controllerDiagnostics;
     const scopeLabel = [
-      controllerName,
+      controllerName || "not read",
       stateName,
       mprDevice?.member_device_name || seed.device_name,
     ].filter(Boolean).join(" ");
@@ -3137,22 +3150,28 @@
       metrics: {},
     };
     const mprDevice = branchMprDevice(seed, trace);
-    const controllerName = seed.controller || mprDevice?.controller || controllerNameFromId(seed.controller_id) || "controller";
+    const controller = branchControllerContext(seed, mprDevice, trace, fabric);
+    const controllerName = controller.name;
     const stateName = seed.state || seed.pathState?.state || seed.pathNode?.status || mprDevice?.state || "unknown";
-    const controllerId = controllerName ? `controller:${controllerName}` : seed.controller_id;
-    const controllerNode = nodes.get(controllerId) || seed.controllerNode || firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
+    const controllerId = controller.id;
+    const controllerNode = controller.node;
     const pathId = seed.pathState?.path_id || seed.pathNode?.id || (controllerName && stateName ? `path:${controllerName}:${classToken(stateName)}` : null);
-    const pathNode = nodes.get(pathId) || seed.pathNode || firstTraceNode(trace, fabric, (node) => (
+    const pathNode = controller.unread ? null : nodes.get(pathId) || seed.pathNode || (ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (node) => (
       node?.kind === "path" && (!controllerId || node.controller_id === controllerId)
-    ));
+    )));
     const pathNodeId = pathNode?.id && nodes.has(pathNode.id) ? pathNode.id : "";
     const pathTraceId = !pathNodeId && pathId && traceById(pathId, fabric) ? pathId : "";
     const expanderId = list(mprDevice?.expander_ids)[0];
-    const expanderNode = nodes.get(expanderId) || seed.expanderNode || firstTraceNode(trace, fabric, (node) => (
+    // A named path without its own MPR row borrows no sibling port's expander
+    // or controller enclosure; its port detail is not read.
+    const portNotRead = !linuxSes && !storageFabric && branchPortNotRead(seed, mprDevice, trace);
+    const expanderNode = nodes.get(expanderId) || (ownDirectPath(seed, trace) ? null : seed.expanderNode) || (portNotRead || ownDirectPath(seed, trace) ? null : firstTraceNode(trace, fabric, (node) => (
       node?.kind === "expander" && (!controllerId || node.controller_id === controllerId)
-    ));
+    )));
     const enclosureNode = nodes.get(mprDevice?.enclosure_id) || firstTraceNode(trace, fabric, (node) => (
-      ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
+      ["enclosure", "mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind)
+      && !(portNotRead && node.kind === "mpr-enclosure")
+      && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
     const transportPort = window.SasFabricTransport?.resolveTransportPort?.(fabric, seed.pathState);
@@ -3190,8 +3209,9 @@
     const branchDiagnostics = Number(linkDiagnostics?.event_count || 0) ? linkDiagnostics : controllerDiagnostics;
     const poolTitle = displayLabel(poolNode) || slot?.pool_name || trace.metrics?.pool_name;
     const vdevTitle = displayLabel(vdevNode) || slot?.vdev_name || trace.metrics?.vdev_name;
-    const sourceTitle = displayLabel(controllerNode) || controllerName;
-    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || controllerName;
+    const sourceTitle = displayLabel(controllerNode) || controllerName || "not read";
+    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || (ownDirectPath(seed, trace)
+      ? `${controllerName || "controller not read"} ${seed.pathState?.state || "state not read"}` : controllerName || "not read");
     const pathContext = compactDeviceLabel(mprDevice?.member_device_name || seed.device_name || fullDeviceName, 42);
     const branchHeaderContext = [
       pathTitle && pathTitle !== sourceTitle ? pathTitle : null,
@@ -3250,14 +3270,14 @@
           ["Capabilities", iocFacts.ioccapabilities],
         ],
         status: controllerNode?.status || stateName,
-        nodeId: controllerNode?.id || controllerId,
+        nodeId: controllerNode?.id || "",
       }),
       renderDiskPathCard({
         kind: labels.path,
         title: pathTitle,
         subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "no per-disk path", 42),
         facts: [
-          [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : formatLinkSpeed(mprDevice?.speed)],
+          [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : portNotRead ? "not read" : formatLinkSpeed(mprDevice?.speed)],
           [linuxSes ? "Block SG" : "PHY", linuxSes ? seed.pathState?.sg_device : storageFabric ? null : expanderPhy?.phy],
           [linuxSes ? "HCTL" : "Remote", linuxSes ? seed.pathState?.scsi_hctl : storageFabric ? null : expanderPhy?.remote_phy],
           [linuxSes ? "Transport" : "Handle", linuxSes ? [seed.pathState?.transport_protocol, seed.pathState?.target_port_protocol].filter(Boolean).join(" / ") : storageFabric ? null : mprDevice?.handle],
@@ -3329,7 +3349,7 @@
           ["Enclosure", slot?.enclosure_name],
         ],
         hoverFacts: [
-          ["Zone slots", location.physical ? formatSlots(zone.slots, 999) : null],
+          ["Enclosure bays", location.physical ? formatSlots(zone.slots, 999) : null],
           ["SES targets", list(slot?.ssh_ses_targets).map((target) => `${target.ses_device}:${target.ses_element_id}`).join(", ")],
           ["SES device", slot?.ssh_ses_device],
           ["Mapping source", slot?.mapping_source],
@@ -3690,7 +3710,7 @@
 
   function aliasScopeLabel(kind) {
     const kindName = String(kind || "").toLowerCase();
-    if (["bay", "backplane", "ses-enclosure", "mpr-enclosure", "storage-enclosure", "expander"].includes(kindName)) {
+    if (["bay", "enclosure", "backplane", "ses-enclosure", "mpr-enclosure", "storage-enclosure", "expander"].includes(kindName)) {
       return "Enclosure";
     }
     return "System";
@@ -3830,7 +3850,7 @@
     }
   }
 
-  function renderInspector(fabric) {
+  function renderInspector(fabric, pageOnly = false) {
     const trace = selectedTrace();
     const node = selectedNode();
     if (!fabric) {
@@ -3838,10 +3858,10 @@
       elements.inspectorBody.innerHTML = "No fabric data loaded.";
       return;
     }
-    const topologyDetail = state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
+    const topologyDetail = !pageOnly && state.mode === "topology" ? window.SasFabricTopology?.inspectorDetail() : null;
     if (topologyDetail) {
-      elements.inspectorTitle.textContent = topologyDetail.title;
-      elements.inspectorBody.innerHTML = topologyDetail.html;
+      window.SasFabricTopology.composeInspector(topologyDetail, { nodes: nodeMap(fabric), renderAliasRow,
+        renderPage: () => renderInspector(fabric, true), title: elements.inspectorTitle, body: elements.inspectorBody });
       return;
     }
     if (trace) {
@@ -4387,6 +4407,7 @@
           expanded: state.expandedSlotLists,
           selection: currentSelectionRef(),
           inventory: state.snapshot,
+          enclosureHref: (id) => { const params = selectedParams({ includeMode: true }); params.set("enclosure_id", id); return `/sas-fabric?${params}`; },
           width: elements.mapPanel.clientWidth,
           // The box's height limit (78vh in the stylesheet), not rounded.
           height: (window.innerHeight || 0) * 0.78,

@@ -16,7 +16,7 @@ import unittest
 
 from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot
-from app.services import sas_fabric_parsers
+from app.services import sas_fabric, sas_fabric_parsers
 from app.services.sas_fabric import build_sas_fabric_snapshot
 from app.services.sas_fabric_parsers import (
     CORE_MPRUTIL_UNIT_SUBCOMMANDS,
@@ -175,7 +175,11 @@ class AdapterSummaryFabricWarningTests(unittest.TestCase):
         self.assertEqual(read.get("summary_units_over_limit"), 300 - limit)
         self.assertEqual(len(read["units"]), limit)
         self.assertTrue(all(item["result"] == "read" for item in read["units"]))
-        self.assertEqual(len(fabric.controllers), limit)
+        # The graph draws read units only up to its controller limit (#1471)
+        # and counts the rest; the collection results above keep every unit.
+        drawn = min(limit, sas_fabric.MAX_FABRIC_CONTROLLERS)
+        self.assertEqual(len(fabric.controllers), drawn)
+        self.assertEqual(read.get("units_over_controller_limit", 0), limit - drawn)
         self.assertEqual(read["counts"]["controllers"], "partial")
         self.assertIn(
             f"The CORE mprutil adapter list named more than {limit} controller units; "

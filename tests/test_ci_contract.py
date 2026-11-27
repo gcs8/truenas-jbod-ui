@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -440,6 +441,13 @@ class CIWorkflowContractTests(unittest.TestCase):
                     unpinned.append(f"{workflow_path.name}: {action}@{match.group('ref')}")
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
+        # The topology mutation job's checkout, Node setup and Python setup
+        # (#1516) are pinned exactly here, so the total below stays the
+        # pinned set of every other job.
+        topology = yaml.safe_load(self.read(CI_WORKFLOW))["jobs"]["topology-mutants"]
+        self.assertEqual([step["uses"].split("@")[0] for step in topology["steps"] if "uses" in step],
+                         ["actions/checkout", "actions/setup-node", "actions/setup-python"])
+        action_count -= 3
 
         # Existing actions plus the trial's pinned checkout, the dispatch-only
         # screenshot capture workflow's checkout and upload, the unittest
@@ -1222,6 +1230,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "public-demo-artifact",
             "image-upgrade-smoke",
             "image-upgrade-scenarios",
+            "topology-mutants",
         ):
             job = workflow["jobs"][name]
             needs = job["needs"]
@@ -1583,6 +1592,169 @@ class RenovatePolicyContractTests(unittest.TestCase):
         self.assertNotIn("uv", ecosystems)
         self.assertIn("npm", ecosystems)
         self.assertIn("github-actions", ecosystems)
+
+
+class TopologyMutationScopeTests(unittest.TestCase):
+    """#1516: the topology mutation job runs whenever anything its runners
+    mutate, import or read changes, and its scope step cannot skip a run."""
+
+    def _step(self) -> str:
+        job = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))["jobs"]["topology-mutants"]
+        return next(step["run"] for step in job["steps"] if step.get("id") == "scope")
+
+    def _pattern(self) -> re.Pattern[str]:
+        found = re.search(r"^\s*pattern='([^']+)'$", self._step(), re.M)
+        self.assertIsNotNone(found)
+        return re.compile(found.group(1))
+
+    def _python_closure(self) -> set[str]:
+        runner = (ROOT / "tests" / "mutation" / "run_topology_backend_mutants.py").read_text(encoding="utf-8")
+        modules = re.findall(r'"(tests\.test_[a-z0-9_]+)"', runner.split("MODULES = [", 1)[1].split("]", 1)[0])
+        self.assertTrue(modules)
+        script = (
+            "import importlib, os, sys\n"
+            f"for name in {modules!r}: importlib.import_module(name)\n"
+            "root = os.getcwd() + os.sep\n"
+            "print('\\n'.join(sorted({os.path.relpath(m.__file__) for m in list(sys.modules.values())"
+            " if getattr(m, '__file__', None) and m.__file__.startswith(root)})))\n"
+        )
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        files: set[str] = set()
+        # The import closure needs the application's dependencies; a job that
+        # installs only the workflow tooling still checks everything else.
+        import importlib.util
+
+        if importlib.util.find_spec("pydantic") is not None:
+            result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, env=env, check=True)
+            files = set(filter(None, result.stdout.splitlines()))
+            self.assertIn("app/services/sas_fabric_core.py", files)
+        # Modules the tests import inside a test, which the import above misses.
+        for module in modules:
+            source = (ROOT / (module.replace(".", "/") + ".py")).read_text(encoding="utf-8")
+            files |= {f"tests/{name}.py" for name in re.findall(r"from tests import ([a-z0-9_]+)", source)}
+        files |= {path for _name, (path, _old, _new) in self._backend_mutants().items()}
+        return files
+
+    def _backend_mutants(self) -> dict:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("topology_backend_scope", ROOT / "tests" / "mutation" / "run_topology_backend_mutants.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.MUTANTS
+
+    def _javascript_closure(self) -> set[str]:
+        listed = json.loads((ROOT / "tests" / "mutation" / "topology_frontend_tests.json").read_text(encoding="utf-8"))
+        queue = [ROOT / file for file in listed["stages"] for file in []] + [ROOT / file for stage in listed["stages"] for file in stage]
+        seen: set[Path] = set()
+        files: set[str] = set()
+        while queue:
+            path = queue.pop()
+            if path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            files.add(path.relative_to(ROOT).as_posix())
+            if path.suffix not in {".js", ".cjs"}:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for target in re.findall(r"require\(\"(\.{1,2}/[^\"]+)\"\)", source):
+                base = (path.parent / target).resolve()
+                queue.extend(candidate for candidate in (base, base.with_name(base.name + ".js"), base.with_name(base.name + ".json"), base / "index.js") if candidate.is_file())
+            # Repository paths a test reads by name, whole directories too.
+            for literal in re.findall(r"\"((?:app|qa|tests|history_service)/[^\"\s]*)\"", source):
+                named = ROOT / literal
+                if named.is_dir():
+                    queue.extend(item for item in named.rglob("*") if item.is_file())
+                elif named.is_file():
+                    queue.append(named)
+        files |= {path.relative_to(ROOT).as_posix() for path in (ROOT / "app" / "static").glob("sas_fabric_topology*.js")}
+        return files
+
+    def test_the_scope_covers_every_file_the_runners_mutate_import_or_read(self) -> None:
+        pattern = self._pattern()
+        harness = {path.relative_to(ROOT).as_posix() for path in (ROOT / "tests" / "mutation").iterdir() if path.is_file()}
+        expected = self._python_closure() | self._javascript_closure() | harness | {
+            "app/templates/sas_fabric.html", "app/static/sas_fabric_transport.js", "package.json", "package-lock.json",
+            "requirements.txt", "requirements-dev.txt", ".github/workflows/ci.yml",
+        }
+        for required in ("tests/js/helpers/fabric_topology_geometry.js", "app/static/sas_fabric_topology_evidence.js", "tests/mutation/topology_frontend_mutants.json"):
+            self.assertIn(required, expected)
+        uncovered = sorted(path for path in expected if not pattern.match(path))
+        self.assertEqual(uncovered, [])
+        # A change elsewhere does not run the job.
+        self.assertIsNone(pattern.match("docs/USAGE.md"))
+
+    def _run_scope(self, changes: list[str]) -> str:
+        with tempfile.TemporaryDirectory() as scratch:
+            repo = Path(scratch)
+            git = ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.invalid", "-c", "commit.gpgsign=false"]
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+            for name in changes:
+                target = repo / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("changed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "change"], cwd=repo, check=True)
+            output = repo / "output"
+            env = {**os.environ, "EVENT_NAME": "push", "BEFORE_SHA": base, "PR_BASE_SHA": "", "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": scratch}
+            subprocess.run(["bash", "-c", self._step()], cwd=repo, env=env, check=True, capture_output=True, text=True)
+            return output.read_text(encoding="utf-8").strip()
+
+    @unittest.skipIf(os.name == "nt", "the CI step is Bash on Linux")
+    def test_the_scope_step_runs_on_a_covered_change_however_long_the_change_list(self) -> None:
+        self.assertEqual(self._run_scope(["tests/js/helpers/fabric_topology_geometry.js"]), "run=true")
+        self.assertEqual(self._run_scope(["docs/only.md"]), "run=false")
+        # A covered file first, then thousands of long unrelated names: the
+        # match must not be lost to an early-closed pipe.
+        many = ["app/static/sas_fabric_topology.js"] + [f"docs/unrelated/{'x' * 150}-{index:05d}.md" for index in range(2500)]
+        self.assertEqual(self._run_scope(many), "run=true")
+        self.assertNotIn("| grep", self._step())
+
+    def test_the_scope_covers_the_files_the_tests_read_at_run_time(self) -> None:
+        # Read only while the tests run (an import inside a test, a script a
+        # test runs as a child process, a JSON file a helper opens), so no
+        # import-time closure sees them; the runners' traced unmutated run
+        # (tests/mutation/read_trace/) found each, and fails on any new one.
+        pattern = self._pattern()
+        for path in ("qa/ui-states.json", "scripts/build_current_source_browser_fixture.py", "scripts/build_ui_crawl_fixture.py",
+                     "scripts/preview_system_sas_fabric.py", "tests/js/fabric_aggregate_provenance.test.js",
+                     "tests/test_history_bulk_bounds.py", "tests/test_snapshot_export.py", "tests/wait_bounds.py",
+                     "tests/mutation/read_trace/sitecustomize.py", "tests/mutation/read_trace/trace.cjs"):
+            self.assertIsNotNone(pattern.match(path), path)
+        # Both runners hold their traced reads to this same pattern line of
+        # this workflow.
+        for runner in ("run_topology_backend_mutants.py", "run_topology_frontend_mutants.cjs"):
+            source = (ROOT / "tests" / "mutation" / runner).read_text(encoding="utf-8")
+            for needle in ("pattern='([^']+)'$", "ci.yml", "read_trace", "the CI path filter of this job does not cover"):
+                self.assertIn(needle, source, f"{runner}: {needle}")
+
+    @unittest.skipIf(os.name == "nt", "the CI step is Bash on Linux")
+    def test_the_scope_step_runs_when_a_covered_file_is_renamed_away(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            repo = Path(scratch)
+            git = ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.invalid", "-c", "commit.gpgsign=false"]
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            covered = repo / "tests" / "js" / "helpers" / "fabric_topology_geometry.js"
+            covered.parent.mkdir(parents=True)
+            covered.write_text("const geometry = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+            # An exact rename (R100): only the destination is outside the filter.
+            (repo / "docs").mkdir()
+            subprocess.run(["git", "mv", str(covered), str(repo / "docs" / "retired.js")], cwd=repo, check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "move"], cwd=repo, check=True)
+            status = subprocess.run(["git", "diff", "--name-status", "-M", f"{base}..HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout
+            self.assertTrue(status.startswith("R100"), status)
+            output = repo / "output"
+            env = {**os.environ, "EVENT_NAME": "push", "BEFORE_SHA": base, "PR_BASE_SHA": "", "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": scratch}
+            subprocess.run(["bash", "-c", self._step()], cwd=repo, env=env, check=True, capture_output=True, text=True)
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "run=true")
 
 
 if __name__ == "__main__":

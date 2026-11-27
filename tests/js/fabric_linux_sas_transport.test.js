@@ -9,14 +9,14 @@ const vm = require("node:vm");
 const root = path.resolve(__dirname, "../..");
 function topology(transportApi) {
   const context = vm.createContext({ window: {} });
-  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context, { filename: path.join(root, "app/static/sas_fabric_transport.js") });
   if (transportApi) context.window.SasFabricTransport = transportApi;
-  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_topology.js"), "utf8"), context);
+  vm.runInContext(require("./helpers/fabric_topology").topologySource(), context, { filename: require("./helpers/fabric_topology").TOPOLOGY_JOINED });
   return context.window.SasFabricTopology;
 }
 function transport() {
   const context = vm.createContext({ window: {} });
-  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(root, "app/static/sas_fabric_transport.js"), "utf8"), context, { filename: path.join(root, "app/static/sas_fabric_transport.js") });
   return context.window.SasFabricTransport;
 }
 function syntheticFabric(available = true) {
@@ -55,21 +55,27 @@ function renderLanes(fabric) {
     inventoryBaySlots: (value) => value.nodes.filter((node) => node.kind === "bay").map((node) => node.slot),
     renderLanesWithoutController: () => "", fabricCountsUnvouched: () => false,
   });
-  vm.runInContext(extract("renderUnattachedInventory") + "\n" + extract("renderLanesMode") + "\nthis.render = renderLanesMode;", context);
+  vm.runInContext(extract("renderUnattachedInventory") + "\n" + extract("renderLanesMode") + "\nthis.render = renderLanesMode;", context, { filename: path.join(root, "app/static/sas_fabric_view.js") });
   return context.render(fabric);
 }
 
 test("Linux transport records are drawn rather than classified as uncollected", () => {
   const model = topology().buildTopologyModel(syntheticFabric());
-  assert.equal(model.contract, "sas");
+  // Transport uses the approved renderer's SAS evidence contract.
+  assert.equal(model.contract, "core");
   assert.equal(model.nodes.filter((node) => node.kind === "expander").length, 2);
   assert.ok(model.tiers.some((tier) => tier.label === "Expanders, level 2"));
   assert.ok(!model.tiers.some((tier) => tier.state === "not_collected"));
   const cascade = model.links.find((link) => link.kind === "expander-expander");
   assert.equal(cascade.lanes.count, 2);
-  assert.equal(cascade.lanes.rate, 12);
+  // The listed rate is not read where the parent's own rows do not read it.
+  assert.equal(cascade.lanes.rate, null);
   assert.equal(model.links.length, 4);
   assert.ok(!model.notices.some((notice) => notice.startsWith("Not drawn:")));
+  // With the parent's rows for the listed PHYs, each reading 12 Gb/s, it is.
+  const fabric = syntheticFabric();
+  fabric.nodes.find((node) => node.id === "expander:front").raw.phys = [2, 3].map((phy) => ({ phy, name: `phy-front:${phy}`, negotiated_rate_gbps: 12 }));
+  assert.equal(topology().buildTopologyModel(fabric).links.find((link) => link.kind === "expander-expander").lanes.rate, 12);
 });
 
 test("no-SES SAS transport edges connect the reported bay", () => {
@@ -103,7 +109,7 @@ test("shared observed SES membership appears in each matching controller lane", 
     aggregateDiskNoun: () => "bay", renderBayChips: () => "", fabricCountPhrase: () => "", hostDiskSummary: () => "",
     renderUnattachedInventory: () => "", renderLanesWithoutController: () => "",
   });
-  vm.runInContext(source.slice(start, end) + "\nthis.render = renderLanesMode;", context);
+  vm.runInContext(source.slice(start, end) + "\nthis.render = renderLanesMode;", context, { filename: path.join(root, "app/static/sas_fabric_view.js") });
   const html = context.render(fabric);
   assert.equal((html.match(/ses:sg9/g) || []).length, 2);
 });
@@ -127,7 +133,7 @@ test("parent-side lane sets show the remote PHYs as unknown", () => {
   const cascade = model.links.find((link) => link.kind === "expander-expander");
   assert.equal(cascade.lanes.sourcePhys.join(","), "2,3");
   assert.equal(cascade.lanes.targetPhys.length, 0);
-  assert.ok(cascade.labelLines.some((line) => line.includes("?")));
+  assert.ok(cascade.labelLines.some((line) => line.includes("far end not read")));
 });
 
 test("SES-only payloads retain the existing not-collected explanation", () => {
@@ -158,7 +164,7 @@ function transportRenderers(fabric, transportApi = transport()) {
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "" }); return elements.get(id); }, querySelectorAll: () => [] },
   });
   const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
-  vm.runInContext(source.slice(0, end) + "\nwindow.testApi = { branchSeedsForDiskTrace, renderDiskPathBranch, renderLanesMode };\n})();", context);
+  vm.runInContext(source.slice(0, end) + "\nwindow.testApi = { branchSeedsForDiskTrace, renderDiskPathBranch, renderLanesMode };\n})();", context, { filename: path.join(root, "app/static/sas_fabric_view.js") });
   return context.window.testApi;
 }
 
@@ -172,6 +178,9 @@ test("referenced transport PHY rows resolve in topology, Disk Path and Storage L
   const model = api.buildTopologyModel(fabric);
   assert.equal(model.bays[0].pathStates[0].transportPhyCount, 1);
   assert.match(api.renderTopology(model), /1 reported PHY rows/);
+  // The approved model also keeps resolved PHY detail on the independently pinnable port.
+  assert.equal(model.bays[0].ports.length, 1);
+  assert.equal(model.bays[0].ports[0].phy.counters.invalid_dword_count, 9);
   const ui = transportRenderers(fabric);
   const trace = fabric.traces[0];
   const seed = ui.branchSeedsForDiskTrace(trace, fabric)[0];
@@ -287,7 +296,7 @@ test("transport copy does not claim that reported expander detail is unexposed",
   const end = source.indexOf("\n  function ", start + 10);
   assert.ok(start >= 0 && end > start);
   const context = vm.createContext({ fabricKind: (fabric) => fabric.raw.fabric_kind, modeCopy: {} });
-  vm.runInContext(source.slice(start, end) + "\nthis.copy = buildFabricViewCopy;", context);
+  vm.runInContext(source.slice(start, end) + "\nthis.copy = buildFabricViewCopy;", context, { filename: path.join(root, "app/static/sas_fabric_view.js") });
   const copy = context.copy(syntheticFabric(), "TrueNAS SCALE");
   assert.equal(copy.summary.controllers[0], "HBAs");
   assert.equal(copy.summary.expanders[0], "Expanders");

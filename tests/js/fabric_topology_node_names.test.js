@@ -24,7 +24,9 @@ for (const [name, fabric] of Object.entries(nameCases())) {
         const visible = texts(node[2]).join(" ");
         assert.equal(visible, entry.lines.join(" "));
         assert.ok(decode(node[1]).startsWith(visible), `${visible} must lead ${decode(node[1])}`);
-        assert.ok(decode(node[2].match(/<title[^>]*>([^<]*)<\/title>/)[1]).includes(entry.label), "hover title retains the full label");
+        // One hover surface (#1465): no native title; the full label is in the accessible name.
+        assert.doesNotMatch(node[0], /<title\b/);
+        assert.ok(decode(node[1]).includes(entry.label), "the accessible name retains the full label");
         if (pinned) assert.match(node[0], /is-pinned/);
       }
     });
@@ -76,9 +78,15 @@ test("tier names start with their rendered label and note with word separators",
   const T = H.loadTopology();
   for (const fabric of Object.values(nameCases())) {
     const html = T.renderTopology(T.buildTopologyModel(fabric), {});
-    const tiers = [...html.matchAll(/<g class="topo-tier"><title[^>]*>([^<]*)<\/title>([\s\S]*?)<\/g>/g)];
+    // One hover surface (#1465): the tier's full wording moved from a native title to its accessible name.
+    assert.doesNotMatch(html, /<title\b/);
+    const tiers = [...html.matchAll(/<g class="topo-tier" data-topo-tier="[^"]*" aria-label="([^"]*)">([\s\S]*?)<\/g>/g)];
     assert.ok(tiers.length > 0);
-    for (const tier of tiers) assert.ok(decode(tier[1]).startsWith(texts(tier[2]).join(" ")));
+    for (const tier of tiers) {
+      const visible = texts(tier[2]).join(" ");
+      assert.ok(visible.length > 0);
+      assert.ok(decode(tier[1]).startsWith(visible), `${visible} must lead ${decode(tier[1])}`);
+    }
   }
 });
 

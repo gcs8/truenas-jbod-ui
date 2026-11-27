@@ -253,19 +253,24 @@ Slots Logical ID       SEPHandle EncHandle Type
 """.strip()
 
 
+def _fixture_shelf_id() -> str:
+    """The logical id the synthetic MPR0_ENCLOSURES row reports."""
+    return MPR0_ENCLOSURES.splitlines()[1].split()[1]
+
+
 MPR0_DEVICES = """
-5000c50000000001 000a 0002 SAS Target 12.0 0002 0
+5000c50000000001 000a 0009 SAS Target 12.0 0002 0
 """.strip()
 
 
 MPR1_DEVICES = """
-5000c50000000001 000c 0012 SAS Target 12.0 0012 0
+5000c50000000001 000c 0019 SAS Target 12.0 0012 0
 """.strip()
 
 
 MPR0_DEVICES_WITH_BUS_TARGET = """
 B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt
-00   180  5000c50000000001 000a    0002      SAS Target    12    0002 0     1
+00   180  5000c50000000001 000a    0009      SAS Target    12    0002 0     1
 """.strip()
 
 
@@ -1347,6 +1352,36 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(devices[0]["bus"], "00")
         self.assertEqual(devices[0]["target"], "180")
         self.assertEqual(devices[0]["slot"], "0")
+
+    def test_parse_mpr_devices_keeps_exact_type_evidence_for_named_destinations(self) -> None:
+        from app.services.sas_fabric_core import _mpr_device_kind
+        from app.services.sas_fabric_parsers import parse_mpr_device_list
+
+        cases = (
+            ("SAS Target da5", "SAS Target", "disk"),
+            ("SMP Target expander0", "SMP Target", "expander"),
+            ("SEP Target ses0", "SEP Target", "sep"),
+            ("SAS Initiator mpr0", "SAS Initiator", "initiator"),
+            ("Unknown Device da9", "Unknown Device", "other"),
+        )
+        lines = [
+            f"00 {index} {index + 1:016x} {index + 1:04x} 0001 {device} 12.0 0002 {index} 1"
+            for index, (device, _device_type, _kind) in enumerate(cases)
+        ]
+        # The first two words are the complete type grammar. Similar prefixes
+        # are device rows but not supported types, so they are rejected.
+        lines.extend((
+            f"00 8 {8:016x} 0008 0001 SAS Targeted da8 12.0 0002 8 1",
+            f"00 9 {9:016x} 0009 0001 XSAS Target da9 12.0 0002 9 1",
+        ))
+
+        devices, rejected = parse_mpr_device_list("\n".join(lines))
+
+        self.assertEqual(rejected, 2)
+        self.assertEqual(
+            [(row["device"], row["device_type"], _mpr_device_kind(row)) for row in devices],
+            [(device, device_type, kind) for device, device_type, kind in cases],
+        )
 
     def test_parse_mpr_dmesg_events_summarizes_controller_and_disk_faults(self) -> None:
         events = parse_mpr_dmesg_events(MPR_DMESG_EVENTS)
@@ -3023,8 +3058,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
         # Codex P2 on #1069: a UNVR Pro prints its bays 1-7 (slot_number_base
         # 1), so the Storage Fabric graph must call slot index 0 "Bay 01", not
         # "Bay 00". Profiles without a base keep their zero-based labels.
-        from app.services.sas_fabric import _backplane_zones_for_slots
-
         def snapshot(base: int) -> InventorySnapshot:
             return InventorySnapshot(
                 slots=[
@@ -3049,8 +3082,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 bay_labels = {node.slot: node.label for node in fabric.nodes if node.kind == "bay"}
                 self.assertEqual(bay_labels[0], first)
                 self.assertEqual(bay_labels[1], second)
-                zones = _backplane_zones_for_slots(snapshot(base).slots)
-                self.assertEqual(zones[0]["range"], f"Bays {base:02d}-{1 + base:02d}")
+                # Slot geometry is not a board: no zone range is built any more.
+                self.assertFalse([node.id for node in fabric.nodes if node.kind == "backplane"])
 
     def test_select_sas_fabric_builder_key_keeps_platform_selection_explicit(self) -> None:
         def system(platform: str) -> SystemConfig:
@@ -3148,7 +3181,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
         fabric_module = importlib.import_module("app.services.sas_fabric")
         expected = {
             "_INVENTORY_SNAPSHOT_EVIDENCE": ("inventory snapshot",),
-            "_PROFILE_SLOT_LAYOUT_EVIDENCE": ("profile slot layout",),
             "_SLOT_MULTIPATH_EVIDENCE": ("multipath members",),
             "_LINUX_SES_PATH_EVIDENCE": (
                 "lsscsi -g",
@@ -3206,11 +3238,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
             patch.object(fabric_module, "_add_host_node", wraps=fabric_module._add_host_node) as add_host,
             patch.object(
                 fabric_module,
-                "_add_backplane_zone_nodes",
-                wraps=fabric_module._add_backplane_zone_nodes,
-            ) as add_backplanes,
-            patch.object(
-                fabric_module,
                 "_add_pool_vdev_nodes_and_links",
                 wraps=fabric_module._add_pool_vdev_nodes_and_links,
             ) as add_storage,
@@ -3228,7 +3255,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 )
 
         self.assertEqual(add_host.call_count, 3)
-        self.assertEqual(add_backplanes.call_count, 3)
         self.assertEqual(add_storage.call_count, 3)
         self.assertEqual(build_result.call_count, 3)
 
@@ -3357,7 +3383,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "with_ses": False,
                 # No mprutil output was observed, so no controller is invented (#1219).
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "host",
                     "pool:Tank%20Main",
@@ -3400,7 +3425,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "platform": "scale",
                 "with_ses": True,
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "controller:linux-ses",
                     "host",
@@ -3440,7 +3464,6 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "platform": "quantastor",
                 "with_ses": False,
                 "node_ids": [
-                    "backplane:0",
                     "bay:0",
                     "controller:storage-v2:4ffb4b40f69f088abe6c90de4105cdd636e63fd2d13479ba4e1719c038f33a1d",
                     "host",
@@ -3768,8 +3791,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 SasFabricAlias(
                     system_id="archive-core",
                     enclosure_id="enc-60",
-                    object_id="backplane:0",
-                    object_kind="backplane",
+                    object_id=f"enclosure:{_fixture_shelf_id()}",
+                    object_kind="enclosure",
                     label="Front-left backplane",
                 ),
             ],
@@ -3786,10 +3809,11 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(controllers["controller:mpr0"]["display_label"], "Archive left HBA")
         self.assertEqual(traces["path:mpr0:fail"].display_label, "Bad-cable path")
         self.assertEqual(paths["path:mpr0:fail"]["display_label"], "Bad-cable path")
-        self.assertEqual(nodes["backplane:0"].label, "Backplane Zone 1")
-        self.assertEqual(nodes["backplane:0"].display_label, "Front-left backplane")
-        self.assertIn("backplane:0", traces["bay:0"].node_ids)
-        self.assertEqual({alias.object_id for alias in fabric.aliases}, {"controller:mpr0", "path:mpr0:fail", "backplane:0"})
+        enclosure_id = f"enclosure:{_fixture_shelf_id()}"
+        self.assertEqual(nodes[enclosure_id].label, _fixture_shelf_id())
+        self.assertEqual(nodes[enclosure_id].display_label, "Front-left backplane")
+        self.assertIn(enclosure_id, traces["bay:0"].node_ids)
+        self.assertEqual({alias.object_id for alias in fabric.aliases}, {"controller:mpr0", "path:mpr0:fail", enclosure_id})
 
     def test_core_snapshot_builds_traceable_dual_hba_path_graph(self) -> None:
         slot = SlotView(
@@ -3888,6 +3912,9 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertIn("ses:/dev/ses8", nodes)
         self.assertEqual(nodes[mpr0_expander_id].related_slots, [0])
         self.assertEqual(nodes[mpr1_expander_id].related_slots, [0])
+        # Asserted, never a KeyError: a missing node is a failed expectation.
+        self.assertIn(mpr0_enclosure_id, nodes)
+        self.assertIn(mpr1_enclosure_id, nodes)
         self.assertEqual(nodes[mpr0_enclosure_id].related_slots, [0])
         self.assertEqual(nodes[mpr1_enclosure_id].related_slots, [0])
         self.assertIn("path:mpr0:fail", traces)
@@ -3982,8 +4009,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         bay_slots = list(range(24))
         mpr0_selected_expander = "expander:controller:mpr0:5000c500ee000001"
         mpr1_selected_expander = "expander:controller:mpr1:50030480090c4fff"
-        mpr0_selected_enclosure = "mpr-enclosure:controller:mpr0:0002"
-        mpr1_selected_enclosure = "mpr-enclosure:controller:mpr1:0012"
+        mpr0_selected_enclosure = f"enclosure:{_fixture_shelf_id()}"
+        mpr1_selected_enclosure = mpr0_selected_enclosure
 
         self.assertTrue(fabric.available)
         self.assertEqual(fabric.paths, [])
@@ -4001,7 +4028,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(nodes[mpr1_selected_expander].related_slots, bay_slots)
         self.assertEqual(nodes["controller:mpr0"].related_slots, bay_slots)
         self.assertEqual(nodes["controller:mpr1"].related_slots, bay_slots)
-        self.assertEqual(nodes[mpr0_selected_enclosure].metrics["selected_disk_count"], 4)
+        self.assertIn(mpr0_selected_enclosure, nodes)
+        self.assertEqual(nodes[mpr0_selected_enclosure].metrics.get("selected_disk_count"), 4)
         self.assertIn("bay:0", traces)
         self.assertIn(mpr0_selected_expander, traces["bay:0"].node_ids)
         self.assertIn(mpr1_selected_enclosure, traces["bay:0"].node_ids)
@@ -4533,6 +4561,7 @@ class FabricPathRegressionTests(unittest.TestCase):
         fabric = self.core_build(5, 5, self.mpr_row(4, "SAS Target da5"))
         bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
         self.assertEqual([item["mpr_slot"] for item in bay.metrics["mpr_devices"]], ["4"])
+        self.assertEqual([item["mpr_device"] for item in bay.metrics["mpr_devices"]], ["SAS Target da5"])
 
     def test_mpr_rejects_named_member_at_contradictory_location_or_enclosure(self):
         for row in (self.mpr_row(2, "SAS Target da5"), self.mpr_row(5, "SAS Target da5", enclosure="0012")):
@@ -4622,7 +4651,7 @@ class FabricPathRegressionTests(unittest.TestCase):
         self.assertEqual(fabric.paths[0]["alias"], "Exact name")
         traces = {t.id: t for t in fabric.traces}
         self.assertEqual(set(traces["bay:0"].node_ids), {
-            "host", controller_id, path_id, enclosure_id, "backplane:0", "bay:0", "pool:Pool", "vdev:Pool/mirror",
+            "host", controller_id, path_id, enclosure_id, "bay:0", "pool:Pool", "vdev:Pool/mirror",
         })
         self.assertEqual(set(traces[path_id].node_ids), {"host", controller_id, path_id})
         expected_edges = {("host", controller_id), (controller_id, path_id), (path_id, enclosure_id)}
