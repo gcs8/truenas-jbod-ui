@@ -1105,11 +1105,23 @@ function wiringChecks(model, fabric) {
       // The disk ports the transport census lists are expected whether or
       // not a row for their PHY arrived: a PHY with no row is not read.
       const listed = new Map();
+      const portsWithoutMembers = new Set();
       for (const port of context.list(model.censusRows)) {
-        // A record not read names no disk port: it is unread evidence.
-        if (port.state !== "read" || port.remote_kind !== "end_device") continue;
+        if (port.remote_kind !== "end_device") continue;
         const chip = chipOf(port.owner_id);
         if (!chip || ![...views, ...hbaViews].some((view) => view.id === chip.id)) continue;
+        // The census can identify the end device without identifying any of its PHYs.
+        // Count the port once, not an invented PHY. Ambiguous names have their own gap below.
+        if (!port.phys.length && port.state !== "ambiguous") {
+          const id = context.text(port.id);
+          const key = id ? JSON.stringify([port.owner_id, id]) : port;
+          if (!portsWithoutMembers.has(key)) {
+            portsWithoutMembers.add(key);
+            const name = id.replace(/^sas-port:/, "");
+            cover.gap(["disk port", "disk ports"], `${chip.label}: ${name || "surveyed disk port"}: PHY membership and counters not read`);
+          }
+        }
+        if (port.state !== "read") continue;
         for (const phy of context.list(port.phys).filter((value) => Number.isInteger(value))) {
           const key = `${chip.id}|${phy}`;
           if (cablePhys.has(key)) continue;

@@ -90,6 +90,57 @@ function coreRole(device, count = 101) {
 
 // --- 1: census identity -------------------------------------------------------------
 
+test("a known disk port with no resolvable PHYs stays in the error check", () => {
+  const item = fixture("fanout-2");
+  const census = item.fabric.raw.sas_transport_ports;
+  const port = census.find((entry) => entry.remote_kind === "end_device" && entry.has_block &&
+    entry.enclosure_identifier !== item.fabric.selected_enclosure_id);
+  assert.ok(port, "use a surveyed port outside the selected bays");
+  const checks = () => checksOf(model(item), "port-errors");
+  const healthy = checks();
+  assert.equal(healthy.length, 1);
+  assert.equal(healthy[0].status, "pass");
+  assert.equal(healthy[0].lines[0], "no errors on 16 disk port PHYs");
+
+  // The collector still identifies the end device, but _port_phys cannot identify its members.
+  const [name] = port.phy_names;
+  for (const chip of [node(item.fabric, port.owner_id).raw, item.fabric.expanders.find((row) => row.id === port.owner_id)]) {
+    assert.ok(chip.phys.some((row) => row.name === name));
+    chip.phys = chip.phys.filter((row) => row.name !== name);
+  }
+  Object.assign(port, { state: "not_read", phys: [], phy_names: [] });
+  for (const repeat of [false, true]) {
+    if (repeat) census.push({ ...port });
+    const partial = checks();
+    assert.equal(partial.length, 1);
+    assert.equal(partial[0].status, "not_read");
+    assert.match(partial[0].lines[0], /Partial: 15 disk port PHYs read and as expected/);
+    assert.ok(partial[0].lines.some((line) => line.startsWith("1 disk port not read:") &&
+      line.includes(port.id.replace(/^sas-port:/, "")) && line.includes("counters")), textOf(partial));
+  }
+
+  // An unread expander connection is not a missing disk port. Neither is a port outside this view.
+  census.pop();
+  for (const change of [{ remote_kind: "expander" }, { owner_id: "not-in-this-view", remote_kind: "end_device" }]) {
+    Object.assign(port, change);
+    const control = checks();
+    assert.equal(control[0].status, "pass");
+    assert.equal(control[0].lines[0], "no errors on 15 disk port PHYs");
+  }
+});
+
+test("unread HBA ports are counted separately from another disk port's measured errors", () => {
+  const item = direct({ count: 101 });
+  const census = item.fabric.raw.sas_transport_ports;
+  for (const number of [13, 14]) census.push({ id: `sas-port:port-1:${number}`, owner_id: HOST1,
+    state: "not_read", remote_kind: "end_device", has_block: true, phys: [], phy_names: [] });
+  const built = model(item);
+  assert.deepEqual(statuses(built, "port-errors"), ["critical", "not_read"]);
+  assert.equal(said(built, /101 invalid dword/).length, 1);
+  const gaps = checksOf(built, "port-errors").find((entry) => entry.status === "not_read").lines;
+  assert.ok(gaps.some((line) => line.startsWith("2 disk ports not read:") && line.includes("port-1:13") && line.includes("port-1:14")));
+});
+
 test("a disk the census names by its PHY name alone keeps its fault in the disk-port check", () => {
   const item = direct();
   record(item).phys = [];

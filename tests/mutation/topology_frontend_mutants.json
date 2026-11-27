@@ -1332,5 +1332,9 @@
  "SIBLINGWIDTH": {
   "from": "for (const link of verified) {\n        const board = into(link);",
   "to": "for (const link of cables.filter((entry) => entry.lanes)) {\n        const board = into(link);"
+ },
+ "UNREADPORT": {
+  "from": "if (!port.phys.length && port.state !== \"ambiguous\") {",
+  "to": "if (false) {"
  }
 }
