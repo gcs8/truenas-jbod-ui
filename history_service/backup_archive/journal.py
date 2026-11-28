@@ -51,6 +51,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from history_service.backup_archive.errors import describe_error
+
 try:
     import fcntl
 except ImportError as exc:  # pragma: no cover - the backup sidecar runs on Linux
@@ -68,6 +70,7 @@ MAX_SUBJECT_CHARS = 256
 # Change ids per commit record: 256 ids of <= 68 bytes stay far below MAX_LINE_BYTES.
 COMMIT_IDS_PER_RECORD = 256
 MAX_RETRY_EXPONENT = 16
+SNAPSHOT_ERROR_PREFIX = "config snapshot failed: "
 
 # Dict keys whose values change on every save without changing what the operator
 # configured. Matched by exact key name at any depth of a config document.
@@ -994,7 +997,7 @@ class ConfigBackupCoalescer:
             snapshot = self._snapshot_config()
             config_hash = canonical_config_hash(snapshot, self.volatile_keys)
         except Exception as exc:  # the snapshot callback is integration code
-            return self._record_failure(change_ids, f"config snapshot failed: {type(exc).__name__}")
+            return self._record_failure(change_ids, f"{SNAPSHOT_ERROR_PREFIX}{describe_error(exc)}")
         last_hash, _ = self.journal.last_backup()
         if config_hash == last_hash:
             try:
@@ -1060,6 +1063,7 @@ __all__ = [
     "DEFAULT_MAX_DELAY_SECONDS",
     "DEFAULT_QUIET_PERIOD_SECONDS",
     "DEFAULT_VOLATILE_KEYS",
+    "SNAPSHOT_ERROR_PREFIX",
     "ChangeJournal",
     "CoalescerResult",
     "ConfigBackupCoalescer",

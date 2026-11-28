@@ -56,7 +56,12 @@ from history_service.backup_archive.catalog import (
 )
 from history_service.backup_archive.cron import CronSchedule
 from history_service.backup_archive.errors import describe_error as _describe_error
-from history_service.backup_archive.journal import ChangeJournal, ConfigBackupCoalescer, CoalescerResult
+from history_service.backup_archive.journal import (
+    SNAPSHOT_ERROR_PREFIX,
+    ChangeJournal,
+    ConfigBackupCoalescer,
+    CoalescerResult,
+)
 from history_service.backup_archive.lifecycle import (
     GroomableTarget,
     GroomingPlan,
@@ -120,7 +125,7 @@ _FETCH_WORKSPACE_QUARANTINE_PREFIX = f"{FETCH_WORKSPACE_PREFIX}quarantine-"
 # workspace its creator has not locked yet and nothing is swapped mid-removal.
 _FETCH_STATE_LOCK_FILE = ".backup-fetch.lock"
 _COPY_CHUNK = 1024 * 1024
-# Marks the synthetic config run recorded when the change journal cannot be read.
+# Marks the synthetic config run recorded when the journal or config snapshot cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
 # Trust-on-first-use SFTP targets pin new host keys here, in the scheduler's
 # private state, never in a file a target names (#816).
@@ -677,7 +682,20 @@ class BackupScheduler:
             try:
                 result: CoalescerResult = self.coalescer.tick()
             except Exception as exc:  # noqa: BLE001 - recorded in status; full backups still run
-                detail = f"{JOURNAL_CHECK_PREFIX}{describe_error(exc)}"[:MAX_DETAIL_CHARS]
+                error = describe_error(exc)
+            else:
+                if result.status == "failed":
+                    logger.warning("Config backup failed: %s", result.error)
+                elif result.status in {"backup", "noop"}:
+                    logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
+                # Keep a snapshot refusal through backoff, including after a restart.
+                error = self.coalescer.last_error or ""
+                if not error and result.status in {"not_due", "busy"}:
+                    error = (self._coalescer_error or "").removeprefix(JOURNAL_CHECK_PREFIX)
+                if result.status == "idle" or not error.startswith(SNAPSHOT_ERROR_PREFIX):
+                    error = ""
+            if error:
+                detail = f"{JOURNAL_CHECK_PREFIX}{error}"[:MAX_DETAIL_CHARS]
                 if detail != self._coalescer_error:
                     if self._coalescer_error is None:
                         with self._state_lock:
@@ -686,24 +704,19 @@ class BackupScheduler:
                     self._coalescer_error = detail
                     logger.error("%s", detail)
                     self._record_class("config", RunRecord(at=_iso(self._clock()) or "", ok=False, detail=detail))
-            else:
-                if self._coalescer_error is not None:
-                    # Readable again: put back the last real run unless a backup replaced it.
-                    with self._state_lock:
-                        current = self._status["classes"].get("config")
-                        restore = isinstance(current, dict) and current.get("detail") == self._coalescer_error
-                        if restore and self._coalescer_prior_run is not None:
-                            self._status["classes"]["config"] = self._coalescer_prior_run
-                        elif restore:
-                            self._status["classes"].pop("config", None)
-                    self._coalescer_error = None
-                    self._coalescer_prior_run = None
-                    if restore:
-                        self._write_status()
-                if result.status == "failed":
-                    logger.warning("Config backup failed: %s", result.error)
-                elif result.status in {"backup", "noop"}:
-                    logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
+            elif self._coalescer_error is not None:
+                # Readable again: put back the last real run unless a backup replaced it.
+                with self._state_lock:
+                    current = self._status["classes"].get("config")
+                    restore = isinstance(current, dict) and current.get("detail") == self._coalescer_error
+                    if restore and self._coalescer_prior_run is not None:
+                        self._status["classes"]["config"] = self._coalescer_prior_run
+                    elif restore:
+                        self._status["classes"].pop("config", None)
+                self._coalescer_error = None
+                self._coalescer_prior_run = None
+                if restore:
+                    self._write_status()
         now = self._clock()
         if self.next_full_at is not None and now >= self.next_full_at:
             self.next_full_at = self._compute_next_full(now)
@@ -2239,7 +2252,7 @@ class ConfigFileSnapshot(dict[str, Any]):
         self.files = MappingProxyType(dict(files))
 
 
-_JSON_STATE_SNAPSHOT_KEYS = frozenset({"mappings", "sas_fabric_aliases"})
+JSON_STATE_SNAPSHOT_FILES = {"mappings": "mapping_file", "sas_fabric_aliases": "sas_fabric_alias_file"}
 
 
 def snapshot_config_files(
@@ -2254,7 +2267,7 @@ def snapshot_config_files(
     for logical, path in paths.items():
         if not path.exists():
             content = None
-        elif logical in _JSON_STATE_SNAPSHOT_KEYS:
+        elif logical in JSON_STATE_SNAPSHOT_FILES:
             with path.open("rb") as source:
                 content = read_json_state(source, path.name)
         else:
@@ -2325,6 +2338,7 @@ __all__ = [
     "ArchiveIntegrityError",
     "ArtifactNotFoundError",
     "BackupScheduler",
+    "JSON_STATE_SNAPSHOT_FILES",
     "SchedulerBusyError",
     "SchedulerPaths",
     "config_group_keys",

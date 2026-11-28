@@ -75,6 +75,7 @@ def build_scheduler(policy: BackupPolicy) -> Any:
     from app.config import _derive_runtime_layout_paths
     from app.services.json_state_budget import read_json_state
     from history_service.backup_scheduler.service import (
+        JSON_STATE_SNAPSHOT_FILES,
         BackupScheduler,
         SchedulerPaths,
         config_group_keys,
@@ -108,8 +109,7 @@ def build_scheduler(policy: BackupPolicy) -> Any:
         "config": Path(layout["config_file"]),
         "runtime_overrides": Path(layout["runtime_overrides_file"]),
         "profiles": Path(layout["profile_file"]),
-        "mappings": Path(layout["mapping_file"]),
-        "sas_fabric_aliases": Path(layout["sas_fabric_alias_file"]),
+        **{key: Path(layout[field]) for key, field in JSON_STATE_SNAPSHOT_FILES.items()},
     }
     return BackupScheduler(
         policy,
