@@ -18,7 +18,7 @@ from app import routes as app_routes
 
 
 class ReleaseStatusTests(unittest.TestCase):
-    def test_v0240_rc3_release_metadata_is_aligned(self) -> None:
+    def test_v0240_rc1_release_metadata_is_aligned(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         package = json.loads((repository / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((repository / "package-lock.json").read_text(encoding="utf-8"))
