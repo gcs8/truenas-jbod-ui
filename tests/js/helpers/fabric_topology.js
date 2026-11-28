@@ -185,6 +185,21 @@ function reciprocalTables(fabric) {
 const range = (start, end) => Array.from({ length: end - start }, (_, index) => start + index);
 const DUAL = [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }];
 
+// Two rows on opposite sides of one board's expander strip.
+function dualPortBoard() {
+  const fabric = coreFabric();
+  const rows = [range(0, 20), range(20, 40)];
+  const enclosures = DUAL.map(({ controller }, index) => {
+    const hba = addController(fabric, controller);
+    const chip = addExpander(fabric, controller, 0xb00 + index, 1, hba.id);
+    const enclosure = addEnclosure(fabric, controller, "0002", "Synthetic board", chip.id);
+    enclosure.raw.logical_id = "synthetic-board";
+    return enclosure.id;
+  });
+  addBays(fabric, rows.flat(), enclosures, DUAL);
+  return { fabric, inventory: { layout_rows: rows } };
+}
+
 // The default two-HBA system: each HBA has a level-1 expander feeding a front
 // enclosure and a level-2 expander feeding a rear one; 48 dual-pathed bays.
 function twoHbaCascade() {
@@ -272,6 +287,7 @@ function threeLevelCascade() {
 }
 
 module.exports = {
+  dualPortBoard,
   eightHbaSixteenShelves,
   threeLevelCascade,
   range,

@@ -94,7 +94,7 @@ function groupText(group) {
     return lines;
   }
 
-function groupSize(group) {
+function groupSize(group, hbas) {
     const texts = groupText(group);
     // An expandable group's control sits at its top left in both states,
     // its text below the control.
@@ -110,6 +110,14 @@ function groupSize(group) {
       // profile's column groups set apart.
       const columns = Math.max(...group.rows.map((row) => Math.max(...row.map((cell) => cell.column)) + 1));
       const breaks = context.list(group.breakColumns).filter((column) => column < columns);
+      // Each HBA keeps its own port columns. Reserve the minimum hit width
+      // before sizing the board, rather than letting adjacent targets overlap.
+      group.perHba = Math.max(1, ...group.bays.flatMap((bay) => hbas.map((id) => bay.ports.filter((port) => port.controllerId === id).length)));
+      group.portSlots = Math.max(hbas.length * group.perHba, ...group.bays.map((bay) => bay.ports.length));
+      if (group.bays.some((bay) => bay.ports.length)) {
+        group.cellWidth = Math.max(group.cellWidth, 12 * (group.portSlots + 1));
+        for (const bay of group.bays) bay.w = group.cellWidth;
+      }
       group.pitch = group.cellWidth + context.PHYS_GAP;
       group.breaks = breaks;
       group.cellH = group.cellWidth >= context.PHYS_CELL_NAMED ? context.PHYS_CELL_TALL : context.PHYS_CELL_H;
@@ -809,8 +817,7 @@ function placeCells(model) {
       // One mark per path, grouped by HBA: each HBA has as many places in a
       // cell as the most paths it has to one bay of the block, so the marks
       // of one HBA line up down the block.
-      const perHba = Math.max(1, ...group.bays.flatMap((bay) => hbas.map((name) => bay.ports.filter((port) => port.controllerId === name).length)));
-      const slots = Math.max(1, hbas.length * perHba, ...group.bays.map((bay) => bay.ports.length));
+      const { perHba, portSlots: slots } = group;
       group.rows.forEach((row, r) => row.forEach(({ bay, column }) => {
         bay.x = cellsLeft + column * group.pitch + group.breaks.filter((at) => at <= column).length * context.GROUP_GAP;
         bay.y = r < group.split ? top + r * pitchY : lowerTop + (r - group.split) * pitchY;
@@ -835,7 +842,7 @@ function placeCells(model) {
           port.y = bay.flip ? bay.y + 11 : bay.y + bay.h - 11;
           port.busY = bus ? (bay.flip ? bus.bottom : bus.top) : null;
           port.flip = bay.flip;
-          port.hitW = Math.max(12, Math.floor(bay.w / (slots + 1)));
+          port.hitW = Math.floor(bay.w / (slots + 1));
         });
       }));
       // Chips known only from their disks stand under the ports that name
@@ -1123,7 +1130,7 @@ function layoutModel(model, options = {}) {
         for (const bay of group.bays) bay.w = size;
       }
     }
-    for (const group of model.groups) [group.w, group.h] = groupSize(group);
+    for (const group of model.groups) [group.w, group.h] = groupSize(group, hbaOrder);
     // A physical enclosure's node is drawn as its block's head: its lines
     // are the head's lines (the block's summary lines when collapsed).
     for (const entry of model.nodes) {
@@ -1752,16 +1759,16 @@ function renderBayCell(bay, path, used) {
     const title = bayTitle(bay);
     // A bay label with no supported number is shown as the producer wrote it.
     const shownLabel = bay.locationKnown ? bay.number || bay.label : bay.label;
-    // Under the strip a cell reads upward: ports, then number, then name.
-    const down = bay.flip ? height - (bay.short ? 39 : 30) : 0;
+    // Position the label inside the clickable tile, not inside the port band.
+    const tileY = bay.flip ? bay.y + band : bay.y;
     const flagged = bay.flagged || "";
     if (flagged) used.add(`flag-${flagged}`);
     // A tall cell says SAS or SATA beside the bay number.
     const numberText = shownLabel && bay.tag ? `${shownLabel} · ${bay.tag}` : shownLabel;
-    const number = (shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${bay.y + down + (bay.spread ? 16 : 14)}" text-anchor="middle">${context.escapeHtml(numberText)}</text>` : "")
-      + (bay.short ? ` <text class="topo-bay-device" x="${bay.x + bay.w / 2}" y="${bay.y + down + 31}" text-anchor="middle">${context.escapeHtml(bay.short)}</text>` : "");
+    const number = (shownLabel ? `<text class="topo-bay-number" x="${bay.x + bay.w / 2}" y="${tileY + (bay.spread ? 16 : 14)}" text-anchor="middle">${context.escapeHtml(numberText)}</text>` : "")
+      + (bay.short ? ` <text class="topo-bay-device" x="${bay.x + bay.w / 2}" y="${tileY + 31}" text-anchor="middle">${context.escapeHtml(bay.short)}</text>` : "");
     const badge = flagged ? flagBadge(bay.x + bay.w - 6, bay.y + (bay.flip ? height - 6 : 7), true, flagged) : "";
-    return `<g class="topo-bay bay-${bay.occupancy} state-${context.token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${flagged ? ` is-flagged tier-${flagged}` : ""}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${context.escapeHtml(bay.bayId)}" aria-label="${context.escapeHtml(visibleName([numberText, bay.short || "", more ? `+${more}` : ""].filter(Boolean), title))}"><rect x="${bay.x}" y="${bay.flip ? bay.y + band : bay.y}" width="${bay.w}" height="${height - band}" rx="3"></rect>${number} ${marks} ${count}${badge}</g>`;
+    return `<g class="topo-bay bay-${bay.occupancy} state-${context.token(bay.status)}${bay.locationKnown ? "" : " is-logical"}${flagged ? ` is-flagged tier-${flagged}` : ""}${highlight}" role="button" tabindex="0" ${hook} data-topo-bay="${context.escapeHtml(bay.bayId)}" aria-label="${context.escapeHtml(visibleName([numberText, bay.short || "", more ? `+${more}` : ""].filter(Boolean), title))}"><rect x="${bay.x}" y="${tileY}" width="${bay.w}" height="${height - band}" rx="3"></rect>${number} ${marks} ${count}${badge}</g>`;
   }
 
 function pathSummary(summary) {
