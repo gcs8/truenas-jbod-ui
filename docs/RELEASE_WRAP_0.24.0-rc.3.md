@@ -8,12 +8,12 @@ Previous release tag: `v0.24.0-rc.2`
 ## Scope
 
 Release branch: `release/v0.24.0-rc.3`.
-Base: `main` at `62649c3ec9e8b393adf6ef2184ffd4b1c8a7b0d9`.
+Base: `main` at `f7c1f77f8f9abbe97b156e757c987b8dee0b2cb4`.
 The tag, registry publication and deployment are outside phase A. No
 qualification result is carried forward from rc.2. The release follows
 `docs/RELEASE_CHECKLIST.md`, including its prerelease rules.
 
-Changelog coverage: pass (20 PRs)
+Changelog coverage: pass (23 PRs)
 
 ## Checklist evidence
 

@@ -5,10 +5,11 @@ v0.24.0-rc.3 is a testing release candidate, not v0.24.0 final.
 ## Since v0.24.0-rc.2
 
 - Storage Fabric Topology groups bays by their physical enclosure, in inventory order, and shows shared expanders, neighbouring shelves and the paths that connect them. Pin a node or cable to inspect its evidence. Wiring checks distinguish a confirmed measurement from an unread, conflicting or partial one; they no longer infer backplane zones from link evidence.
+- Dense Topology rows keep bay and port click targets separate. Links retain their identity when evidence changes. Snapshot export keeps an in-flight estimate cancellable and exposes a retry after a failed estimate.
 - TrueNAS SCALE and Linux can use read-only sysfs data for SAS paths and PHY counters where the adapter exposes them. Disk details keep direct and multipath evidence tied to the controller and port that supplied it. Unread disk capacity displays as unread instead of showing SES descriptor text.
 - Disk synchronization distinguishes a busy request from unknown status and keeps its result current after recovery. Snapshot export offers a retry while inventory is busy.
 - Backup scheduling bounds its configuration snapshot, remote backup fetches constrain workspace file handling, and history import verifies the members it publishes. These changes can refuse work that cannot be budgeted or verified safely.
-- Dependency updates and CI checks add dependency auditing, workflow lint, scheduled published-image scanning, secret-history scanning and Topology mutation tests. QA fixtures no longer reuse captured enclosure identifiers or SAS addresses.
+- Playwright 1.65.1 updates the development browser runner. CI checks add dependency auditing, workflow lint, scheduled published-image scanning, secret-history scanning and Topology mutation tests. QA fixtures no longer reuse captured enclosure identifiers or SAS addresses.
 
 See `CHANGELOG.md` for the full list and upgrade notes.
 

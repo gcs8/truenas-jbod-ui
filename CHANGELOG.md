@@ -35,6 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Highlights
 
+- Dense Storage Fabric bay and port controls no longer overlap; links keep their selection identity as their evidence changes.
 - Storage Fabric draws physical enclosures, shared expanders and path-owned wiring evidence.
 - SCALE and Linux can report read-only SAS paths and PHY counters where sysfs exposes them.
 - Disk synchronization and snapshot export explain busy or unread status and how to retry.
@@ -162,9 +163,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   per controller unit; conflicting observations still leave ownership unread.
   The Linux disk-port error check reports known ports whose PHY membership is
   unread instead of passing on the remaining ports alone (#1504).
+- Kept snapshot downloads available while the size estimate was busy, bounded
+  automatic estimate waits, and cleared cancelled download retries before the
+  next dialog. Cancel or Escape now aborts an active download request; another
+  download cannot start until that request settles (#1525).
+- Kept the reported PHY membership and rate on Linux topology cables with
+  custom IDs. Conflicting lane lists still leave cable membership unverified (#1529).
+- Separated bay and port click targets on dense Topology boards so selecting
+  a port no longer pins its bay or a neighbouring port (#1531).
 
 ### Internal
 
+- Updated the Playwright development browser runner to 1.65.1 and revised the
+  screenshot capture workflow and its instructions (#1507).
 - Accepted either an orderly socket close or a connection reset in the
   performance client's trickle-deadline test while retaining its deadline and
   pre-cleanup closure checks (#1469).
