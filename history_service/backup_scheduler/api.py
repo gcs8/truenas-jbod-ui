@@ -187,15 +187,18 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
         filename = record.name.rsplit("/", 1)[-1]
 
         def chunks():
-            digest, size, held = hashlib.sha256(), 0, b""
+            digest, remaining, held = hashlib.sha256(), record.size, b""
             try:
-                while chunk := handle.read(_STREAM_CHUNK_BYTES):
+                while remaining:
+                    chunk = handle.read(min(_STREAM_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
                     if held:
                         yield held
                     held = chunk
                     digest.update(chunk)
-                    size += len(chunk)
-                if (size, digest.hexdigest()) != (record.size, record.sha256):
+                    remaining -= len(chunk)
+                if handle.read(1) or digest.hexdigest() != record.sha256:
                     raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
                 if held:
                     yield held
