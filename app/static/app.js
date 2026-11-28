@@ -171,6 +171,7 @@
       viewSelectionExpanded: false,
       selectedStorageViewIds: [],
       running: false,
+      downloadController: null,
       downloadRetryAtMs: 0,
       dialogGeneration: 0,
       estimate: {
@@ -8433,8 +8434,10 @@
     state.export.dialogGeneration = (state.export.dialogGeneration || 0) + 1;
     if (state.export.downloadRetryAtMs) setStatus("Download retry cancelled.");
     else if (state.export.running) setStatus("Download cancelled.");
+    if (state.export.running) state.export.downloadController.abort();
+    // A cancelled wait owns no request. An active POST stays locked until finally.
+    if (state.export.downloadRetryAtMs) state.export.running = false;
     state.export.downloadRetryAtMs = 0;
-    state.export.running = false;
     if (exportSnapshotDialog && exportSnapshotDialog.open) {
       exportSnapshotDialog.close();
     }
@@ -11392,6 +11395,8 @@
     const sameDialog = () => dialogGeneration === (state.export.dialogGeneration || 0);
     const requestBody = JSON.stringify(snapshotExportRequestPayload());
     const retryAtMs = state.export.downloadRetryAtMs || 0;
+    const controller = new AbortController();
+    state.export.downloadController = controller;
     try {
       state.export.running = true;
       syncSnapshotExportDialog();
@@ -11414,6 +11419,7 @@
       setStatus("Preparing the offline copy...");
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: requestBody,
       });
@@ -11457,7 +11463,10 @@
         setStatus(`Snapshot export failed: ${error.message || error}`, "error");
       }
     } finally {
-      if (sameDialog()) state.export.running = false;
+      if (state.export.downloadController === controller) {
+        state.export.downloadController = null;
+        state.export.running = false;
+      }
       syncSnapshotExportDialog();
     }
   }

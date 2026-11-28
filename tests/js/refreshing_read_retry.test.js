@@ -291,7 +291,7 @@ function exportDialogHarness(responses) {
     "refreshSnapshotExportEstimate", "exportEnclosureSnapshot", "syncSnapshotExportDialog",
     "renderSnapshotExportEstimate", "escapeHtml", "closeSnapshotExportDialog",
   ], {
-    state, Date: { now: () => clock.now },
+    state, AbortController, Date: { now: () => clock.now },
     exportSnapshotDialog: dialog, exportSnapshotConfirm: confirm, exportEstimateRetry: retryEstimate,
     exportSnapshotEstimate: estimateElement, exportSnapshotNote: { textContent: "" },
     exportSnapshotWindowHint: null, exportRedactToggle: null, exportPackagingSelect: null,
@@ -366,6 +366,20 @@ test("Download copy works during an automatic estimate retry", async () => {
   assert.equal(h.requests.length, 2);
 });
 
+test("Download copy uses the export route when estimate retries have paused", async () => {
+  const h = exportDialogHarness([
+    ...Array.from({ length: 4 }, () => httpResponse(503, {}, "2")),
+    { ...httpResponse(200, {}), blob: async () => ({}) },
+  ]);
+  await h.refreshSnapshotExportEstimate();
+  assert.equal(h.retryEstimate.hidden, false);
+  h.sandbox.waitMs = () => new Promise(() => {}); // Keep a misrouted estimate at its retry deadline.
+  h.confirm.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.requests.at(-1).url, "/api/export/enclosure-snapshot");
+  assert.deepEqual(h.downloads, ["snapshot.zip"]);
+});
+
 test("an explicit estimate retry succeeds without restarting the export", async () => {
   const h = exportDialogHarness(Array.from({ length: 4 }, () => httpResponse(503, { detail: "Still refreshing." }, "2")));
   await h.refreshSnapshotExportEstimate();
@@ -430,7 +444,8 @@ test("closing the dialog during a busy download retry does not send another requ
 });
 
 test("reopening the dialog cannot revive a cancelled download retry", async () => {
-  const h = exportDialogHarness([httpResponse(503, { detail: "Still refreshing." }, "2")]);
+  let finish;
+  const h = exportDialogHarness([httpResponse(503, {}, "2"), new Promise(resolve => { finish = resolve; })]);
   await h.exportEnclosureSnapshot();
   let release;
   h.sandbox.waitMs = () => new Promise(resolve => { release = resolve; });
@@ -442,12 +457,38 @@ test("reopening the dialog cannot revive a cancelled download retry", async () =
   h.syncSnapshotExportDialog();
   assert.equal(h.confirm.textContent, "Download copy");
   assert.equal(h.confirm.disabled, false);
+  const next = h.exportEnclosureSnapshot();
   release();
   await retry;
-  assert.equal(h.requests.length, 1, "a reopened dialog cannot authorize the earlier cancelled download");
-  assert.equal(h.dialog.open, true, "the earlier retry must not close the new dialog");
-  assert.equal(h.state.export.running, false);
-  assert.equal(h.downloads.length, 0);
+  assert.equal(h.requests.length, 2, "only the new dialog can start another request");
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.state.export.running, true, "the cancelled wait must not unlock the new download");
+  assert.equal(h.confirm.disabled, true);
+  finish({ ...httpResponse(200, {}), blob: async () => ({}) });
+  await next;
+  assert.deepEqual(h.downloads, ["snapshot.zip"]);
+});
+
+test("closing aborts the download and keeps it locked until the body settles", async () => {
+  let finishBody;
+  const h = exportDialogHarness([{ ...httpResponse(200, {}), blob: () => new Promise(resolve => { finishBody = resolve; }) }]);
+  const download = h.exportEnclosureSnapshot();
+  await new Promise(resolve => setImmediate(resolve));
+  const signal = h.requests[0].options.signal;
+  h.closeSnapshotExportDialog();
+  assert.equal(signal?.aborted, true, "Cancel must abort the export POST");
+  assert.equal(h.statuses.at(-1).text, "Download cancelled.");
+  h.dialog.open = true;
+  h.syncSnapshotExportDialog();
+  assert.equal(h.confirm.disabled, true);
+  await h.exportEnclosureSnapshot();
+  assert.equal(h.requests.length, 1, "no second POST before the cancelled one settles");
+  finishBody({}); // A late success despite abort must not deliver a file or close the new dialog.
+  await download;
+  assert.deepEqual(h.downloads, []);
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.confirm.disabled, false);
+  assert.equal(h.statuses.at(-1).text, "Download cancelled.");
 });
 
 test("a late busy response cannot offer a retry in another system's dialog", async () => {
