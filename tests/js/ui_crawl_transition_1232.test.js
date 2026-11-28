@@ -12,6 +12,7 @@
 // requests through the real guard while a navigation is in flight.
 
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -262,4 +263,101 @@ test("#1232: option expansion also retires the outgoing page before it arms its 
   } finally {
     fs.rmSync(outDir, { recursive: true, force: true });
   }
+});
+
+const MAIN = { page: "main", label: "synthetic/main", url: `${ORIGINS.ui}/` };
+const ESTIMATE = "/api/export/enclosure-snapshot/estimate";
+
+async function exportCrawler(t) {
+  const outDir = tmpDir("estimate");
+  t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
+  const { crawler, guard, page } = stubCrawler({ outDir });
+  const events = new EventEmitter();
+  const pending = new Set();
+  const goto = page.goto.bind(page);
+  function finish(request, failed = false) {
+    if (pending.delete(request)) events.emit(failed ? "requestfailed" : "requestfinished", request);
+  }
+  Object.assign(page, {
+    on: events.on.bind(events),
+    setDefaultTimeout() {},
+    goto(url) {
+      // The browser drops every outstanding fetch when the document retires.
+      for (const request of pending) finish(request, true);
+      return goto(url);
+    },
+  });
+  crawler.context = { newPage: async () => page };
+  crawler.cdpFactory = async () => crawler.cdp;
+  await crawler.openPage();
+  crawler.unmetRequirement = async (state) => state.page === "main" ? null : "synthetic: page load only";
+  crawler.newDriver = () => ({
+    resetState() {}, downloads: [],
+    async runSteps() {
+      for (const request of requests) {
+        events.emit("request", request);
+        assert.equal(guard.admit({ method: request.method(), url: request.url(), body: "{}" }).allowed, true);
+        pending.add(request);
+      }
+    },
+  });
+  crawler.runChecks = async () => ({ findings: [] });
+  let captured = false;
+  crawler.capture = async () => {
+    captured = true;
+    return { tiles: [] };
+  };
+  const requests = [0, 1].map(() => ({
+    method: () => "POST", url: () => `${ORIGINS.ui}${ESTIMATE}`, resourceType: () => "fetch",
+    timing: () => ({ responseEnd: 10 }), failure: () => ({ errorText: "net::ERR_ABORTED" }),
+  }));
+  return { crawler, page, requests, finish, captured: () => captured };
+}
+
+test("export scope waits past capture for a superseded estimate before the next state", async (t) => {
+  const { crawler, requests, finish, captured } = await exportCrawler(t);
+  const records = (async () => [
+    await crawler.crawlState(MAIN, stateById("main.export.scope")),
+    await crawler.crawlState(HISTORY, stateById("history.default")),
+  ])();
+  await new Promise(setImmediate);
+  assert.ok(captured(), "the export capture is complete while both requests are still outstanding");
+  finish(requests[1]);
+  await new Promise(setImmediate);
+  finish(requests[0]);
+  const [first, second] = await records;
+  assert.deepEqual(second.findings, [], "retirement aborted the outgoing estimate in the next state");
+  assert.deepEqual(first.findings, []);
+  assert.equal(first.status, "done");
+});
+
+test("an estimate aborted by the live export dialog remains blocking", async (t) => {
+  const { crawler, requests, finish, captured } = await exportCrawler(t);
+  const record = crawler.crawlState(MAIN, stateById("main.export.dialog"));
+  await new Promise(setImmediate);
+  assert.ok(captured());
+  finish(requests[0], true);
+  finish(requests[1]);
+  const result = await record;
+  assert.ok(result.findings.some(({ type, severity, text }) => type === "request-failed" && severity === "error"
+    && text === `POST ${ESTIMATE} net::ERR_ABORTED`), "the live document's abort must be reported");
+  assert.equal(result.status, "error");
+});
+
+test("an export estimate that never settles is a named blocking timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, page, requests, finish, captured } = await exportCrawler(t);
+  const record = crawler.crawlState(MAIN, stateById("main.export.dialog"));
+  await new Promise(setImmediate);
+  assert.ok(captured());
+  finish(requests[1]);
+  t.mock.timers.tick(29_999);
+  await new Promise(setImmediate);
+  assert.equal(page.url(), MAIN.url, "the 30 s deadline has not expired");
+  t.mock.timers.tick(1);
+  const result = await record;
+  assert.ok(result.findings.some(({ type, severity, text }) => type === "estimate-settle-timeout" && severity === "error"
+    && text.includes(ESTIMATE)), "the unsettled request must be reported as a timeout");
+  assert.equal(result.status, "error");
+  assert.equal(page.url(), "about:blank");
 });
