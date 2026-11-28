@@ -53,6 +53,14 @@ from tests.test_restore_refusal_cleanup import (
 ORDINARY = refusal.RestoreTimestampSizeTests.ORDINARY
 SIDE_FILE_REASON = "next to the staged history member"
 CONTENT_REASON = "is not the member that was validated"
+UNRECOGNIZED_TRIGGER_REASON = (
+    "History database contains an unrecognized trigger. Nothing was restored."
+)
+COUNT_TRIGGER_NAMES = {
+    f"count_{table_name}_{operation}"
+    for table_name in ("slot_events", "metric_samples", "metric_rollups")
+    for operation in ("insert", "delete")
+}
 
 
 def _rewrite_in_place(target: Path, change: Callable[[sqlite3.Connection], None]) -> None:
@@ -160,6 +168,14 @@ class ImportInstallsTheValidatedMemberTests(_ImportRootCleanup):
         self._import(None)
         self.assertEqual(len(self.staged), 1)
         self.assertEqual(_metric_rows(self.live), self.IMPORTED_ROWS)
+        with closing(sqlite3.connect(self.live)) as connection:
+            trigger_names = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+        self.assertEqual(trigger_names, COUNT_TRIGGER_NAMES)
 
     def test_write_ahead_log_beside_the_staged_member_is_refused(self) -> None:
         with self.assertRaises(ValueError) as refused:
@@ -384,6 +400,43 @@ class MemberChecksOnThePrivateCopyTests(_ImportRootCleanup):
             sha256=hashlib.sha256(content).hexdigest(),
             member_check=SystemBackupService._check_history_structure,
         )
+
+    def _assert_trigger_refused(self, member: Path) -> None:
+        with (
+            patch.object(
+                self.store,
+                "_publish_replacement",
+                side_effect=AssertionError("trigger admission reached publication"),
+            ) as publish,
+            self.assertRaises(ValueError) as refused,
+        ):
+            self._restore(member)
+        self.assertEqual(str(refused.exception), UNRECOGNIZED_TRIGGER_REASON)
+        publish.assert_not_called()
+        self.assertEqual(_dump(self.live), self.original_dump)
+
+    def test_extra_trigger_is_refused_before_publish(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            connection.executescript("""
+                CREATE TRIGGER synthetic_history_count_update
+                AFTER UPDATE ON history_table_counts BEGIN
+                    SELECT 1;
+                END;
+            """)
+        self._assert_trigger_refused(member)
+
+    def test_count_trigger_name_with_different_sql_is_refused(self) -> None:
+        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            connection.executescript("""
+                DROP TRIGGER count_metric_samples_insert;
+                CREATE TRIGGER count_metric_samples_insert
+                AFTER INSERT ON metric_samples BEGIN
+                    SELECT 1;
+                END;
+            """)
+        self._assert_trigger_refused(member)
 
     def test_member_missing_a_required_table_is_refused(self) -> None:
         member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])

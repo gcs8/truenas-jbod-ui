@@ -17,6 +17,7 @@ from collections import Counter
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -81,6 +82,11 @@ INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES = 2
 MIB = 1024 * 1024
 # Tables whose row counts history_table_counts tracks through triggers.
 HISTORY_COUNTED_TABLES = ("slot_events", "metric_samples", "metric_rollups")
+HISTORY_COUNT_TRIGGER_NAMES = frozenset(
+    f"count_{table_name}_{operation}"
+    for table_name in HISTORY_COUNTED_TABLES
+    for operation in ("insert", "delete")
+)
 # How long an index build waits for exact-count scans already running before it
 # starts anyway. New exact-count requests are deferred as soon as it waits.
 INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS = 60.0
@@ -705,6 +711,19 @@ CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS = 250_000
 SCHEMA = _BASE_SCHEMA + "".join(
     f"\n{statement};\n" for _, statement in CHRONOLOGICAL_INDEXES[:_SCHEMA_CHRONOLOGICAL_INDEX_COUNT]
 )
+
+
+@lru_cache(maxsize=1)
+def _history_count_trigger_contract() -> tuple[tuple[str, str], ...]:
+    """Return normalized count triggers from the canonical schema text."""
+    contract: list[tuple[str, str]] = []
+    for name in sorted(HISTORY_COUNT_TRIGGER_NAMES):
+        marker = f"CREATE TRIGGER IF NOT EXISTS {name}\n"
+        _, remainder = _BASE_SCHEMA.split(marker, 1)
+        body, _ = remainder.split("\nEND;", 1)
+        sql = f"CREATE TRIGGER {name}\n{body}\nEND"
+        contract.append((name, " ".join(sql.split()).casefold()))
+    return tuple(contract)
 
 
 class HistoryIndexBuildCancelled(RuntimeError):
