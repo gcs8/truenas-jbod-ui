@@ -276,7 +276,7 @@ test("#1232: option expansion also retires the outgoing page before it arms its 
 const MAIN = { page: "main", label: "synthetic/main", url: `${ORIGINS.ui}/` };
 const ESTIMATE = "/api/export/enclosure-snapshot/estimate";
 
-async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAbort = false } = {}) {
+async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAbort = false, stepRequests = 2 } = {}) {
   const outDir = tmpDir("requests");
   t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
   const { crawler, guard, page } = stubCrawler({ outDir });
@@ -284,6 +284,10 @@ async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAb
   const pending = new Set();
   const retired = [];
   const goto = page.goto.bind(page);
+  function start(request) {
+    pending.add(request);
+    events.emit("request", request);
+  }
   function finish(request, failed = false) {
     if (pending.delete(request)) events.emit(failed ? "requestfailed" : "requestfinished", request);
   }
@@ -308,10 +312,9 @@ async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAb
   crawler.newDriver = () => ({
     resetState() {}, downloads: [],
     async runSteps() {
-      for (const request of requests) {
-        events.emit("request", request);
+      for (const request of requests.slice(0, stepRequests)) {
         assert.equal(guard.admit({ method: request.method(), url: request.url(), body: "{}" }).allowed, true);
-        pending.add(request);
+        start(request);
       }
     },
   });
@@ -325,7 +328,7 @@ async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAb
     method: () => method, url: () => `${ORIGINS.ui}${pathname}`, resourceType: () => "fetch",
     timing: () => ({ responseEnd: 10 }), failure: () => ({ errorText: "net::ERR_ABORTED" }),
   }));
-  return { crawler, page, requests, finish, captured: () => captured };
+  return { crawler, guard, page, events, requests, start, finish, captured: () => captured };
 }
 
 test("export scope waits past capture for a superseded estimate before the next state", async (t) => {
@@ -421,4 +424,97 @@ test("a live SMART batch abort is blocking even when the next state never starts
   assert.ok(result.findings.some(({ type, severity, text, detail }) => type === "request-failed" && severity === "error"
     && text === `POST ${SMART_BATCH} net::ERR_ABORTED` && !detail?.during), "a live abort must be visible and not labeled a retirement abort");
   assert.equal(result.status, "error");
+});
+
+test("a follow-on request gets a fresh quiet interval but shares the original settle deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, page, requests: [first, next], start, finish } = await requestCrawler(t, { pathname: SMART_BATCH, stepRequests: 1 });
+  const record = crawler.crawlState(MAIN, stateById("main.default"));
+  await new Promise(setImmediate);
+  t.mock.timers.tick(29_800);
+  finish(first);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(149);
+  assert.equal(page.url(), MAIN.url, "the first completion must not retire the live document");
+  start(next);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(1);
+  await new Promise(setImmediate);
+  assert.equal(page.url(), MAIN.url, "the quiet timer must stop when the chain refills the pending set");
+  finish(next);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(49);
+  assert.equal(page.url(), MAIN.url, "the second completion starts a new quiet interval");
+  t.mock.timers.tick(1);
+  await new Promise(setImmediate);
+  assert.equal(page.url(), "about:blank", "the original 30 s cap is not extended by the chain or its quiet interval");
+  const result = await record;
+  assert.deepEqual(result.findings, [], "all requests settled before the cap");
+  assert.equal(result.status, "done");
+});
+
+test("reload preserves the outgoing load window while draining and settles both requests before a busy retry", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, guard, page, events, requests: [outgoing], start, finish } = await requestCrawler(t, { pathname: SMART_BATCH });
+  const target = { ...MAIN, platform: "quantastor" };
+  const state = stateById("main.default");
+  const record = crawler.beginDocument(target, state);
+  await crawler.load(target);
+  const driver = Crawler.prototype.newDriver.call(crawler, target);
+  const originalWindow = guard.load;
+  assert.ok(originalWindow, "the outgoing platform has a real load window");
+  const frame = {};
+  page.mainFrame = () => frame;
+  const navigation = { ...outgoing, method: () => "GET", url: () => MAIN.url, isNavigationRequest: () => true, frame: () => frame };
+  const asset = { ...outgoing, method: () => "GET", url: () => `${ORIGINS.ui}/static/fixture.js` };
+  let reloads = 0;
+  page.reload = async () => {
+    if (++reloads === 1) {
+      finish(outgoing, true);
+      start(navigation); // The new navigation request arrives before commit.
+      events.emit("framenavigated", frame);
+      start(asset); // This starts before reload resolves, but after commit.
+      return { status: () => 503, headers: () => ({}) };
+    }
+    finish(navigation, true);
+    finish(asset, true);
+    return { status: () => 200 };
+  };
+  start(outgoing);
+  const reloaded = driver.step_reload();
+  await new Promise(setImmediate);
+  assert.equal(guard.load, originalWindow, "do not swap load windows while the outgoing request is in flight");
+  assert.equal(reloads, 0);
+  t.mock.timers.tick(30_000);
+  await new Promise(setImmediate);
+  assert.equal(reloads, 1, "the busy retry may not start while its document still has pending requests");
+  t.mock.timers.tick(30_000);
+  await reloaded;
+  assert.equal(reloads, 2);
+  await crawler.finishDocument(record, state);
+  const pending = [`POST ${SMART_BATCH}`, "GET /", "GET /static/fixture.js"];
+  assert.deepEqual(record.findings.filter((f) => f.type === "settle-timeout").map((f) => f.text),
+    pending.map((name) => `${name} did not settle within 30000 ms`));
+  assert.deepEqual(record.findings.filter((f) => f.detail?.during === "document-retirement").map((f) => f.text),
+    pending.map((name) => `${name} net::ERR_ABORTED`));
+  assert.equal(record.status, "error");
+});
+
+test("a late HTTP 429 goes to the document that issued the request, not the next state", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, page, events, requests: [request] } = await requestCrawler(t, { pathname: SMART_BATCH, delayAbort: true, stepRequests: 1 });
+  const firstRun = crawler.crawlState(MAIN, stateById("main.default"));
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30_000);
+  const first = await firstRun;
+  const goto = page.goto.bind(page);
+  page.goto = (url) => {
+    if (url === HISTORY.url) events.emit("response", { status: () => 429, url: request.url, request: () => request });
+    return goto(url);
+  };
+  const second = await crawler.crawlState(HISTORY, stateById("history.default"));
+  assert.deepEqual(second.findings, []);
+  assert.deepEqual(first.findings.filter(({ type }) => type === "http-error"), [
+    { type: "http-error", severity: "error", text: `429 POST ${SMART_BATCH}`, detail: undefined },
+  ]);
 });

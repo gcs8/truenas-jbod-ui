@@ -18,6 +18,7 @@ const { scopeKindFor } = require("./reach");
 const png = require("./png");
 
 const REQUEST_SETTLE_MS = 30_000;
+const REQUEST_QUIET_MS = 150;
 
 const READY = {
   async main(page, timeout = 240_000) {
@@ -132,7 +133,7 @@ class Crawler {
     const owners = new WeakMap();
     const finish = (request) => {
       const owner = owners.get(request);
-      if (owner?.pending.delete(request) && !owner.pending.size) owner.onEmpty?.();
+      if (owner?.pending.delete(request) && !owner.pending.size) owner.onPendingChange?.();
       return owner;
     };
     page.on("framenavigated", (frame) => {
@@ -160,6 +161,8 @@ class Crawler {
       if (!owner) return; // the crawler's blank page has no state
       owners.set(request, owner);
       owner.pending.add(request);
+      owner.needsQuiet = true;
+      if (owner.pending.size === 1) owner.onPendingChange?.();
     });
     page.on("requestfailed", (request) => {
       const owner = finish(request);
@@ -452,8 +455,8 @@ class Crawler {
   }
 
   // #1232: keep the outgoing policy until its document is gone. The guard
-  // keeps state reads after endState(); load and follow-up windows still
-  // close at their existing boundaries.
+  // keeps state reads after endState(). Close the load window before the
+  // drain and the bounded follow-up window before the retirement navigation.
   async finishDocument(record, state) {
     this.endLoadWindow();
     this.guard.endState();
@@ -476,28 +479,32 @@ class Crawler {
     record.finishedAt = new Date().toISOString();
   }
 
-  // Await the response body or failure, not just the headers. All requests
-  // (including new ones while draining) share the same deadline.
+  // Wait for response bodies or failures and then a quiet interval: the page
+  // can issue another request as soon as the previous one finishes.
   async waitForRequests(owner) {
-    if (!owner?.pending.size || owner.timedOut) return;
-    let timer;
-    try {
-      while (owner.pending.size && !owner.timedOut) {
-        await new Promise((resolve) => {
-          owner.onEmpty = resolve;
-          timer ??= setTimeout(() => {
-            owner.timedOut = new WeakSet(owner.pending);
-            for (const request of owner.pending) {
-              this.documentFinding(owner, "settle-timeout", "error", `${requestName(request)} did not settle within ${REQUEST_SETTLE_MS} ms`);
-            }
-            owner.onEmpty();
-          }, REQUEST_SETTLE_MS);
-        });
-      }
-    } finally {
-      clearTimeout(timer);
-      owner.onEmpty = null;
-    }
+    if (!owner?.needsQuiet || owner.timedOut) return;
+    await new Promise((resolve) => {
+      let quiet;
+      const done = () => {
+        clearTimeout(quiet);
+        clearTimeout(deadline);
+        owner.onPendingChange = null;
+        owner.needsQuiet = false;
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        owner.timedOut = new WeakSet(owner.pending);
+        for (const request of owner.pending) {
+          this.documentFinding(owner, "settle-timeout", "error", `${requestName(request)} did not settle within ${REQUEST_SETTLE_MS} ms`);
+        }
+        done();
+      }, REQUEST_SETTLE_MS);
+      owner.onPendingChange = () => {
+        clearTimeout(quiet);
+        if (!owner.pending.size) quiet = setTimeout(done, REQUEST_QUIET_MS);
+      };
+      owner.onPendingChange();
+    });
   }
 
   // Reloads and busy retries replace a document within the same state. Keep
