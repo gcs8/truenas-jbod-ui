@@ -934,6 +934,53 @@ test("a CORE node's conflicting address disowns the cascade in either record ord
   }
 });
 
+test("renaming a Linux cable leaves its card and the lanes check unchanged", () => {
+  const item = fixture("dual-domain-linux");
+  const link = item.fabric.links.find((entry) => entry.reported_lanes);
+  const before = model(item);
+  const card = cardRows(before, { kind: "link", id: link.id });
+  assert.equal(lanesCard(before, link), "8 · 12 Gb/s");
+  link.id = "custom-cable";
+  const built = model(item);
+  assert.deepEqual(cardRows(built, { kind: "link", id: link.id }), card);
+  assert.deepEqual(checksOf(built, "lanes"), checksOf(before, "lanes"));
+});
+
+test("competing Linux cable records with different PHY lists stay unverified in either order", () => {
+  for (const first of [false, true]) {
+    const item = fixture("dual-domain-linux");
+    const link = item.fabric.links.find((entry) => entry.reported_lanes);
+    link.id = "custom-cable";
+    const rival = structuredClone(link);
+    rival.id = "other-cable";
+    rival.reported_lanes.source_phys.pop();
+    rival.reported_lanes.lane_count--;
+    beside(item.fabric.links, link, rival, first);
+    const built = model(item);
+    for (const cable of [link, rival]) {
+      const card = lanesCard(built, cable);
+      assert.ok(card.startsWith(`${cable.reported_lanes.lane_count} reported; which PHYs the cable uses is not read`), card);
+      assert.doesNotMatch(card, /Gb\/s/);
+    }
+    assert.match(textOf(checksOf(built, "lanes")), /their lane lists differ/);
+  }
+});
+
+test("a second Linux link ID claiming identical PHYs counts even when its record is not drawn", () => {
+  for (const duplicateId of [false, true]) for (const first of [true, false]) {
+    const item = fixture("dual-domain-linux");
+    const [link, other] = item.fabric.links.filter((entry) => entry.reported_lanes);
+    const rival = structuredClone(link);
+    rival.id = duplicateId ? other.id : "other-cable";
+    beside(item.fabric.links, duplicateId ? other : link, rival, first);
+    const built = model(item);
+    const reason = /which PHYs the cable uses is not read .*a second link ID between these ends also claims it/;
+    assert.match(lanesCard(built, link), reason);
+    if (!duplicateId || first) assert.match(lanesCard(built, rival), reason);
+    assert.match(textOf(checksOf(built, "lanes")), /a second link ID between these ends also claims it/);
+  }
+});
+
 test("two link IDs cannot verify two cables on the same four PHY pairs", () => {
   for (const sameId of [true, false]) for (const first of [true, false]) {
     const data = core();

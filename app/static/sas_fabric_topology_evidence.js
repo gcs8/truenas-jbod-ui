@@ -235,9 +235,11 @@ function laneClaims(model) {
       for (const key of [...listed].map((phy) => `${chipId(model, id)}|${phy}`)) (claims.get(key) || claims.set(key, []).get(key)).push(entry);
     };
     const drawn = model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).filter((entry) => context.LANE_LINKS.has(entry.kind) && entry.lanes);
+    // A raw Linux list claims endpoints and PHYs, not a second drawn cable.
     for (const { id, key, source, target, lanes } of [...drawn, ...list(model.laneRecords).map((record) => ({ ...record, lanes: parseLanes(record.lanes) }))]) {
-      claim(source, [...lanes.sourcePhys, ...lanes.rows.map((lane) => lane.source)], source, target, key ?? id);
-      claim(target, [...lanes.targetPhys, ...lanes.rows.map((lane) => lane.target)], source, target, key ?? id);
+      const linkId = model.transport ? id : key ?? id;
+      claim(source, [...lanes.sourcePhys, ...lanes.rows.map((lane) => lane.source)], source, target, linkId);
+      claim(target, [...lanes.targetPhys, ...lanes.rows.map((lane) => lane.target)], source, target, linkId);
     }
     for (const item of list(model.parentClaims)) {
       if (item.port) ports.set(item.port, (ports.get(item.port) || new Set()).add(chipId(model, item.child)));
@@ -643,7 +645,7 @@ function ownerIndex(model) {
     }
     // A list of a link this view does not draw (an end that is not a drawn
     // node) is a claim too, where it is one PHY per lane: no cable to name.
-    const drawn = new Set(model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).map((entry) => entry.id));
+    const drawn = new Set(model.links.flatMap((entry) => [entry, ...list(entry.stubCables)]).map((entry) => entry.laneKey));
     for (const record of list(model.laneRecords).filter((item) => !drawn.has(item.key))) {
       const lanes = parseLanes(record.lanes);
       const membership = membershipOf({ lanes });
