@@ -334,7 +334,8 @@ class CrawlDriver {
     // A reload is a page load: its load-time requests (Sol #1108) are judged
     // in the same page-load window as the first navigation.
     const reload = async () => {
-      await navigate(this.page, () => this.page.reload({ waitUntil: "domcontentloaded", timeout: 300_000 }));
+      const reloadPage = () => this.page.reload({ waitUntil: "domcontentloaded", timeout: 300_000 });
+      await navigate(this.page, () => this.navigateDocument ? this.navigateDocument(reloadPage) : reloadPage());
       if (this.ready) await this.ready(this.page);
     };
     await (this.withLoadWindow ? this.withLoadWindow(reload) : reload());

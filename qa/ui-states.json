@@ -254,13 +254,11 @@
     },
     {
       "id": "main.export.dialog", "page": "main", "safety": "read", "ci": true,
-      "settle_export_estimate": true,
       "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"wait": 1500}],
       "covers": ["#export-snapshot-button", "#export-snapshot-dialog", "#export-redact-toggle", "#export-packaging-select", "#export-allow-oversize-toggle", "#export-include-enclosures-toggle", "#export-include-views-toggle", "#export-snapshot-cancel", "#export-estimate-retry", "#export-snapshot-confirm"]
     },
     {
       "id": "main.export.scope", "page": "main", "safety": "read", "ci": true,
-      "settle_export_estimate": true,
       "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"check": "#export-include-enclosures-toggle"}, {"check": "#export-include-views-toggle"}, {"wait": 1500}],
       "covers": ["#export-include-enclosures-toggle", "#export-include-views-toggle", "[data-export-enclosure-id]", "[data-export-storage-view-id]", "input\"checkbox\"@app/static/app.js"]
     },

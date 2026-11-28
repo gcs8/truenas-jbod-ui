@@ -17,8 +17,7 @@ const { readsFor, loadRequestsFor, selectsSystemAttribute } = require("./invento
 const { scopeKindFor } = require("./reach");
 const png = require("./png");
 
-const EXPORT_ESTIMATE_PATH = "/api/export/enclosure-snapshot/estimate";
-const EXPORT_ESTIMATE_SETTLE_MS = 30_000;
+const REQUEST_SETTLE_MS = 30_000;
 
 const READY = {
   async main(page, timeout = 240_000) {
@@ -89,6 +88,10 @@ function renderedKeys(specs) {
   return out;
 }
 
+function requestName(request) {
+  return `${request.method()} ${new URL(request.url()).pathname}`;
+}
+
 function safeName(value) {
   return String(value).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 120);
 }
@@ -112,7 +115,7 @@ class Crawler {
     this.downloadDir = downloads ? path.join(outDir, "downloads") : null;
     this.records = [];
     this.actuations = [];
-    this.bucket = null;
+    this.document = null;
     fs.mkdirSync(outDir, { recursive: true });
     if (this.downloadDir) fs.mkdirSync(this.downloadDir, { recursive: true });
   }
@@ -124,47 +127,60 @@ class Crawler {
   async openPage() {
     const page = await this.context.newPage();
     page.setDefaultTimeout(60_000);
-    const push = (type, severity, text, detail) => this.bucket && this.bucket.push({ type, severity, text: String(text).slice(0, 300), detail });
+    // Request objects outlive their documents. Never consult the current
+    // state when handling their response or terminal events.
+    const owners = new WeakMap();
+    const finish = (request) => {
+      const owner = owners.get(request);
+      if (owner?.pending.delete(request) && !owner.pending.size) owner.onEmpty?.();
+      return owner;
+    };
+    page.on("framenavigated", (frame) => {
+      if (this.navigation && frame === page.mainFrame()) this.document = this.navigation;
+    });
     page.on("console", (message) => {
       if (message.type() !== "error") return;
       // In fixture mode a missing synthetic answer is a fixture gap, not a product error.
       if (this.fixtureMode && /Failed to load resource: the server responded with a status of 404/.test(message.text())) return;
       // Requests the guard aborted are recorded by the guard, not as console errors.
       if (/net::ERR_BLOCKED_BY_CLIENT/.test(message.text())) return;
-      push("console-error", "error", message.text());
+      this.documentFinding(this.document, "console-error", "error", message.text());
     });
-    page.on("pageerror", (error) => push("page-error", "error", error.message));
-    const finishEstimate = (request) => {
-      const estimates = this.exportEstimates;
-      if (!estimates?.pending.delete(request)) return false;
-      if (!estimates.pending.size) estimates.onEmpty?.();
-      return true;
-    };
+    page.on("pageerror", (error) => this.documentFinding(this.document, "page-error", "error", error.message));
     page.on("request", (request) => {
-      if (this.exportEstimates && request.method() === "POST" && new URL(request.url()).pathname === EXPORT_ESTIMATE_PATH) {
-        this.exportEstimates.pending.add(request);
+      let owner = owners.get(request.redirectedFrom?.());
+      if (!owner && this.navigation && request.isNavigationRequest?.()) {
+        // A navigation request may precede its frame. That frame's request
+        // still belongs to this state even if Playwright cannot resolve it.
+        let frame;
+        try { frame = request.frame(); } catch { /* not yet available */ }
+        if (!frame || frame === page.mainFrame()) owner = this.navigation;
       }
+      owner ||= this.document;
+      if (!owner) return; // the crawler's blank page has no state
+      owners.set(request, owner);
+      owner.pending.add(request);
     });
     page.on("requestfailed", (request) => {
-      if (finishEstimate(request)) this.exportEstimates.failed = true;
+      const owner = finish(request);
       const failure = request.failure()?.errorText || "failed";
       if (/ERR_BLOCKED_BY_CLIENT|blockedbyclient/i.test(failure)) return; // recorded by the guard
-      if (/ERR_ABORTED/.test(failure) && request.resourceType() === "document") return;
-      push("request-failed", "error", `${request.method()} ${new URL(request.url()).pathname} ${failure}`);
+      const retirementAbort = owner?.retiring && owner.timedOut?.has(request) && /ERR_ABORTED/.test(failure);
+      this.documentFinding(owner, "request-failed", "error", `${requestName(request)} ${failure}`,
+        retirementAbort ? { during: "document-retirement" } : undefined);
     });
-    page.on("requestfinished", async (request) => {
-      finishEstimate(request);
-      const timing = request.timing();
-      const elapsed = timing.responseEnd > 0 ? timing.responseEnd : null;
-      if (elapsed && elapsed > this.budgets.requestMs) {
-        push("slow-request", "warn", `${request.method()} ${new URL(request.url()).pathname}`, { ms: Math.round(elapsed), budgetMs: this.budgets.requestMs });
+    page.on("requestfinished", (request) => {
+      const owner = finish(request);
+      const elapsed = request.timing().responseEnd;
+      if (elapsed > this.budgets.requestMs) {
+        this.documentFinding(owner, "slow-request", "warn", requestName(request), { ms: Math.round(elapsed), budgetMs: this.budgets.requestMs });
       }
     });
     page.on("response", (response) => {
       if (response.status() < 400) return;
       const url = new URL(response.url());
       const type = this.fixtureMode && response.status() === 404 && url.pathname.startsWith("/api/") ? "fixture-gap" : "http-error";
-      push(type, type === "fixture-gap" ? "info" : "error", `${response.status()} ${response.request().method()} ${url.pathname}`);
+      this.documentFinding(owners.get(response.request()), type, type === "fixture-gap" ? "info" : "error", `${response.status()} ${response.request().method()} ${url.pathname}`);
     });
     this.page = page;
     this.cdp = await this.cdpFactory(page);
@@ -251,17 +267,21 @@ class Crawler {
     const index = (state.steps || []).findIndex((step) => step.forEachOption);
     if (index < 0) return [state];
     const step = state.steps[index];
-    await this.retireDocument();
+    const record = this.beginDocument(target, state, { phase: "option-expansion", status: "not-applicable" });
     this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
-    await this.load(target);
-    const driver = this.newDriver(target);
-    await driver.runSteps(state.steps.slice(0, index));
-    const values = await this.page.locator(step.forEachOption).first().evaluate((select) => Array.from(select.options).filter((o) => !o.disabled).map((o) => o.value));
-    return values.slice(0, step.max || 12).map((value) => ({
-      ...state,
-      id: `${state.id}{${value}}`,
-      steps: [...state.steps.slice(0, index), { forEachOption: step.forEachOption, value }, ...state.steps.slice(index + 1)],
-    }));
+    try {
+      await this.load(target);
+      const driver = this.newDriver(target);
+      await driver.runSteps(state.steps.slice(0, index));
+      const values = await this.page.locator(step.forEachOption).first().evaluate((select) => Array.from(select.options).filter((o) => !o.disabled).map((o) => o.value));
+      return values.slice(0, step.max || 12).map((value) => ({
+        ...state,
+        id: `${state.id}{${value}}`,
+        steps: [...state.steps.slice(0, index), { forEachOption: step.forEachOption, value }, ...state.steps.slice(index + 1)],
+      }));
+    } finally {
+      await this.finishDocument(record, state);
+    }
   }
 
   // One driver per page: it owns the page's dialog and response listeners,
@@ -272,6 +292,7 @@ class Crawler {
     }
     this.driver.ready = READY[target.ready] && ((page) => READY[target.ready](page, this.readyTimeoutMs));
     this.driver.withLoadWindow = (fn) => this.withLoadWindow(target, fn);
+    this.driver.navigateDocument = (action) => this.navigateDocument(action);
     this.driver.bind = this.bindFor(target);
     this.driver.service = (this.inventory.pages[target.page] || {}).service || "ui";
     this.driver.resetState();
@@ -382,6 +403,8 @@ class Crawler {
   // window opens with each navigation or reload and stays open until the next
   // one or the end of the state; it admits nothing but those reads.
   async withLoadWindow(target, fn) {
+    // Do not open the incoming load window while the outgoing page drains.
+    await this.waitForRequests(this.document);
     this.endLoadWindow();
     // #1128: a finished state's follow-up window ends when the next page load starts.
     this.endFollowUp();
@@ -406,34 +429,96 @@ class Crawler {
     if (admitted.length) (this.loadAdmitted = this.loadAdmitted || []).push(...admitted.map((entry) => ({ target: this.loadTarget, state: this.guard.state, ...entry })));
   }
 
-  // #1232: before the next state's policy is armed, the outgoing document is
-  // replaced with about:blank (no request, nothing to guard). Until that
-  // navigation commits the outgoing page is still alive and its queued
-  // requests (the history dashboard's health poll) are judged by its own
-  // state's read list, which the guard keeps after endState(); once it is
-  // gone nothing it queued can reach the next state's list. The finished
-  // state's load and follow-up windows close here, at the start of this
-  // navigation, as they did at the start of the next page load: retiring a
-  // page never extends them.
-  async retireDocument() {
-    this.endLoadWindow();
-    this.endFollowUp();
-    if (!this.page || this.page.url() === "about:blank") return;
-    await this.page.goto("about:blank", { waitUntil: "load", timeout: 60_000 });
+  beginDocument(target, state, extra) {
+    const record = {
+      target: target.label, page: target.page, state: state.id, baseId: state.baseId || state.id, safety: state.safety,
+      status: null, widths: [], findings: [], startedAt: new Date().toISOString(), ...extra,
+    };
+    this.document = { record, state, pending: new Set() };
+    return record;
   }
 
-  // Use requestfinished (the body was received), not just response headers.
-  // All outstanding requests share one deadline, including superseded ones.
-  async waitForExportEstimates() {
-    const estimates = this.exportEstimates;
-    if (!estimates.pending.size) return;
+  documentFinding(owner, type, severity, text, detail) {
+    if (!owner) return;
+    const { record, state } = owner;
+    // Option discovery has its own document. Retain its findings without
+    // counting a clean discovery probe as an executed state.
+    if (record.phase === "option-expansion" && !record.findings.length) this.records.push(record);
+    record.findings.push({ type, severity, text: String(text).slice(0, 300), detail });
+    if (record.finishedAt) {
+      if (type === "request-failed") record.status = "error";
+      this.markKnown(record, state);
+    }
+  }
+
+  // #1232: keep the outgoing policy until its document is gone. The guard
+  // keeps state reads after endState(); load and follow-up windows still
+  // close at their existing boundaries.
+  async finishDocument(record, state) {
+    this.endLoadWindow();
+    this.guard.endState();
+    const owner = this.document;
+    await this.waitForRequests(owner);
+    this.endFollowUp();
+    if (this.page && this.page.url() !== "about:blank") {
+      owner.retiring = true;
+      await this.page.goto("about:blank", { waitUntil: "load", timeout: 60_000 }).catch((error) => {
+        owner.retiring = false;
+        const message = `could not retire the page: ${String(error.message || error).split("\n")[0].slice(0, 260)}`;
+        this.aborted ||= message;
+        this.documentFinding(owner, "state-error", "error", message);
+        record.status = "error";
+      });
+    }
+    if (record.findings.some((finding) => ["request-failed", "settle-timeout"].includes(finding.type))) record.status = "error";
+    if (!this.page || this.page.url() === "about:blank") this.document = null;
+    this.markKnown(record, state);
+    record.finishedAt = new Date().toISOString();
+  }
+
+  // Await the response body or failure, not just the headers. All requests
+  // (including new ones while draining) share the same deadline.
+  async waitForRequests(owner) {
+    if (!owner?.pending.size || owner.timedOut) return;
     let timer;
-    await new Promise((resolve) => {
-      estimates.onEmpty = resolve;
-      timer = setTimeout(resolve, EXPORT_ESTIMATE_SETTLE_MS);
-    });
-    clearTimeout(timer);
-    estimates.onEmpty = null;
+    try {
+      while (owner.pending.size && !owner.timedOut) {
+        await new Promise((resolve) => {
+          owner.onEmpty = resolve;
+          timer ??= setTimeout(() => {
+            owner.timedOut = new WeakSet(owner.pending);
+            for (const request of owner.pending) {
+              this.documentFinding(owner, "settle-timeout", "error", `${requestName(request)} did not settle within ${REQUEST_SETTLE_MS} ms`);
+            }
+            owner.onEmpty();
+          }, REQUEST_SETTLE_MS);
+        });
+      }
+    } finally {
+      clearTimeout(timer);
+      owner.onEmpty = null;
+    }
+  }
+
+  // Reloads and busy retries replace a document within the same state. Keep
+  // its tracker until commit, but tag the incoming navigation separately.
+  async navigateDocument(action) {
+    const outgoing = this.document;
+    await this.waitForRequests(outgoing);
+    const incoming = { record: outgoing.record, state: outgoing.state, pending: new Set() };
+    this.navigation = incoming;
+    outgoing.retiring = true;
+    try {
+      const response = await action();
+      this.document = incoming;
+      return response;
+    } finally {
+      this.navigation = null;
+      if (this.document === outgoing) {
+        outgoing.retiring = false;
+        await this.waitForRequests(incoming);
+      }
+    }
   }
 
   async load(target) {
@@ -444,7 +529,7 @@ class Crawler {
     const started = Date.now();
     await this.withLoadWindow(target, async () => {
       this.debug(`goto ${target.label}`);
-      await navigate(this.page, () => this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 }));
+      await navigate(this.page, () => this.navigateDocument(() => this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 })));
       this.debug("width");
       await this.setWidth(this.widths[0]);
       this.debug("ready");
@@ -491,20 +576,11 @@ class Crawler {
 
   async crawlState(target, state) {
     const relDir = path.join(safeName(target.label), safeName(state.id));
-    const record = {
-      target: target.label, page: target.page, state: state.id, baseId: state.baseId || state.id, safety: state.safety,
-      status: null, widths: [], findings: [], startedAt: new Date().toISOString(),
-    };
-    this.bucket = record.findings;
+    const record = this.beginDocument(target, state);
     this.log(`${target.label} ${state.id}: start`);
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     let driver = null;
-    // #1232: a page that could not be retired fails this state before it
-    // loads, and this state's policy is never armed while that page lives.
-    const retired = await this.retireDocument().then(() => null, (error) => error);
-    if (!retired) this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     try {
-      if (retired) throw new Error(`could not retire the previous page: ${String(retired.message || retired).split("\n")[0]}`);
-      if (state.settle_export_estimate) this.exportEstimates = { pending: new Set(), onEmpty: null, failed: false };
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
       record.readyMs = readyMs;
@@ -563,27 +639,7 @@ class Crawler {
         // next state reloads anyway
       }
     }
-    this.endLoadWindow();
-    this.guard.endState();
-    if (this.exportEstimates) {
-      // Retire this document while it still owns the findings bucket. The
-      // settlement wait does not extend the guard's load or actuation windows.
-      await this.waitForExportEstimates();
-      if (this.exportEstimates.pending.size) {
-        record.findings.push({ type: "estimate-settle-timeout", severity: "error", text: `POST ${EXPORT_ESTIMATE_PATH} did not settle within ${EXPORT_ESTIMATE_SETTLE_MS} ms` });
-        record.status = "error";
-      }
-      await this.retireDocument().catch((error) => {
-        this.aborted = `could not retire the export page: ${String(error.message || error).split("\n")[0].slice(0, 260)}`;
-        record.findings.push({ type: "state-error", severity: "error", text: this.aborted });
-        record.status = "error";
-      });
-      if (this.exportEstimates.failed) record.status = "error";
-      this.exportEstimates = null;
-    }
-    this.bucket = null;
-    this.markKnown(record, state);
-    record.finishedAt = new Date().toISOString();
+    await this.finishDocument(record, state);
     this.records.push(record);
     const counts = record.widths.reduce((sum, w) => sum + w.findings.filter((f) => f.severity === "error" && !f.known && !f.expected).length, 0) + record.findings.filter((f) => f.severity === "error" && !f.expected).length;
     this.log(`${target.label} ${state.id}: ${record.status}${record.reason ? ` (${record.reason})` : ""}, ${counts} error findings`);

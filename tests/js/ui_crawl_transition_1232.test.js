@@ -207,10 +207,15 @@ test("#1232: with live target binding, the outgoing page's read is bound to its 
     const queued = { [targetA.url]: [inventoryRead("enc-a"), inventoryRead("enc-b"), inventoryRead("enc-a", "&force=true")] };
     const { crawler, guard, page } = stubCrawler({ queued, fixtureMode: false, outDir });
     const state = stateById("main.default");
+    // A finished state's follow-up window closes when retirement starts.
+    const endState = guard.endState.bind(guard);
+    guard.endState = () => {
+      endState();
+      if (page.url() === targetA.url) {
+        guard.openFollowUp(state.id, [{ method: "GET", path: "/api/inventory", force: true, max: 1 }], { bind: crawler.bindFor(targetA), ms: 60_000 });
+      }
+    };
     await crawler.crawlState(targetA, state);
-    // A finished state's follow-up window closes when the next navigation
-    // starts; retiring the page does not extend it.
-    guard.openFollowUp(state.id, [{ method: "GET", path: "/api/inventory", force: true, max: 1 }], { bind: crawler.bindFor(targetA), ms: 60_000 });
     await crawler.crawlState(targetB, state);
     const late = onlySent(page, targetA.url);
     assert.equal(late.length, 3, JSON.stringify(page.sent));
@@ -225,19 +230,22 @@ test("#1232: with live target binding, the outgoing page's read is bound to its 
   }
 });
 
-test("#1232: a page that cannot be retired fails the next state before its policy is armed or its page loads", async () => {
+test("#1232: a page that cannot be retired fails its own state without arming or loading the next state", async () => {
   const outDir = tmpDir("stuck");
   try {
     const { crawler, page, armed } = stubCrawler({ queued: { [HISTORY.url]: [HEALTH_POLL] }, outDir });
-    await crawler.crawlState(HISTORY, stateById("history.default"));
     const goto = page.goto.bind(page);
     page.goto = async (url, options) => {
       if (url === "about:blank") throw new Error("synthetic navigation failure");
       return goto(url, options);
     };
-    const record = await crawler.crawlState(ADMIN, stateById("admin.operations"));
+    await crawler.crawlTarget(HISTORY, [stateById("history.default")]);
+    await crawler.crawlTarget(ADMIN, [stateById("admin.operations")]);
+    assert.equal(crawler.records.length, 1);
+    const [record] = crawler.records;
+    assert.equal(record.state, "history.default");
     assert.equal(record.status, "error", JSON.stringify(record));
-    assert.match(record.findings.map((finding) => finding.text).join("\n"), /could not retire the previous page: synthetic navigation failure/);
+    assert.match(record.findings.map((finding) => finding.text).join("\n"), /could not retire the page: synthetic navigation failure/);
     assert.equal(armed.some((entry) => entry.stateId === "admin.operations"), false, "admin.operations was armed while the history page was still alive");
     assert.equal(page.gotos.includes(ADMIN.url), false, "the admin page was loaded anyway");
   } finally {
@@ -268,12 +276,13 @@ test("#1232: option expansion also retires the outgoing page before it arms its 
 const MAIN = { page: "main", label: "synthetic/main", url: `${ORIGINS.ui}/` };
 const ESTIMATE = "/api/export/enclosure-snapshot/estimate";
 
-async function exportCrawler(t) {
-  const outDir = tmpDir("estimate");
+async function requestCrawler(t, { method = "POST", pathname = ESTIMATE, delayAbort = false } = {}) {
+  const outDir = tmpDir("requests");
   t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
   const { crawler, guard, page } = stubCrawler({ outDir });
   const events = new EventEmitter();
   const pending = new Set();
+  const retired = [];
   const goto = page.goto.bind(page);
   function finish(request, failed = false) {
     if (pending.delete(request)) events.emit(failed ? "requestfailed" : "requestfinished", request);
@@ -282,8 +291,13 @@ async function exportCrawler(t) {
     on: events.on.bind(events),
     setDefaultTimeout() {},
     goto(url) {
-      // The browser drops every outstanding fetch when the document retires.
-      for (const request of pending) finish(request, true);
+      if (delayAbort && url === "about:blank") {
+        // The browser can deliver a terminal event after retirement has returned.
+        retired.push(...pending);
+      } else {
+        for (const request of retired.splice(0)) finish(request, true);
+        for (const request of pending) finish(request, true);
+      }
       return goto(url);
     },
   });
@@ -308,14 +322,14 @@ async function exportCrawler(t) {
     return { tiles: [] };
   };
   const requests = [0, 1].map(() => ({
-    method: () => "POST", url: () => `${ORIGINS.ui}${ESTIMATE}`, resourceType: () => "fetch",
+    method: () => method, url: () => `${ORIGINS.ui}${pathname}`, resourceType: () => "fetch",
     timing: () => ({ responseEnd: 10 }), failure: () => ({ errorText: "net::ERR_ABORTED" }),
   }));
   return { crawler, page, requests, finish, captured: () => captured };
 }
 
 test("export scope waits past capture for a superseded estimate before the next state", async (t) => {
-  const { crawler, requests, finish, captured } = await exportCrawler(t);
+  const { crawler, requests, finish, captured } = await requestCrawler(t);
   const records = (async () => [
     await crawler.crawlState(MAIN, stateById("main.export.scope")),
     await crawler.crawlState(HISTORY, stateById("history.default")),
@@ -332,7 +346,7 @@ test("export scope waits past capture for a superseded estimate before the next 
 });
 
 test("an estimate aborted by the live export dialog remains blocking", async (t) => {
-  const { crawler, requests, finish, captured } = await exportCrawler(t);
+  const { crawler, requests, finish, captured } = await requestCrawler(t);
   const record = crawler.crawlState(MAIN, stateById("main.export.dialog"));
   await new Promise(setImmediate);
   assert.ok(captured());
@@ -346,7 +360,7 @@ test("an estimate aborted by the live export dialog remains blocking", async (t)
 
 test("an export estimate that never settles is a named blocking timeout", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const { crawler, page, requests, finish, captured } = await exportCrawler(t);
+  const { crawler, page, requests, finish, captured } = await requestCrawler(t);
   const record = crawler.crawlState(MAIN, stateById("main.export.dialog"));
   await new Promise(setImmediate);
   assert.ok(captured());
@@ -356,8 +370,55 @@ test("an export estimate that never settles is a named blocking timeout", async 
   assert.equal(page.url(), MAIN.url, "the 30 s deadline has not expired");
   t.mock.timers.tick(1);
   const result = await record;
-  assert.ok(result.findings.some(({ type, severity, text }) => type === "estimate-settle-timeout" && severity === "error"
+  assert.ok(result.findings.some(({ type, severity, text }) => type === "settle-timeout" && severity === "error"
     && text.includes(ESTIMATE)), "the unsettled request must be reported as a timeout");
   assert.equal(result.status, "error");
   assert.equal(page.url(), "about:blank");
+});
+
+const SMART_BATCH = "/api/slots/smart-batch";
+
+test("a slow SMART batch settles after capture without an abort in either state", async (t) => {
+  const { crawler, requests, finish } = await requestCrawler(t, { pathname: SMART_BATCH });
+  const records = (async () => [
+    await crawler.crawlState(MAIN, stateById("main.default")),
+    await crawler.crawlState(HISTORY, stateById("history.default")),
+  ])();
+  await new Promise(setImmediate);
+  finish(requests[1]);
+  await new Promise(setImmediate);
+  finish(requests[0]);
+  const [first, second] = await records;
+  assert.equal(first.status, "done");
+  assert.deepEqual(first.findings, []);
+  assert.deepEqual(second.findings, [], "the next state must not receive the SMART batch abort");
+});
+
+test("a hanging GET times out on its owner and a late retirement abort stays there", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, requests, finish } = await requestCrawler(t, { method: "GET", pathname: "/api/inventory", delayAbort: true });
+  const firstRun = crawler.crawlState(MAIN, stateById("main.default"));
+  await new Promise(setImmediate);
+  finish(requests[1]);
+  t.mock.timers.tick(30_000);
+  const first = await firstRun;
+  const second = await crawler.crawlState(HISTORY, stateById("history.default"));
+  assert.deepEqual(second.findings, [], "a terminal event arriving during the next goto still belongs to the issuing document");
+  assert.equal(first.status, "error");
+  assert.ok(first.findings.some(({ type, severity, text }) => type === "settle-timeout" && severity === "error"
+    && text.includes("GET /api/inventory")), "the timeout must name the unfinished request");
+  assert.ok(first.findings.some(({ type, severity, text, detail }) => type === "request-failed" && severity === "error"
+    && text === "GET /api/inventory net::ERR_ABORTED" && detail?.during === "document-retirement"), "the late retirement abort must be visible on its owner");
+});
+
+test("a live SMART batch abort is blocking even when the next state never starts", async (t) => {
+  const { crawler, requests, finish } = await requestCrawler(t, { pathname: SMART_BATCH });
+  const record = crawler.crawlState(MAIN, stateById("main.default"));
+  await new Promise(setImmediate);
+  finish(requests[0], true);
+  finish(requests[1]);
+  const result = await record;
+  assert.ok(result.findings.some(({ type, severity, text, detail }) => type === "request-failed" && severity === "error"
+    && text === `POST ${SMART_BATCH} net::ERR_ABORTED` && !detail?.during), "a live abort must be visible and not labeled a retirement abort");
+  assert.equal(result.status, "error");
 });
