@@ -124,6 +124,6 @@
     {"service":"scheduler","method":"POST","path":"/internal/backups/{artifact_id}/verify","class":"internal","why":"Backup scheduler sidecar API; only the admin sidecar calls it, never a page.","fingerprint":"7273cd5f839df5f156d69d19"},
     {"service":"scheduler","method":"POST","path":"/internal/backups/{artifact_id}/preserve","class":"internal","why":"Backup scheduler sidecar API; only the admin sidecar calls it, never a page.","fingerprint":"92070506fb8f2a369229142a"},
     {"service":"scheduler","method":"DELETE","path":"/internal/backups/{artifact_id}/preserve","class":"internal","why":"Backup scheduler sidecar API; only the admin sidecar calls it, never a page.","fingerprint":"3d51058f18bcc8893365b694"},
-    {"service":"scheduler","method":"GET","path":"/internal/backups/{artifact_id}/download","class":"internal","why":"Backup scheduler sidecar API; only the admin sidecar calls it, never a page.","fingerprint":"bfd787ccbea323d59a7ca786"}
+    {"service":"scheduler","method":"GET","path":"/internal/backups/{artifact_id}/download","class":"internal","why":"Backup scheduler sidecar API; only the admin sidecar calls it, never a page.","fingerprint":"cf8bc0a309ba12dff3b034f0"}
   ]
 }

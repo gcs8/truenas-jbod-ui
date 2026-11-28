@@ -15,6 +15,7 @@ temporary directory, and clean-up failures are real permission denials.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -97,8 +98,8 @@ class _FetchWorkspaceBase(SchedulerTestBase):
             log.removeHandler(handler)
 
     def fetch(self) -> bytes:
-        with self.scheduler.materialize(self.remote.artifact_id) as (_record, path):
-            return path.read_bytes()
+        with self.scheduler.materialize(self.remote.artifact_id) as (_record, handle):
+            return handle.read()
 
     def abandoned_workspace(self, name: str = "backup-fetch-abandoned", *, content: bytes = b"full copy") -> Path:
         workspace = self.state_dir / name
@@ -157,11 +158,11 @@ class FetchWorkspaceReclaimTests(_FetchWorkspaceBase):
 
     def test_a_workspace_held_by_a_live_fetch_is_not_reclaimed(self) -> None:
         with self.scheduler.materialize(self.remote.artifact_id) as (_record, held):
-            held_workspace = held.parent.name
+            (held_workspace,) = self.workspaces()
             result = self.verify()  # its own fetch scans the folder while this one is open
             self.assertEqual((result["ok"], result["outcome"]), (True, "matched"))
             self.assertEqual(self.workspaces(), [held_workspace])
-            self.assertEqual(hashlib.sha256(held.read_bytes()).hexdigest(), self.remote.sha256)
+            self.assertEqual(hashlib.sha256(held.read()).hexdigest(), self.remote.sha256)
             # A third fetch, entered while the first is still open, also leaves it.
             self.fetch()
             self.assertEqual(self.workspaces(), [held_workspace])
@@ -395,6 +396,40 @@ class PinnedStateFolderTests(_FetchWorkspaceBase):
 
         return mock.patch.object(os, name, hooked)
 
+    def _download_attempt(self, artifact_id: str, materialize, *, chunk_size: int):
+        from history_service.backup_scheduler import api
+
+        app = api.build_app(self.scheduler)
+        route = next(route for route in app.routes if getattr(route, "path", None) == "/internal/backups/{artifact_id}/download")
+
+        async def attempt():
+            sent: list[dict] = []
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                sent.append(message)
+
+            with (
+                mock.patch.object(self.scheduler, "materialize", materialize),
+                mock.patch.object(api, "_STREAM_CHUNK_BYTES", chunk_size),
+            ):
+                response = await route.endpoint(artifact_id)  # type: ignore[attr-defined]
+                caught = None
+                try:
+                    await response(
+                        {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}},
+                        receive,
+                        send,
+                    )
+                except Exception as exc:  # the response must abort after its headers
+                    caught = exc
+            body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+            return caught, body
+
+        return asyncio.run(attempt())
+
     def test_a_state_folder_swapped_for_a_link_cannot_redirect_reclamation(self) -> None:
         victim = "backup-fetch-victim"
         self.abandoned_workspace(victim, content=b"abandoned copy")
@@ -554,6 +589,124 @@ class PinnedStateFolderTests(_FetchWorkspaceBase):
         if data is None:
             self.fail("the pinned workspace did not receive the fetched bytes")
         self.assertEqual(hashlib.sha256(data).hexdigest(), self.remote.sha256)
+
+    def test_download_streams_the_file_that_passed_verification(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def replace_name_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                workspace = next(
+                    entry
+                    for entry in self.state_dir.iterdir()
+                    if entry.name.startswith(service.FETCH_WORKSPACE_PREFIX)
+                )
+                replacement = workspace / "replacement"
+                replacement.write_bytes(b"x" * self.remote.size)
+                os.replace(replacement, workspace / "archive")
+                yield opened
+
+        with mock.patch.object(self.scheduler, "materialize", replace_name_after_materialize):
+            status, body = asgi_call(
+                build_app(self.scheduler),
+                "GET",
+                f"/internal/backups/{self.remote.artifact_id}/download",
+            )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), self.remote.sha256)
+
+    def test_local_download_streams_the_file_that_passed_verification(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        local = self.scheduler.catalog.list(location=service.LOCAL_LOCATION)[0]
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def replace_name_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                path = self.scheduler._local_path(local)
+                replacement = path.with_name(f"{path.name}.replacement")
+                replacement.write_bytes(b"x" * local.size)
+                os.replace(replacement, path)
+                yield opened
+
+        with mock.patch.object(self.scheduler, "materialize", replace_name_after_materialize):
+            status, body = asgi_call(
+                build_app(self.scheduler),
+                "GET",
+                f"/internal/backups/{local.artifact_id}/download",
+            )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), local.sha256)
+
+    def test_download_stops_short_if_the_open_file_changes(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def overwrite_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                workspace = next(
+                    entry
+                    for entry in self.state_dir.iterdir()
+                    if entry.name.startswith(service.FETCH_WORKSPACE_PREFIX)
+                )
+                with (workspace / "archive").open("r+b") as replacement:
+                    replacement.write(b"x" * self.remote.size)
+                yield opened
+
+        with mock.patch.object(self.scheduler, "materialize", overwrite_after_materialize):
+            with self.assertRaises(service.ArchiveIntegrityError):
+                asgi_call(
+                    build_app(self.scheduler),
+                    "GET",
+                    f"/internal/backups/{self.remote.artifact_id}/download",
+                )
+        self.assertEqual(self.workspaces(), [])
+
+    def test_download_holds_all_expected_bytes_until_an_excess_byte_is_refused(self) -> None:
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def overwrite_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                workspace = next(self.state_dir.glob(f"{service.FETCH_WORKSPACE_PREFIX}*"))
+                with (workspace / "archive").open("r+b") as replacement:
+                    replacement.write(b"x" * self.remote.size + b"y")
+                    replacement.truncate()
+                yield opened
+
+        caught, body = self._download_attempt(
+            self.remote.artifact_id,
+            overwrite_after_materialize,
+            chunk_size=self.remote.size,
+        )
+        self.assertIsInstance(caught, service.ArchiveIntegrityError)
+        self.assertEqual(body, b"", "the final expected bytes were released before EOF")
+        self.assertEqual(self.workspaces(), [])
+
+    def test_download_holds_a_short_file_until_its_size_is_refused(self) -> None:
+        materialize = self.scheduler.materialize
+
+        @contextlib.contextmanager
+        def truncate_after_materialize(artifact_id: str):
+            with materialize(artifact_id) as opened:
+                workspace = next(self.state_dir.glob(f"{service.FETCH_WORKSPACE_PREFIX}*"))
+                with (workspace / "archive").open("r+b") as replacement:
+                    replacement.truncate(self.remote.size - 1)
+                yield opened
+
+        caught, body = self._download_attempt(
+            self.remote.artifact_id,
+            truncate_after_materialize,
+            chunk_size=self.remote.size,
+        )
+        self.assertIsInstance(caught, service.ArchiveIntegrityError)
+        self.assertEqual(body, b"", "a short file released its final bytes")
+        self.assertEqual(self.workspaces(), [])
 
     def test_an_empty_workspace_without_its_fetch_marker_is_left_in_place(self) -> None:
         empty = self.state_dir / "backup-fetch-empty"
