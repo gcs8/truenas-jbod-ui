@@ -1,7 +1,7 @@
 """An imported history publication stays bound to the checked private copy.
 
 The private copy must have one name, and the descriptor published by rename
-must still contain the bytes accepted after SQLite and member checks. Every
+must still contain the bytes bound before SQLite and member checks. Every
 fixture is synthetic and lives in a temporary directory.
 """
 
@@ -124,7 +124,8 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
         )
         with sqlite3.connect(member) as connection:
             connection.execute(
-                "UPDATE history_table_counts SET row_count = 0 WHERE table_name = 'metric_samples'"
+                "INSERT OR REPLACE INTO history_table_counts (table_name, row_count) "
+                "VALUES ('metric_samples', 0)"
             )
             connection.commit()
         content = member.read_bytes()
