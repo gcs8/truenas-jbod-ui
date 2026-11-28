@@ -171,6 +171,7 @@
       viewSelectionExpanded: false,
       selectedStorageViewIds: [],
       running: false,
+      downloadController: null,
       downloadRetryAtMs: 0,
       dialogGeneration: 0,
       estimate: {
@@ -394,6 +395,7 @@
   const exportIncludeViewsToggle = document.getElementById("export-include-views-toggle");
   const exportViewSelection = document.getElementById("export-view-selection");
   const exportSnapshotConfirm = document.getElementById("export-snapshot-confirm");
+  const exportEstimateRetry = document.getElementById("export-estimate-retry");
   const exportSnapshotCancel = document.getElementById("export-snapshot-cancel");
   const exportSnapshotNote = document.getElementById("export-snapshot-note");
   const exportSnapshotWindowHint = document.getElementById("export-snapshot-window-hint");
@@ -8266,7 +8268,6 @@
         return isCurrent() ? payload : superseded;
       }, {
         isCurrent: () => isCurrent() && Boolean(exportSnapshotDialog?.open),
-        retryDelayMs: snapshotExportRetryDelayMs,
         onRetry: (attempt, delayMs) => {
           state.export.estimate.retryNote = busyReadRetryMessage(attempt, delayMs);
           syncSnapshotExportDialog();
@@ -8371,7 +8372,10 @@
     if (state.export.estimate.error) {
       parts.push(state.export.estimate.error);
     }
-    if (state.export.downloadRetryAtMs) parts.push("The inventory is still refreshing. Retry the download when ready.");
+    if (state.export.downloadRetryAtMs) {
+      parts.push(state.export.running ? "Waiting to retry the download. Choose Cancel to stop waiting."
+        : "The inventory is still refreshing. Retry the download when ready.");
+    }
     exportSnapshotNote.textContent = parts.join(" ");
     if (exportSnapshotWindowHint) {
       if (isHistoryAvailable()) {
@@ -8384,9 +8388,13 @@
     if (exportSnapshotConfirm) {
       const estimate = state.export.estimate.data;
       const shouldBlock = Boolean(estimate && !estimate.selected_allowed);
-      exportSnapshotConfirm.textContent = state.export.downloadRetryAtMs ? "Retry download"
-        : state.export.estimate.retryAtMs ? "Retry estimate" : "Download copy";
-      exportSnapshotConfirm.disabled = state.export.running || state.export.estimate.loading || shouldBlock;
+      exportSnapshotConfirm.textContent = state.export.downloadRetryAtMs ? "Retry download" : "Download copy";
+      exportSnapshotConfirm.disabled = state.export.running || shouldBlock
+        || (state.export.estimate.loading && !state.export.estimate.retryNote);
+    }
+    if (exportEstimateRetry) {
+      exportEstimateRetry.classList.toggle("hidden", !state.export.estimate.retryAtMs);
+      exportEstimateRetry.disabled = state.export.running || state.export.estimate.loading;
     }
   }
 
@@ -8424,6 +8432,12 @@
 
   function closeSnapshotExportDialog() {
     state.export.dialogGeneration = (state.export.dialogGeneration || 0) + 1;
+    if (state.export.downloadRetryAtMs) setStatus("Download retry cancelled.");
+    else if (state.export.running) setStatus("Download cancelled.");
+    if (state.export.running) state.export.downloadController.abort();
+    // A cancelled wait owns no request. An active POST stays locked until finally.
+    if (state.export.downloadRetryAtMs) state.export.running = false;
+    state.export.downloadRetryAtMs = 0;
     if (exportSnapshotDialog && exportSnapshotDialog.open) {
       exportSnapshotDialog.close();
     }
@@ -11241,7 +11255,7 @@
     return Math.min(Math.max(error.retryAfterSeconds * 1000, 1000), BUSY_READ_RETRY_MAX_DELAY_MS);
   }
 
-  // Export retries must not run earlier than the server's Retry-After.
+  // Explicit export retries must not run earlier than the server's Retry-After.
   function snapshotExportRetryDelayMs(error) {
     if (busyReadRetryDelayMs(error) === null) return null;
     return Math.max(1000, error.retryAfterSeconds * 1000);
@@ -11263,7 +11277,7 @@
       try {
         return await read();
       } catch (error) {
-        const delayMs = (options.retryDelayMs || busyReadRetryDelayMs)(error);
+        const delayMs = busyReadRetryDelayMs(error);
         if (delayMs === null || attempt > BUSY_READ_RETRY_LIMIT || !isCurrent()) throw error;
         if (onRetry) onRetry(attempt, delayMs, error);
         await wait(delayMs);
@@ -11378,8 +11392,11 @@
     }
     const scopeKey = currentUiScopeKey();
     const dialogGeneration = state.export.dialogGeneration || 0;
+    const sameDialog = () => dialogGeneration === (state.export.dialogGeneration || 0);
     const requestBody = JSON.stringify(snapshotExportRequestPayload());
     const retryAtMs = state.export.downloadRetryAtMs || 0;
+    const controller = new AbortController();
+    state.export.downloadController = controller;
     try {
       state.export.running = true;
       syncSnapshotExportDialog();
@@ -11390,15 +11407,19 @@
       if (delayMs) {
         setStatus(`The inventory is still refreshing. Trying the download again in ${Math.ceil(delayMs / 1000)} s.`);
         await waitMs(delayMs);
-        if ((exportSnapshotDialog && !exportSnapshotDialog.open)
-            || dialogGeneration !== (state.export.dialogGeneration || 0)
-            || scopeKey !== currentUiScopeKey()
-            || requestBody !== JSON.stringify(snapshotExportRequestPayload())) return;
+        if (!sameDialog()) return;
+        if ((exportSnapshotDialog && !exportSnapshotDialog.open) || scopeKey !== currentUiScopeKey()
+            || requestBody !== JSON.stringify(snapshotExportRequestPayload())) {
+          state.export.downloadRetryAtMs = 0;
+          setStatus("Download retry cancelled.");
+          return;
+        }
       }
       state.export.downloadRetryAtMs = 0;
       setStatus("Preparing the offline copy...");
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: requestBody,
       });
@@ -11416,6 +11437,7 @@
         throw failure;
       }
       const blob = await response.blob();
+      if (!sameDialog() || scopeKey !== currentUiScopeKey()) return;
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -11424,6 +11446,7 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
+      state.export.running = false;
       closeSnapshotExportDialog();
       const packaging = (response.headers.get("X-Export-Packaging") || "html").toUpperCase();
       const redactionMode = response.headers.get("X-Export-Redaction") || "none";
@@ -11431,6 +11454,7 @@
       const sizeLabel = formatArtifactSize(response.headers.get("X-Export-Size-Bytes"));
       setStatus(`Exported ${redaction}${packaging} snapshot (${sizeLabel}).`);
     } catch (error) {
+      if (!sameDialog() || scopeKey !== currentUiScopeKey()) return;
       const delayMs = snapshotExportRetryDelayMs(error);
       if (delayMs !== null) {
         state.export.downloadRetryAtMs = Date.now() + delayMs;
@@ -11439,7 +11463,10 @@
         setStatus(`Snapshot export failed: ${error.message || error}`, "error");
       }
     } finally {
-      state.export.running = false;
+      if (state.export.downloadController === controller) {
+        state.export.downloadController = null;
+        state.export.running = false;
+      }
       syncSnapshotExportDialog();
     }
   }
@@ -12776,12 +12803,11 @@
   }
   if (exportSnapshotConfirm) {
     exportSnapshotConfirm.addEventListener("click", () => {
-      if (state.export.estimate.retryAtMs && !state.export.downloadRetryAtMs) {
-        void refreshSnapshotExportEstimate();
-      } else {
-        void exportEnclosureSnapshot();
-      }
+      void exportEnclosureSnapshot();
     });
+  }
+  if (exportEstimateRetry) {
+    exportEstimateRetry.addEventListener("click", () => { void refreshSnapshotExportEstimate(); });
   }
   if (exportRedactToggle) {
     exportRedactToggle.addEventListener("change", (event) => {
