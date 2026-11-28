@@ -299,6 +299,34 @@ require("./fixture-suites/topology-node-names")({
   fixture, routeSynthetic, capture, axeViolations, viewports: [NARROW, ...DESKTOP], origin: ORIGIN,
 });
 
+test("Topology port controls clear the bays on both sides of a board", async ({ page }) => {
+  const { dualPortBoard } = require("../tests/js/helpers/fabric_topology");
+  const { pageChecks } = require("./ui-crawl/checks");
+  const { fabric, inventory } = dualPortBoard();
+  const html = fixture.fabric.html.replace(/window\.SAS_FABRIC_BOOTSTRAP = (.+);/, (_match, json) => {
+    const bootstrap = JSON.parse(json);
+    fabric.system_id = bootstrap.systemId;
+    fabric.selected_enclosure_id = bootstrap.enclosureId;
+    bootstrap.fabric = fabric;
+    Object.assign(bootstrap.snapshot, inventory, { slots: [] });
+    return `window.SAS_FABRIC_BOOTSTRAP = ${JSON.stringify(bootstrap)};`;
+  });
+  const errors = await routeSynthetic(page, html, { fabric });
+  await page.setViewportSize(DESKTOP[0]);
+  await page.goto(`${ORIGIN}/sas-fabric`);
+  await page.locator("#fabric-mode-topology").click();
+  await expect(page.locator(".topo-port")).toHaveCount(2 * inventory.layout_rows.flat().length);
+  for (const viewport of [...DESKTOP, NARROW]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    expect(await page.evaluate(() => innerWidth)).toBe(viewport.width);
+    const { findings } = await page.evaluate(pageChecks, {});
+    expect(findings.filter((f) => f.type === "control-overlap"), `${viewport.width} px`).toEqual([]);
+    await capture(page, `topology-board-${viewport.width}`);
+  }
+  expect(errors).toEqual([]);
+});
+
 async function enableHeatMap(page) {
   const toggle = page.locator("#heatmap-toggle-button");
   if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();

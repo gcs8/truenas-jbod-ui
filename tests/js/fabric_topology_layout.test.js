@@ -1277,14 +1277,28 @@ test("in a board, port marks never overlap their bay, another bay or a label, an
     // A bus junction is a circle.
     const dot = box ? null : /<circle\b[^>]*\bcx="([-\d.]+)" cy="([-\d.]+)" r="([\d.]+)"/.exec(match[2]);
     const [x, y, w, h] = box ? box.slice(1).map(Number) : [Number(dot[1]) - Number(dot[3]), Number(dot[2]) - Number(dot[3]), 2 * Number(dot[3]), 2 * Number(dot[3])];
-    return { name: /aria-label="([^"]*)"/.exec(match[1])?.[1] || "", body: match[2], x, y, w, h };
+    // The button is the SVG group, not just its rectangle. Include the bay
+    // label's ascent (one em at the default 12 px); the browser spec measures
+    // the actual font bounds with the crawler.
+    const baseline = /<text class="topo-bay-number"[^>]* y="([-\d.]+)"/.exec(match[2]);
+    const top = baseline ? Math.min(y, Number(baseline[1]) - 12) : y;
+    return { name: /aria-label="([^"]*)"/.exec(match[1])?.[1] || "", body: match[2], x, y: top, w, h: y + h - top };
   });
   const overlap = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
   const decode = (text) => text.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   const { fabric } = H.producerCases().core_cascade;
   const inventory = { selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id, layout_rows: [[0, 1, 2, 3], [4, 5, 6, 7]] };
   const { fixtures: generality } = JSON.parse(fs.readFileSync(path.join(H.ROOT, "tests/fixtures/sas_fabric/topology_generality.json"), "utf8"));
-  const cases = [["core cascade as two boards", fabric, { inventory }], ...generality.map((item) => [item.id, item.fabric, item.options])];
+  const board = H.dualPortBoard();
+  const fourPaths = H.dualPortBoard();
+  for (const trace of fourPaths.fabric.traces) {
+    trace.metrics.path_states = [...trace.metrics.path_states, ...trace.metrics.path_states].map((state, i) => ({ ...state, device_name: `path${i}` }));
+  }
+  const cases = [
+    ["four paths per bay", fourPaths.fabric, { inventory: fourPaths.inventory }],
+    ["dual-port board", board.fabric, { inventory: board.inventory }], ["core cascade as two boards", fabric, { inventory }],
+    ...generality.map((item) => [item.id, item.fabric, item.options]),
+  ];
   let boards = 0;
   for (const [name, given, options] of cases) {
     for (const width of [1150, 3372]) {
@@ -1295,7 +1309,7 @@ test("in a board, port marks never overlap their bay, another bay or a label, an
       const bays = rects(html, "topo-bay");
       const labels = rects(html, "topo-link-label");
       for (const port of ports) {
-        for (const other of [...bays, ...labels]) assert.equal(overlap(port, other), 0, `${name} @${width}: a port overlaps ${other.name.slice(0, 60)}`);
+        for (const other of [...ports.filter((p) => p !== port), ...bays, ...labels]) assert.equal(overlap(port, other), 0, `${name} @${width}: a port overlaps ${other.name.slice(0, 60)}`);
       }
       for (const bay of bays) {
         const visible = [...bay.body.matchAll(/<text\b[^>]*>([^<]*)<\/text>(\s*)/g)].map((match) => decode(match[1]) + match[2]).join("").trim().replace(/\s+/g, " ");
