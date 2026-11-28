@@ -198,6 +198,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added pinned actionlint, ShellCheck and zizmor checks across all workflows, with
   exact-source reviewed findings and fail-closed handling for new findings,
   changed baselines and incomplete scanner output (#1521).
+- Waited for in-flight snapshot export estimates before retiring the crawler's
+  export states, while keeping request failures and timeouts blocking (#1533).
 
 ## v0.24.0-rc.2 - 2026-11-21
 

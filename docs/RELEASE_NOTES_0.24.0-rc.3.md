@@ -10,6 +10,7 @@ v0.24.0-rc.3 is a testing release candidate, not v0.24.0 final.
 - Disk synchronization distinguishes a busy request from unknown status and keeps its result current after recovery. Snapshot export offers a retry while inventory is busy.
 - Backup scheduling bounds its configuration snapshot, remote backup fetches constrain workspace file handling, and history import verifies the members it publishes. These changes can refuse work that cannot be budgeted or verified safely.
 - Playwright 1.65.1 updates the development browser runner. CI checks add dependency auditing, workflow lint, scheduled published-image scanning, secret-history scanning and Topology mutation tests. QA fixtures no longer reuse captured enclosure identifiers or SAS addresses.
+- The QA crawler waits for in-flight snapshot export estimates before leaving export states. Request failures and timeouts still fail the crawl (#1533).
 
 See `CHANGELOG.md` for the full list and upgrade notes.
 

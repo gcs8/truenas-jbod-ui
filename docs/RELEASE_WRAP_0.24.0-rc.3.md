@@ -18,7 +18,7 @@ Qualification outcome: **Pass** for phase A, subject to exact-head CI on this
 wrap and the release PR review gate. No registry image or deployment was made.
 Local QA image `sha256:ec5bb8770cae50a8b4557d1277d10204b218b6afc6e84f711479d743ad709eb0` is pinned to the cut.
 
-Changelog coverage: pass (23 PRs)
+Changelog coverage: pass (24 PRs)
 
 ## Checklist evidence
 
