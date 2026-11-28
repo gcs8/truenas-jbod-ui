@@ -115,6 +115,7 @@ from history_service.store import (
     SQLITE_CONNECT_TIMEOUT_SECONDS,
     VALIDATED_MEMBER_CHANGED_MESSAGE,
     HistoryStore,
+    _history_count_trigger_contract,
     require_bounded_restored_timestamps,
     require_restorable_schema_version,
 )
@@ -346,6 +347,9 @@ PASSPHRASE_REQUIRED_MESSAGE = "This backup is encrypted. Enter its passphrase to
 EXPORT_PASSPHRASE_REQUIRED_MESSAGE = "Enter a passphrase to encrypt this backup."
 WRONG_PASSPHRASE_MESSAGE = (
     "The backup could not be decrypted. Check the passphrase and try again."
+)
+UNRECOGNIZED_HISTORY_TRIGGER_MESSAGE = (
+    "History database contains an unrecognized trigger. Nothing was restored."
 )
 SEGMENTED_CATALOG_NOT_SET_MESSAGE = (
     "This backup contains segmented history but HISTORY_SEGMENT_CATALOG_PATH is not "
@@ -4577,6 +4581,12 @@ class SystemBackupService:
             if integrity_checked
             else connection.execute("PRAGMA quick_check").fetchall()
         )
+        schema = connection.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+        if any(
+            schema_type not in ("table", "index", "view", "trigger")
+            for schema_type, _, _ in schema
+        ):
+            raise ValueError(UNRECOGNIZED_HISTORY_TRIGGER_MESSAGE)
         required_columns = {
             "slot_state_current": {"system_id", "enclosure_key", "slot"},
             "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
@@ -4605,6 +4615,13 @@ class SystemBackupService:
                 raise ValueError(
                     f"History database table {table_name} is missing required columns."
                 )
+        expected_triggers = dict(_history_count_trigger_contract())
+        if any(
+            expected_triggers.get(name) != sql
+            for schema_type, name, sql in schema
+            if schema_type == "trigger"
+        ):
+            raise ValueError(UNRECOGNIZED_HISTORY_TRIGGER_MESSAGE)
         if rows != [("ok",)]:
             raise ValueError("History database integrity check failed.")
 

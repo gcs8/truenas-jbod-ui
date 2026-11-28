@@ -1,16 +1,16 @@
 """An imported history publication stays bound to the checked private copy.
 
 The private copy must have one name, and the descriptor published by rename
-must still contain the bytes accepted after SQLite and member checks. Every
+must still contain the bytes bound before SQLite and member checks. Every
 fixture is synthetic and lives in a temporary directory.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sqlite3
-import sys
 from pathlib import Path
 from typing import Callable
 from unittest.mock import patch
@@ -114,6 +114,93 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
         self.assertTrue(self.publication_seen)
         self.assertEqual(refusal._metric_rows(self.live), self.IMPORTED_ROWS)
 
+    def test_validated_copy_is_hashed_before_checks_and_live_recount_follows_publish(
+        self,
+    ) -> None:
+        """Published bytes stay hash-bound; counters derive from the live file."""
+        member = refusal._history_database(
+            self.root / "member.sqlite3",
+            [validated.ORDINARY, validated.ORDINARY],
+        )
+        with sqlite3.connect(member) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO history_table_counts (table_name, row_count) "
+                "VALUES ('metric_samples', 0)"
+            )
+            connection.commit()
+        content = member.read_bytes()
+        store = HistoryStore(str(self.live), recover_unreadable_database=False)
+        events: list[str] = []
+        real_copy = HistoryStore._copy_validated_member
+        real_hash = HistoryStore._hash_private_publication_descriptor
+        real_read = HistoryStore._read_private_copy_alone
+        real_recount = HistoryStore._recount_restored_table_counts
+        real_publish = HistoryStore._publish_replacement
+
+        def record_copy(source: Path, descriptor: int, *expected) -> None:
+            real_copy(source, descriptor, *expected)
+            events.append("copy")
+
+        def record_hash(descriptor: int) -> tuple[int, str]:
+            events.append("hash")
+            return real_hash(descriptor)
+
+        def record_read(
+            cls,
+            connection: sqlite3.Connection,
+            private_path: Path,
+        ) -> None:
+            events.append("check")
+            real_read(connection, private_path)
+
+        def record_recount(connection: sqlite3.Connection) -> None:
+            database_path = Path(str(connection.execute("PRAGMA database_list").fetchone()[2]))
+            events.append("recount:live" if database_path == self.live else "recount:private")
+            real_recount(connection)
+
+        def record_publish(
+            instance: HistoryStore,
+            temp_path: Path,
+            target_path: Path,
+            **kwargs,
+        ) -> None:
+            if target_path == self.live:
+                events.append("publish")
+            real_publish(instance, temp_path, target_path, **kwargs)
+
+        with (
+            patch.object(HistoryStore, "_copy_validated_member", staticmethod(record_copy)),
+            patch.object(
+                HistoryStore,
+                "_hash_private_publication_descriptor",
+                staticmethod(record_hash),
+            ),
+            patch.object(HistoryStore, "_read_private_copy_alone", classmethod(record_read)),
+            patch.object(
+                HistoryStore,
+                "_recount_restored_table_counts",
+                staticmethod(record_recount),
+            ),
+            patch.object(HistoryStore, "_publish_replacement", record_publish),
+        ):
+            store.restore_validated_member(
+                member,
+                size_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+                member_check=SystemBackupService._check_history_structure,
+            )
+
+        self.assertEqual(
+            events,
+            ["copy", "hash", "check", "publish", "hash", "hash", "recount:live"],
+        )
+        with sqlite3.connect(self.live) as connection:
+            stored = connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = 'metric_samples'"
+            ).fetchone()[0]
+            actual = connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
+        self.assertEqual(stored, actual)
+
     def test_multiply_linked_private_copy_is_refused(self) -> None:
         alias = self.root / "private-copy-alias.sqlite3"
 
@@ -154,32 +241,35 @@ class ImportPublicationBindingTests(refusal._ImportRootCleanup):
         self._assert_refused_unchanged(refused.exception, publication_seen=None)
 
     def test_private_copy_changed_before_publish_hash_is_refused(self) -> None:
-        real_hash = HistoryStore._hash_private_publication_descriptor
+        real_fsync = store_module.os.fsync
+        real_rename = HistoryStore._rename_at2
         changed = False
+        changed_path: Path | None = None
+        candidate_renames = 0
 
-        def rewrite_before_publish_hash(descriptor: int) -> tuple[int, str]:
-            nonlocal changed
-            connection = sys._getframe(1).f_locals.get("restore_connection")
-            if isinstance(connection, sqlite3.Connection):
-                try:
-                    connection.execute("SELECT 1")
-                except sqlite3.ProgrammingError:
-                    if not changed:
-                        changed = True
-                        private_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-                        self._rewrite_metric_in_place(private_path, suffix="before-publish-hash")
-            return real_hash(descriptor)
+        def rewrite_after_fsync(descriptor: int) -> None:
+            nonlocal changed, changed_path
+            real_fsync(descriptor)
+            descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if descriptor_path.name.endswith(".restore") and not changed:
+                changed = True
+                changed_path = descriptor_path
+                self._rewrite_metric_in_place(descriptor_path, suffix="before-publish-hash")
+
+        def observe_rename(source_path: Path, target_path: Path, *, flags: int) -> None:
+            nonlocal candidate_renames
+            if source_path == changed_path:
+                candidate_renames += 1
+            real_rename(source_path, target_path, flags=flags)
 
         with (
-            patch.object(
-                HistoryStore,
-                "_hash_private_publication_descriptor",
-                staticmethod(rewrite_before_publish_hash),
-            ),
+            patch.object(store_module.os, "fsync", side_effect=rewrite_after_fsync),
+            patch.object(HistoryStore, "_rename_at2", side_effect=observe_rename),
             self.assertRaises(ValueError) as refused,
         ):
             self._import(None)
         self.assertTrue(changed, "the pre-publish rewrite hook did not run")
+        self.assertEqual(candidate_renames, 0, "publication renamed bytes before checking them")
         self._assert_refused_unchanged(refused.exception, publication_seen=None)
 
     def test_live_file_rewritten_after_rename_is_rolled_back(self) -> None:

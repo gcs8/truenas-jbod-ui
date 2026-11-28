@@ -17,6 +17,7 @@ from collections import Counter
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -81,6 +82,11 @@ INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES = 2
 MIB = 1024 * 1024
 # Tables whose row counts history_table_counts tracks through triggers.
 HISTORY_COUNTED_TABLES = ("slot_events", "metric_samples", "metric_rollups")
+HISTORY_COUNT_TRIGGER_NAMES = frozenset(
+    f"count_{table_name}_{operation}"
+    for table_name in HISTORY_COUNTED_TABLES
+    for operation in ("insert", "delete")
+)
 # How long an index build waits for exact-count scans already running before it
 # starts anyway. New exact-count requests are deferred as soon as it waits.
 INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS = 60.0
@@ -705,6 +711,19 @@ CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS = 250_000
 SCHEMA = _BASE_SCHEMA + "".join(
     f"\n{statement};\n" for _, statement in CHRONOLOGICAL_INDEXES[:_SCHEMA_CHRONOLOGICAL_INDEX_COUNT]
 )
+
+
+@lru_cache(maxsize=1)
+def _history_count_trigger_contract() -> tuple[tuple[str, str], ...]:
+    """Return byte-exact count triggers from the canonical schema text."""
+    contract: list[tuple[str, str]] = []
+    for name in sorted(HISTORY_COUNT_TRIGGER_NAMES):
+        marker = f"CREATE TRIGGER IF NOT EXISTS {name}\n"
+        _, remainder = _BASE_SCHEMA.split(marker, 1)
+        body, _ = remainder.split("\nEND;", 1)
+        sql = f"CREATE TRIGGER {name}\n{body}\nEND"
+        contract.append((name, sql))
+    return tuple(contract)
 
 
 class HistoryIndexBuildCancelled(RuntimeError):
@@ -2834,6 +2853,12 @@ class HistoryStore:
                     # it is the only file checked and published (#1422).
                     self._copy_validated_member(source, temp_fd, *validated_content)
                     os.pwrite(temp_fd, _ROLLBACK_JOURNAL_FILE_FORMAT, _FILE_FORMAT_HEADER_OFFSET)
+                    # Bind publication before any SQLite checks. Those checks
+                    # are read-only, and every later publication hash must
+                    # still match these exact bytes (#1505).
+                    validation_content = self._hash_private_publication_descriptor(temp_fd)
+                else:
+                    validation_content = None
                 with ExitStack() as connections:
                     source_connection = (
                         connections.enter_context(closing(sqlite3.connect(str(source))))
@@ -2854,15 +2879,6 @@ class HistoryStore:
                     require_restorable_schema_version(
                         int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
                     )
-                    if validated_content is not None:
-                        # Recount before the validation hash: the counters are
-                        # derived from the checked data and must be part of the
-                        # exact bytes that every later hash must match (#1449).
-                        self._recount_restored_table_counts(restore_connection)
-                        restore_connection.commit()
-                        validation_content = self._hash_private_publication_descriptor(temp_fd)
-                    else:
-                        validation_content = None
                     # An import's member checks run again on the copy that is
                     # published, not only on the file validated earlier (#1422).
                     # The timestamp bound below is not part of them, so it
@@ -2884,20 +2900,10 @@ class HistoryStore:
                         self._recount_restored_table_counts(restore_connection)
                         restore_connection.commit()
 
-                publish_content = (
-                    self._hash_private_publication_descriptor(temp_fd)
-                    if validation_content is not None
-                    else None
-                )
-                if (
-                    validation_content is not None
-                    and publish_content != validation_content
-                ):
-                    raise ValueError(VALIDATED_MEMBER_CHANGED_MESSAGE)
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
                 publish_descriptor = temp_fd
                 temp_fd = None
-                if publish_content is None:
+                if validation_content is None:
                     self._publish_replacement(
                         temp_path,
                         self.file_path,
@@ -2914,6 +2920,13 @@ class HistoryStore:
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
                 self._normalize_database_permissions()
                 self._journal_mode_identity = None
+                if validation_content is not None:
+                    # Recount the published file while the history and store
+                    # locks remain held. The validated bytes are the publication
+                    # contract; derived counters change only after publication.
+                    with closing(self._connect(migration_lock_held=True)) as live_connection:
+                        self._recount_restored_table_counts(live_connection)
+                        live_connection.commit()
                 if self._initialize_enabled:
                     self._initialize_schema(migration_lock_held=True)
         finally:
@@ -2942,10 +2955,11 @@ class HistoryStore:
         SQLite side files next to the member refuse the restore. The member is
         opened once and copied through that descriptor into a private file;
         unless the copy has ``size_bytes`` and ``sha256``, the values recorded
-        when it was validated, nothing is restored. SQLite then reads that copy
-        as one file (see ``_read_private_copy_alone``). ``member_check`` and
-        the timestamp bound every incoming backup gets run on that copy, and
-        only that copy is published (#1422).
+        when it was validated, nothing is restored. The copy is hash-bound
+        before SQLite checks it, only unchanged bytes are published, and its
+        derived table counts are recomputed on the live file while the history
+        lock remains held. ``member_check`` and the timestamp bound every
+        incoming backup gets run on the private copy (#1422, #1505).
         """
         self._require_unsegmented_operation("v1 restore")
         try:
