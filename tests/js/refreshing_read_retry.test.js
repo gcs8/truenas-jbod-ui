@@ -285,13 +285,14 @@ function exportDialogHarness(responses) {
   const requests = [], statuses = [], downloads = [];
   const estimateElement = { innerHTML: "" };
   const confirm = { disabled: false, textContent: "Download copy", addEventListener(_event, handler) { this.click = handler; } };
+  const retryEstimate = { ...confirm, classList: { toggle(_name, hidden) { retryEstimate.hidden = hidden; } } };
   const dialog = { open: true, close() { this.open = false; } };
   const h = load([
     "refreshSnapshotExportEstimate", "exportEnclosureSnapshot", "syncSnapshotExportDialog",
     "renderSnapshotExportEstimate", "escapeHtml", "closeSnapshotExportDialog",
   ], {
-    state, Date: { now: () => clock.now },
-    exportSnapshotDialog: dialog, exportSnapshotConfirm: confirm,
+    state, AbortController, Date: { now: () => clock.now },
+    exportSnapshotDialog: dialog, exportSnapshotConfirm: confirm, exportEstimateRetry: retryEstimate,
     exportSnapshotEstimate: estimateElement, exportSnapshotNote: { textContent: "" },
     exportSnapshotWindowHint: null, exportRedactToggle: null, exportPackagingSelect: null,
     exportAllowOversizeToggle: null,
@@ -318,23 +319,26 @@ function exportDialogHarness(responses) {
   const start = APP_SOURCE.indexOf("  if (exportSnapshotConfirm) {", APP_SOURCE.indexOf('exportSnapshotCancel.addEventListener'));
   const end = APP_SOURCE.indexOf("  if (exportRedactToggle)", start);
   vm.runInContext(APP_SOURCE.slice(start, end), h.sandbox);
-  return { ...h, state, clock, requests, statuses, downloads, confirm, dialog, estimateElement };
+  return { ...h, state, clock, requests, statuses, downloads, confirm, retryEstimate, dialog, estimateElement };
 }
 
 test("the estimate retry action keeps the dialog settings and waits the full Retry-After", async () => {
   const h = exportDialogHarness(Array.from({ length: 4 }, () => httpResponse(503, { detail: "Still refreshing." }, "12")));
   await h.refreshSnapshotExportEstimate();
-  assert.equal(h.confirm.textContent, "Retry estimate");
+  assert.equal(h.confirm.textContent, "Download copy");
+  assert.equal(h.retryEstimate.hidden, false);
   assert.equal(h.confirm.disabled, false);
   assert.doesNotMatch(h.estimateElement.innerHTML, /unavailable|warning|error/i);
   assert.match(h.estimateElement.innerHTML, /still refreshing/i);
-  assert.deepEqual(h.waits, [12000, 12000, 12000]);
+  assert.deepEqual(h.waits, Array(3).fill(constantValue("BUSY_READ_RETRY_MAX_DELAY_MS")));
   assert.equal(h.requests.length, 4);
   // A manual retry is another estimate, never a download or a reopened dialog.
   let release;
   h.sandbox.waitMs = delay => new Promise(resolve => { h.waits.push(delay); release = resolve; });
-  h.confirm.click();
-  assert.equal(h.confirm.disabled, true);
+  h.retryEstimate.click();
+  assert.equal(h.retryEstimate.disabled, true);
+  assert.equal(h.confirm.disabled, false);
+  assert.equal(h.waits.at(-1), 12000);
   assert.equal(h.requests.length, 4, "the manual retry must wait for Retry-After");
   h.dialog.open = false;
   release();
@@ -343,6 +347,37 @@ test("the estimate retry action keeps the dialog settings and waits the full Ret
   assert.equal(h.state.export.packaging, "zip");
   assert.equal(h.state.export.redactSensitive, true);
   assert.equal(h.downloads.length, 0);
+});
+
+test("Download copy works during an automatic estimate retry", async () => {
+  const h = exportDialogHarness([httpResponse(503, {}, "60"), { ...httpResponse(200, {}), blob: async () => ({}) }]);
+  let release;
+  h.sandbox.waitMs = delay => new Promise(resolve => { h.waits.push(delay); release = resolve; });
+  const estimating = h.refreshSnapshotExportEstimate();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.waits[0], constantValue("BUSY_READ_RETRY_MAX_DELAY_MS"));
+  assert.equal(h.confirm.disabled, false);
+  h.confirm.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.requests[1].url, "/api/export/enclosure-snapshot");
+  assert.deepEqual(h.downloads, ["snapshot.zip"]);
+  release();
+  await estimating;
+  assert.equal(h.requests.length, 2);
+});
+
+test("Download copy uses the export route when estimate retries have paused", async () => {
+  const h = exportDialogHarness([
+    ...Array.from({ length: 4 }, () => httpResponse(503, {}, "2")),
+    { ...httpResponse(200, {}), blob: async () => ({}) },
+  ]);
+  await h.refreshSnapshotExportEstimate();
+  assert.equal(h.retryEstimate.hidden, false);
+  h.sandbox.waitMs = () => new Promise(() => {}); // Keep a misrouted estimate at its retry deadline.
+  h.confirm.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.requests.at(-1).url, "/api/export/enclosure-snapshot");
+  assert.deepEqual(h.downloads, ["snapshot.zip"]);
 });
 
 test("an explicit estimate retry succeeds without restarting the export", async () => {
@@ -409,19 +444,65 @@ test("closing the dialog during a busy download retry does not send another requ
 });
 
 test("reopening the dialog cannot revive a cancelled download retry", async () => {
-  const h = exportDialogHarness([httpResponse(503, { detail: "Still refreshing." }, "2")]);
+  let finish;
+  const h = exportDialogHarness([httpResponse(503, {}, "2"), new Promise(resolve => { finish = resolve; })]);
   await h.exportEnclosureSnapshot();
   let release;
   h.sandbox.waitMs = () => new Promise(resolve => { release = resolve; });
   const retry = h.exportEnclosureSnapshot();
+  assert.match(h.statuses.at(-1).text, /Trying the download again/);
   h.closeSnapshotExportDialog();
+  assert.match(h.statuses.at(-1).text, /retry cancelled/i);
   h.dialog.open = true;
+  h.syncSnapshotExportDialog();
+  assert.equal(h.confirm.textContent, "Download copy");
+  assert.equal(h.confirm.disabled, false);
+  const next = h.exportEnclosureSnapshot();
   release();
   await retry;
-  assert.equal(h.requests.length, 1, "a reopened dialog cannot authorize the earlier cancelled download");
-  assert.equal(h.dialog.open, true, "the earlier retry must not close the new dialog");
-  assert.equal(h.state.export.running, false);
-  assert.equal(h.downloads.length, 0);
+  assert.equal(h.requests.length, 2, "only the new dialog can start another request");
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.state.export.running, true, "the cancelled wait must not unlock the new download");
+  assert.equal(h.confirm.disabled, true);
+  finish({ ...httpResponse(200, {}), blob: async () => ({}) });
+  await next;
+  assert.deepEqual(h.downloads, ["snapshot.zip"]);
+});
+
+test("closing aborts the download and keeps it locked until the body settles", async () => {
+  let finishBody;
+  const h = exportDialogHarness([{ ...httpResponse(200, {}), blob: () => new Promise(resolve => { finishBody = resolve; }) }]);
+  const download = h.exportEnclosureSnapshot();
+  await new Promise(resolve => setImmediate(resolve));
+  const signal = h.requests[0].options.signal;
+  h.closeSnapshotExportDialog();
+  assert.equal(signal?.aborted, true, "Cancel must abort the export POST");
+  assert.equal(h.statuses.at(-1).text, "Download cancelled.");
+  h.dialog.open = true;
+  h.syncSnapshotExportDialog();
+  assert.equal(h.confirm.disabled, true);
+  await h.exportEnclosureSnapshot();
+  assert.equal(h.requests.length, 1, "no second POST before the cancelled one settles");
+  finishBody({}); // A late success despite abort must not deliver a file or close the new dialog.
+  await download;
+  assert.deepEqual(h.downloads, []);
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.confirm.disabled, false);
+  assert.equal(h.statuses.at(-1).text, "Download cancelled.");
+});
+
+test("a late busy response cannot offer a retry in another system's dialog", async () => {
+  const h = exportDialogHarness([]);
+  let respond;
+  h.sandbox.fetch = () => new Promise(resolve => { respond = resolve; });
+  const download = h.exportEnclosureSnapshot();
+  h.closeSnapshotExportDialog();
+  h.sandbox.currentUiScopeKey = () => "second-system";
+  h.dialog.open = true;
+  respond(httpResponse(503, {}, "5"));
+  await download;
+  assert.equal(h.confirm.textContent, "Download copy");
+  assert.doesNotMatch(h.sandbox.exportSnapshotNote.textContent, /retry the download/i);
 });
 
 test("a waiting download retry cannot follow a different scope or changed settings", async () => {
@@ -436,6 +517,7 @@ test("a waiting download retry cannot follow a different scope or changed settin
     release();
     await retry;
     assert.equal(h.requests.length, 1, change);
+    assert.match(h.statuses.at(-1).text, /retry cancelled/i);
     assert.equal(h.state.export.running, false);
     assert.equal(h.downloads.length, 0);
   }
