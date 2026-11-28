@@ -305,7 +305,9 @@ test("Sol: the crawler opens the load window around navigation and reloads only 
   };
   const crawler = Object.create(Crawler.prototype);
   Object.assign(crawler, { guard: g, inventory: inv, page, widths: [1600], lastLoad: 0, paceMs: 0, settleMs: 0, readyTimeoutMs: 1, fixtureMode: false, writeSystem: null, log() {}, debug() {}, setWidth: async () => {} });
-  await crawler.load({ page: "main", ready: null, url: `${ORIGIN}/?system_id=sys-q`, system: "sys-q", platform: "quantastor" });
+  const target = { page: "main", ready: null, url: `${ORIGIN}/?system_id=sys-q`, system: "sys-q", platform: "quantastor" };
+  crawler.beginDocument(target, inventory.expandStates(inv).find(({ id }) => id === "main.default"));
+  await crawler.load(target);
   assert.equal(results[0].allowed, true, JSON.stringify(results[0]));
   // The follow-up forced storage-view read may come long after ready; the
   // window stays open (for those declared reads only) until the state ends.
