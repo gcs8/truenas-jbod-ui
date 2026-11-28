@@ -1726,7 +1726,7 @@ function buildTopologyModel(given, options = {}) {
       // A card reports its own record, even when a competing link lists a different width.
       const previous = group.reportedById.get(item.id);
       if (previous === undefined || signature < previous) group.reportedById.set(item.id, signature);
-      laneRecords.push({ key, source: item.source, target: item.target, lanes: item.reported_lanes });
+      laneRecords.push({ key, id: item.id, source: item.source, target: item.target, lanes: item.reported_lanes });
     }
     // Every record the payload carries of each node id: a Linux cable's
     // child is what all of its records report.

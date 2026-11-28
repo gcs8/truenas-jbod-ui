@@ -966,6 +966,21 @@ test("competing Linux cable records with different PHY lists stay unverified in 
   }
 });
 
+test("a second Linux link ID claiming identical PHYs counts even when its record is not drawn", () => {
+  for (const duplicateId of [false, true]) for (const first of [true, false]) {
+    const item = fixture("dual-domain-linux");
+    const [link, other] = item.fabric.links.filter((entry) => entry.reported_lanes);
+    const rival = structuredClone(link);
+    rival.id = duplicateId ? other.id : "other-cable";
+    beside(item.fabric.links, duplicateId ? other : link, rival, first);
+    const built = model(item);
+    const reason = /which PHYs the cable uses is not read .*a second link ID between these ends also claims it/;
+    assert.match(lanesCard(built, link), reason);
+    if (!duplicateId || first) assert.match(lanesCard(built, rival), reason);
+    assert.match(textOf(checksOf(built, "lanes")), /a second link ID between these ends also claims it/);
+  }
+});
+
 test("two link IDs cannot verify two cables on the same four PHY pairs", () => {
   for (const sameId of [true, false]) for (const first of [true, false]) {
     const data = core();
