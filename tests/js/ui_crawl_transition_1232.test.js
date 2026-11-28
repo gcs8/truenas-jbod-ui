@@ -449,8 +449,37 @@ test("a follow-on request gets a fresh quiet interval but shares the original se
   await new Promise(setImmediate);
   assert.equal(page.url(), "about:blank", "the original 30 s cap is not extended by the chain or its quiet interval");
   const result = await record;
-  assert.deepEqual(result.findings, [], "all requests settled before the cap");
-  assert.equal(result.status, "done");
+  assert.deepEqual(result.findings.map(({ type, severity, text }) => ({ type, severity, text })), [
+    { type: "settle-timeout", severity: "error", text: "document did not stay quiet for 150 ms within 30000 ms" },
+  ]);
+  assert.equal(result.status, "error");
+});
+
+test("a chain that refills until the cap blocks its own state even when the last request finished", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { crawler, page, requests: [first], start, finish } = await requestCrawler(t, { pathname: SMART_BATCH, stepRequests: 1 });
+  const run = crawler.crawlState(MAIN, stateById("main.default"));
+  await new Promise(setImmediate);
+  let request = first;
+  for (let i = 0; i < 300; i += 1) {
+    if (i > 0) {
+      t.mock.timers.tick(50);
+      request = { ...first };
+      start(request);
+    }
+    t.mock.timers.tick(50);
+    finish(request);
+  }
+  await new Promise(setImmediate);
+  assert.equal(page.url(), MAIN.url, "a chain with 50 ms gaps has not settled before the cap");
+  t.mock.timers.tick(50);
+  const record = await run;
+  const next = await crawler.crawlState(HISTORY, stateById("history.default"));
+  assert.deepEqual(next.findings, []);
+  assert.equal(record.status, "error");
+  assert.deepEqual(record.findings.map(({ type, severity, text }) => ({ type, severity, text })), [
+    { type: "settle-timeout", severity: "error", text: "document did not stay quiet for 150 ms within 30000 ms" },
+  ]);
 });
 
 test("reload preserves the outgoing load window while draining and settles both requests before a busy retry", async (t) => {

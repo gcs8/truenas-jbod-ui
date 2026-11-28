@@ -494,6 +494,9 @@ class Crawler {
       };
       const deadline = setTimeout(() => {
         owner.timedOut = new WeakSet(owner.pending);
+        if (!owner.pending.size) {
+          this.documentFinding(owner, "settle-timeout", "error", `document did not stay quiet for ${REQUEST_QUIET_MS} ms within ${REQUEST_SETTLE_MS} ms`);
+        }
         for (const request of owner.pending) {
           this.documentFinding(owner, "settle-timeout", "error", `${requestName(request)} did not settle within ${REQUEST_SETTLE_MS} ms`);
         }
