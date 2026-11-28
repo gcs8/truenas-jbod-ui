@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import sys
 from typing import Any
@@ -184,9 +185,25 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
                 raise HTTPException(status_code=409, detail=f"{rejection} Verify it, or use another copy.") from exc
             raise HTTPException(status_code=502, detail=f"Could not read the backup: {describe_error(exc)}") from exc
         filename = record.name.rsplit("/", 1)[-1]
-        chunks = iter(lambda: handle.read(_STREAM_CHUNK_BYTES), b"")
+
+        def chunks():
+            digest, size, held = hashlib.sha256(), 0, b""
+            try:
+                while chunk := handle.read(_STREAM_CHUNK_BYTES):
+                    if held:
+                        yield held
+                    held = chunk
+                    digest.update(chunk)
+                    size += len(chunk)
+                if (size, digest.hexdigest()) != (record.size, record.sha256):
+                    raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+                if held:
+                    yield held
+            finally:
+                stack.close()
+
         return StreamingResponse(
-            chunks,
+            chunks(),
             media_type="application/octet-stream",
             headers={
                 "Content-Disposition": _attachment(filename),

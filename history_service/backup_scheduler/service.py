@@ -2248,7 +2248,7 @@ def _verified_file(
     descriptor = os.open(path, flags, dir_fd=directory)
     with os.fdopen(descriptor, "rb") as handle:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
+            raise ArchiveIntegrityError("The copy is not a regular file.")
         digest = hashlib.sha256()
         size = 0
         while chunk := handle.read(_COPY_CHUNK):
