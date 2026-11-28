@@ -251,7 +251,8 @@ test("known physical disk keeps bay labels and alias identity", () => {
   assert.equal(ui.elements.get("fabric-inspector-title").textContent, "Selected Bay 00");
   assert.match(ui.elements.get("fabric-inspector-body").innerHTML, /Selected Bay<\/span>/);
   assert.match(ui.renderDiskPathMode(ui.fabric), /<strong>Bay 00<\/strong>/);
-  assert.match(ui.renderDiskPathMode(ui.fabric), /Backplane Zone/);
+  assert.match(ui.renderDiskPathMode(ui.fabric), /Enclosure not read/);
+  assert.doesNotMatch(ui.renderDiskPathMode(ui.fabric), /Backplane Zone/);
   assert.match(ui.elements.get("fabric-inspector-body").innerHTML, /data-fabric-alias-edit="bay:0"/);
 });
 

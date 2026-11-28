@@ -23,7 +23,9 @@ for (const [name, fabric] of Object.entries(H.producerCases()).map(([name, entry
         assert.ok(label, link.id);
         const visible = texts(label[3]).join(" ");
         assert.ok(visible.length > 0);
-        assert.ok(decode(label[2]).startsWith(`${visible}, Link `), `${visible} must lead ${decode(label[2])}`);
+        // Approved design: a path into a physical enclosure is named "Path ..."; any other link "Link ...".
+        const noun = link.bundle && model.groupById.get(link.target)?.enclosure ? "Path" : "Link";
+        assert.ok(decode(label[2]).startsWith(`${visible}, ${noun} `), `${visible} must lead ${decode(label[2])}`);
         if (pinned) assert.match(label[0], /is-pinned/);
       }
     });

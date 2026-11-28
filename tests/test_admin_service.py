@@ -2097,7 +2097,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("bestDiagnosticNode", script_text)
         self.assertIn("defaultSelectionRef", script_text)
         self.assertIn("data-fabric-mode-target", script_text)
-        self.assertIn("Backplane Zone", script_text)
+        self.assertIn("Enclosure not read", script_text)
+        self.assertNotIn("Backplane Zone", script_text)
         self.assertIn("disk-path-board", script_text)
         self.assertIn("disk-path-bay-layout", script_text)
         self.assertIn("tooltipText", script_text)
@@ -4699,7 +4700,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             return_value=MagicMock(
                 enclosures=[
                     EnclosureOption(
-                        id="50030480090c4f7f",
+                        id="5000c500ee000001",
                         label="Front 24 Bay",
                         name="SES Front 24",
                         rows=6,
@@ -4726,7 +4727,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["system_id"], "archive-core")
-        self.assertEqual(payload["enclosures"][0]["id"], "50030480090c4f7f")
+        self.assertEqual(payload["enclosures"][0]["id"], "5000c500ee000001")
         self.assertEqual(payload["enclosures"][0]["label"], "Front 24 Bay")
         self.assertEqual(payload["enclosures"][0]["profile_id"], "supermicro-ssg-6048r-front-24")
         self.assertEqual(payload["enclosures"][0]["profile_label"], "Supermicro SSG-6048R Front 24")

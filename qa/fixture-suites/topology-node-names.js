@@ -4,7 +4,7 @@ const { test, expect } = require("@playwright/test");
 const fs = require("node:fs");
 const path = require("node:path");
 const H = require("../../tests/js/helpers/fabric_topology");
-const { recorderFabric } = require("../../tests/js/helpers/topology_node_names");
+const { recorderFabric, overflowFabric } = require("../../tests/js/helpers/topology_node_names");
 
 async function nativeNames(page, session) {
   const selector = "#fabric-map-panel :is(.topo-node, .topo-link-label, .topo-bay, .topo-expand)[role=button]";
@@ -34,7 +34,7 @@ async function nativeNames(page, session) {
 }
 
 module.exports = function register({ fixture, routeSynthetic, capture, axeViolations, viewports, origin }) {
-  for (const [shape, build] of [["sas", () => structuredClone(H.producerCases().core_cascade.fabric)], ["recorder", recorderFabric]]) {
+  for (const [shape, build] of [["sas", () => structuredClone(H.producerCases().core_cascade.fabric)], ["recorder", recorderFabric], ["overflow", overflowFabric]]) {
     for (const viewport of viewports) {
       test(`Topology node names preserve ${shape} visible text at ${viewport.width} px`, async ({ page }) => {
         test.setTimeout(90_000);
@@ -45,6 +45,9 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
           fabric.system_id = bootstrap.systemId;
           fabric.selected_enclosure_id = bootstrap.enclosureId;
           bootstrap.fabric = fabric;
+          // Inventory layout rows spread a bay's paths into one mark each; the
+          // +N overflow is the bay-number-order fallback's shape.
+          if (shape === "overflow" && bootstrap.snapshot) delete bootstrap.snapshot.layout_rows;
           return `window.SAS_FABRIC_BOOTSTRAP = ${JSON.stringify(bootstrap)};`;
         });
         const errors = await routeSynthetic(page, html, { fabric });
@@ -57,15 +60,26 @@ module.exports = function register({ fixture, routeSynthetic, capture, axeViolat
         const panel = page.locator("#fabric-map-panel");
         await expect(panel.locator(".topo-node.kind-host")).toBeVisible();
         expect(await page.evaluate(() => innerWidth)).toBe(viewport.width);
-        if (shape === "recorder") {
+        if (shape !== "sas") {
           await expect(panel.locator(".topo-node.kind-path text").first()).toContainText("…");
           await expect(panel.locator(".topo-bay")).toHaveCount(4);
         }
+        if (shape === "overflow") {
+          await expect(panel.locator(".topo-path-more").first()).toBeVisible();
+          const bay = panel.locator(".topo-bay").filter({ has: page.locator(".topo-path-more") }).first();
+          const count = await bay.locator(".topo-path-more").textContent();
+          expect(await bay.getAttribute("aria-label")).toContain(count);
+        }
+        await expect(panel.locator("title, [title]")).toHaveCount(0);
+        const hba = panel.locator(".topo-node.kind-controller").first();
+        await hba.hover();
+        await expect(panel.locator("[data-topology-tip]")).toBeVisible();
+        await page.mouse.move(0, 0);
         const session = await page.context().newCDPSession(page);
         const observations = [];
         for (const state of ["unpinned", "pinned"]) {
           if (state === "pinned") {
-            const node = panel.locator(shape === "recorder" ? ".topo-node.kind-path" : ".topo-node.kind-expander").first();
+            const node = panel.locator(shape !== "sas" ? ".topo-node.kind-path" : ".topo-node.kind-expander").first();
             await node.focus();
             await node.press("Enter");
             await expect(panel.locator(".topo-node.is-pinned")).toHaveCount(1);

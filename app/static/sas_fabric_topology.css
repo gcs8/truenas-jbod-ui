@@ -319,6 +319,20 @@ body.fabric-topology-mode .fabric-page-shell {
   stroke: var(--panel-border);
 }
 
+/* A physical enclosure: its head is the enclosure's node inside its bay
+   block, so the head's own box shows only when it is traced, focused or
+   pinned. The edge caption names the enclosure view's front edge. */
+.fabric-topology-svg .topo-enclosure-head > rect {
+  fill: transparent;
+  stroke: transparent;
+}
+
+.fabric-topology-svg .topo-edge-caption {
+  fill: var(--muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .fabric-topology-svg .topo-node.mark-parent-unknown > rect {
   stroke: var(--unmapped);
   stroke-dasharray: 5 3;
@@ -449,6 +463,11 @@ body.fabric-topology-mode .fabric-page-shell {
 }
 
 .fabric-topology-svg .topo-bay .topo-bay-number {
+  font-size: 0.75rem;
+}
+
+.fabric-topology-svg .topo-bay .topo-bay-device {
+  fill: var(--muted);
   font-size: 0.75rem;
 }
 
@@ -592,4 +611,321 @@ body.fabric-topology-mode .fabric-page-shell {
     width: 100%;
     min-width: 15rem;
   }
+}
+
+/* r2: boards. The strip a board's expander chips stand in, each chip's bus
+   along the strip's edge, and each bay's ports on the buses. */
+.fabric-topology-svg .topo-board-strip {
+  fill: color-mix(in srgb, var(--healthy) 10%, var(--surface));
+  stroke: var(--panel-border);
+}
+
+.fabric-topology-svg .topo-link.is-bus {
+  stroke-width: 2;
+  stroke-opacity: 0.85;
+}
+
+.fabric-topology-swatch.is-bus {
+  border-top-width: 2px;
+}
+
+.fabric-topology-svg .topo-port-hit {
+  fill: transparent;
+  stroke: transparent;
+}
+
+.fabric-topology-svg .topo-link.topo-port-stub {
+  stroke-width: 1.5;
+  stroke-dasharray: none;
+}
+
+.fabric-topology-svg .topo-port.is-on-path + .topo-port-stub {
+  stroke: var(--selected);
+}
+
+.fabric-topology-svg .topo-port.is-dim + .topo-port-stub {
+  opacity: 0.3;
+}
+
+.fabric-topology-svg .topo-port.is-on-path > .topo-port-hit {
+  stroke-width: 1;
+}
+
+/* Warning is orange and critical red. The yellow of the page's palette is
+   an HBA's line colour here, so it is not a warning's. */
+.fabric-topology {
+  --topology-warning: var(--unmapped);
+}
+
+/* A wiring check's flag: a triangle on the item and a line in the list. */
+.topo-flag-shape.tier-warning {
+  fill: var(--topology-warning);
+}
+
+.topo-flag-shape {
+  fill: var(--fault);
+  stroke: var(--surface);
+  stroke-width: 1;
+}
+
+.topo-flag-mark {
+  fill: none;
+  stroke: var(--surface);
+  stroke-width: 1.75;
+  stroke-linecap: round;
+}
+
+.topo-flag-mark.is-small {
+  stroke-width: 1.25;
+}
+
+.fabric-topology-svg .topo-link-label.is-flagged.tier-warning .topo-label-box,
+.fabric-topology-svg .topo-node.is-flagged.tier-warning:not(.topo-enclosure-head) > rect {
+  stroke: var(--topology-warning);
+}
+
+.fabric-topology-svg .topo-link-label.is-flagged.tier-critical .topo-label-box,
+.fabric-topology-svg .topo-node.is-flagged.tier-critical:not(.topo-enclosure-head) > rect {
+  stroke: var(--fault);
+}
+
+.fabric-topology-checks {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 0.8125rem;
+}
+
+.fabric-topology-checks-title {
+  margin: 0 0 6px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.fabric-topology-checks-title .subtle {
+  margin-left: 8px;
+  font-weight: 400;
+}
+
+.fabric-topology-checks ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 34rem), 1fr));
+  gap: 6px 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fabric-topology-check {
+  display: grid;
+  grid-template-columns: 5.2rem minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  min-width: 0;
+}
+
+.fabric-topology-check-status {
+  padding: 1px 6px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  font-family: var(--mono, monospace);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.fabric-topology-check.is-pass .fabric-topology-check-status {
+  border-color: var(--healthy);
+  color: var(--healthy);
+}
+
+.fabric-topology-check.is-warning .fabric-topology-check-status {
+  border-color: var(--topology-warning);
+  background: var(--topology-warning);
+  color: var(--surface);
+}
+
+/* The page's fault red reaches only 4.24:1 against any palette text, so the
+   badge keeps the red as its border on a deep red fill under the page text. */
+.fabric-topology-check.is-critical .fabric-topology-check-status {
+  border-color: var(--fault);
+  background: color-mix(in srgb, var(--fault) 35%, var(--surface));
+  color: var(--text);
+}
+
+.fabric-topology-check.is-not-read .fabric-topology-check-status {
+  border-color: var(--unmapped);
+  border-style: dashed;
+  color: var(--unmapped);
+}
+
+.fabric-topology-check-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology-check-title {
+  font-weight: 600;
+}
+
+.fabric-topology-check-line {
+  color: var(--text);
+}
+
+.fabric-topology-check.is-pass .fabric-topology-check-line,
+.fabric-topology-check-note {
+  color: var(--muted);
+}
+
+/* The hover card: beside the pointer or the focused item, over the drawing,
+   never taking the pointer. */
+.fabric-topology {
+  position: relative;
+}
+
+.fabric-topology > .fabric-topology-tip {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  /* The label column takes what its labels need, up to two fifths of the
+     card; the value column always keeps the rest, so a long label can never
+     squeeze a value into a column of single characters. Long unbroken
+     tokens (device names, addresses) wrap inside their own column. */
+  grid-template-columns: fit-content(40%) minmax(0, 1fr);
+  gap: 2px 10px;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: min(18rem, 92%);
+  max-width: min(28rem, 92%);
+  padding: 8px 10px;
+  border: 1px solid var(--selected);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 45%);
+  color: var(--text);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.fabric-topology > .fabric-topology-tip > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fabric-topology > .fabric-topology-tip[hidden] {
+  display: none;
+}
+
+.topo-tip-title {
+  grid-column: 1 / -1;
+  font-size: 0.8125rem;
+}
+
+.topo-tip-label {
+  color: var(--muted);
+}
+
+:is(.topo-tip-label, .topo-tip-value).is-caution,
+.kv-row.topo-caution .kv-value {
+  color: var(--topology-warning);
+  font-weight: 600;
+}
+
+:is(.topo-tip-label, .topo-tip-value).is-warn,
+.kv-row.topo-warn .kv-value {
+  color: var(--fault);
+  font-weight: 600;
+}
+
+/* r3: the SAS table the Topology drawing adds to the page's inspector. */
+.fabric-topology-sas .kv-grid {
+  font-size: 0.8125rem;
+}
+
+/* r4: Clear selection is in the bar only while something is pinned or
+   searched for; the page's button rule would show it regardless. */
+.fabric-topology .fabric-topology-clear[hidden] {
+  display: none;
+}
+
+/* r6: two head ends on one backplane. The head end this page is on has a
+   heavier outline; nothing else about the drawing depends on it. */
+.fabric-topology-svg .topo-node.is-own-view > rect {
+  stroke: var(--text);
+  stroke-width: 1.5;
+}
+
+/* r7: "What the SAS transport adds". Measured facts have a filled marker,
+   what is inferred or still not read an open one. */
+.fabric-topology-adds {
+  margin: 10px 0 12px;
+}
+
+.fabric-topology-adds-list {
+  display: grid;
+  gap: 3px;
+  margin: 6px 0 0;
+  padding: 0;
+  max-width: 110rem;
+  list-style: none;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+.fabric-topology-adds-item {
+  position: relative;
+  padding-left: 18px;
+  color: var(--text);
+}
+
+.fabric-topology-adds-item::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0.45em;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--healthy);
+  border-radius: 50%;
+  background: var(--healthy);
+}
+
+.fabric-topology-adds-item.is-open {
+  color: var(--muted);
+}
+
+.fabric-topology-adds-item.is-open::before {
+  border-color: var(--muted);
+  background: none;
+}
+
+/* r7b: a cascade stub: the enclosure before or after this one in the chain.
+   Dashed, because its bays are not drawn here; a link when its enclosure is
+   known. */
+.fabric-topology-svg .topo-node.topo-stub > rect {
+  stroke-dasharray: 5 3;
+}
+
+.fabric-topology-svg a.topo-node {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.fabric-topology-svg a.topo-node:hover > rect,
+.fabric-topology-svg a.topo-node:focus-visible > rect {
+  stroke: var(--selected);
+  stroke-dasharray: none;
+}
+
+.fabric-topology-svg a.topo-node:focus-visible {
+  outline: none;
+}
+
+.fabric-topology-svg a.topo-node .topo-node-fact:last-of-type {
+  fill: var(--selected);
 }

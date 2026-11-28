@@ -6,12 +6,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -55,49 +63,40 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -110,6 +109,19 @@
           "source": "bay:0",
           "status": null,
           "target": "pool:tank"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -139,37 +151,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -272,6 +253,57 @@
           "alias": null,
           "controller_id": null,
           "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
           "evidence": [],
           "id": "host",
           "kind": "host",
@@ -312,6 +344,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -440,7 +473,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0"
@@ -456,7 +488,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -542,12 +573,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -591,49 +630,40 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -646,6 +676,19 @@
           "source": "bay:0",
           "status": null,
           "target": "pool:tank"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -675,37 +718,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -808,6 +820,57 @@
           "alias": null,
           "controller_id": null,
           "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
           "evidence": [],
           "id": "host",
           "kind": "host",
@@ -848,6 +911,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -976,7 +1040,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0"
@@ -992,7 +1055,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -1078,12 +1140,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -1127,30 +1197,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -1236,21 +1312,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -1262,6 +1323,19 @@
           "source": "bay:0",
           "status": null,
           "target": "pool:tank"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -1304,37 +1378,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -1430,6 +1473,57 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -1576,6 +1670,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -1704,7 +1799,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -1721,7 +1815,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -1814,6 +1907,11 @@
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -1857,30 +1955,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": null,
-          "slots": "01",
-          "status": null,
-          "type": "Unknown",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -1966,21 +2070,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -2007,6 +2096,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -2049,37 +2151,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -2175,6 +2246,57 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -2321,6 +2443,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -2449,7 +2572,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -2467,7 +2589,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -2560,6 +2681,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -2580,21 +2706,6 @@
       "enclosures": [],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -2634,37 +2745,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -2861,7 +2941,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -2876,7 +2955,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -2960,12 +3038,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -2988,30 +3074,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -3097,21 +3189,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -3138,6 +3215,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -3180,37 +3270,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -3285,6 +3344,57 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -3431,6 +3541,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -3559,7 +3670,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -3577,7 +3687,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -3664,12 +3773,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -3713,30 +3830,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -3822,21 +3945,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -3863,6 +3971,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -3905,37 +4026,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -4031,6 +4121,57 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -4177,6 +4318,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -4305,7 +4447,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -4323,7 +4464,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -4410,12 +4550,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -4459,30 +4607,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -4568,21 +4722,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -4609,6 +4748,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -4651,37 +4803,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -4782,6 +4903,57 @@
         },
         {
           "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
           "controller_id": "controller:mpr0",
           "display_label": null,
           "evidence": [
@@ -4923,6 +5095,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -5051,7 +5224,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -5069,7 +5241,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -5156,12 +5327,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -5205,30 +5384,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -5314,21 +5499,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -5355,6 +5525,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -5397,37 +5580,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -5528,6 +5680,57 @@
         },
         {
           "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
           "controller_id": "controller:mpr0",
           "display_label": null,
           "evidence": [
@@ -5669,6 +5872,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -5797,7 +6001,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -5815,7 +6018,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -5902,12 +6104,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -5951,30 +6161,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -6060,21 +6276,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -6101,6 +6302,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -6143,37 +6357,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -6274,6 +6457,57 @@
         },
         {
           "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
           "controller_id": "controller:mpr0",
           "display_label": null,
           "evidence": [
@@ -6415,6 +6649,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -6543,7 +6778,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -6561,7 +6795,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -6650,21 +6883,6 @@
       "expanders": [],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -6692,37 +6910,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -6857,7 +7044,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -6872,7 +7058,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -6960,21 +7145,6 @@
       "expanders": [],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -7028,37 +7198,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -7228,7 +7367,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -7243,7 +7381,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -7707,6 +7844,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -7727,21 +7869,6 @@
       "enclosures": [],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -7781,37 +7908,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -8012,7 +8108,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -8027,7 +8122,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -8119,6 +8213,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {
             "active": 1
@@ -8143,21 +8242,6 @@
       "enclosures": [],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -8225,37 +8309,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -8503,7 +8556,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "host-controller:host->controller:mpr0",
             "controller-path:controller:mpr0->path:mpr0:active",
             "path-bay:path:mpr0:active->bay:0:0",
@@ -8527,7 +8579,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "controller:mpr0",
             "path:mpr0:active",
             "pool:tank",
@@ -8662,21 +8713,6 @@
       "expanders": [],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -8704,37 +8740,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -8878,7 +8883,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -8893,7 +8897,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -8979,12 +8982,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": null,
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -9028,30 +9039,36 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -9137,21 +9154,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -9178,6 +9180,19 @@
           "source": "controller:mpr0",
           "status": null,
           "target": "expander:controller:mpr0:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
         },
         {
           "evidence": [],
@@ -9220,37 +9235,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -9346,6 +9330,57 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -9492,6 +9527,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -9617,7 +9653,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -9635,7 +9670,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -9722,12 +9756,20 @@
       "controllers": [
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": "SAS3008",
           "device": "/dev/mpr0",
           "firmware": "16.00.12.00",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -9769,12 +9811,20 @@
         },
         {
           "acpi_handle": null,
+          "ambiguous_device_handles": [
+            "000b"
+          ],
           "board": "Synthetic HBA",
           "chip": "SAS3008",
           "device": "/dev/mpr1",
           "firmware": "16.00.12.00",
           "id": "controller:mpr1",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
           "name": "mpr1",
           "path_counts": {},
           "pci": null,
@@ -9818,57 +9868,53 @@
       "enclosures": [
         {
           "alias": null,
-          "controller_id": "controller:mpr0",
           "device_count": 1,
           "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr0:0010",
-          "kind": "mpr-enclosure",
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
           "label": "5000000000000001",
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0010",
+            "mpr-enclosure:controller:mpr1:0010"
+          ],
           "logical_id": "5000000000000001",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr0:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 0
+            },
+            {
+              "controller_id": "controller:mpr1",
+              "enc_handle": "0010",
+              "id": "mpr-enclosure:controller:mpr1:0010",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 1,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "01"
+              },
+              "unit": 1
+            }
+          ],
           "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 0
-        },
-        {
-          "alias": null,
-          "controller_id": "controller:mpr1",
-          "device_count": 1,
-          "display_label": null,
-          "enc_handle": "0010",
-          "fabric_scope": "selected_enclosure",
-          "id": "mpr-enclosure:controller:mpr1:0010",
-          "kind": "mpr-enclosure",
-          "label": "5000000000000001",
-          "logical_id": "5000000000000001",
-          "raw_id": "5000000000000001",
-          "related_slots": [
-            0
-          ],
-          "selected_bay_count": 1,
-          "selected_disk_count": 1,
-          "selected_disk_slots": [
-            0
-          ],
-          "selected_enclosure_candidate": true,
-          "sep_handle": "000b",
-          "slots": "01",
-          "status": null,
-          "type": "External SES-2",
-          "unit": 1
+          "related_slots": [],
+          "status": null
         }
       ],
       "expanders": [
@@ -10033,21 +10079,6 @@
       ],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -10089,6 +10120,32 @@
           "source": "controller:mpr1",
           "status": null,
           "target": "expander:controller:mpr1:5000000000000002"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr0:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr0:0010"
+        },
+        {
+          "evidence": [
+            "SES enclosure logical id"
+          ],
+          "id": "enclosure-observation:enclosure:5000000000000001->mpr-enclosure:controller:mpr1:0010",
+          "kind": "enclosure-observation",
+          "related_slots": [],
+          "reported_lanes": null,
+          "slot": null,
+          "source": "enclosure:5000000000000001",
+          "status": null,
+          "target": "mpr-enclosure:controller:mpr1:0010"
         },
         {
           "evidence": [],
@@ -10157,37 +10214,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -10356,6 +10382,75 @@
           "related_slots": [
             0
           ],
+          "slot": null,
+          "status": null
+        },
+        {
+          "alias": null,
+          "controller_id": null,
+          "display_label": null,
+          "evidence": [
+            "SES enclosure logical id",
+            "mprutil -u 0 show enclosures",
+            "mprutil -u 1 show enclosures"
+          ],
+          "id": "enclosure:5000000000000001",
+          "kind": "enclosure",
+          "label": "5000000000000001",
+          "metrics": {
+            "device_count": 1,
+            "selected_bay_count": 1,
+            "selected_disk_count": 1,
+            "selected_disk_slots": [
+              0
+            ],
+            "selected_enclosure": true,
+            "slots": "01"
+          },
+          "raw": {
+            "device_count": 1,
+            "legacy_alias_ids": [
+              "mpr-enclosure:controller:mpr0:0010",
+              "mpr-enclosure:controller:mpr1:0010"
+            ],
+            "logical_id": "5000000000000001",
+            "observations": [
+              {
+                "controller_id": "controller:mpr0",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr0:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 0
+              },
+              {
+                "controller_id": "controller:mpr1",
+                "enc_handle": "0010",
+                "id": "mpr-enclosure:controller:mpr1:0010",
+                "metrics": {
+                  "device_count": 1,
+                  "selected_bay_count": 1,
+                  "selected_disk_count": 1,
+                  "selected_disk_slots": [
+                    0
+                  ],
+                  "selected_enclosure": true,
+                  "slots": "01"
+                },
+                "unit": 1
+              }
+            ]
+          },
+          "raw_id": "5000000000000001",
+          "related_slots": [],
           "slot": null,
           "status": null
         },
@@ -10601,6 +10696,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr0:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -10646,6 +10742,7 @@
             "fabric_scope": "selected_enclosure",
             "id": "mpr-enclosure:controller:mpr1:0010",
             "logical_id": "5000000000000001",
+            "physical_enclosure_id": "enclosure:5000000000000001",
             "selected_bay_count": 1,
             "selected_disk_count": 1,
             "selected_disk_slots": [
@@ -10785,7 +10882,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
             "host-controller:host->controller:mpr0",
@@ -10806,7 +10902,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0",
             "controller:mpr0",
@@ -10898,21 +10993,6 @@
       "expanders": [],
       "links": [
         {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
-        {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
           "kind": "bay-pool",
@@ -10940,37 +11020,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -11114,7 +11163,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -11129,7 +11177,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -11221,6 +11268,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "unreadable",
+            "expanders": "unreadable"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -11241,21 +11293,6 @@
       "enclosures": [],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -11295,37 +11332,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -11522,7 +11528,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -11537,7 +11542,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],
@@ -11629,6 +11633,11 @@
           "firmware": "1.2.3",
           "id": "controller:mpr0",
           "iocfacts": {},
+          "mpr_lists": {
+            "devices": "not_read",
+            "enclosures": "empty",
+            "expanders": "empty"
+          },
           "name": "mpr0",
           "path_counts": {},
           "pci": null,
@@ -11649,21 +11658,6 @@
       "enclosures": [],
       "expanders": [],
       "links": [
-        {
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane-bay:backplane:0->bay:0:0",
-          "kind": "backplane-bay",
-          "related_slots": [
-            0
-          ],
-          "reported_lanes": null,
-          "slot": 0,
-          "source": "backplane:0",
-          "status": null,
-          "target": "bay:0"
-        },
         {
           "evidence": [],
           "id": "bay-pool:bay:0->pool:tank:0",
@@ -11703,37 +11697,6 @@
         }
       ],
       "nodes": [
-        {
-          "alias": null,
-          "controller_id": null,
-          "display_label": null,
-          "evidence": [
-            "profile slot layout"
-          ],
-          "id": "backplane:0",
-          "kind": "backplane",
-          "label": "Backplane Zone 1",
-          "metrics": {
-            "slot_count": 1,
-            "slot_range": "Bays 00-00",
-            "zone": 1
-          },
-          "raw": {
-            "id": "backplane:0",
-            "index": 0,
-            "label": "Backplane Zone 1",
-            "range": "Bays 00-00",
-            "slots": [
-              0
-            ]
-          },
-          "raw_id": null,
-          "related_slots": [
-            0
-          ],
-          "slot": null,
-          "status": null
-        },
         {
           "alias": null,
           "controller_id": null,
@@ -11935,7 +11898,6 @@
           "kind": "bay",
           "label": "Bay 00",
           "link_ids": [
-            "backplane-bay:backplane:0->bay:0:0",
             "bay-pool:bay:0->pool:tank:0",
             "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
           ],
@@ -11950,7 +11912,6 @@
           "node_ids": [
             "host",
             "bay:0",
-            "backplane:0",
             "pool:tank",
             "vdev:tank/mirror-0"
           ],

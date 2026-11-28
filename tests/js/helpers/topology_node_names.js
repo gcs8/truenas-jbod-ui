@@ -30,6 +30,14 @@ function recorderFabric() {
   return fabric;
 }
 
+function overflowFabric() {
+  const fabric = recorderFabric();
+  fabric.traces[0].metrics.path_states = Array.from({ length: 9 }, (_, index) => ({
+    controller: "Linux block", state: index ? "passive" : "active", device_name: `synthetic-port-${index}`,
+  }));
+  return fabric;
+}
+
 function nameCases() {
   const cases = Object.fromEntries(Object.entries(H.producerCases()).map(([name, value]) => [name, value.fabric]));
   cases.recorder_long_path = recorderFabric();
@@ -40,4 +48,4 @@ function nameCases() {
   return cases;
 }
 
-module.exports = { recorderFabric, nameCases };
+module.exports = { recorderFabric, overflowFabric, nameCases };

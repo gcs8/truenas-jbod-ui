@@ -229,7 +229,7 @@ Recommended saved shape:
   binding:
     mode: auto
     enclosure_ids:
-      - "500304801f715f3f"
+      - "5000c500ee000003"
     serials: []
     pool_names: []
 ```

@@ -313,7 +313,8 @@ const HEALTHY_SUMMARIES = {
   blank_expander_handles: { controllers: "1", paths: "0", expanders: "0", enclosures: "1" },
   blank_sep_unknown_enclosure: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
   show_all_only: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
-  show_all_second_unit: { controllers: "2", paths: "0", expanders: "2", enclosures: "2" },
+  // Both controller observations report the same physical enclosure logical id.
+  show_all_second_unit: { controllers: "2", paths: "0", expanders: "2", enclosures: "1" },
   discovery_first: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
   discovery_interior: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },
   discovery_last: { controllers: "1", paths: "0", expanders: "1", enclosures: "1" },

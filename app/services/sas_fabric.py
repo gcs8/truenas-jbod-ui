@@ -12,6 +12,7 @@ from urllib.parse import quote, unquote
 from app.config import SystemConfig
 from app.models.domain import (
     InventorySnapshot,
+    MultipathMember,
     SasFabricAlias,
     SasFabricLink,
     SasFabricNode,
@@ -22,7 +23,9 @@ from app.models.domain import (
     slot_occupancy,
 )
 from app.services.core_expander_counters import KeptCounterRead
-from app.services.parsers import canonicalize_ssh_command, normalize_text, parse_camcontrol_devlist
+from app.services.parsers import (
+    bay_peer_devices, canonicalize_ssh_command, normalize_device_name, normalize_text, parse_camcontrol_devlist,
+)
 from app.services.sas_fabric_parsers import (
     CORE_MPRUTIL_UNIT_SUBCOMMANDS as CORE_MPRUTIL_UNIT_SUBCOMMANDS,
     MPR_REJECTED_CONTROLLER_REASON,
@@ -140,7 +143,6 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
 )
 
 _INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
-_PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
 _SLOT_MULTIPATH_EVIDENCE = ("multipath members",)
 _LINUX_SES_PATH_EVIDENCE = (
     "lsscsi -g",
@@ -345,6 +347,14 @@ def _build_sas_fabric_result(
             if node is not None:
                 node.raw.update(provenance)
         available = available or any(_slot_has_disk(slot) for slot in location_unknown_slots)
+    if nodes is not None and links is not None and traces is not None:
+        from app.services.sas_fabric_enclosures import project_enclosures
+        project_enclosures(nodes, links, traces, snapshot)
+        _apply_sas_fabric_aliases(nodes=nodes, traces=traces, controllers=controllers or [], paths=paths or [],
+                                 aliases=_sas_fabric_alias_map(aliases or []))
+        enclosures = [_node_raw_for_payload(node) for node in nodes.values()
+                      if node.kind == "enclosure" or (node.kind in {"mpr-enclosure", "ses-enclosure", "storage-enclosure"}
+                                                     and not node.raw.get("physical_enclosure_id"))]
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
@@ -417,31 +427,6 @@ def _add_host_node(
     )
 
 
-def _add_backplane_zone_nodes(
-    nodes: dict[str, SasFabricNode],
-    snapshot: InventorySnapshot,
-) -> dict[int, dict[str, Any]]:
-    backplane_zones = _backplane_zones_for_slots([slot for slot in snapshot.slots if slot.physical_location_known])
-    for zone in backplane_zones.values():
-        add_node(
-            nodes,
-            SasFabricNode(
-                id=zone["id"],
-                kind="backplane",
-                label=zone["label"],
-                related_slots=zone["slots"],
-                metrics={
-                    "zone": zone["index"] + 1,
-                    "slot_range": zone["range"],
-                    "slot_count": len(zone["slots"]),
-                },
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-                raw=zone,
-            ),
-        )
-    return backplane_zones
-
-
 def _add_pool_vdev_nodes_and_links(
     *,
     slot: SlotView,
@@ -510,24 +495,56 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         pcie_slots,
         mpr_sysctl_locations,
     )
-    path_counts, path_slots = _path_counts_from_slots(snapshot.slots)
-    controller_names = sorted(
-        # Only the summary's admitted units, inside the unit bound.
+    cam_devices = parse_camcontrol_devlist(normalized_outputs.get("camcontrol devlist -v", ""))
+    # Only the summary's admitted units, inside the unit bound, and inside the
+    # build's controller limit: units past it are left out everywhere below.
+    unit_controller_names, omitted_units = _budget_unit_controllers(
         {f"mpr{unit}" for unit in discover_mpr_units_from_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))}
-        | set(path_counts)
         | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
+    # The graph draws only admitted units; collection results below still
+    # report every unit that was read.
+    graph_unit_data = {
+        unit: payload for unit, payload in unit_data.items() if _mpr_controller_name_for_unit(unit) in unit_controller_names
+    }
+    if omitted_units:
+        fabric_warnings.append(
+            f"Storage Fabric controller limit reached: {len(omitted_units)} controller "
+            f"{'unit' if len(omitted_units) == 1 else 'units'} beyond {MAX_FABRIC_CONTROLLERS} "
+            f"{'was' if len(omitted_units) == 1 else 'were'} not read."
+        )
+    ownership = snapshot_fabric_disk_ownership(snapshot)
+    path_evidence_read = _snapshot_path_evidence_read(ownership, normalized_outputs)
+    members_by_slot = _core_path_members(
+        snapshot.slots, cam_devices, ownership, known_controllers=unit_controller_names,
+        path_evidence_read=path_evidence_read,
+    )
+    if members_by_slot.limit_reached:
+        fabric_warnings.append(members_by_slot.limit_warning())
+    if members_by_slot.evidence_unread_bays:
+        fabric_warnings.append(
+            f"Storage Fabric direct path controllers and MPR rows were not read for "
+            f"{len(members_by_slot.evidence_unread_bays)} bays: the CAM and mprutil replies are not from the read "
+            "their bay view was built from."
+        )
+    if members_by_slot.ownership_limited:
+        fabric_warnings.append(
+            f"Storage Fabric alternate paths were not read for {len(members_by_slot.ownership_limited)} bays: "
+            f"API disks listed more than {MAX_FABRIC_OWNERSHIP_DEVICE_KEYS} device names, so ownership was not read."
+        )
+    path_counts, path_slots = _path_counts_from_slots(snapshot.slots, members_by_slot)
+    controller_names = sorted(unit_controller_names | set(path_counts))
 
     controllers: list[dict[str, Any]] = []
     for controller_name in controller_names:
         # The unnumbered fallback has no observed unit; never derive one from its name.
-        legacy_unit = controller_name == _LEGACY_MPR_CONTROLLER_NAME and _LEGACY_MPR_UNIT_KEY in unit_data
+        legacy_unit = controller_name == _LEGACY_MPR_CONTROLLER_NAME and _LEGACY_MPR_UNIT_KEY in graph_unit_data
         unit = None if legacy_unit else _mpr_unit_from_text(controller_name)
         summary_row = next((row for row in adapter_summary if row.get("unit") == unit), None) if unit is not None else None
         if legacy_unit:
-            parsed_unit = unit_data[_LEGACY_MPR_UNIT_KEY]
+            parsed_unit = graph_unit_data[_LEGACY_MPR_UNIT_KEY]
         else:
-            parsed_unit = unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
+            parsed_unit = graph_unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
         detail = parsed_unit.get("adapter_detail", {}) if parsed_unit else {}
         iocfacts = parsed_unit.get("iocfacts", {}) if parsed_unit else {}
         pci_info = pci_inventory.get(controller_name, {})
@@ -602,11 +619,15 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         add_link(links, "host", controller["id"], "host-controller", related_slots=related_slots)
 
     paths: list[dict[str, Any]] = []
+    slots_by_number = {slot.slot: slot for slot in snapshot.slots}
     for controller_name, state_counts in sorted(path_counts.items()):
         controller_id = f"controller:{controller_name}"
         for state, count in sorted(state_counts.items(), key=lambda item: (_path_state_sort_key(item[0]), item[0])):
             slots = sorted(path_slots[controller_name][state])
             path_id = f"path:{controller_name}:{state}"
+            path_evidence = _dedupe_strings(
+                [evidence for number in slots for evidence in _slot_path_evidence(slots_by_number[number])]
+            )
             paths.append(
                 {
                     "id": path_id,
@@ -626,7 +647,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                     controller_id=controller_id,
                     related_slots=slots,
                     metrics={"count": count},
-                    evidence=list(_SLOT_MULTIPATH_EVIDENCE),
+                    evidence=path_evidence,
                 ),
             )
             add_link(links, controller_id, path_id, "controller-path", status=state, related_slots=slots)
@@ -638,7 +659,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 link_ids=[_link_id("host", controller_id, "host-controller"), _link_id(controller_id, path_id, "controller-path")],
                 slots=slots,
                 metrics={"count": count, "state": state},
-                evidence=list(_SLOT_MULTIPATH_EVIDENCE),
+                evidence=path_evidence,
             )
 
     ses_devices_by_slot = _ses_devices_by_slot(snapshot.slots)
@@ -646,25 +667,23 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         nodes=nodes,
         links=links,
         controllers=controllers,
-        unit_data=unit_data,
+        unit_data=graph_unit_data,
         selected_enclosure_keys=selected_enclosure_keys,
     )
     mpr_trace_index = _build_mpr_trace_index(
-        unit_data=unit_data,
+        unit_data=graph_unit_data,
         controllers=controllers,
         diagnostics=mpr_kernel_diagnostics,
     )
     # CAM's per-device target on its own controller is the identity that ties a
     # member disk to its `mprutil show devices` row (#936).
-    cam_devices = parse_camcontrol_devlist(normalized_outputs.get("camcontrol devlist -v", ""))
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
+    multipath_detail_unread_bays: set[int] = set()
 
     for slot in snapshot.slots:
         bay_id = f"bay:{slot.slot}"
         bay_related_nodes = ["host", bay_id]
         bay_related_links: list[str] = []
         mpr_device_metrics: list[dict[str, Any]] = []
-        backplane_zone = backplane_zones.get(slot.slot)
         add_node(
             nodes,
             SasFabricNode(
@@ -684,19 +703,27 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=[slot.slot],
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_nodes.append(backplane_zone["id"])
-            bay_related_links.append(backplane_link.id)
-        for member in (slot.multipath.members if slot.multipath else []):
+        slot_members = members_by_slot[slot.slot]
+        direct_members = not (slot.multipath and slot.multipath.members)
+        # Multipath members keep their gmultipath controller, but their port
+        # detail is read only from the CAM/mprutil replies of the bay's read.
+        # Every CORE inventory build records the digest of its replies; only a
+        # recorded mismatch is a later read. A snapshot without that record
+        # was not built from a read in this process (hand-built fixtures).
+        port_detail_read = direct_members or path_evidence_read or ownership is None or ownership.path_evidence is None
+        if not port_detail_read and any(member.controller_label for member in slot_members):
+            multipath_detail_unread_bays.add(slot.slot)
+        # Bay position may pick a row only for a controller's one member in
+        # the whole snapshot: every member counts, including one past the
+        # admission limit, and a member whose controller is not read could
+        # be on any controller.
+        snapshot_members = list(slot.multipath.members) if slot.multipath and slot.multipath.members else []
+        snapshot_controllers = Counter(_core_controller_name(member.controller_label) for member in snapshot_members)
+        position_allowed = (
+            bool(snapshot_members) and None not in snapshot_controllers
+            and slot.slot not in members_by_slot.path_limited
+        )
+        for member in slot_members:
             controller_name = normalize_text(member.controller_label)
             if not controller_name:
                 continue
@@ -712,7 +739,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ]
             )
             bay_related_links.append(link.id)
-            mpr_context = _add_mpr_member_trace_context(
+            mpr_context = {} if not port_detail_read else _add_mpr_member_trace_context(
                 nodes=nodes,
                 links=links,
                 trace_index=mpr_trace_index,
@@ -728,6 +755,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 slot_location_numbers=_slot_location_number_candidates(slot),
                 slot_ses_number=_parse_mpr_slot_number((slot.raw_status or {}).get("ses_slot_number")),
                 diagnostics=mpr_kernel_diagnostics,
+                own_evidence=direct_members or not position_allowed or snapshot_controllers[controller_name] != 1,
             )
             if mpr_context:
                 bay_related_nodes.extend(mpr_context["node_ids"])
@@ -794,14 +822,22 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                         "controller": member.controller_label,
                         "state": normalize_path_state(member.state),
                         "device_name": member.device_name,
+                        **_path_row_not_read(member, members_by_slot, cam_devices, direct=direct_members,
+                                             evidence_read=port_detail_read),
                     }
-                    for member in (slot.multipath.members if slot.multipath else [])
+                    for member in slot_members
                 ],
                 "mpr_devices": mpr_device_metrics,
+                **members_by_slot.bay_not_read(slot.slot),
             },
-            evidence=["inventory snapshot", *_SLOT_MULTIPATH_EVIDENCE],
+            evidence=["inventory snapshot", *(_slot_path_evidence(slot) if slot_members else _SLOT_MULTIPATH_EVIDENCE)],
         )
 
+    if multipath_detail_unread_bays:
+        fabric_warnings.append(
+            f"Storage Fabric multipath port details were not read for {len(multipath_detail_unread_bays)} bays: "
+            "the CAM and mprutil replies are not from the read their bay view was built from."
+        )
     fabric_warnings.extend(_scope_mpr_infrastructure(
         nodes=nodes,
         links=links,
@@ -901,7 +937,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             unit_data,
             unit_reads,
             # Summary rows and units that were not read leave the counts short too.
-            rejected_units=rejected_units + rejected_summary_rows + summary_units_over_limit,
+            rejected_units=rejected_units + rejected_summary_rows + summary_units_over_limit + len(omitted_units),
             controllers_seen=bool(controller_names),
             paths_seen=bool(paths),
         ),
@@ -913,8 +949,15 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         # past the summary's unit bound: counts only, never the text.
         "rejected_summary_rows": rejected_summary_rows,
         "summary_units_over_limit": summary_units_over_limit,
+        # Read units the graph left out at the controller limit: a count only.
+        **({"units_over_controller_limit": len(omitted_units)} if omitted_units else {}),
         "unread_phy_tables": sum(unread_tables.values()),
     }
+    if members_by_slot.not_read_reasons:
+        controller_read["counts"]["controllers"] = "partial"
+    if (members_by_slot.path_limited or members_by_slot.ownership_limited
+            or any(not member.controller_label for members in members_by_slot.values() for member in members)):
+        controller_read["counts"]["paths"] = "partial"
     # Without controller data the bays, pools and vdevs the inventory already
     # knows are still drawn; the warning above says what could not be read.
     inventory_drawn = any(node.kind in {"bay", "pool", "vdev"} for node in nodes.values())
@@ -1197,8 +1240,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             evidence=list(_LINUX_SES_PATH_EVIDENCE),
         )
 
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
-
     for slot in snapshot.slots:
         slot_identity = _slot_storage_identity(slot)
         transport_detail = _slot_linux_transport_detail(slot)
@@ -1212,7 +1253,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             *([_link_id(controller_id, path_id, "controller-path")] if path_id else []),
             *([_link_id(path_id, ses_id, "path-ses-enclosure")] if path_id and ses_id else []),
         ]
-        backplane_zone = backplane_zones.get(slot.slot)
         add_node(
             nodes,
             SasFabricNode(
@@ -1250,18 +1290,6 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
                 },
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=[slot.slot],
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_nodes.append(backplane_zone["id"])
-            bay_related_links.append(backplane_link.id)
         if ses_id:
             ses_link = add_link(
                 links,
@@ -1439,7 +1467,6 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
     controllers_by_name: dict[str, dict[str, Any]] = {}
     paths_by_id: dict[str, dict[str, Any]] = {}
     enclosure_nodes: dict[str, SasFabricNode] = {}
-    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
 
     for slot in evidence_slots:
         raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
@@ -1585,14 +1612,12 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
         )
 
         bay_id = f"bay:{slot.slot}"
-        backplane_zone = backplane_zones.get(slot.slot)
         bay_related_nodes = _dedupe_strings(
             [
                 "host",
                 controller_id,
                 path_id,
                 enclosure_id,
-                *( [backplane_zone["id"]] if backplane_zone else [] ),
                 bay_id,
             ]
         )
@@ -1628,17 +1653,6 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
                 },
             ),
         )
-        if backplane_zone:
-            backplane_link = add_link(
-                links,
-                backplane_zone["id"],
-                bay_id,
-                "backplane-bay",
-                slot=slot.slot,
-                related_slots=slot_numbers,
-                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
-            )
-            bay_related_links.append(backplane_link.id)
         enclosure_link = add_link(
             links,
             enclosure_id,
@@ -2195,11 +2209,346 @@ def _mpr_count_completeness(
     }
 
 
-def _path_counts_from_slots(slots: list[SlotView]) -> tuple[dict[str, Counter[str]], dict[str, dict[str, list[int]]]]:
+# Path projection limits for one fabric build (#1471). Real hardware stays well
+# inside them: a dual-domain disk has 4 paths, a host a handful of HBAs, and a
+# 4,096-bay inventory at 4 paths a bay shares those controllers' few path
+# states. Anything beyond is dropped or not read, and reported.
+MAX_FABRIC_PATH_MEMBERS_PER_BAY = 8
+MAX_FABRIC_CONTROLLERS = 64
+MAX_FABRIC_PATH_NODES = 2048
+PATH_LIMIT_REASON = "path limit reached"
+CONTROLLER_LIMIT_REASON = "controller limit reached"
+
+
+# API disk ownership for direct-path peer admission (#1471): only normalized
+# `daN` device names, each mapped to its owning disk. It rides on the in-memory
+# snapshot object it was built with, so it is freed with that snapshot, and is
+# never serialized. More names than the limit leave ownership not read for that
+# snapshot: no direct peers, one warning, never a partial set.
+MAX_FABRIC_OWNERSHIP_DEVICE_KEYS = 16384
+OWNERSHIP_LIMIT_REASON = "ownership limit reached"
+_CORE_DA_DEVICE = re.compile(r"da[0-9]{1,5}")
+_FABRIC_OWNERSHIP_ATTRIBUTE = "_fabric_disk_ownership"
+
+
+@dataclass(frozen=True, slots=True)
+class FabricDiskOwnership:
+    owners: Mapping[str, int] | None
+    over_limit: bool = False
+    # Digest of the CAM and mprutil replies the snapshot was built from. Direct
+    # path controller, target and MPR rows are read only from those replies.
+    path_evidence: str | None = None
+
+
+# Direct-path CAM/MPR evidence from another read than the bay snapshot's own.
+PATH_EVIDENCE_REASON = "path evidence not from this bay view's read"
+
+
+def fabric_path_evidence(ssh_outputs: Mapping[str, str | None]) -> str:
+    """Digest of the CAM and mprutil replies that direct paths are read from."""
+    digest = hashlib.sha256()
+    canonical = {canonicalize_ssh_command(command): output
+                 for command, output in ssh_outputs.items() if output is not None}
+    for command, output in sorted(canonical.items()):
+        if command == "camcontrol devlist -v" or command.startswith("mprutil "):
+            for part in (command, output):
+                encoded = part.encode("utf-8", "surrogatepass")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+    return digest.hexdigest()
+
+
+def fabric_disk_ownership(
+    disk_keys: Iterable[Iterable[str]], *, path_evidence: str | None = None,
+) -> FabricDiskOwnership:
+    """Index each disk's `daN` names by disk ordinal; stop at the limit."""
+    owners: dict[str, int] = {}
+    for ordinal, keys in enumerate(disk_keys):
+        for key in keys:
+            if not isinstance(key, str) or len(key) > 7:
+                continue
+            name = key.lower()
+            if not _CORE_DA_DEVICE.fullmatch(name):
+                continue
+            if name not in owners and len(owners) >= MAX_FABRIC_OWNERSHIP_DEVICE_KEYS:
+                return FabricDiskOwnership(owners=None, over_limit=True, path_evidence=path_evidence)
+            owners[name] = ordinal  # last writer wins, as in `_index_disk_records`
+    return FabricDiskOwnership(owners=owners, path_evidence=path_evidence)
+
+
+def attach_fabric_disk_ownership(snapshot: InventorySnapshot, ownership: FabricDiskOwnership) -> None:
+    """Attach to the live snapshot object only; pydantic does not serialize it."""
+    setattr(snapshot, _FABRIC_OWNERSHIP_ATTRIBUTE, ownership)
+
+
+def snapshot_fabric_disk_ownership(snapshot: InventorySnapshot) -> FabricDiskOwnership | None:
+    ownership = vars(snapshot).get(_FABRIC_OWNERSHIP_ATTRIBUTE)
+    return ownership if isinstance(ownership, FabricDiskOwnership) else None
+
+
+# A CAM controller (SIM) name as `camcontrol devlist -v` prints it: a lowercase
+# FreeBSD driver name (mpr, mps, mpt, isp, umass-sim, mpi3mr, ...) ending in a
+# letter, then a 1-4 digit unit (the unit rule of `admit_mpr_unit_number`). The
+# length is checked before any regex. Being a valid path label does not make a
+# controller eligible for MPR diagnostics; those stay keyed by mprutil units.
+_CORE_CONTROLLER_NAME = re.compile(r"[a-z](?:[a-z0-9_-]{0,10}[a-z_])?[0-9]{1,4}")
+_CORE_CONTROLLER_NAME_MAX_LENGTH = 16
+
+
+def _core_controller_name(value: Any) -> str | None:
+    """A member's controller name, or None (not read) when it is not one."""
+    if not isinstance(value, str) or len(value) > _CORE_CONTROLLER_NAME_MAX_LENGTH:
+        return None
+    return value if _CORE_CONTROLLER_NAME.fullmatch(value) else None
+
+
+def _snapshot_path_evidence_read(ownership: FabricDiskOwnership | None, normalized_outputs: Mapping[str, str]) -> bool:
+    """Whether these CAM/mprutil replies are the ones the bay snapshot was built from."""
+    if ownership is None or ownership.path_evidence is None:
+        return False
+    return ownership.path_evidence == fabric_path_evidence(normalized_outputs)
+
+
+def _budget_unit_controllers(names: set[str]) -> tuple[set[str], set[str]]:
+    """Admit mprutil units lowest first up to the controller limit; return (admitted, omitted)."""
+    ordered = sorted(names, key=lambda name: -1 if name == _LEGACY_MPR_CONTROLLER_NAME else int(name[3:]))
+    return set(ordered[:MAX_FABRIC_CONTROLLERS]), set(ordered[MAX_FABRIC_CONTROLLERS:])
+
+
+class _CorePathMembers(dict[int, list[MultipathMember]]):
+    """Path members by bay, after the guard and the projection limits.
+
+    `not_read_reasons` and `refused` are keyed by member object identity; the
+    members live for the whole build.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.path_limited: set[int] = set()
+        # How many paths each limited bay did not keep: a count, never names.
+        self.path_dropped: dict[int, int] = {}
+        self.not_read_reasons: dict[int, str] = {}
+        self.refused: set[int] = set()
+        self.ownership_limited: set[int] = set()
+        # Direct members whose CAM/MPR evidence is from another read.
+        self.evidence_unread: set[int] = set()
+        self.evidence_unread_bays: set[int] = set()
+
+    @property
+    def limit_reached(self) -> bool:
+        return bool(self.path_limited or self.not_read_reasons)
+
+    def limit_warning(self) -> str:
+        return (
+            f"Storage Fabric path limits reached: {len(self.path_limited)} bays had paths beyond "
+            f"{MAX_FABRIC_PATH_MEMBERS_PER_BAY} per bay or {MAX_FABRIC_PATH_NODES} path nodes, and "
+            f"{len(self.not_read_reasons)} paths were beyond {MAX_FABRIC_CONTROLLERS} controllers; "
+            "those were not read."
+        )
+
+    def row_not_read(self, member: MultipathMember) -> dict[str, Any]:
+        reason = self.not_read_reasons.get(id(member))
+        if reason is not None:
+            return {"not_read": ["controller"], "not_read_reasons": {"controller": reason}}
+        return {"not_read": ["controller"]} if id(member) in self.refused else {}
+
+    def bay_not_read(self, slot: int) -> dict[str, Any]:
+        reasons = {}
+        if slot in self.path_limited:
+            reasons["path_states"] = PATH_LIMIT_REASON
+        if slot in self.ownership_limited:
+            reasons["alternate_paths"] = OWNERSHIP_LIMIT_REASON
+        if not reasons:
+            return {}
+        counts = {"path_states": self.path_dropped[slot]} if self.path_dropped.get(slot) else {}
+        return {"not_read": list(reasons), "not_read_reasons": reasons, **({"not_read_counts": counts} if counts else {})}
+
+
+def _apply_path_limits(result: _CorePathMembers, known_controllers: set[str]) -> None:
+    """Bound members per bay, distinct controllers and distinct path nodes.
+
+    Runs before any graph construction, in bay order, for direct and
+    multipath members alike. Members past a bay's limit, or that would add a
+    path node past the total, are dropped and their bay is marked not read. A
+    controller past the total is not read on that member.
+    """
+    controllers = set(known_controllers)
+    path_nodes: set[tuple[str, str]] = set()
+    for slot, members in result.items():
+        kept: list[MultipathMember] = []
+        for member in members:
+            if len(kept) >= MAX_FABRIC_PATH_MEMBERS_PER_BAY:
+                result.path_limited.add(slot)
+                break
+            controller = normalize_text(member.controller_label)
+            if controller and controller not in controllers:
+                if len(controllers) >= MAX_FABRIC_CONTROLLERS:
+                    refused = id(member) in result.refused
+                    member = member.model_copy(update={"controller_label": None})
+                    if refused:
+                        result.refused.add(id(member))
+                    result.not_read_reasons[id(member)] = CONTROLLER_LIMIT_REASON
+                    controller = None
+                else:
+                    controllers.add(controller)
+            if controller:
+                node = (controller, normalize_path_state(member.state))
+                if node not in path_nodes:
+                    if len(path_nodes) >= MAX_FABRIC_PATH_NODES:
+                        result.path_limited.add(slot)
+                        continue
+                    path_nodes.add(node)
+            kept.append(member)
+        if len(kept) < len(members):
+            result.path_dropped[slot] = len(members) - len(kept)
+        result[slot] = kept
+
+
+def _core_path_members(
+    slots: list[SlotView], cam_devices: Any, ownership: FabricDiskOwnership | None = None,
+    *, known_controllers: set[str] | frozenset[str] = frozenset(), path_evidence_read: bool = True,
+) -> _CorePathMembers:
+    """Use the inventory's shared-bay rule when no geom lists the disk's paths.
+
+    Peers must pass the rule twice: against every API disk the inventory read
+    (including unplaced disks and other enclosures), exactly as the enclosure
+    view does, and against the rendered bays, so a name another bay claims is
+    not borrowed. Without the API index no peer is admitted.
+    """
+    # Each disk's `daN` name set is its owner identity for the shared rule.
+    by_disk: dict[int, set[str]] = defaultdict(set)
+    for name, ordinal in ((ownership.owners or {}) if ownership is not None else {}).items():
+        by_disk[ordinal].add(name)
+    disk_names = {ordinal: frozenset(names) for ordinal, names in by_disk.items()}
+    api_owners: dict[str, frozenset[str]] = {
+        name: disk_names[ordinal] for name, ordinal in ((ownership.owners or {}) if ownership is not None else {}).items()
+    }
+    owners: dict[str, Any] = {}
+    conflicting_owner = object()
+    for slot in slots:
+        raw_names = (slot.raw_status or {}).get("device_names")
+        for value in [
+            slot.device_name, *slot.smart_device_names,
+            *(raw_names if isinstance(raw_names, list) else []),
+            *([member.device_name for member in slot.multipath.members] if slot.multipath else []),
+        ]:
+            name = normalize_device_name(value) if isinstance(value, str) else None
+            if name:
+                key = name.lower()
+                if key not in owners:
+                    owners[key] = slot
+                elif owners[key] is not slot:
+                    owners[key] = conflicting_owner
+    result = _CorePathMembers()
+    for slot in slots:
+        if slot.multipath and slot.multipath.members:
+            projected = []
+            for member in slot.multipath.members:
+                copied = member.model_copy(update={"controller_label": _core_controller_name(member.controller_label)})
+                if member.controller_label and not copied.controller_label:
+                    result.refused.add(id(copied))
+                projected.append(copied)
+            result[slot.slot] = projected
+            continue
+        members: list[MultipathMember] = []
+        result[slot.slot] = members
+        own = normalize_device_name(slot.device_name)
+        raw = slot.raw_status or {}
+        names = raw.get("device_names")
+        if (
+            slot_occupancy(slot) != "present" or not slot.physical_location_known or not _slot_ses_devices(slot)
+            or not own or not _CORE_DA_DEVICE.fullmatch(own)
+            or not isinstance(names, list) or owners.get(own.lower()) is not slot
+        ):
+            continue
+        # The helper requires this bay to name the disk's own path, and rejects
+        # peers another disk owns. It is also used by the enclosure view (#902).
+        api_owner = api_owners.get(own.lower())
+        listed = list(dict.fromkeys(
+            name for value in names if isinstance(value, str)
+            if (name := normalize_device_name(value)) and _CORE_DA_DEVICE.fullmatch(name)
+        ))
+        # The API disk's own other `daN` name (a proven alias of this disk) is
+        # a path as well as a name no API disk owns. Both must still be
+        # unclaimed by every other rendered bay.
+        api_peers = {
+            *bay_peer_devices(raw, set(api_owner), api_owners, api_owner),
+            *(name for name in listed if name != own and name.lower() in api_owner),
+        } if api_owner is not None else set()
+        peers = set(bay_peer_devices(raw, {own.lower()}, owners, slot)).intersection(api_peers)
+        if own not in listed:
+            continue
+        if ownership is not None and ownership.over_limit and len(listed) > 1:
+            result.ownership_limited.add(slot.slot)
+        # Only a hint naming an admitted path establishes current pool usage.
+        # The API's preferred device and a stale hint do not establish it.
+        in_use = normalize_device_name(raw.get("pool_device_name"))
+        if in_use not in {name for name in listed if name == own or name in peers}:
+            in_use = None
+        for name in listed:
+            if name != own and name not in peers:
+                continue
+            member = MultipathMember(
+                device_name=name,
+                controller_label=_core_controller_name(cam_devices.controllers.get(name.lower())) if path_evidence_read else None,
+                state="unknown" if in_use is None else "active" if name == in_use else "standby",
+            )
+            if not path_evidence_read:
+                result.evidence_unread.add(id(member))
+                result.evidence_unread_bays.add(slot.slot)
+            members.append(member)
+        if len(members) > MAX_FABRIC_PATH_MEMBERS_PER_BAY:
+            # Keep the disk's own path and the path in use inside the limit.
+            members.sort(key=lambda member: member.device_name not in {own, in_use})
+    _apply_path_limits(result, set(known_controllers))
+    return result
+
+
+def _path_row_not_read(
+    member: MultipathMember, members: _CorePathMembers, cam_devices: Any, *, direct: bool, evidence_read: bool = True,
+) -> dict[str, Any]:
+    limited = members.row_not_read(member)
+    if not direct:
+        if evidence_read or not member.controller_label:
+            return limited
+        # A multipath member's port detail from another read is not this path's.
+        return {
+            "not_read": [*limited.get("not_read", []), "target"],
+            "not_read_reasons": {**limited.get("not_read_reasons", {}), "target": PATH_EVIDENCE_REASON},
+        }
+    if id(member) in members.evidence_unread:
+        row = _direct_member_not_read(member, None)
+        row["not_read_reasons"] = {field: PATH_EVIDENCE_REASON for field in ("controller", "target")}
+        return row
+    row = _direct_member_not_read(member, cam_devices)
+    if "not_read_reasons" in limited:
+        row["not_read_reasons"] = limited["not_read_reasons"]
+    return row
+
+
+def _direct_member_not_read(member: MultipathMember, cam_devices: Any) -> dict[str, Any]:
+    not_read = ["state"] if member.state == "unknown" else []
+    if not member.controller_label:
+        not_read.append("controller")
+    if cam_devices is None or _cam_member_target(cam_devices, member.controller_label or "", member.device_name) is None:
+        not_read.append("target")
+    return {"not_read": not_read} if not_read else {}
+
+
+def _slot_path_evidence(slot: SlotView) -> list[str]:
+    return list(_SLOT_MULTIPATH_EVIDENCE) if slot.multipath and slot.multipath.members else [
+        "sesutil map shared bay", "camcontrol devlist -v",
+    ]
+
+
+def _path_counts_from_slots(
+    slots: list[SlotView], members_by_slot: dict[int, list[MultipathMember]] | None = None,
+) -> tuple[dict[str, Counter[str]], dict[str, dict[str, list[int]]]]:
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     path_slots: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
     for slot in slots:
-        for member in (slot.multipath.members if slot.multipath else []):
+        members = members_by_slot[slot.slot] if members_by_slot is not None else (slot.multipath.members if slot.multipath else [])
+        for member in members:
             controller = normalize_text(member.controller_label)
             if not controller:
                 continue
@@ -2892,34 +3241,6 @@ def _bay_label(slot: SlotView) -> str:
     """
     label = str(slot.slot_label or "").strip()
     return label if label.isdigit() else f"{slot.slot:02d}"
-
-
-def _backplane_zones_for_slots(slots: list[SlotView]) -> dict[int, dict[str, Any]]:
-    labels = {slot.slot: _bay_label(slot) for slot in slots if isinstance(slot.slot, int)}
-    slot_numbers = _snapshot_slot_numbers(slots)
-    if not slot_numbers:
-        return {}
-    slot_count = max(slot_numbers) + 1
-    zone_count = 4 if slot_count >= 4 else 1
-    zone_size = max(1, (slot_count + zone_count - 1) // zone_count)
-    zones_by_slot: dict[int, dict[str, Any]] = {}
-    for zone_index in range(zone_count):
-        start = zone_index * zone_size
-        end = min(slot_count - 1, start + zone_size - 1)
-        zone_slots = [slot for slot in slot_numbers if start <= slot <= end]
-        if not zone_slots:
-            continue
-        zone = {
-            "id": f"backplane:{zone_index}",
-            "index": zone_index,
-            "label": f"Backplane Zone {zone_index + 1}",
-            "slots": zone_slots,
-            "range": f"Bays {labels.get(zone_slots[0], f'{zone_slots[0]:02d}')}-"
-            f"{labels.get(zone_slots[-1], f'{zone_slots[-1]:02d}')}",
-        }
-        for slot in zone_slots:
-            zones_by_slot[slot] = zone
-    return zones_by_slot
 
 
 def _sas_fabric_alias_map(aliases: list[SasFabricAlias]) -> dict[str, SasFabricAlias]:

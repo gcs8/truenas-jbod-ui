@@ -1,0 +1,1874 @@
+{
+  "fabric": {
+    "aliases": [],
+    "available": true,
+    "controllers": [
+      {
+        "acpi_handle": null,
+        "board": "Synthetic HBA",
+        "chip": "SAS3008",
+        "device": "/dev/mpr0",
+        "firmware": "16.00.12.00",
+        "id": "controller:mpr0",
+        "iocfacts": {},
+        "mpr_lists": {
+          "devices": "read",
+          "enclosures": "read",
+          "expanders": "read"
+        },
+        "name": "mpr0",
+        "path_counts": {
+          "standby": 1
+        },
+        "pci": null,
+        "pci_address": null,
+        "pci_device": null,
+        "pci_location": null,
+        "pci_parent": null,
+        "pci_vendor": null,
+        "pcie_slot": null,
+        "pcie_slot_type": null,
+        "pcie_slot_usage": null,
+        "phy_rows": [],
+        "related_slots": [
+          0
+        ],
+        "temperature": null,
+        "unit": 0
+      },
+      {
+        "acpi_handle": null,
+        "board": "Synthetic HBA",
+        "chip": "SAS3008",
+        "device": "/dev/mpr1",
+        "firmware": "16.00.12.00",
+        "id": "controller:mpr1",
+        "iocfacts": {},
+        "mpr_lists": {
+          "devices": "read",
+          "enclosures": "read",
+          "expanders": "read"
+        },
+        "name": "mpr1",
+        "path_counts": {
+          "active": 1
+        },
+        "pci": null,
+        "pci_address": null,
+        "pci_device": null,
+        "pci_location": null,
+        "pci_parent": null,
+        "pci_vendor": null,
+        "pcie_slot": null,
+        "pcie_slot_type": null,
+        "pcie_slot_usage": null,
+        "phy_rows": [],
+        "related_slots": [
+          0
+        ],
+        "temperature": null,
+        "unit": 1
+      }
+    ],
+    "enclosures": [
+      {
+        "alias": null,
+        "device_count": 1,
+        "display_label": null,
+        "id": "enclosure:5000c50000000f01",
+        "kind": "enclosure",
+        "label": "5000c50000000f01",
+        "legacy_alias_ids": [
+          "mpr-enclosure:controller:mpr0:0002",
+          "mpr-enclosure:controller:mpr1:0002"
+        ],
+        "logical_id": "5000c50000000f01",
+        "observations": [
+          {
+            "controller_id": "controller:mpr0",
+            "enc_handle": "0002",
+            "id": "mpr-enclosure:controller:mpr0:0002",
+            "metrics": {
+              "device_count": 1,
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure": true,
+              "slots": "2"
+            },
+            "unit": 0
+          },
+          {
+            "controller_id": "controller:mpr1",
+            "enc_handle": "0002",
+            "id": "mpr-enclosure:controller:mpr1:0002",
+            "metrics": {
+              "device_count": 1,
+              "selected_bay_count": 2,
+              "selected_disk_count": 1,
+              "selected_disk_slots": [
+                0
+              ],
+              "selected_enclosure": true,
+              "slots": "2"
+            },
+            "unit": 1
+          }
+        ],
+        "raw_id": "5000c50000000f01",
+        "related_slots": [
+          0,
+          1
+        ],
+        "status": null
+      }
+    ],
+    "expanders": [
+      {
+        "alias": null,
+        "controller_id": "controller:mpr0",
+        "dev_handle": "0009",
+        "device_counts": {
+          "SAS Initiator": 1
+        },
+        "display_label": null,
+        "enc_handle": "0002",
+        "fabric_scope": "selected_enclosure",
+        "id": "expander:controller:mpr0:5000c50000000e00",
+        "kind": "expander",
+        "label": "5000c50000000e00",
+        "linked_phys": 1,
+        "num_phys": "1",
+        "parent": "0001",
+        "parent_link_reason": "resolved",
+        "parent_link_state": "resolved",
+        "phy_error_counters": {
+          "device": "pass0",
+          "measured_phys": 0,
+          "message": "Expander counters not read yet.",
+          "phys_with_errors": 0,
+          "read_at": null,
+          "reason": null,
+          "rows": [],
+          "source": "camcontrol smpcmd REPORT PHY ERROR LOG",
+          "state": "not_read",
+          "stopped_at_phy": null,
+          "unknown_phys": 0
+        },
+        "phys": [
+          {
+            "counter_reason": null,
+            "counter_state": "not_read",
+            "dev_handle": "0001",
+            "device": "SAS Initiator",
+            "invalid_dword_count": null,
+            "loss_of_dword_synchronization_count": null,
+            "max": "12.0",
+            "min": "1.5",
+            "phy": "0",
+            "phy_reset_problem_count": null,
+            "remote_phy": "0001",
+            "running_disparity_error_count": null,
+            "speed": "12.0"
+          }
+        ],
+        "raw_id": "5000c50000000e00",
+        "related_slots": [
+          0
+        ],
+        "sas_address": "5000c50000000e00",
+        "sas_level": "1",
+        "selected_bay_count": 2,
+        "selected_disk_count": 1,
+        "selected_disk_slots": [
+          0
+        ],
+        "selected_enclosure_candidate": true,
+        "status": null,
+        "unit": 0
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr1",
+        "dev_handle": "0009",
+        "device_counts": {
+          "SAS Initiator": 1
+        },
+        "display_label": null,
+        "enc_handle": "0002",
+        "fabric_scope": "selected_enclosure",
+        "id": "expander:controller:mpr1:5000c50000000e01",
+        "kind": "expander",
+        "label": "5000c50000000e01",
+        "linked_phys": 1,
+        "num_phys": "1",
+        "parent": "0001",
+        "parent_link_reason": "resolved",
+        "parent_link_state": "resolved",
+        "phy_error_counters": {
+          "device": "pass1",
+          "measured_phys": 0,
+          "message": "Expander counters not read yet.",
+          "phys_with_errors": 0,
+          "read_at": null,
+          "reason": null,
+          "rows": [],
+          "source": "camcontrol smpcmd REPORT PHY ERROR LOG",
+          "state": "not_read",
+          "stopped_at_phy": null,
+          "unknown_phys": 0
+        },
+        "phys": [
+          {
+            "counter_reason": null,
+            "counter_state": "not_read",
+            "dev_handle": "0001",
+            "device": "SAS Initiator",
+            "invalid_dword_count": null,
+            "loss_of_dword_synchronization_count": null,
+            "max": "12.0",
+            "min": "1.5",
+            "phy": "0",
+            "phy_reset_problem_count": null,
+            "remote_phy": "0001",
+            "running_disparity_error_count": null,
+            "speed": "12.0"
+          }
+        ],
+        "raw_id": "5000c50000000e01",
+        "related_slots": [
+          0
+        ],
+        "sas_address": "5000c50000000e01",
+        "sas_level": "1",
+        "selected_bay_count": 2,
+        "selected_disk_count": 1,
+        "selected_disk_slots": [
+          0
+        ],
+        "selected_enclosure_candidate": true,
+        "status": null,
+        "unit": 1
+      }
+    ],
+    "links": [
+      {
+        "evidence": [],
+        "id": "bay-pool:bay:0->pool:synthetic-pool:0",
+        "kind": "bay-pool",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "bay:0",
+        "status": null,
+        "target": "pool:synthetic-pool"
+      },
+      {
+        "evidence": [
+          "mprutil -u 0 show expanders"
+        ],
+        "id": "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00",
+        "kind": "controller-expander",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "controller:mpr0",
+        "status": null,
+        "target": "expander:controller:mpr0:5000c50000000e00"
+      },
+      {
+        "evidence": [
+          "mprutil -u 1 show expanders"
+        ],
+        "id": "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01",
+        "kind": "controller-expander",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "controller:mpr1",
+        "status": null,
+        "target": "expander:controller:mpr1:5000c50000000e01"
+      },
+      {
+        "evidence": [],
+        "id": "controller-path:controller:mpr0->path:mpr0:standby",
+        "kind": "controller-path",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "controller:mpr0",
+        "status": "standby",
+        "target": "path:mpr0:standby"
+      },
+      {
+        "evidence": [],
+        "id": "controller-path:controller:mpr1->path:mpr1:active",
+        "kind": "controller-path",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "controller:mpr1",
+        "status": "active",
+        "target": "path:mpr1:active"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-bay:enclosure:5000c50000000f01->bay:0:0",
+        "kind": "enclosure-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "bay:0"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-bay:enclosure:5000c50000000f01->bay:1:1",
+        "kind": "enclosure-bay",
+        "related_slots": [
+          1
+        ],
+        "reported_lanes": null,
+        "slot": 1,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "bay:1"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-observation:enclosure:5000c50000000f01->mpr-enclosure:controller:mpr0:0002",
+        "kind": "enclosure-observation",
+        "related_slots": [],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "mpr-enclosure:controller:mpr0:0002"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-observation:enclosure:5000c50000000f01->mpr-enclosure:controller:mpr1:0002",
+        "kind": "enclosure-observation",
+        "related_slots": [],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "mpr-enclosure:controller:mpr1:0002"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-ses:enclosure:5000c50000000f01->ses:/dev/ses0",
+        "kind": "enclosure-ses",
+        "related_slots": [
+          0,
+          1
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "ses:/dev/ses0"
+      },
+      {
+        "evidence": [
+          "SES enclosure logical id"
+        ],
+        "id": "enclosure-ses:enclosure:5000c50000000f01->ses:/dev/ses1",
+        "kind": "enclosure-ses",
+        "related_slots": [
+          0,
+          1
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "enclosure:5000c50000000f01",
+        "status": null,
+        "target": "ses:/dev/ses1"
+      },
+      {
+        "evidence": [
+          "mprutil -u 0 show devices"
+        ],
+        "id": "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+        "kind": "expander-enclosure",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "expander:controller:mpr0:5000c50000000e00",
+        "status": null,
+        "target": "mpr-enclosure:controller:mpr0:0002"
+      },
+      {
+        "evidence": [
+          "mprutil -u 1 show devices"
+        ],
+        "id": "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+        "kind": "expander-enclosure",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "expander:controller:mpr1:5000c50000000e01",
+        "status": null,
+        "target": "mpr-enclosure:controller:mpr1:0002"
+      },
+      {
+        "evidence": [],
+        "id": "host-controller:host->controller:mpr0",
+        "kind": "host-controller",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "host",
+        "status": null,
+        "target": "controller:mpr0"
+      },
+      {
+        "evidence": [],
+        "id": "host-controller:host->controller:mpr1",
+        "kind": "host-controller",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "host",
+        "status": null,
+        "target": "controller:mpr1"
+      },
+      {
+        "evidence": [
+          "mprutil -u 0 show devices"
+        ],
+        "id": "mpr-enclosure-bay:mpr-enclosure:controller:mpr0:0002->bay:0:0",
+        "kind": "mpr-enclosure-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "mpr-enclosure:controller:mpr0:0002",
+        "status": "standby",
+        "target": "bay:0"
+      },
+      {
+        "evidence": [
+          "mprutil -u 1 show devices"
+        ],
+        "id": "mpr-enclosure-bay:mpr-enclosure:controller:mpr1:0002->bay:0:0",
+        "kind": "mpr-enclosure-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "mpr-enclosure:controller:mpr1:0002",
+        "status": "active",
+        "target": "bay:0"
+      },
+      {
+        "evidence": [],
+        "id": "path-bay:path:mpr0:standby->bay:0:0",
+        "kind": "path-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "path:mpr0:standby",
+        "status": "standby",
+        "target": "bay:0"
+      },
+      {
+        "evidence": [],
+        "id": "path-bay:path:mpr1:active->bay:0:0",
+        "kind": "path-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "path:mpr1:active",
+        "status": "active",
+        "target": "bay:0"
+      },
+      {
+        "evidence": [
+          "mprutil -u 0 show devices"
+        ],
+        "id": "path-expander:path:mpr0:standby->expander:controller:mpr0:5000c50000000e00",
+        "kind": "path-expander",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "path:mpr0:standby",
+        "status": "standby",
+        "target": "expander:controller:mpr0:5000c50000000e00"
+      },
+      {
+        "evidence": [
+          "mprutil -u 1 show devices"
+        ],
+        "id": "path-expander:path:mpr1:active->expander:controller:mpr1:5000c50000000e01",
+        "kind": "path-expander",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": null,
+        "source": "path:mpr1:active",
+        "status": "active",
+        "target": "expander:controller:mpr1:5000c50000000e01"
+      },
+      {
+        "evidence": [],
+        "id": "pool-vdev:pool:synthetic-pool->vdev:synthetic-pool/mirror-0:0",
+        "kind": "pool-vdev",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "pool:synthetic-pool",
+        "status": null,
+        "target": "vdev:synthetic-pool/mirror-0"
+      },
+      {
+        "evidence": [],
+        "id": "ses-bay:ses:/dev/ses0->bay:0:0",
+        "kind": "ses-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "ses:/dev/ses0",
+        "status": null,
+        "target": "bay:0"
+      },
+      {
+        "evidence": [],
+        "id": "ses-bay:ses:/dev/ses0->bay:1:1",
+        "kind": "ses-bay",
+        "related_slots": [
+          1
+        ],
+        "reported_lanes": null,
+        "slot": 1,
+        "source": "ses:/dev/ses0",
+        "status": null,
+        "target": "bay:1"
+      },
+      {
+        "evidence": [],
+        "id": "ses-bay:ses:/dev/ses1->bay:0:0",
+        "kind": "ses-bay",
+        "related_slots": [
+          0
+        ],
+        "reported_lanes": null,
+        "slot": 0,
+        "source": "ses:/dev/ses1",
+        "status": null,
+        "target": "bay:0"
+      },
+      {
+        "evidence": [],
+        "id": "ses-bay:ses:/dev/ses1->bay:1:1",
+        "kind": "ses-bay",
+        "related_slots": [
+          1
+        ],
+        "reported_lanes": null,
+        "slot": 1,
+        "source": "ses:/dev/ses1",
+        "status": null,
+        "target": "bay:1"
+      }
+    ],
+    "nodes": [
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "inventory snapshot"
+        ],
+        "id": "bay:0",
+        "kind": "bay",
+        "label": "Bay 00",
+        "metrics": {
+          "device_name": "da11",
+          "health": "ONLINE",
+          "pool_name": "synthetic-pool",
+          "present": true,
+          "vdev_name": "mirror-0"
+        },
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          0
+        ],
+        "slot": 0,
+        "status": "healthy"
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "inventory snapshot"
+        ],
+        "id": "bay:1",
+        "kind": "bay",
+        "label": "Bay 01",
+        "metrics": {
+          "device_name": null,
+          "health": "Not Installed",
+          "pool_name": null,
+          "present": false,
+          "vdev_name": null
+        },
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          1
+        ],
+        "slot": 1,
+        "status": "empty"
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 0 show adapter"
+        ],
+        "id": "controller:mpr0",
+        "kind": "controller",
+        "label": "mpr0",
+        "metrics": {
+          "firmware": "16.00.12.00",
+          "kernel_diagnostics": {},
+          "linked_phy_count": null,
+          "path_counts": {
+            "standby": 1
+          },
+          "pci_address": null,
+          "pcie_slot": null,
+          "phy_count": null,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_enclosure": true,
+          "temperature": null
+        },
+        "raw": {
+          "acpi_handle": null,
+          "board": "Synthetic HBA",
+          "chip": "SAS3008",
+          "device": "/dev/mpr0",
+          "firmware": "16.00.12.00",
+          "iocfacts": {},
+          "name": "mpr0",
+          "path_counts": {
+            "standby": 1
+          },
+          "pci": null,
+          "pci_address": null,
+          "pci_device": null,
+          "pci_location": null,
+          "pci_parent": null,
+          "pci_vendor": null,
+          "pcie_slot": null,
+          "pcie_slot_type": null,
+          "pcie_slot_usage": null,
+          "phy_rows": [],
+          "temperature": null,
+          "unit": 0
+        },
+        "raw_id": "/dev/mpr0",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 1 show adapter"
+        ],
+        "id": "controller:mpr1",
+        "kind": "controller",
+        "label": "mpr1",
+        "metrics": {
+          "firmware": "16.00.12.00",
+          "kernel_diagnostics": {},
+          "linked_phy_count": null,
+          "path_counts": {
+            "active": 1
+          },
+          "pci_address": null,
+          "pcie_slot": null,
+          "phy_count": null,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_enclosure": true,
+          "temperature": null
+        },
+        "raw": {
+          "acpi_handle": null,
+          "board": "Synthetic HBA",
+          "chip": "SAS3008",
+          "device": "/dev/mpr1",
+          "firmware": "16.00.12.00",
+          "iocfacts": {},
+          "name": "mpr1",
+          "path_counts": {
+            "active": 1
+          },
+          "pci": null,
+          "pci_address": null,
+          "pci_device": null,
+          "pci_location": null,
+          "pci_parent": null,
+          "pci_vendor": null,
+          "pcie_slot": null,
+          "pcie_slot_type": null,
+          "pcie_slot_usage": null,
+          "phy_rows": [],
+          "temperature": null,
+          "unit": 1
+        },
+        "raw_id": "/dev/mpr1",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": "online"
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "SES enclosure logical id",
+          "mprutil -u 0 show enclosures",
+          "mprutil -u 0 show devices",
+          "mprutil -u 1 show enclosures",
+          "mprutil -u 1 show devices"
+        ],
+        "id": "enclosure:5000c50000000f01",
+        "kind": "enclosure",
+        "label": "5000c50000000f01",
+        "metrics": {
+          "device_count": 1,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true,
+          "slots": "2"
+        },
+        "raw": {
+          "device_count": 1,
+          "legacy_alias_ids": [
+            "mpr-enclosure:controller:mpr0:0002",
+            "mpr-enclosure:controller:mpr1:0002"
+          ],
+          "logical_id": "5000c50000000f01",
+          "observations": [
+            {
+              "controller_id": "controller:mpr0",
+              "enc_handle": "0002",
+              "id": "mpr-enclosure:controller:mpr0:0002",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 2,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "2"
+              },
+              "unit": 0
+            },
+            {
+              "controller_id": "controller:mpr1",
+              "enc_handle": "0002",
+              "id": "mpr-enclosure:controller:mpr1:0002",
+              "metrics": {
+                "device_count": 1,
+                "selected_bay_count": 2,
+                "selected_disk_count": 1,
+                "selected_disk_slots": [
+                  0
+                ],
+                "selected_enclosure": true,
+                "slots": "2"
+              },
+              "unit": 1
+            }
+          ]
+        },
+        "raw_id": "5000c50000000f01",
+        "related_slots": [
+          0,
+          1
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr0",
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 0 show expanders",
+          "mprutil -u 0 show devices"
+        ],
+        "id": "expander:controller:mpr0:5000c50000000e00",
+        "kind": "expander",
+        "label": "5000c50000000e00",
+        "metrics": {
+          "linked_phys": 1,
+          "num_phys": "1",
+          "phy_error_counters": "Expander counters not read yet.",
+          "sas_level": "1",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true
+        },
+        "raw": {
+          "controller_id": "controller:mpr0",
+          "dev_handle": "0009",
+          "device_counts": {
+            "SAS Initiator": 1
+          },
+          "enc_handle": "0002",
+          "fabric_scope": "selected_enclosure",
+          "id": "expander:controller:mpr0:5000c50000000e00",
+          "linked_phys": 1,
+          "num_phys": "1",
+          "parent": "0001",
+          "parent_link_reason": "resolved",
+          "parent_link_state": "resolved",
+          "phy_error_counters": {
+            "device": "pass0",
+            "measured_phys": 0,
+            "message": "Expander counters not read yet.",
+            "phys_with_errors": 0,
+            "read_at": null,
+            "reason": null,
+            "rows": [],
+            "source": "camcontrol smpcmd REPORT PHY ERROR LOG",
+            "state": "not_read",
+            "stopped_at_phy": null,
+            "unknown_phys": 0
+          },
+          "phys": [
+            {
+              "counter_reason": null,
+              "counter_state": "not_read",
+              "dev_handle": "0001",
+              "device": "SAS Initiator",
+              "invalid_dword_count": null,
+              "loss_of_dword_synchronization_count": null,
+              "max": "12.0",
+              "min": "1.5",
+              "phy": "0",
+              "phy_reset_problem_count": null,
+              "remote_phy": "0001",
+              "running_disparity_error_count": null,
+              "speed": "12.0"
+            }
+          ],
+          "sas_address": "5000c50000000e00",
+          "sas_level": "1",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure_candidate": true,
+          "unit": 0
+        },
+        "raw_id": "5000c50000000e00",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr1",
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 1 show expanders",
+          "mprutil -u 1 show devices"
+        ],
+        "id": "expander:controller:mpr1:5000c50000000e01",
+        "kind": "expander",
+        "label": "5000c50000000e01",
+        "metrics": {
+          "linked_phys": 1,
+          "num_phys": "1",
+          "phy_error_counters": "Expander counters not read yet.",
+          "sas_level": "1",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true
+        },
+        "raw": {
+          "controller_id": "controller:mpr1",
+          "dev_handle": "0009",
+          "device_counts": {
+            "SAS Initiator": 1
+          },
+          "enc_handle": "0002",
+          "fabric_scope": "selected_enclosure",
+          "id": "expander:controller:mpr1:5000c50000000e01",
+          "linked_phys": 1,
+          "num_phys": "1",
+          "parent": "0001",
+          "parent_link_reason": "resolved",
+          "parent_link_state": "resolved",
+          "phy_error_counters": {
+            "device": "pass1",
+            "measured_phys": 0,
+            "message": "Expander counters not read yet.",
+            "phys_with_errors": 0,
+            "read_at": null,
+            "reason": null,
+            "rows": [],
+            "source": "camcontrol smpcmd REPORT PHY ERROR LOG",
+            "state": "not_read",
+            "stopped_at_phy": null,
+            "unknown_phys": 0
+          },
+          "phys": [
+            {
+              "counter_reason": null,
+              "counter_state": "not_read",
+              "dev_handle": "0001",
+              "device": "SAS Initiator",
+              "invalid_dword_count": null,
+              "loss_of_dword_synchronization_count": null,
+              "max": "12.0",
+              "min": "1.5",
+              "phy": "0",
+              "phy_reset_problem_count": null,
+              "remote_phy": "0001",
+              "running_disparity_error_count": null,
+              "speed": "12.0"
+            }
+          ],
+          "sas_address": "5000c50000000e01",
+          "sas_level": "1",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure_candidate": true,
+          "unit": 1
+        },
+        "raw_id": "5000c50000000e01",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [],
+        "id": "host",
+        "kind": "host",
+        "label": "Synthetic CORE",
+        "metrics": {
+          "slot_count": 2
+        },
+        "raw": {},
+        "raw_id": "synthetic-core",
+        "related_slots": [],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr0",
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 0 show enclosures",
+          "mprutil -u 0 show devices"
+        ],
+        "id": "mpr-enclosure:controller:mpr0:0002",
+        "kind": "mpr-enclosure",
+        "label": "5000c50000000f01",
+        "metrics": {
+          "device_count": 1,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true,
+          "slots": "2"
+        },
+        "raw": {
+          "controller_id": "controller:mpr0",
+          "device_count": 1,
+          "enc_handle": "0002",
+          "fabric_scope": "selected_enclosure",
+          "id": "mpr-enclosure:controller:mpr0:0002",
+          "logical_id": "5000c50000000f01",
+          "physical_enclosure_id": "enclosure:5000c50000000f01",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure_candidate": true,
+          "sep_handle": "0008",
+          "slots": "2",
+          "type": "SES",
+          "unit": 0
+        },
+        "raw_id": "5000c50000000f01",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr1",
+        "display_label": null,
+        "evidence": [
+          "mprutil -u 1 show enclosures",
+          "mprutil -u 1 show devices"
+        ],
+        "id": "mpr-enclosure:controller:mpr1:0002",
+        "kind": "mpr-enclosure",
+        "label": "5000c50000000f01",
+        "metrics": {
+          "device_count": 1,
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure": true,
+          "slots": "2"
+        },
+        "raw": {
+          "controller_id": "controller:mpr1",
+          "device_count": 1,
+          "enc_handle": "0002",
+          "fabric_scope": "selected_enclosure",
+          "id": "mpr-enclosure:controller:mpr1:0002",
+          "logical_id": "5000c50000000f01",
+          "physical_enclosure_id": "enclosure:5000c50000000f01",
+          "selected_bay_count": 2,
+          "selected_disk_count": 1,
+          "selected_disk_slots": [
+            0
+          ],
+          "selected_enclosure_candidate": true,
+          "sep_handle": "0008",
+          "slots": "2",
+          "type": "SES",
+          "unit": 1
+        },
+        "raw_id": "5000c50000000f01",
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr0",
+        "display_label": null,
+        "evidence": [
+          "sesutil map shared bay",
+          "camcontrol devlist -v"
+        ],
+        "id": "path:mpr0:standby",
+        "kind": "path",
+        "label": "mpr0 standby",
+        "metrics": {
+          "count": 1
+        },
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": "standby"
+      },
+      {
+        "alias": null,
+        "controller_id": "controller:mpr1",
+        "display_label": null,
+        "evidence": [
+          "sesutil map shared bay",
+          "camcontrol devlist -v"
+        ],
+        "id": "path:mpr1:active",
+        "kind": "path",
+        "label": "mpr1 active",
+        "metrics": {
+          "count": 1
+        },
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": "active"
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [],
+        "id": "pool:synthetic-pool",
+        "kind": "pool",
+        "label": "synthetic-pool",
+        "metrics": {},
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "SES enclosure device"
+        ],
+        "id": "ses:/dev/ses0",
+        "kind": "ses-enclosure",
+        "label": "/dev/ses0",
+        "metrics": {},
+        "raw": {
+          "physical_enclosure_id": "enclosure:5000c50000000f01",
+          "ses_device": "/dev/ses0"
+        },
+        "raw_id": "/dev/ses0",
+        "related_slots": [
+          0,
+          1
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [
+          "SES enclosure device"
+        ],
+        "id": "ses:/dev/ses1",
+        "kind": "ses-enclosure",
+        "label": "/dev/ses1",
+        "metrics": {},
+        "raw": {
+          "physical_enclosure_id": "enclosure:5000c50000000f01",
+          "ses_device": "/dev/ses1"
+        },
+        "raw_id": "/dev/ses1",
+        "related_slots": [
+          0,
+          1
+        ],
+        "slot": null,
+        "status": null
+      },
+      {
+        "alias": null,
+        "controller_id": null,
+        "display_label": null,
+        "evidence": [],
+        "id": "vdev:synthetic-pool/mirror-0",
+        "kind": "vdev",
+        "label": "mirror-0",
+        "metrics": {},
+        "raw": {},
+        "raw_id": null,
+        "related_slots": [
+          0
+        ],
+        "slot": null,
+        "status": null
+      }
+    ],
+    "paths": [
+      {
+        "controller": "mpr0",
+        "count": 1,
+        "id": "path:mpr0:standby",
+        "slots": [
+          0
+        ],
+        "state": "standby"
+      },
+      {
+        "controller": "mpr1",
+        "count": 1,
+        "id": "path:mpr1:active",
+        "slots": [
+          0
+        ],
+        "state": "active"
+      }
+    ],
+    "platform": "core",
+    "raw": {
+      "command_failures": [],
+      "commands": [
+        "camcontrol devlist -v",
+        "mprutil -u 0 show adapter",
+        "mprutil -u 0 show devices",
+        "mprutil -u 0 show enclosures",
+        "mprutil -u 0 show expanders",
+        "mprutil -u 1 show adapter",
+        "mprutil -u 1 show devices",
+        "mprutil -u 1 show enclosures",
+        "mprutil -u 1 show expanders",
+        "mprutil show adapters",
+        "sesutil map"
+      ],
+      "controller_read": {
+        "counts": {
+          "controllers": "complete",
+          "enclosures": "complete",
+          "expanders": "complete",
+          "paths": "complete"
+        },
+        "lists": {
+          "mpr0": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          },
+          "mpr1": {
+            "devices": "read",
+            "enclosures": "read",
+            "expanders": "read"
+          }
+        },
+        "rejected_summary_rows": 0,
+        "rejected_units": 0,
+        "summary_units_over_limit": 0,
+        "units": [
+          {
+            "controller": "mpr0",
+            "result": "read"
+          },
+          {
+            "controller": "mpr1",
+            "result": "read"
+          }
+        ],
+        "unread_phy_tables": 0
+      },
+      "mpr_kernel_events": {
+        "controllers": [],
+        "devices": [],
+        "event_count": 0
+      },
+      "mpr_sysctl_locations": {},
+      "path_counts": {
+        "mpr0": {
+          "standby": 1
+        },
+        "mpr1": {
+          "active": 1
+        }
+      },
+      "path_slots": {
+        "mpr0": {
+          "standby": [
+            0
+          ]
+        },
+        "mpr1": {
+          "active": [
+            0
+          ]
+        }
+      },
+      "pci_controllers": [],
+      "pcie_slots": [],
+      "selected_bay_slots": [
+        0,
+        1
+      ],
+      "selected_disk_slots": [
+        0
+      ],
+      "selected_enclosure_keys": [
+        "5000c50000000f01"
+      ]
+    },
+    "selected_enclosure_id": "5000c50000000f01",
+    "selected_enclosure_label": "2 Bay SES",
+    "snapshot_cache_state": "miss",
+    "source_cache_state": "miss",
+    "sources": {},
+    "system_id": "synthetic-core",
+    "system_label": "Synthetic CORE",
+    "traces": [
+      {
+        "alias": null,
+        "display_label": null,
+        "evidence": [
+          "inventory snapshot",
+          "sesutil map shared bay",
+          "camcontrol devlist -v"
+        ],
+        "id": "bay:0",
+        "kind": "bay",
+        "label": "Bay 00",
+        "link_ids": [
+          "host-controller:host->controller:mpr0",
+          "controller-path:controller:mpr0->path:mpr0:standby",
+          "path-bay:path:mpr0:standby->bay:0:0",
+          "path-expander:path:mpr0:standby->expander:controller:mpr0:5000c50000000e00",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+          "mpr-enclosure-bay:mpr-enclosure:controller:mpr0:0002->bay:0:0",
+          "host-controller:host->controller:mpr1",
+          "controller-path:controller:mpr1->path:mpr1:active",
+          "path-bay:path:mpr1:active->bay:0:0",
+          "path-expander:path:mpr1:active->expander:controller:mpr1:5000c50000000e01",
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+          "mpr-enclosure-bay:mpr-enclosure:controller:mpr1:0002->bay:0:0",
+          "ses-bay:ses:/dev/ses0->bay:0:0",
+          "ses-bay:ses:/dev/ses1->bay:0:0",
+          "bay-pool:bay:0->pool:synthetic-pool:0",
+          "pool-vdev:pool:synthetic-pool->vdev:synthetic-pool/mirror-0:0",
+          "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00",
+          "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01",
+          "enclosure-bay:enclosure:5000c50000000f01->bay:0:0"
+        ],
+        "metrics": {
+          "device_name": "da11",
+          "mpr_devices": [
+            {
+              "controller": "mpr0",
+              "diagnostics": {},
+              "enclosure_handle": "0002",
+              "enclosure_id": "mpr-enclosure:controller:mpr0:0002",
+              "expander_ids": [
+                "expander:controller:mpr0:5000c50000000e00"
+              ],
+              "handle": "0020",
+              "member_device_name": "da3",
+              "mpr_device": "SAS Target",
+              "mpr_slot": "0",
+              "parent": "0009",
+              "physical_enclosure_id": "enclosure:5000c50000000f01",
+              "sas_address": "5000c50000000d00",
+              "speed": "12.0",
+              "state": "standby"
+            },
+            {
+              "controller": "mpr1",
+              "diagnostics": {},
+              "enclosure_handle": "0002",
+              "enclosure_id": "mpr-enclosure:controller:mpr1:0002",
+              "expander_ids": [
+                "expander:controller:mpr1:5000c50000000e01"
+              ],
+              "handle": "0020",
+              "member_device_name": "da11",
+              "mpr_device": "SAS Target",
+              "mpr_slot": "0",
+              "parent": "0009",
+              "physical_enclosure_id": "enclosure:5000c50000000f01",
+              "sas_address": "5000c50000000d01",
+              "speed": "12.0",
+              "state": "active"
+            }
+          ],
+          "path_states": [
+            {
+              "controller": "mpr0",
+              "device_name": "da3",
+              "state": "standby"
+            },
+            {
+              "controller": "mpr1",
+              "device_name": "da11",
+              "state": "active"
+            }
+          ],
+          "pool_name": "synthetic-pool",
+          "vdev_name": "mirror-0"
+        },
+        "node_ids": [
+          "host",
+          "bay:0",
+          "controller:mpr0",
+          "path:mpr0:standby",
+          "expander:controller:mpr0:5000c50000000e00",
+          "mpr-enclosure:controller:mpr0:0002",
+          "controller:mpr1",
+          "path:mpr1:active",
+          "expander:controller:mpr1:5000c50000000e01",
+          "mpr-enclosure:controller:mpr1:0002",
+          "ses:/dev/ses0",
+          "ses:/dev/ses1",
+          "pool:synthetic-pool",
+          "vdev:synthetic-pool/mirror-0",
+          "enclosure:5000c50000000f01"
+        ],
+        "slots": [
+          0
+        ]
+      },
+      {
+        "alias": null,
+        "display_label": null,
+        "evidence": [
+          "inventory snapshot",
+          "multipath members",
+          "selected enclosure scope"
+        ],
+        "id": "bay:1",
+        "kind": "bay",
+        "label": "Bay 01",
+        "link_ids": [
+          "ses-bay:ses:/dev/ses0->bay:1:1",
+          "ses-bay:ses:/dev/ses1->bay:1:1",
+          "host-controller:host->controller:mpr0",
+          "host-controller:host->controller:mpr1",
+          "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+          "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01",
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+          "enclosure-bay:enclosure:5000c50000000f01->bay:1:1"
+        ],
+        "metrics": {
+          "device_name": null,
+          "mpr_devices": [],
+          "path_states": [],
+          "pool_name": null,
+          "selected_enclosure_scope": true,
+          "vdev_name": null
+        },
+        "node_ids": [
+          "host",
+          "bay:1",
+          "ses:/dev/ses0",
+          "ses:/dev/ses1",
+          "controller:mpr0",
+          "controller:mpr1",
+          "expander:controller:mpr0:5000c50000000e00",
+          "expander:controller:mpr1:5000c50000000e01",
+          "mpr-enclosure:controller:mpr0:0002",
+          "mpr-enclosure:controller:mpr1:0002",
+          "enclosure:5000c50000000f01"
+        ],
+        "slots": [
+          1
+        ]
+      },
+      {
+        "alias": null,
+        "display_label": null,
+        "evidence": [
+          "sesutil map shared bay",
+          "camcontrol devlist -v",
+          "mprutil -u 0 show devices"
+        ],
+        "id": "path:mpr0:standby",
+        "kind": "path",
+        "label": "mpr0 standby",
+        "link_ids": [
+          "host-controller:host->controller:mpr0",
+          "controller-path:controller:mpr0->path:mpr0:standby",
+          "path-expander:path:mpr0:standby->expander:controller:mpr0:5000c50000000e00",
+          "expander-enclosure:expander:controller:mpr0:5000c50000000e00->mpr-enclosure:controller:mpr0:0002",
+          "controller-expander:controller:mpr0->expander:controller:mpr0:5000c50000000e00"
+        ],
+        "metrics": {
+          "count": 1,
+          "expander_count": 1,
+          "mpr_device_count": 1,
+          "mpr_enclosure_count": 1,
+          "state": "standby"
+        },
+        "node_ids": [
+          "host",
+          "controller:mpr0",
+          "path:mpr0:standby",
+          "expander:controller:mpr0:5000c50000000e00",
+          "mpr-enclosure:controller:mpr0:0002"
+        ],
+        "slots": [
+          0
+        ]
+      },
+      {
+        "alias": null,
+        "display_label": null,
+        "evidence": [
+          "sesutil map shared bay",
+          "camcontrol devlist -v",
+          "mprutil -u 1 show devices"
+        ],
+        "id": "path:mpr1:active",
+        "kind": "path",
+        "label": "mpr1 active",
+        "link_ids": [
+          "host-controller:host->controller:mpr1",
+          "controller-path:controller:mpr1->path:mpr1:active",
+          "path-expander:path:mpr1:active->expander:controller:mpr1:5000c50000000e01",
+          "expander-enclosure:expander:controller:mpr1:5000c50000000e01->mpr-enclosure:controller:mpr1:0002",
+          "controller-expander:controller:mpr1->expander:controller:mpr1:5000c50000000e01"
+        ],
+        "metrics": {
+          "count": 1,
+          "expander_count": 1,
+          "mpr_device_count": 1,
+          "mpr_enclosure_count": 1,
+          "state": "active"
+        },
+        "node_ids": [
+          "host",
+          "controller:mpr1",
+          "path:mpr1:active",
+          "expander:controller:mpr1:5000c50000000e01",
+          "mpr-enclosure:controller:mpr1:0002"
+        ],
+        "slots": [
+          0
+        ]
+      }
+    ],
+    "warnings": []
+  },
+  "slots": [
+    {
+      "attached_sas_address": null,
+      "column_index": 0,
+      "device_name": "da11",
+      "enclosure_id": "5000c50000000f01",
+      "enclosure_identifier": "Slot01",
+      "enclosure_label": "2 Bay SES",
+      "enclosure_name": "ExampleCo SyntheticShelf",
+      "gptid": "da11",
+      "health": "ONLINE",
+      "identify_active": false,
+      "identity_state": "known",
+      "last_smart_test_lifetime_hours": null,
+      "last_smart_test_status": null,
+      "last_smart_test_type": null,
+      "led_backend": "ssh",
+      "led_reason": null,
+      "led_supported": true,
+      "logical_block_size": null,
+      "logical_unit_id": null,
+      "mapping_clear_revision": "7f8455193b67a739eb92b6d8e4914c7a4ae37f558365bb8f84e4f0a200050c13",
+      "mapping_reason": null,
+      "mapping_revision": "2bccc3fae8f90e61610e2bf680b5c917b98de24e72645ca484e4f0a200050c13",
+      "mapping_source": "device-name",
+      "mapping_supported": true,
+      "model": "ExampleCo SAME-MODEL 0001",
+      "multipath": null,
+      "non_identify_state": "healthy",
+      "notes": null,
+      "operator_context": {},
+      "persistent_id_label": null,
+      "phy_identifier": null,
+      "physical_block_size": null,
+      "physical_location_known": true,
+      "pool_name": "synthetic-pool",
+      "present": true,
+      "raw_status": {
+        "attached_sas_address": null,
+        "descriptor": "Slot01",
+        "device_hint": "da3",
+        "device_names": [
+          "da3",
+          "da11"
+        ],
+        "device_names_source": "sesutil_map",
+        "enclosure_id": "5000c50000000f01",
+        "enclosure_label": "2 Bay SES",
+        "enclosure_name": "ExampleCo SyntheticShelf",
+        "identify_active": false,
+        "mapping_resolution_source": "device-name",
+        "model_hint": null,
+        "phy_identifier": null,
+        "pool_device_name": "da11",
+        "presence_conflict": false,
+        "presence_source": "sesutil_map",
+        "present": true,
+        "reported_size": null,
+        "sas_address_conflict": false,
+        "sas_address_degraded": false,
+        "sas_address_hint": null,
+        "sas_address_source": null,
+        "sas_device_type": null,
+        "serial_hint": null,
+        "ses_device": "/dev/ses0",
+        "ses_disabled": null,
+        "ses_do_not_remove": null,
+        "ses_element_id": 7,
+        "ses_fault_requested": null,
+        "ses_fault_sensed": null,
+        "ses_hot_spare": null,
+        "ses_predicted_failure": null,
+        "ses_slot_number": 1,
+        "ses_swapped": null,
+        "ses_targets": [
+          {
+            "enclosure_id": "5000c50000000f01",
+            "ses_device": "/dev/ses0",
+            "ses_element_id": 7,
+            "ses_slot_number": 1
+          },
+          {
+            "enclosure_id": "5000c50000000f01",
+            "ses_device": "/dev/ses1",
+            "ses_element_id": 7,
+            "ses_slot_number": 1
+          }
+        ],
+        "shared_sas_address": null,
+        "slot_number_source": "ses_description",
+        "slot_number_warning": null,
+        "stale_manual_mapping": false,
+        "status": "OK",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "value": "OK"
+      },
+      "row_index": 1,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "search_text": "00 da11 sanitized-direct-disk exampleco same-model 0001 da11 mirror-0 special exampleco syntheticshelf 2 bay ses",
+      "serial": "SANITIZED-DIRECT-DISK",
+      "sg_device": "/dev/ses0",
+      "size_bytes": null,
+      "size_human": null,
+      "slot": 0,
+      "slot_label": "00",
+      "smart_device_names": [
+        "da11"
+      ],
+      "smart_device_type": null,
+      "ssh_ses_device": "/dev/ses0",
+      "ssh_ses_element_id": 7,
+      "ssh_ses_targets": [
+        {
+          "enclosure_id": "5000c50000000f01",
+          "ses_device": "/dev/ses0",
+          "ses_element_id": 7,
+          "ses_slot_number": 1
+        },
+        {
+          "enclosure_id": "5000c50000000f01",
+          "ses_device": "/dev/ses1",
+          "ses_element_id": 7,
+          "ses_slot_number": 1
+        }
+      ],
+      "state": "healthy",
+      "target_port_protocol": null,
+      "temperature_c": null,
+      "topology_label": "synthetic-pool > mirror-0 > special",
+      "transport_protocol": null,
+      "vdev_class": "special",
+      "vdev_name": "mirror-0"
+    },
+    {
+      "attached_sas_address": null,
+      "column_index": 0,
+      "device_name": null,
+      "enclosure_id": "5000c50000000f01",
+      "enclosure_identifier": "Slot02",
+      "enclosure_label": "2 Bay SES",
+      "enclosure_name": "ExampleCo SyntheticShelf",
+      "gptid": null,
+      "health": "Not Installed",
+      "identify_active": false,
+      "identity_state": "known",
+      "last_smart_test_lifetime_hours": null,
+      "last_smart_test_status": null,
+      "last_smart_test_type": null,
+      "led_backend": "ssh",
+      "led_reason": null,
+      "led_supported": true,
+      "logical_block_size": null,
+      "logical_unit_id": null,
+      "mapping_clear_revision": "5db6bbc2d3e11436b4f5d990eddd7944229a7eb20ae3e35379918ca14758efcc",
+      "mapping_reason": null,
+      "mapping_revision": "ba038557dc90b014ee4a7cf874de93e323231b07cc335a1e79918ca14758efcc",
+      "mapping_source": "ses-empty",
+      "mapping_supported": true,
+      "model": null,
+      "multipath": null,
+      "non_identify_state": "empty",
+      "notes": null,
+      "operator_context": {},
+      "persistent_id_label": null,
+      "phy_identifier": null,
+      "physical_block_size": null,
+      "physical_location_known": true,
+      "pool_name": null,
+      "present": false,
+      "raw_status": {
+        "attached_sas_address": null,
+        "descriptor": "Slot02",
+        "device_hint": null,
+        "device_names": [],
+        "device_names_source": null,
+        "enclosure_id": "5000c50000000f01",
+        "enclosure_label": "2 Bay SES",
+        "enclosure_name": "ExampleCo SyntheticShelf",
+        "identify_active": false,
+        "mapping_resolution_source": "ses-empty",
+        "model_hint": null,
+        "phy_identifier": null,
+        "presence_conflict": false,
+        "presence_source": "sesutil_map",
+        "present": false,
+        "reported_size": null,
+        "sas_address_conflict": false,
+        "sas_address_degraded": false,
+        "sas_address_hint": null,
+        "sas_address_source": null,
+        "sas_device_type": null,
+        "serial_hint": null,
+        "ses_device": "/dev/ses0",
+        "ses_disabled": null,
+        "ses_do_not_remove": null,
+        "ses_element_id": 9,
+        "ses_fault_requested": null,
+        "ses_fault_sensed": null,
+        "ses_hot_spare": null,
+        "ses_predicted_failure": null,
+        "ses_slot_number": 2,
+        "ses_swapped": null,
+        "ses_targets": [
+          {
+            "enclosure_id": "5000c50000000f01",
+            "ses_device": "/dev/ses0",
+            "ses_element_id": 9,
+            "ses_slot_number": 2
+          },
+          {
+            "enclosure_id": "5000c50000000f01",
+            "ses_device": "/dev/ses1",
+            "ses_element_id": 9,
+            "ses_slot_number": 2
+          }
+        ],
+        "shared_sas_address": null,
+        "slot_number_source": "ses_description",
+        "slot_number_warning": null,
+        "stale_manual_mapping": false,
+        "status": "Not Installed",
+        "target_port_protocol": null,
+        "transport_protocol": null,
+        "value": "Not Installed"
+      },
+      "row_index": 0,
+      "sas_address": null,
+      "scsi_hctl": null,
+      "search_text": "01 exampleco syntheticshelf 2 bay ses",
+      "serial": null,
+      "sg_device": "/dev/ses0",
+      "size_bytes": null,
+      "size_human": null,
+      "slot": 1,
+      "slot_label": "01",
+      "smart_device_names": [],
+      "smart_device_type": null,
+      "ssh_ses_device": "/dev/ses0",
+      "ssh_ses_element_id": 9,
+      "ssh_ses_targets": [
+        {
+          "enclosure_id": "5000c50000000f01",
+          "ses_device": "/dev/ses0",
+          "ses_element_id": 9,
+          "ses_slot_number": 2
+        },
+        {
+          "enclosure_id": "5000c50000000f01",
+          "ses_device": "/dev/ses1",
+          "ses_element_id": 9,
+          "ses_slot_number": 2
+        }
+      ],
+      "state": "empty",
+      "target_port_protocol": null,
+      "temperature_c": null,
+      "topology_label": null,
+      "transport_protocol": null,
+      "vdev_class": null,
+      "vdev_name": null
+    }
+  ]
+}

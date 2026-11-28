@@ -140,7 +140,7 @@
         "sha256:8af795bbd88a16011c8719477bf18ba19888f88653ffe91ee32c7a99f74d892d": 2
       },
       "sas_wwn_identifier": {
-        "sha256:6a14d3e9357bc3ad09490b292d315eea40e4ce7a33b7330b9ec577328d34cbad": 1
+        "sha256:cb9686da5437270fe6ffc47d73e8ddf548b90c875c0b449dc079efdfde935a6b": 1
       }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
@@ -351,6 +351,14 @@
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
+  "tests/fixtures/sas_fabric/topology_generality.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:a9adc806bff6a724301a8597f6bb5b1da61a90096278581d13d033aac86f297e": 4831
+      }
+    },
+    "reason": "Synthetic builder output for the 13 invented Topology generality fabrics; every SAS identifier comes from the generator's patterned seeds (5aaa..., 5bbb..., 5eee...), and exact detector counts are pinned. No captured device identity is used."
+  },
   "tests/js/admin_bootstrap_platform_copy.test.js": {
     "findings": {
       "private_posix_host_path": {
@@ -391,6 +399,126 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/js/core_fabric_direct_paths.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:9bbf2346da88d87f62ed9480eda8c73fa66883cf47e0ef7c816746ce58ccd37f": 2
+      }
+    },
+    "reason": "One invented second-expander address in the synthetic prefix of the CORE direct-path fixture; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_identity_tuple.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:bbc70a6a942939cf2d1c65b6a14d1676480554ba0aa9832be862b44e70e2398f": 12
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_presence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:38293954194f7f96feb465fe6b9e02791d90c81181ae820fb1963ec0e1354c1f": 12
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_unread_evidence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:a0ed08dfbd4a4204a1127efe56bbde7526da3acc8eaf6fb3f29f545bc6a0d6ec": 12
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_whole_evidence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:5368930778f647e6737117cc12e5345c46a21fcd03b90075add8c47280584362": 13
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/mutation/topology_frontend_mutants.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:e4ea638b598a785e6f18f18d2916dc13c98772bb5a043c98d04b138d84805f84": 3
+      }
+    },
+    "reason": "Mutants plant one invented SAS address in the view, or name a synthetic fixture expander's address, to prove the tests reject what the payload does not carry."
+  },
+  "tests/test_fabric_topology_fixture.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:b340b46b333ad369fe840f9ce6fed6f44d67b1eb64e33cc3a673e1a9828d5489": 20
+      }
+    },
+    "reason": "Patterned synthetic CORE expander, disk, HBA and enclosure addresses of the builder's synthetic survey lines; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_endpoints.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:9f09f970b54ca5f5439dd513d9cb83cca2767400f99ac76976d204128e8433c0": 12
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port, CORE expander and absent-expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_ledger.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:0252233fe4dbf31e0360735d1c89ddd43c476907898100d456c1e76ed3c9b896": 8
+      }
+    },
+    "reason": "Patterned synthetic HBA, disk-port and CORE expander addresses from the Topology fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_classification.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:c234a6634c4a9b36b3ba8bcb11022d0cf910451013e40a78191c3320284ea5b6": 6
+      }
+    },
+    "reason": "Patterned synthetic HBA and disk-port addresses from the Topology generality fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_coverage.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:c09424c7174f925ab9b40cbddda0a4c49c07f9554683b20630f1583d27e5bcda": 9
+      }
+    },
+    "reason": "One invented decoy-expander address in the synthetic prefix of the CORE direct-path fixture, and the generality fixture's patterned HBA and disk-port addresses for a direct-attached disk; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_surfaces.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:c234a6634c4a9b36b3ba8bcb11022d0cf910451013e40a78191c3320284ea5b6": 6
+      }
+    },
+    "reason": "Patterned synthetic HBA and disk-port addresses from the Topology generality fixture seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_generality.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:e6084cc484de75ace2c26b9940ec211d47466869fa876cc590a196c39a24dce8": 1
+      }
+    },
+    "reason": "Invented Topology generality test: one patterned synthetic expander address from the fixture generator's seeds; exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_health.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:ee5263bacff2d3e7f9bf4b507182926429ec336b2b89acc7dbbb0534e74aebe9": 2
+      }
+    },
+    "reason": "Two patterned synthetic identifiers from the Topology generality fixture seeds (a disk port address and its shelf id); exact detector count is pinned."
+  },
+  "tests/js/fabric_topology_own_evidence.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:e6dac837cac425653f0ba125123f4b65020d32ed66115172f8476456e758b57b": 2
+      }
+    },
+    "reason": "Two patterned synthetic expander addresses from the Topology generality fixture seeds; exact detector count is pinned."
+  },
   "tests/js/mapping_health_accessibility.test.js": {
     "findings": {
       "local_windows_drive_path": {
@@ -430,7 +558,7 @@
         "sha256:d5363628e881b66d6825605a543b014632618b3b9bd14cc2cc8bac61f17222ec": 10
       },
       "sas_wwn_identifier": {
-        "sha256:7d33aabd5f337ddf08d57b26bb11daaf32f48f1a28a849f646e9bdf16565d00e": 2
+        "sha256:c790276575cf23a90f09f3966dd6e0335e6055639bddf320350cd7d79b35dcbc": 2
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -506,7 +634,7 @@
         "sha256:1dcbec214c335287b7d5381f812ca247487d70cc969bb1741a9864f840387d35": 108
       },
       "sas_wwn_identifier": {
-        "sha256:fde8a8c53d4bf8d87ef466b60065e198cd25faa767693f956c52b1146f7bc467": 161
+        "sha256:a075025e8dbfe239ee4d7adb2bb9c5a8383a1fbdfe3db407ef4978e19b48f7cf": 161
       }
     },
     "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. Issue 926 adds six literal occurrences of one invented enclosure identifier for dual-path locate-light confirmation; no captured device identity is added."
@@ -528,7 +656,7 @@
         "sha256:39de09fc25e538bb2bb7ccf330b7ffbdfaf157185f2e123cf78e2ddb148909e8": 1
       },
       "sas_wwn_identifier": {
-        "sha256:ba282af2d3f317b8b91ec5b30e6f00e87a92f7567342a1045f13b831186da796": 145
+        "sha256:13c9402a05021632b674dacb0c4eaf0b524a4db26dd750733629c19046d124de": 145
       }
     },
     "reason": "Synthetic or adversarial test literals; exact detector counts are pinned. Issue 926 adds four literal occurrences of one invented enclosure identifier for dual-path locate-light parsing; no captured device identity is added."
@@ -598,7 +726,7 @@
         "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
       },
       "sas_wwn_identifier": {
-        "sha256:6df162229ae2a86b0867c5dfee09eed22ac8390c6d1709d2015a0607e2b798a1": 53
+        "sha256:97e7759a43075543b96926e22fff918a4c9f3355e67775d94f4dfb9baa7cb386": 53
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -665,6 +793,14 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/topology_generality_fixtures.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:3ce106caae4884eef4477a3403dd0a9e0fa143d420933dc4f041c1688ffde6c5": 29
+      }
+    },
+    "reason": "Synthetic generator for the 13 invented Topology generality fabrics: patterned SAS address seeds only (5aaa..., 5bbb..., 5fff...); exact detector counts are pinned."
   },
   "wiki/Advanced-Configuration.md": {
     "findings": {
@@ -742,10 +878,18 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/fixtures/sas_fabric/core_direct_paths.json": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:71f2c687081fe26436f166707fbe860705eb7bb90eabaec9a2d4aefd96328ab7": 106
+      }
+    },
+    "reason": "Invented CORE direct-path builder fixture: five SAS identifiers from the test's synthetic enclosure, expander and disk seeds. Exact values and counts are pinned; no captured device identity is used."
+  },
   "tests/fixtures/sas_fabric/core_no_controller_fabric.json": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:5f0cae8e4211a85f261675a956d3b42650d8e87540f37bfb27f79556aec60944": 255
+        "sha256:0502132a9b60273af2cd42457ee2950711f4674120987d7c648b1508a8b76952": 343
       }
     },
     "reason": "Synthetic builder output from the CORE Storage Fabric test inputs; exact detector counts are pinned."
@@ -753,10 +897,18 @@
   "tests/fixtures/sas_fabric/topology_fabric.json": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:2d718b96696ad85f77b670cd01639ff894c2ad22e8e25da182053a3375d99b11": 273
+        "sha256:3865d9207b8e5fac8ad9c5b51e1941d54004c897b4164cdd3c1fba7085e6ab57": 337
       }
     },
     "reason": "Synthetic builder output from the Storage Fabric Topology test inputs; exact detector counts are pinned."
+  },
+  "tests/test_core_fabric_direct_paths.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:409fd7895fb33a25a75410661938c90ca2949d08bcb5102df35efe35177aad22": 18
+      }
+    },
+    "reason": "Invented CORE enclosure-path and multipath regression identifiers, using the same synthetic prefix and numeric seeds as the fixture builder; no captured value is used."
   },
   "tests/test_core_fabric_legacy_controller.py": {
     "findings": {

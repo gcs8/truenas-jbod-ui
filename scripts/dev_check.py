@@ -19,6 +19,9 @@ FIXED_JAVASCRIPT_PATHS = (
     "app/static/app.js",
     "app/static/app_smart_formatters.js",
     "app/static/sas_fabric_view.js",
+    "app/static/sas_fabric_topology_layout.js",
+    "app/static/sas_fabric_topology_ui.js",
+    "app/static/sas_fabric_topology_evidence.js",
     "app/static/sas_fabric_topology.js",
     "app/static/sas_fabric_transport.js",
     "admin_service/static/admin.js",
@@ -75,6 +78,9 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
             "node --check app/static/app.js",
             "node --check app/static/app_smart_formatters.js",
             "node --check app/static/sas_fabric_view.js",
+            "node --check app/static/sas_fabric_topology_layout.js",
+            "node --check app/static/sas_fabric_topology_ui.js",
+            "node --check app/static/sas_fabric_topology_evidence.js",
             "node --check app/static/sas_fabric_topology.js",
             "node --check admin_service/static/admin.js",
             "node --check admin_service/static/admin_profile_model.js",
@@ -202,6 +208,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_safety",
             "tests.test_admin_transport_routes",
             "tests.test_admin_ttl",
+            "tests.test_core_fabric_direct_paths",
             "tests.test_demo_create_durability",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",
@@ -372,6 +379,14 @@ WINDOWS_EXCLUSIONS = (
             "without an installed Bash runtime"
         ),
         modules=("tests.test_bash_ci_contract",),
+    ),
+    WindowsExclusion(
+        category="Topology mutation runner self-tests",
+        reason=(
+            "the self-tests run the Node and Python mutation runners on disposable "
+            "trees as Linux CI runs them"
+        ),
+        modules=("tests.test_topology_mutation_runners",),
     ),
     WindowsExclusion(
         category="Linux singleton runner trial",

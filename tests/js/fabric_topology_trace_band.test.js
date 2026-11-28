@@ -23,7 +23,9 @@ const BUILDER = "function traceSentences(model, view = {}) {";
 
 function loadSource(source, context = {}) {
   const sandbox = vm.createContext({ window: {}, document: { addEventListener() {} }, ...context });
-  vm.runInContext(source, sandbox);
+  // Named as the product it is (the joined topology scripts, perhaps
+  // reworded by the test), so its exceptions are the product's.
+  vm.runInContext(source, sandbox, { filename: H.TOPOLOGY_JOINED });
   return sandbox.window.SasFabricTopology;
 }
 
@@ -205,7 +207,7 @@ function fakePage(T0 = null, settings = {}) {
       removeEventListener: (name) => fontHandlers.delete(name),
     },
   };
-  const T = T0 ? T0({ window, document }) : loadSource(fs.readFileSync(SOURCE_PATH, "utf8"), { window, document });
+  const T = T0 ? T0({ window, document }) : loadSource(H.topologySource(), { window, document });
   T.attach(container, null, null, {});
   const page = {
     T,
@@ -266,7 +268,7 @@ function fakePage(T0 = null, settings = {}) {
 
 // A topology view whose sentence builder records every list it returns.
 function recorded(calls) {
-  const source = fs.readFileSync(SOURCE_PATH, "utf8");
+  const source = H.topologySource();
   assert.equal(source.split(BUILDER).length - 1, 1, "the sentence builder is one function");
   const wrapped = source.replace(BUILDER, "function traceSentences(model, view = {}) { const made = traceSentencesBuilt(model, view); calls.lists.push(made); return made; }\n  function traceSentencesBuilt(model, view = {}) {");
   return (context) => loadSource(wrapped, { ...context, calls });
@@ -303,6 +305,8 @@ function producible(page, fabric, options) {
     handlers.get("click")({ target: element(ref) });
     see();
   }
+  // Force a pin instead of toggling off the sole item in a host-only drawing.
+  page.escape();
   if (pinnable.length) handlers.get("click")({ target: element(pinnable[0]) });
   visit();
   sentences.delete("");
@@ -360,7 +364,8 @@ function widePort() {
   const dual = [{ controller: "mpr0", state: "active" }, { controller: "mpr1", state: "passive" }];
   H.addBays(fabric, H.range(0, 24), fronts, dual);
   H.addBays(fabric, H.range(24, 48), rears, dual);
-  return fabric;
+  // Both ends' rows, as the builder reports them: the wide ports are read.
+  return H.reciprocalTables(fabric);
 }
 
 // One dual-pathed shelf of 1,024 bays behind two HBAs.
@@ -427,8 +432,16 @@ test("every sentence the band shows, through hover, focus, a pin and a held pin,
   }
   const page = fakePage();
   page.draw(widePort(), { width: 1100 });
-  assert.ok(page.lastFill().some((text) => text.includes("PHYs 24, 25, 26, 27, 28, 29, 30, 31 to PHYs 0, 1, 2, 3, 4, 5, 6, 7. Pinned item kept; Esc clears.")),
-    "the wide port's whole PHY list is measured");
+  const api = H.loadTopology();
+  const model = api.buildTopologyModel(widePort());
+  // The cascade's wide port (PHYs 24-31 down to 0-7), not the HBA's cable.
+  const cables = model.links.filter((link) => link.lanes?.count === 8 && link.lanes.sourcePhys[0] === 24);
+  assert.equal(cables.length, 2, "one level-1 to level-2 cable per HBA");
+  for (const cable of cables) {
+    // Full SAS detail moved to the one hover card, not the short trace band.
+    const card = api.cardFor(model, { kind: "link", id: cable.id });
+    assert.match(card.rows.find((row) => row.label === "PHYs").value, /^24–31 at .+ ↔ 0–7 at .+$/);
+  }
 });
 
 test("the held height is the tallest laid-out sentence the drawing can show, rounded up: a sample by length would miss it", () => {
@@ -649,7 +662,10 @@ test("a host-only fabric with a long host label: the host's held-pin focus sente
   const page = fakePage();
   const { sentences } = producible(page, fabric, { width: 1100 });
   const host = { kind: "node", id: "host", key: "topoNode" };
+  // A click on the pinned item clears it (approved design), so start unpinned.
+  page.escape();
   page.handlers.get("click")({ target: page.element(host) });
+  assert.match(page.pin.textContent, /^Pinned: synthetic-host-/);
   page.handlers.get("focusin")({ target: page.element(host) });
   assert.match(page.pin.textContent, /^Tracing: synthetic-host-(?:segment-){30}end.*\. Pinned item kept; Esc clears\.$/);
   assert.ok(page.lastFill().includes(page.pin.textContent));
@@ -657,8 +673,8 @@ test("a host-only fabric with a long host label: the host's held-pin focus sente
 });
 
 test("the band's sentences are written once: a change to the wording changes the visible sentence and the measured ones alike", () => {
-  const source = fs.readFileSync(SOURCE_PATH, "utf8");
-  for (const words of ["Tracing: ", "Pinned: ", " Pinned item kept; Esc clears.", ". Esc clears."]) {
+  const source = H.topologySource();
+  for (const words of ["Tracing: ", "Pinned: ", " Pinned item kept; Esc clears.", ". Click it again, click the background or press Esc to clear."]) {
     assert.equal(source.split(words).length - 1, 1, `${JSON.stringify(words)} is written once`);
   }
   const changed = source.replace("Tracing: ", "Following: ").replace(" Pinned item kept; Esc clears.", " The pin stays; Esc clears it.");
@@ -684,10 +700,10 @@ test("hover, focus, a pin and Esc write only the visible sentence's text and rea
       return true;
     },
   });
-  const marks = new Set(["[data-topo-node]", "[data-topo-link]", "[data-topo-cross]", "[data-topo-bay]", "[data-topo-group]"]);
+  const marks = new Set(["[data-topo-node]", "[data-topo-link]", "[data-topo-cross]", "[data-topo-bay]", "[data-topo-group]", "[data-topo-port]"]);
   const root = new Proxy({}, {
     get(target, key) {
-      if (key === "querySelector") return (selector) => { if (selector !== "[data-topology-pin]") log.push(`query ${selector}`); return selector === "[data-topology-pin]" ? pin : null; };
+      if (key === "querySelector") return (selector) => { if (!["[data-topology-pin]", "[data-topology-tip]", "[data-topology-clear]"].includes(selector)) log.push(`query ${selector}`); return selector === "[data-topology-pin]" ? pin : null; };
       if (key === "querySelectorAll") return (selector) => { if (!marks.has(selector)) log.push(`query all ${selector}`); return []; };
       log.push(`root get ${String(key)}`);
       return undefined;

@@ -1,0 +1,58 @@
+name: Dependency audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - requirements.txt
+      - requirements.lock
+      - requirements-dev.txt
+      - package.json
+      - package-lock.json
+      - .github/workflows/dependency-audit.yml
+      - .github/scripts/dependency_audit.py
+      - .github/tests/test_dependency_audit.py
+      - .github/dependency-audit-ignore.json
+      - .github/DEPENDENCY_AUDIT.md
+      - tests/test_ci_contract.py
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PIP_ONLY_BINARY: ":all:"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      npm_config_ignore_scripts: "true"
+      npm_config_update_notifier: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Test audit policy and report handling without network
+        run: python -m unittest discover -s .github/tests -p 'test_dependency_audit.py' -v
+      - name: Validate accepted ignores before scanner installation or network audits
+        run: python .github/scripts/dependency_audit.py --validate-only
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+      - name: Install pinned audit tools
+        run: |
+          python -m venv "$RUNNER_TEMP/audit-venv"
+          "$RUNNER_TEMP/audit-venv/bin/python" -m pip install --only-binary=:all: pip-audit==2.10.1
+          npm install --global --ignore-scripts npm@10.9.8
+      - name: Audit production Python, resolved development Python and npm lock
+        run: '"$RUNNER_TEMP/audit-venv/bin/python" .github/scripts/dependency_audit.py'
