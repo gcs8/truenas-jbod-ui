@@ -36,18 +36,18 @@ jobs:
     name: Capture candidate public demo screenshots
     runs-on: ubuntu-latest
     container:
-      # Human-readable tag: mcr.microsoft.com/playwright:v1.64.1-jammy
-      # Pinned to the digest that tag resolved to on 2026-10-30, so a retag in
+      # Human-readable tag: mcr.microsoft.com/playwright:v1.65.1-jammy
+      # Pinned to the digest that tag resolved to on 2026-11-27, so a retag in
       # the registry cannot change the fonts or the Chromium build under a
       # capture. Re-record the digest with:
       #   curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
-      #     https://mcr.microsoft.com/v2/playwright/manifests/v1.64.1-jammy
-      image: mcr.microsoft.com/playwright:v1.64.1-jammy@sha256:6075bd984554db82aee96bcdde53197f091dfe8c4b89322c61da77b86308b810
+      #     https://mcr.microsoft.com/v2/playwright/manifests/v1.65.1-jammy
+      image: mcr.microsoft.com/playwright:v1.65.1-jammy@sha256:b0ee5ce5e14ac42c394c0564a0a30adbda052153c611561bb2d31263593d6dd8
     env:
       CAPTURE_REF: ${{ inputs.ref }}
-      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.64.1-jammy@sha256:6075bd984554db82aee96bcdde53197f091dfe8c4b89322c61da77b86308b810
-      CONTAINER_TAG: mcr.microsoft.com/playwright:v1.64.1-jammy
-      PLAYWRIGHT_VERSION: "1.64.1"
+      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.65.1-jammy@sha256:b0ee5ce5e14ac42c394c0564a0a30adbda052153c611561bb2d31263593d6dd8
+      CONTAINER_TAG: mcr.microsoft.com/playwright:v1.65.1-jammy
+      PLAYWRIGHT_VERSION: "1.65.1"
       QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
       # The families Chromium reported through CSS.getPlatformFontsForNode, not
       # the families fc-match resolves. Recorded by qualification run 34734456858

@@ -471,7 +471,7 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
     def test_control_character_is_not_read_only_for_the_affected_attribute(self):
         from app.services.linux_sas_transport import parse_sas_transport
 
-        for character in ("\x01", "\x7f", "\u0085", "\u202e", "\u200d"):
+        for character in ("\x01", "\x7f", "\u0085", "\u202e", "\u200d", "\ud800"):
             with self.subTest(character=repr(character)):
                 payload = deepcopy(self.payload)
                 host = next(row for row in payload["rows"] if row["kind"] == "scsi_host")
@@ -484,7 +484,7 @@ class LinuxSasTransportTreeTests(unittest.TestCase):
                 self.assertEqual(decoded.attrs["proc_name"], "mpt3sas")
                 self.assertEqual(host["attrs"]["board_name"], "Synthetic" + character + "HBA")
                 result = fabric(json.dumps(payload))
-                self.assertIsNone(result.controllers[0]["board"])
+                self.assertIsNone(json.loads(result.model_dump_json())["controllers"][0]["board"])
                 self.assertEqual(len(result.expanders), 2)
                 self.assertEqual(
                     len(next(trace for trace in result.traces if trace.id == "bay:0").metrics["sas_transport_ports"]), 1
