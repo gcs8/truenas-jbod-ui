@@ -312,13 +312,13 @@ test("Topology port controls clear the bays on both sides of a board", async ({ 
     return `window.SAS_FABRIC_BOOTSTRAP = ${JSON.stringify(bootstrap)};`;
   });
   const errors = await routeSynthetic(page, html, { fabric });
-  await page.setViewportSize(DESKTOP[0]);
-  await page.goto(`${ORIGIN}/sas-fabric`);
-  await page.locator("#fabric-mode-topology").click();
-  await expect(page.locator(".topo-port")).toHaveCount(2 * inventory.layout_rows.flat().length);
   for (const viewport of [...DESKTOP, NARROW]) {
     await page.setViewportSize(viewport);
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await page.goto(`${ORIGIN}/sas-fabric`);
+    await page.locator("#fabric-mode-topology").click();
+    await expect(page.locator(".topo-port")).toHaveCount(2 * inventory.layout_rows.flat().length);
+    const lowerRow = page.locator(`[data-topo-bay="bay:${inventory.layout_rows[1][0]}"]`);
+    await lowerRow.scrollIntoViewIfNeeded();
     expect(await page.evaluate(() => innerWidth)).toBe(viewport.width);
     const { findings } = await page.evaluate(pageChecks, {});
     expect(findings.filter((f) => f.type === "control-overlap"), `${viewport.width} px`).toEqual([]);
