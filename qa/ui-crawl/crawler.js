@@ -17,6 +17,9 @@ const { readsFor, loadRequestsFor, selectsSystemAttribute } = require("./invento
 const { scopeKindFor } = require("./reach");
 const png = require("./png");
 
+const EXPORT_ESTIMATE_PATH = "/api/export/enclosure-snapshot/estimate";
+const EXPORT_ESTIMATE_SETTLE_MS = 30_000;
+
 const READY = {
   async main(page, timeout = 240_000) {
     await page.waitForFunction(() => {
@@ -131,13 +134,26 @@ class Crawler {
       push("console-error", "error", message.text());
     });
     page.on("pageerror", (error) => push("page-error", "error", error.message));
+    const finishEstimate = (request) => {
+      const estimates = this.exportEstimates;
+      if (!estimates?.pending.delete(request)) return false;
+      if (!estimates.pending.size) estimates.onEmpty?.();
+      return true;
+    };
+    page.on("request", (request) => {
+      if (this.exportEstimates && request.method() === "POST" && new URL(request.url()).pathname === EXPORT_ESTIMATE_PATH) {
+        this.exportEstimates.pending.add(request);
+      }
+    });
     page.on("requestfailed", (request) => {
+      if (finishEstimate(request)) this.exportEstimates.failed = true;
       const failure = request.failure()?.errorText || "failed";
       if (/ERR_BLOCKED_BY_CLIENT|blockedbyclient/i.test(failure)) return; // recorded by the guard
       if (/ERR_ABORTED/.test(failure) && request.resourceType() === "document") return;
       push("request-failed", "error", `${request.method()} ${new URL(request.url()).pathname} ${failure}`);
     });
     page.on("requestfinished", async (request) => {
+      finishEstimate(request);
       const timing = request.timing();
       const elapsed = timing.responseEnd > 0 ? timing.responseEnd : null;
       if (elapsed && elapsed > this.budgets.requestMs) {
@@ -406,6 +422,20 @@ class Crawler {
     await this.page.goto("about:blank", { waitUntil: "load", timeout: 60_000 });
   }
 
+  // Use requestfinished (the body was received), not just response headers.
+  // All outstanding requests share one deadline, including superseded ones.
+  async waitForExportEstimates() {
+    const estimates = this.exportEstimates;
+    if (!estimates.pending.size) return;
+    let timer;
+    await new Promise((resolve) => {
+      estimates.onEmpty = resolve;
+      timer = setTimeout(resolve, EXPORT_ESTIMATE_SETTLE_MS);
+    });
+    clearTimeout(timer);
+    estimates.onEmpty = null;
+  }
+
   async load(target) {
     // Serialize and space page loads on a live stack (Archive load rules).
     const wait = this.lastLoad + this.paceMs - Date.now();
@@ -474,6 +504,7 @@ class Crawler {
     if (!retired) this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     try {
       if (retired) throw new Error(`could not retire the previous page: ${String(retired.message || retired).split("\n")[0]}`);
+      if (state.settle_export_estimate) this.exportEstimates = { pending: new Set(), onEmpty: null, failed: false };
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
       record.readyMs = readyMs;
@@ -534,6 +565,22 @@ class Crawler {
     }
     this.endLoadWindow();
     this.guard.endState();
+    if (this.exportEstimates) {
+      // Retire this document while it still owns the findings bucket. The
+      // settlement wait does not extend the guard's load or actuation windows.
+      await this.waitForExportEstimates();
+      if (this.exportEstimates.pending.size) {
+        record.findings.push({ type: "estimate-settle-timeout", severity: "error", text: `POST ${EXPORT_ESTIMATE_PATH} did not settle within ${EXPORT_ESTIMATE_SETTLE_MS} ms` });
+        record.status = "error";
+      }
+      await this.retireDocument().catch((error) => {
+        this.aborted = `could not retire the export page: ${String(error.message || error).split("\n")[0].slice(0, 260)}`;
+        record.findings.push({ type: "state-error", severity: "error", text: this.aborted });
+        record.status = "error";
+      });
+      if (this.exportEstimates.failed) record.status = "error";
+      this.exportEstimates = null;
+    }
     this.bucket = null;
     this.markKnown(record, state);
     record.finishedAt = new Date().toISOString();

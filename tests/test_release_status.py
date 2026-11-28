@@ -26,15 +26,17 @@ class ReleaseStatusTests(unittest.TestCase):
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
         wiki_home = (repository / "wiki" / "Home.md").read_text(encoding="utf-8")
         release_notes = (repository / "docs" / "RELEASE_NOTES_0.23.0.md").read_text(encoding="utf-8")
-        beta_notes = (repository / "docs" / "RELEASE_NOTES_0.24.0-rc.2.md").read_text(encoding="utf-8")
+        beta_notes = (repository / "docs" / "RELEASE_NOTES_0.24.0-rc.3.md").read_text(encoding="utf-8")
 
         from app import __version__
 
-        self.assertEqual(__version__, "0.24.0-rc.2")
-        self.assertEqual(package["version"], "0.24.0-rc.2")
-        self.assertEqual(package_lock["version"], "0.24.0-rc.2")
-        self.assertEqual(package_lock["packages"][""]["version"], "0.24.0-rc.2")
-        self.assertIn("# Release Notes - v0.24.0-rc.2", beta_notes)
+        self.assertEqual(__version__, "0.24.0-rc.3")
+        self.assertEqual(package["version"], "0.24.0-rc.3")
+        self.assertEqual(package_lock["version"], "0.24.0-rc.3")
+        self.assertEqual(package_lock["packages"][""]["version"], "0.24.0-rc.3")
+        self.assertIn("# Release Notes - v0.24.0-rc.3", beta_notes)
+        self.assertIn("## v0.24.0-rc.3 - 2026-11-27", changelog)
+        self.assertLess(changelog.index("## v0.24.0-rc.3"), changelog.index("## v0.24.0-rc.2"))
         self.assertIn("## v0.24.0-rc.2 - 2026-11-21", changelog)
         self.assertLess(changelog.index("## v0.24.0-rc.2"), changelog.index("## v0.24.0-rc.1"))
         self.assertIn("## v0.24.0-rc.1 - 2026-11-11", changelog)
