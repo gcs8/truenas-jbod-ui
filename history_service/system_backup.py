@@ -4581,6 +4581,12 @@ class SystemBackupService:
             if integrity_checked
             else connection.execute("PRAGMA quick_check").fetchall()
         )
+        schema = connection.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+        if any(
+            schema_type not in ("table", "index", "view", "trigger")
+            for schema_type, _, _ in schema
+        ):
+            raise ValueError(UNRECOGNIZED_HISTORY_TRIGGER_MESSAGE)
         required_columns = {
             "slot_state_current": {"system_id", "enclosure_key", "slot"},
             "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
@@ -4610,12 +4616,10 @@ class SystemBackupService:
                     f"History database table {table_name} is missing required columns."
                 )
         expected_triggers = dict(_history_count_trigger_contract())
-        triggers = connection.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
-        ).fetchall()
         if any(
-            expected_triggers.get(str(name)) != " ".join(str(sql).split()).casefold()
-            for name, sql in triggers
+            expected_triggers.get(name) != sql
+            for schema_type, name, sql in schema
+            if schema_type == "trigger"
         ):
             raise ValueError(UNRECOGNIZED_HISTORY_TRIGGER_MESSAGE)
         if rows != [("ok",)]:

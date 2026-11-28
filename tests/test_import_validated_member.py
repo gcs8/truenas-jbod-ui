@@ -42,6 +42,7 @@ from tests.test_interrupted_restore_recovery import (
 )
 # Module import, not class import: importing the test classes would run
 # them a second time under this module.
+from . import test_history_released_schema_upgrades as released
 from tests import test_restore_refusal_cleanup as refusal
 from tests.test_restore_refusal_cleanup import (
     _dump,
@@ -426,17 +427,58 @@ class MemberChecksOnThePrivateCopyTests(_ImportRootCleanup):
             """)
         self._assert_trigger_refused(member)
 
-    def test_count_trigger_name_with_different_sql_is_refused(self) -> None:
-        member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])
+    def test_uppercase_trigger_type_is_refused_before_publish(self) -> None:
+        member = _history_database(self.root / "uppercase-type.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            connection.executescript("""
+                CREATE TRIGGER synthetic_history_count_update
+                AFTER UPDATE ON history_table_counts BEGIN
+                    SELECT 1;
+                END;
+                PRAGMA writable_schema=ON;
+                UPDATE sqlite_master
+                SET type = 'TRIGGER'
+                WHERE name = 'synthetic_history_count_update';
+                PRAGMA writable_schema=RESET;
+            """)
+        self._assert_trigger_refused(member)
+
+    def test_count_trigger_string_literal_case_variant_is_refused(self) -> None:
+        member = _history_database(self.root / "literal-case.sqlite3", [ORDINARY, ORDINARY])
         with closing(sqlite3.connect(member)) as connection:
             connection.executescript("""
                 DROP TRIGGER count_metric_samples_insert;
                 CREATE TRIGGER count_metric_samples_insert
                 AFTER INSERT ON metric_samples BEGIN
-                    SELECT 1;
+                    UPDATE history_table_counts
+                    SET row_count = row_count + 1
+                    WHERE table_name = 'METRIC_SAMPLES';
                 END;
             """)
         self._assert_trigger_refused(member)
+
+    def test_count_trigger_lookalike_character_variant_is_refused(self) -> None:
+        member = _history_database(self.root / "lookalike.sqlite3", [ORDINARY, ORDINARY])
+        with closing(sqlite3.connect(member)) as connection:
+            connection.executescript("""
+                DROP TRIGGER count_metric_samples_insert;
+                CREATE TRIGGER count_metric_samples_insert
+                AFTER INSERT ON metric_samples BEGIN
+                    UPDATE history_table_counts
+                    SET row_count = row_count + 1
+                    WHERE table_name = 'metric_ſamples';
+                END;
+            """)
+        self._assert_trigger_refused(member)
+
+    def test_released_schema_members_are_installed(self) -> None:
+        for release in released.RELEASED_SCHEMAS:
+            with self.subTest(release=release):
+                member = self.root / f"{release}.sqlite3"
+                released.build_released_database(member, release)
+                self._restore(member)
+                with closing(sqlite3.connect(self.live)) as connection:
+                    self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
 
     def test_member_missing_a_required_table_is_refused(self) -> None:
         member = _history_database(self.root / "member.sqlite3", [ORDINARY, ORDINARY])

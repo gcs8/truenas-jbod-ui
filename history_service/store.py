@@ -715,14 +715,14 @@ SCHEMA = _BASE_SCHEMA + "".join(
 
 @lru_cache(maxsize=1)
 def _history_count_trigger_contract() -> tuple[tuple[str, str], ...]:
-    """Return normalized count triggers from the canonical schema text."""
+    """Return byte-exact count triggers from the canonical schema text."""
     contract: list[tuple[str, str]] = []
     for name in sorted(HISTORY_COUNT_TRIGGER_NAMES):
         marker = f"CREATE TRIGGER IF NOT EXISTS {name}\n"
         _, remainder = _BASE_SCHEMA.split(marker, 1)
         body, _ = remainder.split("\nEND;", 1)
         sql = f"CREATE TRIGGER {name}\n{body}\nEND"
-        contract.append((name, " ".join(sql.split()).casefold()))
+        contract.append((name, sql))
     return tuple(contract)
 
 
