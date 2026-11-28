@@ -1489,9 +1489,8 @@ function adoptLinuxTransport(payload, options = {}) {
       if (mapped.length) ports.set(trace.id, mapped);
     }
     // Cables: the parent's PHYs as reported; the far end inferred or not read.
-    const links = [];
-    for (const item of list(payload.links)) {
-      if (!isRecord(item) || !LANE_LINKS.has(item.kind)) continue;
+    const links = list(payload.links).map((item) => {
+      if (!isRecord(item) || !LANE_LINKS.has(item.kind)) return item;
       const lanes = isRecord(item.reported_lanes) ? { ...item.reported_lanes } : null;
       const child = hardware.find((node) => node.id === item.target);
       if (lanes && !list(lanes.target_phys).length && census.length && census.every((port) => port.state === "read") && child) {
@@ -1502,8 +1501,8 @@ function adoptLinuxTransport(payload, options = {}) {
           for (const row of free) role.set(`${child.id}|${row.name}`, "Cable far end (inferred)");
         }
       }
-      links.push({ ...item, id: `${item.kind}:${rename(item.source)}->${rename(item.target)}`, source: rename(item.source), target: rename(item.target), reported_lanes: lanes });
-    }
+      return { ...item, source: rename(item.source), target: rename(item.target), reported_lanes: lanes };
+    });
     const phyRow = (ownerId, row) => {
       const measured = row.counter_state === "measured";
       return {
@@ -1554,11 +1553,10 @@ function withLinuxTransport(fabric) {
     const adopted = adoptLinuxTransport(fabric);
     if (!adopted) return null;
     const nodes = new Map(adopted.nodes.map((node) => [node.id, node]));
-    const lanes = new Map(adopted.links.map((link) => [link.id, link]));
     return {
       ...fabric,
       nodes: list(fabric.nodes).map((item) => nodes.get(item?.id) || item),
-      links: list(fabric.links).map((item) => lanes.get(item?.id) || item),
+      links: adopted.links,
       traces: list(fabric.traces).map((trace) => {
         if (!isRecord(trace) || trace.kind !== "bay") return trace;
         // A row with no controller is SES detail kept without a path: not a path.
@@ -1713,16 +1711,22 @@ function buildTopologyModel(given, options = {}) {
     const bayLinks = [];
     const pathBayLinks = [];
     const seenLinks = new Set();
-    // Every lane list the payload gives for one link (by its id; a Linux
-    // cable by its kind and two ends, as it is drawn): a cable whose records
-    // give different lists has no one list, whichever record came first.
+    // Linux groups lane evidence by the cable's endpoints, not its display ID.
+    const laneKey = (item) => transport ? JSON.stringify([item.kind, item.source, item.target]) : item.id;
     const laneLists = new Map();
     // And every such record with a list, drawn or not: each is a claim.
     const laneRecords = [];
     for (const item of list(given?.links).filter((entry) => isRecord(entry) && LANE_LINKS.has(entry.kind))) {
-      const key = transport ? `${item.kind}:${item.source}->${item.target}` : item.id;
-      laneLists.set(key, (laneLists.get(key) || new Map()).set(stable(item.reported_lanes ?? null), item.reported_lanes));
-      if (isRecord(item.reported_lanes)) laneRecords.push({ key, source: item.source, target: item.target, lanes: item.reported_lanes });
+      const key = laneKey(item);
+      const group = laneLists.get(key) || { lists: new Map(), reportedById: new Map() };
+      laneLists.set(key, group);
+      const signature = stable(item.reported_lanes ?? null);
+      group.lists.set(signature, item.reported_lanes);
+      if (!isRecord(item.reported_lanes)) continue;
+      // A card reports its own record, even when a competing link lists a different width.
+      const previous = group.reportedById.get(item.id);
+      if (previous === undefined || signature < previous) group.reportedById.set(item.id, signature);
+      laneRecords.push({ key, id: item.id, source: item.source, target: item.target, lanes: item.reported_lanes });
     }
     // Every record the payload carries of each node id: a Linux cable's
     // child is what all of its records report.
@@ -1756,10 +1760,11 @@ function buildTopologyModel(given, options = {}) {
         if (!hiddenEnd && !unsupportedEnd) skipped.unjoined.push(item.id);
         continue;
       }
-      const lists = laneLists.get(item.id);
+      const key = laneKey(item);
+      const group = laneLists.get(key);
+      const lists = group?.lists;
       const listsDisagree = (lists?.size || 0) > 1;
-      // Where they differ, the one shown as reported is the same in any order.
-      const reported = listsDisagree ? lists.get([...lists.keys()].filter((key) => key !== "null").sort()[0]) : item.reported_lanes;
+      const reported = listsDisagree ? lists.get(group.reportedById.get(item.id)) : item.reported_lanes;
       const lanesPayload = isRecord(reported) ? reported : null;
       let lanes = null;
       if (lanesPayload && Number.isInteger(lanesPayload.lane_count)) {
@@ -1803,6 +1808,7 @@ function buildTopologyModel(given, options = {}) {
         // The SAS address the lane list itself gives for each end, where it does.
         listEnds: [sasAddressOf(lanesPayload?.source_sas_address), sasAddressOf(lanesPayload?.attached_sas_address)],
         listsDisagree,
+        laneKey: key,
         // Every lane list any record of the link gives: each is a claim.
         listRecords: laneLink ? [...(lists?.values() || [])].filter(isRecord) : [],
         ancestry: transport && laneLink ? ancestryOf(nodeRecords.get(item.target) || []) : null,
